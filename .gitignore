@@ -19,3 +19,8 @@
 
 # Debug files
 *.pdb
+
+# SQL
+crates/**/migrations/+.sql
+**/*.sql
+

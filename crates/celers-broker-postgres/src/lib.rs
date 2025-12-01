@@ -6,14 +6,22 @@
 //! - Dead Letter Queue (DLQ) for permanently failed tasks
 //! - Delayed task execution (enqueue_at, enqueue_after)
 //! - Prometheus metrics (optional `metrics` feature)
-//! - Batch enqueue/dequeue operations
+//! - Batch enqueue/dequeue/ack operations
 //! - Transaction safety
 //! - Distributed workers without contention
+//! - Queue pause/resume functionality
+//! - DLQ inspection and requeue
+//! - Task status inspection
+//! - Database health checks
+//! - Automatic task archiving
 
 use async_trait::async_trait;
 use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -22,10 +30,179 @@ use celers_metrics::{
     DLQ_SIZE, PROCESSING_QUEUE_SIZE, QUEUE_SIZE, TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL,
 };
 
+/// Task state in the database
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DbTaskState {
+    Pending,
+    Processing,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl std::fmt::Display for DbTaskState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbTaskState::Pending => write!(f, "pending"),
+            DbTaskState::Processing => write!(f, "processing"),
+            DbTaskState::Completed => write!(f, "completed"),
+            DbTaskState::Failed => write!(f, "failed"),
+            DbTaskState::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+impl std::str::FromStr for DbTaskState {
+    type Err = CelersError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "pending" => Ok(DbTaskState::Pending),
+            "processing" => Ok(DbTaskState::Processing),
+            "completed" => Ok(DbTaskState::Completed),
+            "failed" => Ok(DbTaskState::Failed),
+            "cancelled" => Ok(DbTaskState::Cancelled),
+            _ => Err(CelersError::Other(format!("Unknown task state: {}", s))),
+        }
+    }
+}
+
+/// Information about a task in the database
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub id: Uuid,
+    pub task_name: String,
+    pub state: DbTaskState,
+    pub priority: i32,
+    pub retry_count: i32,
+    pub max_retries: i32,
+    pub created_at: DateTime<Utc>,
+    pub scheduled_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub worker_id: Option<String>,
+    pub error_message: Option<String>,
+}
+
+/// Information about a dead-lettered task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DlqTaskInfo {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub task_name: String,
+    pub retry_count: i32,
+    pub error_message: Option<String>,
+    pub failed_at: DateTime<Utc>,
+}
+
+/// Database health status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthStatus {
+    pub healthy: bool,
+    pub connection_pool_size: u32,
+    pub idle_connections: u32,
+    pub pending_tasks: i64,
+    pub processing_tasks: i64,
+    pub dlq_tasks: i64,
+    pub database_version: String,
+}
+
+/// Queue statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueueStatistics {
+    pub pending: i64,
+    pub processing: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+    pub dlq: i64,
+    pub total: i64,
+}
+
+/// Task result stored in the database
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    pub task_id: Uuid,
+    pub task_name: String,
+    pub status: TaskResultStatus,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub traceback: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub runtime_ms: Option<i64>,
+}
+
+/// Task result status
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskResultStatus {
+    Pending,
+    Started,
+    Success,
+    Failure,
+    Retry,
+    Revoked,
+}
+
+impl std::fmt::Display for TaskResultStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskResultStatus::Pending => write!(f, "PENDING"),
+            TaskResultStatus::Started => write!(f, "STARTED"),
+            TaskResultStatus::Success => write!(f, "SUCCESS"),
+            TaskResultStatus::Failure => write!(f, "FAILURE"),
+            TaskResultStatus::Retry => write!(f, "RETRY"),
+            TaskResultStatus::Revoked => write!(f, "REVOKED"),
+        }
+    }
+}
+
+impl std::str::FromStr for TaskResultStatus {
+    type Err = CelersError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "PENDING" => Ok(TaskResultStatus::Pending),
+            "STARTED" => Ok(TaskResultStatus::Started),
+            "SUCCESS" => Ok(TaskResultStatus::Success),
+            "FAILURE" => Ok(TaskResultStatus::Failure),
+            "RETRY" => Ok(TaskResultStatus::Retry),
+            "REVOKED" => Ok(TaskResultStatus::Revoked),
+            _ => Err(CelersError::Other(format!("Unknown result status: {}", s))),
+        }
+    }
+}
+
+/// Table size information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableSizeInfo {
+    pub table_name: String,
+    pub row_count: i64,
+    pub total_size_bytes: i64,
+    pub table_size_bytes: i64,
+    pub index_size_bytes: i64,
+    pub total_size_pretty: String,
+}
+
+/// Index usage statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexUsageInfo {
+    pub index_name: String,
+    pub table_name: String,
+    pub index_scans: i64,
+    pub tuples_read: i64,
+    pub tuples_fetched: i64,
+    pub index_size_bytes: i64,
+    pub index_size_pretty: String,
+}
+
 /// PostgreSQL-based broker implementation using SKIP LOCKED
 pub struct PostgresBroker {
     pool: PgPool,
     queue_name: String,
+    paused: AtomicBool,
 }
 
 impl PostgresBroker {
@@ -50,17 +227,25 @@ impl PostgresBroker {
         Ok(Self {
             pool,
             queue_name: queue_name.to_string(),
+            paused: AtomicBool::new(false),
         })
     }
 
     /// Run database migrations
     pub async fn migrate(&self) -> Result<()> {
-        let migration_sql = include_str!("../migrations/001_init.sql");
-
-        sqlx::query(migration_sql)
+        // Run initial schema migration
+        let init_sql = include_str!("../migrations/001_init.sql");
+        sqlx::query(init_sql)
             .execute(&self.pool)
             .await
-            .map_err(|e| CelersError::Other(format!("Migration failed: {}", e)))?;
+            .map_err(|e| CelersError::Other(format!("Migration 001_init failed: {}", e)))?;
+
+        // Run results table migration
+        let results_sql = include_str!("../migrations/002_results.sql");
+        sqlx::query(results_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Migration 002_results failed: {}", e)))?;
 
         Ok(())
     }
@@ -68,166 +253,6 @@ impl PostgresBroker {
     /// Get the underlying connection pool
     pub fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    /// Enqueue multiple tasks in a single transaction (batch operation)
-    ///
-    /// This is significantly faster than individual enqueue calls when
-    /// inserting many tasks. Uses a single transaction and prepared statement.
-    ///
-    /// # Returns
-    /// Vector of task IDs in the same order as input tasks
-    pub async fn enqueue_batch(&self, tasks: Vec<SerializedTask>) -> Result<Vec<TaskId>> {
-        if tasks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
-
-        let mut task_ids = Vec::with_capacity(tasks.len());
-
-        for task in &tasks {
-            let task_id = task.metadata.id;
-            let mut db_metadata = json!({
-                "queue": self.queue_name,
-                "enqueued_at": chrono::Utc::now().to_rfc3339(),
-            });
-
-            // Merge task metadata if present
-            if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
-                if let Some(obj) = db_metadata.as_object_mut() {
-                    if let Some(meta_obj) = task_meta.as_object() {
-                        for (k, v) in meta_obj {
-                            obj.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-
-            sqlx::query(
-                r#"
-                INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-                VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW())
-                "#,
-            )
-            .bind(task_id)
-            .bind(&task.metadata.name)
-            .bind(&task.payload)
-            .bind(task.metadata.priority)
-            .bind(task.metadata.max_retries as i32)
-            .bind(db_metadata)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to enqueue task in batch: {}", e)))?;
-
-            task_ids.push(task_id);
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to commit batch enqueue: {}", e)))?;
-
-        #[cfg(feature = "metrics")]
-        {
-            TASKS_ENQUEUED_TOTAL.inc_by(tasks.len() as f64);
-
-            // Track per-task-type metrics
-            for task in &tasks {
-                TASKS_ENQUEUED_BY_TYPE
-                    .with_label_values(&[&task.metadata.name])
-                    .inc();
-            }
-        }
-
-        Ok(task_ids)
-    }
-
-    /// Dequeue multiple tasks atomically (batch operation)
-    ///
-    /// Fetches up to `limit` tasks in a single transaction using
-    /// FOR UPDATE SKIP LOCKED for distributed worker safety.
-    ///
-    /// # Arguments
-    /// * `limit` - Maximum number of tasks to dequeue
-    ///
-    /// # Returns
-    /// Vector of broker messages (may be less than limit if queue has fewer tasks)
-    pub async fn dequeue_batch(&self, limit: usize) -> Result<Vec<BrokerMessage>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
-
-        let rows = sqlx::query(
-            r#"
-            SELECT id, task_name, payload, retry_count
-            FROM celers_tasks
-            WHERE state = 'pending'
-              AND scheduled_at <= NOW()
-            ORDER BY priority DESC, created_at ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT $1
-            "#,
-        )
-        .bind(limit as i64)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {}", e)))?;
-
-        if rows.is_empty() {
-            tx.rollback().await.map_err(|e| {
-                CelersError::Other(format!("Failed to rollback transaction: {}", e))
-            })?;
-            return Ok(Vec::new());
-        }
-
-        let mut messages = Vec::with_capacity(rows.len());
-        let mut task_ids = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let task_id: Uuid = row.get("id");
-            let task_name: String = row.get("task_name");
-            let payload: Vec<u8> = row.get("payload");
-            let retry_count: i32 = row.get("retry_count");
-
-            messages.push(BrokerMessage {
-                task: SerializedTask::new(task_name, payload),
-                receipt_handle: Some(retry_count.to_string()),
-            });
-
-            task_ids.push(task_id);
-        }
-
-        // Mark all fetched tasks as processing in a single query
-        sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'processing',
-                started_at = NOW(),
-                retry_count = retry_count + 1
-            WHERE id = ANY($1)
-            "#,
-        )
-        .bind(&task_ids)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to mark batch as processing: {}", e)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to commit batch dequeue: {}", e)))?;
-
-        Ok(messages)
     }
 
     /// Move a task to the Dead Letter Queue
@@ -238,6 +263,623 @@ impl PostgresBroker {
             .await
             .map_err(|e| CelersError::Other(format!("Failed to move task to DLQ: {}", e)))?;
 
+        Ok(())
+    }
+
+    // ========== Queue Control ==========
+
+    /// Pause the queue (dequeue will return None while paused)
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        tracing::info!(queue = %self.queue_name, "Queue paused");
+    }
+
+    /// Resume the queue
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        tracing::info!(queue = %self.queue_name, "Queue resumed");
+    }
+
+    /// Check if the queue is paused
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    // ========== Task Inspection ==========
+
+    /// Get detailed information about a specific task
+    pub async fn get_task(&self, task_id: &TaskId) -> Result<Option<TaskInfo>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, task_name, state, priority, retry_count, max_retries,
+                   created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+            FROM celers_tasks
+            WHERE id = $1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task: {}", e)))?;
+
+        match row {
+            Some(row) => {
+                let state_str: String = row.get("state");
+                Ok(Some(TaskInfo {
+                    id: row.get("id"),
+                    task_name: row.get("task_name"),
+                    state: state_str.parse()?,
+                    priority: row.get("priority"),
+                    retry_count: row.get("retry_count"),
+                    max_retries: row.get("max_retries"),
+                    created_at: row.get("created_at"),
+                    scheduled_at: row.get("scheduled_at"),
+                    started_at: row.get("started_at"),
+                    completed_at: row.get("completed_at"),
+                    worker_id: row.get("worker_id"),
+                    error_message: row.get("error_message"),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List tasks by state with pagination
+    pub async fn list_tasks(
+        &self,
+        state: Option<DbTaskState>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = match state {
+            Some(s) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE state = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(s.to_string())
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    ORDER BY created_at DESC
+                    LIMIT $1 OFFSET $2
+                    "#,
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| CelersError::Other(format!("Failed to list tasks: {}", e)))?;
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state_str: String = row.get("state");
+            tasks.push(TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: state_str.parse()?,
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            });
+        }
+        Ok(tasks)
+    }
+
+    /// Get queue statistics
+    pub async fn get_statistics(&self) -> Result<QueueStatistics> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                COUNT(*) FILTER (WHERE state = 'processing') as processing,
+                COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                COUNT(*) FILTER (WHERE state = 'cancelled') as cancelled,
+                COUNT(*) as total
+            FROM celers_tasks
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get statistics: {}", e)))?;
+
+        let dlq_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_dead_letter_queue")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {}", e)))?;
+
+        Ok(QueueStatistics {
+            pending: row.get("pending"),
+            processing: row.get("processing"),
+            completed: row.get("completed"),
+            failed: row.get("failed"),
+            cancelled: row.get("cancelled"),
+            dlq: dlq_count,
+            total: row.get("total"),
+        })
+    }
+
+    // ========== DLQ Operations ==========
+
+    /// List tasks in the dead letter queue
+    pub async fn list_dlq(&self, limit: i64, offset: i64) -> Result<Vec<DlqTaskInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_id, task_name, retry_count, error_message, failed_at
+            FROM celers_dead_letter_queue
+            ORDER BY failed_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {}", e)))?;
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            tasks.push(DlqTaskInfo {
+                id: row.get("id"),
+                task_id: row.get("task_id"),
+                task_name: row.get("task_name"),
+                retry_count: row.get("retry_count"),
+                error_message: row.get("error_message"),
+                failed_at: row.get("failed_at"),
+            });
+        }
+        Ok(tasks)
+    }
+
+    /// Requeue a task from the dead letter queue
+    ///
+    /// This moves the task back to the main queue with reset retry count.
+    pub async fn requeue_from_dlq(&self, dlq_id: &Uuid) -> Result<TaskId> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        // Get task from DLQ
+        let row = sqlx::query(
+            r#"
+            SELECT task_id, task_name, payload, metadata
+            FROM celers_dead_letter_queue
+            WHERE id = $1
+            "#,
+        )
+        .bind(dlq_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {}", e)))?;
+
+        let row = row.ok_or_else(|| CelersError::Other("DLQ task not found".to_string()))?;
+
+        let task_id: Uuid = row.get("task_id");
+        let task_name: String = row.get("task_name");
+        let payload: Vec<u8> = row.get("payload");
+        let metadata: Option<serde_json::Value> = row.get("metadata");
+
+        // Create new task in main queue
+        let new_task_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (id, task_name, payload, state, priority, retry_count, max_retries, metadata, created_at, scheduled_at)
+            VALUES ($1, $2, $3, 'pending', 0, 0, 3, $4, NOW(), NOW())
+            "#,
+        )
+        .bind(new_task_id)
+        .bind(&task_name)
+        .bind(&payload)
+        .bind(metadata)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
+
+        // Delete from DLQ
+        sqlx::query("DELETE FROM celers_dead_letter_queue WHERE id = $1")
+            .bind(dlq_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to delete from DLQ: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit requeue: {}", e)))?;
+
+        tracing::info!(original_task_id = %task_id, new_task_id = %new_task_id, task_name = %task_name, "Requeued task from DLQ");
+
+        Ok(new_task_id)
+    }
+
+    /// Purge (delete) a task from the dead letter queue
+    pub async fn purge_dlq(&self, dlq_id: &Uuid) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM celers_dead_letter_queue WHERE id = $1")
+            .bind(dlq_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to purge DLQ task: {}", e)))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Purge all tasks from the dead letter queue
+    pub async fn purge_all_dlq(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM celers_dead_letter_queue")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to purge all DLQ: {}", e)))?;
+
+        tracing::info!(count = result.rows_affected(), "Purged all DLQ tasks");
+        Ok(result.rows_affected())
+    }
+
+    // ========== Health & Maintenance ==========
+
+    /// Check database health
+    pub async fn check_health(&self) -> Result<HealthStatus> {
+        // Test connection
+        let version: String = sqlx::query_scalar("SELECT version()")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Health check failed: {}", e)))?;
+
+        // Get queue counts
+        let stats = self.get_statistics().await?;
+
+        Ok(HealthStatus {
+            healthy: true,
+            connection_pool_size: self.pool.options().get_max_connections(),
+            idle_connections: self.pool.num_idle() as u32,
+            pending_tasks: stats.pending,
+            processing_tasks: stats.processing,
+            dlq_tasks: stats.dlq,
+            database_version: version,
+        })
+    }
+
+    /// Archive completed tasks older than the specified duration
+    ///
+    /// Returns the number of tasks archived (deleted).
+    pub async fn archive_completed_tasks(&self, older_than: Duration) -> Result<u64> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(older_than.as_secs() as i64);
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM celers_tasks
+            WHERE state IN ('completed', 'failed', 'cancelled')
+              AND completed_at < $1
+            "#,
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to archive tasks: {}", e)))?;
+
+        tracing::info!(count = result.rows_affected(), cutoff = %cutoff, "Archived completed tasks");
+        Ok(result.rows_affected())
+    }
+
+    /// Clean up stuck processing tasks (tasks that have been processing too long)
+    ///
+    /// This can happen if a worker crashes. Tasks are requeued with incremented retry count.
+    pub async fn recover_stuck_tasks(&self, stuck_threshold: Duration) -> Result<u64> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(stuck_threshold.as_secs() as i64);
+
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'pending',
+                started_at = NULL,
+                worker_id = NULL,
+                error_message = 'Recovered from stuck processing state'
+            WHERE state = 'processing'
+              AND started_at < $1
+            "#,
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to recover stuck tasks: {}", e)))?;
+
+        if result.rows_affected() > 0 {
+            tracing::warn!(
+                count = result.rows_affected(),
+                "Recovered stuck processing tasks"
+            );
+        }
+        Ok(result.rows_affected())
+    }
+
+    /// Purge all tasks (dangerous - use with caution)
+    pub async fn purge_all(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM celers_tasks")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to purge all tasks: {}", e)))?;
+
+        tracing::warn!(count = result.rows_affected(), "Purged all tasks");
+        Ok(result.rows_affected())
+    }
+
+    // ========== Task Result Storage ==========
+
+    /// Store a task result in the database
+    ///
+    /// This creates or updates the result for a given task ID.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_result(
+        &self,
+        task_id: &TaskId,
+        task_name: &str,
+        status: TaskResultStatus,
+        result: Option<serde_json::Value>,
+        error: Option<&str>,
+        traceback: Option<&str>,
+        runtime_ms: Option<i64>,
+    ) -> Result<()> {
+        let completed_at = match status {
+            TaskResultStatus::Success | TaskResultStatus::Failure | TaskResultStatus::Revoked => {
+                Some(Utc::now())
+            }
+            _ => None,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO celers_task_results
+                (task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8)
+            ON CONFLICT (task_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                result = EXCLUDED.result,
+                error = EXCLUDED.error,
+                traceback = EXCLUDED.traceback,
+                completed_at = EXCLUDED.completed_at,
+                runtime_ms = EXCLUDED.runtime_ms
+            "#,
+        )
+        .bind(task_id)
+        .bind(task_name)
+        .bind(status.to_string())
+        .bind(result)
+        .bind(error)
+        .bind(traceback)
+        .bind(completed_at)
+        .bind(runtime_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to store result: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Get a task result from the database
+    pub async fn get_result(&self, task_id: &TaskId) -> Result<Option<TaskResult>> {
+        let row = sqlx::query(
+            r#"
+            SELECT task_id, task_name, status, result, error, traceback,
+                   created_at, completed_at, runtime_ms
+            FROM celers_task_results
+            WHERE task_id = $1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get result: {}", e)))?;
+
+        match row {
+            Some(row) => {
+                let status_str: String = row.get("status");
+                Ok(Some(TaskResult {
+                    task_id: row.get("task_id"),
+                    task_name: row.get("task_name"),
+                    status: status_str.parse()?,
+                    result: row.get("result"),
+                    error: row.get("error"),
+                    traceback: row.get("traceback"),
+                    created_at: row.get("created_at"),
+                    completed_at: row.get("completed_at"),
+                    runtime_ms: row.get("runtime_ms"),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a task result from the database
+    pub async fn delete_result(&self, task_id: &TaskId) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM celers_task_results WHERE task_id = $1")
+            .bind(task_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to delete result: {}", e)))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Archive old task results
+    ///
+    /// Deletes results older than the specified duration.
+    pub async fn archive_results(&self, older_than: Duration) -> Result<u64> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(older_than.as_secs() as i64);
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM celers_task_results
+            WHERE completed_at < $1
+            "#,
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to archive results: {}", e)))?;
+
+        tracing::info!(count = result.rows_affected(), cutoff = %cutoff, "Archived old results");
+        Ok(result.rows_affected())
+    }
+
+    // ========== Database Monitoring ==========
+
+    /// Get table size information for CeleRS tables
+    pub async fn get_table_sizes(&self) -> Result<Vec<TableSizeInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                relname as table_name,
+                n_live_tup as row_count,
+                pg_total_relation_size(relid) as total_size_bytes,
+                pg_table_size(relid) as table_size_bytes,
+                pg_indexes_size(relid) as index_size_bytes,
+                pg_size_pretty(pg_total_relation_size(relid)) as total_size_pretty
+            FROM pg_stat_user_tables
+            WHERE relname LIKE 'celers_%'
+            ORDER BY pg_total_relation_size(relid) DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {}", e)))?;
+
+        let mut tables = Vec::with_capacity(rows.len());
+        for row in rows {
+            tables.push(TableSizeInfo {
+                table_name: row.get("table_name"),
+                row_count: row.get("row_count"),
+                total_size_bytes: row.get("total_size_bytes"),
+                table_size_bytes: row.get("table_size_bytes"),
+                index_size_bytes: row.get("index_size_bytes"),
+                total_size_pretty: row.get("total_size_pretty"),
+            });
+        }
+        Ok(tables)
+    }
+
+    /// Get index usage statistics for CeleRS tables
+    pub async fn get_index_usage(&self) -> Result<Vec<IndexUsageInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                indexrelname as index_name,
+                relname as table_name,
+                idx_scan as index_scans,
+                idx_tup_read as tuples_read,
+                idx_tup_fetch as tuples_fetched,
+                pg_relation_size(indexrelid) as index_size_bytes,
+                pg_size_pretty(pg_relation_size(indexrelid)) as index_size_pretty
+            FROM pg_stat_user_indexes
+            WHERE relname LIKE 'celers_%'
+            ORDER BY idx_scan DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get index usage: {}", e)))?;
+
+        let mut indexes = Vec::with_capacity(rows.len());
+        for row in rows {
+            indexes.push(IndexUsageInfo {
+                index_name: row.get("index_name"),
+                table_name: row.get("table_name"),
+                index_scans: row.get("index_scans"),
+                tuples_read: row.get("tuples_read"),
+                tuples_fetched: row.get("tuples_fetched"),
+                index_size_bytes: row.get("index_size_bytes"),
+                index_size_pretty: row.get("index_size_pretty"),
+            });
+        }
+        Ok(indexes)
+    }
+
+    /// Get unused indexes (indexes that have never been scanned)
+    ///
+    /// This can help identify indexes that can be safely dropped.
+    pub async fn get_unused_indexes(&self) -> Result<Vec<IndexUsageInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                indexrelname as index_name,
+                relname as table_name,
+                idx_scan as index_scans,
+                idx_tup_read as tuples_read,
+                idx_tup_fetch as tuples_fetched,
+                pg_relation_size(indexrelid) as index_size_bytes,
+                pg_size_pretty(pg_relation_size(indexrelid)) as index_size_pretty
+            FROM pg_stat_user_indexes
+            WHERE relname LIKE 'celers_%'
+              AND idx_scan = 0
+            ORDER BY pg_relation_size(indexrelid) DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get unused indexes: {}", e)))?;
+
+        let mut indexes = Vec::with_capacity(rows.len());
+        for row in rows {
+            indexes.push(IndexUsageInfo {
+                index_name: row.get("index_name"),
+                table_name: row.get("table_name"),
+                index_scans: row.get("index_scans"),
+                tuples_read: row.get("tuples_read"),
+                tuples_fetched: row.get("tuples_fetched"),
+                index_size_bytes: row.get("index_size_bytes"),
+                index_size_pretty: row.get("index_size_pretty"),
+            });
+        }
+        Ok(indexes)
+    }
+
+    /// Analyze tables to update statistics for query planner
+    ///
+    /// This should be run periodically for optimal query performance.
+    pub async fn analyze_tables(&self) -> Result<()> {
+        sqlx::query("ANALYZE celers_tasks")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to analyze celers_tasks: {}", e)))?;
+
+        sqlx::query("ANALYZE celers_dead_letter_queue")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to analyze celers_dead_letter_queue: {}", e))
+            })?;
+
+        sqlx::query("ANALYZE celers_task_results")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to analyze celers_task_results: {}", e))
+            })?;
+
+        tracing::info!("Analyzed all CeleRS tables");
         Ok(())
     }
 }
@@ -291,6 +933,11 @@ impl Broker for PostgresBroker {
     }
 
     async fn dequeue(&self) -> Result<Option<BrokerMessage>> {
+        // Check if queue is paused
+        if self.paused.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+
         // Use FOR UPDATE SKIP LOCKED to atomically claim a task
         // This is the magic that makes distributed workers work without contention
         let mut tx = self
@@ -570,6 +1217,173 @@ impl Broker for PostgresBroker {
 
         Ok(task_id)
     }
+
+    // ========== Batch Operations (optimized overrides) ==========
+
+    /// Optimized batch enqueue using a single transaction
+    async fn enqueue_batch(&self, tasks: Vec<SerializedTask>) -> Result<Vec<TaskId>> {
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        let mut task_ids = Vec::with_capacity(tasks.len());
+
+        for task in &tasks {
+            let task_id = task.metadata.id;
+            let mut db_metadata = json!({
+                "queue": self.queue_name,
+                "enqueued_at": chrono::Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
+                if let Some(obj) = db_metadata.as_object_mut() {
+                    if let Some(meta_obj) = task_meta.as_object() {
+                        for (k, v) in meta_obj {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW())
+                "#,
+            )
+            .bind(task_id)
+            .bind(&task.metadata.name)
+            .bind(&task.payload)
+            .bind(task.metadata.priority)
+            .bind(task.metadata.max_retries as i32)
+            .bind(db_metadata)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue task in batch: {}", e)))?;
+
+            task_ids.push(task_id);
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit batch enqueue: {}", e)))?;
+
+        #[cfg(feature = "metrics")]
+        {
+            TASKS_ENQUEUED_TOTAL.inc_by(tasks.len() as f64);
+            for task in &tasks {
+                TASKS_ENQUEUED_BY_TYPE
+                    .with_label_values(&[&task.metadata.name])
+                    .inc();
+            }
+        }
+
+        Ok(task_ids)
+    }
+
+    /// Optimized batch dequeue using a single transaction with FOR UPDATE SKIP LOCKED
+    async fn dequeue_batch(&self, count: usize) -> Result<Vec<BrokerMessage>> {
+        if count == 0 || self.paused.load(Ordering::SeqCst) {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_name, payload, retry_count
+            FROM celers_tasks
+            WHERE state = 'pending'
+              AND scheduled_at <= NOW()
+            ORDER BY priority DESC, created_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT $1
+            "#,
+        )
+        .bind(count as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {}", e)))?;
+
+        if rows.is_empty() {
+            tx.rollback().await.map_err(|e| {
+                CelersError::Other(format!("Failed to rollback transaction: {}", e))
+            })?;
+            return Ok(Vec::new());
+        }
+
+        let mut messages = Vec::with_capacity(rows.len());
+        let mut task_ids = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let task_id: Uuid = row.get("id");
+            let task_name: String = row.get("task_name");
+            let payload: Vec<u8> = row.get("payload");
+            let retry_count: i32 = row.get("retry_count");
+
+            messages.push(BrokerMessage {
+                task: SerializedTask::new(task_name, payload),
+                receipt_handle: Some(retry_count.to_string()),
+            });
+
+            task_ids.push(task_id);
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'processing',
+                started_at = NOW(),
+                retry_count = retry_count + 1
+            WHERE id = ANY($1)
+            "#,
+        )
+        .bind(&task_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to mark batch as processing: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit batch dequeue: {}", e)))?;
+
+        Ok(messages)
+    }
+
+    /// Optimized batch ack using a single query with ANY()
+    async fn ack_batch(&self, tasks: &[(TaskId, Option<String>)]) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let task_ids: Vec<Uuid> = tasks.iter().map(|(id, _)| *id).collect();
+
+        sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'completed',
+                completed_at = NOW()
+            WHERE id = ANY($1)
+            "#,
+        )
+        .bind(&task_ids)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to batch ack tasks: {}", e)))?;
+
+        Ok(())
+    }
 }
 
 impl PostgresBroker {
@@ -613,6 +1427,139 @@ impl PostgresBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_db_task_state_display() {
+        assert_eq!(DbTaskState::Pending.to_string(), "pending");
+        assert_eq!(DbTaskState::Processing.to_string(), "processing");
+        assert_eq!(DbTaskState::Completed.to_string(), "completed");
+        assert_eq!(DbTaskState::Failed.to_string(), "failed");
+        assert_eq!(DbTaskState::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn test_db_task_state_from_str() {
+        assert_eq!(
+            "pending".parse::<DbTaskState>().unwrap(),
+            DbTaskState::Pending
+        );
+        assert_eq!(
+            "processing".parse::<DbTaskState>().unwrap(),
+            DbTaskState::Processing
+        );
+        assert_eq!(
+            "completed".parse::<DbTaskState>().unwrap(),
+            DbTaskState::Completed
+        );
+        assert_eq!(
+            "failed".parse::<DbTaskState>().unwrap(),
+            DbTaskState::Failed
+        );
+        assert_eq!(
+            "cancelled".parse::<DbTaskState>().unwrap(),
+            DbTaskState::Cancelled
+        );
+        // Case insensitive
+        assert_eq!(
+            "PENDING".parse::<DbTaskState>().unwrap(),
+            DbTaskState::Pending
+        );
+        assert_eq!(
+            "Completed".parse::<DbTaskState>().unwrap(),
+            DbTaskState::Completed
+        );
+    }
+
+    #[test]
+    fn test_db_task_state_invalid() {
+        assert!("invalid".parse::<DbTaskState>().is_err());
+        assert!("".parse::<DbTaskState>().is_err());
+    }
+
+    #[test]
+    fn test_queue_statistics_default() {
+        let stats = QueueStatistics::default();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.processing, 0);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.cancelled, 0);
+        assert_eq!(stats.dlq, 0);
+        assert_eq!(stats.total, 0);
+    }
+
+    #[test]
+    fn test_db_task_state_serialization() {
+        let state = DbTaskState::Pending;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"pending\"");
+
+        let deserialized: DbTaskState = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, state);
+    }
+
+    #[test]
+    fn test_task_result_status_display() {
+        assert_eq!(TaskResultStatus::Pending.to_string(), "PENDING");
+        assert_eq!(TaskResultStatus::Started.to_string(), "STARTED");
+        assert_eq!(TaskResultStatus::Success.to_string(), "SUCCESS");
+        assert_eq!(TaskResultStatus::Failure.to_string(), "FAILURE");
+        assert_eq!(TaskResultStatus::Retry.to_string(), "RETRY");
+        assert_eq!(TaskResultStatus::Revoked.to_string(), "REVOKED");
+    }
+
+    #[test]
+    fn test_task_result_status_from_str() {
+        assert_eq!(
+            "PENDING".parse::<TaskResultStatus>().unwrap(),
+            TaskResultStatus::Pending
+        );
+        assert_eq!(
+            "STARTED".parse::<TaskResultStatus>().unwrap(),
+            TaskResultStatus::Started
+        );
+        assert_eq!(
+            "SUCCESS".parse::<TaskResultStatus>().unwrap(),
+            TaskResultStatus::Success
+        );
+        assert_eq!(
+            "FAILURE".parse::<TaskResultStatus>().unwrap(),
+            TaskResultStatus::Failure
+        );
+        assert_eq!(
+            "RETRY".parse::<TaskResultStatus>().unwrap(),
+            TaskResultStatus::Retry
+        );
+        assert_eq!(
+            "REVOKED".parse::<TaskResultStatus>().unwrap(),
+            TaskResultStatus::Revoked
+        );
+        // Case insensitive
+        assert_eq!(
+            "pending".parse::<TaskResultStatus>().unwrap(),
+            TaskResultStatus::Pending
+        );
+        assert_eq!(
+            "Success".parse::<TaskResultStatus>().unwrap(),
+            TaskResultStatus::Success
+        );
+    }
+
+    #[test]
+    fn test_task_result_status_invalid() {
+        assert!("invalid".parse::<TaskResultStatus>().is_err());
+        assert!("".parse::<TaskResultStatus>().is_err());
+    }
+
+    #[test]
+    fn test_task_result_status_serialization() {
+        let status = TaskResultStatus::Success;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"success\"");
+
+        let deserialized: TaskResultStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, status);
+    }
 
     #[tokio::test]
     #[ignore] // Requires PostgreSQL running

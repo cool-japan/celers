@@ -4,7 +4,7 @@
 
 ## Status: ✅ FEATURE COMPLETE
 
-Full AWS SQS broker implementation with long polling, visibility timeout management, and IAM authentication.
+Full AWS SQS broker implementation with long polling, visibility timeout management, FIFO queues, DLQ, SSE, and IAM authentication.
 
 ## Completed Features
 
@@ -36,6 +36,8 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 - [x] `with_visibility_timeout()` - Set visibility timeout
 - [x] `with_wait_time()` - Set long polling wait time
 - [x] `with_max_messages()` - Set max messages per poll
+- [x] `with_message_retention()` - Set message retention period
+- [x] `with_delay_seconds()` - Set default message delay
 - [x] Automatic AWS credential detection
 
 ### Batch Operations ✅
@@ -44,6 +46,47 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 - [x] `ack_batch()` - Delete up to 10 messages in a single call
 - [x] 10x cost reduction vs individual operations
 - [x] Automatic handling of partial failures
+
+### FIFO Queue Support ✅
+- [x] `FifoConfig` struct for FIFO-specific settings
+- [x] `with_fifo()` - Configure FIFO queue settings
+- [x] `publish_fifo()` - Publish with message group ID and deduplication
+- [x] `publish_fifo_batch()` - Batch publish for FIFO queues
+- [x] Content-based deduplication support
+- [x] High throughput mode (3000 TPS per message group)
+- [x] Automatic deduplication ID generation
+
+### Dead Letter Queue (DLQ) ✅
+- [x] `DlqConfig` struct for DLQ configuration
+- [x] `with_dlq()` - Configure DLQ at queue creation
+- [x] `set_redrive_policy()` - Set DLQ for existing queues
+- [x] Configurable max receive count (1-1000)
+
+### Server-Side Encryption (SSE) ✅
+- [x] `SseConfig` struct for encryption settings
+- [x] `with_sse()` - Configure encryption
+- [x] SQS-managed encryption support
+- [x] KMS encryption with custom key ID
+- [x] Configurable data key reuse period
+
+### Queue Monitoring ✅
+- [x] `get_queue_stats()` - Get detailed queue statistics
+- [x] `QueueStats` struct with message counts
+- [x] Message retention and visibility timeout info
+- [x] FIFO queue detection
+- [x] Creation and modification timestamps
+- [x] `get_queue_arn()` - Get queue ARN
+- [x] `extend_visibility()` - Extend message visibility timeout
+- [x] `extend_visibility_batch()` - Batch visibility extension
+
+### Advanced Operations ✅
+- [x] `publish_with_delay()` - Publish with per-message delay (0-900 seconds)
+- [x] `update_queue_attributes()` - Update visibility timeout, retention, delay
+- [x] `remove_redrive_policy()` - Remove DLQ configuration
+- [x] `get_redrive_policy()` - Get current DLQ configuration
+- [x] `tag_queue()` - Add metadata tags to queue
+- [x] `get_queue_tags()` - Get queue tags
+- [x] `untag_queue()` - Remove tags from queue
 
 ## AWS SQS Specifics
 
@@ -88,30 +131,22 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 
 ## Future Enhancements
 
-### Advanced Features
-- [ ] Dead Letter Queue (DLQ) configuration
-- [ ] Message deduplication (FIFO queues)
-- [ ] Content-based deduplication
-- [ ] FIFO queue support
-- [ ] Server-side encryption (SSE)
-- [ ] KMS key configuration
-
-### Monitoring
+### Monitoring (CloudWatch Integration)
 - [ ] CloudWatch metrics integration
-- [ ] Queue depth monitoring
-- [ ] Age of oldest message tracking
-- [ ] Receive count statistics
+- [ ] Queue depth alerts
+- [ ] Receive count statistics via CloudWatch
 
 ### Performance
 - [ ] Connection pooling (if needed)
 - [ ] Parallel message processing
 - [ ] Adaptive polling strategies
-- [ ] Cost optimization recommendations
 
 ## Testing Status
 
 - [x] Compilation tests
 - [x] Unit tests (broker creation, builder pattern)
+- [x] Configuration tests (FIFO, DLQ, SSE)
+- [x] Clamping tests for all configuration values
 - [ ] Integration tests with LocalStack
 - [ ] Integration tests with real AWS SQS
 - [ ] Performance benchmarks

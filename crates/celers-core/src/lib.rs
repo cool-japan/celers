@@ -7,9 +7,11 @@ pub mod broker;
 pub mod control;
 pub mod error;
 pub mod event;
+pub mod exception;
 pub mod executor;
 pub mod rate_limit;
 pub mod result;
+pub mod retry;
 pub mod revocation;
 pub mod router;
 pub mod state;
@@ -28,21 +30,26 @@ pub use event::{
     LoggingEventEmitter, NoOpEventEmitter, TaskEvent, TaskEventBuilder, WorkerEvent,
     WorkerEventBuilder,
 };
+pub use exception::{
+    ExceptionAction, ExceptionCategory, ExceptionHandler, ExceptionHandlerChain, ExceptionPolicy,
+    LoggingExceptionHandler, PolicyExceptionHandler, TaskException, TracebackFrame,
+};
 pub use executor::TaskRegistry;
 pub use rate_limit::{
     create_rate_limiter, RateLimitConfig, RateLimiter, SlidingWindow, TaskRateLimiter, TokenBucket,
     WorkerRateLimiter,
 };
 pub use result::{AsyncResult, ResultStore, TaskResultValue};
+pub use retry::{RetryPolicy, RetryStrategy};
 pub use revocation::{
     PatternRevocation, RevocationManager, RevocationMode, RevocationRequest, RevocationResult,
     RevocationState, WorkerRevocationManager,
 };
 pub use router::{
-    GlobPattern, PatternMatcher, RegexPattern, RouteResult, RouteRule, Router, RouterBuilder,
-    RoutingConfig,
+    ArgumentCondition, GlobPattern, PatternMatcher, RegexPattern, RouteResult, RouteRule, Router,
+    RouterBuilder, RoutingConfig,
 };
-pub use state::TaskState;
+pub use state::{StateHistory, StateTransition, TaskState};
 pub use task::{SerializedTask, Task, TaskId, TaskMetadata};
 pub use time_limit::{
     TaskTimeLimits, TimeLimit, TimeLimitConfig, TimeLimitExceeded, TimeLimitSettings,

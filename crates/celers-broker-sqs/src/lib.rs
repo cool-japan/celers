@@ -6,11 +6,14 @@
 //!
 //! - Long polling for efficiency (up to 20 seconds)
 //! - Visibility timeout handling
-//! - Dead Letter Queue integration
+//! - Dead Letter Queue (DLQ) integration
+//! - FIFO queue support with message deduplication
+//! - Server-side encryption (SSE) with optional KMS
 //! - IAM role authentication
 //! - Batch operations for throughput (publish_batch, consume_batch, ack_batch)
 //! - Priority queue support (via message attributes)
 //! - Cost optimization through batch API calls (10x reduction)
+//! - Queue monitoring and statistics
 //!
 //! # Example
 //!
@@ -31,6 +34,27 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # FIFO Queue Example
+//!
+//! ```ignore
+//! use celers_broker_sqs::{SqsBroker, FifoConfig};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create FIFO queue with content-based deduplication
+//! let fifo_config = FifoConfig::new()
+//!     .with_content_based_deduplication(true)
+//!     .with_high_throughput(true);
+//!
+//! let mut broker = SqsBroker::new("my-queue.fifo")
+//!     .await?
+//!     .with_fifo(fifo_config);
+//!
+//! // For FIFO queues, publish with message group ID
+//! broker.publish_fifo("my-queue.fifo", message, "group-1", None).await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -46,6 +70,119 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// Dead Letter Queue (DLQ) configuration
+#[derive(Debug, Clone)]
+pub struct DlqConfig {
+    /// ARN of the dead letter queue
+    pub dlq_arn: String,
+    /// Maximum number of receives before sending to DLQ (1-1000)
+    pub max_receive_count: i32,
+}
+
+impl DlqConfig {
+    /// Create a new DLQ configuration
+    pub fn new(dlq_arn: impl Into<String>, max_receive_count: i32) -> Self {
+        Self {
+            dlq_arn: dlq_arn.into(),
+            max_receive_count: max_receive_count.clamp(1, 1000),
+        }
+    }
+}
+
+/// FIFO queue configuration
+#[derive(Debug, Clone, Default)]
+pub struct FifoConfig {
+    /// Enable content-based deduplication (uses SHA-256 of message body)
+    pub content_based_deduplication: bool,
+    /// Enable high throughput mode (300 -> 3000 TPS per message group)
+    pub high_throughput: bool,
+    /// Default message group ID for messages without explicit group
+    pub default_message_group_id: Option<String>,
+}
+
+impl FifoConfig {
+    /// Create a new FIFO configuration
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable content-based deduplication
+    pub fn with_content_based_deduplication(mut self, enabled: bool) -> Self {
+        self.content_based_deduplication = enabled;
+        self
+    }
+
+    /// Enable high throughput mode (3000 TPS per message group)
+    pub fn with_high_throughput(mut self, enabled: bool) -> Self {
+        self.high_throughput = enabled;
+        self
+    }
+
+    /// Set default message group ID
+    pub fn with_default_message_group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.default_message_group_id = Some(group_id.into());
+        self
+    }
+}
+
+/// Server-side encryption configuration
+#[derive(Debug, Clone)]
+pub struct SseConfig {
+    /// Use KMS encryption (true) or SQS-managed encryption (false)
+    pub use_kms: bool,
+    /// KMS key ID or alias (required if use_kms is true)
+    pub kms_key_id: Option<String>,
+    /// KMS data key reuse period in seconds (60-86400)
+    pub kms_data_key_reuse_period: Option<i32>,
+}
+
+impl SseConfig {
+    /// Create SSE configuration with SQS-managed encryption
+    pub fn sqs_managed() -> Self {
+        Self {
+            use_kms: false,
+            kms_key_id: None,
+            kms_data_key_reuse_period: None,
+        }
+    }
+
+    /// Create SSE configuration with KMS encryption
+    pub fn kms(key_id: impl Into<String>) -> Self {
+        Self {
+            use_kms: true,
+            kms_key_id: Some(key_id.into()),
+            kms_data_key_reuse_period: Some(300), // 5 minutes default
+        }
+    }
+
+    /// Set KMS data key reuse period (60-86400 seconds)
+    pub fn with_data_key_reuse_period(mut self, seconds: i32) -> Self {
+        self.kms_data_key_reuse_period = Some(seconds.clamp(60, 86400));
+        self
+    }
+}
+
+/// Queue statistics and monitoring data
+#[derive(Debug, Clone, Default)]
+pub struct QueueStats {
+    /// Approximate number of messages in the queue
+    pub approximate_message_count: u64,
+    /// Approximate number of messages not visible (being processed)
+    pub approximate_not_visible_count: u64,
+    /// Approximate number of delayed messages
+    pub approximate_delayed_count: u64,
+    /// Queue creation timestamp (Unix epoch seconds)
+    pub created_timestamp: Option<u64>,
+    /// Last modified timestamp (Unix epoch seconds)
+    pub last_modified_timestamp: Option<u64>,
+    /// Message retention period in seconds
+    pub message_retention_period: Option<u64>,
+    /// Visibility timeout in seconds
+    pub visibility_timeout: Option<u64>,
+    /// Whether this is a FIFO queue
+    pub is_fifo: bool,
+}
+
 /// AWS SQS broker implementation
 pub struct SqsBroker {
     client: Option<Client>,
@@ -57,6 +194,16 @@ pub struct SqsBroker {
     wait_time_seconds: i32,
     /// Maximum messages to receive per poll (default 1, max 10)
     max_messages: i32,
+    /// Dead Letter Queue configuration
+    dlq_config: Option<DlqConfig>,
+    /// FIFO queue configuration
+    fifo_config: Option<FifoConfig>,
+    /// Server-side encryption configuration
+    sse_config: Option<SseConfig>,
+    /// Message retention period in seconds (60-1209600, default 345600 = 4 days)
+    message_retention_seconds: i32,
+    /// Delay seconds for messages (0-900, default 0)
+    delay_seconds: i32,
 }
 
 impl SqsBroker {
@@ -64,6 +211,8 @@ impl SqsBroker {
     ///
     /// # Arguments
     /// * `queue_name` - SQS queue name (will be created if it doesn't exist)
+    ///
+    /// Note: For FIFO queues, the queue name must end with ".fifo"
     pub async fn new(queue_name: &str) -> Result<Self> {
         Ok(Self {
             client: None,
@@ -72,25 +221,74 @@ impl SqsBroker {
             visibility_timeout: 30,
             wait_time_seconds: 20, // Long polling
             max_messages: 1,
+            dlq_config: None,
+            fifo_config: None,
+            sse_config: None,
+            message_retention_seconds: 345600, // 4 days
+            delay_seconds: 0,
         })
     }
 
-    /// Set visibility timeout (default 30 seconds)
+    /// Set visibility timeout (default 30 seconds, max 43200 = 12 hours)
     pub fn with_visibility_timeout(mut self, seconds: i32) -> Self {
-        self.visibility_timeout = seconds;
+        self.visibility_timeout = seconds.clamp(0, 43200);
         self
     }
 
     /// Set long polling wait time (default 20 seconds, max 20)
     pub fn with_wait_time(mut self, seconds: i32) -> Self {
-        self.wait_time_seconds = seconds.min(20);
+        self.wait_time_seconds = seconds.clamp(0, 20);
         self
     }
 
     /// Set maximum messages per poll (default 1, max 10)
     pub fn with_max_messages(mut self, max: i32) -> Self {
-        self.max_messages = max.min(10);
+        self.max_messages = max.clamp(1, 10);
         self
+    }
+
+    /// Configure Dead Letter Queue (DLQ)
+    ///
+    /// Messages that fail processing more than `max_receive_count` times
+    /// will be moved to the DLQ.
+    pub fn with_dlq(mut self, config: DlqConfig) -> Self {
+        self.dlq_config = Some(config);
+        self
+    }
+
+    /// Configure FIFO queue settings
+    ///
+    /// Note: Queue name must end with ".fifo" for FIFO queues
+    pub fn with_fifo(mut self, config: FifoConfig) -> Self {
+        self.fifo_config = Some(config);
+        self
+    }
+
+    /// Configure server-side encryption
+    pub fn with_sse(mut self, config: SseConfig) -> Self {
+        self.sse_config = Some(config);
+        self
+    }
+
+    /// Set message retention period (default 4 days)
+    ///
+    /// Valid range: 60 seconds to 1209600 seconds (14 days)
+    pub fn with_message_retention(mut self, seconds: i32) -> Self {
+        self.message_retention_seconds = seconds.clamp(60, 1209600);
+        self
+    }
+
+    /// Set default delay for messages (default 0)
+    ///
+    /// Valid range: 0 to 900 seconds (15 minutes)
+    pub fn with_delay_seconds(mut self, seconds: i32) -> Self {
+        self.delay_seconds = seconds.clamp(0, 900);
+        self
+    }
+
+    /// Check if this broker is configured for FIFO queue
+    pub fn is_fifo(&self) -> bool {
+        self.queue_name.ends_with(".fifo") || self.fifo_config.is_some()
     }
 
     /// Get or create SQS client (cloned for borrow checker compatibility)
@@ -378,6 +576,690 @@ impl SqsBroker {
         );
         Ok(successful)
     }
+
+    /// Publish a message to a FIFO queue
+    ///
+    /// FIFO queues require a message group ID for ordering guarantees.
+    /// Optionally provide a deduplication ID for exactly-once delivery.
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name (must end with ".fifo")
+    /// * `message` - The message to publish
+    /// * `message_group_id` - Required for FIFO ordering
+    /// * `deduplication_id` - Optional; if None and content-based deduplication is
+    ///   disabled, a UUID will be generated
+    pub async fn publish_fifo(
+        &mut self,
+        queue: &str,
+        message: Message,
+        message_group_id: &str,
+        deduplication_id: Option<&str>,
+    ) -> Result<()> {
+        if !queue.ends_with(".fifo") {
+            return Err(BrokerError::OperationFailed(
+                "FIFO queue name must end with '.fifo'".to_string(),
+            ));
+        }
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        // Serialize message to JSON
+        let body = serde_json::to_string(&message)
+            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        // Build message attributes
+        let mut attributes = HashMap::new();
+
+        if let Some(priority) = message.properties.priority {
+            attributes.insert(
+                "priority".to_string(),
+                MessageAttributeValue::builder()
+                    .data_type("Number")
+                    .string_value(priority.to_string())
+                    .build()
+                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+            );
+        }
+
+        if let Some(ref correlation_id) = message.properties.correlation_id {
+            attributes.insert(
+                "correlation_id".to_string(),
+                MessageAttributeValue::builder()
+                    .data_type("String")
+                    .string_value(correlation_id)
+                    .build()
+                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+            );
+        }
+
+        // Determine deduplication ID
+        let dedup_id = deduplication_id.map(String::from).or_else(|| {
+            // If content-based deduplication is enabled, SQS will handle it
+            if self
+                .fifo_config
+                .as_ref()
+                .is_some_and(|c| c.content_based_deduplication)
+            {
+                None
+            } else {
+                // Generate a UUID for deduplication
+                Some(uuid::Uuid::new_v4().to_string())
+            }
+        });
+
+        // Send message
+        let mut request = client
+            .send_message()
+            .queue_url(&queue_url)
+            .message_body(&body)
+            .message_group_id(message_group_id);
+
+        if let Some(ref dedup) = dedup_id {
+            request = request.message_deduplication_id(dedup);
+        }
+
+        if !attributes.is_empty() {
+            request = request.set_message_attributes(Some(attributes));
+        }
+
+        request.send().await.map_err(|e| {
+            BrokerError::OperationFailed(format!("Failed to send FIFO message: {}", e))
+        })?;
+
+        debug!(
+            "Published FIFO message to queue: {} (group: {})",
+            queue, message_group_id
+        );
+        Ok(())
+    }
+
+    /// Publish multiple messages to a FIFO queue in a batch
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name (must end with ".fifo")
+    /// * `messages` - Vector of (message, message_group_id, optional_deduplication_id)
+    ///
+    /// # Returns
+    /// Number of messages successfully published
+    pub async fn publish_fifo_batch(
+        &mut self,
+        queue: &str,
+        messages: Vec<(Message, String, Option<String>)>,
+    ) -> Result<usize> {
+        if messages.is_empty() {
+            return Ok(0);
+        }
+
+        if !queue.ends_with(".fifo") {
+            return Err(BrokerError::OperationFailed(
+                "FIFO queue name must end with '.fifo'".to_string(),
+            ));
+        }
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let batch_size = messages.len().min(10);
+        let batch_messages = &messages[..batch_size];
+
+        let content_based_dedup = self
+            .fifo_config
+            .as_ref()
+            .is_some_and(|c| c.content_based_deduplication);
+
+        let mut entries = Vec::new();
+        for (idx, (message, group_id, dedup_id)) in batch_messages.iter().enumerate() {
+            let body = serde_json::to_string(message)
+                .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+            let mut entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                .id(idx.to_string())
+                .message_body(body)
+                .message_group_id(group_id);
+
+            // Set deduplication ID
+            let final_dedup_id = dedup_id.clone().or_else(|| {
+                if content_based_dedup {
+                    None
+                } else {
+                    Some(uuid::Uuid::new_v4().to_string())
+                }
+            });
+
+            if let Some(ref dedup) = final_dedup_id {
+                entry = entry.message_deduplication_id(dedup);
+            }
+
+            // Add message attributes
+            let mut attributes = HashMap::new();
+            if let Some(priority) = message.properties.priority {
+                attributes.insert(
+                    "priority".to_string(),
+                    MessageAttributeValue::builder()
+                        .data_type("Number")
+                        .string_value(priority.to_string())
+                        .build()
+                        .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+                );
+            }
+
+            if let Some(ref correlation_id) = message.properties.correlation_id {
+                attributes.insert(
+                    "correlation_id".to_string(),
+                    MessageAttributeValue::builder()
+                        .data_type("String")
+                        .string_value(correlation_id)
+                        .build()
+                        .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+                );
+            }
+
+            if !attributes.is_empty() {
+                entry = entry.set_message_attributes(Some(attributes));
+            }
+
+            entries.push(
+                entry
+                    .build()
+                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+            );
+        }
+
+        let result = client
+            .send_message_batch()
+            .queue_url(&queue_url)
+            .set_entries(Some(entries))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to send FIFO batch: {}", e))
+            })?;
+
+        let successful = result.successful().len();
+
+        let failed = result.failed();
+        if !failed.is_empty() {
+            warn!(
+                "FIFO batch send had {} failures out of {}",
+                failed.len(),
+                batch_size
+            );
+        }
+
+        debug!(
+            "Published {} FIFO messages in batch to queue: {}",
+            successful, queue
+        );
+        Ok(successful)
+    }
+
+    /// Get detailed queue statistics and monitoring data
+    ///
+    /// Returns approximate counts for messages and other queue attributes.
+    pub async fn get_queue_stats(&mut self, queue: &str) -> Result<QueueStats> {
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let result = client
+            .get_queue_attributes()
+            .queue_url(&queue_url)
+            .attribute_names(QueueAttributeName::All)
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to get queue attributes: {}", e))
+            })?;
+
+        let attrs = result.attributes();
+
+        let parse_u64 = |name: QueueAttributeName| -> Option<u64> {
+            attrs
+                .and_then(|a| a.get(&name))
+                .and_then(|v| v.parse().ok())
+        };
+
+        let parse_bool = |name: QueueAttributeName| -> bool {
+            attrs
+                .and_then(|a| a.get(&name))
+                .map(|v| v == "true")
+                .unwrap_or(false)
+        };
+
+        Ok(QueueStats {
+            approximate_message_count: parse_u64(QueueAttributeName::ApproximateNumberOfMessages)
+                .unwrap_or(0),
+            approximate_not_visible_count: parse_u64(
+                QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
+            )
+            .unwrap_or(0),
+            approximate_delayed_count: parse_u64(
+                QueueAttributeName::ApproximateNumberOfMessagesDelayed,
+            )
+            .unwrap_or(0),
+            created_timestamp: parse_u64(QueueAttributeName::CreatedTimestamp),
+            last_modified_timestamp: parse_u64(QueueAttributeName::LastModifiedTimestamp),
+            message_retention_period: parse_u64(QueueAttributeName::MessageRetentionPeriod),
+            visibility_timeout: parse_u64(QueueAttributeName::VisibilityTimeout),
+            is_fifo: parse_bool(QueueAttributeName::FifoQueue),
+        })
+    }
+
+    /// Extend visibility timeout for a message
+    ///
+    /// Use this when processing takes longer than expected to prevent
+    /// the message from becoming visible to other consumers.
+    ///
+    /// # Arguments
+    /// * `delivery_tag` - The receipt handle of the message
+    /// * `timeout_seconds` - New visibility timeout (0-43200 seconds)
+    pub async fn extend_visibility(
+        &mut self,
+        delivery_tag: &str,
+        timeout_seconds: i32,
+    ) -> Result<()> {
+        let client = self.get_client().await?;
+        let queue_url = self
+            .queue_url
+            .as_ref()
+            .ok_or_else(|| BrokerError::Connection("Not connected".to_string()))?;
+
+        client
+            .change_message_visibility()
+            .queue_url(queue_url)
+            .receipt_handle(delivery_tag)
+            .visibility_timeout(timeout_seconds.clamp(0, 43200))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to extend visibility: {}", e))
+            })?;
+
+        debug!(
+            "Extended visibility timeout to {} seconds for message",
+            timeout_seconds
+        );
+        Ok(())
+    }
+
+    /// Get the ARN of a queue
+    pub async fn get_queue_arn(&mut self, queue: &str) -> Result<String> {
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let result = client
+            .get_queue_attributes()
+            .queue_url(&queue_url)
+            .attribute_names(QueueAttributeName::QueueArn)
+            .send()
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Failed to get queue ARN: {}", e)))?;
+
+        result
+            .attributes()
+            .and_then(|a| a.get(&QueueAttributeName::QueueArn))
+            .map(|s| s.to_string())
+            .ok_or_else(|| BrokerError::OperationFailed("Queue ARN not found".to_string()))
+    }
+
+    /// Configure redrive policy (Dead Letter Queue) for an existing queue
+    ///
+    /// # Arguments
+    /// * `queue` - The source queue name
+    /// * `dlq_arn` - ARN of the dead letter queue
+    /// * `max_receive_count` - Number of receives before moving to DLQ
+    pub async fn set_redrive_policy(
+        &mut self,
+        queue: &str,
+        dlq_arn: &str,
+        max_receive_count: i32,
+    ) -> Result<()> {
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let redrive_policy = serde_json::json!({
+            "deadLetterTargetArn": dlq_arn,
+            "maxReceiveCount": max_receive_count.clamp(1, 1000).to_string()
+        })
+        .to_string();
+
+        client
+            .set_queue_attributes()
+            .queue_url(&queue_url)
+            .attributes(QueueAttributeName::RedrivePolicy, redrive_policy)
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to set redrive policy: {}", e))
+            })?;
+
+        info!(
+            "Set redrive policy for queue {} -> DLQ {} (max receives: {})",
+            queue, dlq_arn, max_receive_count
+        );
+        Ok(())
+    }
+
+    /// Extend visibility timeout for multiple messages in a batch
+    ///
+    /// More efficient than extending visibility for individual messages.
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name
+    /// * `entries` - Vector of (receipt_handle, timeout_seconds) tuples (max 10)
+    ///
+    /// # Returns
+    /// Number of messages successfully updated
+    pub async fn extend_visibility_batch(
+        &mut self,
+        queue: &str,
+        entries: Vec<(String, i32)>,
+    ) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let batch_size = entries.len().min(10);
+        let batch_entries = &entries[..batch_size];
+
+        let mut request_entries = Vec::new();
+        for (idx, (receipt_handle, timeout)) in batch_entries.iter().enumerate() {
+            request_entries.push(
+                aws_sdk_sqs::types::ChangeMessageVisibilityBatchRequestEntry::builder()
+                    .id(idx.to_string())
+                    .receipt_handle(receipt_handle)
+                    .visibility_timeout(timeout.clamp(&0, &43200).to_owned())
+                    .build()
+                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+            );
+        }
+
+        let result = client
+            .change_message_visibility_batch()
+            .queue_url(&queue_url)
+            .set_entries(Some(request_entries))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to extend visibility batch: {}", e))
+            })?;
+
+        let successful = result.successful().len();
+
+        let failed = result.failed();
+        if !failed.is_empty() {
+            warn!(
+                "Batch visibility extension had {} failures out of {}",
+                failed.len(),
+                batch_size
+            );
+        }
+
+        debug!("Extended visibility for {} messages in batch", successful);
+        Ok(successful)
+    }
+
+    /// Publish a message with a custom delay
+    ///
+    /// The message will be invisible for the specified delay before becoming available.
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name
+    /// * `message` - The message to publish
+    /// * `delay_seconds` - Delay before message becomes visible (0-900 seconds)
+    pub async fn publish_with_delay(
+        &mut self,
+        queue: &str,
+        message: Message,
+        delay_seconds: i32,
+    ) -> Result<()> {
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let body = serde_json::to_string(&message)
+            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        let mut attributes = HashMap::new();
+
+        if let Some(priority) = message.properties.priority {
+            attributes.insert(
+                "priority".to_string(),
+                MessageAttributeValue::builder()
+                    .data_type("Number")
+                    .string_value(priority.to_string())
+                    .build()
+                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+            );
+        }
+
+        if let Some(ref correlation_id) = message.properties.correlation_id {
+            attributes.insert(
+                "correlation_id".to_string(),
+                MessageAttributeValue::builder()
+                    .data_type("String")
+                    .string_value(correlation_id)
+                    .build()
+                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+            );
+        }
+
+        client
+            .send_message()
+            .queue_url(&queue_url)
+            .message_body(&body)
+            .delay_seconds(delay_seconds.clamp(0, 900))
+            .set_message_attributes(if attributes.is_empty() {
+                None
+            } else {
+                Some(attributes)
+            })
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to send delayed message: {}", e))
+            })?;
+
+        debug!(
+            "Published message to SQS queue {} with {} second delay",
+            queue, delay_seconds
+        );
+        Ok(())
+    }
+
+    /// Update queue attributes
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name
+    /// * `visibility_timeout` - Optional new visibility timeout (0-43200 seconds)
+    /// * `message_retention` - Optional new message retention period (60-1209600 seconds)
+    /// * `delay_seconds` - Optional new default delay (0-900 seconds)
+    pub async fn update_queue_attributes(
+        &mut self,
+        queue: &str,
+        visibility_timeout: Option<i32>,
+        message_retention: Option<i32>,
+        delay_seconds: Option<i32>,
+    ) -> Result<()> {
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let mut attributes = HashMap::new();
+
+        if let Some(vt) = visibility_timeout {
+            attributes.insert(
+                QueueAttributeName::VisibilityTimeout,
+                vt.clamp(0, 43200).to_string(),
+            );
+        }
+
+        if let Some(mr) = message_retention {
+            attributes.insert(
+                QueueAttributeName::MessageRetentionPeriod,
+                mr.clamp(60, 1209600).to_string(),
+            );
+        }
+
+        if let Some(ds) = delay_seconds {
+            attributes.insert(
+                QueueAttributeName::DelaySeconds,
+                ds.clamp(0, 900).to_string(),
+            );
+        }
+
+        if attributes.is_empty() {
+            return Ok(());
+        }
+
+        client
+            .set_queue_attributes()
+            .queue_url(&queue_url)
+            .set_attributes(Some(attributes))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to update queue attributes: {}", e))
+            })?;
+
+        debug!("Updated queue attributes for: {}", queue);
+        Ok(())
+    }
+
+    /// Remove the redrive policy from a queue
+    ///
+    /// This disables the Dead Letter Queue for the specified queue.
+    pub async fn remove_redrive_policy(&mut self, queue: &str) -> Result<()> {
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        // Setting an empty string removes the redrive policy
+        client
+            .set_queue_attributes()
+            .queue_url(&queue_url)
+            .attributes(QueueAttributeName::RedrivePolicy, "")
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to remove redrive policy: {}", e))
+            })?;
+
+        info!("Removed redrive policy from queue: {}", queue);
+        Ok(())
+    }
+
+    /// Get the redrive policy for a queue
+    ///
+    /// Returns the DLQ ARN and max receive count if configured.
+    pub async fn get_redrive_policy(&mut self, queue: &str) -> Result<Option<(String, i32)>> {
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let result = client
+            .get_queue_attributes()
+            .queue_url(&queue_url)
+            .attribute_names(QueueAttributeName::RedrivePolicy)
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to get redrive policy: {}", e))
+            })?;
+
+        if let Some(policy_str) = result
+            .attributes()
+            .and_then(|a| a.get(&QueueAttributeName::RedrivePolicy))
+        {
+            if policy_str.is_empty() {
+                return Ok(None);
+            }
+
+            let policy: serde_json::Value = serde_json::from_str(policy_str)
+                .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+            let dlq_arn = policy["deadLetterTargetArn"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            let max_receive_count = policy["maxReceiveCount"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| policy["maxReceiveCount"].as_i64().map(|n| n as i32))
+                .unwrap_or(10);
+
+            if dlq_arn.is_empty() {
+                return Ok(None);
+            }
+
+            return Ok(Some((dlq_arn, max_receive_count)));
+        }
+
+        Ok(None)
+    }
+
+    /// Tag a queue with metadata
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name
+    /// * `tags` - Map of tag key-value pairs
+    pub async fn tag_queue(&mut self, queue: &str, tags: HashMap<String, String>) -> Result<()> {
+        if tags.is_empty() {
+            return Ok(());
+        }
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        client
+            .tag_queue()
+            .queue_url(&queue_url)
+            .set_tags(Some(tags))
+            .send()
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Failed to tag queue: {}", e)))?;
+
+        debug!("Tagged queue: {}", queue);
+        Ok(())
+    }
+
+    /// Get tags for a queue
+    pub async fn get_queue_tags(&mut self, queue: &str) -> Result<HashMap<String, String>> {
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        let result = client
+            .list_queue_tags()
+            .queue_url(&queue_url)
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to get queue tags: {}", e))
+            })?;
+
+        Ok(result.tags().cloned().unwrap_or_default())
+    }
+
+    /// Remove tags from a queue
+    pub async fn untag_queue(&mut self, queue: &str, tag_keys: Vec<String>) -> Result<()> {
+        if tag_keys.is_empty() {
+            return Ok(());
+        }
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(queue).await?;
+
+        client
+            .untag_queue()
+            .queue_url(&queue_url)
+            .set_tag_keys(Some(tag_keys))
+            .send()
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Failed to untag queue: {}", e)))?;
+
+        debug!("Removed tags from queue: {}", queue);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -650,7 +1532,12 @@ impl Broker for SqsBroker {
         // Clone values before borrowing
         let visibility_timeout = self.visibility_timeout;
         let wait_time_seconds = self.wait_time_seconds;
+        let message_retention_seconds = self.message_retention_seconds;
+        let delay_seconds = self.delay_seconds;
         let queue_name = self.queue_name.clone();
+        let fifo_config = self.fifo_config.clone();
+        let sse_config = self.sse_config.clone();
+        let dlq_config = self.dlq_config.clone();
 
         let client = self.get_client().await?;
 
@@ -668,9 +1555,86 @@ impl Broker for SqsBroker {
             wait_time_seconds.to_string(),
         );
 
+        // Set message retention period
+        attributes.insert(
+            QueueAttributeName::MessageRetentionPeriod,
+            message_retention_seconds.to_string(),
+        );
+
+        // Set default delay seconds
+        attributes.insert(QueueAttributeName::DelaySeconds, delay_seconds.to_string());
+
         // Configure for priority mode if requested
         if matches!(mode, QueueMode::Priority) {
             warn!("SQS doesn't natively support priority queues. Priority is handled via message attributes.");
+        }
+
+        // Configure FIFO queue settings
+        let is_fifo = queue.ends_with(".fifo") || fifo_config.is_some();
+        if is_fifo {
+            if !queue.ends_with(".fifo") {
+                return Err(BrokerError::OperationFailed(
+                    "FIFO queue name must end with '.fifo'".to_string(),
+                ));
+            }
+
+            attributes.insert(QueueAttributeName::FifoQueue, "true".to_string());
+
+            if let Some(ref fifo) = fifo_config {
+                if fifo.content_based_deduplication {
+                    attributes.insert(
+                        QueueAttributeName::ContentBasedDeduplication,
+                        "true".to_string(),
+                    );
+                }
+
+                if fifo.high_throughput {
+                    attributes.insert(
+                        QueueAttributeName::DeduplicationScope,
+                        "messageGroup".to_string(),
+                    );
+                    attributes.insert(
+                        QueueAttributeName::FifoThroughputLimit,
+                        "perMessageGroupId".to_string(),
+                    );
+                }
+            }
+
+            info!("Creating FIFO queue: {}", queue);
+        }
+
+        // Configure Server-Side Encryption
+        if let Some(ref sse) = sse_config {
+            if sse.use_kms {
+                if let Some(ref key_id) = sse.kms_key_id {
+                    attributes.insert(QueueAttributeName::KmsMasterKeyId, key_id.clone());
+                }
+                if let Some(reuse_period) = sse.kms_data_key_reuse_period {
+                    attributes.insert(
+                        QueueAttributeName::KmsDataKeyReusePeriodSeconds,
+                        reuse_period.to_string(),
+                    );
+                }
+                info!("Queue {} configured with KMS encryption", queue);
+            } else {
+                attributes.insert(QueueAttributeName::SqsManagedSseEnabled, "true".to_string());
+                info!("Queue {} configured with SQS-managed SSE", queue);
+            }
+        }
+
+        // Configure Dead Letter Queue (redrive policy)
+        if let Some(ref dlq) = dlq_config {
+            let redrive_policy = serde_json::json!({
+                "deadLetterTargetArn": dlq.dlq_arn,
+                "maxReceiveCount": dlq.max_receive_count.to_string()
+            })
+            .to_string();
+
+            attributes.insert(QueueAttributeName::RedrivePolicy, redrive_policy);
+            info!(
+                "Queue {} configured with DLQ: {} (max receives: {})",
+                queue, dlq.dlq_arn, dlq.max_receive_count
+            );
         }
 
         let result = client
@@ -760,5 +1724,175 @@ mod tests {
         assert_eq!(broker.visibility_timeout, 60);
         assert_eq!(broker.wait_time_seconds, 10);
         assert_eq!(broker.max_messages, 5);
+    }
+
+    #[tokio::test]
+    async fn test_fifo_config() {
+        let fifo = FifoConfig::new()
+            .with_content_based_deduplication(true)
+            .with_high_throughput(true)
+            .with_default_message_group_id("default-group");
+
+        assert!(fifo.content_based_deduplication);
+        assert!(fifo.high_throughput);
+        assert_eq!(
+            fifo.default_message_group_id,
+            Some("default-group".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fifo_broker() {
+        let broker = SqsBroker::new("test-queue.fifo")
+            .await
+            .unwrap()
+            .with_fifo(FifoConfig::new().with_content_based_deduplication(true));
+
+        assert!(broker.is_fifo());
+        assert!(broker.fifo_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_dlq_config() {
+        let dlq = DlqConfig::new("arn:aws:sqs:us-east-1:123456789:my-dlq", 3);
+
+        assert_eq!(dlq.dlq_arn, "arn:aws:sqs:us-east-1:123456789:my-dlq");
+        assert_eq!(dlq.max_receive_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_dlq_config_clamping() {
+        let dlq_low = DlqConfig::new("arn:test", 0);
+        assert_eq!(dlq_low.max_receive_count, 1);
+
+        let dlq_high = DlqConfig::new("arn:test", 2000);
+        assert_eq!(dlq_high.max_receive_count, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_sse_config_sqs_managed() {
+        let sse = SseConfig::sqs_managed();
+
+        assert!(!sse.use_kms);
+        assert!(sse.kms_key_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sse_config_kms() {
+        let sse = SseConfig::kms("alias/my-key").with_data_key_reuse_period(600);
+
+        assert!(sse.use_kms);
+        assert_eq!(sse.kms_key_id, Some("alias/my-key".to_string()));
+        assert_eq!(sse.kms_data_key_reuse_period, Some(600));
+    }
+
+    #[tokio::test]
+    async fn test_sse_config_data_key_reuse_clamping() {
+        let sse = SseConfig::kms("key").with_data_key_reuse_period(30);
+        assert_eq!(sse.kms_data_key_reuse_period, Some(60)); // min 60
+
+        let sse_high = SseConfig::kms("key").with_data_key_reuse_period(100000);
+        assert_eq!(sse_high.kms_data_key_reuse_period, Some(86400)); // max 86400
+    }
+
+    #[tokio::test]
+    async fn test_broker_with_all_configs() {
+        let broker = SqsBroker::new("my-queue.fifo")
+            .await
+            .unwrap()
+            .with_visibility_timeout(60)
+            .with_wait_time(15)
+            .with_max_messages(10)
+            .with_message_retention(86400)
+            .with_delay_seconds(5)
+            .with_fifo(FifoConfig::new().with_content_based_deduplication(true))
+            .with_sse(SseConfig::sqs_managed())
+            .with_dlq(DlqConfig::new("arn:test:dlq", 5));
+
+        assert_eq!(broker.visibility_timeout, 60);
+        assert_eq!(broker.wait_time_seconds, 15);
+        assert_eq!(broker.max_messages, 10);
+        assert_eq!(broker.message_retention_seconds, 86400);
+        assert_eq!(broker.delay_seconds, 5);
+        assert!(broker.fifo_config.is_some());
+        assert!(broker.sse_config.is_some());
+        assert!(broker.dlq_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_visibility_timeout_clamping() {
+        let broker = SqsBroker::new("test")
+            .await
+            .unwrap()
+            .with_visibility_timeout(50000); // above max
+
+        assert_eq!(broker.visibility_timeout, 43200); // clamped to max
+    }
+
+    #[tokio::test]
+    async fn test_wait_time_clamping() {
+        let broker = SqsBroker::new("test").await.unwrap().with_wait_time(30); // above max
+
+        assert_eq!(broker.wait_time_seconds, 20); // clamped to max
+    }
+
+    #[tokio::test]
+    async fn test_max_messages_clamping() {
+        let broker = SqsBroker::new("test").await.unwrap().with_max_messages(15); // above max
+
+        assert_eq!(broker.max_messages, 10); // clamped to max
+    }
+
+    #[tokio::test]
+    async fn test_message_retention_clamping() {
+        let broker_low = SqsBroker::new("test")
+            .await
+            .unwrap()
+            .with_message_retention(30); // below min
+
+        assert_eq!(broker_low.message_retention_seconds, 60); // clamped to min
+
+        let broker_high = SqsBroker::new("test")
+            .await
+            .unwrap()
+            .with_message_retention(2000000); // above max
+
+        assert_eq!(broker_high.message_retention_seconds, 1209600); // clamped to max (14 days)
+    }
+
+    #[tokio::test]
+    async fn test_delay_seconds_clamping() {
+        let broker = SqsBroker::new("test")
+            .await
+            .unwrap()
+            .with_delay_seconds(1000); // above max
+
+        assert_eq!(broker.delay_seconds, 900); // clamped to max (15 min)
+    }
+
+    #[test]
+    fn test_queue_stats_default() {
+        let stats = QueueStats::default();
+
+        assert_eq!(stats.approximate_message_count, 0);
+        assert_eq!(stats.approximate_not_visible_count, 0);
+        assert_eq!(stats.approximate_delayed_count, 0);
+        assert!(stats.created_timestamp.is_none());
+        assert!(stats.last_modified_timestamp.is_none());
+        assert!(stats.message_retention_period.is_none());
+        assert!(stats.visibility_timeout.is_none());
+        assert!(!stats.is_fifo);
+    }
+
+    #[tokio::test]
+    async fn test_is_fifo_by_name() {
+        let broker = SqsBroker::new("my-queue.fifo").await.unwrap();
+        assert!(broker.is_fifo());
+    }
+
+    #[tokio::test]
+    async fn test_is_not_fifo() {
+        let broker = SqsBroker::new("my-queue").await.unwrap();
+        assert!(!broker.is_fifo());
     }
 }

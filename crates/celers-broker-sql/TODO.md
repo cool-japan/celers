@@ -2,13 +2,13 @@
 
 > MySQL database broker implementation for CeleRS
 
-## Status: ✅ FEATURE COMPLETE
+## Status: FEATURE COMPLETE
 
-MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, and high-performance batch operations.
+MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-performance batch operations, queue control, task inspection, result storage, worker tracking, and comprehensive maintenance utilities.
 
 ## Completed Features
 
-### Core Operations ✅
+### Core Operations
 - [x] `enqueue()` - Insert tasks into MySQL database
 - [x] `dequeue()` - Fetch with FOR UPDATE SKIP LOCKED
 - [x] `ack()` - Update task state to completed
@@ -17,40 +17,95 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, and h
 - [x] `cancel()` - Cancel pending/processing tasks
 - [x] Transaction support for atomicity
 
-### Database Schema ✅
+### Database Schema
 - [x] `celers_tasks` table with all required columns
 - [x] `celers_dead_letter_queue` (DLQ) table
 - [x] `celers_task_history` table for auditing
-- [x] Indexes for performance
+- [x] `celers_task_results` table for result storage
+- [x] Indexes for performance (including 003_performance_indexes.sql)
 - [x] State enum (pending, processing, completed, failed, cancelled)
 - [x] Priority column for task ordering
 
-### Dead Letter Queue ✅
+### Dead Letter Queue
 - [x] Automatic DLQ on max retries
 - [x] DLQ table structure
 - [x] Failed task archiving via stored procedure
-- [x] DLQ inspection queries
+- [x] DLQ inspection queries (`list_dlq`)
+- [x] Requeue from DLQ (`requeue_from_dlq`)
+- [x] Purge DLQ (`purge_dlq`, `purge_all_dlq`)
 
-### Migrations ✅
+### Migrations
 - [x] Initial schema migration (001_init.sql)
+- [x] Results table migration (002_results.sql)
+- [x] Performance indexes migration (003_performance_indexes.sql)
 - [x] MySQL-specific data types (CHAR(36) for UUID, MEDIUMBLOB, JSON)
 - [x] Stored procedure for DLQ operations
 - [x] Migration documentation
 
-### Batch Operations ✅
+### Batch Operations
 - [x] Batch enqueue (multiple tasks in single transaction)
 - [x] Batch dequeue (fetch multiple tasks atomically)
+- [x] Batch ack (acknowledge multiple tasks in single query)
 - [x] Optimized for high-throughput scenarios
 - [x] Maintains FOR UPDATE SKIP LOCKED safety
 
-### Delayed Task Execution ✅
+### Delayed Task Execution
 - [x] `enqueue_at(task, timestamp)` - Schedule for specific Unix timestamp
 - [x] `enqueue_after(task, delay_secs)` - Schedule after delay in seconds
 - [x] Uses existing `scheduled_at` column with index
 - [x] Automatic processing when tasks are ready (in dequeue)
 - [x] MySQL DATE_ADD() for relative delays
 
-### Observability ✅
+### Queue Control
+- [x] `pause()` - Pause the queue (dequeue returns None)
+- [x] `resume()` - Resume queue processing
+- [x] `is_paused()` - Check queue pause state
+- [x] Atomic pause state with AtomicBool
+
+### Task Inspection
+- [x] `get_task()` - Get detailed info about a specific task
+- [x] `list_tasks()` - List tasks by state with pagination
+- [x] `get_statistics()` - Get queue statistics (pending, processing, completed, failed, cancelled, DLQ)
+- [x] `count_by_task_name()` - Get statistics grouped by task name
+- [x] `get_processing_tasks()` - Get all currently processing tasks
+- [x] `get_tasks_by_worker()` - Get tasks by worker ID
+- [x] `list_scheduled_tasks()` - List tasks scheduled for the future
+- [x] `count_scheduled_tasks()` - Count scheduled tasks
+- [x] Data types: `DbTaskState`, `TaskInfo`, `QueueStatistics`, `TaskNameCount`, `ScheduledTaskInfo`
+
+### Task Updates
+- [x] `update_error_message()` - Update error message on a task
+- [x] `set_worker_id()` - Set worker ID on a processing task
+- [x] `dequeue_with_worker_id()` - Dequeue and set worker ID atomically
+
+### Task Result Storage
+- [x] `store_result()` - Store task execution result
+- [x] `get_result()` - Retrieve task result
+- [x] `delete_result()` - Delete a task result
+- [x] `archive_results()` - Archive old results
+- [x] Data types: `TaskResult`, `TaskResultStatus`
+- [x] MySQL ON DUPLICATE KEY UPDATE for upsert
+
+### Health & Maintenance
+- [x] `check_health()` - Database health check with version info
+- [x] `archive_completed_tasks()` - Archive old completed/failed/cancelled tasks
+- [x] `recover_stuck_tasks()` - Recover tasks stuck in processing state
+- [x] `purge_all()` - Purge all tasks (dangerous)
+- [x] `purge_by_state()` - Purge tasks by specific state
+- [x] `purge_completed()` - Purge completed tasks only
+- [x] `purge_failed()` - Purge failed tasks only
+- [x] `purge_cancelled()` - Purge cancelled tasks only
+- [x] `purge_by_task_name()` - Purge tasks by task name
+- [x] Connection pool metrics (size, idle connections)
+- [x] Data type: `HealthStatus`
+
+### Database Monitoring
+- [x] `get_table_sizes()` - Get CeleRS table size info
+- [x] `optimize_tables()` - MySQL OPTIMIZE TABLE for performance
+- [x] `analyze_tables()` - MySQL ANALYZE TABLE for query optimization
+- [x] Data type: `TableSizeInfo`
+
+### Observability
 - [x] Prometheus metrics (optional feature)
 - [x] Tasks enqueued counter (total and per-type)
 - [x] Queue size gauges (pending, processing, DLQ)
@@ -59,7 +114,7 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, and h
 
 ## Configuration
 
-### Connection ✅
+### Connection
 - [x] MySQL connection string
 - [x] Connection pooling via sqlx
 - [x] Configurable queue table name
@@ -68,16 +123,18 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, and h
 ## MySQL-Specific Implementation Details
 
 ### Data Type Mappings
-- UUID → `CHAR(36)` (text representation)
-- BYTEA → `MEDIUMBLOB` (binary large object)
-- TIMESTAMP WITH TIME ZONE → `TIMESTAMP` (MySQL doesn't have timezone-aware timestamps)
-- JSONB → `JSON` (MySQL native JSON type)
+- UUID -> `CHAR(36)` (text representation)
+- BYTEA -> `MEDIUMBLOB` (binary large object)
+- TIMESTAMP WITH TIME ZONE -> `TIMESTAMP` (MySQL doesn't have timezone-aware timestamps)
+- JSONB -> `JSON` (MySQL native JSON type)
 
 ### Query Differences from PostgreSQL
-- PostgreSQL `$1, $2` placeholders → MySQL `?, ?` placeholders
-- PostgreSQL `ANY($1)` array parameter → MySQL `IN (?, ?, ...)` dynamic placeholders
-- PostgreSQL `gen_random_uuid()` → MySQL `UUID()` function
-- PostgreSQL `NOW() + INTERVAL '5 seconds'` → MySQL `DATE_ADD(NOW(), INTERVAL 5 SECOND)`
+- PostgreSQL `$1, $2` placeholders -> MySQL `?, ?` placeholders
+- PostgreSQL `ANY($1)` array parameter -> MySQL `IN (?, ?, ...)` dynamic placeholders
+- PostgreSQL `gen_random_uuid()` -> MySQL `UUID()` function
+- PostgreSQL `NOW() + INTERVAL '5 seconds'` -> MySQL `DATE_ADD(NOW(), INTERVAL 5 SECOND)`
+- PostgreSQL `FILTER (WHERE ...)` -> MySQL `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`
+- PostgreSQL `ON CONFLICT DO UPDATE` -> MySQL `ON DUPLICATE KEY UPDATE`
 
 ### Stored Procedures
 - Uses MySQL stored procedure syntax instead of PostgreSQL PL/pgSQL
@@ -87,35 +144,39 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, and h
 ## Future Enhancements
 
 ### Performance
-- [ ] Additional indexes for common query patterns
 - [ ] Table partitioning for large queues (by created_at)
 - [ ] Query optimization with EXPLAIN ANALYZE
 - [ ] Consider BINARY(16) for UUIDs instead of CHAR(36)
 
 ### Advanced Features
-- [x] Task scheduling/delayed execution ✅ (COMPLETED)
+- [x] Task scheduling/delayed execution (COMPLETED)
 - [ ] Task dependencies/DAG support
-- [ ] Task result storage in database
-- [ ] Multi-tenant queue support
-- [ ] Queue pause/resume functionality
+- [x] Task result storage in database (COMPLETED)
+- [ ] Multi-tenant queue support (partial - queue_name implemented)
+- [x] Queue pause/resume functionality (COMPLETED)
+- [x] Worker tracking (COMPLETED)
 
 ### Monitoring
-- [x] Prometheus metrics integration ✅ (COMPLETED)
+- [x] Prometheus metrics integration (COMPLETED)
 - [ ] Query performance tracking
-- [ ] Connection pool metrics
-- [ ] Table size monitoring
-- [ ] Index usage statistics
+- [x] Connection pool metrics (COMPLETED)
+- [x] Table size monitoring (COMPLETED)
+- [ ] Index usage statistics (MySQL doesn't have pg_stat_user_indexes)
 
 ### Maintenance
-- [ ] Automatic archiving of old tasks
-- [ ] OPTIMIZE TABLE automation
-- [ ] Index maintenance tools
-- [ ] Database health checks
+- [x] Automatic archiving of old tasks (COMPLETED)
+- [x] OPTIMIZE TABLE automation (COMPLETED)
+- [x] ANALYZE TABLE for index maintenance (COMPLETED)
+- [x] Database health checks (COMPLETED)
+- [x] Selective purge operations (COMPLETED)
 
 ## Testing Status
 
 - [x] Compilation tests
 - [x] Unit test structure
+- [x] DbTaskState tests (display, from_str, serialization)
+- [x] TaskResultStatus tests (display, from_str, serialization)
+- [x] QueueStatistics tests
 - [ ] Integration tests with real MySQL
 - [ ] Concurrency tests (FOR UPDATE SKIP LOCKED)
 - [ ] Performance benchmarks vs PostgreSQL
@@ -139,37 +200,85 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, and h
 - `tracing`: Logging
 - `uuid`: Task ID generation
 - `chrono`: Timestamp handling
+- `rust_decimal`: Decimal handling for MySQL SUM results
 
-## MySQL Configuration
+## API Summary
 
-Recommended settings for production:
+### Core Broker Trait Methods
+```rust
+enqueue(task) -> TaskId
+dequeue() -> Option<BrokerMessage>
+ack(task_id, receipt_handle)
+reject(task_id, receipt_handle, requeue: bool)
+queue_size() -> usize
+cancel(task_id) -> bool
+enqueue_at(task, timestamp) -> TaskId
+enqueue_after(task, delay_secs) -> TaskId
+enqueue_batch(tasks) -> Vec<TaskId>
+dequeue_batch(count) -> Vec<BrokerMessage>
+ack_batch(tasks)
+```
 
-```ini
-[mysqld]
-# Connection pooling
-max_connections = 200
+### Queue Control
+```rust
+pause()
+resume()
+is_paused() -> bool
+```
 
-# Query cache (MySQL 5.7 and earlier)
-query_cache_type = 1
-query_cache_size = 64M
+### Task Inspection
+```rust
+get_task(task_id) -> Option<TaskInfo>
+list_tasks(state, limit, offset) -> Vec<TaskInfo>
+get_statistics() -> QueueStatistics
+count_by_task_name() -> Vec<TaskNameCount>
+get_processing_tasks(limit, offset) -> Vec<TaskInfo>
+get_tasks_by_worker(worker_id) -> Vec<TaskInfo>
+list_scheduled_tasks(limit, offset) -> Vec<ScheduledTaskInfo>
+count_scheduled_tasks() -> i64
+```
 
-# InnoDB settings
-innodb_buffer_pool_size = 1G
-innodb_log_file_size = 256M
-innodb_flush_log_at_trx_commit = 1
+### Task Updates
+```rust
+update_error_message(task_id, error_message) -> bool
+set_worker_id(task_id, worker_id) -> bool
+dequeue_with_worker_id(worker_id) -> Option<BrokerMessage>
+```
 
-# Binary logging (for replication)
-log_bin = mysql-bin
-binlog_format = ROW
+### DLQ Operations
+```rust
+list_dlq(limit, offset) -> Vec<DlqTaskInfo>
+requeue_from_dlq(dlq_id) -> TaskId
+purge_dlq(dlq_id) -> bool
+purge_all_dlq() -> u64
+```
 
-# Character set
-character_set_server = utf8mb4
-collation_server = utf8mb4_unicode_ci
+### Result Storage
+```rust
+store_result(task_id, task_name, status, result, error, traceback, runtime_ms)
+get_result(task_id) -> Option<TaskResult>
+delete_result(task_id) -> bool
+archive_results(older_than: Duration) -> u64
+```
 
-# Performance
-table_open_cache = 2000
-tmp_table_size = 64M
-max_heap_table_size = 64M
+### Health & Maintenance
+```rust
+check_health() -> HealthStatus
+archive_completed_tasks(older_than: Duration) -> u64
+recover_stuck_tasks(stuck_threshold: Duration) -> u64
+purge_all() -> u64
+purge_by_state(state) -> u64
+purge_completed() -> u64
+purge_failed() -> u64
+purge_cancelled() -> u64
+purge_by_task_name(task_name) -> u64
+```
+
+### Database Monitoring
+```rust
+get_table_sizes() -> Vec<TableSizeInfo>
+optimize_tables()
+analyze_tables()
 ```
 
 ## Schema Design
@@ -190,12 +299,37 @@ max_heap_table_size = 64M
 - `error_message`: TEXT - Error details if failed
 - `metadata`: JSON - Additional task metadata
 
-### Indexes
+### Results Table
+- `task_id`: CHAR(36) PRIMARY KEY - Task UUID
+- `task_name`: VARCHAR(255) - Task type identifier
+- `status`: VARCHAR(20) - Result status (PENDING/STARTED/SUCCESS/FAILURE/RETRY/REVOKED)
+- `result`: JSON - Task result data
+- `error`: TEXT - Error message if failed
+- `traceback`: TEXT - Stack trace if failed
+- `created_at`: TIMESTAMP - Result creation time
+- `completed_at`: TIMESTAMP - Task completion time
+- `runtime_ms`: BIGINT - Task runtime in milliseconds
+
+### Indexes (001_init.sql)
 - `idx_tasks_state_priority`: `(state, priority DESC, created_at ASC)` for efficient dequeue
 - `idx_tasks_scheduled`: `(scheduled_at, state)` for scheduled tasks
 - `idx_tasks_worker`: `(worker_id, state)` for worker tracking
 - `idx_dlq_failed_at`: Dead letter queue timestamp index
 - `idx_history_task_id`: Task history lookup index
+
+### Indexes (002_results.sql)
+- `idx_results_task_name`: Results by task name
+- `idx_results_completed_at`: Results cleanup index
+- `idx_results_status`: Results by status
+
+### Indexes (003_performance_indexes.sql)
+- `idx_tasks_task_name`: Task name lookups
+- `idx_tasks_task_name_state`: Task name + state combination
+- `idx_tasks_worker_started`: Worker monitoring
+- `idx_tasks_created_at`: Time-based queries
+- `idx_tasks_completed_at`: Archiving queries
+- `idx_dlq_task_id`: DLQ task ID lookups
+- `idx_history_timestamp`: History by timestamp
 
 ## Notes
 
@@ -206,6 +340,7 @@ max_heap_table_size = 64M
 - Transaction-based operations for consistency
 - Automatic retry handling with exponential backoff
 - Compatible with MySQL 8.0+ (requires SKIP LOCKED support)
+- Worker ID tracking for distributed worker monitoring
 
 ## Comparison with PostgreSQL Broker
 
@@ -215,6 +350,10 @@ max_heap_table_size = 64M
 - Same batch operations API
 - Same DLQ mechanism
 - Same transaction safety guarantees
+- Same task inspection methods
+- Same result storage API
+- Same queue control (pause/resume)
+- Same worker tracking API
 
 ### Differences
 - MySQL uses `?` placeholders vs PostgreSQL `$1, $2`
@@ -222,3 +361,6 @@ max_heap_table_size = 64M
 - MySQL stored procedures vs PostgreSQL functions
 - MySQL DATE_ADD() vs PostgreSQL INTERVAL syntax
 - MySQL doesn't support partial indexes (WHERE clause in CREATE INDEX)
+- MySQL uses ON DUPLICATE KEY UPDATE vs ON CONFLICT
+- MySQL SUM returns DECIMAL vs integer
+- MySQL TIMESTAMPDIFF vs PostgreSQL EXTRACT(EPOCH FROM)

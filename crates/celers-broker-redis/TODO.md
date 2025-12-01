@@ -4,7 +4,7 @@
 
 ## Status: ✅ FEATURE COMPLETE
 
-Full-featured Redis broker with FIFO/priority queues, DLQ, and task cancellation.
+Full-featured Redis broker with FIFO/priority queues, DLQ, task cancellation, health checks, queue control, task deduplication, circuit breaker, rate limiting, and automatic retry.
 
 ## Completed Features
 
@@ -54,6 +54,87 @@ Full-featured Redis broker with FIFO/priority queues, DLQ, and task cancellation
 - [x] Atomic move from delayed queue to main queue
 - [x] Support for both FIFO and Priority queue modes
 - [x] Metrics tracking for delayed tasks
+
+### Health Checks ✅ (NEW)
+- [x] `HealthChecker` - Redis health monitoring
+- [x] `ping()` - Ping Redis and measure latency
+- [x] `check_health()` - Comprehensive health status
+- [x] `get_queue_stats()` - Queue statistics (pending, processing, DLQ, delayed)
+- [x] `get_memory_info()` - Redis memory statistics
+- [x] `RedisHealthStatus` - Structured health status
+  - [x] Connection status, latency
+  - [x] Memory usage (used, max, percentage)
+  - [x] Connected clients count
+  - [x] Redis version, role (master/slave)
+  - [x] Memory critical threshold checks
+- [x] `QueueStats` - Queue depth tracking
+
+### Queue Control ✅ (NEW)
+- [x] `QueueController` - Queue state management
+- [x] `pause()` - Pause queue (no enqueue, no dequeue)
+- [x] `resume()` - Resume normal operation
+- [x] `drain()` - Drain mode (no enqueue, dequeue allowed)
+- [x] `emergency_stop()` - Local emergency stop flag
+- [x] `get_state()` - Get current queue state
+- [x] `can_enqueue()`, `can_dequeue()` - Permission checks
+- [x] `QueueState` enum (Active, Paused, Draining)
+- [x] Emergency stop flag sharing for async coordination
+
+### Task Deduplication ✅ (NEW)
+- [x] `Deduplicator` - Prevent duplicate task processing
+- [x] `DedupStrategy` - Multiple deduplication strategies
+  - [x] `ById` - Deduplicate by task ID
+  - [x] `ByContent` - Deduplicate by task name + payload hash
+  - [x] `ByKey` - Custom deduplication key
+- [x] `check()` - Check if task is duplicate
+- [x] `mark()` - Mark task as seen
+- [x] `check_and_mark()` - Atomic check and mark
+- [x] `unmark()` - Remove deduplication entry
+- [x] `clear()` - Clear all deduplication entries
+- [x] `count()` - Count tracked entries
+- [x] TTL-based auto-expiry
+- [x] `content_hash()` - Generate content hash for tasks
+
+### Circuit Breaker ✅ (NEW)
+- [x] `CircuitBreaker` - Protect against cascading failures
+- [x] `CircuitBreakerConfig` - Configurable thresholds and timeouts
+- [x] `CircuitState` enum (Closed, Open, HalfOpen)
+- [x] `allow_request()` - Check if request should be allowed
+- [x] `record_success()`, `record_failure()` - Track operation results
+- [x] `force_open()`, `force_close()`, `reset()` - Manual control
+- [x] `stats()` - Get breaker statistics
+- [x] `time_until_half_open()` - Time until recovery attempt
+- [x] Configurable failure threshold
+- [x] Configurable recovery timeout
+- [x] Success threshold for closing from HalfOpen
+- [x] Half-open max requests limit
+
+### Rate Limiting ✅ (NEW)
+- [x] `TokenBucketLimiter` - Local rate limiting with burst capacity
+- [x] `DistributedRateLimiter` - Redis-backed distributed rate limiting
+- [x] `QueueRateLimiter` - Unified API for local/distributed
+- [x] `TrackedRateLimiter` - Rate limiter with statistics
+- [x] `QueueRateLimitConfig` - Configurable rate, burst, window
+- [x] `try_acquire()`, `try_acquire_n()` - Permit acquisition
+- [x] `time_until_available()` - Time until permit available
+- [x] `available_permits()` - Current available permits
+- [x] Sliding window algorithm (distributed)
+- [x] Lua script for atomic distributed limiting
+
+### Retry Mechanism ✅ (NEW)
+- [x] `RetryExecutor` - Execute operations with automatic retry
+- [x] `RetryConfig` - Configurable retry behavior
+- [x] `BackoffStrategy` - Multiple backoff algorithms
+  - [x] Fixed delay
+  - [x] Linear backoff
+  - [x] Exponential backoff
+  - [x] Exponential with jitter
+  - [x] Decorrelated jitter (AWS recommended)
+- [x] `ErrorKind` - Error classification for retry decisions
+- [x] `RetryResult` - Result with retry metadata
+- [x] `execute()` - Generic retry execution
+- [x] `execute_with_classification()` - Redis-specific retry
+- [x] Preset configs: `aggressive()`, `conservative()`, `no_retry()`
 
 ## Configuration
 
@@ -112,40 +193,44 @@ Full-featured Redis broker with FIFO/priority queues, DLQ, and task cancellation
   - [ ] Conflict resolution
 
 ### Monitoring
-- [ ] Per-queue metrics
-  - [ ] Queue depth by name
+- [x] Per-queue metrics ✅
+  - [x] Queue depth by name (QueueStats)
   - [ ] Enqueue/dequeue rates
   - [ ] Task age histogram
-- [ ] Operation latency tracking
-  - [ ] Command-level latency
+- [x] Operation latency tracking ✅
+  - [x] Command-level latency (ping latency)
   - [ ] P50/P95/P99 percentiles
   - [ ] Slow operation logging
 - [ ] Connection pool metrics
   - [ ] Active connections
   - [ ] Connection wait time
   - [ ] Connection errors
-- [ ] Redis server health checks
-  - [ ] Ping/PONG checks
-  - [ ] Memory usage alerts
+- [x] Redis server health checks ✅
+  - [x] Ping/PONG checks
+  - [x] Memory usage alerts (memory critical checks)
   - [ ] Keyspace statistics
   - [ ] Replication lag monitoring
 
 ### Reliability & Error Handling
-- [ ] Automatic retry with backoff
-  - [ ] Exponential backoff
-  - [ ] Jittered retry
-  - [ ] Max retry limits
-- [ ] Circuit breaker for Redis
-  - [ ] Failure threshold
-  - [ ] Recovery timeout
-  - [ ] Half-open state testing
+- [x] Automatic retry with backoff ✅
+  - [x] Exponential backoff
+  - [x] Jittered retry (exponential with jitter, decorrelated jitter)
+  - [x] Max retry limits
+  - [x] Linear and fixed backoff
+  - [x] Error classification for retry decisions
+- [x] Circuit breaker for Redis ✅
+  - [x] Failure threshold
+  - [x] Recovery timeout
+  - [x] Half-open state testing
+  - [x] Success threshold for closing
+  - [x] Statistics and monitoring
 - [ ] Graceful degradation
   - [ ] Fallback to local queue
   - [ ] Read-only mode
   - [ ] Queuing during outages
 - [ ] Data integrity
   - [ ] Checksum validation
-  - [ ] Duplicate detection
+  - [x] Duplicate detection ✅ (via Deduplicator)
   - [ ] Ordered delivery guarantees
 
 ### Security
@@ -167,22 +252,32 @@ Full-featured Redis broker with FIFO/priority queues, DLQ, and task cancellation
   - [ ] Weighted queue selection
   - [ ] Priority aging
   - [ ] Starvation prevention
-- [ ] Queue rate limiting
-  - [ ] Token bucket per queue
-  - [ ] Sliding window limits
-  - [ ] Distributed rate limiting
-- [ ] Queue pausing/resuming
-  - [ ] Temporary queue suspension
-  - [ ] Drain mode
-  - [ ] Emergency stop
-- [ ] Task deduplication
-  - [ ] Content-based dedup
-  - [ ] Time-window dedup
-  - [ ] Dedup key strategies
+- [x] Queue rate limiting ✅
+  - [x] Token bucket per queue (TokenBucketLimiter)
+  - [x] Sliding window limits (DistributedRateLimiter)
+  - [x] Distributed rate limiting (Redis-backed)
+- [x] Queue pausing/resuming ✅
+  - [x] Temporary queue suspension (pause/resume)
+  - [x] Drain mode (process remaining, block new)
+  - [x] Emergency stop (local instant effect)
+- [x] Task deduplication ✅
+  - [x] Content-based dedup (ByContent strategy)
+  - [x] Time-window dedup (TTL-based expiry)
+  - [x] Dedup key strategies (ById, ByContent, ByKey)
 
 ## Testing Status
 
-- [ ] Unit tests (mocked Redis)
+- [x] Unit tests ✅ (62 tests passing)
+  - [x] QueueMode tests
+  - [x] Broker construction and accessor tests
+  - [x] Health check tests
+  - [x] Queue control tests
+  - [x] Deduplication tests
+  - [x] Lua script tests
+  - [x] Visibility manager tests
+  - [x] Circuit breaker tests
+  - [x] Rate limiter tests
+  - [x] Retry mechanism tests
 - [ ] Integration tests with real Redis
 - [ ] Load testing
 - [ ] Concurrency testing

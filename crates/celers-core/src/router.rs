@@ -195,6 +195,8 @@ pub struct RouteRule {
     pub routing_key: Option<String>,
     /// Optional exchange name (for AMQP)
     pub exchange: Option<String>,
+    /// Optional argument condition for argument-based routing
+    pub argument_condition: Option<ArgumentCondition>,
 }
 
 impl RouteRule {
@@ -206,6 +208,7 @@ impl RouteRule {
             priority: 0,
             routing_key: None,
             exchange: None,
+            argument_condition: None,
         }
     }
 
@@ -227,9 +230,354 @@ impl RouteRule {
         self
     }
 
+    /// Set the argument condition for argument-based routing
+    pub fn with_argument_condition(mut self, condition: ArgumentCondition) -> Self {
+        self.argument_condition = Some(condition);
+        self
+    }
+
     /// Check if this rule matches a task name
     pub fn matches(&self, task_name: &str) -> bool {
         self.matcher.matches(task_name)
+    }
+
+    /// Check if this rule matches a task name and arguments
+    ///
+    /// Returns true if:
+    /// - The task name matches the pattern matcher
+    /// - AND (if argument_condition is set) the arguments match the condition
+    pub fn matches_with_args(
+        &self,
+        task_name: &str,
+        args: &[serde_json::Value],
+        kwargs: &serde_json::Map<String, serde_json::Value>,
+    ) -> bool {
+        if !self.matcher.matches(task_name) {
+            return false;
+        }
+
+        match &self.argument_condition {
+            Some(condition) => condition.evaluate(args, kwargs),
+            None => true,
+        }
+    }
+}
+
+// ============================================================================
+// Argument-Based Routing
+// ============================================================================
+
+/// Condition for matching task arguments
+///
+/// Allows routing based on the content of task arguments or keyword arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ArgumentCondition {
+    /// Check if a positional argument at index equals a value
+    ArgEquals {
+        /// Argument index (0-based)
+        index: usize,
+        /// Expected value
+        value: serde_json::Value,
+    },
+
+    /// Check if a positional argument at index exists
+    ArgExists {
+        /// Argument index (0-based)
+        index: usize,
+    },
+
+    /// Check if a keyword argument equals a value
+    KwargEquals {
+        /// Keyword argument name
+        key: String,
+        /// Expected value
+        value: serde_json::Value,
+    },
+
+    /// Check if a keyword argument exists
+    KwargExists {
+        /// Keyword argument name
+        key: String,
+    },
+
+    /// Check if a keyword argument matches a pattern
+    KwargMatches {
+        /// Keyword argument name
+        key: String,
+        /// Regex pattern
+        pattern: String,
+    },
+
+    /// Check if a positional argument is greater than a threshold
+    ArgGreaterThan {
+        /// Argument index (0-based)
+        index: usize,
+        /// Threshold value
+        threshold: f64,
+    },
+
+    /// Check if a positional argument is less than a threshold
+    ArgLessThan {
+        /// Argument index (0-based)
+        index: usize,
+        /// Threshold value
+        threshold: f64,
+    },
+
+    /// Check if a keyword argument is greater than a threshold
+    KwargGreaterThan {
+        /// Keyword argument name
+        key: String,
+        /// Threshold value
+        threshold: f64,
+    },
+
+    /// Check if a keyword argument is less than a threshold
+    KwargLessThan {
+        /// Keyword argument name
+        key: String,
+        /// Threshold value
+        threshold: f64,
+    },
+
+    /// Check if a keyword argument contains a value (for strings/arrays)
+    KwargContains {
+        /// Keyword argument name
+        key: String,
+        /// Value to search for
+        value: serde_json::Value,
+    },
+
+    /// Logical AND of multiple conditions
+    And(Vec<ArgumentCondition>),
+
+    /// Logical OR of multiple conditions
+    Or(Vec<ArgumentCondition>),
+
+    /// Logical NOT of a condition
+    Not(Box<ArgumentCondition>),
+
+    /// Always true (no argument condition)
+    Always,
+}
+
+impl ArgumentCondition {
+    /// Create a condition that checks if arg[index] == value
+    pub fn arg_equals(index: usize, value: serde_json::Value) -> Self {
+        Self::ArgEquals { index, value }
+    }
+
+    /// Create a condition that checks if arg[index] exists
+    pub fn arg_exists(index: usize) -> Self {
+        Self::ArgExists { index }
+    }
+
+    /// Create a condition that checks if kwargs[key] == value
+    pub fn kwarg_equals(key: impl Into<String>, value: serde_json::Value) -> Self {
+        Self::KwargEquals {
+            key: key.into(),
+            value,
+        }
+    }
+
+    /// Create a condition that checks if kwargs[key] exists
+    pub fn kwarg_exists(key: impl Into<String>) -> Self {
+        Self::KwargExists { key: key.into() }
+    }
+
+    /// Create a condition that checks if kwargs[key] matches a regex pattern
+    pub fn kwarg_matches(key: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self::KwargMatches {
+            key: key.into(),
+            pattern: pattern.into(),
+        }
+    }
+
+    /// Create a condition that checks if arg[index] > threshold
+    pub fn arg_greater_than(index: usize, threshold: f64) -> Self {
+        Self::ArgGreaterThan { index, threshold }
+    }
+
+    /// Create a condition that checks if arg[index] < threshold
+    pub fn arg_less_than(index: usize, threshold: f64) -> Self {
+        Self::ArgLessThan { index, threshold }
+    }
+
+    /// Create a condition that checks if kwargs[key] > threshold
+    pub fn kwarg_greater_than(key: impl Into<String>, threshold: f64) -> Self {
+        Self::KwargGreaterThan {
+            key: key.into(),
+            threshold,
+        }
+    }
+
+    /// Create a condition that checks if kwargs[key] < threshold
+    pub fn kwarg_less_than(key: impl Into<String>, threshold: f64) -> Self {
+        Self::KwargLessThan {
+            key: key.into(),
+            threshold,
+        }
+    }
+
+    /// Create a condition that checks if kwargs[key] contains value
+    pub fn kwarg_contains(key: impl Into<String>, value: serde_json::Value) -> Self {
+        Self::KwargContains {
+            key: key.into(),
+            value,
+        }
+    }
+
+    /// Create an always-true condition
+    pub fn always() -> Self {
+        Self::Always
+    }
+
+    /// Combine with AND
+    pub fn and(self, other: ArgumentCondition) -> Self {
+        match self {
+            Self::And(mut conditions) => {
+                conditions.push(other);
+                Self::And(conditions)
+            }
+            _ => Self::And(vec![self, other]),
+        }
+    }
+
+    /// Combine with OR
+    pub fn or(self, other: ArgumentCondition) -> Self {
+        match self {
+            Self::Or(mut conditions) => {
+                conditions.push(other);
+                Self::Or(conditions)
+            }
+            _ => Self::Or(vec![self, other]),
+        }
+    }
+
+    /// Negate the condition
+    pub fn negate(self) -> Self {
+        Self::Not(Box::new(self))
+    }
+
+    /// Evaluate the condition against task arguments
+    ///
+    /// # Arguments
+    /// * `args` - Positional arguments as JSON values
+    /// * `kwargs` - Keyword arguments as a JSON object
+    pub fn evaluate(
+        &self,
+        args: &[serde_json::Value],
+        kwargs: &serde_json::Map<String, serde_json::Value>,
+    ) -> bool {
+        match self {
+            Self::Always => true,
+
+            Self::ArgEquals { index, value } => {
+                args.get(*index).map(|v| v == value).unwrap_or(false)
+            }
+
+            Self::ArgExists { index } => args.len() > *index,
+
+            Self::KwargEquals { key, value } => {
+                kwargs.get(key).map(|v| v == value).unwrap_or(false)
+            }
+
+            Self::KwargExists { key } => kwargs.contains_key(key),
+
+            Self::KwargMatches { key, pattern } => {
+                if let Some(serde_json::Value::String(s)) = kwargs.get(key) {
+                    Regex::new(pattern)
+                        .map(|re| re.is_match(s))
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+
+            Self::ArgGreaterThan { index, threshold } => args
+                .get(*index)
+                .and_then(|v| v.as_f64())
+                .map(|v| v > *threshold)
+                .unwrap_or(false),
+
+            Self::ArgLessThan { index, threshold } => args
+                .get(*index)
+                .and_then(|v| v.as_f64())
+                .map(|v| v < *threshold)
+                .unwrap_or(false),
+
+            Self::KwargGreaterThan { key, threshold } => kwargs
+                .get(key)
+                .and_then(|v| v.as_f64())
+                .map(|v| v > *threshold)
+                .unwrap_or(false),
+
+            Self::KwargLessThan { key, threshold } => kwargs
+                .get(key)
+                .and_then(|v| v.as_f64())
+                .map(|v| v < *threshold)
+                .unwrap_or(false),
+
+            Self::KwargContains { key, value } => {
+                if let Some(v) = kwargs.get(key) {
+                    match v {
+                        serde_json::Value::String(s) => {
+                            if let Some(needle) = value.as_str() {
+                                s.contains(needle)
+                            } else {
+                                false
+                            }
+                        }
+                        serde_json::Value::Array(arr) => arr.contains(value),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+
+            Self::And(conditions) => conditions.iter().all(|c| c.evaluate(args, kwargs)),
+
+            Self::Or(conditions) => conditions.iter().any(|c| c.evaluate(args, kwargs)),
+
+            Self::Not(condition) => !condition.evaluate(args, kwargs),
+        }
+    }
+}
+
+impl std::fmt::Display for ArgumentCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Always => write!(f, "always"),
+            Self::ArgEquals { index, value } => write!(f, "args[{}] == {}", index, value),
+            Self::ArgExists { index } => write!(f, "args[{}] exists", index),
+            Self::KwargEquals { key, value } => write!(f, "kwargs[{}] == {}", key, value),
+            Self::KwargExists { key } => write!(f, "kwargs[{}] exists", key),
+            Self::KwargMatches { key, pattern } => {
+                write!(f, "kwargs[{}] matches /{}/", key, pattern)
+            }
+            Self::ArgGreaterThan { index, threshold } => {
+                write!(f, "args[{}] > {}", index, threshold)
+            }
+            Self::ArgLessThan { index, threshold } => write!(f, "args[{}] < {}", index, threshold),
+            Self::KwargGreaterThan { key, threshold } => {
+                write!(f, "kwargs[{}] > {}", key, threshold)
+            }
+            Self::KwargLessThan { key, threshold } => write!(f, "kwargs[{}] < {}", key, threshold),
+            Self::KwargContains { key, value } => {
+                write!(f, "kwargs[{}] contains {}", key, value)
+            }
+            Self::And(conditions) => {
+                let parts: Vec<String> = conditions.iter().map(|c| format!("{}", c)).collect();
+                write!(f, "({})", parts.join(" AND "))
+            }
+            Self::Or(conditions) => {
+                let parts: Vec<String> = conditions.iter().map(|c| format!("{}", c)).collect();
+                write!(f, "({})", parts.join(" OR "))
+            }
+            Self::Not(condition) => write!(f, "NOT ({})", condition),
+        }
     }
 }
 
@@ -338,6 +686,46 @@ impl Router {
         self.default_queue.as_ref().map(RouteResult::new)
     }
 
+    /// Route a task with arguments to a queue
+    ///
+    /// This method considers both task name patterns and argument conditions.
+    /// Returns `None` if no matching rule and no default queue.
+    pub fn route_with_args(
+        &self,
+        task_name: &str,
+        args: &[serde_json::Value],
+        kwargs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<String> {
+        self.route_full_with_args(task_name, args, kwargs)
+            .map(|r| r.queue)
+    }
+
+    /// Route a task with arguments and get full routing information
+    ///
+    /// This method considers both task name patterns and argument conditions.
+    /// Returns `None` if no matching rule and no default queue.
+    pub fn route_full_with_args(
+        &self,
+        task_name: &str,
+        args: &[serde_json::Value],
+        kwargs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<RouteResult> {
+        // Check direct routes first (direct routes don't have argument conditions)
+        if let Some(result) = self.direct_routes.get(task_name) {
+            return Some(result.clone());
+        }
+
+        // Check pattern-based rules with argument conditions
+        for rule in &self.rules {
+            if rule.matches_with_args(task_name, args, kwargs) {
+                return Some(RouteResult::from_rule(rule));
+            }
+        }
+
+        // Fall back to default queue
+        self.default_queue.as_ref().map(RouteResult::new)
+    }
+
     /// Check if a task has any matching route
     pub fn has_route(&self, task_name: &str) -> bool {
         self.direct_routes.contains_key(task_name)
@@ -399,6 +787,53 @@ impl RouterBuilder {
     pub fn direct_route(mut self, task_name: &str, queue: &str) -> Self {
         self.router
             .add_direct_route(task_name, RouteResult::new(queue));
+        self
+    }
+
+    /// Add a rule that routes tasks based on argument conditions
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::router::{RouterBuilder, PatternMatcher, ArgumentCondition};
+    ///
+    /// let router = RouterBuilder::new()
+    ///     .route_with_args(
+    ///         PatternMatcher::glob("process.*"),
+    ///         "high_priority",
+    ///         ArgumentCondition::kwarg_equals("priority", serde_json::json!("high")),
+    ///     )
+    ///     .route_with_args(
+    ///         PatternMatcher::glob("process.*"),
+    ///         "low_priority",
+    ///         ArgumentCondition::kwarg_equals("priority", serde_json::json!("low")),
+    ///     )
+    ///     .default_queue("default")
+    ///     .build();
+    /// ```
+    pub fn route_with_args(
+        mut self,
+        matcher: PatternMatcher,
+        queue: &str,
+        condition: ArgumentCondition,
+    ) -> Self {
+        self.router
+            .add_rule(RouteRule::new(matcher, queue).with_argument_condition(condition));
+        self
+    }
+
+    /// Add a rule with both priority and argument condition
+    pub fn route_with_args_priority(
+        mut self,
+        matcher: PatternMatcher,
+        queue: &str,
+        condition: ArgumentCondition,
+        priority: i32,
+    ) -> Self {
+        self.router.add_rule(
+            RouteRule::new(matcher, queue)
+                .with_argument_condition(condition)
+                .with_priority(priority),
+        );
         self
     }
 

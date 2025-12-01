@@ -5,6 +5,12 @@
 //! - Priority queue support
 //! - Dead Letter Queue (DLQ)
 //! - Task cancellation via Pub/Sub
+//! - Health checks and monitoring
+//! - Queue pause/resume functionality
+//! - Task deduplication
+//! - Circuit breaker for resilience
+//! - Rate limiting (local and distributed)
+//! - Automatic retry with configurable backoff
 
 use async_trait::async_trait;
 use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
@@ -16,9 +22,26 @@ use celers_metrics::{
     DLQ_SIZE, PROCESSING_QUEUE_SIZE, QUEUE_SIZE, TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL,
 };
 
+pub mod circuit_breaker;
+pub mod dedup;
+pub mod health;
 pub mod lua_scripts;
+pub mod queue_control;
+pub mod rate_limit;
+pub mod retry;
 pub mod visibility;
 
+pub use circuit_breaker::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
+};
+pub use dedup::{DedupResult, DedupStrategy, Deduplicator};
+pub use health::{HealthChecker, QueueStats, RedisHealthStatus};
+pub use queue_control::{QueueController, QueueState};
+pub use rate_limit::{
+    DistributedRateLimiter, QueueRateLimitConfig, QueueRateLimiter, TokenBucketLimiter,
+    TrackedRateLimiter,
+};
+pub use retry::{BackoffStrategy, RetryConfig, RetryExecutor, RetryResult};
 use visibility::VisibilityManager;
 
 /// Queue mode for Redis broker
@@ -232,6 +255,68 @@ impl RedisBroker {
             CelersError::Broker(format!("Failed to create PubSub connection: {}", e))
         })?;
         Ok(pubsub)
+    }
+
+    /// Create a health checker for monitoring Redis status
+    pub fn health_checker(&self) -> HealthChecker {
+        HealthChecker::new(self.client.clone())
+    }
+
+    /// Create a queue controller for pause/resume operations
+    pub fn queue_controller(&self) -> QueueController {
+        QueueController::new(self.client.clone(), &self.queue_name)
+    }
+
+    /// Create a task deduplicator
+    pub fn deduplicator(&self) -> Deduplicator {
+        Deduplicator::new(self.client.clone(), &self.queue_name)
+    }
+
+    /// Get queue statistics (pending, processing, DLQ, delayed counts)
+    pub async fn get_queue_stats(&self) -> Result<QueueStats> {
+        self.health_checker()
+            .get_queue_stats(&self.queue_name, self.mode.is_priority())
+            .await
+    }
+
+    /// Check Redis health status
+    pub async fn check_health(&self) -> RedisHealthStatus {
+        self.health_checker().check_health().await
+    }
+
+    /// Ping Redis and return latency in milliseconds
+    pub async fn ping(&self) -> Result<u64> {
+        self.health_checker().ping().await
+    }
+
+    /// Get the visibility timeout in seconds
+    pub fn visibility_timeout(&self) -> u64 {
+        self.visibility_timeout_secs
+    }
+
+    /// Get the Redis client (for advanced operations)
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Get the delayed queue name
+    pub fn delayed_queue_name(&self) -> &str {
+        &self.delayed_queue
+    }
+
+    /// Get the processing queue name
+    pub fn processing_queue_name(&self) -> &str {
+        &self.processing_queue
+    }
+
+    /// Get the DLQ name
+    pub fn dlq_name(&self) -> &str {
+        &self.dlq_name
+    }
+
+    /// Get the main queue name
+    pub fn queue_name(&self) -> &str {
+        &self.queue_name
     }
 
     /// Move ready delayed tasks to the main queue
@@ -779,5 +864,91 @@ impl Broker for RedisBroker {
 
         let execute_at = now + delay_secs as i64;
         self.enqueue_at(task, execute_at).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_queue_mode_is_fifo() {
+        assert!(QueueMode::Fifo.is_fifo());
+        assert!(!QueueMode::Priority.is_fifo());
+    }
+
+    #[test]
+    fn test_queue_mode_is_priority() {
+        assert!(!QueueMode::Fifo.is_priority());
+        assert!(QueueMode::Priority.is_priority());
+    }
+
+    #[test]
+    fn test_queue_mode_display() {
+        assert_eq!(QueueMode::Fifo.to_string(), "FIFO");
+        assert_eq!(QueueMode::Priority.to_string(), "Priority");
+    }
+
+    #[test]
+    fn test_redis_broker_new() {
+        let broker = RedisBroker::new("redis://localhost:6379", "test_queue");
+        assert!(broker.is_ok());
+
+        let broker = broker.unwrap();
+        assert_eq!(broker.queue_name(), "test_queue");
+        assert_eq!(broker.mode(), QueueMode::Fifo);
+    }
+
+    #[test]
+    fn test_redis_broker_with_mode() {
+        let broker =
+            RedisBroker::with_mode("redis://localhost:6379", "test_queue", QueueMode::Priority);
+        assert!(broker.is_ok());
+
+        let broker = broker.unwrap();
+        assert_eq!(broker.mode(), QueueMode::Priority);
+    }
+
+    #[test]
+    fn test_redis_broker_with_visibility_timeout() {
+        let broker = RedisBroker::new("redis://localhost:6379", "test_queue")
+            .unwrap()
+            .with_visibility_timeout(600);
+
+        assert_eq!(broker.visibility_timeout(), 600);
+    }
+
+    #[test]
+    fn test_queue_names() {
+        let broker = RedisBroker::new("redis://localhost:6379", "my_queue").unwrap();
+
+        assert_eq!(broker.queue_name(), "my_queue");
+        assert_eq!(broker.processing_queue_name(), "my_queue:processing");
+        assert_eq!(broker.dlq_name(), "my_queue:dlq");
+        assert_eq!(broker.delayed_queue_name(), "my_queue:delayed");
+        assert_eq!(broker.cancel_channel(), "my_queue:cancel");
+    }
+
+    #[test]
+    fn test_broker_accessors() {
+        let broker = RedisBroker::new("redis://localhost:6379", "test_queue").unwrap();
+
+        // Test health_checker creation
+        let _ = broker.health_checker();
+
+        // Test queue_controller creation
+        let _ = broker.queue_controller();
+
+        // Test deduplicator creation
+        let _ = broker.deduplicator();
+
+        // Test client access
+        let _ = broker.client();
+    }
+
+    #[test]
+    fn test_invalid_redis_url() {
+        let result = RedisBroker::new("invalid://not-a-redis-url", "test_queue");
+        assert!(result.is_err());
     }
 }

@@ -266,7 +266,7 @@ Each crate has its own detailed TODO.md with implementation status and future en
 ### Task Routing & Dispatching
 - [x] **Advanced Routing** ✅ (Implemented in celers-core/src/router.rs)
   - [x] Task routing by name patterns (glob, regex)
-  - [ ] Task routing by arguments/kwargs
+  - [x] Task routing by arguments/kwargs (ArgumentCondition)
   - [x] Queue routing based on task type
   - [ ] Topic-based routing (AMQP exchanges)
   - [x] Priority-based routing
@@ -302,7 +302,7 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [x] on_retry callbacks
   - [x] Signature linking (task.apply_async(link=...))
   - [x] Immutable signatures
-  - [ ] Callback argument passing
+  - [x] Callback argument passing (CallbackArgMode: Prepend, Append, Kwarg, None)
 
 - [x] **Task State Tracking** ✅
   - [x] PENDING state
@@ -313,8 +313,8 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [x] RETRY state
   - [x] REVOKED state
   - [x] REJECTED state
-  - [ ] Custom states
-  - [ ] State transition events
+  - [x] Custom states (TaskState::Custom with name and metadata)
+  - [x] State transition events (StateTransition, StateHistory)
 
 ### Events & Monitoring
 - [ ] **Real-Time Events**
@@ -372,15 +372,15 @@ Each crate has its own detailed TODO.md with implementation status and future en
 
 ### Canvas Workflow Enhancements
 - [x] **Enhanced Workflows** ✅ (Implemented in celers-canvas/src/lib.rs)
-  - [ ] `chain.apply_async()` with ETA
+  - [x] `chain.apply_async()` with ETA (apply_with_eta, apply_with_countdown, with_staggered_countdown)
   - [x] `group.skew()` - Staggered task execution
   - [x] `group.jitter()` - Random delay distribution
   - [x] `chunks()` - Split iterable into chunks
   - [x] `xmap()` - Map with exception handling
   - [x] `xstarmap()` - Starmap with exception handling
-  - [ ] Nested workflows (chain of chords)
+  - [x] Nested workflows (CanvasElement, NestedChain, NestedGroup)
   - [x] Conditional workflows (if/else primitives) ✅ - Condition, Branch, Maybe, Switch
-  - [ ] Workflow error handling strategies
+  - [x] Workflow error handling strategies (ErrorStrategy enum)
 
 - [x] **Signature Improvements** ✅
   - [x] Partial signatures (`.partial()`, `.complete()`)
@@ -452,21 +452,26 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [ ] Schedule replication
 
 ### Error Handling & Retry Policies
-- [ ] **Advanced Retry Strategies**
-  - [ ] Exponential backoff ✅
-  - [ ] Linear backoff
-  - [ ] Fixed delay
-  - [ ] Custom retry strategies
-  - [ ] Max retry delays
-  - [ ] Retry jitter
-  - [ ] Conditional retries (retry only on specific exceptions)
+- [x] **Advanced Retry Strategies** ✅ (Implemented in celers-core/src/retry.rs)
+  - [x] Exponential backoff
+  - [x] Linear backoff
+  - [x] Fixed delay
+  - [x] Polynomial backoff
+  - [x] Fibonacci backoff
+  - [x] Decorrelated jitter (AWS recommended)
+  - [x] Full jitter and Equal jitter
+  - [x] Custom retry strategies (explicit delay sequence)
+  - [x] Max retry delays
+  - [x] Retry jitter
+  - [x] Conditional retries (retry_on/dont_retry_on patterns)
+  - [x] RetryPolicy configuration
 
-- [ ] **Exception Handling**
-  - [ ] Ignore result on specific exceptions
-  - [ ] Custom exception handlers per task
-  - [ ] Exception serialization for cross-language
-  - [ ] Traceback preservation
-  - [ ] Retry on specific exception types
+- [x] **Exception Handling** ✅ (Implemented in celers-core/src/exception.rs)
+  - [x] Ignore result on specific exceptions (ExceptionPolicy.ignore_on)
+  - [x] Custom exception handlers per task (ExceptionHandler trait)
+  - [x] Exception serialization for cross-language (TaskException JSON/Celery format)
+  - [x] Traceback preservation (TracebackFrame, traceback_str)
+  - [x] Retry on specific exception types (ExceptionPolicy.retry_on)
 
 ### Security & Authentication
 - [ ] **Broker Security**

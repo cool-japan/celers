@@ -296,6 +296,40 @@ impl Signature {
         self
     }
 
+    /// Set callback argument passing mode
+    ///
+    /// Controls how task result is passed to linked callbacks.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Signature, CallbackArgMode};
+    ///
+    /// let sig = Signature::new("task".to_string())
+    ///     .with_callback_arg_mode(CallbackArgMode::Append);
+    /// ```
+    pub fn with_callback_arg_mode(mut self, mode: CallbackArgMode) -> Self {
+        self.options.callback_arg_mode = mode;
+        self
+    }
+
+    /// Set callback kwarg key (used when CallbackArgMode::Kwarg)
+    ///
+    /// Specifies the keyword argument name for passing the result.
+    /// Defaults to "result" if not set.
+    pub fn with_callback_kwarg_key(mut self, key: impl Into<String>) -> Self {
+        self.options.callback_kwarg_key = Some(key.into());
+        self
+    }
+
+    /// Configure callback to receive result as keyword argument
+    ///
+    /// Shorthand for setting CallbackArgMode::Kwarg with a key.
+    pub fn with_result_as_kwarg(mut self, key: impl Into<String>) -> Self {
+        self.options.callback_arg_mode = CallbackArgMode::Kwarg;
+        self.options.callback_kwarg_key = Some(key.into());
+        self
+    }
+
     /// Serialize signature to JSON string
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
@@ -333,6 +367,51 @@ impl std::fmt::Display for Signature {
     }
 }
 
+/// Callback argument passing mode
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum CallbackArgMode {
+    /// Pass result as first positional argument (default)
+    #[default]
+    Prepend,
+
+    /// Pass result as last positional argument
+    Append,
+
+    /// Pass result as a keyword argument with specified key
+    Kwarg,
+
+    /// Don't pass result to callback (callback uses its own args)
+    None,
+}
+
+impl CallbackArgMode {
+    /// Create a kwarg mode (result passed as "result" kwarg)
+    pub fn kwarg() -> Self {
+        Self::Kwarg
+    }
+
+    /// Check if this mode passes result to callback
+    pub fn passes_result(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl std::fmt::Display for CallbackArgMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepend => write!(f, "prepend"),
+            Self::Append => write!(f, "append"),
+            Self::Kwarg => write!(f, "kwarg"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+/// Helper for serde skip_serializing_if
+fn is_default_callback_arg_mode(mode: &CallbackArgMode) -> bool {
+    *mode == CallbackArgMode::Prepend
+}
+
 /// Task options
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TaskOptions {
@@ -362,6 +441,14 @@ pub struct TaskOptions {
     /// Callback on retry
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_retry: Option<Box<Signature>>,
+
+    /// How to pass result to success callbacks
+    #[serde(default, skip_serializing_if = "is_default_callback_arg_mode")]
+    pub callback_arg_mode: CallbackArgMode,
+
+    /// Key name when using CallbackArgMode::Kwarg
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_kwarg_key: Option<String>,
 
     /// Task expiration time in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -497,6 +584,56 @@ impl TaskOptions {
 
         let delay = (base_delay as f64 * backoff.powi(retry_count as i32)) as u64;
         delay.min(max_delay)
+    }
+
+    /// Get the callback argument mode
+    pub fn callback_arg_mode(&self) -> CallbackArgMode {
+        self.callback_arg_mode
+    }
+
+    /// Get the callback kwarg key (defaults to "result")
+    pub fn callback_kwarg_key(&self) -> &str {
+        self.callback_kwarg_key.as_deref().unwrap_or("result")
+    }
+
+    /// Prepare a callback signature with result passed according to callback_arg_mode
+    ///
+    /// This modifies the callback signature to include the result value
+    /// according to the configured callback argument passing mode.
+    ///
+    /// # Arguments
+    /// * `callback` - The callback signature to prepare
+    /// * `result` - The result value to pass to the callback
+    ///
+    /// # Returns
+    /// A new signature with the result incorporated
+    pub fn prepare_callback(
+        &self,
+        mut callback: Signature,
+        result: serde_json::Value,
+    ) -> Signature {
+        // Don't modify immutable signatures
+        if callback.immutable {
+            return callback;
+        }
+
+        match self.callback_arg_mode {
+            CallbackArgMode::Prepend => {
+                callback.args.insert(0, result);
+            }
+            CallbackArgMode::Append => {
+                callback.args.push(result);
+            }
+            CallbackArgMode::Kwarg => {
+                let key = self.callback_kwarg_key().to_string();
+                callback.kwargs.insert(key, result);
+            }
+            CallbackArgMode::None => {
+                // Don't modify the callback
+            }
+        }
+
+        callback
     }
 }
 
@@ -636,6 +773,97 @@ impl Chain {
     /// Get number of tasks in chain
     pub fn len(&self) -> usize {
         self.tasks.len()
+    }
+
+    /// Apply the chain with a countdown (delay in seconds)
+    ///
+    /// The first task will be delayed by the countdown amount.
+    /// Subsequent tasks are linked and will execute after the previous completes.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![]);
+    ///
+    /// // Start chain execution after 60 seconds
+    /// chain.apply_with_countdown(broker, 60).await?;
+    /// ```
+    pub async fn apply_with_countdown<B: Broker>(
+        mut self,
+        broker: &B,
+        countdown: u64,
+    ) -> Result<Uuid, CanvasError> {
+        if self.tasks.is_empty() {
+            return Err(CanvasError::Invalid("Chain cannot be empty".to_string()));
+        }
+
+        // Set countdown on the first task
+        if let Some(first) = self.tasks.first_mut() {
+            first.options.countdown = Some(countdown);
+        }
+
+        // Use regular apply to handle the chain
+        self.apply(broker).await
+    }
+
+    /// Apply the chain with an ETA (execution time as Unix timestamp)
+    ///
+    /// The first task will be scheduled for execution at the specified ETA.
+    /// Subsequent tasks are linked and will execute after the previous completes.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::time::{SystemTime, UNIX_EPOCH, Duration};
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![]);
+    ///
+    /// // Schedule chain for 1 hour from now
+    /// let eta = SystemTime::now()
+    ///     .duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+    /// chain.apply_with_eta(broker, eta).await?;
+    /// ```
+    pub async fn apply_with_eta<B: Broker>(
+        mut self,
+        broker: &B,
+        eta: u64,
+    ) -> Result<Uuid, CanvasError> {
+        if self.tasks.is_empty() {
+            return Err(CanvasError::Invalid("Chain cannot be empty".to_string()));
+        }
+
+        // Calculate countdown from ETA
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let countdown = if eta > now { eta - now } else { 0 };
+
+        // Set countdown on the first task
+        if let Some(first) = self.tasks.first_mut() {
+            first.options.countdown = Some(countdown);
+        }
+
+        self.apply(broker).await
+    }
+
+    /// Set countdown on all tasks in the chain (staggered execution)
+    ///
+    /// Each task gets a progressively larger countdown.
+    ///
+    /// # Arguments
+    /// * `start` - Initial countdown for first task
+    /// * `step` - Additional delay added for each subsequent task
+    pub fn with_staggered_countdown(mut self, start: u64, step: u64) -> Self {
+        let mut countdown = start;
+        for task in &mut self.tasks {
+            task.options.countdown = Some(countdown);
+            countdown += step;
+        }
+        self
     }
 }
 
@@ -1952,6 +2180,496 @@ impl std::fmt::Display for Switch {
             )
         } else {
             write!(f, "Switch[{}]", case_strs.join(", "))
+        }
+    }
+}
+
+// ============================================================================
+// Nested Workflows
+// ============================================================================
+
+/// A canvas element that can be either a simple signature or a nested workflow
+///
+/// This enables composing complex workflows where any step can be another workflow.
+///
+/// # Example
+/// ```
+/// use celers_canvas::{CanvasElement, Chain, Group, Signature, Chord};
+///
+/// // Create a chain where one element is a group (parallel tasks)
+/// let element = CanvasElement::group(
+///     Group::new()
+///         .add("task1", vec![])
+///         .add("task2", vec![])
+/// );
+///
+/// // Create a nested chain of chords
+/// let nested = CanvasElement::chain(
+///     Chain::new()
+///         .then("step1", vec![])
+///         .then("step2", vec![])
+/// );
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "element_type")]
+pub enum CanvasElement {
+    /// A simple task signature
+    Signature(Signature),
+
+    /// A chain of tasks
+    Chain(Chain),
+
+    /// A group of parallel tasks
+    Group(Group),
+
+    /// A chord (group + callback)
+    Chord {
+        /// Header group
+        header: Group,
+        /// Callback signature
+        body: Signature,
+    },
+
+    /// A map operation
+    Map {
+        /// Task to apply
+        task: Signature,
+        /// Argument sets
+        argsets: Vec<Vec<serde_json::Value>>,
+    },
+
+    /// A conditional branch
+    Branch(Branch),
+
+    /// A switch statement
+    Switch(Switch),
+}
+
+impl CanvasElement {
+    /// Create a signature element
+    pub fn signature(sig: Signature) -> Self {
+        Self::Signature(sig)
+    }
+
+    /// Create a task element (shorthand for signature)
+    pub fn task(name: impl Into<String>, args: Vec<serde_json::Value>) -> Self {
+        Self::Signature(Signature::new(name.into()).with_args(args))
+    }
+
+    /// Create a chain element
+    pub fn chain(chain: Chain) -> Self {
+        Self::Chain(chain)
+    }
+
+    /// Create a group element
+    pub fn group(group: Group) -> Self {
+        Self::Group(group)
+    }
+
+    /// Create a chord element
+    pub fn chord(header: Group, body: Signature) -> Self {
+        Self::Chord { header, body }
+    }
+
+    /// Create a map element
+    pub fn map(task: Signature, argsets: Vec<Vec<serde_json::Value>>) -> Self {
+        Self::Map { task, argsets }
+    }
+
+    /// Create a branch element
+    pub fn branch(branch: Branch) -> Self {
+        Self::Branch(branch)
+    }
+
+    /// Create a switch element
+    pub fn switch(switch: Switch) -> Self {
+        Self::Switch(switch)
+    }
+
+    /// Check if this is a simple signature
+    pub fn is_signature(&self) -> bool {
+        matches!(self, Self::Signature(_))
+    }
+
+    /// Check if this is a chain
+    pub fn is_chain(&self) -> bool {
+        matches!(self, Self::Chain(_))
+    }
+
+    /// Check if this is a group
+    pub fn is_group(&self) -> bool {
+        matches!(self, Self::Group(_))
+    }
+
+    /// Check if this is a chord
+    pub fn is_chord(&self) -> bool {
+        matches!(self, Self::Chord { .. })
+    }
+
+    /// Get the element type as a string
+    pub fn element_type(&self) -> &'static str {
+        match self {
+            Self::Signature(_) => "signature",
+            Self::Chain(_) => "chain",
+            Self::Group(_) => "group",
+            Self::Chord { .. } => "chord",
+            Self::Map { .. } => "map",
+            Self::Branch(_) => "branch",
+            Self::Switch(_) => "switch",
+        }
+    }
+}
+
+impl std::fmt::Display for CanvasElement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Signature(sig) => write!(f, "Signature[{}]", sig.task),
+            Self::Chain(chain) => write!(f, "{}", chain),
+            Self::Group(group) => write!(f, "{}", group),
+            Self::Chord { header, body } => {
+                write!(f, "Chord[header={}, body={}]", header, body.task)
+            }
+            Self::Map { task, argsets } => {
+                write!(f, "Map[task={}, {} argsets]", task.task, argsets.len())
+            }
+            Self::Branch(branch) => write!(f, "{}", branch),
+            Self::Switch(switch) => write!(f, "{}", switch),
+        }
+    }
+}
+
+impl From<Signature> for CanvasElement {
+    fn from(sig: Signature) -> Self {
+        Self::Signature(sig)
+    }
+}
+
+impl From<Chain> for CanvasElement {
+    fn from(chain: Chain) -> Self {
+        Self::Chain(chain)
+    }
+}
+
+impl From<Group> for CanvasElement {
+    fn from(group: Group) -> Self {
+        Self::Group(group)
+    }
+}
+
+impl From<Branch> for CanvasElement {
+    fn from(branch: Branch) -> Self {
+        Self::Branch(branch)
+    }
+}
+
+impl From<Switch> for CanvasElement {
+    fn from(switch: Switch) -> Self {
+        Self::Switch(switch)
+    }
+}
+
+/// A nested chain that can contain any canvas element
+///
+/// Unlike the basic Chain that only contains Signatures, NestedChain
+/// can contain Groups, Chords, or other Chains as steps.
+///
+/// # Example
+/// ```
+/// use celers_canvas::{NestedChain, CanvasElement, Group, Signature};
+///
+/// let workflow = NestedChain::new()
+///     .then_element(CanvasElement::task("step1".to_string(), vec![]))
+///     .then_element(CanvasElement::group(
+///         Group::new()
+///             .add("parallel_a", vec![])
+///             .add("parallel_b", vec![])
+///     ))
+///     .then_element(CanvasElement::task("step2".to_string(), vec![]));
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestedChain {
+    /// Elements in the chain
+    pub elements: Vec<CanvasElement>,
+}
+
+impl NestedChain {
+    /// Create a new empty nested chain
+    pub fn new() -> Self {
+        Self {
+            elements: Vec::new(),
+        }
+    }
+
+    /// Add an element to the chain
+    pub fn then_element(mut self, element: CanvasElement) -> Self {
+        self.elements.push(element);
+        self
+    }
+
+    /// Add a signature to the chain
+    pub fn then_signature(mut self, sig: Signature) -> Self {
+        self.elements.push(CanvasElement::Signature(sig));
+        self
+    }
+
+    /// Add a simple task to the chain
+    pub fn then(mut self, task: &str, args: Vec<serde_json::Value>) -> Self {
+        self.elements.push(CanvasElement::task(task, args));
+        self
+    }
+
+    /// Add a group to the chain (parallel execution point)
+    pub fn then_group(mut self, group: Group) -> Self {
+        self.elements.push(CanvasElement::Group(group));
+        self
+    }
+
+    /// Add a chord to the chain
+    pub fn then_chord(mut self, header: Group, body: Signature) -> Self {
+        self.elements.push(CanvasElement::Chord { header, body });
+        self
+    }
+
+    /// Add a branch to the chain
+    pub fn then_branch(mut self, branch: Branch) -> Self {
+        self.elements.push(CanvasElement::Branch(branch));
+        self
+    }
+
+    /// Add another chain as a nested element
+    pub fn then_chain(mut self, chain: Chain) -> Self {
+        self.elements.push(CanvasElement::Chain(chain));
+        self
+    }
+
+    /// Check if the chain is empty
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+
+    /// Get the number of elements
+    pub fn len(&self) -> usize {
+        self.elements.len()
+    }
+
+    /// Flatten the nested chain into a sequence of signatures where possible
+    ///
+    /// This is useful for simpler execution when nested workflows aren't needed.
+    /// Note: This will return None if the chain contains elements that can't be
+    /// flattened to signatures (groups, chords, etc.)
+    pub fn flatten_signatures(&self) -> Option<Vec<Signature>> {
+        let mut result = Vec::new();
+
+        for element in &self.elements {
+            match element {
+                CanvasElement::Signature(sig) => result.push(sig.clone()),
+                CanvasElement::Chain(chain) => {
+                    result.extend(chain.tasks.clone());
+                }
+                _ => return None, // Can't flatten non-signature elements
+            }
+        }
+
+        Some(result)
+    }
+}
+
+impl Default for NestedChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for NestedChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let element_strs: Vec<String> = self.elements.iter().map(|e| format!("{}", e)).collect();
+        write!(f, "NestedChain[{}]", element_strs.join(" -> "))
+    }
+}
+
+/// A nested group that can contain any canvas element
+///
+/// Unlike the basic Group that only contains Signatures, NestedGroup
+/// can contain Chains, other Groups, or Chords as parallel tasks.
+///
+/// # Example
+/// ```
+/// use celers_canvas::{NestedGroup, CanvasElement, Chain, Signature};
+///
+/// let workflow = NestedGroup::new()
+///     .add_element(CanvasElement::chain(
+///         Chain::new().then("step1", vec![]).then("step2", vec![])
+///     ))
+///     .add_element(CanvasElement::chain(
+///         Chain::new().then("step3", vec![]).then("step4", vec![])
+///     ));
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestedGroup {
+    /// Elements in the group (executed in parallel)
+    pub elements: Vec<CanvasElement>,
+}
+
+impl NestedGroup {
+    /// Create a new empty nested group
+    pub fn new() -> Self {
+        Self {
+            elements: Vec::new(),
+        }
+    }
+
+    /// Add an element to the group
+    pub fn add_element(mut self, element: CanvasElement) -> Self {
+        self.elements.push(element);
+        self
+    }
+
+    /// Add a signature to the group
+    pub fn add_signature(mut self, sig: Signature) -> Self {
+        self.elements.push(CanvasElement::Signature(sig));
+        self
+    }
+
+    /// Add a simple task to the group
+    pub fn add(mut self, task: &str, args: Vec<serde_json::Value>) -> Self {
+        self.elements.push(CanvasElement::task(task, args));
+        self
+    }
+
+    /// Add a chain to the group
+    pub fn add_chain(mut self, chain: Chain) -> Self {
+        self.elements.push(CanvasElement::Chain(chain));
+        self
+    }
+
+    /// Check if the group is empty
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+
+    /// Get the number of elements
+    pub fn len(&self) -> usize {
+        self.elements.len()
+    }
+
+    /// Flatten to signatures if possible
+    pub fn flatten_signatures(&self) -> Option<Vec<Signature>> {
+        let mut result = Vec::new();
+
+        for element in &self.elements {
+            match element {
+                CanvasElement::Signature(sig) => result.push(sig.clone()),
+                _ => return None,
+            }
+        }
+
+        Some(result)
+    }
+}
+
+impl Default for NestedGroup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for NestedGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let element_strs: Vec<String> = self.elements.iter().map(|e| format!("{}", e)).collect();
+        write!(f, "NestedGroup[{}]", element_strs.join(" | "))
+    }
+}
+
+/// Error handling strategy for workflows
+///
+/// Determines how the workflow should behave when a task fails.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum ErrorStrategy {
+    /// Stop the workflow on first error (default)
+    #[default]
+    StopOnError,
+
+    /// Continue even if some tasks fail
+    ContinueOnError,
+
+    /// Retry the failed task a number of times before failing
+    RetryOnError {
+        /// Maximum number of retries
+        max_retries: u32,
+        /// Delay between retries in seconds
+        delay: Option<u64>,
+    },
+
+    /// Execute a fallback task on error
+    Fallback {
+        /// Fallback task to execute
+        fallback: Signature,
+    },
+
+    /// Execute an error handler task that receives the error info
+    ErrorHandler {
+        /// Error handler task name
+        handler: Signature,
+    },
+}
+
+impl ErrorStrategy {
+    /// Create a stop-on-error strategy
+    pub fn stop() -> Self {
+        Self::StopOnError
+    }
+
+    /// Create a continue-on-error strategy
+    pub fn continue_on_error() -> Self {
+        Self::ContinueOnError
+    }
+
+    /// Create a retry strategy
+    pub fn retry(max_retries: u32) -> Self {
+        Self::RetryOnError {
+            max_retries,
+            delay: None,
+        }
+    }
+
+    /// Create a retry strategy with delay
+    pub fn retry_with_delay(max_retries: u32, delay: u64) -> Self {
+        Self::RetryOnError {
+            max_retries,
+            delay: Some(delay),
+        }
+    }
+
+    /// Create a fallback strategy
+    pub fn fallback(task: Signature) -> Self {
+        Self::Fallback { fallback: task }
+    }
+
+    /// Create an error handler strategy
+    pub fn error_handler(handler: Signature) -> Self {
+        Self::ErrorHandler { handler }
+    }
+
+    /// Check if this strategy allows continuing on error
+    pub fn allows_continue(&self) -> bool {
+        !matches!(self, Self::StopOnError)
+    }
+}
+
+impl std::fmt::Display for ErrorStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StopOnError => write!(f, "StopOnError"),
+            Self::ContinueOnError => write!(f, "ContinueOnError"),
+            Self::RetryOnError { max_retries, delay } => {
+                if let Some(d) = delay {
+                    write!(f, "RetryOnError({} times, {}s delay)", max_retries, d)
+                } else {
+                    write!(f, "RetryOnError({} times)", max_retries)
+                }
+            }
+            Self::Fallback { fallback } => write!(f, "Fallback({})", fallback.task),
+            Self::ErrorHandler { handler } => write!(f, "ErrorHandler({})", handler.task),
         }
     }
 }

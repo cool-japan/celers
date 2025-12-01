@@ -4,7 +4,7 @@
 
 ## Status: ✅ FEATURE COMPLETE
 
-Full-featured AMQP broker with exchange/queue topology, message confirmation, and priority support.
+Full-featured AMQP broker with exchange/queue topology, message confirmation, priority support, DLX, TTL, and connection retry.
 
 ## Completed Features
 
@@ -13,6 +13,8 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, an
 - [x] Channel creation and management
 - [x] Connection status checking
 - [x] Graceful disconnect
+- [x] Connection retry with configurable attempts/delay
+- [x] Virtual host support
 
 ### Message Publishing ✅
 - [x] Basic message publishing to queues
@@ -21,6 +23,7 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, an
 - [x] Publisher confirms (automatic)
 - [x] Priority support via message properties
 - [x] Correlation ID support
+- [x] Message TTL support (`publish_with_ttl()`)
 
 ### Message Consumption ✅
 - [x] Polling consumption via basic_get
@@ -28,6 +31,7 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, an
 - [x] Message rejection with requeue
 - [x] Delivery tag tracking
 - [x] Redelivery flag support
+- [x] QoS (prefetch) configuration
 
 ### Queue Management ✅
 - [x] Queue declaration with options
@@ -36,12 +40,19 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, an
 - [x] Queue purging
 - [x] Queue deletion
 - [x] Queue size inspection
+- [x] Queue TTL (x-message-ttl)
+- [x] Queue expiration (x-expires)
+- [x] Max queue length (x-max-length)
+- [x] Dead Letter Exchange configuration
 
 ### Exchange/Topology ✅
-- [x] Exchange declaration (Direct exchange)
+- [x] Exchange declaration (Direct, Fanout, Topic, Headers)
 - [x] Queue binding to exchange
+- [x] Queue unbinding from exchange
 - [x] Default "celery" exchange setup
 - [x] Routing key support
+- [x] Exchange deletion
+- [x] Dead Letter Exchange (DLX) setup
 
 ### Batch Operations ✅
 - [x] `publish_batch()` - Publish multiple messages efficiently
@@ -49,21 +60,32 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, an
 - [x] Reduces round-trips compared to individual publishes
 - [x] Returns successful publish count
 
+### Configuration ✅
+- [x] `AmqpConfig` - Broker-level configuration
+- [x] `QueueConfig` - Queue-level configuration
+- [x] `DlxConfig` - Dead Letter Exchange configuration
+- [x] `AmqpExchangeType` - Exchange type enum (Direct, Fanout, Topic, Headers)
+
+### Consumer Streaming ✅
+- [x] `start_consumer()` - Start a streaming consumer (basic_consume)
+- [x] `cancel_consumer()` - Cancel a consumer by tag
+- [x] Returns `lapin::Consumer` for async stream processing
+
+### Health Monitoring ✅
+- [x] `health_status()` - Get detailed health status
+- [x] `is_healthy()` - Quick health check
+- [x] `HealthStatus` struct with connection/channel state
+
+### Transaction Support ✅
+- [x] `start_transaction()` - Begin AMQP transaction
+- [x] `commit_transaction()` - Commit transaction
+- [x] `rollback_transaction()` - Rollback transaction
+- [x] `transaction_state()` - Get current transaction state
+
 ## Future Enhancements
 
 ### Advanced Features
-- [ ] Consumer streaming (basic_consume with callback)
-- [ ] QoS (prefetch) configuration
-- [ ] Dead Letter Exchange (DLX) support
-- [ ] Message TTL support
-- [ ] Exchange types (Fanout, Topic, Headers)
-- [ ] Connection recovery and retry
-
-### Topology
-- [ ] Multiple exchange support
-- [ ] Complex routing patterns
-- [ ] Topology management API
-- [ ] Virtual host support
+- [ ] Automatic reconnection on connection loss (during operation)
 
 ### Performance
 - [x] Batch publishing ✅
@@ -72,21 +94,26 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, an
 - [ ] Pipeline publishing
 
 ### Monitoring
+- [x] Connection health monitoring ✅
 - [ ] Channel-level metrics
 - [ ] Publisher confirm tracking
-- [ ] Connection health monitoring
 - [ ] RabbitMQ Management API integration
 
 ### Reliability
-- [ ] Automatic reconnection
+- [x] Transaction support ✅
 - [ ] Message deduplication
-- [ ] Transaction support
-- [ ] Message persistence guarantees
 
 ## Testing Status
 
 - [x] Broker creation test
 - [x] Broker name test
+- [x] Config builder tests
+- [x] Queue config builder tests
+- [x] DLX config tests
+- [x] Exchange types tests
+- [x] Virtual host URL tests
+- [x] Health status tests
+- [x] Transaction state tests
 - [ ] Integration tests with RabbitMQ
 - [ ] Connection recovery tests
 - [ ] Message ordering tests
@@ -150,8 +177,5 @@ This implementation is **100% compatible** with Python Celery's AMQP backend:
 
 ## Known Limitations
 
-- No consumer streaming (basic_consume) implemented yet
-- No Dead Letter Exchange configuration
-- No connection recovery/retry logic
-- Single channel per connection
-- `list_queues()` requires RabbitMQ Management API
+- Single channel per connection (channel pooling not yet implemented)
+- `list_queues()` requires RabbitMQ Management API (not available via AMQP protocol)

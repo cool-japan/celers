@@ -67,6 +67,58 @@ The core crate provides all fundamental building blocks for task queue systems.
 - [x] `Display` for `TaskMetadata` (concise task summary)
 - [x] `Display` for `CelersError` (via thiserror)
 
+### Retry Strategies ✅
+- [x] `RetryStrategy` enum with comprehensive strategies
+  - [x] `Fixed` - Constant delay between retries
+  - [x] `Linear` - Linear backoff (initial + increment per retry)
+  - [x] `Exponential` - Exponential backoff with configurable multiplier
+  - [x] `Polynomial` - Polynomial backoff (n^power)
+  - [x] `Fibonacci` - Fibonacci sequence delays
+  - [x] `DecorrelatedJitter` - AWS recommended jitter strategy
+  - [x] `FullJitter` - Random between 0 and exponential delay
+  - [x] `EqualJitter` - Half fixed, half random
+  - [x] `Custom` - User-defined delay sequences
+  - [x] `Immediate` - No delay between retries
+- [x] `RetryPolicy` for policy-based retry configuration
+  - [x] Max retries configuration
+  - [x] Retry on specific error patterns
+  - [x] Don't retry on specific error patterns
+  - [x] Retry on timeout flag
+  - [x] `should_retry()` - Check if retry is allowed
+  - [x] `get_retry_delay()` - Calculate delay for retry attempt
+
+### Exception Handling ✅
+- [x] `TaskException` structured exception type
+  - [x] Exception type and message
+  - [x] Traceback frames with file/line/function
+  - [x] Raw traceback string (Python compatibility)
+  - [x] Exception category (Retryable, Fatal, Ignorable, etc.)
+  - [x] Cause/context chaining for nested exceptions
+  - [x] Metadata support for additional context
+  - [x] JSON serialization for cross-language support
+  - [x] Celery-compatible format export
+- [x] `ExceptionCategory` enum for exception classification
+  - [x] Retryable, Fatal, Ignorable, RequiresIntervention, Unknown
+- [x] `ExceptionAction` enum for action decisions
+  - [x] Retry, Fail, Ignore, Reject, Default
+- [x] `ExceptionPolicy` for policy-based exception handling
+  - [x] retry_on patterns (retry specific exception types)
+  - [x] ignore_on patterns (task succeeds despite exception)
+  - [x] fail_on patterns (no retry, go to DLQ)
+  - [x] reject_on patterns (no retry, no DLQ)
+  - [x] Glob pattern matching for exception types
+  - [x] Traceback preservation configuration
+  - [x] Max traceback depth truncation
+- [x] `ExceptionHandler` trait for custom handlers
+  - [x] `handle()` - Determine action for exception
+  - [x] `transform()` - Modify exception (add metadata, truncate traceback)
+  - [x] `on_exception()` - Hook for logging/metrics
+- [x] `ExceptionHandlerChain` for composable handlers
+- [x] Built-in handlers
+  - [x] `LoggingExceptionHandler` - Log exceptions with tracing
+  - [x] `PolicyExceptionHandler` - Apply ExceptionPolicy rules
+- [x] Common exception type constants for easy categorization
+
 ### Potential Improvements
 - [ ] Add task dependencies/DAG support
 - [x] Implement task result storage backend (celers-backend-*)
@@ -96,6 +148,14 @@ The core crate provides all fundamental building blocks for task queue systems.
 - [x] Unit tests for state machine (4 tests)
 - [x] Unit tests for metadata creation (1 test)
 - [x] Unit tests for task registry (1 test)
+- [x] Unit tests for retry strategies (16+ tests)
+- [x] Unit tests for router patterns (20+ tests)
+- [x] Unit tests for rate limiting (4 tests)
+- [x] Unit tests for time limits (13 tests)
+- [x] Unit tests for revocation (8 tests)
+- [x] Unit tests for error types (12 tests)
+- [x] Unit tests for exception handling (19+ tests)
+- [x] Doc tests for all public APIs (12 tests)
 - [ ] Add property-based testing for state transitions
 - [ ] Add integration tests for full task lifecycle
 
@@ -115,6 +175,8 @@ The core crate provides all fundamental building blocks for task queue systems.
 - `uuid`: Unique IDs
 - `chrono`: Timestamps
 - `thiserror`: Error types
+- `regex`: Pattern matching for routing
+- `rand`: Random number generation for jittered retry strategies
 
 ## Notes
 

@@ -16,8 +16,28 @@
 //! - **Body**: Serialized task arguments
 //! - **Content-Type**: Serialization format ("application/json", "application/x-msgpack")
 //! - **Content-Encoding**: Encoding format ("utf-8", "binary")
+//!
+//! # Modules
+//!
+//! - [`compat`] - Python Celery compatibility verification
+//! - [`serializer`] - Pluggable serialization framework
+//! - [`result`] - Task result message format
+//! - [`event`] - Celery event message format
+//! - [`compression`] - Message body compression
+//! - [`embed`] - Embedded body format (args, kwargs, embed)
+//! - [`negotiation`] - Protocol version negotiation
+//! - [`security`] - Security utilities and content-type whitelist
+//! - [`builder`] - Fluent message builder API
 
+pub mod builder;
 pub mod compat;
+pub mod compression;
+pub mod embed;
+pub mod event;
+pub mod negotiation;
+pub mod result;
+pub mod security;
+pub mod serializer;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,7 +45,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Protocol version
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProtocolVersion {
     /// Protocol version 2 (Celery 4.x+)
     V2,
