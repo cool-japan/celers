@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for CeleRS
 # Build stage
-FROM rust:1.75-slim as builder
+FROM rust:1.91-slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
