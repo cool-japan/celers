@@ -1,0 +1,30 @@
+[package]
+name = "celers-broker-sqs"
+version = "0.1.0"
+edition = "2021"
+authors = ["CeleRS Contributors"]
+description = "AWS SQS broker implementation for CeleRS"
+keywords = ["celery", "aws", "sqs", "broker", "cloud"]
+categories = ["asynchronous", "network-programming", "web-programming"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/celers"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.11", features = ["v4"] }
+tracing = "0.1"
+tokio = { version = "1.42", features = ["full"] }
+
+# AWS SDK for SQS
+aws-config = "1.5"
+aws-sdk-sqs = "1.64"
+
+# Core dependencies
+celers-protocol = { path = "../celers-protocol" }
+celers-kombu = { path = "../celers-kombu" }
+
+[dev-dependencies]
+tokio-test = "0.4"

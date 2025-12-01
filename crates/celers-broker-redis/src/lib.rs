@@ -1,0 +1,783 @@
+//! Redis broker implementation for CeleRS
+//!
+//! Provides Kombu-compatible Redis broker with:
+//! - Visibility timeout using Lua scripts
+//! - Priority queue support
+//! - Dead Letter Queue (DLQ)
+//! - Task cancellation via Pub/Sub
+
+use async_trait::async_trait;
+use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
+use redis::{AsyncCommands, Client};
+use tracing::{debug, error, info, warn};
+
+#[cfg(feature = "metrics")]
+use celers_metrics::{
+    DLQ_SIZE, PROCESSING_QUEUE_SIZE, QUEUE_SIZE, TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL,
+};
+
+pub mod lua_scripts;
+pub mod visibility;
+
+use visibility::VisibilityManager;
+
+/// Queue mode for Redis broker
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMode {
+    /// Standard FIFO queue using Redis lists
+    Fifo,
+    /// Priority queue using Redis sorted sets (higher priority = processed first)
+    Priority,
+}
+
+impl QueueMode {
+    /// Check if this is FIFO mode
+    pub fn is_fifo(&self) -> bool {
+        matches!(self, QueueMode::Fifo)
+    }
+
+    /// Check if this is Priority mode
+    pub fn is_priority(&self) -> bool {
+        matches!(self, QueueMode::Priority)
+    }
+}
+
+impl std::fmt::Display for QueueMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueueMode::Fifo => write!(f, "FIFO"),
+            QueueMode::Priority => write!(f, "Priority"),
+        }
+    }
+}
+
+/// Redis-based broker implementation
+pub struct RedisBroker {
+    client: Client,
+    queue_name: String,
+    processing_queue: String,
+    dlq_name: String,
+    delayed_queue: String,
+    cancel_channel: String,
+    mode: QueueMode,
+    #[allow(dead_code)]
+    visibility_manager: VisibilityManager,
+    visibility_timeout_secs: u64,
+}
+
+impl RedisBroker {
+    /// Create a new Redis broker with FIFO mode
+    pub fn new(redis_url: &str, queue_name: &str) -> Result<Self> {
+        Self::with_mode(redis_url, queue_name, QueueMode::Fifo)
+    }
+
+    /// Create a new Redis broker with specified queue mode
+    pub fn with_mode(redis_url: &str, queue_name: &str, mode: QueueMode) -> Result<Self> {
+        let client = Client::open(redis_url)
+            .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
+
+        Ok(Self {
+            client,
+            queue_name: queue_name.to_string(),
+            processing_queue: format!("{}:processing", queue_name),
+            dlq_name: format!("{}:dlq", queue_name),
+            delayed_queue: format!("{}:delayed", queue_name),
+            cancel_channel: format!("{}:cancel", queue_name),
+            mode,
+            visibility_manager: VisibilityManager::new(),
+            visibility_timeout_secs: 300, // 5 minutes default
+        })
+    }
+
+    /// Set visibility timeout (default: 300 seconds)
+    pub fn with_visibility_timeout(mut self, timeout_secs: u64) -> Self {
+        self.visibility_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Get the queue mode
+    pub fn mode(&self) -> QueueMode {
+        self.mode
+    }
+
+    /// Get the number of tasks in the Dead Letter Queue
+    pub async fn dlq_size(&self) -> Result<usize> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let size: usize = conn
+            .llen(&self.dlq_name)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get DLQ size: {}", e)))?;
+
+        Ok(size)
+    }
+
+    /// Inspect tasks in the Dead Letter Queue
+    pub async fn inspect_dlq(&self, limit: isize) -> Result<Vec<SerializedTask>> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let items: Vec<String> = conn
+            .lrange(&self.dlq_name, 0, limit - 1)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to inspect DLQ: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for item in items {
+            let task: SerializedTask = serde_json::from_str(&item)
+                .map_err(|e| CelersError::Deserialization(e.to_string()))?;
+            tasks.push(task);
+        }
+
+        Ok(tasks)
+    }
+
+    /// Replay a task from the Dead Letter Queue back to the main queue
+    pub async fn replay_from_dlq(&self, task_id: &TaskId) -> Result<bool> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        // Get all DLQ items
+        let items: Vec<String> = conn
+            .lrange(&self.dlq_name, 0, -1)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get DLQ items: {}", e)))?;
+
+        // Find the task by ID
+        for item in items {
+            let task: SerializedTask = serde_json::from_str(&item)
+                .map_err(|e| CelersError::Deserialization(e.to_string()))?;
+
+            if &task.metadata.id == task_id {
+                // Remove from DLQ
+                conn.lrem::<_, _, ()>(&self.dlq_name, 1, &item)
+                    .await
+                    .map_err(|e| {
+                        CelersError::Broker(format!("Failed to remove from DLQ: {}", e))
+                    })?;
+
+                // Reset retry count in task metadata
+                let mut replayed_task = task;
+                replayed_task.metadata.state = celers_core::TaskState::Pending;
+
+                let serialized = serde_json::to_string(&replayed_task)
+                    .map_err(|e| CelersError::Serialization(e.to_string()))?;
+
+                // Re-enqueue based on mode
+                match self.mode {
+                    QueueMode::Fifo => {
+                        conn.rpush::<_, _, ()>(&self.queue_name, &serialized)
+                            .await
+                            .map_err(|e| {
+                                CelersError::Broker(format!("Failed to replay task: {}", e))
+                            })?;
+                    }
+                    QueueMode::Priority => {
+                        let score = -replayed_task.metadata.priority as f64;
+                        conn.zadd::<_, _, _, ()>(&self.queue_name, &serialized, score)
+                            .await
+                            .map_err(|e| {
+                                CelersError::Broker(format!("Failed to replay task: {}", e))
+                            })?;
+                    }
+                }
+
+                info!("Replayed task {} from DLQ", task_id);
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Clear all tasks from the Dead Letter Queue
+    pub async fn clear_dlq(&self) -> Result<usize> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let count: usize = conn
+            .llen(&self.dlq_name)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get DLQ size: {}", e)))?;
+
+        conn.del::<_, ()>(&self.dlq_name)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to clear DLQ: {}", e)))?;
+
+        info!("Cleared {} tasks from DLQ", count);
+        Ok(count)
+    }
+
+    /// Get the cancellation channel name (for workers to subscribe)
+    pub fn cancel_channel(&self) -> &str {
+        &self.cancel_channel
+    }
+
+    /// Create a PubSub connection for listening to cancellation messages
+    pub async fn create_pubsub(&self) -> Result<redis::aio::PubSub> {
+        let pubsub = self.client.get_async_pubsub().await.map_err(|e| {
+            CelersError::Broker(format!("Failed to create PubSub connection: {}", e))
+        })?;
+        Ok(pubsub)
+    }
+
+    /// Move ready delayed tasks to the main queue
+    ///
+    /// Checks the delayed queue for tasks ready to execute (timestamp <= now)
+    /// and moves them to the main queue atomically.
+    async fn process_delayed_tasks(&self) -> Result<usize> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CelersError::Other(format!("Failed to get current time: {}", e)))?
+            .as_secs() as f64;
+
+        // Get all tasks ready for execution (score <= now)
+        let ready_tasks: Vec<String> =
+            conn.zrangebyscore(&self.delayed_queue, "-inf", now)
+                .await
+                .map_err(|e| CelersError::Broker(format!("Failed to get ready tasks: {}", e)))?;
+
+        if ready_tasks.is_empty() {
+            return Ok(0);
+        }
+
+        let count = ready_tasks.len();
+
+        // Move tasks to main queue based on queue mode
+        let mut pipe = redis::pipe();
+
+        for task_data in &ready_tasks {
+            // Deserialize to get priority for sorted queue
+            if let Ok(task) = serde_json::from_str::<SerializedTask>(task_data) {
+                match self.mode {
+                    QueueMode::Fifo => {
+                        pipe.rpush(&self.queue_name, task_data);
+                    }
+                    QueueMode::Priority => {
+                        let score = -(task.metadata.priority as f64);
+                        pipe.zadd(&self.queue_name, task_data, score);
+                    }
+                }
+            }
+
+            // Remove from delayed queue
+            pipe.zrem(&self.delayed_queue, task_data);
+        }
+
+        // Execute all operations atomically
+        pipe.query_async::<redis::Value>(&mut conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to move delayed tasks: {}", e)))?;
+
+        debug!("Moved {} delayed tasks to main queue", count);
+
+        Ok(count)
+    }
+}
+
+#[async_trait]
+impl Broker for RedisBroker {
+    async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let task_id = task.metadata.id;
+        let priority = task.metadata.priority;
+        let serialized =
+            serde_json::to_string(&task).map_err(|e| CelersError::Serialization(e.to_string()))?;
+
+        match self.mode {
+            QueueMode::Fifo => {
+                // Use list for FIFO (priority ignored)
+                conn.rpush::<_, _, ()>(&self.queue_name, &serialized)
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to enqueue task: {}", e)))?;
+            }
+            QueueMode::Priority => {
+                // Use sorted set with priority as score (negate for descending order)
+                // Higher priority values should be processed first
+                let score = -priority as f64;
+                conn.zadd::<_, _, _, ()>(&self.queue_name, &serialized, score)
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to enqueue task: {}", e)))?;
+            }
+        }
+
+        debug!(
+            "Enqueued task {} to queue {} (priority: {})",
+            task_id, self.queue_name, priority
+        );
+
+        #[cfg(feature = "metrics")]
+        {
+            TASKS_ENQUEUED_TOTAL.inc();
+
+            // Track per-task-type metrics
+            let task_name = &task.metadata.name;
+            TASKS_ENQUEUED_BY_TYPE.with_label_values(&[task_name]).inc();
+        }
+
+        Ok(task_id)
+    }
+
+    async fn dequeue(&self) -> Result<Option<BrokerMessage>> {
+        // Process delayed tasks first (move ready tasks to main queue)
+        let _ = self.process_delayed_tasks().await;
+
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let result = match self.mode {
+            QueueMode::Fifo => {
+                // Use BRPOPLPUSH for atomic dequeue and move to processing queue
+                conn.brpoplpush(&self.queue_name, &self.processing_queue, 1.0)
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue task: {}", e)))?
+            }
+            QueueMode::Priority => {
+                // Use ZPOPMIN to get highest priority task (lowest score due to negation)
+                // Note: Redis doesn't have BZPOPMINLPUSH, so we do two operations
+                let items: Vec<(String, f64)> = conn
+                    .zpopmin(&self.queue_name, 1)
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue task: {}", e)))?;
+
+                if let Some((data, _score)) = items.first() {
+                    // Move to processing queue
+                    conn.lpush::<_, _, ()>(&self.processing_queue, data)
+                        .await
+                        .map_err(|e| {
+                            CelersError::Broker(format!("Failed to move task to processing: {}", e))
+                        })?;
+                    Some(data.clone())
+                } else {
+                    None
+                }
+            }
+        };
+
+        match result {
+            Some(data) => {
+                let task: SerializedTask = serde_json::from_str(&data)
+                    .map_err(|e| CelersError::Deserialization(e.to_string()))?;
+
+                debug!(
+                    "Dequeued task {} (priority: {})",
+                    task.metadata.id, task.metadata.priority
+                );
+                Ok(Some(BrokerMessage {
+                    task,
+                    receipt_handle: Some(data),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn ack(&self, task_id: &TaskId, receipt_handle: Option<&str>) -> Result<()> {
+        if let Some(handle) = receipt_handle {
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+            conn.lrem::<_, _, ()>(&self.processing_queue, 1, handle)
+                .await
+                .map_err(|e| CelersError::Broker(format!("Failed to ack task: {}", e)))?;
+
+            info!("Acknowledged task {}", task_id);
+        }
+        Ok(())
+    }
+
+    async fn reject(
+        &self,
+        task_id: &TaskId,
+        receipt_handle: Option<&str>,
+        requeue: bool,
+    ) -> Result<()> {
+        if let Some(handle) = receipt_handle {
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+            // Remove from processing queue
+            conn.lrem::<_, _, ()>(&self.processing_queue, 1, handle)
+                .await
+                .map_err(|e| {
+                    CelersError::Broker(format!("Failed to remove from processing: {}", e))
+                })?;
+
+            if requeue {
+                // Re-add to main queue (increment retry count)
+                let mut task: SerializedTask = serde_json::from_str(handle)
+                    .map_err(|e| CelersError::Deserialization(e.to_string()))?;
+
+                // Update task state to Retrying
+                let retry_count = match task.metadata.state {
+                    celers_core::TaskState::Retrying(count) => count + 1,
+                    _ => 1,
+                };
+                task.metadata.state = celers_core::TaskState::Retrying(retry_count);
+
+                let serialized = serde_json::to_string(&task)
+                    .map_err(|e| CelersError::Serialization(e.to_string()))?;
+
+                match self.mode {
+                    QueueMode::Fifo => {
+                        conn.rpush::<_, _, ()>(&self.queue_name, &serialized)
+                            .await
+                            .map_err(|e| {
+                                CelersError::Broker(format!("Failed to requeue task: {}", e))
+                            })?;
+                    }
+                    QueueMode::Priority => {
+                        let score = -task.metadata.priority as f64;
+                        conn.zadd::<_, _, _, ()>(&self.queue_name, &serialized, score)
+                            .await
+                            .map_err(|e| {
+                                CelersError::Broker(format!("Failed to requeue task: {}", e))
+                            })?;
+                    }
+                }
+
+                info!(
+                    "Rejected and requeued task {} (retry {})",
+                    task_id, retry_count
+                );
+            } else {
+                // Move to Dead Letter Queue
+                conn.lpush::<_, _, ()>(&self.dlq_name, handle)
+                    .await
+                    .map_err(|e| {
+                        CelersError::Broker(format!("Failed to move task to DLQ: {}", e))
+                    })?;
+                error!("Task {} failed permanently, moved to DLQ", task_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn queue_size(&self) -> Result<usize> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let size: usize = match self.mode {
+            QueueMode::Fifo => conn
+                .llen(&self.queue_name)
+                .await
+                .map_err(|e| CelersError::Broker(format!("Failed to get queue size: {}", e)))?,
+            QueueMode::Priority => conn
+                .zcard(&self.queue_name)
+                .await
+                .map_err(|e| CelersError::Broker(format!("Failed to get queue size: {}", e)))?,
+        };
+
+        #[cfg(feature = "metrics")]
+        {
+            QUEUE_SIZE.set(size as f64);
+
+            // Also update processing and DLQ sizes
+            let processing_size: usize = conn.llen(&self.processing_queue).await.unwrap_or(0);
+            PROCESSING_QUEUE_SIZE.set(processing_size as f64);
+
+            let dlq_size: usize = conn.llen(&self.dlq_name).await.unwrap_or(0);
+            DLQ_SIZE.set(dlq_size as f64);
+        }
+
+        Ok(size)
+    }
+
+    async fn cancel(&self, task_id: &TaskId) -> Result<bool> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        // Publish cancellation message
+        let cancel_msg = task_id.to_string();
+        let subscribers: i32 = conn
+            .publish(&self.cancel_channel, &cancel_msg)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to publish cancel message: {}", e)))?;
+
+        if subscribers > 0 {
+            info!(
+                "Published cancellation for task {} to {} subscriber(s)",
+                task_id, subscribers
+            );
+            Ok(true)
+        } else {
+            warn!("No subscribers listening for task {} cancellation", task_id);
+            Ok(false)
+        }
+    }
+
+    // Optimized batch operations using Redis pipelining
+
+    async fn enqueue_batch(&self, tasks: Vec<SerializedTask>) -> Result<Vec<TaskId>> {
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let mut task_ids = Vec::with_capacity(tasks.len());
+        let mut pipe = redis::pipe();
+
+        // Build pipeline with all enqueue operations
+        for task in &tasks {
+            let task_id = task.metadata.id;
+            task_ids.push(task_id);
+
+            let serialized = serde_json::to_string(&task)
+                .map_err(|e| CelersError::Serialization(e.to_string()))?;
+
+            match self.mode {
+                QueueMode::Fifo => {
+                    pipe.rpush(&self.queue_name, &serialized);
+                }
+                QueueMode::Priority => {
+                    let score = -(task.metadata.priority as f64);
+                    pipe.zadd(&self.queue_name, &serialized, score);
+                }
+            }
+        }
+
+        // Execute all operations in a single round-trip
+        pipe.query_async::<redis::Value>(&mut conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to enqueue batch: {}", e)))?;
+
+        debug!(
+            "Enqueued batch of {} tasks to queue {}",
+            tasks.len(),
+            self.queue_name
+        );
+
+        #[cfg(feature = "metrics")]
+        {
+            use celers_metrics::{
+                BATCH_ENQUEUE_TOTAL, BATCH_SIZE, TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL,
+            };
+            TASKS_ENQUEUED_TOTAL.inc_by(tasks.len() as f64);
+            BATCH_ENQUEUE_TOTAL.inc();
+            BATCH_SIZE.observe(tasks.len() as f64);
+
+            // Track per-task-type metrics
+            for task in &tasks {
+                let task_name = &task.metadata.name;
+                TASKS_ENQUEUED_BY_TYPE.with_label_values(&[task_name]).inc();
+            }
+        }
+
+        Ok(task_ids)
+    }
+
+    async fn dequeue_batch(&self, count: usize) -> Result<Vec<BrokerMessage>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let mut messages = Vec::with_capacity(count);
+
+        match self.mode {
+            QueueMode::Fifo => {
+                // Use pipeline for FIFO batch dequeue
+                let mut pipe = redis::pipe();
+                for _ in 0..count {
+                    pipe.rpoplpush(&self.queue_name, &self.processing_queue);
+                }
+
+                let results: Vec<Option<String>> = pipe
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue batch: {}", e)))?;
+
+                for data_opt in results {
+                    if let Some(data) = data_opt {
+                        let task: SerializedTask = serde_json::from_str(&data)
+                            .map_err(|e| CelersError::Deserialization(e.to_string()))?;
+
+                        messages.push(BrokerMessage {
+                            task,
+                            receipt_handle: Some(data),
+                        });
+                    } else {
+                        break; // Queue is empty
+                    }
+                }
+            }
+            QueueMode::Priority => {
+                // For priority queue, pop multiple items at once
+                let items: Vec<(String, f64)> = conn
+                    .zpopmin(&self.queue_name, count as isize)
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue batch: {}", e)))?;
+
+                if !items.is_empty() {
+                    // Move all to processing queue using pipeline
+                    let mut pipe = redis::pipe();
+                    for (data, _score) in &items {
+                        pipe.lpush(&self.processing_queue, data);
+                    }
+
+                    pipe.query_async::<redis::Value>(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            CelersError::Broker(format!(
+                                "Failed to move batch to processing: {}",
+                                e
+                            ))
+                        })?;
+
+                    for (data, _score) in items {
+                        let task: SerializedTask = serde_json::from_str(&data)
+                            .map_err(|e| CelersError::Deserialization(e.to_string()))?;
+
+                        messages.push(BrokerMessage {
+                            task,
+                            receipt_handle: Some(data),
+                        });
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "Dequeued batch of {} tasks from queue {}",
+            messages.len(),
+            self.queue_name
+        );
+
+        #[cfg(feature = "metrics")]
+        if !messages.is_empty() {
+            use celers_metrics::{BATCH_DEQUEUE_TOTAL, BATCH_SIZE};
+            BATCH_DEQUEUE_TOTAL.inc();
+            BATCH_SIZE.observe(messages.len() as f64);
+        }
+
+        Ok(messages)
+    }
+
+    async fn ack_batch(&self, tasks: &[(TaskId, Option<String>)]) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let mut pipe = redis::pipe();
+        let mut ack_count = 0;
+
+        for (task_id, receipt_handle) in tasks {
+            if let Some(handle) = receipt_handle {
+                pipe.lrem(&self.processing_queue, 1, handle);
+                ack_count += 1;
+            } else {
+                warn!("No receipt handle for task {}, skipping ack", task_id);
+            }
+        }
+
+        if ack_count > 0 {
+            pipe.query_async::<redis::Value>(&mut conn)
+                .await
+                .map_err(|e| CelersError::Broker(format!("Failed to ack batch: {}", e)))?;
+
+            debug!("Acknowledged batch of {} tasks", ack_count);
+        }
+
+        Ok(())
+    }
+
+    // Delayed Task Execution
+
+    async fn enqueue_at(&self, task: SerializedTask, execute_at: i64) -> Result<TaskId> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let task_id = task.metadata.id;
+        let serialized =
+            serde_json::to_string(&task).map_err(|e| CelersError::Serialization(e.to_string()))?;
+
+        // Add to delayed queue (sorted set with execute_at as score)
+        conn.zadd::<_, _, _, ()>(&self.delayed_queue, &serialized, execute_at as f64)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to schedule delayed task: {}", e)))?;
+
+        debug!(
+            "Scheduled task {} for execution at Unix timestamp {} (queue: {})",
+            task_id, execute_at, self.delayed_queue
+        );
+
+        #[cfg(feature = "metrics")]
+        {
+            TASKS_ENQUEUED_TOTAL.inc();
+
+            // Track per-task-type metrics
+            let task_name = &task.metadata.name;
+            TASKS_ENQUEUED_BY_TYPE.with_label_values(&[task_name]).inc();
+        }
+
+        Ok(task_id)
+    }
+
+    async fn enqueue_after(&self, task: SerializedTask, delay_secs: u64) -> Result<TaskId> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CelersError::Other(format!("Failed to get current time: {}", e)))?
+            .as_secs() as i64;
+
+        let execute_at = now + delay_secs as i64;
+        self.enqueue_at(task, execute_at).await
+    }
+}

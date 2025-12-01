@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package result_backend;
+
+// Result backend service for task result storage and chord synchronization
+service ResultBackendService {
+  // Store task result
+  rpc StoreResult(StoreResultRequest) returns (StoreResultResponse);
+
+  // Get task result
+  rpc GetResult(GetResultRequest) returns (GetResultResponse);
+
+  // Delete task result
+  rpc DeleteResult(DeleteResultRequest) returns (DeleteResultResponse);
+
+  // Set result expiration
+  rpc SetExpiration(SetExpirationRequest) returns (SetExpirationResponse);
+
+  // Initialize chord state
+  rpc ChordInit(ChordInitRequest) returns (ChordInitResponse);
+
+  // Complete chord task (increment counter)
+  rpc ChordCompleteTask(ChordCompleteTaskRequest) returns (ChordCompleteTaskResponse);
+
+  // Get chord state
+  rpc ChordGetState(ChordGetStateRequest) returns (ChordGetStateResponse);
+}
+
+// Task result state
+enum TaskResultState {
+  PENDING = 0;
+  STARTED = 1;
+  SUCCESS = 2;
+  FAILURE = 3;
+  REVOKED = 4;
+  RETRY = 5;
+}
+
+// Task metadata
+message TaskMeta {
+  string task_id = 1;
+  string task_name = 2;
+  TaskResultState result_state = 3;
+  optional string result_data = 4;  // JSON string
+  optional string error_message = 5;
+  optional uint32 retry_count = 6;
+  int64 created_at = 7;  // Unix timestamp (seconds)
+  optional int64 started_at = 8;
+  optional int64 completed_at = 9;
+  optional string worker = 10;
+}
+
+// Chord state
+message ChordState {
+  string chord_id = 1;
+  uint32 total = 2;
+  uint32 completed = 3;
+  optional string callback = 4;
+  repeated string task_ids = 5;  // Array of task UUIDs
+}
+
+// Store result request/response
+message StoreResultRequest {
+  string task_id = 1;
+  TaskMeta meta = 2;
+}
+
+message StoreResultResponse {
+  bool success = 1;
+}
+
+// Get result request/response
+message GetResultRequest {
+  string task_id = 1;
+}
+
+message GetResultResponse {
+  optional TaskMeta meta = 1;
+}
+
+// Delete result request/response
+message DeleteResultRequest {
+  string task_id = 1;
+}
+
+message DeleteResultResponse {
+  bool success = 1;
+}
+
+// Set expiration request/response
+message SetExpirationRequest {
+  string task_id = 1;
+  uint64 ttl_seconds = 2;
+}
+
+message SetExpirationResponse {
+  bool success = 1;
+}
+
+// Chord init request/response
+message ChordInitRequest {
+  ChordState state = 1;
+}
+
+message ChordInitResponse {
+  bool success = 1;
+}
+
+// Chord complete task request/response
+message ChordCompleteTaskRequest {
+  string chord_id = 1;
+}
+
+message ChordCompleteTaskResponse {
+  uint32 completed_count = 1;
+}
+
+// Chord get state request/response
+message ChordGetStateRequest {
+  string chord_id = 1;
+}
+
+message ChordGetStateResponse {
+  optional ChordState state = 1;
+}

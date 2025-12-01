@@ -1,0 +1,81 @@
+[package]
+name = "celers"
+version = "0.1.0"
+edition = "2021"
+authors = ["CeleRS Contributors"]
+description = "Celery-compatible distributed task queue for Rust (Facade crate)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cool-japan/celers"
+readme = "README.md"
+keywords = ["celery", "task-queue", "distributed", "async", "worker"]
+categories = ["asynchronous", "network-programming", "concurrency"]
+
+[dependencies]
+# Re-export core functionality
+celers-core = { path = "../celers-core", version = "0.1.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+celers-kombu = { path = "../celers-kombu", version = "0.1.0" }
+celers-worker = { path = "../celers-worker", version = "0.1.0" }
+celers-canvas = { path = "../celers-canvas", version = "0.1.0" }
+celers-macros = { path = "../celers-macros", version = "0.1.0" }
+
+# Optional broker implementations
+celers-broker-redis = { path = "../celers-broker-redis", version = "0.1.0", optional = true }
+celers-broker-postgres = { path = "../celers-broker-postgres", version = "0.1.0", optional = true }
+celers-broker-sql = { path = "../celers-broker-sql", version = "0.1.0", optional = true }
+celers-broker-amqp = { path = "../celers-broker-amqp", version = "0.1.0", optional = true }
+celers-broker-sqs = { path = "../celers-broker-sqs", version = "0.1.0", optional = true }
+
+# Optional backend implementations
+celers-backend-redis = { path = "../celers-backend-redis", version = "0.1.0", optional = true }
+celers-backend-db = { path = "../celers-backend-db", version = "0.1.0", optional = true }
+celers-backend-rpc = { path = "../celers-backend-rpc", version = "0.1.0", optional = true }
+
+# Optional beat scheduler
+celers-beat = { path = "../celers-beat", version = "0.1.0", optional = true }
+
+# Optional metrics
+celers-metrics = { path = "../celers-metrics", version = "0.1.0", optional = true }
+
+# Core async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Re-exported types
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+thiserror = "2.0"
+
+[features]
+default = ["redis", "json"]
+
+# Broker features
+redis = ["celers-broker-redis"]
+postgres = ["celers-broker-postgres"]
+mysql = ["celers-broker-sql"]
+amqp = ["celers-broker-amqp"]
+sqs = ["celers-broker-sqs"]
+
+# Backend features
+backend-redis = ["celers-backend-redis"]
+backend-db = ["celers-backend-db"]
+backend-rpc = ["celers-backend-rpc"]
+
+# Scheduler
+beat = ["celers-beat"]
+
+# Serialization
+json = []
+msgpack = ["celers-protocol/msgpack"]
+
+# Observability
+metrics = ["celers-metrics"]
+tracing = []
+
+# Full feature set
+full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-db", "backend-rpc", "beat", "json", "msgpack", "metrics", "tracing"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+anyhow = "1.0"

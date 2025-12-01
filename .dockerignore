@@ -1,0 +1,35 @@
+# Git
+.git/
+.gitignore
+.github/
+
+# Build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+docs/
+LICENSE*
+
+# Tests and benchmarks
+benches/
+tests/
+examples/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,23 @@
+[package]
+name = "celers-kombu"
+version = "0.1.0"
+edition = "2021"
+authors = ["CeleRS Contributors"]
+description = "Broker abstraction layer for CeleRS (inspired by Python Kombu)"
+keywords = ["celery", "kombu", "messaging", "amqp", "queue"]
+categories = ["network-programming", "asynchronous"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/celers"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.11", features = ["v4"] }
+
+# Core protocol
+celers-protocol = { path = "../celers-protocol" }
+
+[dev-dependencies]
+tokio = { version = "1.42", features = ["full"] }

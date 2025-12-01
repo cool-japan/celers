@@ -1,0 +1,33 @@
+[package]
+name = "celers-worker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Task execution runtime for CeleRS with concurrency control and health checks"
+keywords = ["celery", "worker", "runtime", "executor", "async"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+celers-core = { path = "../celers-core" }
+celers-canvas = { path = "../celers-canvas", optional = true }
+celers-backend-redis = { path = "../celers-backend-redis", optional = true }
+celers-metrics = { path = "../celers-metrics", optional = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hostname = { workspace = true }
+chrono = { workspace = true }
+
+[features]
+default = []
+metrics = ["celers-metrics"]
+canvas = ["celers-canvas"]
+workflows = ["canvas", "celers-backend-redis"]

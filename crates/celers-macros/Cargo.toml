@@ -1,0 +1,18 @@
+[package]
+name = "celers-macros"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Procedural macros for CeleRS task definitions (#[task], #[derive(Task)])"
+keywords = ["celery", "macros", "procedural", "task", "derive"]
+categories = ["asynchronous", "development-tools"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1.0.42"
+syn = { version = "2.0.111", features = ["full"] }
+proc-macro2 = "1.0.103"

@@ -1,0 +1,31 @@
+[package]
+name = "celers-canvas"
+version = "0.1.0"
+edition = "2021"
+authors = ["CeleRS Contributors"]
+description = "Workflow primitives for CeleRS (Chain, Chord, Group, Map)"
+keywords = ["celery", "workflow", "canvas", "chain", "chord"]
+categories = ["asynchronous", "concurrency"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/celers"
+
+[dependencies]
+async-trait = "0.1"
+regex = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.11", features = ["v4"] }
+
+# Core dependencies
+celers-core = { path = "../celers-core" }
+celers-protocol = { path = "../celers-protocol" }
+celers-kombu = { path = "../celers-kombu" }
+celers-backend-redis = { path = "../celers-backend-redis", optional = true }
+
+[features]
+default = []
+backend-redis = ["celers-backend-redis"]
+
+[dev-dependencies]
+tokio = { version = "1.42", features = ["full"] }

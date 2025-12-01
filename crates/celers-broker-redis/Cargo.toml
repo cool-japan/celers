@@ -1,0 +1,25 @@
+[package]
+name = "celers-broker-redis"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Redis broker implementation for CeleRS with Lua scripts and priority queues"
+keywords = ["celery", "redis", "broker", "queue", "async"]
+categories = ["asynchronous", "network-programming", "caching"]
+
+[dependencies]
+celers-core = { path = "../celers-core" }
+celers-metrics = { path = "../celers-metrics", optional = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+redis = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+metrics = ["celers-metrics"]

@@ -1,0 +1,15 @@
+[package]
+name = "celers-metrics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prometheus metrics and observability for CeleRS"
+keywords = ["celery", "metrics", "prometheus", "monitoring", "observability"]
+categories = ["asynchronous", "development-tools"]
+
+[dependencies]
+prometheus = "0.13.4"
+tokio = { workspace = true }
+lazy_static = "1.5.0"

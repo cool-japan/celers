@@ -1,0 +1,27 @@
+[package]
+name = "celers-protocol"
+version = "0.1.0"
+edition = "2021"
+authors = ["CeleRS Contributors"]
+description = "Celery Protocol v2/v5 implementation for CeleRS"
+keywords = ["celery", "protocol", "messaging", "serialization", "kombu"]
+categories = ["encoding", "network-programming"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/celers"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+
+# Optional serialization formats
+rmp-serde = { version = "1.3", optional = true }  # MessagePack
+bincode = { version = "2.0.0-rc.3", optional = true }  # Binary
+
+[features]
+default = ["json"]
+json = []
+msgpack = ["rmp-serde"]
+binary = ["bincode"]

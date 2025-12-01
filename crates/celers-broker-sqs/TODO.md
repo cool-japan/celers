@@ -1,0 +1,218 @@
+# celers-broker-sqs TODO
+
+> AWS SQS broker implementation for CeleRS
+
+## Status: ✅ FEATURE COMPLETE
+
+Full AWS SQS broker implementation with long polling, visibility timeout management, and IAM authentication.
+
+## Completed Features
+
+### Core Operations ✅
+- [x] `connect()` - Initialize AWS SDK client and get queue URL
+- [x] `disconnect()` - Clean up AWS client
+- [x] `publish()` - Send messages to SQS queue
+- [x] `consume()` - Receive messages with long polling
+- [x] `ack()` - Delete message from queue (acknowledge)
+- [x] `reject()` - Reject message with optional requeue
+- [x] `queue_size()` - Get approximate number of messages
+
+### Queue Management ✅
+- [x] `create_queue()` - Create SQS queue with attributes
+- [x] `delete_queue()` - Delete SQS queue
+- [x] `purge()` - Remove all messages from queue
+- [x] `list_queues()` - List all available queues
+
+### AWS SQS Features ✅
+- [x] Long polling (up to 20 seconds wait time)
+- [x] Visibility timeout configuration
+- [x] Message attributes for priority and correlation ID
+- [x] Receive count tracking (redelivered flag)
+- [x] IAM role authentication via AWS SDK
+- [x] Queue URL caching for performance
+
+### Configuration ✅
+- [x] Builder pattern for configuration
+- [x] `with_visibility_timeout()` - Set visibility timeout
+- [x] `with_wait_time()` - Set long polling wait time
+- [x] `with_max_messages()` - Set max messages per poll
+- [x] Automatic AWS credential detection
+
+### Batch Operations ✅
+- [x] `publish_batch()` - Send up to 10 messages in a single API call
+- [x] `consume_batch()` - Receive up to 10 messages at once
+- [x] `ack_batch()` - Delete up to 10 messages in a single call
+- [x] 10x cost reduction vs individual operations
+- [x] Automatic handling of partial failures
+
+## AWS SQS Specifics
+
+### Message Attributes
+- **priority**: Stored as Number attribute (SQS doesn't natively support priority)
+- **correlation_id**: Stored as String attribute for request-response patterns
+
+### Long Polling
+- Default wait time: 20 seconds (maximum allowed by SQS)
+- Reduces empty receives and costs
+- Configurable via `with_wait_time()`
+
+### Visibility Timeout
+- Default: 30 seconds
+- Time window for message processing before redelivery
+- Configurable via `with_visibility_timeout()`
+
+### Queue URL Caching
+- Queue URLs are fetched once and cached
+- Reduces API calls to AWS
+- Automatically refreshed on connection
+
+## Implementation Details
+
+### Message Format
+- Messages serialized to JSON
+- Compatible with Celery protocol via celers-protocol
+- Message attributes used for metadata (priority, correlation_id)
+
+### Error Handling
+- AWS SDK errors mapped to BrokerError
+- Automatic retry with AWS SDK defaults
+- Connection errors properly propagated
+
+### Authentication
+- Uses AWS SDK credential chain:
+  1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+  2. IAM role (recommended for EC2/ECS)
+  3. AWS credentials file (~/.aws/credentials)
+  4. ECS container credentials
+  5. EC2 instance metadata
+
+## Future Enhancements
+
+### Advanced Features
+- [ ] Dead Letter Queue (DLQ) configuration
+- [ ] Message deduplication (FIFO queues)
+- [ ] Content-based deduplication
+- [ ] FIFO queue support
+- [ ] Server-side encryption (SSE)
+- [ ] KMS key configuration
+
+### Monitoring
+- [ ] CloudWatch metrics integration
+- [ ] Queue depth monitoring
+- [ ] Age of oldest message tracking
+- [ ] Receive count statistics
+
+### Performance
+- [ ] Connection pooling (if needed)
+- [ ] Parallel message processing
+- [ ] Adaptive polling strategies
+- [ ] Cost optimization recommendations
+
+## Testing Status
+
+- [x] Compilation tests
+- [x] Unit tests (broker creation, builder pattern)
+- [ ] Integration tests with LocalStack
+- [ ] Integration tests with real AWS SQS
+- [ ] Performance benchmarks
+- [ ] Cost analysis
+
+## Documentation
+
+- [x] Module-level documentation
+- [x] API documentation
+- [x] Feature documentation
+- [ ] AWS IAM policy examples
+- [ ] Deployment guide
+- [ ] Cost optimization guide
+- [ ] Monitoring setup guide
+
+## Dependencies
+
+- `celers-protocol`: Message protocol
+- `celers-kombu`: Broker traits
+- `aws-config`: AWS configuration loading
+- `aws-sdk-sqs`: SQS client library
+- `serde_json`: Message serialization
+- `tracing`: Logging
+
+## AWS IAM Requirements
+
+Minimum IAM permissions needed:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes",
+        "sqs:ListQueues",
+        "sqs:CreateQueue",
+        "sqs:DeleteQueue",
+        "sqs:PurgeQueue"
+      ],
+      "Resource": "arn:aws:sqs:*:*:*"
+    }
+  ]
+}
+```
+
+For production, restrict `Resource` to specific queue ARNs.
+
+## SQS Limits
+
+- Message size: 256 KB maximum
+- Message retention: 1 minute to 14 days (default 4 days)
+- Visibility timeout: 0 seconds to 12 hours
+- Long polling wait time: 0 to 20 seconds
+- Batch size: Up to 10 messages
+- Queue name: Alphanumeric, hyphens, underscores (max 80 chars)
+- FIFO queue throughput: 300 TPS (can increase with batching)
+- Standard queue throughput: Nearly unlimited
+
+## Cost Considerations
+
+### Standard Queues
+- $0.40 per million requests (first 1 million free per month)
+- Requests include: SendMessage, ReceiveMessage, DeleteMessage, etc.
+
+### FIFO Queues
+- $0.50 per million requests (first 1 million free per month)
+
+### Cost Optimization Tips
+1. Use long polling to reduce empty receives
+2. Batch operations when possible (10x cheaper)
+3. Adjust visibility timeout to avoid duplicate processing
+4. Use IAM roles instead of access keys (free, more secure)
+5. Consider message size (large messages cost the same as small)
+
+## Notes
+
+- SQS is a managed service - no infrastructure to manage
+- Messages delivered at-least-once (standard queues)
+- Messages delivered exactly-once (FIFO queues)
+- Priority queues not natively supported (use message attributes)
+- No broker topology (exchanges/bindings) like AMQP
+- Ideal for cloud-native, serverless architectures
+- Automatic scaling and redundancy
+
+## Comparison with Other Brokers
+
+### vs RabbitMQ (AMQP)
+- **Pros**: Fully managed, no infrastructure, unlimited scale, pay-per-use
+- **Cons**: No advanced routing, higher latency, no priority queues
+
+### vs Redis
+- **Pros**: Durable by design, managed service, better for async patterns
+- **Cons**: Higher latency, no sub-millisecond performance, costs
+
+### vs PostgreSQL/MySQL
+- **Pros**: Managed service, no database maintenance, better scalability
+- **Cons**: Cannot query message history, no SQL-based analytics
