@@ -32,8 +32,8 @@ sha2 = { version = "0.10", optional = true }  # SHA-256 for HMAC
 aes-gcm = { version = "0.10", optional = true }  # AES-256-GCM encryption
 
 # Optional serialization formats
-prost = { version = "0.13", optional = true }  # Protobuf
-bson = { version = "2.13", optional = true }  # BSON
+prost = { version = "0.14", optional = true }  # Protobuf
+bson = { version = "3.1", optional = true }  # BSON
 
 [features]
 default = ["json"]
@@ -52,7 +52,7 @@ crypto = ["signing", "encryption"]
 all-serializers = ["msgpack", "yaml", "protobuf", "bson-format"]
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "message_benchmarks"
