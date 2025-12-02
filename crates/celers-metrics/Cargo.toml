@@ -10,6 +10,6 @@ keywords = ["celery", "metrics", "prometheus", "monitoring", "observability"]
 categories = ["asynchronous", "development-tools"]
 
 [dependencies]
-prometheus = "0.13.4"
+prometheus = "0.14.0"
 tokio = { workspace = true }
 lazy_static = "1.5.0"
