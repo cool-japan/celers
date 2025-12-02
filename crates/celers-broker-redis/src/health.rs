@@ -5,6 +5,7 @@
 //! - Memory usage monitoring
 //! - Server info retrieval
 //! - Keyspace statistics
+//! - Replication lag monitoring
 
 use celers_core::{CelersError, Result};
 use redis::AsyncCommands;
@@ -77,6 +78,57 @@ impl QueueStats {
     /// Total number of tasks across all queues
     pub fn total(&self) -> usize {
         self.pending + self.processing + self.dlq + self.delayed
+    }
+}
+
+/// Keyspace statistics for a Redis database
+#[derive(Debug, Clone, Default)]
+pub struct KeyspaceStats {
+    /// Database number
+    pub db: u32,
+    /// Number of keys
+    pub keys: u64,
+    /// Number of keys with expiration
+    pub expires: u64,
+    /// Average TTL in milliseconds
+    pub avg_ttl: Option<u64>,
+}
+
+/// Replication information
+#[derive(Debug, Clone, Default)]
+pub struct ReplicationInfo {
+    /// Role (master, slave, sentinel)
+    pub role: String,
+    /// Number of connected slaves (if master)
+    pub connected_slaves: Option<u32>,
+    /// Master host (if slave)
+    pub master_host: Option<String>,
+    /// Master port (if slave)
+    pub master_port: Option<u16>,
+    /// Replication lag in seconds (if slave)
+    pub replication_lag_secs: Option<u64>,
+    /// Master link status (if slave)
+    pub master_link_status: Option<String>,
+    /// Is replication healthy?
+    pub is_healthy: bool,
+}
+
+impl ReplicationInfo {
+    /// Check if this is a master
+    pub fn is_master(&self) -> bool {
+        self.role == "master"
+    }
+
+    /// Check if this is a slave
+    pub fn is_slave(&self) -> bool {
+        self.role == "slave"
+    }
+
+    /// Check if replication lag is critical (> threshold seconds)
+    pub fn is_lag_critical(&self, threshold_secs: u64) -> bool {
+        self.replication_lag_secs
+            .map(|lag| lag > threshold_secs)
+            .unwrap_or(false)
     }
 }
 
@@ -208,6 +260,119 @@ impl HealthChecker {
 
         Ok(parse_redis_info(&info))
     }
+
+    /// Get keyspace statistics for all databases
+    pub async fn get_keyspace_stats(&self) -> Result<Vec<KeyspaceStats>> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
+
+        let info: String = redis::cmd("INFO")
+            .arg("keyspace")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get keyspace info: {}", e)))?;
+
+        let info_map = parse_redis_info(&info);
+        let mut stats = Vec::new();
+
+        // Parse keyspace entries (e.g., "db0:keys=10,expires=2,avg_ttl=1000")
+        for (key, value) in info_map {
+            if let Some(db_num) = key.strip_prefix("db") {
+                if let Ok(db) = db_num.parse::<u32>() {
+                    let mut keys = 0;
+                    let mut expires = 0;
+                    let mut avg_ttl = None;
+
+                    // Parse the value (format: "keys=10,expires=2,avg_ttl=1000")
+                    for part in value.split(',') {
+                        if let Some((k, v)) = part.split_once('=') {
+                            match k {
+                                "keys" => keys = v.parse().unwrap_or(0),
+                                "expires" => expires = v.parse().unwrap_or(0),
+                                "avg_ttl" => avg_ttl = v.parse().ok(),
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    stats.push(KeyspaceStats {
+                        db,
+                        keys,
+                        expires,
+                        avg_ttl,
+                    });
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Get replication information
+    pub async fn get_replication_info(&self) -> Result<ReplicationInfo> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
+
+        let info: String = redis::cmd("INFO")
+            .arg("replication")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get replication info: {}", e)))?;
+
+        let info_map = parse_redis_info(&info);
+
+        let role = info_map
+            .get("role")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let mut repl_info = ReplicationInfo {
+            role: role.clone(),
+            ..Default::default()
+        };
+
+        if role == "master" {
+            repl_info.connected_slaves = info_map
+                .get("connected_slaves")
+                .and_then(|v| v.parse().ok());
+            repl_info.is_healthy = true;
+        } else if role == "slave" {
+            repl_info.master_host = info_map.get("master_host").cloned();
+            repl_info.master_port = info_map.get("master_port").and_then(|v| v.parse().ok());
+            repl_info.master_link_status = info_map.get("master_link_status").cloned();
+
+            // Calculate replication lag
+            if let Some(lag_str) = info_map.get("master_repl_offset") {
+                if let (Some(master_offset), Some(slave_offset)) = (
+                    lag_str.parse::<u64>().ok(),
+                    info_map
+                        .get("slave_repl_offset")
+                        .and_then(|v| v.parse::<u64>().ok()),
+                ) {
+                    // Rough estimation: assume 1 byte = 1 microsecond (adjust as needed)
+                    let lag = master_offset.saturating_sub(slave_offset);
+                    repl_info.replication_lag_secs = Some(lag / 1_000_000);
+                }
+            }
+
+            // Check if master link is up
+            repl_info.is_healthy = repl_info
+                .master_link_status
+                .as_ref()
+                .map(|s| s == "up")
+                .unwrap_or(false);
+        } else {
+            repl_info.is_healthy = true; // Sentinel or unknown
+        }
+
+        Ok(repl_info)
+    }
 }
 
 /// Parse Redis INFO command output into a HashMap
@@ -287,5 +452,64 @@ maxmemory:10240000
         assert_eq!(map.get("connected_clients"), Some(&"10".to_string()));
         assert_eq!(map.get("used_memory"), Some(&"1024000".to_string()));
         assert_eq!(map.get("maxmemory"), Some(&"10240000".to_string()));
+    }
+
+    #[test]
+    fn test_keyspace_stats() {
+        let stats = KeyspaceStats {
+            db: 0,
+            keys: 100,
+            expires: 20,
+            avg_ttl: Some(5000),
+        };
+        assert_eq!(stats.db, 0);
+        assert_eq!(stats.keys, 100);
+        assert_eq!(stats.expires, 20);
+        assert_eq!(stats.avg_ttl, Some(5000));
+    }
+
+    #[test]
+    fn test_replication_info_master() {
+        let info = ReplicationInfo {
+            role: "master".to_string(),
+            connected_slaves: Some(2),
+            is_healthy: true,
+            ..Default::default()
+        };
+        assert!(info.is_master());
+        assert!(!info.is_slave());
+        assert!(info.is_healthy);
+        assert_eq!(info.connected_slaves, Some(2));
+    }
+
+    #[test]
+    fn test_replication_info_slave() {
+        let info = ReplicationInfo {
+            role: "slave".to_string(),
+            master_host: Some("localhost".to_string()),
+            master_port: Some(6379),
+            master_link_status: Some("up".to_string()),
+            replication_lag_secs: Some(5),
+            is_healthy: true,
+            ..Default::default()
+        };
+        assert!(!info.is_master());
+        assert!(info.is_slave());
+        assert!(info.is_healthy);
+        assert_eq!(info.replication_lag_secs, Some(5));
+    }
+
+    #[test]
+    fn test_replication_lag_critical() {
+        let mut info = ReplicationInfo {
+            role: "slave".to_string(),
+            replication_lag_secs: Some(100),
+            ..Default::default()
+        };
+        assert!(info.is_lag_critical(50));
+        assert!(!info.is_lag_critical(150));
+
+        info.replication_lag_secs = None;
+        assert!(!info.is_lag_critical(50));
     }
 }

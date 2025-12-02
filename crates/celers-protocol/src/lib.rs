@@ -28,16 +28,34 @@
 //! - [`negotiation`] - Protocol version negotiation
 //! - [`security`] - Security utilities and content-type whitelist
 //! - [`builder`] - Fluent message builder API
+//! - [`auth`] - Message authentication and signing (HMAC)
+//! - [`crypto`] - Message encryption (AES-256-GCM)
+//! - [`extensions`] - Message extensions and utility helpers
+//! - [`migration`] - Protocol version migration helpers
+//! - [`middleware`] - Message transformation middleware
+//! - [`zerocopy`] - Zero-copy deserialization for performance
+//! - [`lazy`] - Lazy deserialization for large messages
+//! - [`pool`] - Message pooling for memory efficiency
+//! - [`extension_api`] - Custom protocol extensions API
 
+pub mod auth;
 pub mod builder;
 pub mod compat;
 pub mod compression;
+pub mod crypto;
 pub mod embed;
 pub mod event;
+pub mod extension_api;
+pub mod extensions;
+pub mod lazy;
+pub mod middleware;
+pub mod migration;
 pub mod negotiation;
+pub mod pool;
 pub mod result;
 pub mod security;
 pub mod serializer;
+pub mod zerocopy;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

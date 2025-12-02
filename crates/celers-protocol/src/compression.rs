@@ -180,7 +180,7 @@ impl Compressor {
         use flate2::write::GzEncoder;
         use flate2::Compression;
 
-        let level = self.level.min(9) as u32;
+        let level = self.level.min(9);
         let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
         encoder
             .write_all(data)

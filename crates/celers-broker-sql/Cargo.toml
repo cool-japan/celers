@@ -31,3 +31,4 @@ metrics = ["celers-metrics"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+futures = "0.3"

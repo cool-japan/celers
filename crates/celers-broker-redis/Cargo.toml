@@ -19,6 +19,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 redis = { workspace = true }
 tracing = { workspace = true }
+flate2 = { workspace = true }
+crc32fast = "1.4"
 
 [features]
 default = []

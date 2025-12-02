@@ -14,6 +14,81 @@
 //! - Task status inspection
 //! - Database health checks
 //! - Automatic task archiving
+//!
+//! # Quick Start
+//!
+//! ```no_run
+//! use celers_broker_postgres::PostgresBroker;
+//! use celers_core::{Broker, SerializedTask};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create broker and run migrations
+//! let broker = PostgresBroker::new("postgres://user:pass@localhost/mydb").await?;
+//! broker.migrate().await?;
+//!
+//! // Enqueue a task
+//! let task = SerializedTask::new("my_task".to_string(), vec![1, 2, 3]);
+//! let task_id = broker.enqueue(task).await?;
+//!
+//! // Dequeue and process
+//! if let Some(msg) = broker.dequeue().await? {
+//!     // Process task...
+//!     broker.ack(&msg.task.metadata.id, msg.receipt_handle.as_deref()).await?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Delayed Execution
+//!
+//! Schedule tasks for future execution:
+//!
+//! ```no_run
+//! use celers_broker_postgres::PostgresBroker;
+//! use celers_core::{Broker, SerializedTask};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+//! let task = SerializedTask::new("delayed_task".to_string(), vec![]);
+//!
+//! // Schedule for specific timestamp (Unix seconds)
+//! let execute_at = 1735689600; // Some future timestamp
+//! broker.enqueue_at(task.clone(), execute_at).await?;
+//!
+//! // Or schedule after a delay (seconds)
+//! broker.enqueue_after(task, 300).await?; // 5 minutes from now
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Batch Operations
+//!
+//! Process multiple tasks efficiently:
+//!
+//! ```no_run
+//! use celers_broker_postgres::PostgresBroker;
+//! use celers_core::{Broker, SerializedTask};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+//! // Batch enqueue
+//! let tasks = vec![
+//!     SerializedTask::new("task1".to_string(), vec![1]),
+//!     SerializedTask::new("task2".to_string(), vec![2]),
+//! ];
+//! broker.enqueue_batch(tasks).await?;
+//!
+//! // Batch dequeue
+//! let messages = broker.dequeue_batch(10).await?;
+//!
+//! // Batch acknowledge
+//! let acks: Vec<_> = messages.iter()
+//!     .map(|m| (m.task.metadata.id, m.receipt_handle.clone()))
+//!     .collect();
+//! broker.ack_batch(&acks).await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use async_trait::async_trait;
 use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
@@ -231,6 +306,33 @@ impl PostgresBroker {
         })
     }
 
+    /// Create a new PostgreSQL broker with custom pool configuration
+    ///
+    /// # Arguments
+    /// * `database_url` - PostgreSQL connection string
+    /// * `queue_name` - Logical queue name
+    /// * `max_connections` - Maximum number of connections in the pool
+    /// * `acquire_timeout_secs` - Timeout for acquiring a connection (seconds)
+    pub async fn with_pool_config(
+        database_url: &str,
+        queue_name: &str,
+        max_connections: u32,
+        acquire_timeout_secs: u64,
+    ) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+            .connect(database_url)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
+
+        Ok(Self {
+            pool,
+            queue_name: queue_name.to_string(),
+            paused: AtomicBool::new(false),
+        })
+    }
+
     /// Run database migrations
     pub async fn migrate(&self) -> Result<()> {
         // Run initial schema migration
@@ -253,6 +355,11 @@ impl PostgresBroker {
     /// Get the underlying connection pool
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Get the queue name
+    pub fn queue_name(&self) -> &str {
+        &self.queue_name
     }
 
     /// Move a task to the Dead Letter Queue
@@ -881,6 +988,209 @@ impl PostgresBroker {
 
         tracing::info!("Analyzed all CeleRS tables");
         Ok(())
+    }
+
+    /// Manually vacuum CeleRS tables to reclaim space
+    ///
+    /// This is useful for high-churn queues. For most cases, PostgreSQL's
+    /// autovacuum is sufficient.
+    pub async fn vacuum_tables(&self) -> Result<()> {
+        sqlx::query("VACUUM ANALYZE celers_tasks")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to vacuum celers_tasks: {}", e)))?;
+
+        sqlx::query("VACUUM ANALYZE celers_dead_letter_queue")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to vacuum celers_dead_letter_queue: {}", e))
+            })?;
+
+        sqlx::query("VACUUM ANALYZE celers_task_results")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to vacuum celers_task_results: {}", e))
+            })?;
+
+        tracing::info!("Vacuumed all CeleRS tables");
+        Ok(())
+    }
+
+    /// Count tasks by state
+    ///
+    /// Returns the number of tasks in the specified state.
+    pub async fn count_by_state(&self, state: DbTaskState) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE state = $1")
+            .bind(state.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to count tasks by state: {}", e)))?;
+
+        Ok(count)
+    }
+
+    /// Get the number of tasks scheduled for future execution
+    ///
+    /// Returns the count of tasks that are pending but scheduled for a future time.
+    pub async fn count_scheduled(&self) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM celers_tasks WHERE state = 'pending' AND scheduled_at > NOW()",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to count scheduled tasks: {}", e)))?;
+
+        Ok(count)
+    }
+
+    /// Cancel all pending tasks
+    ///
+    /// Returns the number of tasks cancelled.
+    pub async fn cancel_all_pending(&self) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW()
+            WHERE state = 'pending'
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel all pending tasks: {}", e)))?;
+
+        tracing::warn!(
+            count = result.rows_affected(),
+            "Cancelled all pending tasks"
+        );
+        Ok(result.rows_affected())
+    }
+
+    /// Test database connectivity
+    ///
+    /// Performs a simple query to verify the connection is working.
+    /// Returns true if the connection is healthy.
+    pub async fn test_connection(&self) -> Result<bool> {
+        let result: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Connection test failed: {}", e)))?;
+
+        Ok(result == 1)
+    }
+
+    /// Get the age (in seconds) of the oldest pending task
+    ///
+    /// Returns None if there are no pending tasks.
+    pub async fn oldest_pending_age_secs(&self) -> Result<Option<i64>> {
+        let age: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT EXTRACT(EPOCH FROM (NOW() - created_at))::BIGINT
+            FROM celers_tasks
+            WHERE state = 'pending'
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get oldest pending age: {}", e)))?;
+
+        Ok(age)
+    }
+
+    /// Get the age (in seconds) of the oldest processing task
+    ///
+    /// This is useful for detecting stuck tasks. Returns None if there are no processing tasks.
+    pub async fn oldest_processing_age_secs(&self) -> Result<Option<i64>> {
+        let age: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT EXTRACT(EPOCH FROM (NOW() - started_at))::BIGINT
+            FROM celers_tasks
+            WHERE state = 'processing' AND started_at IS NOT NULL
+            ORDER BY started_at ASC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get oldest processing age: {}", e)))?;
+
+        Ok(age)
+    }
+
+    /// Get average task processing time for completed tasks (in milliseconds)
+    ///
+    /// Calculates the average time between started_at and completed_at for recently completed tasks.
+    /// Uses the last 1000 completed tasks by default.
+    pub async fn avg_processing_time_ms(&self) -> Result<Option<f64>> {
+        let avg: Option<f64> = sqlx::query_scalar(
+            r#"
+            SELECT AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
+            FROM (
+                SELECT started_at, completed_at
+                FROM celers_tasks
+                WHERE state = 'completed'
+                  AND started_at IS NOT NULL
+                  AND completed_at IS NOT NULL
+                ORDER BY completed_at DESC
+                LIMIT 1000
+            ) recent_tasks
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            CelersError::Other(format!("Failed to calculate avg processing time: {}", e))
+        })?;
+
+        Ok(avg)
+    }
+
+    /// Get the retry rate (percentage of tasks that have been retried at least once)
+    ///
+    /// Returns a value between 0.0 and 100.0.
+    pub async fn retry_rate(&self) -> Result<f64> {
+        let rate: Option<f64> = sqlx::query_scalar(
+            r#"
+            SELECT
+                CASE WHEN COUNT(*) > 0
+                THEN (COUNT(*) FILTER (WHERE retry_count > 0)::FLOAT / COUNT(*)::FLOAT * 100.0)
+                ELSE 0.0
+                END
+            FROM celers_tasks
+            WHERE state IN ('completed', 'failed', 'processing')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to calculate retry rate: {}", e)))?;
+
+        Ok(rate.unwrap_or(0.0))
+    }
+
+    /// Get success rate (percentage of completed vs failed tasks)
+    ///
+    /// Returns a value between 0.0 and 100.0.
+    pub async fn success_rate(&self) -> Result<f64> {
+        let rate: Option<f64> = sqlx::query_scalar(
+            r#"
+            SELECT
+                CASE WHEN COUNT(*) > 0
+                THEN (COUNT(*) FILTER (WHERE state = 'completed')::FLOAT / COUNT(*)::FLOAT * 100.0)
+                ELSE 0.0
+                END
+            FROM celers_tasks
+            WHERE state IN ('completed', 'failed')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to calculate success rate: {}", e)))?;
+
+        Ok(rate.unwrap_or(0.0))
     }
 }
 

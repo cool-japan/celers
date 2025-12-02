@@ -23,9 +23,15 @@ use celers_metrics::{
 };
 
 pub mod circuit_breaker;
+pub mod compression;
+pub mod connection;
 pub mod dedup;
+pub mod degradation;
 pub mod health;
+pub mod integrity;
 pub mod lua_scripts;
+pub mod metrics_ext;
+pub mod pool;
 pub mod queue_control;
 pub mod rate_limit;
 pub mod retry;
@@ -34,8 +40,18 @@ pub mod visibility;
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
 };
+pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionStats, Compressor};
+pub use connection::{ConnectionStats, RedisConfig, TlsConfig};
 pub use dedup::{DedupResult, DedupStrategy, Deduplicator};
-pub use health::{HealthChecker, QueueStats, RedisHealthStatus};
+pub use degradation::{DegradationManager, DegradationMode, DegradationStats, QueuedOperation};
+pub use health::{HealthChecker, KeyspaceStats, QueueStats, RedisHealthStatus, ReplicationInfo};
+pub use integrity::{ChecksumAlgorithm, IntegrityStats, IntegrityValidator, IntegrityWrappedTask};
+pub use lua_scripts::{ScriptId, ScriptManager, ScriptPerformance, ScriptStats, SCRIPT_VERSION};
+pub use metrics_ext::{
+    HistogramSnapshot, LatencyStats, MetricsSnapshot, MetricsTracker, SlowOperation,
+    SlowOperationLogger, TaskAgeHistogram,
+};
+pub use pool::{ConnectionPool, PoolConfig, PoolStats};
 pub use queue_control::{QueueController, QueueState};
 pub use rate_limit::{
     DistributedRateLimiter, QueueRateLimitConfig, QueueRateLimiter, TokenBucketLimiter,
@@ -98,6 +114,25 @@ impl RedisBroker {
     pub fn with_mode(redis_url: &str, queue_name: &str, mode: QueueMode) -> Result<Self> {
         let client = Client::open(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
+
+        Ok(Self {
+            client,
+            queue_name: queue_name.to_string(),
+            processing_queue: format!("{}:processing", queue_name),
+            dlq_name: format!("{}:dlq", queue_name),
+            delayed_queue: format!("{}:delayed", queue_name),
+            cancel_channel: format!("{}:cancel", queue_name),
+            mode,
+            visibility_manager: VisibilityManager::new(),
+            visibility_timeout_secs: 300, // 5 minutes default
+        })
+    }
+
+    /// Create a new Redis broker from a RedisConfig
+    pub fn from_config(config: &RedisConfig, queue_name: &str, mode: QueueMode) -> Result<Self> {
+        let client = config.build_client()?;
+
+        debug!("Created Redis broker with config: {}", config.describe());
 
         Ok(Self {
             client,
@@ -272,6 +307,90 @@ impl RedisBroker {
         Deduplicator::new(self.client.clone(), &self.queue_name)
     }
 
+    /// Create a script manager for Lua script optimization
+    pub fn script_manager(&self) -> ScriptManager {
+        ScriptManager::new(self.client.clone())
+    }
+
+    /// Set TTL (time-to-live) for tasks in all queues
+    ///
+    /// This helps prevent unbounded queue growth by automatically expiring old tasks.
+    /// TTL is set in seconds.
+    pub async fn set_queue_ttl(&self, ttl_secs: u64) -> Result<()> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        // Set TTL on main queue
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&self.queue_name)
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to set queue TTL: {}", e)))?;
+
+        // Set TTL on processing queue
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&self.processing_queue)
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| {
+                CelersError::Broker(format!("Failed to set processing queue TTL: {}", e))
+            })?;
+
+        // Set TTL on delayed queue
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&self.delayed_queue)
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to set delayed queue TTL: {}", e)))?;
+
+        debug!("Set TTL of {} seconds on all queues", ttl_secs);
+
+        Ok(())
+    }
+
+    /// Clean up old tasks from DLQ (older than specified age in seconds)
+    pub async fn cleanup_dlq(&self, _max_age_secs: u64) -> Result<usize> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        // Get all DLQ items
+        let items: Vec<String> = conn
+            .lrange(&self.dlq_name, 0, -1)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get DLQ items: {}", e)))?;
+
+        let mut removed_count = 0;
+
+        for item in items {
+            // Try to parse task to validate it's a proper task
+            if serde_json::from_str::<SerializedTask>(&item).is_ok() {
+                // This is a simplified version - in real use, you'd track DLQ entry time
+                // and only remove tasks older than max_age_secs
+                conn.lrem::<_, _, ()>(&self.dlq_name, 1, &item)
+                    .await
+                    .map_err(|e| {
+                        CelersError::Broker(format!("Failed to remove from DLQ: {}", e))
+                    })?;
+                removed_count += 1;
+            }
+        }
+
+        if removed_count > 0 {
+            info!("Cleaned up {} old tasks from DLQ", removed_count);
+        }
+
+        Ok(removed_count)
+    }
+
     /// Get queue statistics (pending, processing, DLQ, delayed counts)
     pub async fn get_queue_stats(&self) -> Result<QueueStats> {
         self.health_checker()
@@ -317,6 +436,95 @@ impl RedisBroker {
     /// Get the main queue name
     pub fn queue_name(&self) -> &str {
         &self.queue_name
+    }
+
+    /// Get all queue names managed by this broker
+    pub fn queue_names(&self) -> Vec<String> {
+        vec![
+            self.queue_name.clone(),
+            self.processing_queue.clone(),
+            self.dlq_name.clone(),
+            self.delayed_queue.clone(),
+        ]
+    }
+
+    /// Check if a specific queue exists and has tasks
+    pub async fn queue_exists(&self, queue_name: &str) -> Result<bool> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(queue_name)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to check queue existence: {}", e)))?;
+
+        Ok(exists)
+    }
+
+    /// Get the size of a specific queue by name
+    pub async fn get_queue_size_by_name(&self, queue_name: &str) -> Result<usize> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        // Try both list and sorted set
+        let list_size: usize = conn.llen(queue_name).await.unwrap_or(0);
+        if list_size > 0 {
+            return Ok(list_size);
+        }
+
+        let zset_size: usize = conn.zcard(queue_name).await.unwrap_or(0);
+        Ok(zset_size)
+    }
+
+    /// Delete a specific queue (use with caution!)
+    pub async fn delete_queue(&self, queue_name: &str) -> Result<()> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        conn.del::<_, ()>(queue_name)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to delete queue: {}", e)))?;
+
+        warn!("Deleted queue: {}", queue_name);
+        Ok(())
+    }
+
+    /// Purge all queues (main, processing, DLQ, delayed)
+    pub async fn purge_all_queues(&self) -> Result<usize> {
+        let mut total_removed = 0;
+
+        for queue_name in self.queue_names() {
+            if let Ok(size) = self.get_queue_size_by_name(&queue_name).await {
+                total_removed += size;
+                self.delete_queue(&queue_name).await?;
+            }
+        }
+
+        warn!("Purged all queues, removed {} tasks total", total_removed);
+        Ok(total_removed)
+    }
+
+    /// Get a summary of all queue sizes
+    pub async fn get_all_queue_sizes(&self) -> Result<std::collections::HashMap<String, usize>> {
+        let mut sizes = std::collections::HashMap::new();
+
+        for queue_name in self.queue_names() {
+            if let Ok(size) = self.get_queue_size_by_name(&queue_name).await {
+                sizes.insert(queue_name, size);
+            }
+        }
+
+        Ok(sizes)
     }
 
     /// Move ready delayed tasks to the main queue

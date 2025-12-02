@@ -14,6 +14,9 @@ Production-ready broker abstraction with:
 - ✅ **Requeue Support**: Retry failed messages
 - ✅ **Message Envelope**: Delivery metadata tracking
 - ✅ **Error Handling**: Comprehensive error types
+- ✅ **Middleware System**: Message transformation pipeline
+  - **Built-in**: Validation, Logging, Metrics, Retry Limit, Rate Limiting, Deduplication
+  - **Feature-gated**: Compression (Gzip), Signing (HMAC), Encryption (AES-256-GCM)
 
 ## Architecture
 
@@ -602,6 +605,250 @@ producer.publish_with_routing("logs", "error", message).await?;
 ```rust
 // Publish to exchange, all queues receive
 producer.publish_with_routing("broadcast", "*", message).await?;
+```
+
+## Middleware
+
+The crate provides a powerful middleware system for message transformation, validation, security, and reliability.
+
+### Middleware Chain
+
+```rust
+use celers_kombu::{MiddlewareChain, ValidationMiddleware, LoggingMiddleware};
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(ValidationMiddleware::new()))
+    .with_middleware(Box::new(LoggingMiddleware::new("MyApp")));
+
+// Use with producer
+producer.publish_with_middleware("celery", message, &chain).await?;
+
+// Use with consumer
+if let Some(envelope) = consumer.consume_with_middleware("celery", timeout, &chain).await? {
+    // Process validated and logged message
+}
+```
+
+### Built-in Middleware
+
+#### ValidationMiddleware
+
+Validates message structure and size limits:
+
+```rust
+use celers_kombu::ValidationMiddleware;
+
+let validator = ValidationMiddleware::new()
+    .with_max_body_size(10 * 1024 * 1024)  // 10MB limit
+    .with_require_task_name(true);
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(validator));
+```
+
+#### LoggingMiddleware
+
+Logs message events for debugging:
+
+```rust
+use celers_kombu::LoggingMiddleware;
+
+let logger = LoggingMiddleware::new("MyApp")
+    .with_body_logging();  // Enable detailed logging
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(logger));
+```
+
+#### MetricsMiddleware
+
+Collects message statistics:
+
+```rust
+use celers_kombu::MetricsMiddleware;
+use std::sync::{Arc, Mutex};
+
+let metrics = Arc::new(Mutex::new(BrokerMetrics::new()));
+let metrics_mw = MetricsMiddleware::new(metrics.clone());
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(metrics_mw));
+
+// Later, get metrics snapshot
+let snapshot = metrics.lock().unwrap().clone();
+println!("Published: {}, Consumed: {}",
+    snapshot.messages_published,
+    snapshot.messages_consumed);
+```
+
+#### RetryLimitMiddleware
+
+Enforces maximum retry count:
+
+```rust
+use celers_kombu::RetryLimitMiddleware;
+
+let retry_limiter = RetryLimitMiddleware::new(3);  // Max 3 retries
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(retry_limiter));
+```
+
+#### RateLimitingMiddleware
+
+Controls message publishing rate using token bucket algorithm:
+
+```rust
+use celers_kombu::RateLimitingMiddleware;
+
+let rate_limiter = RateLimitingMiddleware::new(100.0);  // 100 messages/sec
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(rate_limiter));
+
+// Automatically enforces rate limit on publish
+producer.publish_with_middleware("celery", message, &chain).await?;
+```
+
+#### DeduplicationMiddleware
+
+Prevents duplicate message processing:
+
+```rust
+use celers_kombu::DeduplicationMiddleware;
+
+let dedup = DeduplicationMiddleware::new(10_000);  // Track 10K message IDs
+// Or use default: let dedup = DeduplicationMiddleware::with_default_cache();
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(dedup));
+
+// Rejects duplicate messages based on task_id
+consumer.consume_with_middleware("celery", timeout, &chain).await?;
+```
+
+### Feature-Gated Middleware
+
+The following middleware require enabling feature flags in `Cargo.toml`:
+
+#### CompressionMiddleware
+
+Compresses message bodies (requires `compression` feature):
+
+```toml
+[dependencies]
+celers-kombu = { version = "0.1", features = ["compression"] }
+```
+
+```rust
+#[cfg(feature = "compression")]
+use celers_kombu::CompressionMiddleware;
+#[cfg(feature = "compression")]
+use celers_protocol::compression::CompressionType;
+
+#[cfg(feature = "compression")]
+{
+    let compressor = CompressionMiddleware::new(CompressionType::Gzip)
+        .with_min_size(1024)    // Only compress messages > 1KB
+        .with_level(6);         // Compression level 1-9
+
+    let chain = MiddlewareChain::new()
+        .with_middleware(Box::new(compressor));
+}
+```
+
+#### SigningMiddleware
+
+Signs messages with HMAC-SHA256 (requires `signing` feature):
+
+```toml
+[dependencies]
+celers-kombu = { version = "0.1", features = ["signing"] }
+```
+
+```rust
+#[cfg(feature = "signing")]
+use celers_kombu::SigningMiddleware;
+
+#[cfg(feature = "signing")]
+{
+    let secret_key = b"your-secret-key-min-32-bytes-long!!!";
+    let signer = SigningMiddleware::new(secret_key);
+
+    let chain = MiddlewareChain::new()
+        .with_middleware(Box::new(signer));
+}
+```
+
+#### EncryptionMiddleware
+
+Encrypts messages with AES-256-GCM (requires `encryption` feature):
+
+```toml
+[dependencies]
+celers-kombu = { version = "0.1", features = ["encryption"] }
+```
+
+```rust
+#[cfg(feature = "encryption")]
+use celers_kombu::EncryptionMiddleware;
+
+#[cfg(feature = "encryption")]
+{
+    let encryption_key = b"32-byte-secret-key-for-aes-256!!";  // Must be 32 bytes
+    let encryptor = EncryptionMiddleware::new(encryption_key)?;
+
+    let chain = MiddlewareChain::new()
+        .with_middleware(Box::new(encryptor));
+}
+```
+
+### Enable All Features
+
+```toml
+[dependencies]
+celers-kombu = { version = "0.1", features = ["full"] }
+```
+
+### Combining Middleware
+
+Create a complete middleware pipeline:
+
+```rust
+use celers_kombu::*;
+use std::sync::{Arc, Mutex};
+
+let metrics = Arc::new(Mutex::new(BrokerMetrics::new()));
+
+let chain = MiddlewareChain::new()
+    // Validation first
+    .with_middleware(Box::new(ValidationMiddleware::new()))
+    // Rate limiting
+    .with_middleware(Box::new(RateLimitingMiddleware::new(100.0)))
+    // Deduplication
+    .with_middleware(Box::new(DeduplicationMiddleware::with_default_cache()))
+    // Logging
+    .with_middleware(Box::new(LoggingMiddleware::new("MyApp")))
+    // Metrics collection
+    .with_middleware(Box::new(MetricsMiddleware::new(metrics.clone())))
+    // Retry limit
+    .with_middleware(Box::new(RetryLimitMiddleware::new(3)));
+
+// Optional: Add compression, signing, encryption (if features enabled)
+#[cfg(feature = "compression")]
+let chain = chain.with_middleware(Box::new(
+    CompressionMiddleware::new(CompressionType::Gzip)
+));
+
+#[cfg(feature = "signing")]
+let chain = chain.with_middleware(Box::new(
+    SigningMiddleware::new(b"secret-key")
+));
+
+#[cfg(feature = "encryption")]
+let chain = chain.with_middleware(Box::new(
+    EncryptionMiddleware::new(b"32-byte-encryption-key-here!!!!!")?
+));
 ```
 
 ## Best Practices

@@ -131,22 +131,38 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 
 ## Future Enhancements
 
-### Monitoring (CloudWatch Integration)
-- [ ] CloudWatch metrics integration
-- [ ] Queue depth alerts
+### Monitoring (CloudWatch Integration) ✅
+- [x] CloudWatch metrics integration
+- [x] `CloudWatchConfig` struct for configuration
+- [x] `with_cloudwatch()` - Configure CloudWatch metrics
+- [x] `publish_metrics()` - Publish queue stats to CloudWatch
+- [x] Custom dimensions support
+- [x] Automatic metric publishing for queue depth
+- [ ] Queue depth alerts (requires CloudWatch Alarms setup)
 - [ ] Receive count statistics via CloudWatch
 
-### Performance
+### Performance ✅
+- [x] Adaptive polling strategies
+- [x] `PollingStrategy` enum (Fixed, ExponentialBackoff, Adaptive)
+- [x] `AdaptivePollingConfig` for configuration
+- [x] `with_adaptive_polling()` - Configure adaptive polling
+- [x] Automatic wait time adjustment based on queue activity
+- [x] Cost optimization through smart polling
+- [x] Parallel message processing
+- [x] `consume_parallel()` - Process multiple messages concurrently
+- [x] Automatic error handling and requeue on failure
+- [x] Improved throughput for I/O-bound and CPU-intensive tasks
 - [ ] Connection pooling (if needed)
-- [ ] Parallel message processing
-- [ ] Adaptive polling strategies
 
 ## Testing Status
 
 - [x] Compilation tests
 - [x] Unit tests (broker creation, builder pattern)
 - [x] Configuration tests (FIFO, DLQ, SSE)
+- [x] CloudWatch configuration tests (5 tests)
+- [x] Adaptive polling tests (10 tests)
 - [x] Clamping tests for all configuration values
+- [x] 35 total unit tests passing
 - [ ] Integration tests with LocalStack
 - [ ] Integration tests with real AWS SQS
 - [ ] Performance benchmarks
@@ -168,6 +184,7 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 - `celers-kombu`: Broker traits
 - `aws-config`: AWS configuration loading
 - `aws-sdk-sqs`: SQS client library
+- `aws-sdk-cloudwatch`: CloudWatch metrics publishing
 - `serde_json`: Message serialization
 - `tracing`: Logging
 
@@ -194,12 +211,26 @@ Minimum IAM permissions needed:
         "sqs:PurgeQueue"
       ],
       "Resource": "arn:aws:sqs:*:*:*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "CeleRS/SQS"
+        }
+      }
     }
   ]
 }
 ```
 
 For production, restrict `Resource` to specific queue ARNs.
+
+**Note**: CloudWatch permissions are only needed if you enable CloudWatch metrics via `with_cloudwatch()`.
 
 ## SQS Limits
 
@@ -237,6 +268,102 @@ For production, restrict `Resource` to specific queue ARNs.
 - No broker topology (exchanges/bindings) like AMQP
 - Ideal for cloud-native, serverless architectures
 - Automatic scaling and redundancy
+
+## Usage Examples
+
+### CloudWatch Metrics Integration
+
+```rust
+use celers_broker_sqs::{SqsBroker, CloudWatchConfig};
+
+// Enable CloudWatch metrics publishing
+let cw_config = CloudWatchConfig::new("CeleRS/SQS")
+    .with_dimension("Environment", "production")
+    .with_dimension("Application", "my-app");
+
+let mut broker = SqsBroker::new("my-queue")
+    .await?
+    .with_cloudwatch(cw_config);
+
+broker.connect().await?;
+
+// Manually publish metrics (or call periodically)
+broker.publish_metrics("my-queue").await?;
+```
+
+The following metrics are published to CloudWatch:
+- `ApproximateNumberOfMessages` - Messages available in the queue
+- `ApproximateNumberOfMessagesNotVisible` - Messages being processed
+- `ApproximateNumberOfMessagesDelayed` - Delayed messages
+
+### Adaptive Polling Strategies
+
+```rust
+use celers_broker_sqs::{SqsBroker, AdaptivePollingConfig, PollingStrategy};
+
+// Use exponential backoff when queue is empty
+let adaptive_config = AdaptivePollingConfig::new(PollingStrategy::ExponentialBackoff)
+    .with_min_wait_time(1)
+    .with_max_wait_time(20)
+    .with_backoff_multiplier(2.0);
+
+let mut broker = SqsBroker::new("my-queue")
+    .await?
+    .with_adaptive_polling(adaptive_config);
+
+broker.connect().await?;
+
+// Polling will automatically adjust based on queue activity
+// - When messages are available: decreases wait time (more responsive)
+// - When queue is empty: increases wait time (saves costs)
+loop {
+    if let Some(envelope) = broker.consume("my-queue", Duration::from_secs(20)).await? {
+        // Process message
+        broker.ack(&envelope.delivery_tag).await?;
+    }
+}
+```
+
+**Polling Strategies:**
+- `Fixed` - Uses configured wait time (default behavior)
+- `ExponentialBackoff` - Increases wait time exponentially when queue is empty, resets when messages arrive
+- `Adaptive` - Decreases wait time when busy, increases after 3+ consecutive empty receives
+
+### Parallel Message Processing
+
+```rust
+use celers_broker_sqs::SqsBroker;
+use std::time::Duration;
+
+let mut broker = SqsBroker::new("my-queue").await?;
+broker.connect().await?;
+
+// Process up to 10 messages in parallel
+let processed = broker.consume_parallel(
+    "my-queue",
+    10,
+    Duration::from_secs(20),
+    |envelope| async move {
+        // Your async processing logic here
+        println!("Processing: {:?}", envelope.message);
+
+        // Simulate some async work
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Return Ok(()) to acknowledge, Err to requeue
+        Ok(())
+    }
+).await?;
+
+println!("Successfully processed {} messages", processed);
+```
+
+**Benefits:**
+- Concurrent processing of multiple messages
+- Automatic acknowledgment on success
+- Automatic requeue on failure
+- Improved throughput for I/O-bound tasks
+- Uses tokio's task spawning for true parallelism
 
 ## Comparison with Other Brokers
 

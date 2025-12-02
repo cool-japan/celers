@@ -15,6 +15,9 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 - [x] Graceful disconnect
 - [x] Connection retry with configurable attempts/delay
 - [x] Virtual host support
+- [x] Automatic reconnection on connection loss during operation
+- [x] Connection pooling for high concurrency
+- [x] Channel pooling for efficient channel reuse
 
 ### Message Publishing ✅
 - [x] Basic message publishing to queues
@@ -56,6 +59,7 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 
 ### Batch Operations ✅
 - [x] `publish_batch()` - Publish multiple messages efficiently
+- [x] `publish_pipeline()` - Publish with configurable pipeline depth for maximum throughput
 - [x] Publisher confirms collected after all publishes
 - [x] Reduces round-trips compared to individual publishes
 - [x] Returns successful publish count
@@ -65,6 +69,9 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 - [x] `QueueConfig` - Queue-level configuration
 - [x] `DlxConfig` - Dead Letter Exchange configuration
 - [x] `AmqpExchangeType` - Exchange type enum (Direct, Fanout, Topic, Headers)
+- [x] Auto-reconnect configuration (enable/disable, max attempts, delay)
+- [x] Connection and channel pool size configuration
+- [x] Message deduplication configuration (enable/disable, cache size, TTL)
 
 ### Consumer Streaming ✅
 - [x] `start_consumer()` - Start a streaming consumer (basic_consume)
@@ -75,6 +82,10 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 - [x] `health_status()` - Get detailed health status
 - [x] `is_healthy()` - Quick health check
 - [x] `HealthStatus` struct with connection/channel state
+- [x] `ReconnectionStats` - Track reconnection attempts and success/failure
+- [x] `ChannelMetrics` - Track messages published, consumed, acked, rejected, and errors
+- [x] `PublisherConfirmStats` - Track publisher confirms with latency metrics
+- [x] `DeduplicationCache` - Prevent duplicate message processing with TTL-based cache
 
 ### Transaction Support ✅
 - [x] `start_transaction()` - Begin AMQP transaction
@@ -85,23 +96,23 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 ## Future Enhancements
 
 ### Advanced Features
-- [ ] Automatic reconnection on connection loss (during operation)
+- [x] Automatic reconnection on connection loss (during operation) ✅
 
 ### Performance
 - [x] Batch publishing ✅
-- [ ] Connection pooling
-- [ ] Channel pooling
-- [ ] Pipeline publishing
+- [x] Connection pooling ✅
+- [x] Channel pooling ✅
+- [x] Pipeline publishing ✅
 
 ### Monitoring
 - [x] Connection health monitoring ✅
-- [ ] Channel-level metrics
-- [ ] Publisher confirm tracking
+- [x] Channel-level metrics ✅
+- [x] Publisher confirm tracking ✅
 - [ ] RabbitMQ Management API integration
 
 ### Reliability
 - [x] Transaction support ✅
-- [ ] Message deduplication
+- [x] Message deduplication ✅
 
 ## Testing Status
 
@@ -177,5 +188,5 @@ This implementation is **100% compatible** with Python Celery's AMQP backend:
 
 ## Known Limitations
 
-- Single channel per connection (channel pooling not yet implemented)
 - `list_queues()` requires RabbitMQ Management API (not available via AMQP protocol)
+- Connection and channel pools require explicit configuration (disabled by default for backward compatibility)

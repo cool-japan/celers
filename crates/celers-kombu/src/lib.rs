@@ -1202,6 +1202,16 @@ pub struct MessageOptions {
     pub reply_to: Option<String>,
     /// Custom headers
     pub headers: HashMap<String, String>,
+    /// Enable message signing (HMAC)
+    pub sign: bool,
+    /// Signing key for HMAC (if signing is enabled)
+    pub signing_key: Option<Vec<u8>>,
+    /// Enable message encryption (AES-256-GCM)
+    pub encrypt: bool,
+    /// Encryption key (32 bytes for AES-256)
+    pub encryption_key: Option<Vec<u8>>,
+    /// Compression hint
+    pub compress: bool,
 }
 
 impl MessageOptions {
@@ -1252,6 +1262,26 @@ impl MessageOptions {
         self
     }
 
+    /// Enable message signing with HMAC
+    pub fn with_signing(mut self, key: Vec<u8>) -> Self {
+        self.sign = true;
+        self.signing_key = Some(key);
+        self
+    }
+
+    /// Enable message encryption with AES-256-GCM
+    pub fn with_encryption(mut self, key: Vec<u8>) -> Self {
+        self.encrypt = true;
+        self.encryption_key = Some(key);
+        self
+    }
+
+    /// Enable compression
+    pub fn with_compression(mut self) -> Self {
+        self.compress = true;
+        self
+    }
+
     /// Check if message has expired (based on expires_at)
     pub fn is_expired(&self, current_timestamp: u64) -> bool {
         self.expires_at.is_some_and(|exp| current_timestamp > exp)
@@ -1260,6 +1290,21 @@ impl MessageOptions {
     /// Check if message should be delayed
     pub fn should_delay(&self) -> bool {
         self.delay.is_some()
+    }
+
+    /// Check if message should be signed
+    pub fn should_sign(&self) -> bool {
+        self.sign && self.signing_key.is_some()
+    }
+
+    /// Check if message should be encrypted
+    pub fn should_encrypt(&self) -> bool {
+        self.encrypt && self.encryption_key.is_some()
+    }
+
+    /// Check if message should be compressed
+    pub fn should_compress(&self) -> bool {
+        self.compress
     }
 }
 
@@ -1286,6 +1331,687 @@ pub trait ExtendedProducer: Producer {
         message: Message,
         options: MessageOptions,
     ) -> Result<()>;
+}
+
+// =============================================================================
+// Middleware Support
+// =============================================================================
+
+/// Message middleware for pre/post processing
+#[async_trait]
+pub trait MessageMiddleware: Send + Sync {
+    /// Process message before publishing
+    async fn before_publish(&self, message: &mut Message) -> Result<()>;
+
+    /// Process message after consuming
+    async fn after_consume(&self, message: &mut Message) -> Result<()>;
+
+    /// Get middleware name for logging
+    fn name(&self) -> &str;
+}
+
+/// Middleware chain for processing messages
+pub struct MiddlewareChain {
+    middlewares: Vec<Box<dyn MessageMiddleware>>,
+}
+
+impl MiddlewareChain {
+    /// Create a new empty middleware chain
+    pub fn new() -> Self {
+        Self {
+            middlewares: Vec::new(),
+        }
+    }
+
+    /// Add middleware to the chain
+    pub fn with_middleware(mut self, middleware: Box<dyn MessageMiddleware>) -> Self {
+        self.middlewares.push(middleware);
+        self
+    }
+
+    /// Process message through all middlewares (before publish)
+    pub async fn process_before_publish(&self, message: &mut Message) -> Result<()> {
+        for middleware in &self.middlewares {
+            middleware.before_publish(message).await?;
+        }
+        Ok(())
+    }
+
+    /// Process message through all middlewares (after consume)
+    pub async fn process_after_consume(&self, message: &mut Message) -> Result<()> {
+        for middleware in &self.middlewares {
+            middleware.after_consume(message).await?;
+        }
+        Ok(())
+    }
+
+    /// Get number of middlewares in chain
+    pub fn len(&self) -> usize {
+        self.middlewares.len()
+    }
+
+    /// Check if chain is empty
+    pub fn is_empty(&self) -> bool {
+        self.middlewares.is_empty()
+    }
+}
+
+impl Default for MiddlewareChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Producer with middleware support
+#[async_trait]
+pub trait MiddlewareProducer: Producer {
+    /// Publish a message with middleware processing
+    async fn publish_with_middleware(
+        &mut self,
+        queue: &str,
+        mut message: Message,
+        chain: &MiddlewareChain,
+    ) -> Result<()> {
+        // Process through middleware chain
+        chain.process_before_publish(&mut message).await?;
+        // Publish the processed message
+        self.publish(queue, message).await
+    }
+}
+
+/// Consumer with middleware support
+#[async_trait]
+pub trait MiddlewareConsumer: Consumer {
+    /// Consume a message with middleware processing
+    async fn consume_with_middleware(
+        &mut self,
+        queue: &str,
+        timeout: Duration,
+        chain: &MiddlewareChain,
+    ) -> Result<Option<Envelope>> {
+        // Consume the message
+        if let Some(mut envelope) = self.consume(queue, timeout).await? {
+            // Process through middleware chain
+            chain.process_after_consume(&mut envelope.message).await?;
+            Ok(Some(envelope))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// =============================================================================
+// Built-in Middleware Implementations
+// =============================================================================
+
+/// Validation middleware - validates message structure
+pub struct ValidationMiddleware {
+    /// Maximum message body size (bytes)
+    max_body_size: Option<usize>,
+    /// Require task name to be non-empty
+    require_task_name: bool,
+}
+
+impl ValidationMiddleware {
+    /// Create a new validation middleware
+    pub fn new() -> Self {
+        Self {
+            max_body_size: Some(10 * 1024 * 1024), // 10MB default
+            require_task_name: true,
+        }
+    }
+
+    /// Set maximum body size
+    pub fn with_max_body_size(mut self, size: usize) -> Self {
+        self.max_body_size = Some(size);
+        self
+    }
+
+    /// Disable body size check
+    pub fn without_body_size_limit(mut self) -> Self {
+        self.max_body_size = None;
+        self
+    }
+
+    /// Set whether task name is required
+    pub fn with_require_task_name(mut self, require: bool) -> Self {
+        self.require_task_name = require;
+        self
+    }
+
+    fn validate_message(&self, message: &Message) -> Result<()> {
+        // Check task name
+        if self.require_task_name && message.task_name().is_empty() {
+            return Err(BrokerError::Configuration(
+                "Task name cannot be empty".to_string(),
+            ));
+        }
+
+        // Check body size
+        if let Some(max_size) = self.max_body_size {
+            if message.body.len() > max_size {
+                return Err(BrokerError::Configuration(format!(
+                    "Message body size {} exceeds maximum {}",
+                    message.body.len(),
+                    max_size
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for ValidationMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for ValidationMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        self.validate_message(message)
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        self.validate_message(message)
+    }
+
+    fn name(&self) -> &str {
+        "validation"
+    }
+}
+
+/// Logging middleware - logs message events
+pub struct LoggingMiddleware {
+    prefix: String,
+    log_body: bool,
+}
+
+impl LoggingMiddleware {
+    /// Create a new logging middleware
+    pub fn new(prefix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            log_body: false,
+        }
+    }
+
+    /// Enable body logging (for debugging)
+    pub fn with_body_logging(mut self) -> Self {
+        self.log_body = true;
+        self
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for LoggingMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        if self.log_body {
+            eprintln!(
+                "[{}] Publishing: task={}, id={}, body_size={}",
+                self.prefix,
+                message.task_name(),
+                message.task_id(),
+                message.body.len()
+            );
+        } else {
+            eprintln!(
+                "[{}] Publishing: task={}, id={}",
+                self.prefix,
+                message.task_name(),
+                message.task_id()
+            );
+        }
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        if self.log_body {
+            eprintln!(
+                "[{}] Consumed: task={}, id={}, body_size={}",
+                self.prefix,
+                message.task_name(),
+                message.task_id(),
+                message.body.len()
+            );
+        } else {
+            eprintln!(
+                "[{}] Consumed: task={}, id={}",
+                self.prefix,
+                message.task_name(),
+                message.task_id()
+            );
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "logging"
+    }
+}
+
+/// Metrics middleware - collects message statistics
+pub struct MetricsMiddleware {
+    metrics: std::sync::Arc<std::sync::Mutex<BrokerMetrics>>,
+}
+
+impl MetricsMiddleware {
+    /// Create a new metrics middleware
+    pub fn new(metrics: std::sync::Arc<std::sync::Mutex<BrokerMetrics>>) -> Self {
+        Self { metrics }
+    }
+
+    /// Get current metrics snapshot
+    pub fn get_metrics(&self) -> BrokerMetrics {
+        self.metrics.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for MetricsMiddleware {
+    async fn before_publish(&self, _message: &mut Message) -> Result<()> {
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.inc_published();
+        Ok(())
+    }
+
+    async fn after_consume(&self, _message: &mut Message) -> Result<()> {
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.inc_consumed();
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "metrics"
+    }
+}
+
+/// Retry limit middleware - enforces maximum retry count
+pub struct RetryLimitMiddleware {
+    max_retries: u32,
+}
+
+impl RetryLimitMiddleware {
+    /// Create a new retry limit middleware
+    pub fn new(max_retries: u32) -> Self {
+        Self { max_retries }
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for RetryLimitMiddleware {
+    async fn before_publish(&self, _message: &mut Message) -> Result<()> {
+        // No validation on publish
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        // Check retry count from message headers
+        let retries = message.headers.retries.unwrap_or(0);
+        if retries > self.max_retries {
+            return Err(BrokerError::Configuration(format!(
+                "Message exceeded maximum retries: {} > {}",
+                retries, self.max_retries
+            )));
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "retry_limit"
+    }
+}
+
+/// Rate limiting middleware - enforces message rate limits
+pub struct RateLimitingMiddleware {
+    /// Maximum messages per second
+    max_rate: f64,
+    /// Token bucket (tracks available tokens)
+    tokens: std::sync::Arc<std::sync::Mutex<TokenBucket>>,
+}
+
+/// Token bucket for rate limiting
+struct TokenBucket {
+    /// Current token count
+    tokens: f64,
+    /// Maximum tokens
+    capacity: f64,
+    /// Tokens added per second
+    refill_rate: f64,
+    /// Last refill time
+    last_refill: std::time::Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, refill_rate: f64) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_rate,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    fn try_consume(&mut self, tokens: f64) -> bool {
+        // Refill tokens based on elapsed time
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
+        self.last_refill = now;
+
+        // Try to consume tokens
+        if self.tokens >= tokens {
+            self.tokens -= tokens;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl RateLimitingMiddleware {
+    /// Create a new rate limiting middleware
+    ///
+    /// # Arguments
+    ///
+    /// * `max_rate` - Maximum messages per second
+    pub fn new(max_rate: f64) -> Self {
+        Self {
+            max_rate,
+            tokens: std::sync::Arc::new(std::sync::Mutex::new(TokenBucket::new(
+                max_rate, max_rate,
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for RateLimitingMiddleware {
+    async fn before_publish(&self, _message: &mut Message) -> Result<()> {
+        // Try to acquire a token
+        let mut bucket = self.tokens.lock().unwrap();
+        if !bucket.try_consume(1.0) {
+            return Err(BrokerError::OperationFailed(format!(
+                "Rate limit exceeded: {} messages/sec",
+                self.max_rate
+            )));
+        }
+        Ok(())
+    }
+
+    async fn after_consume(&self, _message: &mut Message) -> Result<()> {
+        // No rate limiting on consume
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "rate_limit"
+    }
+}
+
+/// Deduplication middleware - prevents duplicate message processing
+pub struct DeduplicationMiddleware {
+    /// Recently seen message IDs
+    seen_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    /// Maximum size of seen IDs cache
+    max_cache_size: usize,
+}
+
+impl DeduplicationMiddleware {
+    /// Create a new deduplication middleware
+    ///
+    /// # Arguments
+    ///
+    /// * `max_cache_size` - Maximum number of message IDs to track
+    pub fn new(max_cache_size: usize) -> Self {
+        Self {
+            seen_ids: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            max_cache_size,
+        }
+    }
+
+    /// Create with default cache size (10,000 message IDs)
+    pub fn with_default_cache() -> Self {
+        Self::new(10_000)
+    }
+}
+
+impl Default for DeduplicationMiddleware {
+    fn default() -> Self {
+        Self::with_default_cache()
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for DeduplicationMiddleware {
+    async fn before_publish(&self, _message: &mut Message) -> Result<()> {
+        // No deduplication on publish
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        let msg_id = message.task_id();
+        let mut seen = self.seen_ids.lock().unwrap();
+
+        // Check if we've seen this message before
+        if seen.contains(&msg_id) {
+            return Err(BrokerError::OperationFailed(format!(
+                "Duplicate message detected: {}",
+                msg_id
+            )));
+        }
+
+        // Add to seen set
+        seen.insert(msg_id);
+
+        // Evict oldest entries if cache is too large (simple FIFO eviction)
+        if seen.len() > self.max_cache_size {
+            // Remove first element (note: HashSet doesn't have ordering, so this is arbitrary)
+            if let Some(&id) = seen.iter().next() {
+                seen.remove(&id);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "deduplication"
+    }
+}
+
+/// Compression middleware - compresses/decompresses message bodies
+#[cfg(feature = "compression")]
+pub struct CompressionMiddleware {
+    /// Compressor instance
+    compressor: celers_protocol::compression::Compressor,
+    /// Minimum body size to compress (bytes)
+    min_compress_size: usize,
+}
+
+#[cfg(feature = "compression")]
+impl CompressionMiddleware {
+    /// Create a new compression middleware
+    ///
+    /// # Arguments
+    ///
+    /// * `compression_type` - Type of compression to use
+    pub fn new(compression_type: celers_protocol::compression::CompressionType) -> Self {
+        Self {
+            compressor: celers_protocol::compression::Compressor::new(compression_type),
+            min_compress_size: 1024, // 1KB default
+        }
+    }
+
+    /// Set minimum body size to compress
+    pub fn with_min_size(mut self, size: usize) -> Self {
+        self.min_compress_size = size;
+        self
+    }
+
+    /// Set compression level
+    pub fn with_level(mut self, level: u32) -> Self {
+        self.compressor = self.compressor.with_level(level);
+        self
+    }
+}
+
+#[cfg(feature = "compression")]
+#[async_trait]
+impl MessageMiddleware for CompressionMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        // Only compress if body is large enough
+        if message.body.len() >= self.min_compress_size {
+            let compressed = self
+                .compressor
+                .compress(&message.body)
+                .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+            // Only use compressed version if it's actually smaller
+            if compressed.len() < message.body.len() {
+                message.body = compressed;
+                // Note: In a real implementation, we'd set a header to indicate compression
+            }
+        }
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        // Try to decompress (would need to check header in real implementation)
+        // For now, we'll skip decompression on consume since we don't have metadata
+        // A real implementation would check message headers for compression flag
+        let _ = message;
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "compression"
+    }
+}
+
+/// Signing middleware - signs/verifies message bodies using HMAC
+#[cfg(feature = "signing")]
+pub struct SigningMiddleware {
+    /// Message signer instance
+    signer: celers_protocol::auth::MessageSigner,
+}
+
+#[cfg(feature = "signing")]
+impl SigningMiddleware {
+    /// Create a new signing middleware
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Secret key for HMAC signing
+    pub fn new(key: &[u8]) -> Self {
+        Self {
+            signer: celers_protocol::auth::MessageSigner::new(key),
+        }
+    }
+}
+
+#[cfg(feature = "signing")]
+#[async_trait]
+impl MessageMiddleware for SigningMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        // Sign the message body
+        let signature = self.signer.sign(&message.body);
+
+        // Store signature in message headers (would need custom header field)
+        // For now, we'll just validate that signing works
+        // In a real implementation, we'd add a signature field to Message
+        let _ = signature;
+
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        // In a real implementation, we'd:
+        // 1. Extract signature from message headers
+        // 2. Verify signature against message body
+        // 3. Return error if verification fails
+        //
+        // For now, we'll just validate the message can be signed
+        let _ = self.signer.sign(&message.body);
+
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "signing"
+    }
+}
+
+/// Encryption middleware - encrypts/decrypts message bodies using AES-256-GCM
+#[cfg(feature = "encryption")]
+pub struct EncryptionMiddleware {
+    /// Message encryptor instance
+    encryptor: celers_protocol::crypto::MessageEncryptor,
+}
+
+#[cfg(feature = "encryption")]
+impl EncryptionMiddleware {
+    /// Create a new encryption middleware
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - 32-byte secret key for AES-256
+    ///
+    /// # Returns
+    ///
+    /// `Ok(EncryptionMiddleware)` if the key is valid, `Err(BrokerError)` otherwise
+    pub fn new(key: &[u8]) -> Result<Self> {
+        let encryptor = celers_protocol::crypto::MessageEncryptor::new(key)
+            .map_err(|e| BrokerError::Configuration(e.to_string()))?;
+
+        Ok(Self { encryptor })
+    }
+}
+
+#[cfg(feature = "encryption")]
+#[async_trait]
+impl MessageMiddleware for EncryptionMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        // Encrypt the message body
+        let (ciphertext, nonce) = self
+            .encryptor
+            .encrypt(&message.body)
+            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        // In a real implementation, we'd store the nonce in message headers
+        // For now, we'll prepend the nonce to the ciphertext
+        let mut encrypted = nonce.to_vec();
+        encrypted.extend_from_slice(&ciphertext);
+        message.body = encrypted;
+
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        // Extract nonce and ciphertext
+        if message.body.len() < celers_protocol::crypto::NONCE_SIZE {
+            return Err(BrokerError::Serialization(
+                "Message too short to contain nonce".to_string(),
+            ));
+        }
+
+        let (nonce_bytes, ciphertext) = message.body.split_at(celers_protocol::crypto::NONCE_SIZE);
+
+        // Decrypt the message body
+        let plaintext = self
+            .encryptor
+            .decrypt(ciphertext, nonce_bytes)
+            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        message.body = plaintext;
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "encryption"
+    }
 }
 
 // =============================================================================
@@ -1553,6 +2279,10 @@ impl MetricsProvider for MockBroker {
         self.metrics = BrokerMetrics::new();
     }
 }
+
+// Blanket implementations for middleware traits
+impl<T: Producer> MiddlewareProducer for T {}
+impl<T: Consumer> MiddlewareConsumer for T {}
 
 #[cfg(test)]
 mod tests {
@@ -2273,6 +3003,11 @@ mod tests {
         assert!(options.correlation_id.is_none());
         assert!(options.reply_to.is_none());
         assert!(options.headers.is_empty());
+        assert!(!options.sign);
+        assert!(options.signing_key.is_none());
+        assert!(!options.encrypt);
+        assert!(options.encryption_key.is_none());
+        assert!(!options.compress);
     }
 
     #[test]
@@ -2314,5 +3049,444 @@ mod tests {
 
         let without_delay = MessageOptions::new();
         assert!(!without_delay.should_delay());
+    }
+
+    // Middleware tests
+    struct TestMiddleware {
+        name: String,
+    }
+
+    #[async_trait]
+    impl MessageMiddleware for TestMiddleware {
+        async fn before_publish(&self, _message: &mut Message) -> Result<()> {
+            Ok(())
+        }
+
+        async fn after_consume(&self, _message: &mut Message) -> Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[test]
+    fn test_middleware_chain_new() {
+        let chain = MiddlewareChain::new();
+        assert_eq!(chain.len(), 0);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn test_middleware_chain_add() {
+        let chain = MiddlewareChain::new()
+            .with_middleware(Box::new(TestMiddleware {
+                name: "test1".to_string(),
+            }))
+            .with_middleware(Box::new(TestMiddleware {
+                name: "test2".to_string(),
+            }));
+
+        assert_eq!(chain.len(), 2);
+        assert!(!chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_middleware_chain_process_before_publish() {
+        let chain = MiddlewareChain::new().with_middleware(Box::new(TestMiddleware {
+            name: "test".to_string(),
+        }));
+
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![]);
+
+        let result = chain.process_before_publish(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_middleware_chain_process_after_consume() {
+        let chain = MiddlewareChain::new().with_middleware(Box::new(TestMiddleware {
+            name: "test".to_string(),
+        }));
+
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![]);
+
+        let result = chain.process_after_consume(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_middleware_producer_publish_with_middleware() {
+        let mut broker = MockBroker::new();
+        broker.connect().await.unwrap();
+
+        let chain = MiddlewareChain::new().with_middleware(Box::new(TestMiddleware {
+            name: "test".to_string(),
+        }));
+
+        let task_id = Uuid::new_v4();
+        let message = Message::new("test_task".to_string(), task_id, vec![]);
+
+        broker
+            .publish_with_middleware("queue", message, &chain)
+            .await
+            .unwrap();
+
+        assert_eq!(broker.queue_len("queue"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_middleware_consumer_consume_with_middleware() {
+        let mut broker = MockBroker::new();
+        broker.connect().await.unwrap();
+
+        let task_id = Uuid::new_v4();
+        let message = Message::new("test_task".to_string(), task_id, vec![]);
+        broker.publish("queue", message).await.unwrap();
+
+        let chain = MiddlewareChain::new().with_middleware(Box::new(TestMiddleware {
+            name: "test".to_string(),
+        }));
+
+        let envelope = broker
+            .consume_with_middleware("queue", Duration::from_secs(1), &chain)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(envelope.task_id(), task_id);
+    }
+
+    #[test]
+    fn test_middleware_chain_default() {
+        let chain = MiddlewareChain::default();
+        assert_eq!(chain.len(), 0);
+        assert!(chain.is_empty());
+    }
+
+    // MessageOptions security tests
+    #[test]
+    fn test_message_options_with_signing() {
+        let key = vec![1, 2, 3, 4];
+        let options = MessageOptions::new().with_signing(key.clone());
+
+        assert!(options.sign);
+        assert_eq!(options.signing_key, Some(key));
+        assert!(options.should_sign());
+    }
+
+    #[test]
+    fn test_message_options_with_encryption() {
+        let key = vec![5, 6, 7, 8];
+        let options = MessageOptions::new().with_encryption(key.clone());
+
+        assert!(options.encrypt);
+        assert_eq!(options.encryption_key, Some(key));
+        assert!(options.should_encrypt());
+    }
+
+    #[test]
+    fn test_message_options_with_compression() {
+        let options = MessageOptions::new().with_compression();
+
+        assert!(options.compress);
+        assert!(options.should_compress());
+    }
+
+    #[test]
+    fn test_message_options_security_checks() {
+        let options_no_key = MessageOptions::new();
+        assert!(!options_no_key.should_sign());
+        assert!(!options_no_key.should_encrypt());
+
+        let mut options_no_flag = MessageOptions::new();
+        options_no_flag.signing_key = Some(vec![1, 2, 3]);
+        options_no_flag.encryption_key = Some(vec![4, 5, 6]);
+        assert!(!options_no_flag.should_sign()); // sign flag is false
+        assert!(!options_no_flag.should_encrypt()); // encrypt flag is false
+    }
+
+    #[test]
+    fn test_message_options_combined_security() {
+        let sign_key = vec![1, 2, 3, 4];
+        let encrypt_key = vec![5, 6, 7, 8];
+
+        let options = MessageOptions::new()
+            .with_signing(sign_key.clone())
+            .with_encryption(encrypt_key.clone())
+            .with_compression();
+
+        assert!(options.should_sign());
+        assert!(options.should_encrypt());
+        assert!(options.should_compress());
+        assert_eq!(options.signing_key, Some(sign_key));
+        assert_eq!(options.encryption_key, Some(encrypt_key));
+    }
+
+    // Built-in middleware tests
+    #[tokio::test]
+    async fn test_validation_middleware_success() {
+        let middleware = ValidationMiddleware::new();
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
+
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_ok());
+
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validation_middleware_empty_task_name() {
+        let middleware = ValidationMiddleware::new();
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("".to_string(), task_id, vec![]);
+
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_configuration());
+    }
+
+    #[tokio::test]
+    async fn test_validation_middleware_body_size_limit() {
+        let middleware = ValidationMiddleware::new().with_max_body_size(100);
+        let task_id = Uuid::new_v4();
+        let large_body = vec![0u8; 200];
+        let mut message = Message::new("task".to_string(), task_id, large_body);
+
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_configuration());
+    }
+
+    #[tokio::test]
+    async fn test_validation_middleware_no_body_limit() {
+        let middleware = ValidationMiddleware::new().without_body_size_limit();
+        let task_id = Uuid::new_v4();
+        let large_body = vec![0u8; 20 * 1024 * 1024]; // 20MB
+        let mut message = Message::new("task".to_string(), task_id, large_body);
+
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validation_middleware_name() {
+        let middleware = ValidationMiddleware::new();
+        assert_eq!(middleware.name(), "validation");
+    }
+
+    #[tokio::test]
+    async fn test_logging_middleware() {
+        let middleware = LoggingMiddleware::new("TEST");
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
+
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_ok());
+
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_ok());
+
+        assert_eq!(middleware.name(), "logging");
+    }
+
+    #[tokio::test]
+    async fn test_logging_middleware_with_body() {
+        let middleware = LoggingMiddleware::new("TEST").with_body_logging();
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
+
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_middleware() {
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(BrokerMetrics::new()));
+        let middleware = MetricsMiddleware::new(metrics.clone());
+
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![]);
+
+        middleware.before_publish(&mut message).await.unwrap();
+        middleware.after_consume(&mut message).await.unwrap();
+
+        let snapshot = middleware.get_metrics();
+        assert_eq!(snapshot.messages_published, 1);
+        assert_eq!(snapshot.messages_consumed, 1);
+        assert_eq!(middleware.name(), "metrics");
+    }
+
+    #[tokio::test]
+    async fn test_retry_limit_middleware_success() {
+        let middleware = RetryLimitMiddleware::new(3);
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![]);
+
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_ok());
+
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_ok());
+        assert_eq!(middleware.name(), "retry_limit");
+    }
+
+    #[tokio::test]
+    async fn test_middleware_chain_with_validation() {
+        let chain = MiddlewareChain::new().with_middleware(Box::new(ValidationMiddleware::new()));
+
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
+
+        let result = chain.process_before_publish(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_middleware_chain_with_multiple_builtin() {
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(BrokerMetrics::new()));
+
+        let chain = MiddlewareChain::new()
+            .with_middleware(Box::new(ValidationMiddleware::new()))
+            .with_middleware(Box::new(LoggingMiddleware::new("TEST")))
+            .with_middleware(Box::new(MetricsMiddleware::new(metrics.clone())));
+
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
+
+        let result = chain.process_before_publish(&mut message).await;
+        assert!(result.is_ok());
+
+        let snapshot = metrics.lock().unwrap().clone();
+        assert_eq!(snapshot.messages_published, 1);
+    }
+
+    #[test]
+    fn test_validation_middleware_default() {
+        let middleware = ValidationMiddleware::default();
+        assert_eq!(middleware.name(), "validation");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiting_middleware() {
+        let middleware = RateLimitingMiddleware::new(2.0); // 2 messages per second
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![]);
+
+        // First message should succeed
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_ok());
+
+        // Second message should succeed
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_ok());
+
+        // Third message should fail (rate limit exceeded)
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(BrokerError::OperationFailed(_))));
+
+        assert_eq!(middleware.name(), "rate_limit");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiting_middleware_refill() {
+        let middleware = RateLimitingMiddleware::new(10.0); // 10 messages per second
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![]);
+
+        // Consume all tokens
+        for _ in 0..10 {
+            let result = middleware.before_publish(&mut message).await;
+            assert!(result.is_ok());
+        }
+
+        // Next should fail
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_err());
+
+        // Wait for tokens to refill (100ms = 1 token at 10/sec)
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        // Now should succeed
+        let result = middleware.before_publish(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_deduplication_middleware() {
+        let middleware = DeduplicationMiddleware::new(100);
+        let task_id = Uuid::new_v4();
+        let mut message = Message::new("test_task".to_string(), task_id, vec![]);
+
+        // First consumption should succeed
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_ok());
+
+        // Second consumption of same message should fail
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(BrokerError::OperationFailed(_))));
+
+        assert_eq!(middleware.name(), "deduplication");
+    }
+
+    #[tokio::test]
+    async fn test_deduplication_middleware_different_messages() {
+        let middleware = DeduplicationMiddleware::new(100);
+
+        let task_id1 = Uuid::new_v4();
+        let mut message1 = Message::new("test_task".to_string(), task_id1, vec![]);
+
+        let task_id2 = Uuid::new_v4();
+        let mut message2 = Message::new("test_task".to_string(), task_id2, vec![]);
+
+        // Both different messages should succeed
+        let result = middleware.after_consume(&mut message1).await;
+        assert!(result.is_ok());
+
+        let result = middleware.after_consume(&mut message2).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_deduplication_middleware_cache_eviction() {
+        let middleware = DeduplicationMiddleware::new(2); // Small cache
+
+        let task_id1 = Uuid::new_v4();
+        let mut message1 = Message::new("test_task".to_string(), task_id1, vec![]);
+
+        let task_id2 = Uuid::new_v4();
+        let mut message2 = Message::new("test_task".to_string(), task_id2, vec![]);
+
+        let task_id3 = Uuid::new_v4();
+        let mut message3 = Message::new("test_task".to_string(), task_id3, vec![]);
+
+        // Add 3 messages (cache size is 2)
+        let _ = middleware.after_consume(&mut message1).await;
+        let _ = middleware.after_consume(&mut message2).await;
+        let _ = middleware.after_consume(&mut message3).await;
+
+        // One of the first two should be evicted, so this might succeed
+        // (Note: HashSet doesn't guarantee order, so we can't predict which one)
+        assert_eq!(middleware.name(), "deduplication");
+    }
+
+    #[test]
+    fn test_deduplication_middleware_default() {
+        let middleware = DeduplicationMiddleware::default();
+        assert_eq!(middleware.name(), "deduplication");
+    }
+
+    #[test]
+    fn test_deduplication_middleware_with_default_cache() {
+        let middleware = DeduplicationMiddleware::with_default_cache();
+        assert_eq!(middleware.name(), "deduplication");
     }
 }

@@ -155,6 +155,78 @@ impl Serializer for YamlSerializer {
     }
 }
 
+/// BSON serializer implementation
+#[cfg(feature = "bson-format")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BsonSerializer;
+
+#[cfg(feature = "bson-format")]
+impl Serializer for BsonSerializer {
+    fn content_type(&self) -> ContentType {
+        ContentType::Custom("application/bson".to_string())
+    }
+
+    fn content_encoding(&self) -> ContentEncoding {
+        ContentEncoding::Binary
+    }
+
+    fn serialize<T: Serialize>(&self, value: &T) -> SerializerResult<Vec<u8>> {
+        bson::to_vec(value).map_err(|e| SerializerError::Serialize(e.to_string()))
+    }
+
+    fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> SerializerResult<T> {
+        bson::from_slice(bytes).map_err(|e| SerializerError::Deserialize(e.to_string()))
+    }
+
+    fn name(&self) -> &'static str {
+        "bson"
+    }
+}
+
+/// Protobuf serializer implementation
+///
+/// Note: This is a generic Protobuf serializer using prost.
+/// For proper Protobuf support, you should use prost code generation
+/// to create message-specific serializers.
+#[cfg(feature = "protobuf")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProtobufSerializer;
+
+#[cfg(feature = "protobuf")]
+impl ProtobufSerializer {
+    /// Serialize a prost::Message to bytes
+    pub fn serialize_message<T: prost::Message>(&self, value: &T) -> SerializerResult<Vec<u8>> {
+        let mut buf = Vec::new();
+        value
+            .encode(&mut buf)
+            .map_err(|e| SerializerError::Serialize(e.to_string()))?;
+        Ok(buf)
+    }
+
+    /// Deserialize bytes to a prost::Message
+    pub fn deserialize_message<T: prost::Message + Default>(
+        &self,
+        bytes: &[u8],
+    ) -> SerializerResult<T> {
+        T::decode(bytes).map_err(|e| SerializerError::Deserialize(e.to_string()))
+    }
+
+    /// Get content type for Protobuf
+    pub fn content_type(&self) -> ContentType {
+        ContentType::Custom("application/protobuf".to_string())
+    }
+
+    /// Get content encoding for Protobuf
+    pub fn content_encoding(&self) -> ContentEncoding {
+        ContentEncoding::Binary
+    }
+
+    /// Get the name
+    pub fn name(&self) -> &'static str {
+        "protobuf"
+    }
+}
+
 /// Serializer type enum for dynamic dispatch without dyn trait issues
 #[derive(Debug, Clone, Copy)]
 pub enum SerializerType {
@@ -166,6 +238,9 @@ pub enum SerializerType {
     /// YAML serializer
     #[cfg(feature = "yaml")]
     Yaml,
+    /// BSON serializer
+    #[cfg(feature = "bson-format")]
+    Bson,
 }
 
 impl SerializerType {
@@ -177,6 +252,8 @@ impl SerializerType {
             "application/x-msgpack" => Ok(SerializerType::MessagePack),
             #[cfg(feature = "yaml")]
             "application/x-yaml" | "application/yaml" | "text/yaml" => Ok(SerializerType::Yaml),
+            #[cfg(feature = "bson-format")]
+            "application/bson" => Ok(SerializerType::Bson),
             _ => Err(SerializerError::UnsupportedContentType(
                 content_type.to_string(),
             )),
@@ -191,6 +268,8 @@ impl SerializerType {
             SerializerType::MessagePack => MessagePackSerializer.serialize(value),
             #[cfg(feature = "yaml")]
             SerializerType::Yaml => YamlSerializer.serialize(value),
+            #[cfg(feature = "bson-format")]
+            SerializerType::Bson => BsonSerializer.serialize(value),
         }
     }
 
@@ -202,6 +281,8 @@ impl SerializerType {
             SerializerType::MessagePack => MessagePackSerializer.deserialize(bytes),
             #[cfg(feature = "yaml")]
             SerializerType::Yaml => YamlSerializer.deserialize(bytes),
+            #[cfg(feature = "bson-format")]
+            SerializerType::Bson => BsonSerializer.deserialize(bytes),
         }
     }
 
@@ -213,6 +294,8 @@ impl SerializerType {
             SerializerType::MessagePack => MessagePackSerializer.content_type(),
             #[cfg(feature = "yaml")]
             SerializerType::Yaml => YamlSerializer.content_type(),
+            #[cfg(feature = "bson-format")]
+            SerializerType::Bson => BsonSerializer.content_type(),
         }
     }
 
@@ -224,6 +307,8 @@ impl SerializerType {
             SerializerType::MessagePack => MessagePackSerializer.content_encoding(),
             #[cfg(feature = "yaml")]
             SerializerType::Yaml => YamlSerializer.content_encoding(),
+            #[cfg(feature = "bson-format")]
+            SerializerType::Bson => BsonSerializer.content_encoding(),
         }
     }
 
@@ -235,6 +320,8 @@ impl SerializerType {
             SerializerType::MessagePack => MessagePackSerializer.name(),
             #[cfg(feature = "yaml")]
             SerializerType::Yaml => YamlSerializer.name(),
+            #[cfg(feature = "bson-format")]
+            SerializerType::Bson => BsonSerializer.name(),
         }
     }
 }
@@ -249,6 +336,7 @@ impl SerializerType {
 /// - `application/json` - JSON serializer
 /// - `application/x-msgpack` - MessagePack serializer (requires `msgpack` feature)
 /// - `application/x-yaml` - YAML serializer (requires `yaml` feature)
+/// - `application/bson` - BSON serializer (requires `bson-format` feature)
 pub fn get_serializer(content_type: &str) -> SerializerResult<SerializerType> {
     SerializerType::from_content_type(content_type)
 }
@@ -290,6 +378,8 @@ impl SerializerRegistry {
             "application/x-msgpack",
             #[cfg(feature = "yaml")]
             "application/x-yaml",
+            #[cfg(feature = "bson-format")]
+            "application/bson",
         ]
     }
 }
@@ -404,5 +494,39 @@ mod tests {
 
         let err = SerializerError::Compression("gzip failed".to_string());
         assert_eq!(err.to_string(), "Compression error: gzip failed");
+    }
+
+    #[cfg(feature = "bson-format")]
+    #[test]
+    fn test_bson_serializer_round_trip() {
+        let serializer = BsonSerializer;
+        let data = TestData {
+            name: "bson_test".to_string(),
+            value: 200,
+        };
+
+        let bytes = serializer.serialize(&data).unwrap();
+        let decoded: TestData = serializer.deserialize(&bytes).unwrap();
+
+        assert_eq!(data, decoded);
+    }
+
+    #[cfg(feature = "bson-format")]
+    #[test]
+    fn test_bson_serializer_content_type() {
+        let serializer = BsonSerializer;
+        assert_eq!(
+            serializer.content_type(),
+            ContentType::Custom("application/bson".to_string())
+        );
+        assert_eq!(serializer.content_encoding(), ContentEncoding::Binary);
+        assert_eq!(serializer.name(), "bson");
+    }
+
+    #[cfg(feature = "bson-format")]
+    #[test]
+    fn test_get_serializer_bson() {
+        let serializer = get_serializer("application/bson").unwrap();
+        assert_eq!(serializer.name(), "bson");
     }
 }

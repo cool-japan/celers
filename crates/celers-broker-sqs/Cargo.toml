@@ -21,6 +21,7 @@ tokio = { version = "1.42", features = ["full"] }
 # AWS SDK for SQS
 aws-config = "1.5"
 aws-sdk-sqs = "1.64"
+aws-sdk-cloudwatch = "1.68"
 
 # Core dependencies
 celers-protocol = { path = "../celers-protocol" }

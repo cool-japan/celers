@@ -141,27 +141,48 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 - `DELIMITER //` and `DELIMITER ;` for procedure definition
 - `CALL move_to_dlq(?)` to invoke
 
+## Recent Enhancements (2025)
+
+### New Features Added
+- [x] **README.md** - Comprehensive documentation with usage examples
+- [x] **Migration Version Tracking** - Track applied migrations with `celers_migrations` table
+- [x] **Connection Pool Configuration** - Custom pool settings via `PoolConfig`
+- [x] **Query Performance Tracking** - MySQL performance_schema integration
+- [x] **Batch Reject Operation** - Reject multiple tasks efficiently
+- [x] **Task Chain Support** - Enqueue dependent task sequences
+- [x] **Index Usage Statistics** - Monitor index effectiveness
+- [x] **Query Optimization Tools** - EXPLAIN plan analysis utilities
+- [x] **Connection Diagnostics** - Pool utilization and connection metrics
+- [x] **Performance Metrics** - Comprehensive performance snapshot API
+- [x] **Readiness Checks** - `is_ready()` method for health monitoring
+- [x] **Server Variables** - Query MySQL configuration settings
+- [x] **Backup/Restore Documentation** - Complete disaster recovery guide
+- [x] **Integration Tests** - 13 comprehensive integration tests
+- [x] **Concurrency Tests** - SKIP LOCKED behavior verification
+
 ## Future Enhancements
 
 ### Performance
 - [ ] Table partitioning for large queues (by created_at)
-- [ ] Query optimization with EXPLAIN ANALYZE
+- [x] Query optimization with EXPLAIN ANALYZE (COMPLETED)
 - [ ] Consider BINARY(16) for UUIDs instead of CHAR(36)
 
 ### Advanced Features
 - [x] Task scheduling/delayed execution (COMPLETED)
-- [ ] Task dependencies/DAG support
+- [x] Task dependencies/DAG support (COMPLETED - via TaskChain)
 - [x] Task result storage in database (COMPLETED)
-- [ ] Multi-tenant queue support (partial - queue_name implemented)
+- [x] Multi-tenant queue support (COMPLETED - queue_name implemented)
 - [x] Queue pause/resume functionality (COMPLETED)
 - [x] Worker tracking (COMPLETED)
+- [x] Batch operations (COMPLETED - enqueue, dequeue, ack, reject)
 
 ### Monitoring
 - [x] Prometheus metrics integration (COMPLETED)
-- [ ] Query performance tracking
+- [x] Query performance tracking (COMPLETED)
 - [x] Connection pool metrics (COMPLETED)
 - [x] Table size monitoring (COMPLETED)
-- [ ] Index usage statistics (MySQL doesn't have pg_stat_user_indexes)
+- [x] Index usage statistics (COMPLETED)
+- [x] Query plan analysis (COMPLETED - EXPLAIN support)
 
 ### Maintenance
 - [x] Automatic archiving of old tasks (COMPLETED)
@@ -169,6 +190,7 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 - [x] ANALYZE TABLE for index maintenance (COMPLETED)
 - [x] Database health checks (COMPLETED)
 - [x] Selective purge operations (COMPLETED)
+- [x] Migration tracking system (COMPLETED)
 
 ## Testing Status
 
@@ -177,20 +199,36 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 - [x] DbTaskState tests (display, from_str, serialization)
 - [x] TaskResultStatus tests (display, from_str, serialization)
 - [x] QueueStatistics tests
-- [ ] Integration tests with real MySQL
-- [ ] Concurrency tests (FOR UPDATE SKIP LOCKED)
+- [x] PoolConfig tests (COMPLETED)
+- [x] TaskChain builder tests (COMPLETED)
+- [x] Integration tests with real MySQL (COMPLETED - 13 tests)
+  - [x] Batch operations test
+  - [x] Task chain test
+  - [x] Connection diagnostics test
+  - [x] Performance metrics test
+  - [x] Migration tracking test
+  - [x] Readiness check test
+- [x] Concurrency tests (FOR UPDATE SKIP LOCKED) (COMPLETED)
+  - [x] Concurrent dequeue test
+  - [x] SKIP LOCKED behavior test
 - [ ] Performance benchmarks vs PostgreSQL
-- [ ] Migration testing
+- [x] Migration testing (COMPLETED)
 
 ## Documentation
 
 - [x] Module-level documentation
 - [x] Migration files with comments
 - [x] API documentation
-- [ ] MySQL tuning guide
-- [ ] Index strategy documentation
-- [ ] Scaling recommendations
-- [ ] Backup/restore procedures
+- [x] README.md with comprehensive examples (COMPLETED)
+- [x] MySQL tuning guide (COMPLETED - in README.md)
+- [x] Index strategy documentation (COMPLETED - in migration files and README.md)
+- [x] Scaling recommendations (COMPLETED - in README.md)
+- [x] Backup/restore procedures (COMPLETED - comprehensive guide in README.md)
+  - [x] Database backup strategies
+  - [x] Point-in-time recovery procedures
+  - [x] Disaster recovery checklist
+  - [x] Automated backup scripts
+  - [x] Data migration examples
 
 ## Dependencies
 
@@ -279,6 +317,58 @@ purge_by_task_name(task_name) -> u64
 get_table_sizes() -> Vec<TableSizeInfo>
 optimize_tables()
 analyze_tables()
+```
+
+### NEW: Connection Pool Configuration
+```rust
+with_config(url, queue_name, config: PoolConfig) -> MysqlBroker
+// PoolConfig fields: max_connections, min_connections, acquire_timeout_secs,
+//                    max_lifetime_secs, idle_timeout_secs
+```
+
+### NEW: Migration Management
+```rust
+list_migrations() -> Vec<MigrationInfo>
+// Migrations are now tracked in celers_migrations table
+// migrate() is idempotent and skips already-applied migrations
+```
+
+### NEW: Query Performance Tracking
+```rust
+get_query_stats() -> Vec<QueryStats>
+reset_query_stats()
+// Requires MySQL performance_schema to be enabled
+```
+
+### NEW: Index Usage and Query Optimization
+```rust
+get_index_stats() -> Vec<IndexStats>
+explain_dequeue() -> Vec<QueryPlan>
+explain_query(query) -> Vec<QueryPlan>
+check_index_usage() -> Vec<String>
+// Returns warnings about index usage issues
+```
+
+### NEW: Batch Operations
+```rust
+reject_batch(tasks: &[(TaskId, Option<String>, bool)]) -> u64
+// Efficiently reject multiple tasks with retry logic
+```
+
+### NEW: Task Chain Support
+```rust
+enqueue_chain(chain: TaskChain) -> Vec<TaskId>
+// TaskChain::new().then(task1).then(task2).with_delay(5)
+// Creates sequential task execution with optional delays
+```
+
+### NEW: Connection Diagnostics and Performance
+```rust
+get_connection_diagnostics() -> ConnectionDiagnostics
+get_performance_metrics() -> PerformanceMetrics
+is_ready() -> bool
+get_server_variables() -> HashMap<String, String>
+// Monitor connection pool, query performance, and server config
 ```
 
 ## Schema Design

@@ -398,4 +398,157 @@ mod tests {
         assert!(!TaskState::Retrying(3).can_retry(3));
         assert!(!TaskState::Succeeded(vec![]).can_retry(3));
     }
+
+    // Property-based tests
+    #[cfg(test)]
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // Strategy for generating TaskState
+        fn task_state_strategy() -> impl Strategy<Value = TaskState> {
+            prop_oneof![
+                Just(TaskState::Pending),
+                Just(TaskState::Received),
+                Just(TaskState::Reserved),
+                Just(TaskState::Running),
+                (0u32..100).prop_map(TaskState::Retrying),
+                prop::collection::vec(any::<u8>(), 0..100).prop_map(TaskState::Succeeded),
+                any::<String>().prop_map(TaskState::Failed),
+                Just(TaskState::Revoked),
+                Just(TaskState::Rejected),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn test_terminal_states_are_consistent(state in task_state_strategy()) {
+                // Property: If a state is terminal, it should not be active
+                if state.is_terminal() {
+                    prop_assert!(!state.is_active());
+                } else {
+                    prop_assert!(state.is_active());
+                }
+            }
+
+            #[test]
+            fn test_retry_count_is_non_negative(count in 0u32..1000) {
+                let state = TaskState::Retrying(count);
+                prop_assert_eq!(state.retry_count(), count);
+                prop_assert!(state.is_retrying());
+            }
+
+            #[test]
+            fn test_can_retry_respects_max_retries(current_retry in 0u32..100, max_retries in 0u32..100) {
+                let state = TaskState::Retrying(current_retry);
+                let can_retry = state.can_retry(max_retries);
+
+                if current_retry < max_retries {
+                    prop_assert!(can_retry, "Should be able to retry when current_retry < max_retries");
+                } else {
+                    prop_assert!(!can_retry, "Should not be able to retry when current_retry >= max_retries");
+                }
+            }
+
+            #[test]
+            fn test_failed_state_can_always_retry_once(max_retries in 1u32..100) {
+                let state = TaskState::Failed("error".to_string());
+                prop_assert!(state.can_retry(max_retries));
+            }
+
+            #[test]
+            fn test_terminal_states_cannot_retry(max_retries in 1u32..100) {
+                let terminal_states = vec![
+                    TaskState::Succeeded(vec![1, 2, 3]),
+                    TaskState::Revoked,
+                    TaskState::Rejected,
+                ];
+
+                for state in terminal_states {
+                    if !matches!(state, TaskState::Failed(_)) {
+                        prop_assert!(!state.can_retry(max_retries) || state.is_failed());
+                    }
+                }
+            }
+
+            #[test]
+            fn test_state_name_is_consistent(state in task_state_strategy()) {
+                let name = state.name();
+                prop_assert!(!name.is_empty(), "State name should never be empty");
+
+                // Name should match the state type
+                match &state {
+                    TaskState::Pending => prop_assert_eq!(name, "PENDING"),
+                    TaskState::Received => prop_assert_eq!(name, "RECEIVED"),
+                    TaskState::Reserved => prop_assert_eq!(name, "RESERVED"),
+                    TaskState::Running => prop_assert_eq!(name, "RUNNING"),
+                    TaskState::Retrying(_) => prop_assert_eq!(name, "RETRYING"),
+                    TaskState::Succeeded(_) => prop_assert_eq!(name, "SUCCESS"),
+                    TaskState::Failed(_) => prop_assert_eq!(name, "FAILURE"),
+                    TaskState::Revoked => prop_assert_eq!(name, "REVOKED"),
+                    TaskState::Rejected => prop_assert_eq!(name, "REJECTED"),
+                    TaskState::Custom { name: custom_name, .. } => prop_assert_eq!(name, custom_name),
+                }
+            }
+
+            #[test]
+            fn test_success_result_only_for_succeeded(result in prop::collection::vec(any::<u8>(), 0..100)) {
+                let success_state = TaskState::Succeeded(result.clone());
+                prop_assert_eq!(success_state.success_result(), Some(result.as_slice()));
+
+                let other_states = vec![
+                    TaskState::Pending,
+                    TaskState::Running,
+                    TaskState::Failed("error".to_string()),
+                ];
+
+                for state in other_states {
+                    prop_assert_eq!(state.success_result(), None);
+                }
+            }
+
+            #[test]
+            fn test_error_message_only_for_failed(error_msg in any::<String>()) {
+                let failed_state = TaskState::Failed(error_msg.clone());
+                prop_assert_eq!(failed_state.error_message(), Some(error_msg.as_str()));
+
+                let other_states = vec![
+                    TaskState::Pending,
+                    TaskState::Running,
+                    TaskState::Succeeded(vec![]),
+                ];
+
+                for state in other_states {
+                    prop_assert_eq!(state.error_message(), None);
+                }
+            }
+
+            #[test]
+            fn test_state_history_transitions_accumulate(
+                num_transitions in 1usize..20,
+            ) {
+                let mut history = StateHistory::with_initial(TaskState::Pending);
+
+                for i in 0..num_transitions {
+                    let new_state = if i % 2 == 0 {
+                        TaskState::Running
+                    } else {
+                        TaskState::Pending
+                    };
+                    history.transition(new_state);
+                }
+
+                prop_assert_eq!(history.transition_count(), num_transitions);
+                prop_assert!(history.last_transition().is_some());
+            }
+
+            #[test]
+            fn test_state_history_current_state_is_latest(state in task_state_strategy()) {
+                let mut history = StateHistory::with_initial(TaskState::Pending);
+                history.transition(state.clone());
+
+                prop_assert_eq!(history.current_state(), Some(&state));
+            }
+        }
+    }
 }

@@ -21,3 +21,14 @@ celers-protocol = { path = "../celers-protocol" }
 
 [dev-dependencies]
 tokio = { version = "1.42", features = ["full"] }
+
+[features]
+default = []
+# Compression middleware (requires celers-protocol compression features)
+compression = ["celers-protocol/gzip"]
+# Message signing middleware (requires celers-protocol signing feature)
+signing = ["celers-protocol/signing"]
+# Message encryption middleware (requires celers-protocol encryption feature)
+encryption = ["celers-protocol/encryption"]
+# Enable all middleware features
+full = ["compression", "signing", "encryption"]

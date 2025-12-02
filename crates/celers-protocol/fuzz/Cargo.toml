@@ -1,0 +1,37 @@
+[package]
+name = "celers-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+celers-protocol = { path = ".." }
+serde_json = "1.0"
+
+[[bin]]
+name = "fuzz_message"
+path = "fuzz_targets/fuzz_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_serializer"
+path = "fuzz_targets/fuzz_serializer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_compression"
+path = "fuzz_targets/fuzz_compression.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_security"
+path = "fuzz_targets/fuzz_security.rs"
+test = false
+doc = false

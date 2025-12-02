@@ -58,6 +58,10 @@
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
+use aws_sdk_cloudwatch::{
+    types::{Dimension, MetricDatum, StandardUnit},
+    Client as CloudWatchClient,
+};
 use aws_sdk_sqs::{
     types::{MessageAttributeValue, QueueAttributeName},
     Client,
@@ -183,9 +187,176 @@ pub struct QueueStats {
     pub is_fifo: bool,
 }
 
+/// CloudWatch metrics configuration
+#[derive(Debug, Clone)]
+pub struct CloudWatchConfig {
+    /// Namespace for CloudWatch metrics (default: "CeleRS/SQS")
+    pub namespace: String,
+    /// Enable automatic metrics publishing
+    pub enabled: bool,
+    /// Additional dimensions for metrics
+    pub dimensions: HashMap<String, String>,
+}
+
+impl Default for CloudWatchConfig {
+    fn default() -> Self {
+        Self {
+            namespace: "CeleRS/SQS".to_string(),
+            enabled: false,
+            dimensions: HashMap::new(),
+        }
+    }
+}
+
+impl CloudWatchConfig {
+    /// Create a new CloudWatch configuration
+    pub fn new(namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            enabled: true,
+            dimensions: HashMap::new(),
+        }
+    }
+
+    /// Add a dimension for CloudWatch metrics
+    pub fn with_dimension(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.dimensions.insert(name.into(), value.into());
+        self
+    }
+
+    /// Enable or disable CloudWatch metrics
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+}
+
+/// Adaptive polling strategy for queue consumption
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollingStrategy {
+    /// Fixed wait time (no adaptation)
+    Fixed,
+    /// Exponential backoff when queue is empty
+    ExponentialBackoff,
+    /// Aggressive polling when messages are available, backoff when empty
+    Adaptive,
+}
+
+impl Default for PollingStrategy {
+    fn default() -> Self {
+        Self::Fixed
+    }
+}
+
+/// Configuration for adaptive polling
+#[derive(Debug, Clone)]
+pub struct AdaptivePollingConfig {
+    /// Polling strategy to use
+    pub strategy: PollingStrategy,
+    /// Minimum wait time in seconds (default: 1)
+    pub min_wait_time: i32,
+    /// Maximum wait time in seconds (default: 20)
+    pub max_wait_time: i32,
+    /// Backoff multiplier for exponential backoff (default: 2.0)
+    pub backoff_multiplier: f64,
+    /// Current wait time (internal state)
+    current_wait_time: i32,
+    /// Consecutive empty receives count (internal state)
+    consecutive_empty_receives: u32,
+}
+
+impl Default for AdaptivePollingConfig {
+    fn default() -> Self {
+        Self {
+            strategy: PollingStrategy::Fixed,
+            min_wait_time: 1,
+            max_wait_time: 20,
+            backoff_multiplier: 2.0,
+            current_wait_time: 20,
+            consecutive_empty_receives: 0,
+        }
+    }
+}
+
+impl AdaptivePollingConfig {
+    /// Create a new adaptive polling configuration
+    pub fn new(strategy: PollingStrategy) -> Self {
+        Self {
+            strategy,
+            ..Default::default()
+        }
+    }
+
+    /// Set minimum wait time (1-20 seconds)
+    pub fn with_min_wait_time(mut self, seconds: i32) -> Self {
+        self.min_wait_time = seconds.clamp(1, 20);
+        self
+    }
+
+    /// Set maximum wait time (1-20 seconds)
+    pub fn with_max_wait_time(mut self, seconds: i32) -> Self {
+        self.max_wait_time = seconds.clamp(1, 20);
+        self
+    }
+
+    /// Set backoff multiplier (1.0-10.0)
+    pub fn with_backoff_multiplier(mut self, multiplier: f64) -> Self {
+        self.backoff_multiplier = multiplier.clamp(1.0, 10.0);
+        self
+    }
+
+    /// Adjust wait time based on whether messages were received
+    pub fn adjust_wait_time(&mut self, received_messages: bool) {
+        match self.strategy {
+            PollingStrategy::Fixed => {
+                // No adjustment for fixed strategy
+            }
+            PollingStrategy::ExponentialBackoff => {
+                if received_messages {
+                    // Reset to min wait time when messages are received
+                    self.current_wait_time = self.min_wait_time;
+                    self.consecutive_empty_receives = 0;
+                } else {
+                    // Exponential backoff when no messages
+                    self.consecutive_empty_receives += 1;
+                    let new_wait = (self.current_wait_time as f64 * self.backoff_multiplier) as i32;
+                    self.current_wait_time = new_wait.min(self.max_wait_time);
+                }
+            }
+            PollingStrategy::Adaptive => {
+                if received_messages {
+                    // Decrease wait time when messages are available (more aggressive)
+                    self.current_wait_time = (self.current_wait_time / 2).max(self.min_wait_time);
+                    self.consecutive_empty_receives = 0;
+                } else {
+                    // Increase wait time when no messages (save costs)
+                    self.consecutive_empty_receives += 1;
+                    if self.consecutive_empty_receives >= 3 {
+                        let new_wait =
+                            (self.current_wait_time as f64 * self.backoff_multiplier) as i32;
+                        self.current_wait_time = new_wait.min(self.max_wait_time);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the current wait time
+    pub fn current_wait_time(&self) -> i32 {
+        self.current_wait_time
+    }
+
+    /// Reset the adaptive polling state
+    pub fn reset(&mut self) {
+        self.current_wait_time = self.max_wait_time;
+        self.consecutive_empty_receives = 0;
+    }
+}
+
 /// AWS SQS broker implementation
 pub struct SqsBroker {
     client: Option<Client>,
+    cloudwatch_client: Option<CloudWatchClient>,
     queue_name: String,
     queue_url: Option<String>,
     /// Visibility timeout in seconds (default 30)
@@ -204,6 +375,10 @@ pub struct SqsBroker {
     message_retention_seconds: i32,
     /// Delay seconds for messages (0-900, default 0)
     delay_seconds: i32,
+    /// CloudWatch metrics configuration
+    cloudwatch_config: Option<CloudWatchConfig>,
+    /// Adaptive polling configuration
+    adaptive_polling: Option<AdaptivePollingConfig>,
 }
 
 impl SqsBroker {
@@ -216,6 +391,7 @@ impl SqsBroker {
     pub async fn new(queue_name: &str) -> Result<Self> {
         Ok(Self {
             client: None,
+            cloudwatch_client: None,
             queue_name: queue_name.to_string(),
             queue_url: None,
             visibility_timeout: 30,
@@ -226,6 +402,8 @@ impl SqsBroker {
             sse_config: None,
             message_retention_seconds: 345600, // 4 days
             delay_seconds: 0,
+            cloudwatch_config: None,
+            adaptive_polling: None,
         })
     }
 
@@ -286,6 +464,23 @@ impl SqsBroker {
         self
     }
 
+    /// Configure CloudWatch metrics publishing
+    ///
+    /// When enabled, the broker will automatically publish queue metrics to CloudWatch.
+    pub fn with_cloudwatch(mut self, config: CloudWatchConfig) -> Self {
+        self.cloudwatch_config = Some(config);
+        self
+    }
+
+    /// Configure adaptive polling strategy
+    ///
+    /// This allows the broker to adjust its polling behavior based on queue activity,
+    /// potentially reducing costs and improving efficiency.
+    pub fn with_adaptive_polling(mut self, config: AdaptivePollingConfig) -> Self {
+        self.adaptive_polling = Some(config);
+        self
+    }
+
     /// Check if this broker is configured for FIFO queue
     pub fn is_fifo(&self) -> bool {
         self.queue_name.ends_with(".fifo") || self.fifo_config.is_some()
@@ -337,6 +532,78 @@ impl SqsBroker {
                 )))
             }
         }
+    }
+
+    /// Get or create CloudWatch client
+    async fn get_cloudwatch_client(&mut self) -> Result<CloudWatchClient> {
+        if self.cloudwatch_client.is_none() {
+            let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+            self.cloudwatch_client = Some(CloudWatchClient::new(&config));
+        }
+
+        self.cloudwatch_client
+            .clone()
+            .ok_or_else(|| BrokerError::Connection("CloudWatch client not initialized".to_string()))
+    }
+
+    /// Publish queue metrics to CloudWatch
+    ///
+    /// This publishes the current queue statistics to CloudWatch for monitoring.
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name to publish metrics for
+    pub async fn publish_metrics(&mut self, queue: &str) -> Result<()> {
+        let config = match &self.cloudwatch_config {
+            Some(c) if c.enabled => c.clone(),
+            _ => return Ok(()), // CloudWatch not enabled
+        };
+
+        let stats = self.get_queue_stats(queue).await?;
+        let cw_client = self.get_cloudwatch_client().await?;
+
+        let mut dimensions = vec![Dimension::builder().name("QueueName").value(queue).build()];
+
+        // Add custom dimensions
+        for (name, value) in &config.dimensions {
+            dimensions.push(Dimension::builder().name(name).value(value).build());
+        }
+
+        let metrics = vec![
+            MetricDatum::builder()
+                .metric_name("ApproximateNumberOfMessages")
+                .value(stats.approximate_message_count as f64)
+                .unit(StandardUnit::Count)
+                .set_dimensions(Some(dimensions.clone()))
+                .build(),
+            MetricDatum::builder()
+                .metric_name("ApproximateNumberOfMessagesNotVisible")
+                .value(stats.approximate_not_visible_count as f64)
+                .unit(StandardUnit::Count)
+                .set_dimensions(Some(dimensions.clone()))
+                .build(),
+            MetricDatum::builder()
+                .metric_name("ApproximateNumberOfMessagesDelayed")
+                .value(stats.approximate_delayed_count as f64)
+                .unit(StandardUnit::Count)
+                .set_dimensions(Some(dimensions.clone()))
+                .build(),
+        ];
+
+        cw_client
+            .put_metric_data()
+            .namespace(&config.namespace)
+            .set_metric_data(Some(metrics))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to publish metrics: {}", e))
+            })?;
+
+        debug!(
+            "Published CloudWatch metrics for queue {} to namespace {}",
+            queue, config.namespace
+        );
+        Ok(())
     }
 
     /// Publish multiple messages in a single batch (up to 10 messages)
@@ -1260,6 +1527,104 @@ impl SqsBroker {
         debug!("Removed tags from queue: {}", queue);
         Ok(())
     }
+
+    /// Process messages in parallel with a handler function
+    ///
+    /// This method consumes messages in batches and processes them concurrently,
+    /// improving throughput for I/O-bound or CPU-intensive tasks.
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name to consume from
+    /// * `max_messages` - Maximum messages to process in parallel (1-10)
+    /// * `timeout` - Long polling wait time
+    /// * `handler` - Async function to process each message
+    ///
+    /// # Returns
+    /// Number of messages successfully processed
+    ///
+    /// # Example
+    /// ```ignore
+    /// let processed = broker.consume_parallel(
+    ///     "my-queue",
+    ///     5,
+    ///     Duration::from_secs(20),
+    ///     |envelope| async move {
+    ///         println!("Processing message: {:?}", envelope.message);
+    ///         Ok(())
+    ///     }
+    /// ).await?;
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consume_parallel<F, Fut>(
+        &mut self,
+        queue: &str,
+        max_messages: i32,
+        timeout: Duration,
+        handler: F,
+    ) -> Result<usize>
+    where
+        F: Fn(Envelope) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        let envelopes = self.consume_batch(queue, max_messages, timeout).await?;
+
+        if envelopes.is_empty() {
+            return Ok(0);
+        }
+
+        let handler = std::sync::Arc::new(handler);
+        let mut tasks = Vec::new();
+
+        for envelope in envelopes {
+            let delivery_tag = envelope.delivery_tag.clone();
+            let handler = handler.clone();
+
+            let task = tokio::spawn(async move {
+                let result = handler(envelope).await;
+                (delivery_tag, result)
+            });
+
+            tasks.push(task);
+        }
+
+        let mut successful = 0;
+        let mut failed_tags = Vec::new();
+
+        for task in tasks {
+            match task.await {
+                Ok((delivery_tag, Ok(()))) => {
+                    // Handler succeeded, acknowledge message
+                    if let Err(e) = self.ack(&delivery_tag).await {
+                        warn!("Failed to acknowledge message {}: {}", delivery_tag, e);
+                    } else {
+                        successful += 1;
+                    }
+                }
+                Ok((delivery_tag, Err(e))) => {
+                    // Handler failed, requeue message
+                    warn!("Handler failed for message {}: {}", delivery_tag, e);
+                    failed_tags.push(delivery_tag);
+                }
+                Err(e) => {
+                    // Task panicked
+                    warn!("Task panicked: {}", e);
+                }
+            }
+        }
+
+        // Reject failed messages (requeue them)
+        for tag in failed_tags {
+            if let Err(e) = self.reject(&tag, true).await {
+                warn!("Failed to requeue message {}: {}", tag, e);
+            }
+        }
+
+        debug!(
+            "Processed {} messages in parallel from queue: {}",
+            successful, queue
+        );
+        Ok(successful)
+    }
 }
 
 #[async_trait]
@@ -1370,8 +1735,12 @@ impl Consumer for SqsBroker {
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
-        // Convert timeout to wait time (max 20 seconds for SQS)
-        let wait_time = timeout.as_secs().min(20) as i32;
+        // Determine wait time based on adaptive polling configuration
+        let wait_time = if let Some(ref mut adaptive) = self.adaptive_polling {
+            adaptive.current_wait_time()
+        } else {
+            timeout.as_secs().min(20) as i32
+        };
 
         // Receive message with long polling
         let result = client
@@ -1386,6 +1755,17 @@ impl Consumer for SqsBroker {
             .map_err(|e| {
                 BrokerError::OperationFailed(format!("Failed to receive message: {}", e))
             })?;
+
+        let received_messages = result
+            .messages
+            .as_ref()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false);
+
+        // Adjust adaptive polling based on result
+        if let Some(ref mut adaptive) = self.adaptive_polling {
+            adaptive.adjust_wait_time(received_messages);
+        }
 
         if let Some(messages) = result.messages {
             if let Some(sqs_message) = messages.into_iter().next() {
@@ -1894,5 +2274,252 @@ mod tests {
     async fn test_is_not_fifo() {
         let broker = SqsBroker::new("my-queue").await.unwrap();
         assert!(!broker.is_fifo());
+    }
+
+    // CloudWatch configuration tests
+    #[test]
+    fn test_cloudwatch_config_default() {
+        let config = CloudWatchConfig::default();
+        assert_eq!(config.namespace, "CeleRS/SQS");
+        assert!(!config.enabled);
+        assert!(config.dimensions.is_empty());
+    }
+
+    #[test]
+    fn test_cloudwatch_config_new() {
+        let config = CloudWatchConfig::new("MyNamespace");
+        assert_eq!(config.namespace, "MyNamespace");
+        assert!(config.enabled);
+        assert!(config.dimensions.is_empty());
+    }
+
+    #[test]
+    fn test_cloudwatch_config_with_dimensions() {
+        let config = CloudWatchConfig::new("CeleRS/SQS")
+            .with_dimension("Environment", "production")
+            .with_dimension("Application", "my-app");
+
+        assert_eq!(config.dimensions.len(), 2);
+        assert_eq!(
+            config.dimensions.get("Environment"),
+            Some(&"production".to_string())
+        );
+        assert_eq!(
+            config.dimensions.get("Application"),
+            Some(&"my-app".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cloudwatch_config_enabled() {
+        let config = CloudWatchConfig::new("test").with_enabled(false);
+        assert!(!config.enabled);
+
+        let config2 = CloudWatchConfig::default().with_enabled(true);
+        assert!(config2.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_broker_with_cloudwatch() {
+        let cw_config = CloudWatchConfig::new("CeleRS/SQS").with_dimension("Test", "value");
+
+        let broker = SqsBroker::new("test-queue")
+            .await
+            .unwrap()
+            .with_cloudwatch(cw_config);
+
+        assert!(broker.cloudwatch_config.is_some());
+        let config = broker.cloudwatch_config.unwrap();
+        assert_eq!(config.namespace, "CeleRS/SQS");
+        assert!(config.enabled);
+    }
+
+    // Adaptive polling tests
+    #[test]
+    fn test_polling_strategy_default() {
+        let strategy = PollingStrategy::default();
+        assert_eq!(strategy, PollingStrategy::Fixed);
+    }
+
+    #[test]
+    fn test_adaptive_polling_config_default() {
+        let config = AdaptivePollingConfig::default();
+        assert_eq!(config.strategy, PollingStrategy::Fixed);
+        assert_eq!(config.min_wait_time, 1);
+        assert_eq!(config.max_wait_time, 20);
+        assert_eq!(config.backoff_multiplier, 2.0);
+        assert_eq!(config.current_wait_time(), 20);
+    }
+
+    #[test]
+    fn test_adaptive_polling_config_new() {
+        let config = AdaptivePollingConfig::new(PollingStrategy::ExponentialBackoff);
+        assert_eq!(config.strategy, PollingStrategy::ExponentialBackoff);
+        assert_eq!(config.current_wait_time(), 20);
+    }
+
+    #[test]
+    fn test_adaptive_polling_config_builders() {
+        let config = AdaptivePollingConfig::new(PollingStrategy::Adaptive)
+            .with_min_wait_time(2)
+            .with_max_wait_time(15)
+            .with_backoff_multiplier(3.0);
+
+        assert_eq!(config.min_wait_time, 2);
+        assert_eq!(config.max_wait_time, 15);
+        assert_eq!(config.backoff_multiplier, 3.0);
+    }
+
+    #[test]
+    fn test_adaptive_polling_config_clamping() {
+        let config = AdaptivePollingConfig::new(PollingStrategy::Fixed)
+            .with_min_wait_time(0) // below min
+            .with_max_wait_time(30) // above max
+            .with_backoff_multiplier(15.0); // above max
+
+        assert_eq!(config.min_wait_time, 1); // clamped to min
+        assert_eq!(config.max_wait_time, 20); // clamped to max
+        assert_eq!(config.backoff_multiplier, 10.0); // clamped to max
+    }
+
+    #[test]
+    fn test_adaptive_polling_fixed_strategy() {
+        let mut config = AdaptivePollingConfig::new(PollingStrategy::Fixed);
+        let initial_wait = config.current_wait_time();
+
+        config.adjust_wait_time(false); // empty receive
+        assert_eq!(config.current_wait_time(), initial_wait); // no change
+
+        config.adjust_wait_time(true); // received messages
+        assert_eq!(config.current_wait_time(), initial_wait); // no change
+    }
+
+    #[test]
+    fn test_adaptive_polling_exponential_backoff() {
+        let mut config = AdaptivePollingConfig::new(PollingStrategy::ExponentialBackoff)
+            .with_min_wait_time(1)
+            .with_max_wait_time(20)
+            .with_backoff_multiplier(2.0);
+
+        // Start with max wait time
+        assert_eq!(config.current_wait_time(), 20);
+
+        // Receive messages - should reset to min
+        config.adjust_wait_time(true);
+        assert_eq!(config.current_wait_time(), 1);
+
+        // Empty receive - should double
+        config.adjust_wait_time(false);
+        assert_eq!(config.current_wait_time(), 2);
+
+        // Another empty receive - should double again
+        config.adjust_wait_time(false);
+        assert_eq!(config.current_wait_time(), 4);
+
+        // Keep going until we hit max
+        for _ in 0..10 {
+            config.adjust_wait_time(false);
+        }
+        assert_eq!(config.current_wait_time(), 20); // capped at max
+
+        // Receive messages - should reset to min
+        config.adjust_wait_time(true);
+        assert_eq!(config.current_wait_time(), 1);
+    }
+
+    #[test]
+    fn test_adaptive_polling_adaptive_strategy() {
+        let mut config = AdaptivePollingConfig::new(PollingStrategy::Adaptive)
+            .with_min_wait_time(1)
+            .with_max_wait_time(20)
+            .with_backoff_multiplier(2.0);
+
+        // Start with max wait time
+        assert_eq!(config.current_wait_time(), 20);
+
+        // Receive messages - should halve
+        config.adjust_wait_time(true);
+        assert_eq!(config.current_wait_time(), 10);
+
+        // Receive more messages - should halve again
+        config.adjust_wait_time(true);
+        assert_eq!(config.current_wait_time(), 5);
+
+        // Keep receiving - should eventually hit min
+        for _ in 0..10 {
+            config.adjust_wait_time(true);
+        }
+        assert_eq!(config.current_wait_time(), 1);
+
+        // Empty receive (less than 3 consecutive) - should not change
+        config.adjust_wait_time(false);
+        assert_eq!(config.current_wait_time(), 1);
+
+        config.adjust_wait_time(false);
+        assert_eq!(config.current_wait_time(), 1);
+
+        // 3rd consecutive empty receive - should start increasing
+        config.adjust_wait_time(false);
+        assert_eq!(config.current_wait_time(), 2);
+
+        // More empty receives (each triggers increase after 3+ consecutive)
+        config.adjust_wait_time(false); // 4th: 2 * 2 = 4
+        assert_eq!(config.current_wait_time(), 4);
+
+        config.adjust_wait_time(false); // 5th: 4 * 2 = 8
+        assert_eq!(config.current_wait_time(), 8);
+
+        config.adjust_wait_time(false); // 6th: 8 * 2 = 16
+        assert_eq!(config.current_wait_time(), 16);
+    }
+
+    #[test]
+    fn test_adaptive_polling_reset() {
+        let mut config =
+            AdaptivePollingConfig::new(PollingStrategy::ExponentialBackoff).with_max_wait_time(20);
+
+        // Adjust wait time
+        config.adjust_wait_time(true);
+        assert_ne!(config.current_wait_time(), 20);
+
+        // Reset
+        config.reset();
+        assert_eq!(config.current_wait_time(), 20);
+    }
+
+    #[tokio::test]
+    async fn test_broker_with_adaptive_polling() {
+        let adaptive_config = AdaptivePollingConfig::new(PollingStrategy::Adaptive)
+            .with_min_wait_time(1)
+            .with_max_wait_time(15);
+
+        let broker = SqsBroker::new("test-queue")
+            .await
+            .unwrap()
+            .with_adaptive_polling(adaptive_config);
+
+        assert!(broker.adaptive_polling.is_some());
+        let config = broker.adaptive_polling.unwrap();
+        assert_eq!(config.strategy, PollingStrategy::Adaptive);
+        assert_eq!(config.min_wait_time, 1);
+        assert_eq!(config.max_wait_time, 15);
+    }
+
+    #[tokio::test]
+    async fn test_broker_with_all_new_configs() {
+        let cw_config = CloudWatchConfig::new("CeleRS/SQS").with_dimension("Environment", "test");
+
+        let adaptive_config = AdaptivePollingConfig::new(PollingStrategy::ExponentialBackoff)
+            .with_min_wait_time(2)
+            .with_max_wait_time(18);
+
+        let broker = SqsBroker::new("test-queue")
+            .await
+            .unwrap()
+            .with_cloudwatch(cw_config)
+            .with_adaptive_polling(adaptive_config);
+
+        assert!(broker.cloudwatch_config.is_some());
+        assert!(broker.adaptive_polling.is_some());
     }
 }

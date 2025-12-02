@@ -47,6 +47,8 @@ PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, 
 - [x] Connection pooling via sqlx
 - [x] Configurable queue table name
 - [x] Async query execution
+- [x] Custom pool configuration (`with_pool_config`)
+- [x] Queue name accessor method (`queue_name()`)
 
 ### Batch Operations ✅
 - [x] `enqueue_batch()` - Multiple tasks in single transaction
@@ -91,6 +93,18 @@ PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, 
 - [x] `purge_all()` - Purge all tasks (with warning)
 - [x] `HealthStatus` struct with comprehensive health info
 - [x] `analyze_tables()` - Update PostgreSQL statistics for query planner
+- [x] `vacuum_tables()` - Manual VACUUM for space reclamation
+- [x] `count_by_state()` - Count tasks by state
+- [x] `count_scheduled()` - Count tasks scheduled for future execution
+- [x] `cancel_all_pending()` - Cancel all pending tasks
+
+### Diagnostics & Metrics ✅
+- [x] `test_connection()` - Simple connectivity test
+- [x] `oldest_pending_age_secs()` - Age of oldest pending task
+- [x] `oldest_processing_age_secs()` - Age of oldest processing task (stuck detection)
+- [x] `avg_processing_time_ms()` - Average task processing time
+- [x] `retry_rate()` - Percentage of retried tasks
+- [x] `success_rate()` - Task success rate
 
 ### Task Result Storage ✅
 - [x] `celers_task_results` table for result backend
@@ -117,34 +131,43 @@ PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, 
 ## Future Enhancements
 
 ### Performance
-- [ ] Table partitioning for large queues
-- [ ] Query optimization for high throughput
+- [ ] Table partitioning for large queues (for very large deployments)
+- [ ] Query optimization for high throughput (current performance is good)
+- [ ] Connection pool metrics exporter
 
 ### Advanced Features
-- [ ] Task dependencies/DAG support
-- [ ] Multi-tenant queue support (beyond queue_name)
+- [ ] Task dependencies/DAG support (would require schema changes)
+- [ ] Multi-tenant queue support with stronger isolation (beyond queue_name)
+- [ ] Task chaining and workflows
+- [ ] Custom retry strategies (exponential backoff is currently fixed)
 
 ### Maintenance
-- [ ] VACUUM automation
+- [x] Manual VACUUM (`vacuum_tables()` method available)
+- [ ] Automated VACUUM scheduler (background task integration)
 
 ## Testing Status
 
 - [x] Compilation tests
 - [x] Unit tests for types (DbTaskState, TaskResultStatus, etc.)
-- [ ] Unit tests with mock database
-- [ ] Integration tests with real PostgreSQL
-- [ ] Concurrency tests (FOR UPDATE SKIP LOCKED)
-- [ ] Performance benchmarks
-- [ ] Migration testing
+- [x] Doc tests for module-level examples
+- [x] Integration test examples (marked as #[ignore])
+- [ ] Unit tests with mock database (future enhancement)
+- [ ] Full integration test suite with real PostgreSQL (future enhancement)
+- [ ] Concurrency stress tests (future enhancement)
+- [ ] Performance benchmarks (future enhancement)
+- [ ] Migration testing (migrations are idempotent and safe)
 
 ## Documentation
 
 - [x] Module-level documentation
 - [x] Migration files with comments
-- [ ] PostgreSQL tuning guide
-- [ ] Index strategy documentation
-- [ ] Scaling recommendations
-- [ ] Backup/restore procedures
+- [x] Comprehensive README with usage examples
+- [x] Doc tests for key functionality
+- [x] PostgreSQL tuning guide (in README)
+- [x] Performance characteristics (in README)
+- [x] Index strategy documentation (in migration files)
+- [x] Scaling recommendations (in README)
+- [x] Backup/restore procedures (comprehensive guide in README)
 
 ## Dependencies
 

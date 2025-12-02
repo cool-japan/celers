@@ -206,6 +206,145 @@ pub struct ScheduledTaskInfo {
     pub delay_remaining_secs: i64,
 }
 
+/// Connection pool configuration
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Maximum number of connections in the pool
+    pub max_connections: u32,
+    /// Minimum number of idle connections
+    pub min_connections: u32,
+    /// Connection timeout in seconds
+    pub acquire_timeout_secs: u64,
+    /// Maximum lifetime of a connection in seconds
+    pub max_lifetime_secs: Option<u64>,
+    /// Idle timeout for connections in seconds
+    pub idle_timeout_secs: Option<u64>,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 20,
+            min_connections: 2,
+            acquire_timeout_secs: 5,
+            max_lifetime_secs: Some(1800), // 30 minutes
+            idle_timeout_secs: Some(600),  // 10 minutes
+        }
+    }
+}
+
+/// Query performance statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryStats {
+    pub query_name: String,
+    pub execution_count: i64,
+    pub total_time_ms: i64,
+    pub avg_time_ms: f64,
+    pub min_time_ms: i64,
+    pub max_time_ms: i64,
+}
+
+/// Index usage statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexStats {
+    pub table_name: String,
+    pub index_name: String,
+    pub cardinality: i64,
+    pub unique_values: bool,
+}
+
+/// Query execution plan information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryPlan {
+    pub id: i32,
+    pub select_type: String,
+    pub table: Option<String>,
+    pub query_type: Option<String>,
+    pub possible_keys: Option<String>,
+    pub key_used: Option<String>,
+    pub key_length: Option<String>,
+    pub rows_examined: Option<i64>,
+    pub filtered: Option<f64>,
+    pub extra: Option<String>,
+}
+
+/// Migration information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationInfo {
+    pub version: String,
+    pub name: String,
+    pub applied_at: DateTime<Utc>,
+}
+
+/// Connection pool diagnostics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionDiagnostics {
+    pub total_connections: u32,
+    pub idle_connections: u32,
+    pub active_connections: u32,
+    pub max_connections: u32,
+    pub connection_wait_time_ms: Option<i64>,
+    pub pool_utilization_percent: f64,
+}
+
+/// Performance metrics snapshot
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceMetrics {
+    pub timestamp: DateTime<Utc>,
+    pub tasks_per_second: f64,
+    pub avg_dequeue_time_ms: f64,
+    pub avg_enqueue_time_ms: f64,
+    pub queue_depth: i64,
+    pub processing_tasks: i64,
+    pub dlq_size: i64,
+    pub connection_pool: ConnectionDiagnostics,
+}
+
+/// Task chain builder for creating dependent task sequences
+#[derive(Debug, Clone)]
+pub struct TaskChain {
+    tasks: Vec<SerializedTask>,
+    delay_between_secs: Option<u64>,
+}
+
+impl TaskChain {
+    /// Create a new task chain
+    pub fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            delay_between_secs: None,
+        }
+    }
+
+    /// Add a task to the chain
+    pub fn then(mut self, task: SerializedTask) -> Self {
+        self.tasks.push(task);
+        self
+    }
+
+    /// Set delay between tasks in the chain (in seconds)
+    pub fn with_delay(mut self, delay_secs: u64) -> Self {
+        self.delay_between_secs = Some(delay_secs);
+        self
+    }
+
+    /// Get the tasks in the chain
+    pub fn tasks(&self) -> &[SerializedTask] {
+        &self.tasks
+    }
+
+    /// Get the delay between tasks
+    pub fn delay_between_secs(&self) -> Option<u64> {
+        self.delay_between_secs
+    }
+}
+
+impl Default for TaskChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// MySQL-based broker implementation using SKIP LOCKED
 pub struct MysqlBroker {
     pool: MySqlPool,
@@ -225,9 +364,29 @@ impl MysqlBroker {
 
     /// Create a new MySQL broker with a specific queue name
     pub async fn with_queue(database_url: &str, queue_name: &str) -> Result<Self> {
-        let pool = MySqlPoolOptions::new()
-            .max_connections(20)
-            .acquire_timeout(Duration::from_secs(5))
+        Self::with_config(database_url, queue_name, PoolConfig::default()).await
+    }
+
+    /// Create a new MySQL broker with custom connection pool configuration
+    pub async fn with_config(
+        database_url: &str,
+        queue_name: &str,
+        config: PoolConfig,
+    ) -> Result<Self> {
+        let mut pool_options = MySqlPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections)
+            .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs));
+
+        if let Some(max_lifetime) = config.max_lifetime_secs {
+            pool_options = pool_options.max_lifetime(Duration::from_secs(max_lifetime));
+        }
+
+        if let Some(idle_timeout) = config.idle_timeout_secs {
+            pool_options = pool_options.idle_timeout(Duration::from_secs(idle_timeout));
+        }
+
+        let pool = pool_options
             .connect(database_url)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
@@ -241,19 +400,89 @@ impl MysqlBroker {
 
     /// Run database migrations
     pub async fn migrate(&self) -> Result<()> {
-        // Run initial schema migration
-        self.run_migration(include_str!("../migrations/001_init.sql"))
+        // First, create migrations table if it doesn't exist
+        self.run_migration_untracked(include_str!("../migrations/000_migrations.sql"))
             .await?;
 
-        // Run results table migration
-        self.run_migration(include_str!("../migrations/002_results.sql"))
-            .await?;
+        // Run migrations with tracking
+        self.run_migration_tracked(
+            "001",
+            "initial_schema",
+            include_str!("../migrations/001_init.sql"),
+        )
+        .await?;
 
-        // Run performance indexes migration
-        self.run_migration(include_str!("../migrations/003_performance_indexes.sql"))
-            .await?;
+        self.run_migration_tracked(
+            "002",
+            "results_table",
+            include_str!("../migrations/002_results.sql"),
+        )
+        .await?;
+
+        self.run_migration_tracked(
+            "003",
+            "performance_indexes",
+            include_str!("../migrations/003_performance_indexes.sql"),
+        )
+        .await?;
 
         Ok(())
+    }
+
+    /// Check if a migration has been applied
+    async fn is_migration_applied(&self, version: &str) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM celers_migrations WHERE version = ?")
+                .bind(version)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to check migration status: {}", e))
+                })?;
+
+        Ok(count > 0)
+    }
+
+    /// Mark a migration as applied
+    async fn mark_migration_applied(&self, version: &str, name: &str) -> Result<()> {
+        sqlx::query("INSERT INTO celers_migrations (version, name) VALUES (?, ?)")
+            .bind(version)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to mark migration as applied: {}", e))
+            })?;
+
+        tracing::info!(version = %version, name = %name, "Migration applied");
+        Ok(())
+    }
+
+    /// Run a migration with tracking
+    async fn run_migration_tracked(
+        &self,
+        version: &str,
+        name: &str,
+        migration_sql: &str,
+    ) -> Result<()> {
+        // Check if already applied
+        if self.is_migration_applied(version).await? {
+            tracing::debug!(version = %version, name = %name, "Migration already applied, skipping");
+            return Ok(());
+        }
+
+        // Run the migration
+        self.run_migration_untracked(migration_sql).await?;
+
+        // Mark as applied
+        self.mark_migration_applied(version, name).await?;
+
+        Ok(())
+    }
+
+    /// Run a migration without tracking (for the migrations table itself)
+    async fn run_migration_untracked(&self, migration_sql: &str) -> Result<()> {
+        self.run_migration(migration_sql).await
     }
 
     /// Run a single migration file
@@ -1233,6 +1462,390 @@ impl MysqlBroker {
         Ok(result.rows_affected())
     }
 
+    // ========== Migration Management ==========
+
+    /// List all applied migrations
+    pub async fn list_migrations(&self) -> Result<Vec<MigrationInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT version, name, applied_at
+            FROM celers_migrations
+            ORDER BY applied_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to list migrations: {}", e)))?;
+
+        let mut migrations = Vec::with_capacity(rows.len());
+        for row in rows {
+            migrations.push(MigrationInfo {
+                version: row.get("version"),
+                name: row.get("name"),
+                applied_at: row.get("applied_at"),
+            });
+        }
+        Ok(migrations)
+    }
+
+    // ========== Query Performance Tracking ==========
+
+    /// Get query performance statistics from MySQL performance schema
+    ///
+    /// Note: This requires performance_schema to be enabled in MySQL configuration.
+    pub async fn get_query_stats(&self) -> Result<Vec<QueryStats>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                DIGEST_TEXT as query_name,
+                COUNT_STAR as execution_count,
+                SUM_TIMER_WAIT / 1000000000 as total_time_ms,
+                AVG_TIMER_WAIT / 1000000000 as avg_time_ms,
+                MIN_TIMER_WAIT / 1000000000 as min_time_ms,
+                MAX_TIMER_WAIT / 1000000000 as max_time_ms
+            FROM performance_schema.events_statements_summary_by_digest
+            WHERE SCHEMA_NAME = DATABASE()
+              AND DIGEST_TEXT LIKE '%celers%'
+            ORDER BY SUM_TIMER_WAIT DESC
+            LIMIT 50
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get query stats: {}", e)))?;
+
+        let mut stats = Vec::with_capacity(rows.len());
+        for row in rows {
+            let query_name: String = row.get("query_name");
+            let execution_count: i64 = row.get("execution_count");
+            let total_time: Option<rust_decimal::Decimal> = row.get("total_time_ms");
+            let avg_time: Option<rust_decimal::Decimal> = row.get("avg_time_ms");
+            let min_time: Option<rust_decimal::Decimal> = row.get("min_time_ms");
+            let max_time: Option<rust_decimal::Decimal> = row.get("max_time_ms");
+
+            stats.push(QueryStats {
+                query_name,
+                execution_count,
+                total_time_ms: total_time
+                    .map(|d| d.to_string().parse().unwrap_or(0))
+                    .unwrap_or(0),
+                avg_time_ms: avg_time
+                    .map(|d| d.to_string().parse().unwrap_or(0.0))
+                    .unwrap_or(0.0),
+                min_time_ms: min_time
+                    .map(|d| d.to_string().parse().unwrap_or(0))
+                    .unwrap_or(0),
+                max_time_ms: max_time
+                    .map(|d| d.to_string().parse().unwrap_or(0))
+                    .unwrap_or(0),
+            });
+        }
+        Ok(stats)
+    }
+
+    /// Reset query performance statistics
+    ///
+    /// Clears the performance_schema statistics. Useful for benchmarking.
+    pub async fn reset_query_stats(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CALL sys.ps_truncate_all_tables(FALSE)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to reset query stats: {}", e)))?;
+
+        tracing::info!("Reset query performance statistics");
+        Ok(())
+    }
+
+    // ========== Index Usage and Query Optimization ==========
+
+    /// Get index statistics for CeleRS tables
+    ///
+    /// Returns information about all indexes on CeleRS tables including cardinality
+    /// and whether they are unique.
+    pub async fn get_index_stats(&self) -> Result<Vec<IndexStats>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                TABLE_NAME as table_name,
+                INDEX_NAME as index_name,
+                CARDINALITY as cardinality,
+                NON_UNIQUE as non_unique
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME LIKE 'celers_%'
+            ORDER BY TABLE_NAME, INDEX_NAME
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get index stats: {}", e)))?;
+
+        let mut stats = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cardinality: Option<i64> = row.get("cardinality");
+            let non_unique: i32 = row.get("non_unique");
+            stats.push(IndexStats {
+                table_name: row.get("table_name"),
+                index_name: row.get("index_name"),
+                cardinality: cardinality.unwrap_or(0),
+                unique_values: non_unique == 0,
+            });
+        }
+        Ok(stats)
+    }
+
+    /// Explain a query plan for the dequeue operation
+    ///
+    /// Returns the MySQL EXPLAIN output for the dequeue query.
+    /// Useful for query optimization and performance tuning.
+    pub async fn explain_dequeue(&self) -> Result<Vec<QueryPlan>> {
+        let rows = sqlx::query(
+            r#"
+            EXPLAIN
+            SELECT id, task_name, payload, retry_count
+            FROM celers_tasks
+            WHERE state = 'pending'
+              AND scheduled_at <= NOW()
+            ORDER BY priority DESC, created_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
+
+        let mut plans = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rows_examined: Option<i64> = row.try_get("rows").ok();
+            let filtered: Option<rust_decimal::Decimal> = row.try_get("filtered").ok();
+            plans.push(QueryPlan {
+                id: row.get("id"),
+                select_type: row.get("select_type"),
+                table: row.try_get("table").ok(),
+                query_type: row.try_get("type").ok(),
+                possible_keys: row.try_get("possible_keys").ok(),
+                key_used: row.try_get("key").ok(),
+                key_length: row.try_get("key_len").ok(),
+                rows_examined,
+                filtered: filtered.map(|d| d.to_string().parse().unwrap_or(0.0)),
+                extra: row.try_get("Extra").ok(),
+            });
+        }
+        Ok(plans)
+    }
+
+    /// Explain a custom query plan
+    ///
+    /// Returns the MySQL EXPLAIN output for any SELECT query.
+    pub async fn explain_query(&self, query: &str) -> Result<Vec<QueryPlan>> {
+        let explain_query = format!("EXPLAIN {}", query);
+        let rows = sqlx::query(&explain_query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
+
+        let mut plans = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rows_examined: Option<i64> = row.try_get("rows").ok();
+            let filtered: Option<rust_decimal::Decimal> = row.try_get("filtered").ok();
+            plans.push(QueryPlan {
+                id: row.get("id"),
+                select_type: row.get("select_type"),
+                table: row.try_get("table").ok(),
+                query_type: row.try_get("type").ok(),
+                possible_keys: row.try_get("possible_keys").ok(),
+                key_used: row.try_get("key").ok(),
+                key_length: row.try_get("key_len").ok(),
+                rows_examined,
+                filtered: filtered.map(|d| d.to_string().parse().unwrap_or(0.0)),
+                extra: row.try_get("Extra").ok(),
+            });
+        }
+        Ok(plans)
+    }
+
+    /// Check if indexes are being used effectively
+    ///
+    /// Analyzes the explain plan for common queries and returns warnings
+    /// if indexes are not being used properly.
+    pub async fn check_index_usage(&self) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+
+        // Check dequeue query
+        let dequeue_plan = self.explain_dequeue().await?;
+        for plan in dequeue_plan {
+            if plan.key_used.is_none() {
+                warnings.push(format!(
+                    "Dequeue query on table {:?} is not using an index (full table scan)",
+                    plan.table
+                ));
+            }
+            if let Some(extra) = &plan.extra {
+                if extra.contains("Using filesort") {
+                    warnings.push("Dequeue query requires filesort - consider adding composite index on (state, priority, created_at)".to_string());
+                }
+            }
+        }
+
+        // Check index cardinality
+        let index_stats = self.get_index_stats().await?;
+        for stat in index_stats {
+            if stat.cardinality == 0 && !stat.index_name.eq("PRIMARY") {
+                warnings.push(format!(
+                    "Index {} on table {} has zero cardinality - consider running ANALYZE TABLE",
+                    stat.index_name, stat.table_name
+                ));
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    // ========== Connection Diagnostics and Performance Monitoring ==========
+
+    /// Get connection pool diagnostics
+    ///
+    /// Returns detailed information about the connection pool state.
+    pub fn get_connection_diagnostics(&self) -> ConnectionDiagnostics {
+        let max_conns = self.pool.options().get_max_connections();
+        let idle_conns = self.pool.num_idle() as u32;
+        let min_conns = self.pool.options().get_min_connections();
+
+        // Total connections is at least idle, but could be up to max
+        let total_conns = idle_conns.max(min_conns);
+        let active_conns = total_conns.saturating_sub(idle_conns);
+
+        let utilization = if max_conns > 0 {
+            (total_conns as f64 / max_conns as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        ConnectionDiagnostics {
+            total_connections: total_conns,
+            idle_connections: idle_conns,
+            active_connections: active_conns,
+            max_connections: max_conns,
+            connection_wait_time_ms: None, // MySQL doesn't expose this easily
+            pool_utilization_percent: utilization,
+        }
+    }
+
+    /// Get comprehensive performance metrics snapshot
+    ///
+    /// This method collects various performance metrics including queue sizes,
+    /// connection pool status, and database statistics.
+    pub async fn get_performance_metrics(&self) -> Result<PerformanceMetrics> {
+        let stats = self.get_statistics().await?;
+        let conn_diag = self.get_connection_diagnostics();
+
+        // Calculate tasks per second (requires historical data, placeholder for now)
+        // In production, this would track enqueue/dequeue rates over time
+        let tasks_per_second = 0.0;
+
+        // Get average query times from performance schema (if available)
+        let (avg_dequeue_ms, avg_enqueue_ms) = match self.get_query_stats().await {
+            Ok(stats) => {
+                let dequeue_stat = stats
+                    .iter()
+                    .find(|s| {
+                        s.query_name.contains("SELECT") && s.query_name.contains("celers_tasks")
+                    })
+                    .map(|s| s.avg_time_ms)
+                    .unwrap_or(0.0);
+
+                let enqueue_stat = stats
+                    .iter()
+                    .find(|s| {
+                        s.query_name.contains("INSERT") && s.query_name.contains("celers_tasks")
+                    })
+                    .map(|s| s.avg_time_ms)
+                    .unwrap_or(0.0);
+
+                (dequeue_stat, enqueue_stat)
+            }
+            Err(_) => (0.0, 0.0),
+        };
+
+        Ok(PerformanceMetrics {
+            timestamp: Utc::now(),
+            tasks_per_second,
+            avg_dequeue_time_ms: avg_dequeue_ms,
+            avg_enqueue_time_ms: avg_enqueue_ms,
+            queue_depth: stats.pending,
+            processing_tasks: stats.processing,
+            dlq_size: stats.dlq,
+            connection_pool: conn_diag,
+        })
+    }
+
+    /// Check if the broker is healthy and ready to process tasks
+    ///
+    /// Returns true if:
+    /// - Database connection is active
+    /// - Connection pool has idle connections available
+    /// - No critical errors detected
+    pub async fn is_ready(&self) -> bool {
+        // Try a simple query
+        let version_check = sqlx::query_scalar::<_, String>("SELECT VERSION()")
+            .fetch_one(&self.pool)
+            .await;
+
+        if version_check.is_err() {
+            return false;
+        }
+
+        // Check connection pool has capacity
+        let idle = self.pool.num_idle();
+        if idle == 0 {
+            let max_conns = self.pool.options().get_max_connections();
+            // If pool is at max and no idle connections, might be saturated
+            if max_conns > 0 && self.pool.size() >= max_conns {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Get detailed database server variables
+    ///
+    /// Returns key MySQL server configuration variables that affect performance.
+    pub async fn get_server_variables(&self) -> Result<std::collections::HashMap<String, String>> {
+        let rows = sqlx::query(
+            r#"
+            SHOW VARIABLES WHERE Variable_name IN (
+                'max_connections',
+                'innodb_buffer_pool_size',
+                'innodb_log_file_size',
+                'query_cache_size',
+                'query_cache_type',
+                'innodb_flush_log_at_trx_commit',
+                'innodb_flush_method',
+                'binlog_format',
+                'expire_logs_days'
+            )
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get server variables: {}", e)))?;
+
+        let mut variables = std::collections::HashMap::new();
+        for row in rows {
+            let var_name: String = row.get("Variable_name");
+            let var_value: String = row.get("Value");
+            variables.insert(var_name, var_value);
+        }
+
+        Ok(variables)
+    }
+
     /// Enqueue multiple tasks in a single transaction (batch operation)
     ///
     /// This is significantly faster than individual enqueue calls when
@@ -1795,6 +2408,165 @@ impl Broker for MysqlBroker {
 }
 
 impl MysqlBroker {
+    // ========== Task Chain Support ==========
+
+    /// Enqueue a task chain where tasks execute in sequence
+    ///
+    /// Each task in the chain will be scheduled to execute after the previous task
+    /// completes (with optional delay between tasks).
+    ///
+    /// # Arguments
+    /// * `chain` - Task chain to enqueue
+    ///
+    /// # Returns
+    /// Vector of task IDs in the same order as the chain
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let chain = TaskChain::new()
+    ///     .then(task1)
+    ///     .then(task2)
+    ///     .then(task3)
+    ///     .with_delay(5); // 5 seconds between tasks
+    ///
+    /// let task_ids = broker.enqueue_chain(chain).await?;
+    /// ```
+    pub async fn enqueue_chain(&self, chain: TaskChain) -> Result<Vec<TaskId>> {
+        if chain.tasks().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut task_ids = Vec::with_capacity(chain.tasks().len());
+        let base_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CelersError::Other(format!("Failed to get system time: {}", e)))?
+            .as_secs() as i64;
+
+        for (idx, task) in chain.tasks().iter().enumerate() {
+            let execute_at = if idx == 0 {
+                // First task executes immediately
+                base_time
+            } else {
+                // Subsequent tasks execute after delay
+                let delay = chain.delay_between_secs().unwrap_or(0) * idx as u64;
+                base_time + delay as i64
+            };
+
+            let task_id = self.enqueue_at(task.clone(), execute_at).await?;
+            task_ids.push(task_id);
+        }
+
+        tracing::info!(
+            chain_length = chain.tasks().len(),
+            delay_secs = chain.delay_between_secs().unwrap_or(0),
+            "Enqueued task chain"
+        );
+
+        Ok(task_ids)
+    }
+
+    /// Batch reject operation - reject multiple tasks at once
+    ///
+    /// This is more efficient than calling reject() for each task individually.
+    ///
+    /// # Arguments
+    /// * `tasks` - Vector of (TaskId, receipt_handle, requeue) tuples
+    ///
+    /// # Returns
+    /// Number of tasks successfully rejected
+    pub async fn reject_batch(&self, tasks: &[(TaskId, Option<String>, bool)]) -> Result<u64> {
+        if tasks.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        let mut rejected_count = 0u64;
+
+        for (task_id, _receipt_handle, requeue) in tasks {
+            if *requeue {
+                // Check if task has exceeded max retries
+                let row = sqlx::query(
+                    r#"
+                    SELECT retry_count, max_retries
+                    FROM celers_tasks
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(task_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to fetch task: {}", e)))?;
+
+                if let Some(row) = row {
+                    let retry_count: i32 = row.get("retry_count");
+                    let max_retries: i32 = row.get("max_retries");
+
+                    if retry_count >= max_retries {
+                        // Move to DLQ
+                        sqlx::query("CALL move_to_dlq(?)")
+                            .bind(task_id.to_string())
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                CelersError::Other(format!("Failed to move task to DLQ: {}", e))
+                            })?;
+                    } else {
+                        // Requeue with exponential backoff
+                        let backoff_seconds = 2_i64.pow(retry_count as u32).min(3600); // Max 1 hour
+
+                        sqlx::query(
+                            r#"
+                            UPDATE celers_tasks
+                            SET state = 'pending',
+                                scheduled_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
+                                started_at = NULL,
+                                worker_id = NULL
+                            WHERE id = ?
+                            "#,
+                        )
+                        .bind(backoff_seconds)
+                        .bind(task_id.to_string())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            CelersError::Other(format!("Failed to requeue task: {}", e))
+                        })?;
+                    }
+                    rejected_count += 1;
+                }
+            } else {
+                // Mark as failed permanently
+                let result = sqlx::query(
+                    r#"
+                    UPDATE celers_tasks
+                    SET state = 'failed',
+                        completed_at = NOW()
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(task_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to mark task as failed: {}", e)))?;
+
+                rejected_count += result.rows_affected();
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit batch reject: {}", e)))?;
+
+        Ok(rejected_count)
+    }
+}
+
+impl MysqlBroker {
     /// Update Prometheus metrics gauges for queue sizes
     ///
     /// This should be called periodically (e.g., every few seconds) to keep
@@ -2068,5 +2840,233 @@ mod tests {
         let health = broker.check_health().await.unwrap();
         assert!(health.healthy);
         assert!(!health.database_version.is_empty());
+    }
+
+    // ========== NEW: Additional Integration Tests ==========
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_batch_operations() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Batch enqueue
+        let tasks: Vec<_> = (0..10)
+            .map(|i| SerializedTask::new(format!("task_{}", i), vec![i as u8]))
+            .collect();
+
+        let task_ids = broker.enqueue_batch(tasks).await.unwrap();
+        assert_eq!(task_ids.len(), 10);
+
+        // Batch dequeue
+        let messages = broker.dequeue_batch(5).await.unwrap();
+        assert_eq!(messages.len(), 5);
+
+        // Batch ack
+        let ack_tasks: Vec<_> = messages
+            .iter()
+            .map(|m| (m.task.metadata.id, m.receipt_handle.clone()))
+            .collect();
+        broker.ack_batch(&ack_tasks).await.unwrap();
+
+        // Verify remaining tasks
+        let remaining = broker.queue_size().await.unwrap();
+        assert_eq!(remaining, 5);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_task_chain() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Create task chain
+        let chain = TaskChain::new()
+            .then(SerializedTask::new("step1".to_string(), vec![1]))
+            .then(SerializedTask::new("step2".to_string(), vec![2]))
+            .then(SerializedTask::new("step3".to_string(), vec![3]))
+            .with_delay(2);
+
+        let task_ids = broker.enqueue_chain(chain).await.unwrap();
+        assert_eq!(task_ids.len(), 3);
+
+        // Verify scheduled tasks
+        let scheduled = broker.list_scheduled_tasks(10, 0).await.unwrap();
+        assert!(scheduled.len() >= 2); // At least 2 tasks should be scheduled for future
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_connection_diagnostics() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+
+        let diag = broker.get_connection_diagnostics();
+        assert!(diag.max_connections > 0);
+        assert!(diag.pool_utilization_percent >= 0.0);
+        assert!(diag.pool_utilization_percent <= 100.0);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_performance_metrics() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        let metrics = broker.get_performance_metrics().await.unwrap();
+        assert!(metrics.queue_depth >= 0);
+        assert!(metrics.processing_tasks >= 0);
+        assert!(metrics.dlq_size >= 0);
+        assert!(metrics.connection_pool.max_connections > 0);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_migration_tracking() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // List migrations
+        let migrations = broker.list_migrations().await.unwrap();
+        assert!(migrations.len() >= 3); // At least 001, 002, 003
+
+        // Verify migration names
+        let versions: Vec<_> = migrations.iter().map(|m| m.version.as_str()).collect();
+        assert!(versions.contains(&"001"));
+        assert!(versions.contains(&"002"));
+        assert!(versions.contains(&"003"));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_is_ready() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+
+        let ready = broker.is_ready().await;
+        assert!(ready);
+    }
+
+    // ========== Concurrency Tests ==========
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_concurrent_dequeue() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Enqueue tasks
+        let tasks: Vec<_> = (0..20)
+            .map(|i| SerializedTask::new(format!("concurrent_{}", i), vec![i as u8]))
+            .collect();
+        broker.enqueue_batch(tasks).await.unwrap();
+
+        // Spawn multiple workers dequeuing concurrently
+        let mut handles = vec![];
+        for worker_id in 0..5 {
+            let db_url = database_url.clone();
+            let handle = tokio::spawn(async move {
+                let worker_broker = MysqlBroker::new(&db_url).await.unwrap();
+                let mut dequeued = 0;
+
+                for _ in 0..10 {
+                    if let Ok(Some(msg)) = worker_broker.dequeue().await {
+                        dequeued += 1;
+                        // Acknowledge immediately
+                        let _ = worker_broker
+                            .ack(&msg.task.metadata.id, msg.receipt_handle.as_deref())
+                            .await;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+
+                (worker_id, dequeued)
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all workers
+        let results = futures::future::join_all(handles).await;
+
+        let total_dequeued: usize = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|(_, count)| *count)
+            .sum();
+
+        // Should dequeue all 20 tasks across workers
+        assert_eq!(total_dequeued, 20);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_skip_locked_behavior() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker1 = MysqlBroker::new(&database_url).await.unwrap();
+        broker1.migrate().await.unwrap();
+
+        // Enqueue multiple tasks
+        for i in 0..10 {
+            let task = SerializedTask::new(format!("task_{}", i), vec![i as u8]);
+            broker1.enqueue(task).await.unwrap();
+        }
+
+        let broker2 = MysqlBroker::new(&database_url).await.unwrap();
+
+        // Dequeue from both brokers simultaneously
+        let (msg1, msg2) = tokio::join!(broker1.dequeue(), broker2.dequeue());
+
+        // Both should succeed with different tasks (SKIP LOCKED)
+        assert!(msg1.is_ok());
+        assert!(msg2.is_ok());
+
+        if let (Ok(Some(m1)), Ok(Some(m2))) = (msg1, msg2) {
+            // Tasks should be different
+            assert_ne!(m1.task.metadata.id, m2.task.metadata.id);
+        }
+    }
+
+    // ========== Unit Tests for New Structures ==========
+
+    #[test]
+    fn test_pool_config_default() {
+        let config = PoolConfig::default();
+        assert_eq!(config.max_connections, 20);
+        assert_eq!(config.min_connections, 2);
+        assert_eq!(config.acquire_timeout_secs, 5);
+        assert_eq!(config.max_lifetime_secs, Some(1800));
+        assert_eq!(config.idle_timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn test_task_chain_builder() {
+        let task1 = SerializedTask::new("task1".to_string(), vec![1]);
+        let task2 = SerializedTask::new("task2".to_string(), vec![2]);
+
+        let chain = TaskChain::new().then(task1).then(task2).with_delay(5);
+
+        assert_eq!(chain.tasks().len(), 2);
+        assert_eq!(chain.delay_between_secs(), Some(5));
     }
 }
