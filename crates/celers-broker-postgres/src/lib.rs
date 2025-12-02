@@ -97,12 +97,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(feature = "metrics")]
 use celers_metrics::{
-    DLQ_SIZE, PROCESSING_QUEUE_SIZE, QUEUE_SIZE, TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL,
+    DLQ_SIZE, POSTGRES_POOL_IDLE, POSTGRES_POOL_IN_USE, POSTGRES_POOL_MAX_SIZE, POSTGRES_POOL_SIZE,
+    PROCESSING_QUEUE_SIZE, QUEUE_SIZE, TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL,
 };
 
 /// Task state in the database
@@ -183,6 +185,21 @@ pub struct HealthStatus {
     pub database_version: String,
 }
 
+/// Detailed connection pool metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolMetrics {
+    /// Total number of connections in the pool (max_connections)
+    pub max_size: u32,
+    /// Number of currently active connections
+    pub size: u32,
+    /// Number of idle connections available
+    pub idle: u32,
+    /// Number of connections currently in use
+    pub in_use: u32,
+    /// Approximate number of tasks waiting for a connection
+    pub waiting: u32,
+}
+
 /// Queue statistics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueStatistics {
@@ -219,6 +236,68 @@ pub enum TaskResultStatus {
     Failure,
     Retry,
     Revoked,
+}
+
+/// Retry strategy for failed tasks
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RetryStrategy {
+    /// Exponential backoff: 2^retry_count seconds (default, max 1 hour)
+    /// Example: 2s, 4s, 8s, 16s, 32s, 64s, 128s, ...
+    Exponential { max_delay_secs: i64 },
+
+    /// Exponential backoff with random jitter to avoid thundering herd
+    /// backoff = 2^retry_count * random(0.5 to 1.5)
+    ExponentialWithJitter { max_delay_secs: i64 },
+
+    /// Linear backoff: base_delay * retry_count seconds
+    /// Example (base=10): 10s, 20s, 30s, 40s, ...
+    Linear {
+        base_delay_secs: i64,
+        max_delay_secs: i64,
+    },
+
+    /// Fixed delay: always the same delay
+    Fixed { delay_secs: i64 },
+
+    /// No automatic retry (immediate requeue or fail)
+    Immediate,
+}
+
+impl Default for RetryStrategy {
+    fn default() -> Self {
+        RetryStrategy::Exponential {
+            max_delay_secs: 3600,
+        }
+    }
+}
+
+impl RetryStrategy {
+    /// Calculate backoff delay in seconds based on retry count
+    pub fn calculate_backoff(&self, retry_count: i32) -> i64 {
+        match self {
+            RetryStrategy::Exponential { max_delay_secs } => {
+                let backoff = 2_i64.pow(retry_count as u32);
+                backoff.min(*max_delay_secs)
+            }
+            RetryStrategy::ExponentialWithJitter { max_delay_secs } => {
+                let base_backoff = 2_i64.pow(retry_count as u32).min(*max_delay_secs);
+                // Add jitter: multiply by random value between 0.5 and 1.5
+                // Using a simple deterministic jitter based on retry_count to avoid needing RNG
+                // In production, you might want to use rand crate
+                let jitter_factor = 0.5 + ((retry_count % 10) as f64 / 10.0);
+                ((base_backoff as f64) * jitter_factor).round() as i64
+            }
+            RetryStrategy::Linear {
+                base_delay_secs,
+                max_delay_secs,
+            } => {
+                let backoff = base_delay_secs * (retry_count as i64);
+                backoff.min(*max_delay_secs)
+            }
+            RetryStrategy::Fixed { delay_secs } => *delay_secs,
+            RetryStrategy::Immediate => 0,
+        }
+    }
 }
 
 impl std::fmt::Display for TaskResultStatus {
@@ -278,6 +357,7 @@ pub struct PostgresBroker {
     pool: PgPool,
     queue_name: String,
     paused: AtomicBool,
+    retry_strategy: RetryStrategy,
 }
 
 impl PostgresBroker {
@@ -303,6 +383,7 @@ impl PostgresBroker {
             pool,
             queue_name: queue_name.to_string(),
             paused: AtomicBool::new(false),
+            retry_strategy: RetryStrategy::default(),
         })
     }
 
@@ -330,7 +411,21 @@ impl PostgresBroker {
             pool,
             queue_name: queue_name.to_string(),
             paused: AtomicBool::new(false),
+            retry_strategy: RetryStrategy::default(),
         })
+    }
+
+    /// Set the retry strategy for failed tasks
+    ///
+    /// This can be called on an existing broker instance to change the retry behavior.
+    pub fn set_retry_strategy(&mut self, strategy: RetryStrategy) {
+        self.retry_strategy = strategy;
+        tracing::info!(strategy = ?strategy, "Updated retry strategy");
+    }
+
+    /// Get the current retry strategy
+    pub fn retry_strategy(&self) -> RetryStrategy {
+        self.retry_strategy
     }
 
     /// Run database migrations
@@ -473,6 +568,164 @@ impl PostgresBroker {
             }
         }
         .map_err(|e| CelersError::Other(format!("Failed to list tasks: {}", e)))?;
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state_str: String = row.get("state");
+            tasks.push(TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: state_str.parse()?,
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            });
+        }
+        Ok(tasks)
+    }
+
+    /// Find tasks by metadata JSON path query
+    ///
+    /// Uses PostgreSQL's JSONB operators to query tasks by metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Find tasks where metadata.user_id = 123
+    /// let tasks = broker.find_tasks_by_metadata("user_id", &json!(123), 10, 0).await?;
+    ///
+    /// // Find tasks where metadata.priority = "high"
+    /// let tasks = broker.find_tasks_by_metadata("priority", &json!("high"), 10, 0).await?;
+    /// ```
+    pub async fn find_tasks_by_metadata(
+        &self,
+        json_path: &str,
+        value: &serde_json::Value,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_name, state, priority, retry_count, max_retries,
+                   created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+            FROM celers_tasks
+            WHERE metadata->$1 = $2
+            ORDER BY created_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(json_path)
+        .bind(value)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to find tasks by metadata: {}", e)))?;
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state_str: String = row.get("state");
+            tasks.push(TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: state_str.parse()?,
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            });
+        }
+        Ok(tasks)
+    }
+
+    /// Count tasks matching metadata criteria
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Count tasks where metadata.user_id = 123
+    /// let count = broker.count_tasks_by_metadata("user_id", &json!(123)).await?;
+    /// ```
+    pub async fn count_tasks_by_metadata(
+        &self,
+        json_path: &str,
+        value: &serde_json::Value,
+    ) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM celers_tasks
+            WHERE metadata->$1 = $2
+            "#,
+        )
+        .bind(json_path)
+        .bind(value)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to count tasks by metadata: {}", e)))?;
+
+        Ok(count)
+    }
+
+    /// Find tasks by task name with pagination
+    ///
+    /// This is useful for monitoring specific task types.
+    pub async fn find_tasks_by_name(
+        &self,
+        task_name: &str,
+        state: Option<DbTaskState>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = match state {
+            Some(s) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE task_name = $1 AND state = $2
+                    ORDER BY created_at DESC
+                    LIMIT $3 OFFSET $4
+                    "#,
+                )
+                .bind(task_name)
+                .bind(s.to_string())
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE task_name = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(task_name)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| CelersError::Other(format!("Failed to find tasks by name: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
@@ -668,6 +921,24 @@ impl PostgresBroker {
             dlq_tasks: stats.dlq,
             database_version: version,
         })
+    }
+
+    /// Get detailed connection pool metrics
+    ///
+    /// This provides comprehensive statistics about the connection pool state,
+    /// useful for monitoring and capacity planning.
+    pub fn get_pool_metrics(&self) -> PoolMetrics {
+        let max_size = self.pool.options().get_max_connections();
+        let size = self.pool.size();
+        let idle = self.pool.num_idle() as u32;
+
+        PoolMetrics {
+            max_size,
+            size,
+            idle,
+            in_use: size.saturating_sub(idle),
+            waiting: 0, // sqlx doesn't expose waiting connections count
+        }
     }
 
     /// Archive completed tasks older than the specified duration
@@ -1018,6 +1289,98 @@ impl PostgresBroker {
         Ok(())
     }
 
+    /// Start a background maintenance task that periodically runs VACUUM and ANALYZE
+    ///
+    /// This spawns a tokio task that runs maintenance operations at the specified interval.
+    /// Returns a handle that can be used to stop the maintenance task.
+    ///
+    /// # Arguments
+    /// * `interval` - Duration between maintenance runs (e.g., Duration::from_secs(3600) for hourly)
+    /// * `vacuum` - Whether to run VACUUM (can be expensive, consider running less frequently)
+    /// * `analyze` - Whether to run ANALYZE (lightweight, recommended)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Run maintenance every hour (ANALYZE only)
+    /// let handle = broker.start_maintenance_scheduler(
+    ///     Duration::from_secs(3600),
+    ///     false, // Don't VACUUM (let autovacuum handle it)
+    ///     true,  // Do ANALYZE
+    /// );
+    ///
+    /// // Stop the maintenance task later
+    /// handle.abort();
+    /// ```
+    pub fn start_maintenance_scheduler(
+        self: Arc<Self>,
+        interval: Duration,
+        vacuum: bool,
+        analyze: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval_timer = tokio::time::interval(interval);
+            interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval_timer.tick().await;
+
+                tracing::debug!("Running scheduled maintenance task");
+
+                // Run maintenance operations
+                if vacuum {
+                    if let Err(e) = self.vacuum_tables().await {
+                        tracing::error!(error = %e, "Failed to vacuum tables during maintenance");
+                    }
+                } else if analyze {
+                    // Just run ANALYZE without VACUUM (much faster)
+                    if let Err(e) = self.analyze_tables().await {
+                        tracing::error!(error = %e, "Failed to analyze tables during maintenance");
+                    }
+                }
+
+                // Also archive old completed tasks (older than 7 days by default)
+                let archive_threshold = Duration::from_secs(7 * 24 * 3600);
+                match self.archive_completed_tasks(archive_threshold).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!(count = count, "Archived old completed tasks");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to archive tasks during maintenance");
+                    }
+                }
+
+                // Archive old results (older than 30 days)
+                let results_threshold = Duration::from_secs(30 * 24 * 3600);
+                match self.archive_results(results_threshold).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!(count = count, "Archived old task results");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to archive results during maintenance");
+                    }
+                }
+
+                // Check for stuck tasks (processing for more than 1 hour)
+                let stuck_threshold = Duration::from_secs(3600);
+                match self.recover_stuck_tasks(stuck_threshold).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::warn!(count = count, "Recovered stuck processing tasks");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to recover stuck tasks");
+                    }
+                }
+            }
+        })
+    }
+
     /// Count tasks by state
     ///
     /// Returns the number of tasks in the specified state.
@@ -1355,8 +1718,8 @@ impl Broker for PostgresBroker {
                 // Move to DLQ
                 self.move_to_dlq(task_id).await?;
             } else {
-                // Requeue with exponential backoff
-                let backoff_seconds = 2_i64.pow(retry_count as u32).min(3600); // Max 1 hour
+                // Requeue with configured retry strategy
+                let backoff_seconds = self.retry_strategy.calculate_backoff(retry_count);
 
                 sqlx::query(
                     r#"
@@ -1373,6 +1736,14 @@ impl Broker for PostgresBroker {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
+
+                tracing::info!(
+                    task_id = %task_id,
+                    retry_count = retry_count,
+                    backoff_seconds = backoff_seconds,
+                    strategy = ?self.retry_strategy,
+                    "Requeued task with backoff"
+                );
             }
         } else {
             // Mark as failed permanently
@@ -1697,7 +2068,7 @@ impl Broker for PostgresBroker {
 }
 
 impl PostgresBroker {
-    /// Update Prometheus metrics gauges for queue sizes
+    /// Update Prometheus metrics gauges for queue sizes and connection pool
     ///
     /// This should be called periodically (e.g., every few seconds) to keep
     /// metrics up to date. Not part of the Broker trait, but useful for monitoring.
@@ -1725,10 +2096,17 @@ impl PostgresBroker {
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {}", e)))?;
 
-        // Update gauges
+        // Update queue gauges
         QUEUE_SIZE.set(pending_count as f64);
         PROCESSING_QUEUE_SIZE.set(processing_count as f64);
         DLQ_SIZE.set(dlq_count as f64);
+
+        // Update connection pool metrics
+        let pool_metrics = self.get_pool_metrics();
+        POSTGRES_POOL_MAX_SIZE.set(pool_metrics.max_size as f64);
+        POSTGRES_POOL_SIZE.set(pool_metrics.size as f64);
+        POSTGRES_POOL_IDLE.set(pool_metrics.idle as f64);
+        POSTGRES_POOL_IN_USE.set(pool_metrics.in_use as f64);
 
         Ok(())
     }
@@ -1938,5 +2316,94 @@ mod tests {
             msg1.unwrap().task.metadata.id,
             msg2.unwrap().task.metadata.id
         );
+    }
+
+    #[test]
+    fn test_retry_strategy_exponential() {
+        let strategy = RetryStrategy::Exponential {
+            max_delay_secs: 3600,
+        };
+
+        assert_eq!(strategy.calculate_backoff(0), 1); // 2^0 = 1
+        assert_eq!(strategy.calculate_backoff(1), 2); // 2^1 = 2
+        assert_eq!(strategy.calculate_backoff(2), 4); // 2^2 = 4
+        assert_eq!(strategy.calculate_backoff(3), 8); // 2^3 = 8
+        assert_eq!(strategy.calculate_backoff(10), 1024); // 2^10 = 1024
+        assert_eq!(strategy.calculate_backoff(20), 3600); // Capped at max_delay_secs
+    }
+
+    #[test]
+    fn test_retry_strategy_linear() {
+        let strategy = RetryStrategy::Linear {
+            base_delay_secs: 10,
+            max_delay_secs: 100,
+        };
+
+        assert_eq!(strategy.calculate_backoff(0), 0); // 10 * 0 = 0
+        assert_eq!(strategy.calculate_backoff(1), 10); // 10 * 1 = 10
+        assert_eq!(strategy.calculate_backoff(2), 20); // 10 * 2 = 20
+        assert_eq!(strategy.calculate_backoff(5), 50); // 10 * 5 = 50
+        assert_eq!(strategy.calculate_backoff(15), 100); // Capped at max_delay_secs
+    }
+
+    #[test]
+    fn test_retry_strategy_fixed() {
+        let strategy = RetryStrategy::Fixed { delay_secs: 30 };
+
+        assert_eq!(strategy.calculate_backoff(0), 30);
+        assert_eq!(strategy.calculate_backoff(1), 30);
+        assert_eq!(strategy.calculate_backoff(5), 30);
+        assert_eq!(strategy.calculate_backoff(100), 30);
+    }
+
+    #[test]
+    fn test_retry_strategy_immediate() {
+        let strategy = RetryStrategy::Immediate;
+
+        assert_eq!(strategy.calculate_backoff(0), 0);
+        assert_eq!(strategy.calculate_backoff(1), 0);
+        assert_eq!(strategy.calculate_backoff(10), 0);
+    }
+
+    #[test]
+    fn test_retry_strategy_exponential_with_jitter() {
+        let strategy = RetryStrategy::ExponentialWithJitter {
+            max_delay_secs: 3600,
+        };
+
+        // Jitter should produce values in reasonable range
+        let backoff0 = strategy.calculate_backoff(0);
+        assert!(backoff0 >= 0 && backoff0 <= 2); // 2^0 = 1, with jitter 0.5-1.5
+
+        let backoff3 = strategy.calculate_backoff(3);
+        assert!(backoff3 >= 4 && backoff3 <= 12); // 2^3 = 8, with jitter ~0.5-1.5
+    }
+
+    #[test]
+    fn test_retry_strategy_default() {
+        let strategy = RetryStrategy::default();
+        match strategy {
+            RetryStrategy::Exponential { max_delay_secs } => {
+                assert_eq!(max_delay_secs, 3600);
+            }
+            _ => panic!("Default should be Exponential"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL running
+    async fn test_pool_metrics() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+
+        let broker = PostgresBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        let metrics = broker.get_pool_metrics();
+
+        // Pool should have some configuration
+        assert!(metrics.max_size > 0);
+        assert!(metrics.size <= metrics.max_size);
+        assert_eq!(metrics.size, metrics.idle + metrics.in_use);
     }
 }

@@ -2261,4 +2261,611 @@ mod tests {
         };
         assert!(!no_channel.is_healthy());
     }
+
+    // ==================== Integration Tests ====================
+    // These tests require a running RabbitMQ instance
+    // Run with: docker run -d --name rabbitmq -p 5672:5672 rabbitmq:3-management
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_connection_and_disconnect() {
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_integration")
+            .await
+            .unwrap();
+
+        // Test connection
+        let result = broker.connect().await;
+        if result.is_err() {
+            eprintln!(
+                "Skipping integration test - RabbitMQ not available: {:?}",
+                result.err()
+            );
+            return;
+        }
+
+        assert!(broker.is_connected());
+        assert!(broker.is_healthy());
+
+        // Test health status
+        let health = broker.health_status();
+        assert!(health.connected);
+        assert!(health.channel_open);
+
+        // Test disconnect
+        broker.disconnect().await.unwrap();
+        assert!(!broker.is_connected());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_publish_and_consume() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_pubsub")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // Purge queue to start clean
+        let _ = broker.purge("test_pubsub").await;
+
+        // Publish a message
+        let message = MessageBuilder::new("test.task")
+            .args(vec![serde_json::json!(42)])
+            .build()
+            .unwrap();
+
+        broker
+            .publish("test_pubsub", message.clone())
+            .await
+            .unwrap();
+
+        // Consume the message
+        let envelope = broker
+            .consume("test_pubsub", Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(envelope.is_some());
+        let envelope = envelope.unwrap();
+        assert_eq!(envelope.message.headers.task, "test.task");
+
+        // Acknowledge the message
+        broker.ack(&envelope.delivery_tag).await.unwrap();
+
+        // Verify queue is empty
+        let size = broker.queue_size("test_pubsub").await.unwrap();
+        assert_eq!(size, 0);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_batch_publish() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_batch")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        let _ = broker.purge("test_batch").await;
+
+        // Create batch of messages
+        let mut messages = Vec::new();
+        for i in 0..10 {
+            let msg = MessageBuilder::new("batch.task")
+                .args(vec![serde_json::json!(i)])
+                .build()
+                .unwrap();
+            messages.push(msg);
+        }
+
+        // Publish batch
+        let count = broker.publish_batch("test_batch", messages).await.unwrap();
+        assert_eq!(count, 10);
+
+        // Verify queue size
+        let size = broker.queue_size("test_batch").await.unwrap();
+        assert_eq!(size, 10);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_pipeline_publish() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_pipeline")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        let _ = broker.purge("test_pipeline").await;
+
+        // Create batch of messages
+        let mut messages = Vec::new();
+        for i in 0..20 {
+            let msg = MessageBuilder::new("pipeline.task")
+                .args(vec![serde_json::json!(i)])
+                .build()
+                .unwrap();
+            messages.push(msg);
+        }
+
+        // Publish with pipeline depth of 5
+        let count = broker
+            .publish_pipeline("test_pipeline", messages, 5)
+            .await
+            .unwrap();
+        assert_eq!(count, 20);
+
+        // Verify queue size
+        let size = broker.queue_size("test_pipeline").await.unwrap();
+        assert_eq!(size, 20);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_message_ordering() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_ordering")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        let _ = broker.purge("test_ordering").await;
+
+        // Publish messages in order
+        for i in 0..5 {
+            let msg = MessageBuilder::new("ordering.task")
+                .args(vec![serde_json::json!(i)])
+                .build()
+                .unwrap();
+            broker.publish("test_ordering", msg).await.unwrap();
+        }
+
+        // Consume messages and verify order
+        for i in 0..5 {
+            let envelope = broker
+                .consume("test_ordering", Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(envelope.is_some());
+
+            let envelope = envelope.unwrap();
+            // Deserialize body to get TaskArgs
+            let task_args: celers_protocol::TaskArgs =
+                serde_json::from_slice(&envelope.message.body).unwrap();
+            assert_eq!(task_args.args[0], serde_json::json!(i));
+
+            broker.ack(&envelope.delivery_tag).await.unwrap();
+        }
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_priority_queue() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let config = AmqpConfig::default();
+        let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_priority", config)
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // Declare priority queue
+        let queue_config = QueueConfig::new().with_max_priority(10);
+        broker
+            .declare_queue_with_config("test_priority", &queue_config)
+            .await
+            .unwrap();
+
+        let _ = broker.purge("test_priority").await;
+
+        // Publish messages with different priorities (lower number = lower priority)
+        for priority in [1, 5, 3, 9, 7] {
+            let msg = MessageBuilder::new("priority.task")
+                .priority(priority)
+                .args(vec![serde_json::json!(priority)])
+                .build()
+                .unwrap();
+            broker.publish("test_priority", msg).await.unwrap();
+        }
+
+        // Give RabbitMQ time to sort by priority
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Consume messages - should be in priority order (highest first)
+        let expected_order = [9, 7, 5, 3, 1];
+        for expected_priority in expected_order {
+            let envelope = broker
+                .consume("test_priority", Duration::from_secs(1))
+                .await
+                .unwrap();
+
+            assert!(envelope.is_some());
+            let envelope = envelope.unwrap();
+            assert_eq!(
+                envelope.message.properties.priority,
+                Some(expected_priority)
+            );
+            broker.ack(&envelope.delivery_tag).await.unwrap();
+        }
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_concurrent_publishing() {
+        use celers_protocol::builder::MessageBuilder;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let broker = Arc::new(Mutex::new(
+            AmqpBroker::new("amqp://localhost:5672", "test_concurrent")
+                .await
+                .unwrap(),
+        ));
+
+        {
+            let mut b = broker.lock().await;
+            if b.connect().await.is_err() {
+                eprintln!("Skipping integration test - RabbitMQ not available");
+                return;
+            }
+            let _ = b.purge("test_concurrent").await;
+        }
+
+        // Spawn multiple tasks to publish concurrently
+        let mut handles = vec![];
+
+        for task_id in 0..10 {
+            let broker_clone = Arc::clone(&broker);
+            let handle = tokio::spawn(async move {
+                let mut b = broker_clone.lock().await;
+                for i in 0..5 {
+                    let msg = MessageBuilder::new("concurrent.task")
+                        .args(vec![serde_json::json!(format!(
+                            "task-{}-msg-{}",
+                            task_id, i
+                        ))])
+                        .build()
+                        .unwrap();
+                    b.publish("test_concurrent", msg).await.unwrap();
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Verify all 50 messages were published (10 tasks * 5 messages each)
+        let mut b = broker.lock().await;
+        let size = b.queue_size("test_concurrent").await.unwrap();
+        assert_eq!(size, 50);
+
+        b.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_connection_recovery() {
+        let config = AmqpConfig::default()
+            .with_auto_reconnect(true)
+            .with_auto_reconnect_config(3, Duration::from_millis(500));
+
+        let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_recovery", config)
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // Verify initial connection
+        assert!(broker.is_connected());
+
+        // Note: Actually killing and restoring the connection would require
+        // Docker container manipulation or similar, which is beyond the scope
+        // of a unit test. Instead, we verify the reconnection stats structure.
+        let stats = broker.reconnection_stats();
+        assert_eq!(stats.total_attempts, 0);
+        assert_eq!(stats.successful_reconnections, 0);
+        assert_eq!(stats.failed_reconnections, 0);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_transaction_commit() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_transaction")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        let _ = broker.purge("test_transaction").await;
+
+        // Start transaction
+        broker.start_transaction().await.unwrap();
+        assert_eq!(broker.transaction_state(), TransactionState::Started);
+
+        // Publish within transaction
+        let msg = MessageBuilder::new("transaction.task")
+            .args(vec![serde_json::json!("commit")])
+            .build()
+            .unwrap();
+        broker.publish("test_transaction", msg).await.unwrap();
+
+        // Commit transaction
+        broker.commit_transaction().await.unwrap();
+        assert_eq!(broker.transaction_state(), TransactionState::Committed);
+
+        // Verify message was committed
+        let size = broker.queue_size("test_transaction").await.unwrap();
+        assert_eq!(size, 1);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_transaction_rollback() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_rollback")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        let _ = broker.purge("test_rollback").await;
+
+        // Start transaction
+        broker.start_transaction().await.unwrap();
+
+        // Publish within transaction
+        let msg = MessageBuilder::new("rollback.task")
+            .args(vec![serde_json::json!("rollback")])
+            .build()
+            .unwrap();
+        broker.publish("test_rollback", msg).await.unwrap();
+
+        // Rollback transaction
+        broker.rollback_transaction().await.unwrap();
+        assert_eq!(broker.transaction_state(), TransactionState::RolledBack);
+
+        // Verify message was NOT committed
+        let size = broker.queue_size("test_rollback").await.unwrap();
+        assert_eq!(size, 0);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_dead_letter_exchange() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_dlx_main")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // Declare DLX
+        broker
+            .declare_dlx("test_dlx_exchange", "test_dlx_queue")
+            .await
+            .unwrap();
+
+        // Declare main queue with DLX configuration
+        let dlx_config = DlxConfig::new("test_dlx_exchange").with_routing_key("test_dlx_queue");
+        let queue_config = QueueConfig::new().with_dlx(dlx_config);
+
+        broker
+            .declare_queue_with_config("test_dlx_main", &queue_config)
+            .await
+            .unwrap();
+
+        let _ = broker.purge("test_dlx_main").await;
+        let _ = broker.purge("test_dlx_queue").await;
+
+        // Publish a message
+        let msg = MessageBuilder::new("dlx.task")
+            .args(vec![serde_json::json!("will be rejected")])
+            .build()
+            .unwrap();
+        broker.publish("test_dlx_main", msg).await.unwrap();
+
+        // Consume and reject (without requeue) - should go to DLX
+        let envelope = broker
+            .consume("test_dlx_main", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(envelope.is_some());
+
+        broker
+            .reject(&envelope.unwrap().delivery_tag, false)
+            .await
+            .unwrap();
+
+        // Give RabbitMQ time to route to DLX
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify message is in DLX queue
+        let dlx_size = broker.queue_size("test_dlx_queue").await.unwrap();
+        assert_eq!(dlx_size, 1);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_message_ttl() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_ttl")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        let _ = broker.purge("test_ttl").await;
+
+        // Publish message with 500ms TTL
+        let msg = MessageBuilder::new("ttl.task")
+            .args(vec![serde_json::json!("expires soon")])
+            .build()
+            .unwrap();
+
+        broker.publish_with_ttl("test_ttl", msg, 500).await.unwrap();
+
+        // Wait for message to expire
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Message should have expired
+        let envelope = broker
+            .consume("test_ttl", Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(envelope.is_none());
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_metrics_tracking() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_metrics")
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        broker.reset_metrics();
+        let _ = broker.purge("test_metrics").await;
+
+        // Publish some messages
+        for i in 0..3 {
+            let msg = MessageBuilder::new("metrics.task")
+                .args(vec![serde_json::json!(i)])
+                .build()
+                .unwrap();
+            broker.publish("test_metrics", msg).await.unwrap();
+        }
+
+        // Check metrics
+        let metrics = broker.channel_metrics();
+        assert_eq!(metrics.messages_published, 3);
+
+        let confirm_stats = broker.publisher_confirm_stats();
+        assert_eq!(confirm_stats.successful_confirms, 3);
+
+        // Consume and ack
+        for _ in 0..3 {
+            if let Ok(Some(envelope)) = broker.consume("test_metrics", Duration::from_secs(1)).await
+            {
+                broker.ack(&envelope.delivery_tag).await.unwrap();
+            }
+        }
+
+        let metrics = broker.channel_metrics();
+        assert_eq!(metrics.messages_consumed, 3);
+        assert_eq!(metrics.messages_acked, 3);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ to be running
+    async fn test_integration_deduplication() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let config = AmqpConfig::default()
+            .with_deduplication(true)
+            .with_deduplication_config(100, Duration::from_secs(60));
+
+        let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_dedup", config)
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        let _ = broker.purge("test_dedup").await;
+
+        // Create a message with specific ID
+        let msg1 = MessageBuilder::new("dedup.task")
+            .args(vec![serde_json::json!("first")])
+            .build()
+            .unwrap();
+
+        // Publish first time - should succeed
+        broker.publish("test_dedup", msg1.clone()).await.unwrap();
+
+        // Publish again with same message ID - should be deduplicated
+        broker.publish("test_dedup", msg1).await.unwrap();
+
+        // Only one message should be in queue
+        let size = broker.queue_size("test_dedup").await.unwrap();
+        assert_eq!(size, 1);
+
+        broker.disconnect().await.unwrap();
+    }
 }

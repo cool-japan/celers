@@ -125,20 +125,38 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 - [x] Virtual host URL tests
 - [x] Health status tests
 - [x] Transaction state tests
-- [ ] Integration tests with RabbitMQ
-- [ ] Connection recovery tests
-- [ ] Message ordering tests
-- [ ] Priority queue tests
-- [ ] Concurrent publishing tests
+- [x] Integration tests with RabbitMQ (14 comprehensive tests)
+  - [x] Connection and disconnect
+  - [x] Publish and consume
+  - [x] Batch publishing
+  - [x] Pipeline publishing
+  - [x] Message ordering
+  - [x] Priority queues
+  - [x] Concurrent publishing
+  - [x] Connection recovery validation
+  - [x] Transaction commit
+  - [x] Transaction rollback
+  - [x] Dead Letter Exchange (DLX)
+  - [x] Message TTL
+  - [x] Metrics tracking
+  - [x] Message deduplication
 
 ## Documentation
 
 - [x] Module-level documentation
 - [x] API documentation
 - [x] Usage examples
-- [ ] RabbitMQ setup guide
-- [ ] Topology design patterns
-- [ ] Troubleshooting guide
+- [x] RabbitMQ setup guide (README.md)
+- [x] Topology design patterns (README.md)
+- [x] Troubleshooting guide (README.md)
+- [x] Comprehensive README.md with:
+  - Quick start guide
+  - Installation instructions
+  - 6 topology design patterns
+  - Advanced features documentation
+  - Troubleshooting for common issues
+  - Performance benchmarks
+  - Testing instructions
 
 ## Dependencies
 

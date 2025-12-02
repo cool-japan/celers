@@ -157,6 +157,28 @@ lazy_static! {
         )
         .unwrap();
 
+    // PostgreSQL Connection Pool Metrics
+
+    /// Maximum number of PostgreSQL connections in the pool
+    pub static ref POSTGRES_POOL_MAX_SIZE: Gauge =
+        register_gauge!("celers_postgres_pool_max_size", "Maximum number of PostgreSQL connections in the pool")
+            .unwrap();
+
+    /// Current number of PostgreSQL connections in the pool
+    pub static ref POSTGRES_POOL_SIZE: Gauge =
+        register_gauge!("celers_postgres_pool_size", "Current number of PostgreSQL connections in the pool")
+            .unwrap();
+
+    /// Current number of idle PostgreSQL connections
+    pub static ref POSTGRES_POOL_IDLE: Gauge =
+        register_gauge!("celers_postgres_pool_idle", "Current number of idle PostgreSQL connections")
+            .unwrap();
+
+    /// Current number of in-use PostgreSQL connections
+    pub static ref POSTGRES_POOL_IN_USE: Gauge =
+        register_gauge!("celers_postgres_pool_in_use", "Current number of in-use PostgreSQL connections")
+            .unwrap();
+
     /// Total number of batch enqueue operations
     pub static ref BATCH_ENQUEUE_TOTAL: Counter =
         register_counter!("celers_batch_enqueue_total", "Total number of batch enqueue operations")
@@ -330,6 +352,10 @@ pub fn reset_metrics() {
     REDIS_CONNECTIONS_ACQUIRED_TOTAL.reset();
     REDIS_CONNECTION_ERRORS_TOTAL.reset();
     REDIS_CONNECTIONS_ACTIVE.set(0.0);
+    POSTGRES_POOL_MAX_SIZE.set(0.0);
+    POSTGRES_POOL_SIZE.set(0.0);
+    POSTGRES_POOL_IDLE.set(0.0);
+    POSTGRES_POOL_IN_USE.set(0.0);
     BATCH_ENQUEUE_TOTAL.reset();
     BATCH_DEQUEUE_TOTAL.reset();
     WORKER_MEMORY_USAGE_BYTES.set(0.0);
