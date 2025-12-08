@@ -17,9 +17,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-redis = { workspace = true }
+redis = { workspace = true, features = ["cluster-async"] }
 tracing = { workspace = true }
 flate2 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 crc32fast = "1.4"
 
 [features]

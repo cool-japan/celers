@@ -645,4 +645,154 @@ mod tests {
             "Exponential(1s * 2^n)"
         );
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn test_fixed_delay_is_constant(delay in 1u64..10000, attempt in 0u32..100) {
+                let strategy = RetryStrategy::fixed(delay);
+                let calculated_delay = strategy.calculate_delay(attempt, Some(delay));
+                prop_assert_eq!(calculated_delay, delay);
+            }
+
+            #[test]
+            fn test_linear_delay_increases_linearly(
+                initial in 100u64..1000,
+                increment in 100u64..1000,
+                attempt in 0u32..50
+            ) {
+                let strategy = RetryStrategy::linear(initial, increment);
+                let expected = initial + (increment * attempt as u64);
+                let calculated = strategy.calculate_delay(attempt, None);
+                prop_assert_eq!(calculated, expected);
+            }
+
+            #[test]
+            fn test_exponential_delay_grows(
+                initial in 100u64..1000,
+                multiplier in 1.5f64..3.0,
+                attempt in 0u32..10
+            ) {
+                let strategy = RetryStrategy::exponential(initial, multiplier);
+                let delay1 = strategy.calculate_delay(attempt, None);
+                let delay2 = strategy.calculate_delay(attempt + 1, Some(delay1));
+
+                // Exponential should grow (or stay same if at max)
+                prop_assert!(delay2 >= delay1);
+            }
+
+            #[test]
+            fn test_exponential_with_max_respects_limit(
+                initial in 100u64..1000,
+                multiplier in 2.0f64..4.0,
+                max_delay in 5000u64..10000,
+                attempt in 0u32..20
+            ) {
+                let strategy = RetryStrategy::exponential_with_max(initial, multiplier, max_delay);
+                let calculated = strategy.calculate_delay(attempt, None);
+                prop_assert!(calculated <= max_delay);
+            }
+
+            #[test]
+            fn test_fibonacci_delay_grows(
+                initial in 100u64..1000,
+                attempt in 1u32..15
+            ) {
+                let strategy = RetryStrategy::fibonacci(initial);
+                let delay1 = strategy.calculate_delay(attempt, None);
+                let delay2 = strategy.calculate_delay(attempt + 1, Some(delay1));
+
+                // Fibonacci should grow
+                prop_assert!(delay2 >= delay1);
+            }
+
+            #[test]
+            fn test_immediate_is_always_zero(attempt in 0u32..1000) {
+                let strategy = RetryStrategy::immediate();
+                let delay = strategy.calculate_delay(attempt, None);
+                prop_assert_eq!(delay, 0);
+            }
+
+            #[test]
+            fn test_full_jitter_within_bounds(
+                initial in 100u64..1000,
+                multiplier in 2.0f64..3.0,
+                max_delay in 10000u64..20000,
+                attempt in 0u32..10
+            ) {
+                let strategy = RetryStrategy::full_jitter(initial, multiplier, max_delay);
+                let delay = strategy.calculate_delay(attempt, None);
+
+                // Full jitter should be between 0 and exponential delay (capped at max)
+                prop_assert!(delay <= max_delay);
+            }
+
+            #[test]
+            fn test_decorrelated_jitter_within_bounds(
+                base in 100u64..1000,
+                max_delay in 10000u64..20000,
+                attempt in 0u32..50,
+                prev_delay in 100u64..5000
+            ) {
+                let strategy = RetryStrategy::decorrelated_jitter(base, max_delay);
+                let delay = strategy.calculate_delay(attempt, Some(prev_delay));
+
+                // Decorrelated jitter should be within bounds
+                prop_assert!(delay <= max_delay);
+                prop_assert!(delay >= base);
+            }
+
+            #[test]
+            fn test_polynomial_delay_grows(
+                initial in 100u64..1000,
+                power in 1.0f64..3.0,
+                attempt in 1u32..10
+            ) {
+                let strategy = RetryStrategy::polynomial(initial, power);
+                let delay1 = strategy.calculate_delay(attempt, None);
+                let delay2 = strategy.calculate_delay(attempt + 1, Some(delay1));
+
+                // Polynomial should grow for power >= 1
+                if power >= 1.0 {
+                    prop_assert!(delay2 >= delay1);
+                }
+            }
+
+            #[test]
+            fn test_custom_strategy_uses_provided_delays(
+                delays in prop::collection::vec(100u64..5000, 1..10),
+                fallback in 1000u64..5000,
+                attempt in 0u32..20
+            ) {
+                let strategy = RetryStrategy::custom(delays.clone(), fallback);
+                let calculated = strategy.calculate_delay(attempt, None);
+
+                if (attempt as usize) < delays.len() {
+                    prop_assert_eq!(calculated, delays[attempt as usize]);
+                } else {
+                    // Should use fallback when attempt exceeds length
+                    prop_assert_eq!(calculated, fallback);
+                }
+            }
+
+            #[test]
+            fn test_retry_policy_respects_max_retries(
+                max_retries in 0u32..100,
+                current_retry in 0u32..150
+            ) {
+                let policy = RetryPolicy::new(max_retries, RetryStrategy::fixed(1000));
+
+                let should_retry = policy.should_retry("test error", current_retry);
+
+                if current_retry < max_retries {
+                    prop_assert!(should_retry);
+                } else {
+                    prop_assert!(!should_retry);
+                }
+            }
+        }
+    }
 }

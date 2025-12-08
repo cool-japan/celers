@@ -163,6 +163,10 @@ impl GrpcResultBackend {
             completed: state.completed as u32,
             callback: state.callback.clone(),
             task_ids: state.task_ids.iter().map(|id| id.to_string()).collect(),
+            created_at: state.created_at.timestamp(),
+            timeout_seconds: state.timeout.map(|d| d.as_secs()),
+            cancelled: state.cancelled,
+            cancellation_reason: state.cancellation_reason.clone(),
         }
     }
 
@@ -186,6 +190,13 @@ impl GrpcResultBackend {
             completed: proto_state.completed as usize,
             callback: proto_state.callback,
             task_ids: task_ids?,
+            created_at: Utc
+                .timestamp_opt(proto_state.created_at, 0)
+                .single()
+                .ok_or_else(|| BackendError::Serialization("Invalid timestamp".to_string()))?,
+            timeout: proto_state.timeout_seconds.map(Duration::from_secs),
+            cancelled: proto_state.cancelled,
+            cancellation_reason: proto_state.cancellation_reason,
         })
     }
 }

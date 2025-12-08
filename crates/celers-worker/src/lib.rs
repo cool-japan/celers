@@ -40,11 +40,29 @@
 //! # }
 //! ```
 
+pub mod cancellation;
 pub mod circuit_breaker;
 pub mod health;
 pub mod memory;
 pub mod middleware;
+pub mod performance_metrics;
+pub mod prefetch;
+pub mod queue_monitor;
+pub mod rate_limit;
+pub mod resource_tracker;
 pub mod shutdown;
+
+// Internal metrics wrapper module
+#[cfg(feature = "metrics")]
+mod metrics {
+    pub use celers_metrics::*;
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)]
+mod metrics {
+    // No-op stubs when metrics feature is disabled
+}
 
 #[cfg(feature = "canvas")]
 pub mod workflows;
@@ -62,7 +80,13 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+pub use cancellation::{CancellationError, CancellationRegistry, CancellationToken};
 pub use circuit_breaker::{CircuitBreaker as WorkerCircuitBreaker, CircuitState};
+pub use performance_metrics::{PerformanceConfig, PerformanceStats, PerformanceTracker};
+pub use prefetch::{PrefetchBuffer, PrefetchConfig, PrefetchStats};
+pub use queue_monitor::{QueueAlertLevel, QueueMonitor, QueueMonitorConfig, QueueStats};
+pub use rate_limit::{RateLimitConfig, RateLimiter};
+pub use resource_tracker::{ResourceLimits, ResourceStats, ResourceTracker};
 pub use shutdown::wait_for_signal;
 
 #[cfg(feature = "metrics")]

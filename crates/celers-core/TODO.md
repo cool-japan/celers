@@ -148,6 +148,9 @@ The core crate provides all fundamental building blocks for task queue systems.
   - [x] Benchmarks for task metadata creation, cloning, serialization
   - [x] Benchmarks for different payload sizes
   - [x] Benchmarks for validation operations
+  - [x] Benchmarks for state transitions (4 benchmarks)
+  - [x] Benchmarks for retry strategies (5 benchmarks covering all strategies)
+  - [x] Benchmarks for DAG operations (5 benchmarks for add/sort/validate)
 - [x] Optimize metadata cloning
   - [x] Added `#[inline]` attributes to hot-path functions (30+ functions)
   - [x] Optimized builder methods for better performance
@@ -170,6 +173,33 @@ The core crate provides all fundamental building blocks for task queue systems.
   - [x] TaskMetadata::validate() - Validate name, retries, timeout
   - [x] SerializedTask::validate() - Validate metadata and payload size
   - [x] SerializedTask::validate_with_limit() - Custom size limits
+- [x] Add batch utility functions ✅ (18 functions total)
+  - [x] task::batch::validate_all() - Batch validation with error reporting
+  - [x] task::batch::filter_by_state() - Filter tasks by state predicate
+  - [x] task::batch::filter_high_priority() - Filter high priority tasks
+  - [x] task::batch::sort_by_priority() - Sort tasks by priority (highest first)
+  - [x] task::batch::count_by_state() - Count tasks grouped by state
+  - [x] task::batch::has_expired_tasks() - Check for expired tasks
+  - [x] task::batch::get_expired_tasks() - Get all expired tasks
+  - [x] task::batch::total_payload_size() - Calculate total payload size
+  - [x] task::batch::filter_with_dependencies() - Find tasks with dependencies
+  - [x] task::batch::filter_retryable() - Find tasks that can be retried
+  - [x] task::batch::filter_by_name_pattern() - Find tasks by name pattern
+  - [x] task::batch::group_by_workflow_id() - Group tasks by workflow group ID
+  - [x] task::batch::filter_terminal() - Find terminal tasks
+  - [x] task::batch::filter_active() - Find active tasks
+  - [x] task::batch::average_payload_size() - Calculate average payload size
+  - [x] task::batch::find_oldest() - Find oldest task by creation time
+  - [x] task::batch::find_newest() - Find newest task by creation time
+- [x] Add TaskMetadata convenience methods ✅ (22 new methods)
+  - [x] State checks: is_pending(), is_running(), is_succeeded(), is_failed(), is_retrying(), is_reserved()
+  - [x] Time helpers: time_remaining(), time_elapsed()
+  - [x] Retry helpers: can_retry(), retry_count(), retries_remaining()
+  - [x] Workflow helpers: is_part_of_workflow(), get_group_id(), get_chord_id()
+  - [x] State transitions: mark_as_running(), mark_as_succeeded(), mark_as_failed()
+  - [x] Cloning: with_new_id() - Clone task with new ID
+- [x] Add SerializedTask delegation methods ✅ (16 delegated methods)
+  - [x] Delegated all new TaskMetadata convenience methods for ergonomic access
 
 ## Testing Status
 
@@ -185,7 +215,7 @@ The core crate provides all fundamental building blocks for task queue systems.
 - [x] Unit tests for exception handling (19+ tests)
 - [x] Unit tests for task dependencies (6 tests)
 - [x] Unit tests for DAG operations (8 tests)
-- [x] Doc tests for all public APIs (18 tests)
+- [x] Doc tests for all public APIs (45 tests including batch utilities and convenience methods)
 - [x] Property-based testing for state transitions (10 tests) ✅
   - [x] Terminal states consistency
   - [x] Retry count validation
@@ -197,6 +227,26 @@ The core crate provides all fundamental building blocks for task queue systems.
   - [x] Error message extraction
   - [x] State history transitions
   - [x] State history current state tracking
+- [x] Property-based testing for DAG operations (7 tests) ✅
+  - [x] Node count matches added nodes
+  - [x] Linear chain sorts correctly
+  - [x] Validate always succeeds for acyclic graphs
+  - [x] Roots have no dependencies
+  - [x] Leaves have no dependents
+  - [x] Edge count matches added dependencies
+  - [x] Remove dependency decreases edge count
+- [x] Property-based testing for retry strategies (11 tests) ✅
+  - [x] Fixed delay is constant
+  - [x] Linear delay increases linearly
+  - [x] Exponential delay grows
+  - [x] Exponential with max respects limit
+  - [x] Fibonacci delay grows
+  - [x] Immediate is always zero
+  - [x] Full jitter within bounds
+  - [x] Decorrelated jitter within bounds
+  - [x] Polynomial delay grows
+  - [x] Custom strategy uses provided delays
+  - [x] Retry policy respects max retries
 - [x] Integration tests for full task lifecycle (8 tests) ✅
   - [x] Complete task lifecycle (Pending → Running → Success)
   - [x] Task retry lifecycle with multiple retries
@@ -207,7 +257,15 @@ The core crate provides all fundamental building blocks for task queue systems.
   - [x] Workflow with multiple dependencies (DAG)
   - [x] Task state history full lifecycle
 
-**Total: 162 unit tests + 18 doc tests = 180 tests, all passing**
+**Total: 180 unit tests + 45 doc tests = 225 tests, all passing** ✅
+
+New in this release (Dec 2025):
+- Added 18 property-based tests for DAG operations and retry strategies
+- Added 18 batch utility functions with comprehensive doc tests
+- Added 22 TaskMetadata convenience methods (state checks, time helpers, retry helpers, workflow helpers)
+- Added 16 SerializedTask delegation methods for ergonomic access
+- Added 14 new benchmarks for state transitions, retry strategies, and DAG operations
+- **56 new helper methods** total for improved developer experience
 
 ## Documentation
 
@@ -223,7 +281,17 @@ The core crate provides all fundamental building blocks for task queue systems.
   - [x] Core concepts overview
   - [x] 5 comprehensive doc test examples
 - [x] Zero-copy serialization design documentation
-- [ ] Create architecture documentation (future work)
+- [x] Create architecture documentation ✅
+  - [x] Design principles and goals
+  - [x] Module organization and dependencies
+  - [x] Core abstractions (Task, Broker, TaskMetadata, etc.)
+  - [x] Complete data flow diagrams
+  - [x] State machine documentation
+  - [x] Dependency graph (DAG) documentation
+  - [x] Error handling strategy
+  - [x] Extension points for customization
+  - [x] Integration with other crates
+  - [x] Performance considerations and optimization tips
 
 ## Dependencies
 

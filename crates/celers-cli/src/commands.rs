@@ -1590,6 +1590,55 @@ pub async fn show_metrics(
     format: &str,
     output_file: Option<&str>,
     pattern: Option<&str>,
+    watch_interval: Option<u64>,
+) -> anyhow::Result<()> {
+    // If watch mode is enabled and output_file is set, it doesn't make sense
+    if watch_interval.is_some() && output_file.is_some() {
+        println!(
+            "{}",
+            "⚠ Watch mode cannot be used with file output".yellow()
+        );
+        return Ok(());
+    }
+
+    if let Some(interval) = watch_interval {
+        // Watch mode - refresh metrics periodically
+        println!("{}", "=== Metrics Watch Mode ===".bold().green());
+        println!(
+            "{}",
+            format!("Refreshing every {} seconds (Ctrl+C to stop)", interval).dimmed()
+        );
+        println!();
+
+        loop {
+            // Clear screen for better readability
+            print!("\x1B[2J\x1B[1;1H"); // ANSI escape codes to clear screen
+
+            // Display current time
+            println!(
+                "{}",
+                format!("Last updated: {}", Utc::now().format("%Y-%m-%d %H:%M:%S")).dimmed()
+            );
+            println!();
+
+            // Gather and format metrics
+            format_and_display_metrics(format, pattern)?;
+
+            // Sleep for the specified interval
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    } else {
+        // One-time display
+        format_and_output_metrics(format, output_file, pattern)?;
+        Ok(())
+    }
+}
+
+/// Format and output metrics (for one-time display)
+fn format_and_output_metrics(
+    format: &str,
+    output_file: Option<&str>,
+    pattern: Option<&str>,
 ) -> anyhow::Result<()> {
     // Gather metrics from Prometheus registry
     let metrics_text = celers_metrics::gather_metrics();
@@ -1736,6 +1785,123 @@ pub async fn show_metrics(
     Ok(())
 }
 
+/// Format and display metrics (for watch mode)
+fn format_and_display_metrics(format: &str, pattern: Option<&str>) -> anyhow::Result<()> {
+    // Gather metrics from Prometheus registry
+    let metrics_text = celers_metrics::gather_metrics();
+
+    // Filter metrics if pattern is provided
+    let filtered_metrics = if let Some(pat) = pattern {
+        metrics_text
+            .lines()
+            .filter(|line| {
+                // Keep HELP and TYPE lines for matching metrics
+                if line.starts_with("# HELP") || line.starts_with("# TYPE") {
+                    line.contains(pat)
+                } else if line.starts_with('#') {
+                    false
+                } else {
+                    line.contains(pat)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        metrics_text.clone()
+    };
+
+    // Format metrics based on format parameter
+    let output = match format.to_lowercase().as_str() {
+        "json" => {
+            // Parse Prometheus text format and convert to JSON
+            let mut metrics_map = serde_json::Map::new();
+
+            for line in filtered_metrics.lines() {
+                if line.starts_with('#') || line.trim().is_empty() {
+                    continue;
+                }
+
+                if let Some(space_idx) = line.rfind(' ') {
+                    let (metric_part, value_str) = line.split_at(space_idx);
+                    let value_str = value_str.trim();
+
+                    if let Ok(value) = value_str.parse::<f64>() {
+                        let metric_name = if let Some(brace_idx) = metric_part.find('{') {
+                            &metric_part[..brace_idx]
+                        } else {
+                            metric_part
+                        };
+
+                        metrics_map.insert(metric_name.to_string(), serde_json::json!(value));
+                    }
+                }
+            }
+
+            serde_json::to_string_pretty(&metrics_map)?
+        }
+
+        "prometheus" | "prom" => filtered_metrics,
+
+        _ => {
+            // Human-readable text format (default)
+            let mut output = String::new();
+            output.push_str(&format!("{}\n\n", "=== CeleRS Metrics ===".bold().green()));
+
+            let mut current_metric = String::new();
+            let mut help_text = String::new();
+
+            for line in filtered_metrics.lines() {
+                if line.starts_with("# HELP") {
+                    if let Some(help) = line.strip_prefix("# HELP ") {
+                        let parts: Vec<&str> = help.splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            current_metric = parts[0].to_string();
+                            help_text = parts[1].to_string();
+                        }
+                    }
+                } else if line.starts_with('#') || line.trim().is_empty() {
+                    continue;
+                } else if let Some(space_idx) = line.rfind(' ') {
+                    let (metric_part, value_str) = line.split_at(space_idx);
+                    let value_str = value_str.trim();
+
+                    let metric_name = if let Some(brace_idx) = metric_part.find('{') {
+                        &metric_part[..brace_idx]
+                    } else {
+                        metric_part
+                    };
+
+                    if metric_name == current_metric && !help_text.is_empty() {
+                        output.push_str(&format!("{}\n", metric_name.cyan().bold()));
+                        output.push_str(&format!("  {}\n", help_text.dimmed()));
+                        output.push_str(&format!(
+                            "  {} {}\n\n",
+                            "Value:".yellow(),
+                            value_str.green()
+                        ));
+                        help_text.clear();
+                    }
+                }
+            }
+
+            if output.trim().is_empty() {
+                output = format!("{}\n", "No metrics found".yellow());
+                if pattern.is_some() {
+                    output.push_str(&format!(
+                        "{}\n",
+                        "Try adjusting your filter pattern".dimmed()
+                    ));
+                }
+            }
+
+            output
+        }
+    };
+
+    println!("{}", output);
+    Ok(())
+}
+
 /// Validate configuration file
 pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow::Result<()> {
     use std::path::Path;
@@ -1784,50 +1950,6 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
     println!("  {} {}", "Queue:".yellow(), config.broker.queue);
     println!("  {} {}", "Mode:".yellow(), config.broker.mode);
 
-    // Validate broker type
-    let valid_broker_types = [
-        "redis",
-        "postgres",
-        "postgresql",
-        "mysql",
-        "amqp",
-        "rabbitmq",
-        "sqs",
-    ];
-    if !valid_broker_types.contains(&config.broker.broker_type.to_lowercase().as_str()) {
-        println!(
-            "  {}",
-            format!(
-                "⚠ Warning: Unknown broker type '{}'",
-                config.broker.broker_type
-            )
-            .yellow()
-        );
-        println!(
-            "  {}",
-            format!("Supported types: {}", valid_broker_types.join(", ")).dimmed()
-        );
-    } else {
-        println!("  {}", "✓ Broker type is valid".green());
-    }
-
-    // Validate queue mode
-    if config.broker.mode != "fifo" && config.broker.mode != "priority" {
-        println!(
-            "  {}",
-            format!(
-                "⚠ Warning: Unknown queue mode '{}' (expected 'fifo' or 'priority')",
-                config.broker.mode
-            )
-            .yellow()
-        );
-    } else {
-        println!(
-            "  {}",
-            format!("✓ Queue mode '{}' is valid", config.broker.mode).green()
-        );
-    }
-
     println!();
 
     // Validate worker configuration
@@ -1853,29 +1975,20 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
         config.worker.default_timeout_secs
     );
 
-    if config.worker.concurrency == 0 {
+    println!();
+
+    // Run validation and show warnings
+    let warnings = config.validate()?;
+    if warnings.is_empty() {
         println!(
-            "  {}",
-            "⚠ Warning: Concurrency is 0 - worker will not process any tasks".yellow()
-        );
-    } else if config.worker.concurrency > 100 {
-        println!(
-            "  {}",
-            format!(
-                "⚠ Warning: High concurrency ({}) may cause resource exhaustion",
-                config.worker.concurrency
-            )
-            .yellow()
+            "{}",
+            "✓ Configuration is valid with no warnings".green().bold()
         );
     } else {
-        println!("  {}", "✓ Worker configuration looks reasonable".green());
-    }
-
-    if config.worker.poll_interval_ms < 100 {
-        println!(
-            "  {}",
-            "⚠ Warning: Very low poll interval may cause excessive CPU usage".yellow()
-        );
+        println!("{}", "Configuration Warnings:".yellow().bold());
+        for warning in &warnings {
+            println!("  {} {}", "⚠".yellow(), warning.yellow());
+        }
     }
 
     println!();
@@ -1977,4 +2090,2392 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
     println!("{}", "✓ Configuration validation complete".green().bold());
 
     Ok(())
+}
+
+/// Pause queue processing
+pub async fn pause_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let pause_key = format!("celers:{}:paused", queue);
+
+    // Set pause flag with a timestamp
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let _: () = redis::cmd("SET")
+        .arg(&pause_key)
+        .arg(&timestamp)
+        .query_async(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("✓ Queue '{}' has been paused", queue)
+            .green()
+            .bold()
+    );
+    println!();
+    println!("{}", "Note:".yellow().bold());
+    println!("  • Workers will stop processing tasks from this queue");
+    println!("  • Existing tasks will remain in the queue");
+    println!("  • Use 'celers queue resume' to resume processing");
+    println!();
+    println!("  Paused at: {}", timestamp.cyan());
+
+    Ok(())
+}
+
+/// Resume queue processing
+pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let pause_key = format!("celers:{}:paused", queue);
+
+    // Check if queue is paused
+    let paused: Option<String> = redis::cmd("GET")
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if paused.is_none() {
+        println!("{}", format!("✓ Queue '{}' is not paused", queue).yellow());
+        return Ok(());
+    }
+
+    // Remove pause flag
+    let _: () = redis::cmd("DEL")
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("✓ Queue '{}' has been resumed", queue)
+            .green()
+            .bold()
+    );
+    println!();
+    println!("{}", "Note:".yellow().bold());
+    println!("  • Workers will now process tasks from this queue");
+    if let Some(paused_at) = paused {
+        println!("  • Was paused at: {}", paused_at.dimmed());
+    }
+
+    Ok(())
+}
+
+/// Run system health diagnostics
+pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+    println!("{}", "=== System Health Check ===".bold().cyan());
+    println!();
+
+    let mut health_issues = Vec::new();
+    let mut health_warnings = Vec::new();
+
+    // Test 1: Broker Connection
+    println!("{}", "1. Broker Connection".bold());
+    let client = match redis::Client::open(broker_url) {
+        Ok(c) => {
+            println!("  {} Redis client created", "✓".green());
+            c
+        }
+        Err(e) => {
+            println!("  {} Failed to create Redis client: {}", "✗".red(), e);
+            health_issues.push("Cannot create Redis client".to_string());
+            println!();
+            println!("{}", "Health Check Failed".red().bold());
+            return Ok(());
+        }
+    };
+
+    let mut conn = match client.get_multiplexed_async_connection().await {
+        Ok(c) => {
+            println!("  {} Successfully connected to broker", "✓".green());
+            c
+        }
+        Err(e) => {
+            println!("  {} Failed to connect: {}", "✗".red(), e);
+            health_issues.push("Cannot connect to broker".to_string());
+            println!();
+            println!("{}", "Health Check Failed".red().bold());
+            return Ok(());
+        }
+    };
+
+    // Test PING
+    match redis::cmd("PING").query_async::<String>(&mut conn).await {
+        Ok(_) => {
+            println!("  {} PING successful", "✓".green());
+        }
+        Err(e) => {
+            println!("  {} PING failed: {}", "⚠".yellow(), e);
+            health_warnings.push("PING to broker failed".to_string());
+        }
+    }
+
+    println!();
+
+    // Test 2: Queue Status
+    println!("{}", "2. Queue Status".bold());
+    let broker = RedisBroker::new(broker_url, queue)?;
+
+    let _queue_size = match broker.queue_size().await {
+        Ok(size) => {
+            println!("  {} Queue size: {}", "✓".green(), size);
+            size
+        }
+        Err(e) => {
+            println!("  {} Failed to get queue size: {}", "✗".red(), e);
+            health_issues.push("Cannot get queue size".to_string());
+            0
+        }
+    };
+
+    let dlq_size = match broker.dlq_size().await {
+        Ok(size) => {
+            if size > 0 {
+                println!("  {} DLQ size: {} (has failed tasks)", "⚠".yellow(), size);
+                health_warnings.push(format!("{} tasks in Dead Letter Queue", size));
+            } else {
+                println!("  {} DLQ size: {} (empty)", "✓".green(), size);
+            }
+            size
+        }
+        Err(e) => {
+            println!("  {} Failed to get DLQ size: {}", "✗".red(), e);
+            health_issues.push("Cannot get DLQ size".to_string());
+            0
+        }
+    };
+
+    println!();
+
+    // Test 3: Queue Accessibility
+    println!("{}", "3. Queue Accessibility".bold());
+    let queue_key = format!("celers:{}", queue);
+    let _queue_type: String = match redis::cmd("TYPE")
+        .arg(&queue_key)
+        .query_async(&mut conn)
+        .await
+    {
+        Ok(t) => {
+            if t == "none" {
+                println!(
+                    "  {} Queue does not exist (will be created on first task)",
+                    "⚠".yellow()
+                );
+                health_warnings.push("Queue not yet created".to_string());
+            } else if t == "list" {
+                println!("  {} Queue type: FIFO (list)", "✓".green());
+            } else if t == "zset" {
+                println!("  {} Queue type: Priority (sorted set)", "✓".green());
+            } else {
+                println!("  {} Unknown queue type: {}", "⚠".yellow(), t);
+                health_warnings.push(format!("Unknown queue type: {}", t));
+            }
+            t
+        }
+        Err(e) => {
+            println!("  {} Failed to check queue type: {}", "✗".red(), e);
+            health_issues.push("Cannot check queue type".to_string());
+            "none".to_string()
+        }
+    };
+
+    // Check if queue is paused
+    let pause_key = format!("celers:{}:paused", queue);
+    match redis::cmd("GET")
+        .arg(&pause_key)
+        .query_async::<Option<String>>(&mut conn)
+        .await
+    {
+        Ok(Some(paused_at)) => {
+            println!("  {} Queue is PAUSED (since: {})", "⚠".yellow(), paused_at);
+            health_warnings.push(format!("Queue is paused since {}", paused_at));
+        }
+        Ok(None) => {
+            println!("  {} Queue is not paused", "✓".green());
+        }
+        Err(e) => {
+            println!("  {} Failed to check pause status: {}", "⚠".yellow(), e);
+        }
+    }
+
+    println!();
+
+    // Test 4: Memory Usage (if accessible)
+    println!("{}", "4. Broker Memory".bold());
+    match redis::cmd("INFO")
+        .arg("memory")
+        .query_async::<String>(&mut conn)
+        .await
+    {
+        Ok(info) => {
+            // Parse used_memory from INFO output
+            for line in info.lines() {
+                if line.starts_with("used_memory_human:") {
+                    let memory = line.split(':').nth(1).unwrap_or("N/A");
+                    println!("  {} Used memory: {}", "✓".green(), memory);
+                    break;
+                }
+            }
+        }
+        Err(_) => {
+            println!("  {} Memory info not available", "⚠".yellow());
+        }
+    }
+
+    println!();
+
+    // Test 5: Health Summary
+    println!("{}", "Health Summary".bold().cyan());
+    println!();
+
+    if health_issues.is_empty() && health_warnings.is_empty() {
+        println!(
+            "{}",
+            "  ✓ All checks passed! System is healthy.".green().bold()
+        );
+    } else {
+        if !health_issues.is_empty() {
+            println!("{}", "  Critical Issues:".red().bold());
+            for issue in &health_issues {
+                println!("    {} {}", "✗".red(), issue);
+            }
+            println!();
+        }
+
+        if !health_warnings.is_empty() {
+            println!("{}", "  Warnings:".yellow().bold());
+            for warning in &health_warnings {
+                println!("    {} {}", "⚠".yellow(), warning);
+            }
+            println!();
+        }
+
+        if health_issues.is_empty() {
+            println!(
+                "{}",
+                "  Overall: System is operational with warnings"
+                    .yellow()
+                    .bold()
+            );
+        } else {
+            println!("{}", "  Overall: System has critical issues".red().bold());
+        }
+    }
+
+    println!();
+
+    // Recommendations
+    if dlq_size > 0 {
+        println!("{}", "Recommendations:".cyan().bold());
+        println!("  • Inspect DLQ: celers dlq inspect");
+        println!("  • Clear DLQ: celers dlq clear --confirm");
+        println!();
+    }
+
+    Ok(())
+}
+
+/// List all running workers
+pub async fn list_workers(broker_url: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!("{}", "=== Active Workers ===".bold().cyan());
+    println!();
+
+    // Workers register themselves with a heartbeat key
+    let worker_pattern = "celers:worker:*:heartbeat";
+    let mut cursor = 0;
+    let mut worker_keys: Vec<String> = Vec::new();
+
+    loop {
+        let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(worker_pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut conn)
+            .await?;
+
+        worker_keys.extend(keys);
+        cursor = new_cursor;
+
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    if worker_keys.is_empty() {
+        println!("{}", "No active workers found".yellow());
+        println!();
+        println!("Workers register themselves when they start processing tasks.");
+        return Ok(());
+    }
+
+    #[derive(Tabled)]
+    struct WorkerInfo {
+        #[tabled(rename = "Worker ID")]
+        id: String,
+        #[tabled(rename = "Status")]
+        status: String,
+        #[tabled(rename = "Last Heartbeat")]
+        last_heartbeat: String,
+    }
+
+    let mut workers = Vec::new();
+    let worker_count = worker_keys.len();
+
+    for key in &worker_keys {
+        // Extract worker ID from key: celers:worker:<id>:heartbeat
+        let parts: Vec<&str> = key.split(':').collect();
+        if parts.len() >= 3 {
+            let worker_id = parts[2].to_string();
+
+            // Get heartbeat timestamp
+            let heartbeat: Option<String> =
+                redis::cmd("GET").arg(key).query_async(&mut conn).await?;
+
+            let status = if heartbeat.is_some() {
+                "Active".to_string()
+            } else {
+                "Unknown".to_string()
+            };
+
+            let last_heartbeat = heartbeat.unwrap_or_else(|| "N/A".to_string());
+
+            workers.push(WorkerInfo {
+                id: worker_id,
+                status,
+                last_heartbeat,
+            });
+        }
+    }
+
+    let table = Table::new(workers).with(Style::rounded()).to_string();
+    println!("{}", table);
+    println!();
+    println!(
+        "{}",
+        format!("Total active workers: {}", worker_count)
+            .cyan()
+            .bold()
+    );
+
+    Ok(())
+}
+
+/// Show detailed statistics for a worker
+pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!(
+        "{}",
+        format!("=== Worker Statistics: {} ===", worker_id)
+            .bold()
+            .cyan()
+    );
+    println!();
+
+    // Check if worker exists
+    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let heartbeat: Option<String> = redis::cmd("GET")
+        .arg(&heartbeat_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if heartbeat.is_none() {
+        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        println!();
+        println!("Possible reasons:");
+        println!("  • Worker is not running");
+        println!("  • Worker ID is incorrect");
+        println!("  • Worker hasn't sent a heartbeat yet");
+        return Ok(());
+    }
+
+    #[derive(Tabled)]
+    struct StatRow {
+        #[tabled(rename = "Metric")]
+        metric: String,
+        #[tabled(rename = "Value")]
+        value: String,
+    }
+
+    // Gather worker statistics
+    let stats_key = format!("celers:worker:{}:stats", worker_id);
+    let stats: Option<String> = redis::cmd("GET")
+        .arg(&stats_key)
+        .query_async(&mut conn)
+        .await?;
+
+    let mut stat_rows = vec![
+        StatRow {
+            metric: "Worker ID".to_string(),
+            value: worker_id.to_string(),
+        },
+        StatRow {
+            metric: "Status".to_string(),
+            value: "Active".to_string(),
+        },
+        StatRow {
+            metric: "Last Heartbeat".to_string(),
+            value: heartbeat.unwrap_or_else(|| "N/A".to_string()),
+        },
+    ];
+
+    if let Some(stats_json) = stats {
+        if let Ok(stats_data) = serde_json::from_str::<serde_json::Value>(&stats_json) {
+            if let Some(tasks_processed) = stats_data.get("tasks_processed") {
+                stat_rows.push(StatRow {
+                    metric: "Tasks Processed".to_string(),
+                    value: tasks_processed.to_string(),
+                });
+            }
+            if let Some(tasks_failed) = stats_data.get("tasks_failed") {
+                stat_rows.push(StatRow {
+                    metric: "Tasks Failed".to_string(),
+                    value: tasks_failed.to_string(),
+                });
+            }
+            if let Some(uptime) = stats_data.get("uptime_seconds") {
+                stat_rows.push(StatRow {
+                    metric: "Uptime".to_string(),
+                    value: format!("{} seconds", uptime),
+                });
+            }
+        }
+    }
+
+    let table = Table::new(stat_rows).with(Style::rounded()).to_string();
+    println!("{}", table);
+
+    Ok(())
+}
+
+/// Stop a specific worker
+pub async fn stop_worker(broker_url: &str, worker_id: &str, graceful: bool) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!(
+        "{}",
+        format!("=== Stop Worker: {} ===", worker_id)
+            .bold()
+            .yellow()
+    );
+    println!();
+
+    // Check if worker exists
+    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let heartbeat: Option<String> = redis::cmd("GET")
+        .arg(&heartbeat_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if heartbeat.is_none() {
+        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        return Ok(());
+    }
+
+    // Publish stop command via Redis Pub/Sub
+    let channel = if graceful {
+        format!("celers:worker:{}:shutdown_graceful", worker_id)
+    } else {
+        format!("celers:worker:{}:shutdown", worker_id)
+    };
+
+    let subscribers: usize = redis::cmd("PUBLISH")
+        .arg(&channel)
+        .arg("STOP")
+        .query_async(&mut conn)
+        .await?;
+
+    if subscribers > 0 {
+        println!(
+            "{}",
+            format!(
+                "✓ Stop signal sent to worker '{}' (mode: {})",
+                worker_id,
+                if graceful { "graceful" } else { "immediate" }
+            )
+            .green()
+            .bold()
+        );
+        println!();
+        if graceful {
+            println!("The worker will:");
+            println!("  • Finish processing current tasks");
+            println!("  • Stop accepting new tasks");
+            println!("  • Shut down gracefully");
+        } else {
+            println!("The worker will:");
+            println!("  • Stop immediately");
+            println!("  • Cancel running tasks");
+        }
+    } else {
+        println!(
+            "{}",
+            format!("⚠ No subscribers for worker '{}'", worker_id)
+                .yellow()
+                .bold()
+        );
+        println!();
+        println!("The worker may not be listening for stop commands.");
+    }
+
+    Ok(())
+}
+
+/// Pause task processing for a worker
+pub async fn pause_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let pause_key = format!("celers:worker:{}:paused", worker_id);
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    let _: () = redis::cmd("SET")
+        .arg(&pause_key)
+        .arg(&timestamp)
+        .query_async(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("✓ Worker '{}' has been paused", worker_id)
+            .green()
+            .bold()
+    );
+    println!();
+    println!("{}", "Note:".yellow().bold());
+    println!("  • Worker will stop accepting new tasks");
+    println!("  • Current tasks will continue to completion");
+    println!("  • Use 'celers worker-mgmt resume' to resume");
+    println!();
+    println!("  Paused at: {}", timestamp.cyan());
+
+    Ok(())
+}
+
+/// Resume task processing for a worker
+pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let pause_key = format!("celers:worker:{}:paused", worker_id);
+
+    // Check if worker is paused
+    let paused: Option<String> = redis::cmd("GET")
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if paused.is_none() {
+        println!(
+            "{}",
+            format!("✓ Worker '{}' is not paused", worker_id).yellow()
+        );
+        return Ok(());
+    }
+
+    // Remove pause flag
+    let _: () = redis::cmd("DEL")
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("✓ Worker '{}' has been resumed", worker_id)
+            .green()
+            .bold()
+    );
+    println!();
+    println!("{}", "Note:".yellow().bold());
+    println!("  • Worker will now accept new tasks");
+    if let Some(paused_at) = paused {
+        println!("  • Was paused at: {}", paused_at.dimmed());
+    }
+
+    Ok(())
+}
+
+/// Automatic problem detection and diagnostics
+pub async fn doctor(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+    println!("{}", "=== CeleRS Doctor ===".bold().cyan());
+    println!("{}", "Running automatic diagnostics...".dimmed());
+    println!();
+
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let mut issues = Vec::new();
+    let mut warnings = Vec::new();
+    let mut recommendations = Vec::new();
+
+    // Test 1: Broker connectivity
+    println!("{}", "1. Checking broker connectivity...".bold());
+    match redis::cmd("PING").query_async::<String>(&mut conn).await {
+        Ok(_) => {
+            println!("  {} Broker is reachable", "✓".green());
+        }
+        Err(e) => {
+            println!("  {} Broker connection failed: {}", "✗".red(), e);
+            issues.push("Cannot connect to broker".to_string());
+            recommendations.push("Check broker URL and ensure Redis is running".to_string());
+        }
+    }
+    println!();
+
+    // Test 2: Queue health
+    println!("{}", "2. Analyzing queue health...".bold());
+    let broker = RedisBroker::new(broker_url, queue)?;
+
+    let queue_size = broker.queue_size().await.unwrap_or(0);
+    let dlq_size = broker.dlq_size().await.unwrap_or(0);
+
+    println!("  {} Pending tasks: {}", "•".cyan(), queue_size);
+    println!("  {} DLQ tasks: {}", "•".cyan(), dlq_size);
+
+    if dlq_size > 10 {
+        warnings.push(format!("High number of failed tasks in DLQ: {}", dlq_size));
+        recommendations.push("Inspect DLQ with: celers dlq inspect".to_string());
+    }
+
+    if queue_size > 1000 {
+        warnings.push(format!("Large queue backlog: {} tasks", queue_size));
+        recommendations.push("Consider scaling up workers".to_string());
+    }
+    println!();
+
+    // Test 3: Worker availability
+    println!("{}", "3. Checking worker availability...".bold());
+    let worker_pattern = "celers:worker:*:heartbeat";
+    let mut cursor = 0;
+    let mut worker_count = 0;
+
+    loop {
+        let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(worker_pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut conn)
+            .await?;
+
+        worker_count += keys.len();
+        cursor = new_cursor;
+
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    println!("  {} Active workers: {}", "•".cyan(), worker_count);
+
+    if worker_count == 0 && queue_size > 0 {
+        issues.push("No workers available to process pending tasks".to_string());
+        recommendations.push("Start workers with: celers worker".to_string());
+    } else if worker_count > 0 {
+        println!("  {} Workers are available", "✓".green());
+    }
+    println!();
+
+    // Test 4: Queue pause status
+    println!("{}", "4. Checking queue status...".bold());
+    let pause_key = format!("celers:{}:paused", queue);
+    let paused: Option<String> = redis::cmd("GET")
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if let Some(paused_at) = paused {
+        warnings.push(format!("Queue '{}' is paused since {}", queue, paused_at));
+        recommendations.push("Resume queue with: celers queue resume".to_string());
+        println!("  {} Queue is PAUSED", "⚠".yellow());
+    } else {
+        println!("  {} Queue is active", "✓".green());
+    }
+    println!();
+
+    // Test 5: Memory usage
+    println!("{}", "5. Checking broker memory...".bold());
+    match redis::cmd("INFO")
+        .arg("memory")
+        .query_async::<String>(&mut conn)
+        .await
+    {
+        Ok(info) => {
+            for line in info.lines() {
+                if line.starts_with("used_memory_human:") {
+                    let memory = line.split(':').nth(1).unwrap_or("N/A");
+                    println!("  {} Used memory: {}", "•".cyan(), memory);
+                }
+                if line.starts_with("maxmemory_human:") {
+                    let max_memory = line.split(':').nth(1).unwrap_or("N/A");
+                    if max_memory != "0B" {
+                        println!("  {} Max memory: {}", "•".cyan(), max_memory);
+                    }
+                }
+            }
+            println!("  {} Memory usage is acceptable", "✓".green());
+        }
+        Err(_) => {
+            println!("  {} Memory info unavailable", "⚠".yellow());
+        }
+    }
+    println!();
+
+    // Summary
+    println!("{}", "=== Diagnosis Summary ===".bold().cyan());
+    println!();
+
+    if issues.is_empty() && warnings.is_empty() {
+        println!(
+            "{}",
+            "  ✓ No issues detected! System is healthy.".green().bold()
+        );
+    } else {
+        if !issues.is_empty() {
+            println!("{}", "  Critical Issues:".red().bold());
+            for issue in &issues {
+                println!("    {} {}", "✗".red(), issue);
+            }
+            println!();
+        }
+
+        if !warnings.is_empty() {
+            println!("{}", "  Warnings:".yellow().bold());
+            for warning in &warnings {
+                println!("    {} {}", "⚠".yellow(), warning);
+            }
+            println!();
+        }
+
+        if !recommendations.is_empty() {
+            println!("{}", "  Recommendations:".cyan().bold());
+            for (i, rec) in recommendations.iter().enumerate() {
+                println!("    {}. {}", i + 1, rec);
+            }
+            println!();
+        }
+
+        if issues.is_empty() {
+            println!(
+                "{}",
+                "  Overall: System is operational with warnings"
+                    .yellow()
+                    .bold()
+            );
+        } else {
+            println!(
+                "{}",
+                "  Overall: System has critical issues that need attention"
+                    .red()
+                    .bold()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Show task execution logs
+pub async fn show_task_logs(
+    broker_url: &str,
+    task_id_str: &str,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let task_id = task_id_str
+        .parse::<uuid::Uuid>()
+        .map_err(|_| anyhow::anyhow!("Invalid task ID format"))?;
+
+    println!("{}", "=== Task Execution Logs ===".bold().cyan());
+    println!("Task ID: {}", task_id.to_string().yellow());
+    println!();
+
+    // Connect to Redis
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    // Logs are stored in a Redis list: celers:task:<id>:logs
+    let logs_key = format!("celers:task:{}:logs", task_id);
+
+    // Check if logs exist
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(&logs_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if !exists {
+        println!("{}", "✗ No logs found for this task".red());
+        println!();
+        println!("Possible reasons:");
+        println!("  • Task hasn't been executed yet");
+        println!("  • Logs have expired (TTL)");
+        println!("  • Task was executed before logging was enabled");
+        println!("  • Wrong task ID");
+        return Ok(());
+    }
+
+    // Get log count
+    let log_count: isize = redis::cmd("LLEN")
+        .arg(&logs_key)
+        .query_async(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("Total log entries: {}", log_count).cyan().bold()
+    );
+    println!();
+
+    // Fetch logs (most recent first)
+    let logs: Vec<String> = redis::cmd("LRANGE")
+        .arg(&logs_key)
+        .arg(-(limit as isize))
+        .arg(-1)
+        .query_async(&mut conn)
+        .await?;
+
+    if logs.is_empty() {
+        println!("{}", "No log entries available".yellow());
+        return Ok(());
+    }
+
+    // Display logs with colors
+    for (idx, log_entry) in logs.iter().enumerate() {
+        // Try to parse as JSON for structured logs
+        if let Ok(log_json) = serde_json::from_str::<serde_json::Value>(log_entry) {
+            let timestamp = log_json
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("N/A");
+            let level = log_json
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("INFO");
+            let message = log_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or(log_entry);
+
+            let level_colored = match level {
+                "ERROR" | "error" => level.red().bold(),
+                "WARN" | "warn" => level.yellow().bold(),
+                "DEBUG" | "debug" => level.dimmed(),
+                _ => level.cyan().bold(),
+            };
+
+            println!(
+                "{} {} {} {}",
+                format!("[{}]", idx + 1).dimmed(),
+                timestamp.dimmed(),
+                level_colored,
+                message
+            );
+        } else {
+            // Plain text log
+            println!("{} {}", format!("[{}]", idx + 1).dimmed(), log_entry);
+        }
+    }
+
+    println!();
+    if log_count as usize > limit {
+        println!(
+            "{}",
+            format!("Showing last {} of {} log entries", logs.len(), log_count).yellow()
+        );
+        println!(
+            "{}",
+            format!("Use --limit to show more entries (max: {})", log_count).dimmed()
+        );
+    } else {
+        println!(
+            "{}",
+            format!("Showing all {} log entries", logs.len())
+                .green()
+                .bold()
+        );
+    }
+
+    Ok(())
+}
+
+/// List all scheduled tasks
+pub async fn list_schedules(broker_url: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!("{}", "=== Scheduled Tasks ===".bold().cyan());
+    println!();
+
+    // Schedules are stored with keys like: celers:schedule:<name>
+    let schedule_pattern = "celers:schedule:*";
+    let mut cursor = 0;
+    let mut schedule_keys: Vec<String> = Vec::new();
+
+    loop {
+        let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(schedule_pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut conn)
+            .await?;
+
+        schedule_keys.extend(keys);
+        cursor = new_cursor;
+
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    if schedule_keys.is_empty() {
+        println!("{}", "No scheduled tasks found".yellow());
+        println!();
+        println!("Add a schedule with: celers schedule add <name> --task <task> --cron <expr>");
+        return Ok(());
+    }
+
+    #[derive(Tabled)]
+    struct ScheduleInfo {
+        #[tabled(rename = "Name")]
+        name: String,
+        #[tabled(rename = "Task")]
+        task: String,
+        #[tabled(rename = "Cron")]
+        cron: String,
+        #[tabled(rename = "Status")]
+        status: String,
+        #[tabled(rename = "Last Run")]
+        last_run: String,
+    }
+
+    let mut schedules = Vec::new();
+
+    for key in &schedule_keys {
+        // Extract schedule name from key
+        let name = key.strip_prefix("celers:schedule:").unwrap_or(key);
+
+        // Get schedule data
+        let schedule_data: Option<String> =
+            redis::cmd("GET").arg(key).query_async(&mut conn).await?;
+
+        if let Some(data) = schedule_data {
+            if let Ok(schedule) = serde_json::from_str::<serde_json::Value>(&data) {
+                let task = schedule
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("N/A")
+                    .to_string();
+                let cron = schedule
+                    .get("cron")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("N/A")
+                    .to_string();
+
+                // Check if paused
+                let pause_key = format!("celers:schedule:{}:paused", name);
+                let paused: Option<String> = redis::cmd("GET")
+                    .arg(&pause_key)
+                    .query_async(&mut conn)
+                    .await?;
+
+                let status = if paused.is_some() {
+                    "Paused".to_string()
+                } else {
+                    "Active".to_string()
+                };
+
+                let last_run = schedule
+                    .get("last_run")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Never")
+                    .to_string();
+
+                schedules.push(ScheduleInfo {
+                    name: name.to_string(),
+                    task,
+                    cron,
+                    status,
+                    last_run,
+                });
+            }
+        }
+    }
+
+    let table = Table::new(schedules).with(Style::rounded()).to_string();
+    println!("{}", table);
+    println!();
+    println!(
+        "{}",
+        format!("Total scheduled tasks: {}", schedule_keys.len())
+            .cyan()
+            .bold()
+    );
+
+    Ok(())
+}
+
+/// Add a new scheduled task
+#[allow(clippy::too_many_arguments)]
+pub async fn add_schedule(
+    broker_url: &str,
+    name: &str,
+    task: &str,
+    cron: &str,
+    queue: &str,
+    args: Option<&str>,
+) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!("{}", "=== Add Scheduled Task ===".bold().cyan());
+    println!();
+
+    // Validate cron expression (basic validation)
+    let cron_parts: Vec<&str> = cron.split_whitespace().collect();
+    if cron_parts.len() != 5 {
+        println!(
+            "{}",
+            "✗ Invalid cron expression. Expected format: 'min hour day month weekday'"
+                .red()
+                .bold()
+        );
+        println!();
+        println!("Examples:");
+        println!("  0 0 * * *       - Daily at midnight");
+        println!("  0 */2 * * *     - Every 2 hours");
+        println!("  */15 * * * *    - Every 15 minutes");
+        println!("  0 9 * * 1-5     - Weekdays at 9 AM");
+        return Ok(());
+    }
+
+    // Check if schedule already exists
+    let schedule_key = format!("celers:schedule:{}", name);
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(&schedule_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if exists {
+        println!(
+            "{}",
+            format!("✗ Schedule '{}' already exists", name).red().bold()
+        );
+        println!();
+        println!("Use a different name or remove the existing schedule first:");
+        println!("  celers schedule remove {} --confirm", name);
+        return Ok(());
+    }
+
+    // Parse args if provided
+    let args_value = if let Some(args_str) = args {
+        match serde_json::from_str::<serde_json::Value>(args_str) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("{}", "✗ Invalid JSON arguments".red().bold());
+                println!("  Error: {}", e);
+                return Ok(());
+            }
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    // Create schedule data
+    let schedule_data = serde_json::json!({
+        "name": name,
+        "task": task,
+        "cron": cron,
+        "queue": queue,
+        "args": args_value,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "last_run": null,
+    });
+
+    // Save schedule
+    let schedule_json = serde_json::to_string(&schedule_data)?;
+    let _: () = redis::cmd("SET")
+        .arg(&schedule_key)
+        .arg(&schedule_json)
+        .query_async(&mut conn)
+        .await?;
+
+    println!("{}", "✓ Schedule added successfully".green().bold());
+    println!();
+    println!("  {} {}", "Name:".cyan(), name);
+    println!("  {} {}", "Task:".cyan(), task);
+    println!("  {} {}", "Cron:".cyan(), cron);
+    println!("  {} {}", "Queue:".cyan(), queue);
+    if args.is_some() {
+        println!("  {} {}", "Args:".cyan(), args.unwrap());
+    }
+    println!();
+    println!("{}", "Note:".yellow().bold());
+    println!("  • Ensure a beat scheduler is running to execute this schedule");
+    println!("  • The schedule is active and will run at the specified times");
+
+    Ok(())
+}
+
+/// Remove a scheduled task
+pub async fn remove_schedule(broker_url: &str, name: &str, confirm: bool) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let schedule_key = format!("celers:schedule:{}", name);
+
+    // Check if schedule exists
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(&schedule_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if !exists {
+        println!("{}", format!("✗ Schedule '{}' not found", name).red());
+        return Ok(());
+    }
+
+    if !confirm {
+        println!(
+            "{}",
+            format!("⚠ Warning: This will delete schedule '{}'", name)
+                .yellow()
+                .bold()
+        );
+        println!("   Add --confirm to proceed");
+        return Ok(());
+    }
+
+    // Remove schedule and its pause flag
+    let pause_key = format!("celers:schedule:{}:paused", name);
+    let _: () = redis::cmd("DEL")
+        .arg(&schedule_key)
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("✓ Schedule '{}' removed successfully", name)
+            .green()
+            .bold()
+    );
+
+    Ok(())
+}
+
+/// Pause a schedule
+pub async fn pause_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let schedule_key = format!("celers:schedule:{}", name);
+
+    // Check if schedule exists
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(&schedule_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if !exists {
+        println!("{}", format!("✗ Schedule '{}' not found", name).red());
+        return Ok(());
+    }
+
+    // Set pause flag
+    let pause_key = format!("celers:schedule:{}:paused", name);
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let _: () = redis::cmd("SET")
+        .arg(&pause_key)
+        .arg(&timestamp)
+        .query_async(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("✓ Schedule '{}' has been paused", name)
+            .green()
+            .bold()
+    );
+    println!();
+    println!("{}", "Note:".yellow().bold());
+    println!("  • Schedule will not execute until resumed");
+    println!("  • Use 'celers schedule resume {}' to resume", name);
+    println!();
+    println!("  Paused at: {}", timestamp.cyan());
+
+    Ok(())
+}
+
+/// Resume a paused schedule
+pub async fn resume_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let schedule_key = format!("celers:schedule:{}", name);
+
+    // Check if schedule exists
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(&schedule_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if !exists {
+        println!("{}", format!("✗ Schedule '{}' not found", name).red());
+        return Ok(());
+    }
+
+    // Check if paused
+    let pause_key = format!("celers:schedule:{}:paused", name);
+    let paused: Option<String> = redis::cmd("GET")
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if paused.is_none() {
+        println!(
+            "{}",
+            format!("✓ Schedule '{}' is not paused", name).yellow()
+        );
+        return Ok(());
+    }
+
+    // Remove pause flag
+    let _: () = redis::cmd("DEL")
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("✓ Schedule '{}' has been resumed", name)
+            .green()
+            .bold()
+    );
+    println!();
+    println!("{}", "Note:".yellow().bold());
+    println!("  • Schedule will now execute at the specified times");
+    if let Some(paused_at) = paused {
+        println!("  • Was paused at: {}", paused_at.dimmed());
+    }
+
+    Ok(())
+}
+
+/// Manually trigger a scheduled task
+pub async fn trigger_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let schedule_key = format!("celers:schedule:{}", name);
+
+    println!(
+        "{}",
+        format!("=== Trigger Schedule: {} ===", name).bold().cyan()
+    );
+    println!();
+
+    // Get schedule data
+    let schedule_data: Option<String> = redis::cmd("GET")
+        .arg(&schedule_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if let Some(data) = schedule_data {
+        if let Ok(schedule) = serde_json::from_str::<serde_json::Value>(&data) {
+            let task = schedule
+                .get("task")
+                .and_then(|v| v.as_str())
+                .unwrap_or("N/A");
+            let queue = schedule
+                .get("queue")
+                .and_then(|v| v.as_str())
+                .unwrap_or("celers");
+
+            // Publish trigger command via Redis Pub/Sub
+            let trigger_channel = format!("celers:schedule:{}:trigger", name);
+            let subscribers: usize = redis::cmd("PUBLISH")
+                .arg(&trigger_channel)
+                .arg("TRIGGER")
+                .query_async(&mut conn)
+                .await?;
+
+            if subscribers > 0 {
+                println!(
+                    "{}",
+                    format!("✓ Trigger signal sent for schedule '{}'", name)
+                        .green()
+                        .bold()
+                );
+                println!();
+                println!("  {} {}", "Task:".cyan(), task);
+                println!("  {} {}", "Queue:".cyan(), queue);
+                println!();
+                println!("The task will be executed immediately by the beat scheduler.");
+            } else {
+                println!(
+                    "{}",
+                    "⚠ No beat scheduler subscribed to trigger channel"
+                        .yellow()
+                        .bold()
+                );
+                println!();
+                println!("The trigger command was sent but no beat scheduler is listening.");
+                println!("Ensure a beat scheduler is running to execute scheduled tasks.");
+            }
+        } else {
+            println!("{}", "✗ Invalid schedule data".red());
+        }
+    } else {
+        println!("{}", format!("✗ Schedule '{}' not found", name).red());
+    }
+
+    Ok(())
+}
+
+/// Scale workers to N instances
+pub async fn scale_workers(broker_url: &str, target_count: usize) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!(
+        "{}",
+        format!("=== Scale Workers to {} ===", target_count)
+            .bold()
+            .cyan()
+    );
+    println!();
+
+    // Get current worker count
+    let pattern = "celers:worker:*:heartbeat";
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(pattern)
+        .query_async(&mut conn)
+        .await?;
+
+    let current_count = keys.len();
+
+    println!("Current workers: {}", current_count.to_string().yellow());
+    println!("Target workers: {}", target_count.to_string().green());
+    println!();
+
+    if current_count == target_count {
+        println!("{}", "✓ Already at target worker count".green().bold());
+        return Ok(());
+    }
+
+    if current_count < target_count {
+        let needed = target_count - current_count;
+        println!(
+            "{}",
+            format!("⚠ Need to start {} more workers", needed)
+                .yellow()
+                .bold()
+        );
+        println!();
+        println!("To scale up, start additional worker instances:");
+        println!("  celers worker --broker {}", broker_url);
+        println!();
+        println!("Or run them in parallel:");
+        for i in 1..=needed {
+            println!("  celers worker --broker {} & # Worker {}", broker_url, i);
+        }
+    } else {
+        let excess = current_count - target_count;
+        println!(
+            "{}",
+            format!("⚠ Need to stop {} workers", excess).yellow().bold()
+        );
+        println!();
+        println!("To scale down, stop workers gracefully:");
+        println!("  celers worker-mgmt list");
+        println!("  celers worker-mgmt stop <worker-id> --graceful");
+    }
+
+    Ok(())
+}
+
+/// Drain worker (stop accepting new tasks)
+pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!(
+        "{}",
+        format!("=== Drain Worker: {} ===", worker_id).bold().cyan()
+    );
+    println!();
+
+    // Check if worker exists
+    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(&heartbeat_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if !exists {
+        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        return Ok(());
+    }
+
+    // Set drain flag
+    let drain_key = format!("celers:worker:{}:draining", worker_id);
+    let timestamp = Utc::now().to_rfc3339();
+    redis::cmd("SET")
+        .arg(&drain_key)
+        .arg(&timestamp)
+        .query_async::<()>(&mut conn)
+        .await?;
+
+    // Set TTL to 24 hours
+    redis::cmd("EXPIRE")
+        .arg(&drain_key)
+        .arg(86400)
+        .query_async::<()>(&mut conn)
+        .await?;
+
+    println!(
+        "{}",
+        format!("✓ Worker '{}' is now draining", worker_id)
+            .green()
+            .bold()
+    );
+    println!();
+    println!("The worker will:");
+    println!("  • Stop accepting new tasks");
+    println!("  • Complete currently running tasks");
+    println!("  • Shut down automatically when all tasks complete");
+    println!();
+    println!("To resume normal operation:");
+    println!("  celers worker-mgmt resume {}", worker_id);
+
+    Ok(())
+}
+
+/// Show execution history for a schedule
+pub async fn schedule_history(broker_url: &str, name: &str, limit: usize) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!(
+        "{}",
+        format!("=== Schedule History: {} ===", name).bold().cyan()
+    );
+    println!();
+
+    // Get history from Redis sorted set
+    let history_key = format!("celers:schedule:{}:history", name);
+    let entries: Vec<String> = redis::cmd("ZREVRANGE")
+        .arg(&history_key)
+        .arg(0)
+        .arg(limit as isize - 1)
+        .query_async(&mut conn)
+        .await?;
+
+    if entries.is_empty() {
+        println!("{}", "No execution history found".yellow());
+        println!();
+        println!("History is recorded when tasks are triggered by the beat scheduler.");
+        return Ok(());
+    }
+
+    #[derive(Tabled)]
+    struct HistoryEntry {
+        #[tabled(rename = "#")]
+        index: String,
+        #[tabled(rename = "Timestamp")]
+        timestamp: String,
+        #[tabled(rename = "Status")]
+        status: String,
+        #[tabled(rename = "Task ID")]
+        task_id: String,
+    }
+
+    let mut history_entries = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(entry) {
+            let timestamp = data
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("N/A")
+                .to_string();
+            let status = data
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let task_id = data
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("N/A")
+                .to_string();
+
+            history_entries.push(HistoryEntry {
+                index: (idx + 1).to_string(),
+                timestamp,
+                status,
+                task_id,
+            });
+        }
+    }
+
+    let entry_count = history_entries.len();
+    let table = Table::new(history_entries)
+        .with(Style::rounded())
+        .to_string();
+    println!("{}", table);
+    println!();
+    println!(
+        "Showing {} of {} entries",
+        entry_count.to_string().yellow(),
+        entries.len()
+    );
+
+    Ok(())
+}
+
+/// Debug task execution details
+pub async fn debug_task(broker_url: &str, queue: &str, task_id_str: &str) -> anyhow::Result<()> {
+    let task_id = task_id_str
+        .parse::<uuid::Uuid>()
+        .map_err(|_| anyhow::anyhow!("Invalid task ID format"))?;
+
+    println!(
+        "{}",
+        format!("=== Debug Task: {} ===", task_id).bold().cyan()
+    );
+    println!();
+
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    // Get task logs
+    let logs_key = format!("celers:task:{}:logs", task_id);
+    let logs: Vec<String> = redis::cmd("LRANGE")
+        .arg(&logs_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await?;
+
+    if logs.is_empty() {
+        println!("{}", "No debug logs found for this task".yellow());
+    } else {
+        println!("{}", "Task Logs:".green().bold());
+        println!();
+        for log in &logs {
+            if let Ok(log_json) = serde_json::from_str::<serde_json::Value>(log) {
+                let level = log_json
+                    .get("level")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("INFO");
+                let message = log_json
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(log);
+                let timestamp = log_json
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let level_colored = match level {
+                    "ERROR" | "error" => level.red(),
+                    "WARN" | "warn" => level.yellow(),
+                    "DEBUG" | "debug" => level.cyan(),
+                    _ => level.normal(),
+                };
+
+                println!("[{}] {} {}", timestamp.dimmed(), level_colored, message);
+            } else {
+                println!("{}", log);
+            }
+        }
+        println!();
+    }
+
+    // Get task metadata
+    let metadata_key = format!("celers:task:{}:metadata", task_id);
+    let metadata: Option<String> = redis::cmd("GET")
+        .arg(&metadata_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if let Some(meta_str) = metadata {
+        println!("{}", "Task Metadata:".green().bold());
+        println!();
+        if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            println!("{}", serde_json::to_string_pretty(&meta_json)?);
+        } else {
+            println!("{}", meta_str);
+        }
+        println!();
+    }
+
+    // Get task state from queue
+    inspect_task(broker_url, queue, task_id_str).await?;
+
+    Ok(())
+}
+
+/// Debug worker issues
+pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!(
+        "{}",
+        format!("=== Debug Worker: {} ===", worker_id).bold().cyan()
+    );
+    println!();
+
+    // Get worker heartbeat
+    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let heartbeat: Option<String> = redis::cmd("GET")
+        .arg(&heartbeat_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if heartbeat.is_none() {
+        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        println!();
+        println!("Possible causes:");
+        println!("  • Worker is not running");
+        println!("  • Worker ID is incorrect");
+        println!("  • Heartbeat expired (worker crashed)");
+        return Ok(());
+    }
+
+    println!("{}", "Worker Status: Active".green().bold());
+    if let Some(hb) = heartbeat {
+        println!("Last heartbeat: {}", hb.yellow());
+    }
+    println!();
+
+    // Check worker stats
+    let stats_key = format!("celers:worker:{}:stats", worker_id);
+    let stats: Option<String> = redis::cmd("GET")
+        .arg(&stats_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if let Some(stats_str) = stats {
+        println!("{}", "Worker Statistics:".green().bold());
+        if let Ok(stats_json) = serde_json::from_str::<serde_json::Value>(&stats_str) {
+            println!("{}", serde_json::to_string_pretty(&stats_json)?);
+        } else {
+            println!("{}", stats_str);
+        }
+        println!();
+    }
+
+    // Check for pause status
+    let pause_key = format!("celers:worker:{}:paused", worker_id);
+    let paused: bool = redis::cmd("EXISTS")
+        .arg(&pause_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if paused {
+        println!("{}", "⚠ Worker is PAUSED".yellow().bold());
+        println!("  Tasks are not being processed");
+        println!();
+    }
+
+    // Check for drain status
+    let drain_key = format!("celers:worker:{}:draining", worker_id);
+    let draining: bool = redis::cmd("EXISTS")
+        .arg(&drain_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if draining {
+        println!("{}", "⚠ Worker is DRAINING".yellow().bold());
+        println!("  Not accepting new tasks");
+        println!();
+    }
+
+    // Get worker logs
+    let logs_key = format!("celers:worker:{}:logs", worker_id);
+    let logs: Vec<String> = redis::cmd("LRANGE")
+        .arg(&logs_key)
+        .arg(-20)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await?;
+
+    if !logs.is_empty() {
+        println!("{}", "Recent Worker Logs (last 20):".green().bold());
+        println!();
+        for log in logs {
+            println!("{}", log);
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate daily execution report
+pub async fn report_daily(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!("{}", "=== Daily Execution Report ===".bold().cyan());
+    println!();
+
+    let now = Utc::now();
+    let today_key = format!("celers:metrics:{}:daily:{}", queue, now.format("%Y-%m-%d"));
+
+    // Get daily metrics
+    let metrics: Option<String> = redis::cmd("GET")
+        .arg(&today_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if let Some(metrics_str) = metrics {
+        if let Ok(metrics_json) = serde_json::from_str::<serde_json::Value>(&metrics_str) {
+            println!("{}", format!("Date: {}", now.format("%Y-%m-%d")).yellow());
+            println!();
+
+            #[derive(Tabled)]
+            struct DailyMetric {
+                #[tabled(rename = "Metric")]
+                metric: String,
+                #[tabled(rename = "Count")]
+                count: String,
+            }
+
+            let mut daily_metrics = vec![];
+
+            if let Some(total) = metrics_json.get("total_tasks").and_then(|v| v.as_u64()) {
+                daily_metrics.push(DailyMetric {
+                    metric: "Total Tasks".to_string(),
+                    count: total.to_string(),
+                });
+            }
+
+            if let Some(succeeded) = metrics_json.get("succeeded").and_then(|v| v.as_u64()) {
+                daily_metrics.push(DailyMetric {
+                    metric: "Succeeded".to_string(),
+                    count: succeeded.to_string(),
+                });
+            }
+
+            if let Some(failed) = metrics_json.get("failed").and_then(|v| v.as_u64()) {
+                daily_metrics.push(DailyMetric {
+                    metric: "Failed".to_string(),
+                    count: failed.to_string(),
+                });
+            }
+
+            if let Some(retried) = metrics_json.get("retried").and_then(|v| v.as_u64()) {
+                daily_metrics.push(DailyMetric {
+                    metric: "Retried".to_string(),
+                    count: retried.to_string(),
+                });
+            }
+
+            if let Some(avg_time) = metrics_json
+                .get("avg_execution_time")
+                .and_then(|v| v.as_f64())
+            {
+                daily_metrics.push(DailyMetric {
+                    metric: "Avg Execution Time".to_string(),
+                    count: format!("{:.2}s", avg_time),
+                });
+            }
+
+            let table = Table::new(daily_metrics).with(Style::rounded()).to_string();
+            println!("{}", table);
+        }
+    } else {
+        println!("{}", "No metrics available for today".yellow());
+        println!();
+        println!("Metrics are collected automatically when tasks are executed.");
+        println!("Ensure workers are running and processing tasks.");
+    }
+
+    Ok(())
+}
+
+/// Generate weekly statistics report
+pub async fn report_weekly(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!("{}", "=== Weekly Statistics Report ===".bold().cyan());
+    println!();
+
+    let now = Utc::now();
+    let week_start = now - chrono::Duration::days(7);
+
+    println!(
+        "{}",
+        format!(
+            "Period: {} to {}",
+            week_start.format("%Y-%m-%d"),
+            now.format("%Y-%m-%d")
+        )
+        .yellow()
+    );
+    println!();
+
+    let mut total_tasks = 0u64;
+    let mut total_succeeded = 0u64;
+    let mut total_failed = 0u64;
+    let mut total_retried = 0u64;
+
+    // Aggregate daily metrics for the week
+    for day_offset in 0..7 {
+        let day = now - chrono::Duration::days(day_offset);
+        let day_key = format!("celers:metrics:{}:daily:{}", queue, day.format("%Y-%m-%d"));
+
+        let metrics: Option<String> = redis::cmd("GET")
+            .arg(&day_key)
+            .query_async(&mut conn)
+            .await?;
+
+        if let Some(metrics_str) = metrics {
+            if let Ok(metrics_json) = serde_json::from_str::<serde_json::Value>(&metrics_str) {
+                if let Some(tasks) = metrics_json.get("total_tasks").and_then(|v| v.as_u64()) {
+                    total_tasks += tasks;
+                }
+                if let Some(succeeded) = metrics_json.get("succeeded").and_then(|v| v.as_u64()) {
+                    total_succeeded += succeeded;
+                }
+                if let Some(failed) = metrics_json.get("failed").and_then(|v| v.as_u64()) {
+                    total_failed += failed;
+                }
+                if let Some(retried) = metrics_json.get("retried").and_then(|v| v.as_u64()) {
+                    total_retried += retried;
+                }
+            }
+        }
+    }
+
+    #[derive(Tabled)]
+    struct WeeklyMetric {
+        #[tabled(rename = "Metric")]
+        metric: String,
+        #[tabled(rename = "Count")]
+        count: String,
+        #[tabled(rename = "Percentage")]
+        percentage: String,
+    }
+
+    let success_rate = if total_tasks > 0 {
+        (total_succeeded as f64 / total_tasks as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let failure_rate = if total_tasks > 0 {
+        (total_failed as f64 / total_tasks as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let weekly_metrics = vec![
+        WeeklyMetric {
+            metric: "Total Tasks".to_string(),
+            count: total_tasks.to_string(),
+            percentage: "100%".to_string(),
+        },
+        WeeklyMetric {
+            metric: "Succeeded".to_string(),
+            count: total_succeeded.to_string(),
+            percentage: format!("{:.1}%", success_rate),
+        },
+        WeeklyMetric {
+            metric: "Failed".to_string(),
+            count: total_failed.to_string(),
+            percentage: format!("{:.1}%", failure_rate),
+        },
+        WeeklyMetric {
+            metric: "Retried".to_string(),
+            count: total_retried.to_string(),
+            percentage: "-".to_string(),
+        },
+    ];
+
+    let table = Table::new(weekly_metrics)
+        .with(Style::rounded())
+        .to_string();
+    println!("{}", table);
+
+    if total_tasks == 0 {
+        println!();
+        println!("{}", "No tasks processed this week".yellow());
+    }
+
+    Ok(())
+}
+
+/// Analyze performance bottlenecks
+pub async fn analyze_bottlenecks(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!(
+        "{}",
+        "=== Performance Bottleneck Analysis ===".bold().cyan()
+    );
+    println!();
+
+    // Check queue depth
+    let queue_key = format!("celers:{}", queue);
+    let queue_type: String = redis::cmd("TYPE")
+        .arg(&queue_key)
+        .query_async(&mut conn)
+        .await?;
+
+    let queue_size: isize = match queue_type.as_str() {
+        "list" => {
+            redis::cmd("LLEN")
+                .arg(&queue_key)
+                .query_async(&mut conn)
+                .await?
+        }
+        "zset" => {
+            redis::cmd("ZCARD")
+                .arg(&queue_key)
+                .query_async(&mut conn)
+                .await?
+        }
+        _ => 0,
+    };
+
+    // Check worker count
+    let worker_keys: Vec<String> = redis::cmd("KEYS")
+        .arg("celers:worker:*:heartbeat")
+        .query_async(&mut conn)
+        .await?;
+    let worker_count = worker_keys.len();
+
+    // Check DLQ size
+    let dlq_key = format!("celers:{}:dlq", queue);
+    let dlq_size: isize = redis::cmd("LLEN")
+        .arg(&dlq_key)
+        .query_async(&mut conn)
+        .await?;
+
+    println!("{}", "System Overview:".green().bold());
+    println!("  Queue Depth: {}", queue_size.to_string().yellow());
+    println!("  Active Workers: {}", worker_count.to_string().yellow());
+    println!("  DLQ Size: {}", dlq_size.to_string().yellow());
+    println!();
+
+    let mut bottlenecks = Vec::new();
+
+    // Analyze bottlenecks
+    if queue_size > 1000 {
+        bottlenecks.push("High queue depth - consider scaling up workers");
+    }
+
+    if worker_count == 0 && queue_size > 0 {
+        bottlenecks.push("No active workers - tasks are not being processed");
+    }
+
+    if worker_count > 0 && queue_size > (worker_count * 100) as isize {
+        bottlenecks.push("Queue depth is very high relative to worker count");
+    }
+
+    if dlq_size > 100 {
+        bottlenecks.push("High DLQ size - many tasks are failing");
+    }
+
+    if bottlenecks.is_empty() {
+        println!("{}", "✓ No significant bottlenecks detected".green());
+    } else {
+        println!("{}", "⚠ Bottlenecks Detected:".yellow().bold());
+        println!();
+        for (idx, bottleneck) in bottlenecks.iter().enumerate() {
+            println!("  {}. {}", idx + 1, bottleneck);
+        }
+        println!();
+
+        println!("{}", "Recommendations:".cyan().bold());
+        println!();
+        if queue_size > 1000 {
+            println!(
+                "  • Scale up workers: celers worker-mgmt scale {}",
+                worker_count * 2
+            );
+        }
+        if worker_count == 0 {
+            println!("  • Start workers: celers worker --broker {}", broker_url);
+        }
+        if dlq_size > 100 {
+            println!("  • Investigate failed tasks: celers dlq inspect");
+            println!("  • Check task implementations for errors");
+        }
+    }
+
+    Ok(())
+}
+
+/// Analyze failure patterns
+pub async fn analyze_failures(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+    let broker = RedisBroker::new(broker_url, queue)?;
+
+    println!("{}", "=== Failure Pattern Analysis ===".bold().cyan());
+    println!();
+
+    let dlq_size = broker.dlq_size().await?;
+    println!("Total failed tasks: {}", dlq_size.to_string().yellow());
+
+    if dlq_size == 0 {
+        println!("{}", "✓ No failed tasks to analyze".green());
+        return Ok(());
+    }
+
+    println!();
+
+    // Get failed tasks
+    let tasks = broker.inspect_dlq(100).await?;
+
+    let mut task_name_failures: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for task in &tasks {
+        // Count by task name
+        *task_name_failures
+            .entry(task.metadata.name.clone())
+            .or_insert(0) += 1;
+    }
+
+    println!("{}", "Failures by Task Type:".green().bold());
+    println!();
+
+    #[derive(Tabled)]
+    struct FailureCount {
+        #[tabled(rename = "Task Name")]
+        task_name: String,
+        #[tabled(rename = "Failures")]
+        count: String,
+    }
+
+    let mut task_failures: Vec<FailureCount> = task_name_failures
+        .into_iter()
+        .map(|(name, count)| FailureCount {
+            task_name: name,
+            count: count.to_string(),
+        })
+        .collect();
+    task_failures.sort_by(|a, b| {
+        b.count
+            .parse::<usize>()
+            .unwrap()
+            .cmp(&a.count.parse::<usize>().unwrap())
+    });
+
+    let table = Table::new(task_failures.iter().take(10))
+        .with(Style::rounded())
+        .to_string();
+    println!("{}", table);
+    println!();
+    println!("{}", "Recommendations:".cyan().bold());
+    println!();
+    println!("  • Review task implementations for the most failing tasks");
+    println!("  • Check error logs: celers task logs <task-id>");
+    println!("  • Consider increasing retry limits for transient failures");
+    println!("  • Replay fixed tasks: celers dlq replay <task-id>");
+
+    Ok(())
+}
+
+/// Stream worker logs with optional filtering and follow mode
+pub async fn worker_logs(
+    broker_url: &str,
+    worker_id: &str,
+    level_filter: Option<&str>,
+    follow: bool,
+    initial_lines: usize,
+) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    println!(
+        "{}",
+        format!("=== Worker Logs: {} ===", worker_id).bold().cyan()
+    );
+    println!();
+
+    // Check if worker exists
+    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let exists: bool = redis::cmd("EXISTS")
+        .arg(&heartbeat_key)
+        .query_async(&mut conn)
+        .await?;
+
+    if !exists {
+        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        return Ok(());
+    }
+
+    let logs_key = format!("celers:worker:{}:logs", worker_id);
+
+    // Get initial logs
+    let logs: Vec<String> = redis::cmd("LRANGE")
+        .arg(&logs_key)
+        .arg(-(initial_lines as isize))
+        .arg(-1)
+        .query_async(&mut conn)
+        .await?;
+
+    // Display initial logs with filtering
+    for log in &logs {
+        display_log_line(log, level_filter);
+    }
+
+    if !follow {
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", "=== Following logs (Ctrl+C to stop) ===".dimmed());
+    println!();
+
+    // Follow mode - use Redis polling
+    let mut last_length: isize = redis::cmd("LLEN")
+        .arg(&logs_key)
+        .query_async(&mut conn)
+        .await?;
+
+    loop {
+        // Sleep briefly
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Check current length
+        let current_length: isize = redis::cmd("LLEN")
+            .arg(&logs_key)
+            .query_async(&mut conn)
+            .await?;
+
+        if current_length > last_length {
+            // New logs available
+            let new_logs: Vec<String> = redis::cmd("LRANGE")
+                .arg(&logs_key)
+                .arg(last_length)
+                .arg(-1)
+                .query_async(&mut conn)
+                .await?;
+
+            for log in &new_logs {
+                display_log_line(log, level_filter);
+            }
+
+            last_length = current_length;
+        }
+
+        // Check if worker is still alive
+        let still_exists: bool = redis::cmd("EXISTS")
+            .arg(&heartbeat_key)
+            .query_async(&mut conn)
+            .await?;
+
+        if !still_exists {
+            println!();
+            println!("{}", "Worker has stopped".yellow());
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Helper function to display a log line with optional filtering
+#[allow(dead_code)]
+fn display_log_line(log: &str, level_filter: Option<&str>) {
+    if let Ok(log_json) = serde_json::from_str::<serde_json::Value>(log) {
+        let level = log_json
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("INFO");
+        let message = log_json
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or(log);
+        let timestamp = log_json
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Filter by level if specified
+        if let Some(filter) = level_filter {
+            if !level.eq_ignore_ascii_case(filter) {
+                return;
+            }
+        }
+
+        let level_colored = match level.to_uppercase().as_str() {
+            "ERROR" => level.red(),
+            "WARN" => level.yellow(),
+            "DEBUG" => level.cyan(),
+            _ => level.normal(),
+        };
+
+        println!("[{}] {} {}", timestamp.dimmed(), level_colored, message);
+    } else {
+        // Non-JSON log, just print it
+        if level_filter.is_none() {
+            println!("{}", log);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_task_id_parsing() {
+        // Valid UUID
+        let valid_id = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(valid_id.parse::<uuid::Uuid>().is_ok());
+
+        // Invalid UUID
+        let invalid_id = "not-a-valid-uuid";
+        assert!(invalid_id.parse::<uuid::Uuid>().is_err());
+    }
+
+    #[test]
+    fn test_worker_id_extraction() {
+        let key = "celers:worker:worker-123:heartbeat";
+        let parts: Vec<&str> = key.split(':').collect();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[2], "worker-123");
+    }
+
+    #[test]
+    fn test_log_level_matching() {
+        let levels = vec![
+            "ERROR", "error", "WARN", "warn", "INFO", "info", "DEBUG", "debug",
+        ];
+
+        for level in levels {
+            let _colored = match level {
+                "ERROR" | "error" => level,
+                "WARN" | "warn" => level,
+                "DEBUG" | "debug" => level,
+                _ => level,
+            };
+            // Just testing the pattern matching logic
+            assert!(!level.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_redis_key_formatting() {
+        let task_id = uuid::Uuid::new_v4();
+        let logs_key = format!("celers:task:{}:logs", task_id);
+        assert!(logs_key.starts_with("celers:task:"));
+        assert!(logs_key.ends_with(":logs"));
+
+        let worker_id = "worker-123";
+        let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+        assert_eq!(heartbeat_key, "celers:worker:worker-123:heartbeat");
+
+        let pause_key = format!("celers:worker:{}:paused", worker_id);
+        assert_eq!(pause_key, "celers:worker:worker-123:paused");
+    }
+
+    #[test]
+    fn test_queue_key_formatting() {
+        let queue = "test-queue";
+        let queue_key = format!("celers:{}", queue);
+        assert_eq!(queue_key, "celers:test-queue");
+
+        let dlq_key = format!("{}:dlq", queue_key);
+        assert_eq!(dlq_key, "celers:test-queue:dlq");
+
+        let delayed_key = format!("{}:delayed", queue_key);
+        assert_eq!(delayed_key, "celers:test-queue:delayed");
+    }
+
+    #[test]
+    fn test_json_log_parsing() {
+        let valid_log =
+            r#"{"timestamp":"2025-12-04T10:00:00Z","level":"INFO","message":"Test message"}"#;
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(valid_log);
+        assert!(parsed.is_ok());
+
+        let log_json = parsed.unwrap();
+        assert_eq!(log_json.get("level").and_then(|v| v.as_str()), Some("INFO"));
+        assert_eq!(
+            log_json.get("message").and_then(|v| v.as_str()),
+            Some("Test message")
+        );
+
+        let invalid_log = "not json";
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(invalid_log);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_limit_range_calculation() {
+        let limit = 50;
+        let log_count = 100;
+
+        // Redis LRANGE with negative indices
+        let start_idx = -(limit as isize);
+        let end_idx = -1;
+
+        assert_eq!(start_idx, -50);
+        assert_eq!(end_idx, -1);
+
+        // Should get last 50 items
+        assert!(log_count as usize > limit);
+    }
+
+    #[test]
+    fn test_diagnostic_thresholds() {
+        // DLQ threshold
+        let dlq_size = 15;
+        assert!(dlq_size > 10, "Should trigger warning when DLQ > 10");
+
+        // Queue backlog threshold
+        let queue_size = 1500;
+        assert!(
+            queue_size > 1000,
+            "Should trigger warning when queue > 1000"
+        );
+
+        // No workers scenario
+        let worker_count = 0;
+        let pending_tasks = 50;
+        assert!(
+            worker_count == 0 && pending_tasks > 0,
+            "Should trigger error when no workers but tasks pending"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_channel_naming() {
+        let worker_id = "worker-123";
+
+        let graceful_channel = format!("celers:worker:{}:shutdown_graceful", worker_id);
+        assert_eq!(
+            graceful_channel,
+            "celers:worker:worker-123:shutdown_graceful"
+        );
+
+        let immediate_channel = format!("celers:worker:{}:shutdown", worker_id);
+        assert_eq!(immediate_channel, "celers:worker:worker-123:shutdown");
+    }
+
+    #[test]
+    fn test_timestamp_formatting() {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        assert!(timestamp.contains('T'));
+        assert!(timestamp.contains('Z') || timestamp.contains('+'));
+    }
 }

@@ -49,6 +49,12 @@ impl std::fmt::Display for BuilderError {
 
 impl std::error::Error for BuilderError {}
 
+impl From<crate::ValidationError> for BuilderError {
+    fn from(err: crate::ValidationError) -> Self {
+        BuilderError::ValidationError(err.to_string())
+    }
+}
+
 /// Result type for message building
 pub type BuilderResult<T> = Result<T, BuilderError>;
 
@@ -381,7 +387,7 @@ impl MessageBuilder {
     /// Build and validate the message
     pub fn build_validated(self) -> BuilderResult<Message> {
         let message = self.build()?;
-        message.validate().map_err(BuilderError::ValidationError)?;
+        message.validate().map_err(BuilderError::from)?;
         Ok(message)
     }
 }

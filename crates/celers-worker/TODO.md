@@ -77,6 +77,66 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
 - [x] Time window for failure counting
 - [x] Manual reset capability
 
+### Rate Limiting ✅
+- [x] Token bucket algorithm implementation
+- [x] Per-task-type rate limiting
+- [x] Configurable burst capacity and refill rate
+- [x] RateLimitConfig presets (strict, moderate, lenient)
+- [x] Dynamic limit configuration (set/remove limits at runtime)
+- [x] Token acquisition and availability checking
+- [x] Time-until-next-token calculation
+
+### Resource Tracking ✅
+- [x] Memory usage tracking (process RSS)
+- [x] CPU usage monitoring
+- [x] Active task counting
+- [x] System load average tracking
+- [x] Configurable resource limits
+- [x] Warning thresholds for gradual degradation
+- [x] Automatic limit checking
+- [x] Optional metrics integration
+
+### Task Cancellation ✅
+- [x] Cooperative cancellation with CancellationToken
+- [x] CancellationRegistry for managing task cancellations
+- [x] Check cancellation status (polling)
+- [x] Async wait for cancellation signal
+- [x] Cancel individual tasks or all tasks
+- [x] Token cleanup and lifecycle management
+
+### Queue Monitoring ✅
+- [x] Real-time queue depth tracking
+- [x] Historical depth samples with configurable window
+- [x] Queue growth rate calculation
+- [x] Alert levels (Normal, Warning, Critical)
+- [x] Configurable thresholds and intervals
+- [x] Backlog growth detection
+- [x] Statistics: avg/min/max depth over time window
+
+### Performance Metrics ✅
+- [x] Tasks per second (throughput) tracking
+- [x] Average task latency calculation
+- [x] Latency percentiles (P50, P95, P99)
+- [x] Min/max latency tracking
+- [x] Worker utilization percentage
+- [x] Task failure rate tracking
+- [x] Per-task-type failure rate
+- [x] Configurable sample window
+- [x] Configurable percentile window size
+- [x] Active task counting
+- [x] Statistics reset capability
+
+### Task Prefetching ✅
+- [x] Configurable prefetch count
+- [x] Adaptive prefetching based on processing speed
+- [x] Min/max buffer size configuration
+- [x] Prefetch cancellation on shutdown
+- [x] Buffer size tracking
+- [x] Prefetch hit rate calculation
+- [x] Processing time tracking for adaptive adjustment
+- [x] Automatic prefetch count adjustment
+- [x] Statistics and monitoring
+
 ## Configuration
 
 ### WorkerConfig ✅
@@ -108,8 +168,8 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
   - [ ] Priority inheritance and donation
   - [ ] Starvation prevention
 - [x] Circuit breaker for failing tasks ✅
-- [ ] Rate limiting per task type
-  - [ ] Token bucket algorithm
+- [x] Rate limiting per task type ✅
+  - [x] Token bucket algorithm ✅
   - [ ] Sliding window rate limiting
   - [ ] Distributed rate limiting coordination
 - [ ] Worker coordination for distributed systems
@@ -120,10 +180,10 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
 
 ### Performance
 - [x] Batch task processing ✅
-- [ ] Task prefetching to reduce latency
-  - [ ] Configurable prefetch count
-  - [ ] Adaptive prefetching based on processing speed
-  - [ ] Prefetch cancellation on shutdown
+- [x] Task prefetching to reduce latency ✅
+  - [x] Configurable prefetch count ✅
+  - [x] Adaptive prefetching based on processing speed ✅
+  - [x] Prefetch cancellation on shutdown ✅
 - [ ] Memory usage optimization
   - [ ] Task result streaming (avoid full load)
   - [ ] Incremental deserialization
@@ -138,26 +198,26 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
 - [ ] Task execution pipelining
 
 ### Monitoring
-- [ ] Worker heartbeat mechanism
-  - [ ] Periodic heartbeat to broker/backend
+- [x] Worker heartbeat mechanism ✅
+  - [x] Periodic heartbeat to broker/backend ✅
   - [ ] Dead worker detection
   - [ ] Automatic worker deregistration
-  - [ ] Heartbeat-based health checks
-- [ ] Resource usage tracking (CPU/memory)
+  - [x] Heartbeat-based health checks ✅
+- [x] Resource usage tracking (CPU/memory) ✅
+  - [x] Worker-level resource limits ✅
+  - [x] OOM prevention and alerts ✅
+  - [x] CPU throttling when overloaded ✅
   - [ ] Per-task resource consumption
-  - [ ] Worker-level resource limits
-  - [ ] OOM prevention and alerts
-  - [ ] CPU throttling when overloaded
-- [ ] Task queue depth monitoring
-  - [ ] Real-time queue size tracking
-  - [ ] Queue growth rate detection
-  - [ ] Backlog alerts
-- [ ] Worker performance metrics
-  - [ ] Tasks per second throughput
-  - [ ] Average task latency
-  - [ ] P50/P95/P99 latency percentiles
-  - [ ] Worker utilization percentage
-  - [ ] Task failure rate by type
+- [x] Task queue depth monitoring ✅
+  - [x] Real-time queue size tracking ✅
+  - [x] Queue growth rate detection ✅
+  - [x] Backlog alerts ✅
+- [x] Worker performance metrics ✅
+  - [x] Tasks per second throughput ✅
+  - [x] Average task latency ✅
+  - [x] P50/P95/P99 latency percentiles ✅
+  - [x] Worker utilization percentage ✅
+  - [x] Task failure rate by type ✅
 
 ### Reliability & Error Handling
 - [ ] Graceful degradation on resource exhaustion
@@ -170,9 +230,9 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
 - [ ] DLQ integration for poison messages
 
 ### Task Execution
-- [ ] Task cancellation during execution
-  - [ ] Cancellation tokens/contexts
-  - [ ] Cooperative cancellation checkpoints
+- [x] Task cancellation during execution ✅
+  - [x] Cancellation tokens/contexts ✅
+  - [x] Cooperative cancellation checkpoints ✅
   - [ ] Forced termination for unresponsive tasks
 - [ ] Task dependencies and execution ordering
 - [ ] Task result streaming for long operations
@@ -194,10 +254,23 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
 
 - [x] Backoff calculation tests (1 test)
 - [x] Shutdown signal compilation test (1 test)
-- [x] Health checker tests (6 tests)
+- [x] Health checker tests (7 tests)
+- [x] Circuit breaker tests (3 tests)
+- [x] Memory tracker tests (2 tests)
+- [x] Middleware tests (2 tests)
+- [x] Worker config tests (19 tests)
+- [x] Rate limiting tests (13 tests)
+- [x] Resource tracking tests (8 tests)
+- [x] Cancellation tests (13 tests)
+- [x] Queue monitoring tests (13 tests)
+- [x] Performance metrics tests (9 tests)
+- [x] Prefetch tests (10 tests)
 - [ ] Integration tests with real brokers
 - [ ] Load testing with concurrent workers
 - [ ] Stress testing for memory leaks
+
+**Total Unit Tests**: 101 passing
+**Total Doc Tests**: 9 passing
 
 ## Documentation
 

@@ -25,6 +25,25 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// Broker errors
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::BrokerError;
+///
+/// let err = BrokerError::Connection("failed to connect".to_string());
+/// assert!(err.is_connection());
+/// assert!(err.is_retryable());
+/// assert_eq!(err.category(), "connection");
+///
+/// let err = BrokerError::Timeout;
+/// assert!(err.is_timeout());
+/// assert!(err.is_retryable());
+///
+/// let err = BrokerError::QueueNotFound("celery".to_string());
+/// assert!(err.is_queue_not_found());
+/// assert!(!err.is_retryable());
+/// ```
 #[derive(Debug, Error)]
 pub enum BrokerError {
     #[error("Connection error: {0}")]
@@ -113,6 +132,22 @@ impl BrokerError {
 pub type Result<T> = std::result::Result<T, BrokerError>;
 
 /// Queue mode
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::QueueMode;
+///
+/// let fifo = QueueMode::Fifo;
+/// assert!(fifo.is_fifo());
+/// assert!(!fifo.is_priority());
+/// assert_eq!(fifo.to_string(), "FIFO");
+///
+/// let priority = QueueMode::Priority;
+/// assert!(priority.is_priority());
+/// assert!(!priority.is_fifo());
+/// assert_eq!(priority.to_string(), "Priority");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMode {
     /// First-In-First-Out
@@ -143,6 +178,23 @@ impl std::fmt::Display for QueueMode {
 }
 
 /// Message envelope (message + metadata)
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::Envelope;
+/// use celers_protocol::Message;
+/// use uuid::Uuid;
+///
+/// let task_id = Uuid::new_v4();
+/// let message = Message::new("my_task".to_string(), task_id, vec![1, 2, 3]);
+/// let envelope = Envelope::new(message, "delivery-tag-123".to_string());
+///
+/// assert_eq!(envelope.delivery_tag, "delivery-tag-123");
+/// assert!(!envelope.is_redelivered());
+/// assert_eq!(envelope.task_name(), "my_task");
+/// assert_eq!(envelope.task_id(), task_id);
+/// ```
 #[derive(Debug, Clone)]
 pub struct Envelope {
     /// The actual message
@@ -262,6 +314,25 @@ pub trait Broker: Producer + Consumer + Transport {
 }
 
 /// Queue configuration
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::{QueueConfig, QueueMode};
+/// use std::time::Duration;
+///
+/// let config = QueueConfig::new("my_queue".to_string())
+///     .with_mode(QueueMode::Priority)
+///     .with_ttl(Duration::from_secs(3600))
+///     .with_durable(true)
+///     .with_max_message_size(1024 * 1024);
+///
+/// assert_eq!(config.name, "my_queue");
+/// assert_eq!(config.mode, QueueMode::Priority);
+/// assert_eq!(config.message_ttl, Some(Duration::from_secs(3600)));
+/// assert!(config.durable);
+/// assert_eq!(config.max_message_size, Some(1024 * 1024));
+/// ```
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
     /// Queue name
@@ -329,6 +400,31 @@ impl QueueConfig {
 // =============================================================================
 
 /// Result of a batch publish operation
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::BatchPublishResult;
+/// use std::collections::HashMap;
+///
+/// // Successful batch publish
+/// let result = BatchPublishResult::success(10);
+/// assert_eq!(result.succeeded, 10);
+/// assert_eq!(result.failed, 0);
+/// assert!(result.is_complete_success());
+/// assert_eq!(result.total(), 10);
+///
+/// // Partial failure
+/// let mut errors = HashMap::new();
+/// errors.insert(2, "network error".to_string());
+/// let result = BatchPublishResult {
+///     succeeded: 9,
+///     failed: 1,
+///     errors,
+/// };
+/// assert!(!result.is_complete_success());
+/// assert_eq!(result.total(), 10);
+/// ```
 #[derive(Debug, Clone)]
 pub struct BatchPublishResult {
     /// Number of successfully published messages
@@ -402,6 +498,36 @@ pub trait BatchConsumer: Consumer {
 // =============================================================================
 
 /// Retry policy for connection attempts
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::RetryPolicy;
+/// use std::time::Duration;
+///
+/// // Default policy
+/// let policy = RetryPolicy::new();
+/// assert_eq!(policy.max_retries, Some(5));
+/// assert!(policy.should_retry(3));
+/// assert!(!policy.should_retry(6));
+///
+/// // Custom policy with exponential backoff
+/// let policy = RetryPolicy::new()
+///     .with_max_retries(3)
+///     .with_initial_delay(Duration::from_millis(100))
+///     .with_backoff_multiplier(2.0);
+///
+/// let delay = policy.delay_for_attempt(0);
+/// assert_eq!(delay, Duration::from_millis(100));
+///
+/// // Infinite retries
+/// let policy = RetryPolicy::infinite();
+/// assert!(policy.should_retry(1000));
+///
+/// // No retry
+/// let policy = RetryPolicy::no_retry();
+/// assert!(!policy.should_retry(0));
+/// ```
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     /// Maximum number of retry attempts (None = infinite)
@@ -519,6 +645,27 @@ impl RetryPolicy {
 // =============================================================================
 
 /// Health status of a broker
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::HealthStatus;
+///
+/// let healthy = HealthStatus::Healthy;
+/// assert!(healthy.is_healthy());
+/// assert!(healthy.is_operational());
+/// assert_eq!(healthy.to_string(), "healthy");
+///
+/// let degraded = HealthStatus::Degraded;
+/// assert!(!degraded.is_healthy());
+/// assert!(degraded.is_operational());
+/// assert_eq!(degraded.to_string(), "degraded");
+///
+/// let unhealthy = HealthStatus::Unhealthy;
+/// assert!(!unhealthy.is_healthy());
+/// assert!(!unhealthy.is_operational());
+/// assert_eq!(unhealthy.to_string(), "unhealthy");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HealthStatus {
     /// Broker is healthy and accepting connections
@@ -552,6 +699,23 @@ impl std::fmt::Display for HealthStatus {
 }
 
 /// Detailed health check response
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::HealthCheckResponse;
+///
+/// let response = HealthCheckResponse::healthy("redis", "localhost:6379")
+///     .with_latency(15);
+///
+/// assert!(response.status.is_healthy());
+/// assert_eq!(response.broker_type, "redis");
+/// assert_eq!(response.latency_ms, Some(15));
+///
+/// let unhealthy = HealthCheckResponse::unhealthy("amqp", "localhost:5672", "connection refused");
+/// assert!(!unhealthy.status.is_healthy());
+/// assert_eq!(unhealthy.details.get("reason"), Some(&"connection refused".to_string()));
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckResponse {
     /// Overall health status
@@ -619,6 +783,21 @@ pub trait HealthCheck: Send + Sync {
 // =============================================================================
 
 /// Broker metrics
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::BrokerMetrics;
+///
+/// let mut metrics = BrokerMetrics::new();
+/// metrics.inc_published();
+/// metrics.inc_consumed();
+/// metrics.inc_acknowledged();
+///
+/// assert_eq!(metrics.messages_published, 1);
+/// assert_eq!(metrics.messages_consumed, 1);
+/// assert_eq!(metrics.messages_acknowledged, 1);
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BrokerMetrics {
     /// Total messages published
@@ -703,6 +882,24 @@ pub trait MetricsProvider: Send + Sync {
 // =============================================================================
 
 /// Exchange type for AMQP-style brokers
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::ExchangeType;
+///
+/// let direct = ExchangeType::Direct;
+/// assert_eq!(direct.to_string(), "direct");
+///
+/// let fanout = ExchangeType::Fanout;
+/// assert_eq!(fanout.to_string(), "fanout");
+///
+/// let topic = ExchangeType::Topic;
+/// assert_eq!(topic.to_string(), "topic");
+///
+/// let headers = ExchangeType::Headers;
+/// assert_eq!(headers.to_string(), "headers");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExchangeType {
     /// Direct exchange (exact routing key match)
@@ -727,6 +924,21 @@ impl std::fmt::Display for ExchangeType {
 }
 
 /// Exchange configuration
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::{ExchangeConfig, ExchangeType};
+///
+/// let config = ExchangeConfig::new("my_exchange", ExchangeType::Topic)
+///     .with_durable(true)
+///     .with_auto_delete(false);
+///
+/// assert_eq!(config.name, "my_exchange");
+/// assert_eq!(config.exchange_type, ExchangeType::Topic);
+/// assert!(config.durable);
+/// assert!(!config.auto_delete);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeConfig {
     /// Exchange name
@@ -764,6 +976,17 @@ impl ExchangeConfig {
 }
 
 /// Queue binding configuration
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::BindingConfig;
+///
+/// let binding = BindingConfig::new("my_exchange", "my_queue", "routing.key");
+/// assert_eq!(binding.exchange, "my_exchange");
+/// assert_eq!(binding.queue, "my_queue");
+/// assert_eq!(binding.routing_key, "routing.key");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindingConfig {
     /// Source exchange
@@ -826,10 +1049,749 @@ pub trait Admin: Send + Sync {
 }
 
 // =============================================================================
+// Dead Letter Queue (DLQ) Support
+// =============================================================================
+
+/// Dead Letter Queue (DLQ) configuration
+///
+/// Defines how failed messages should be handled and routed to a dead letter queue.
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::DlqConfig;
+/// use std::time::Duration;
+///
+/// let dlq_config = DlqConfig::new("failed_tasks".to_string())
+///     .with_max_retries(3)
+///     .with_ttl(Duration::from_secs(86400)); // 24 hours
+///
+/// assert_eq!(dlq_config.queue_name, "failed_tasks");
+/// assert_eq!(dlq_config.max_retries, Some(3));
+/// assert_eq!(dlq_config.ttl, Some(Duration::from_secs(86400)));
+/// ```
+#[derive(Debug, Clone)]
+pub struct DlqConfig {
+    /// Dead letter queue name
+    pub queue_name: String,
+    /// Maximum retries before sending to DLQ
+    pub max_retries: Option<u32>,
+    /// Time-to-live for messages in DLQ
+    pub ttl: Option<Duration>,
+    /// Whether to include original message metadata
+    pub include_metadata: bool,
+}
+
+impl DlqConfig {
+    /// Create a new DLQ configuration
+    pub fn new(queue_name: String) -> Self {
+        Self {
+            queue_name,
+            max_retries: Some(3),
+            ttl: None,
+            include_metadata: true,
+        }
+    }
+
+    /// Set maximum retries
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
+
+    /// Disable retry limit (infinite retries)
+    pub fn without_retry_limit(mut self) -> Self {
+        self.max_retries = None;
+        self
+    }
+
+    /// Set TTL for DLQ messages
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Set whether to include metadata
+    pub fn with_metadata(mut self, include: bool) -> Self {
+        self.include_metadata = include;
+        self
+    }
+}
+
+/// Dead Letter Queue trait for handling failed messages
+///
+/// Provides methods for moving failed messages to a dead letter queue
+/// and retrieving them for inspection or retry.
+#[async_trait]
+pub trait DeadLetterQueue: Send + Sync {
+    /// Send a message to the dead letter queue
+    async fn send_to_dlq(
+        &mut self,
+        message: &Message,
+        original_queue: &str,
+        reason: &str,
+    ) -> Result<()>;
+
+    /// Retrieve messages from the dead letter queue
+    async fn get_from_dlq(&mut self, dlq_name: &str, limit: usize) -> Result<Vec<Envelope>>;
+
+    /// Retry a message from DLQ (move back to original queue)
+    async fn retry_from_dlq(
+        &mut self,
+        dlq_name: &str,
+        delivery_tag: &str,
+        target_queue: &str,
+    ) -> Result<()>;
+
+    /// Purge dead letter queue
+    async fn purge_dlq(&mut self, dlq_name: &str) -> Result<usize>;
+
+    /// Get DLQ statistics
+    async fn dlq_stats(&mut self, dlq_name: &str) -> Result<DlqStats>;
+}
+
+/// Dead Letter Queue statistics
+#[derive(Debug, Clone, Default)]
+pub struct DlqStats {
+    /// Total messages in DLQ
+    pub message_count: usize,
+    /// Messages by failure reason
+    pub by_reason: HashMap<String, usize>,
+    /// Oldest message timestamp (Unix timestamp)
+    pub oldest_message_time: Option<u64>,
+    /// Newest message timestamp (Unix timestamp)
+    pub newest_message_time: Option<u64>,
+}
+
+impl DlqStats {
+    /// Check if DLQ is empty
+    pub fn is_empty(&self) -> bool {
+        self.message_count == 0
+    }
+
+    /// Get age of oldest message in seconds
+    pub fn oldest_message_age_secs(&self) -> Option<u64> {
+        self.oldest_message_time.map(|ts| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(ts)
+        })
+    }
+}
+
+// =============================================================================
+// Message Transactions
+// =============================================================================
+
+/// Transaction isolation level
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// Read uncommitted (lowest isolation)
+    ReadUncommitted,
+    /// Read committed
+    ReadCommitted,
+    /// Repeatable read
+    RepeatableRead,
+    /// Serializable (highest isolation)
+    Serializable,
+}
+
+/// Transaction state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionState {
+    /// Transaction is active
+    Active,
+    /// Transaction is committed
+    Committed,
+    /// Transaction is rolled back
+    RolledBack,
+}
+
+/// Message transaction trait for atomic operations
+///
+/// Provides ACID guarantees for message operations.
+///
+/// # Examples
+///
+/// ```ignore
+/// use celers_kombu::{MessageTransaction, IsolationLevel};
+///
+/// let mut broker = MyBroker::new();
+/// let tx_id = broker.begin_transaction(IsolationLevel::ReadCommitted).await?;
+///
+/// // Publish messages within transaction
+/// broker.publish_transactional(&tx_id, "queue1", message1).await?;
+/// broker.publish_transactional(&tx_id, "queue2", message2).await?;
+///
+/// // Commit transaction (both messages published atomically)
+/// broker.commit_transaction(&tx_id).await?;
+/// ```
+#[async_trait]
+pub trait MessageTransaction: Send + Sync {
+    /// Begin a new transaction
+    async fn begin_transaction(&mut self, isolation: IsolationLevel) -> Result<String>;
+
+    /// Publish a message within a transaction
+    async fn publish_transactional(
+        &mut self,
+        tx_id: &str,
+        queue: &str,
+        message: Message,
+    ) -> Result<()>;
+
+    /// Consume a message within a transaction
+    async fn consume_transactional(
+        &mut self,
+        tx_id: &str,
+        queue: &str,
+        timeout: Duration,
+    ) -> Result<Option<Envelope>>;
+
+    /// Commit a transaction
+    async fn commit_transaction(&mut self, tx_id: &str) -> Result<()>;
+
+    /// Rollback a transaction
+    async fn rollback_transaction(&mut self, tx_id: &str) -> Result<()>;
+
+    /// Get transaction state
+    async fn transaction_state(&self, tx_id: &str) -> Result<TransactionState>;
+}
+
+// =============================================================================
+// Message Scheduling (Delayed Delivery)
+// =============================================================================
+
+/// Schedule configuration for delayed message delivery
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::ScheduleConfig;
+/// use std::time::Duration;
+///
+/// // Delay by 30 seconds
+/// let schedule = ScheduleConfig::delay(Duration::from_secs(30));
+/// assert!(schedule.delay.is_some());
+///
+/// // Schedule at specific timestamp
+/// let timestamp = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .unwrap()
+///     .as_secs() + 3600;
+/// let schedule = ScheduleConfig::at(timestamp);
+/// assert!(schedule.scheduled_at.is_some());
+/// ```
+#[derive(Debug, Clone)]
+pub struct ScheduleConfig {
+    /// Delay duration from now
+    pub delay: Option<Duration>,
+    /// Absolute timestamp (Unix epoch seconds)
+    pub scheduled_at: Option<u64>,
+    /// Maximum execution time window
+    pub execution_window: Option<Duration>,
+}
+
+impl ScheduleConfig {
+    /// Create schedule with delay
+    pub fn delay(delay: Duration) -> Self {
+        Self {
+            delay: Some(delay),
+            scheduled_at: None,
+            execution_window: None,
+        }
+    }
+
+    /// Create schedule at absolute time
+    pub fn at(timestamp: u64) -> Self {
+        Self {
+            delay: None,
+            scheduled_at: Some(timestamp),
+            execution_window: None,
+        }
+    }
+
+    /// Set execution window
+    pub fn with_window(mut self, window: Duration) -> Self {
+        self.execution_window = Some(window);
+        self
+    }
+
+    /// Check if message is ready for delivery
+    pub fn is_ready(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Some(timestamp) = self.scheduled_at {
+            return now >= timestamp;
+        }
+
+        // If only delay is set, it's ready when converted to timestamp
+        true
+    }
+
+    /// Get delivery timestamp
+    pub fn delivery_time(&self) -> Option<u64> {
+        if let Some(timestamp) = self.scheduled_at {
+            return Some(timestamp);
+        }
+
+        if let Some(delay) = self.delay {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            return Some(now + delay.as_secs());
+        }
+
+        None
+    }
+}
+
+/// Message scheduler trait for delayed delivery
+#[async_trait]
+pub trait MessageScheduler: Send + Sync {
+    /// Schedule a message for delayed delivery
+    async fn schedule_message(
+        &mut self,
+        queue: &str,
+        message: Message,
+        schedule: ScheduleConfig,
+    ) -> Result<String>;
+
+    /// Cancel a scheduled message
+    async fn cancel_scheduled(&mut self, schedule_id: &str) -> Result<()>;
+
+    /// List scheduled messages for a queue
+    async fn list_scheduled(&mut self, queue: &str) -> Result<Vec<ScheduledMessage>>;
+
+    /// Get count of scheduled messages
+    async fn scheduled_count(&mut self, queue: &str) -> Result<usize>;
+}
+
+/// Scheduled message information
+#[derive(Debug, Clone)]
+pub struct ScheduledMessage {
+    /// Schedule ID
+    pub schedule_id: String,
+    /// Queue name
+    pub queue: String,
+    /// Scheduled delivery time (Unix timestamp)
+    pub delivery_time: u64,
+    /// Message size in bytes
+    pub message_size: usize,
+}
+
+// =============================================================================
+// Consumer Groups (Load Balancing)
+// =============================================================================
+
+/// Consumer group configuration
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::ConsumerGroupConfig;
+///
+/// let config = ConsumerGroupConfig::new("my-service".to_string(), "worker-1".to_string())
+///     .with_max_consumers(10)
+///     .with_rebalance_timeout(std::time::Duration::from_secs(30));
+///
+/// assert_eq!(config.group_id, "my-service");
+/// assert_eq!(config.consumer_id, "worker-1");
+/// assert_eq!(config.max_consumers, Some(10));
+/// ```
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupConfig {
+    /// Consumer group ID
+    pub group_id: String,
+    /// Individual consumer ID
+    pub consumer_id: String,
+    /// Maximum consumers in group
+    pub max_consumers: Option<usize>,
+    /// Rebalance timeout
+    pub rebalance_timeout: Duration,
+    /// Heartbeat interval
+    pub heartbeat_interval: Duration,
+}
+
+impl ConsumerGroupConfig {
+    /// Create new consumer group configuration
+    pub fn new(group_id: String, consumer_id: String) -> Self {
+        Self {
+            group_id,
+            consumer_id,
+            max_consumers: None,
+            rebalance_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(3),
+        }
+    }
+
+    /// Set maximum consumers
+    pub fn with_max_consumers(mut self, max: usize) -> Self {
+        self.max_consumers = Some(max);
+        self
+    }
+
+    /// Set rebalance timeout
+    pub fn with_rebalance_timeout(mut self, timeout: Duration) -> Self {
+        self.rebalance_timeout = timeout;
+        self
+    }
+
+    /// Set heartbeat interval
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+}
+
+/// Consumer group trait for load-balanced consumption
+#[async_trait]
+pub trait ConsumerGroup: Send + Sync {
+    /// Join a consumer group
+    async fn join_group(&mut self, config: &ConsumerGroupConfig) -> Result<()>;
+
+    /// Leave consumer group
+    async fn leave_group(&mut self, group_id: &str) -> Result<()>;
+
+    /// Send heartbeat to maintain membership
+    async fn heartbeat(&mut self, group_id: &str) -> Result<()>;
+
+    /// Get consumer group members
+    async fn group_members(&mut self, group_id: &str) -> Result<Vec<String>>;
+
+    /// Consume from group (automatic load balancing)
+    async fn consume_from_group(
+        &mut self,
+        group_id: &str,
+        queues: &[String],
+        timeout: Duration,
+    ) -> Result<Option<Envelope>>;
+}
+
+// =============================================================================
+// Message Replay (Debugging/Recovery)
+// =============================================================================
+
+/// Replay configuration
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::ReplayConfig;
+/// use std::time::Duration;
+///
+/// // Replay last 1 hour
+/// let config = ReplayConfig::from_duration(Duration::from_secs(3600));
+/// assert!(config.from_duration.is_some());
+///
+/// // Replay from specific timestamp
+/// let timestamp = 1699999999;
+/// let config = ReplayConfig::from_timestamp(timestamp);
+/// assert_eq!(config.from_timestamp, Some(timestamp));
+/// ```
+#[derive(Debug, Clone)]
+pub struct ReplayConfig {
+    /// Replay from duration ago
+    pub from_duration: Option<Duration>,
+    /// Replay from absolute timestamp
+    pub from_timestamp: Option<u64>,
+    /// Replay until timestamp (None = now)
+    pub until_timestamp: Option<u64>,
+    /// Maximum messages to replay
+    pub max_messages: Option<usize>,
+    /// Replay speed multiplier (1.0 = real-time)
+    pub speed_multiplier: f64,
+}
+
+impl ReplayConfig {
+    /// Create replay config from duration
+    pub fn from_duration(duration: Duration) -> Self {
+        Self {
+            from_duration: Some(duration),
+            from_timestamp: None,
+            until_timestamp: None,
+            max_messages: None,
+            speed_multiplier: 1.0,
+        }
+    }
+
+    /// Create replay config from timestamp
+    pub fn from_timestamp(timestamp: u64) -> Self {
+        Self {
+            from_duration: None,
+            from_timestamp: Some(timestamp),
+            until_timestamp: None,
+            max_messages: None,
+            speed_multiplier: 1.0,
+        }
+    }
+
+    /// Set end timestamp
+    pub fn until(mut self, timestamp: u64) -> Self {
+        self.until_timestamp = Some(timestamp);
+        self
+    }
+
+    /// Set maximum messages
+    pub fn with_max_messages(mut self, max: usize) -> Self {
+        self.max_messages = Some(max);
+        self
+    }
+
+    /// Set replay speed
+    pub fn with_speed(mut self, multiplier: f64) -> Self {
+        self.speed_multiplier = multiplier;
+        self
+    }
+
+    /// Calculate start timestamp
+    pub fn start_timestamp(&self) -> u64 {
+        if let Some(ts) = self.from_timestamp {
+            return ts;
+        }
+
+        if let Some(duration) = self.from_duration {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            return now.saturating_sub(duration.as_secs());
+        }
+
+        0
+    }
+}
+
+/// Message replay trait for debugging and recovery
+#[async_trait]
+pub trait MessageReplay: Send + Sync {
+    /// Start replay session
+    async fn begin_replay(&mut self, queue: &str, config: ReplayConfig) -> Result<String>;
+
+    /// Get next message from replay
+    async fn replay_next(&mut self, replay_id: &str) -> Result<Option<Envelope>>;
+
+    /// Stop replay session
+    async fn stop_replay(&mut self, replay_id: &str) -> Result<()>;
+
+    /// Get replay progress
+    async fn replay_progress(&mut self, replay_id: &str) -> Result<ReplayProgress>;
+}
+
+/// Replay progress information
+#[derive(Debug, Clone)]
+pub struct ReplayProgress {
+    /// Replay session ID
+    pub replay_id: String,
+    /// Messages replayed so far
+    pub messages_replayed: usize,
+    /// Total messages to replay
+    pub total_messages: Option<usize>,
+    /// Current timestamp being replayed
+    pub current_timestamp: u64,
+    /// Replay is complete
+    pub completed: bool,
+}
+
+impl ReplayProgress {
+    /// Get completion percentage
+    pub fn completion_percent(&self) -> Option<f64> {
+        self.total_messages.map(|total| {
+            if total == 0 {
+                100.0
+            } else {
+                (self.messages_replayed as f64 / total as f64) * 100.0
+            }
+        })
+    }
+}
+
+// =============================================================================
+// Quota Management (Resource Limits)
+// =============================================================================
+
+/// Quota configuration
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::QuotaConfig;
+/// use std::time::Duration;
+///
+/// let quota = QuotaConfig::new()
+///     .with_max_messages(10000)
+///     .with_max_bytes(10 * 1024 * 1024)
+///     .with_max_rate(100.0);
+///
+/// assert_eq!(quota.max_messages, Some(10000));
+/// assert_eq!(quota.max_bytes, Some(10 * 1024 * 1024));
+/// assert_eq!(quota.max_rate_per_sec, Some(100.0));
+/// ```
+#[derive(Debug, Clone)]
+pub struct QuotaConfig {
+    /// Maximum number of messages
+    pub max_messages: Option<usize>,
+    /// Maximum total bytes
+    pub max_bytes: Option<usize>,
+    /// Maximum rate (messages per second)
+    pub max_rate_per_sec: Option<f64>,
+    /// Per-consumer message limit
+    pub max_messages_per_consumer: Option<usize>,
+    /// Quota enforcement action
+    pub enforcement: QuotaEnforcement,
+}
+
+impl QuotaConfig {
+    /// Create new quota configuration
+    pub fn new() -> Self {
+        Self {
+            max_messages: None,
+            max_bytes: None,
+            max_rate_per_sec: None,
+            max_messages_per_consumer: None,
+            enforcement: QuotaEnforcement::Reject,
+        }
+    }
+
+    /// Set maximum messages
+    pub fn with_max_messages(mut self, max: usize) -> Self {
+        self.max_messages = Some(max);
+        self
+    }
+
+    /// Set maximum bytes
+    pub fn with_max_bytes(mut self, max: usize) -> Self {
+        self.max_bytes = Some(max);
+        self
+    }
+
+    /// Set maximum rate
+    pub fn with_max_rate(mut self, rate: f64) -> Self {
+        self.max_rate_per_sec = Some(rate);
+        self
+    }
+
+    /// Set per-consumer limit
+    pub fn with_max_per_consumer(mut self, max: usize) -> Self {
+        self.max_messages_per_consumer = Some(max);
+        self
+    }
+
+    /// Set enforcement action
+    pub fn with_enforcement(mut self, enforcement: QuotaEnforcement) -> Self {
+        self.enforcement = enforcement;
+        self
+    }
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Quota enforcement action
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaEnforcement {
+    /// Reject new messages when quota exceeded
+    Reject,
+    /// Throttle (slow down) when quota exceeded
+    Throttle,
+    /// Warn but allow (soft limit)
+    Warn,
+}
+
+/// Quota usage statistics
+#[derive(Debug, Clone, Default)]
+pub struct QuotaUsage {
+    /// Current message count
+    pub message_count: usize,
+    /// Current bytes used
+    pub bytes_used: usize,
+    /// Current rate (messages/sec)
+    pub current_rate: f64,
+    /// Quota exceeded flag
+    pub exceeded: bool,
+}
+
+impl QuotaUsage {
+    /// Check if message quota is exceeded
+    pub fn is_message_quota_exceeded(&self, config: &QuotaConfig) -> bool {
+        if let Some(max) = config.max_messages {
+            return self.message_count >= max;
+        }
+        false
+    }
+
+    /// Check if bytes quota is exceeded
+    pub fn is_bytes_quota_exceeded(&self, config: &QuotaConfig) -> bool {
+        if let Some(max) = config.max_bytes {
+            return self.bytes_used >= max;
+        }
+        false
+    }
+
+    /// Check if rate quota is exceeded
+    pub fn is_rate_quota_exceeded(&self, config: &QuotaConfig) -> bool {
+        if let Some(max) = config.max_rate_per_sec {
+            return self.current_rate >= max;
+        }
+        false
+    }
+
+    /// Get usage percentage
+    pub fn usage_percent(&self, config: &QuotaConfig) -> Option<f64> {
+        config.max_messages.map(|max| {
+            if max == 0 {
+                100.0
+            } else {
+                (self.message_count as f64 / max as f64) * 100.0
+            }
+        })
+    }
+}
+
+/// Quota management trait
+#[async_trait]
+pub trait QuotaManager: Send + Sync {
+    /// Set quota for a queue
+    async fn set_quota(&mut self, queue: &str, config: QuotaConfig) -> Result<()>;
+
+    /// Get quota configuration
+    async fn get_quota(&mut self, queue: &str) -> Result<QuotaConfig>;
+
+    /// Get quota usage
+    async fn quota_usage(&mut self, queue: &str) -> Result<QuotaUsage>;
+
+    /// Reset quota counters
+    async fn reset_quota(&mut self, queue: &str) -> Result<()>;
+
+    /// Check if operation is allowed under quota
+    async fn check_quota(&mut self, queue: &str, message_size: usize) -> Result<bool>;
+}
+
+// =============================================================================
 // Connection State Callbacks
 // =============================================================================
 
 /// Connection state
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::ConnectionState;
+///
+/// let state = ConnectionState::Connected;
+/// assert_eq!(state.to_string(), "connected");
+///
+/// let disconnected = ConnectionState::Disconnected;
+/// assert_eq!(disconnected.to_string(), "disconnected");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     /// Not connected
@@ -882,6 +1844,25 @@ pub trait ConnectionObserver: Send + Sync {
 // =============================================================================
 
 /// Connection pool configuration
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::PoolConfig;
+/// use std::time::Duration;
+///
+/// let config = PoolConfig::new()
+///     .with_min_connections(2)
+///     .with_max_connections(20)
+///     .with_idle_timeout(Duration::from_secs(300))
+///     .with_acquire_timeout(Duration::from_secs(10))
+///     .with_max_lifetime(Duration::from_secs(3600));
+///
+/// assert_eq!(config.min_connections, 2);
+/// assert_eq!(config.max_connections, 20);
+/// assert_eq!(config.idle_timeout, Some(Duration::from_secs(300)));
+/// assert_eq!(config.acquire_timeout, Duration::from_secs(10));
+/// ```
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// Minimum number of connections to keep in the pool
@@ -999,6 +1980,21 @@ pub trait ConnectionPool: Send + Sync {
 // =============================================================================
 
 /// Circuit breaker state
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::CircuitState;
+///
+/// let closed = CircuitState::Closed;
+/// assert_eq!(closed.to_string(), "closed");
+///
+/// let open = CircuitState::Open;
+/// assert_eq!(open.to_string(), "open");
+///
+/// let half_open = CircuitState::HalfOpen;
+/// assert_eq!(half_open.to_string(), "half-open");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CircuitState {
     /// Circuit is closed, requests flow normally
@@ -1020,6 +2016,24 @@ impl std::fmt::Display for CircuitState {
 }
 
 /// Circuit breaker configuration
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::CircuitBreakerConfig;
+/// use std::time::Duration;
+///
+/// let config = CircuitBreakerConfig::new()
+///     .with_failure_threshold(3)
+///     .with_success_threshold(2)
+///     .with_open_duration(Duration::from_secs(30))
+///     .with_failure_window(Duration::from_secs(60));
+///
+/// assert_eq!(config.failure_threshold, 3);
+/// assert_eq!(config.success_threshold, 2);
+/// assert_eq!(config.open_duration, Duration::from_secs(30));
+/// assert_eq!(config.failure_window, Duration::from_secs(60));
+/// ```
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
     /// Number of failures before opening the circuit
@@ -1135,6 +2149,28 @@ pub trait CircuitBreaker: Send + Sync {
 // =============================================================================
 
 /// Priority levels for messages
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::Priority;
+///
+/// let normal = Priority::Normal;
+/// assert_eq!(normal.as_u8(), 5);
+/// assert_eq!(normal.to_string(), "normal");
+///
+/// let high = Priority::High;
+/// assert!(high > normal);
+/// assert_eq!(high.as_u8(), 7);
+///
+/// // Convert from numeric value
+/// let priority = Priority::from_u8(8);
+/// assert_eq!(priority, Priority::High);
+///
+/// // Default is Normal
+/// let default = Priority::default();
+/// assert_eq!(default, Priority::Normal);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Priority {
     /// Lowest priority (0)
@@ -1186,6 +2222,28 @@ impl Priority {
 }
 
 /// Message-level options
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::{MessageOptions, Priority};
+/// use std::time::Duration;
+///
+/// let options = MessageOptions::new()
+///     .with_priority(Priority::High)
+///     .with_ttl(Duration::from_secs(3600))
+///     .with_correlation_id("req-123".to_string())
+///     .with_reply_to("response_queue".to_string());
+///
+/// assert_eq!(options.priority, Some(Priority::High));
+/// assert_eq!(options.ttl, Some(Duration::from_secs(3600)));
+/// assert_eq!(options.correlation_id, Some("req-123".to_string()));
+///
+/// // Check if message should be signed
+/// let secure_options = MessageOptions::new()
+///     .with_signing(b"secret-key".to_vec());
+/// assert!(secure_options.should_sign());
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageOptions {
     /// Message priority
@@ -1351,6 +2409,19 @@ pub trait MessageMiddleware: Send + Sync {
 }
 
 /// Middleware chain for processing messages
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::{MiddlewareChain, ValidationMiddleware, LoggingMiddleware};
+///
+/// let chain = MiddlewareChain::new()
+///     .with_middleware(Box::new(ValidationMiddleware::new()))
+///     .with_middleware(Box::new(LoggingMiddleware::new("MyApp")));
+///
+/// assert_eq!(chain.len(), 2);
+/// assert!(!chain.is_empty());
+/// ```
 pub struct MiddlewareChain {
     middlewares: Vec<Box<dyn MessageMiddleware>>,
 }
@@ -1445,6 +2516,24 @@ pub trait MiddlewareConsumer: Consumer {
 // =============================================================================
 
 /// Validation middleware - validates message structure
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::ValidationMiddleware;
+///
+/// // Default validation (10MB max, require task name)
+/// let validator = ValidationMiddleware::new();
+///
+/// // Custom validation
+/// let validator = ValidationMiddleware::new()
+///     .with_max_body_size(5 * 1024 * 1024)  // 5MB limit
+///     .with_require_task_name(true);
+///
+/// // Disable body size limit
+/// let validator = ValidationMiddleware::new()
+///     .without_body_size_limit();
+/// ```
 pub struct ValidationMiddleware {
     /// Maximum message body size (bytes)
     max_body_size: Option<usize>,
@@ -1524,6 +2613,19 @@ impl MessageMiddleware for ValidationMiddleware {
 }
 
 /// Logging middleware - logs message events
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::LoggingMiddleware;
+///
+/// // Basic logging
+/// let logger = LoggingMiddleware::new("MyApp");
+///
+/// // With detailed body logging
+/// let verbose_logger = LoggingMiddleware::new("MyApp")
+///     .with_body_logging();
+/// ```
 pub struct LoggingMiddleware {
     prefix: String,
     log_body: bool,
@@ -1593,6 +2695,20 @@ impl MessageMiddleware for LoggingMiddleware {
 }
 
 /// Metrics middleware - collects message statistics
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::{MetricsMiddleware, BrokerMetrics};
+/// use std::sync::{Arc, Mutex};
+///
+/// let metrics = Arc::new(Mutex::new(BrokerMetrics::default()));
+/// let middleware = MetricsMiddleware::new(metrics.clone());
+///
+/// // Later, get metrics snapshot
+/// let snapshot = middleware.get_metrics();
+/// assert_eq!(snapshot.messages_published, 0);
+/// ```
 pub struct MetricsMiddleware {
     metrics: std::sync::Arc<std::sync::Mutex<BrokerMetrics>>,
 }
@@ -1629,6 +2745,15 @@ impl MessageMiddleware for MetricsMiddleware {
 }
 
 /// Retry limit middleware - enforces maximum retry count
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::RetryLimitMiddleware;
+///
+/// // Allow up to 3 retries
+/// let middleware = RetryLimitMiddleware::new(3);
+/// ```
 pub struct RetryLimitMiddleware {
     max_retries: u32,
 }
@@ -1665,6 +2790,15 @@ impl MessageMiddleware for RetryLimitMiddleware {
 }
 
 /// Rate limiting middleware - enforces message rate limits
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::RateLimitingMiddleware;
+///
+/// // Limit to 100 messages per second
+/// let middleware = RateLimitingMiddleware::new(100.0);
+/// ```
 pub struct RateLimitingMiddleware {
     /// Maximum messages per second
     max_rate: f64,
@@ -1752,6 +2886,18 @@ impl MessageMiddleware for RateLimitingMiddleware {
 }
 
 /// Deduplication middleware - prevents duplicate message processing
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::DeduplicationMiddleware;
+///
+/// // Track up to 5000 message IDs
+/// let middleware = DeduplicationMiddleware::new(5000);
+///
+/// // Use default cache size (10,000)
+/// let default_middleware = DeduplicationMiddleware::with_default_cache();
+/// ```
 pub struct DeduplicationMiddleware {
     /// Recently seen message IDs
     seen_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
@@ -1823,6 +2969,20 @@ impl MessageMiddleware for DeduplicationMiddleware {
 }
 
 /// Compression middleware - compresses/decompresses message bodies
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "compression")]
+/// # {
+/// use celers_kombu::CompressionMiddleware;
+/// use celers_protocol::compression::CompressionType;
+///
+/// let middleware = CompressionMiddleware::new(CompressionType::Gzip)
+///     .with_min_size(2048)  // Only compress messages >= 2KB
+///     .with_level(6);       // Compression level 6
+/// # }
+/// ```
 #[cfg(feature = "compression")]
 pub struct CompressionMiddleware {
     /// Compressor instance
@@ -1892,6 +3052,18 @@ impl MessageMiddleware for CompressionMiddleware {
 }
 
 /// Signing middleware - signs/verifies message bodies using HMAC
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "signing")]
+/// # {
+/// use celers_kombu::SigningMiddleware;
+///
+/// let secret_key = b"my-secret-key";
+/// let middleware = SigningMiddleware::new(secret_key);
+/// # }
+/// ```
 #[cfg(feature = "signing")]
 pub struct SigningMiddleware {
     /// Message signer instance
@@ -1945,6 +3117,19 @@ impl MessageMiddleware for SigningMiddleware {
 }
 
 /// Encryption middleware - encrypts/decrypts message bodies using AES-256-GCM
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "encryption")]
+/// # {
+/// use celers_kombu::EncryptionMiddleware;
+///
+/// // 32-byte key for AES-256
+/// let key = [0u8; 32];
+/// let middleware = EncryptionMiddleware::new(&key).expect("valid key");
+/// # }
+/// ```
 #[cfg(feature = "encryption")]
 pub struct EncryptionMiddleware {
     /// Message encryptor instance
@@ -3488,5 +4673,358 @@ mod tests {
     fn test_deduplication_middleware_with_default_cache() {
         let middleware = DeduplicationMiddleware::with_default_cache();
         assert_eq!(middleware.name(), "deduplication");
+    }
+
+    // =============================================================================
+    // DLQ Tests
+    // =============================================================================
+
+    #[test]
+    fn test_dlq_config_new() {
+        let config = DlqConfig::new("failed_tasks".to_string());
+        assert_eq!(config.queue_name, "failed_tasks");
+        assert_eq!(config.max_retries, Some(3));
+        assert_eq!(config.ttl, None);
+        assert!(config.include_metadata);
+    }
+
+    #[test]
+    fn test_dlq_config_builders() {
+        let config = DlqConfig::new("dlq".to_string())
+            .with_max_retries(5)
+            .with_ttl(Duration::from_secs(3600))
+            .with_metadata(false);
+
+        assert_eq!(config.max_retries, Some(5));
+        assert_eq!(config.ttl, Some(Duration::from_secs(3600)));
+        assert!(!config.include_metadata);
+    }
+
+    #[test]
+    fn test_dlq_config_without_retry_limit() {
+        let config = DlqConfig::new("dlq".to_string()).without_retry_limit();
+        assert_eq!(config.max_retries, None);
+    }
+
+    #[test]
+    fn test_dlq_stats_is_empty() {
+        let stats = DlqStats::default();
+        assert!(stats.is_empty());
+        assert_eq!(stats.message_count, 0);
+        assert_eq!(stats.oldest_message_age_secs(), None);
+    }
+
+    #[test]
+    fn test_dlq_stats_oldest_age() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let stats = DlqStats {
+            message_count: 5,
+            by_reason: HashMap::new(),
+            oldest_message_time: Some(now - 100),
+            newest_message_time: Some(now),
+        };
+
+        assert!(!stats.is_empty());
+        assert_eq!(stats.message_count, 5);
+
+        // Age should be approximately 100 seconds (with small tolerance)
+        let age = stats.oldest_message_age_secs().unwrap();
+        assert!(age >= 99 && age <= 101);
+    }
+
+    #[test]
+    fn test_dlq_stats_by_reason() {
+        let mut by_reason = HashMap::new();
+        by_reason.insert("timeout".to_string(), 3);
+        by_reason.insert("serialization_error".to_string(), 2);
+
+        let stats = DlqStats {
+            message_count: 5,
+            by_reason,
+            oldest_message_time: None,
+            newest_message_time: None,
+        };
+
+        assert_eq!(stats.message_count, 5);
+        assert_eq!(stats.by_reason.get("timeout"), Some(&3));
+        assert_eq!(stats.by_reason.get("serialization_error"), Some(&2));
+    }
+
+    // =============================================================================
+    // Transaction Tests
+    // =============================================================================
+
+    #[test]
+    fn test_isolation_level_variants() {
+        let _read_uncommitted = IsolationLevel::ReadUncommitted;
+        let _read_committed = IsolationLevel::ReadCommitted;
+        let _repeatable_read = IsolationLevel::RepeatableRead;
+        let _serializable = IsolationLevel::Serializable;
+    }
+
+    #[test]
+    fn test_transaction_state_variants() {
+        let active = TransactionState::Active;
+        let committed = TransactionState::Committed;
+        let rolled_back = TransactionState::RolledBack;
+
+        assert_eq!(active, TransactionState::Active);
+        assert_eq!(committed, TransactionState::Committed);
+        assert_eq!(rolled_back, TransactionState::RolledBack);
+        assert_ne!(active, committed);
+    }
+
+    #[test]
+    fn test_isolation_level_equality() {
+        assert_eq!(IsolationLevel::ReadCommitted, IsolationLevel::ReadCommitted);
+        assert_ne!(IsolationLevel::ReadCommitted, IsolationLevel::Serializable);
+    }
+
+    // =============================================================================
+    // Scheduling Tests
+    // =============================================================================
+
+    #[test]
+    fn test_schedule_config_delay() {
+        let schedule = ScheduleConfig::delay(Duration::from_secs(30));
+        assert_eq!(schedule.delay, Some(Duration::from_secs(30)));
+        assert!(schedule.scheduled_at.is_none());
+        assert!(schedule.delivery_time().is_some());
+    }
+
+    #[test]
+    fn test_schedule_config_at_timestamp() {
+        let timestamp = 1700000000;
+        let schedule = ScheduleConfig::at(timestamp);
+        assert!(schedule.delay.is_none());
+        assert_eq!(schedule.scheduled_at, Some(timestamp));
+        assert_eq!(schedule.delivery_time(), Some(timestamp));
+    }
+
+    #[test]
+    fn test_schedule_config_with_window() {
+        let schedule =
+            ScheduleConfig::delay(Duration::from_secs(60)).with_window(Duration::from_secs(10));
+        assert_eq!(schedule.execution_window, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn test_schedule_config_is_ready() {
+        // Past timestamp should be ready
+        let past_schedule = ScheduleConfig::at(0);
+        assert!(past_schedule.is_ready());
+
+        // Future timestamp (year 2100) should not be ready
+        let future_schedule = ScheduleConfig::at(4102444800);
+        assert!(!future_schedule.is_ready());
+    }
+
+    // =============================================================================
+    // Consumer Group Tests
+    // =============================================================================
+
+    #[test]
+    fn test_consumer_group_config_new() {
+        let config = ConsumerGroupConfig::new("group1".to_string(), "consumer1".to_string());
+        assert_eq!(config.group_id, "group1");
+        assert_eq!(config.consumer_id, "consumer1");
+        assert_eq!(config.max_consumers, None);
+        assert_eq!(config.rebalance_timeout, Duration::from_secs(30));
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_consumer_group_config_builders() {
+        let config = ConsumerGroupConfig::new("group1".to_string(), "consumer1".to_string())
+            .with_max_consumers(5)
+            .with_rebalance_timeout(Duration::from_secs(60))
+            .with_heartbeat_interval(Duration::from_secs(5));
+
+        assert_eq!(config.max_consumers, Some(5));
+        assert_eq!(config.rebalance_timeout, Duration::from_secs(60));
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
+    }
+
+    // =============================================================================
+    // Replay Tests
+    // =============================================================================
+
+    #[test]
+    fn test_replay_config_from_duration() {
+        let config = ReplayConfig::from_duration(Duration::from_secs(3600));
+        assert_eq!(config.from_duration, Some(Duration::from_secs(3600)));
+        assert!(config.from_timestamp.is_none());
+        assert_eq!(config.speed_multiplier, 1.0);
+    }
+
+    #[test]
+    fn test_replay_config_from_timestamp() {
+        let timestamp = 1699999999;
+        let config = ReplayConfig::from_timestamp(timestamp);
+        assert!(config.from_duration.is_none());
+        assert_eq!(config.from_timestamp, Some(timestamp));
+    }
+
+    #[test]
+    fn test_replay_config_builders() {
+        let config = ReplayConfig::from_duration(Duration::from_secs(3600))
+            .until(1700000000)
+            .with_max_messages(1000)
+            .with_speed(2.0);
+
+        assert_eq!(config.until_timestamp, Some(1700000000));
+        assert_eq!(config.max_messages, Some(1000));
+        assert_eq!(config.speed_multiplier, 2.0);
+    }
+
+    #[test]
+    fn test_replay_config_start_timestamp() {
+        let timestamp = 1699999999;
+        let config = ReplayConfig::from_timestamp(timestamp);
+        assert_eq!(config.start_timestamp(), timestamp);
+
+        // Duration-based should calculate from now
+        let duration_config = ReplayConfig::from_duration(Duration::from_secs(3600));
+        let start_ts = duration_config.start_timestamp();
+        assert!(start_ts > 0);
+    }
+
+    #[test]
+    fn test_replay_progress_completion_percent() {
+        let progress = ReplayProgress {
+            replay_id: "replay-1".to_string(),
+            messages_replayed: 50,
+            total_messages: Some(100),
+            current_timestamp: 1700000000,
+            completed: false,
+        };
+
+        assert_eq!(progress.completion_percent(), Some(50.0));
+
+        // Test with no total
+        let progress_no_total = ReplayProgress {
+            replay_id: "replay-2".to_string(),
+            messages_replayed: 50,
+            total_messages: None,
+            current_timestamp: 1700000000,
+            completed: false,
+        };
+
+        assert_eq!(progress_no_total.completion_percent(), None);
+    }
+
+    // =============================================================================
+    // Quota Tests
+    // =============================================================================
+
+    #[test]
+    fn test_quota_config_new() {
+        let quota = QuotaConfig::new();
+        assert!(quota.max_messages.is_none());
+        assert!(quota.max_bytes.is_none());
+        assert!(quota.max_rate_per_sec.is_none());
+        assert_eq!(quota.enforcement, QuotaEnforcement::Reject);
+    }
+
+    #[test]
+    fn test_quota_config_builders() {
+        let quota = QuotaConfig::new()
+            .with_max_messages(10000)
+            .with_max_bytes(1024 * 1024)
+            .with_max_rate(100.0)
+            .with_max_per_consumer(100)
+            .with_enforcement(QuotaEnforcement::Throttle);
+
+        assert_eq!(quota.max_messages, Some(10000));
+        assert_eq!(quota.max_bytes, Some(1024 * 1024));
+        assert_eq!(quota.max_rate_per_sec, Some(100.0));
+        assert_eq!(quota.max_messages_per_consumer, Some(100));
+        assert_eq!(quota.enforcement, QuotaEnforcement::Throttle);
+    }
+
+    #[test]
+    fn test_quota_config_default() {
+        let quota = QuotaConfig::default();
+        assert!(quota.max_messages.is_none());
+        assert_eq!(quota.enforcement, QuotaEnforcement::Reject);
+    }
+
+    #[test]
+    fn test_quota_enforcement_variants() {
+        let _reject = QuotaEnforcement::Reject;
+        let _throttle = QuotaEnforcement::Throttle;
+        let _warn = QuotaEnforcement::Warn;
+
+        assert_eq!(QuotaEnforcement::Reject, QuotaEnforcement::Reject);
+        assert_ne!(QuotaEnforcement::Reject, QuotaEnforcement::Throttle);
+    }
+
+    #[test]
+    fn test_quota_usage_default() {
+        let usage = QuotaUsage::default();
+        assert_eq!(usage.message_count, 0);
+        assert_eq!(usage.bytes_used, 0);
+        assert_eq!(usage.current_rate, 0.0);
+        assert!(!usage.exceeded);
+    }
+
+    #[test]
+    fn test_quota_usage_is_exceeded() {
+        let config = QuotaConfig::new()
+            .with_max_messages(100)
+            .with_max_bytes(1000)
+            .with_max_rate(10.0);
+
+        let usage = QuotaUsage {
+            message_count: 150,
+            bytes_used: 1500,
+            current_rate: 15.0,
+            exceeded: true,
+        };
+
+        assert!(usage.is_message_quota_exceeded(&config));
+        assert!(usage.is_bytes_quota_exceeded(&config));
+        assert!(usage.is_rate_quota_exceeded(&config));
+    }
+
+    #[test]
+    fn test_quota_usage_not_exceeded() {
+        let config = QuotaConfig::new()
+            .with_max_messages(100)
+            .with_max_bytes(1000)
+            .with_max_rate(10.0);
+
+        let usage = QuotaUsage {
+            message_count: 50,
+            bytes_used: 500,
+            current_rate: 5.0,
+            exceeded: false,
+        };
+
+        assert!(!usage.is_message_quota_exceeded(&config));
+        assert!(!usage.is_bytes_quota_exceeded(&config));
+        assert!(!usage.is_rate_quota_exceeded(&config));
+    }
+
+    #[test]
+    fn test_quota_usage_percent() {
+        let config = QuotaConfig::new().with_max_messages(100);
+
+        let usage = QuotaUsage {
+            message_count: 75,
+            bytes_used: 0,
+            current_rate: 0.0,
+            exceeded: false,
+        };
+
+        assert_eq!(usage.usage_percent(&config), Some(75.0));
+
+        // Test with no max
+        let no_max_config = QuotaConfig::new();
+        assert_eq!(usage.usage_percent(&no_max_config), None);
     }
 }

@@ -159,13 +159,52 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 - [x] **Backup/Restore Documentation** - Complete disaster recovery guide
 - [x] **Integration Tests** - 13 comprehensive integration tests
 - [x] **Concurrency Tests** - SKIP LOCKED behavior verification
+- [x] **Performance Benchmarks** - Criterion-based benchmarks for all core operations (benches/broker_benchmark.rs)
+- [x] **Benchmark Documentation** - Comprehensive guide for running and interpreting benchmarks (benches/README.md)
+- [x] **Table Partitioning Guide** - Comprehensive documentation for partitioning strategies (migrations/004_partitioning_guide.sql)
+- [x] **UUID Optimization Guide** - CHAR(36) vs BINARY(16) analysis and migration guide (migrations/005_uuid_optimization.sql)
+- [x] **Worker Pool Example** - Production-ready worker pool implementation with health monitoring and graceful shutdown (examples/worker_pool.rs)
+- [x] **Task Producer Example** - Comprehensive task enqueueing examples with different patterns (examples/task_producer.rs)
+- [x] **Examples Documentation** - Complete guide for using the examples with troubleshooting and best practices (examples/README.md)
+- [x] **Enhanced Batch Operations** - `cancel_batch()` for bulk task cancellation (2025-12-04)
+- [x] **Worker Statistics** - `get_worker_statistics()` and `get_all_worker_statistics()` for per-worker monitoring (2025-12-04)
+- [x] **Quick State Counting** - `count_by_state_quick()` for lightweight state queries (2025-12-04)
+- [x] **Task Age Distribution** - `get_task_age_distribution()` for queue health monitoring with age buckets (2025-12-04)
+- [x] **Retry Statistics** - `get_retry_statistics()` for analyzing task failure patterns (2025-12-04)
+- [x] **Active Workers List** - `list_active_workers()` for discovering all active workers (2025-12-04)
+- [x] **Queue Health Summary** - `get_queue_health()` for comprehensive health assessment with status (healthy/degraded/critical) (2025-12-04)
+- [x] **Task Throughput Metrics** - `get_task_throughput()` for calculating tasks per second and completion rates (2025-12-04)
+- [x] **Worker Task Recovery** - `requeue_stuck_tasks_by_worker()` for recovering tasks from crashed/stuck workers (2025-12-04)
+- [x] **Transaction Support** - `with_transaction()` for executing multi-step operations atomically (2025-12-05)
+- [x] **Metadata Query Support** - `query_tasks_by_metadata()` for searching tasks by JSON metadata fields (2025-12-05)
+- [x] **Task Deduplication** - `enqueue_deduplicated()` for preventing duplicate tasks based on custom keys (2025-12-05)
+- [x] **Batch State Updates** - `update_batch_state()` for updating multiple task states atomically (2025-12-05)
+- [x] **Queue Capacity Management** - `has_capacity()` and `enqueue_with_capacity()` for backpressure control (2025-12-05)
+- [x] **Task TTL/Expiration** - `expire_pending_tasks()` for expiring stale pending tasks (2025-12-05)
+- [x] **Flexible Task Deletion** - `delete_tasks_by_criteria()` for bulk deletion by state and age (2025-12-05)
+- [x] **Metadata Updates** - `update_task_metadata()` for updating JSON metadata fields (2025-12-05)
+- [x] **Date Range Search** - `search_tasks_by_date_range()` for finding tasks within time windows (2025-12-05)
+- [x] **DLQ Statistics** - `get_dlq_statistics()` for comprehensive DLQ metrics and analysis (2025-12-05)
+- [x] **Task Timeout Recovery** - `recover_timed_out_tasks()` for recovering hung/crashed task processing (2025-12-05)
+- [x] **DLQ Retention Policy** - `apply_dlq_retention()` for automatic cleanup of old DLQ entries (2025-12-07)
+- [x] **Adaptive Batch Sizing** - `get_optimal_batch_size()` for dynamic batch size optimization based on queue depth (2025-12-07)
+- [x] **Enhanced Pool Health** - `get_pool_health()` for detailed connection pool monitoring with utilization metrics (2025-12-07)
+- [x] **Payload Compression** - Built-in compression/decompression functions for large task payloads using DEFLATE (2025-12-07)
+- [x] **Vacuum Analyze** - `vacuum_analyze()` for comprehensive table optimization and statistics updates (2025-12-07)
+- [x] **Slow Query Monitoring** - `get_slow_queries()` for identifying performance bottlenecks from performance_schema (2025-12-07)
+- [x] **Task Priority Aging** - `apply_priority_aging()` to prevent task starvation by boosting priority of old pending tasks (2025-12-07)
+- [x] **Task Progress Tracking** - `update_task_progress()` and `get_task_progress()` for long-running task monitoring (2025-12-07)
+- [x] **Rate Limiting** - `check_rate_limit()` for controlling task execution rates per task type (2025-12-07)
+- [x] **Time-Windowed Deduplication** - `enqueue_deduplicated_window()` for preventing duplicates within time windows (2025-12-07)
+- [x] **Cascade Cancellation** - `cancel_cascade()` for cancelling tasks and all their dependents (2025-12-07)
+- [x] **Circuit Breaker Support** - Data structures for circuit breaker pattern (CircuitBreakerState, CircuitBreakerStats) (2025-12-07)
 
 ## Future Enhancements
 
 ### Performance
-- [ ] Table partitioning for large queues (by created_at)
+- [x] Table partitioning for large queues (by created_at) (COMPLETED - documented in 004_partitioning_guide.sql)
 - [x] Query optimization with EXPLAIN ANALYZE (COMPLETED)
-- [ ] Consider BINARY(16) for UUIDs instead of CHAR(36)
+- [x] Consider BINARY(16) for UUIDs instead of CHAR(36) (COMPLETED - documented in 005_uuid_optimization.sql)
 
 ### Advanced Features
 - [x] Task scheduling/delayed execution (COMPLETED)
@@ -211,7 +250,7 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 - [x] Concurrency tests (FOR UPDATE SKIP LOCKED) (COMPLETED)
   - [x] Concurrent dequeue test
   - [x] SKIP LOCKED behavior test
-- [ ] Performance benchmarks vs PostgreSQL
+- [x] Performance benchmarks vs PostgreSQL (COMPLETED - benches/broker_benchmark.rs)
 - [x] Migration testing (COMPLETED)
 
 ## Documentation
@@ -369,6 +408,112 @@ get_performance_metrics() -> PerformanceMetrics
 is_ready() -> bool
 get_server_variables() -> HashMap<String, String>
 // Monitor connection pool, query performance, and server config
+```
+
+### NEW: Enhanced Batch and Monitoring Operations (2025-12-04)
+```rust
+cancel_batch(task_ids: &[TaskId]) -> u64
+// Cancel multiple tasks atomically (more efficient than individual cancel calls)
+
+get_worker_statistics(worker_id: &str) -> WorkerStatistics
+get_all_worker_statistics() -> Vec<WorkerStatistics>
+list_active_workers() -> Vec<String>
+// Detailed per-worker monitoring and statistics
+
+count_by_state_quick(state: DbTaskState) -> i64
+// Lightweight state counting without full statistics overhead
+
+get_task_age_distribution() -> Vec<TaskAgeDistribution>
+// Task age buckets for queue health monitoring (< 1min, 1-5min, 5-15min, 15-60min, > 60min)
+
+get_retry_statistics() -> Vec<RetryStatistics>
+// Analyze task failure patterns and retry behavior by task type
+
+get_queue_health() -> QueueHealth
+// Comprehensive queue health summary with status (healthy/degraded/critical)
+
+get_task_throughput() -> TaskThroughput
+// Task completion and failure rates (per minute, per hour, per second)
+
+requeue_stuck_tasks_by_worker(worker_id: &str) -> u64
+// Recover tasks from a crashed or stuck worker
+```
+
+### NEW: Advanced Operations (2025-12-05)
+```rust
+with_transaction<F, T, Fut>(f: F) -> Result<T>
+// Execute multiple operations within a single transaction atomically
+
+query_tasks_by_metadata(json_path: &str, value: &str, limit: i64, offset: i64) -> Vec<TaskInfo>
+// Query tasks by metadata JSON field using MySQL JSON functions
+
+enqueue_deduplicated(task: SerializedTask, dedup_key: &str) -> TaskId
+// Enqueue task with deduplication - prevents duplicate tasks based on custom key
+// Returns existing task ID if duplicate found, or new task ID if enqueued
+
+update_batch_state(task_ids: &[TaskId], new_state: DbTaskState) -> u64
+// Update state for multiple tasks atomically (more efficient than individual updates)
+
+has_capacity(max_size: i64) -> bool
+// Check if queue has capacity for more tasks (backpressure control)
+
+enqueue_with_capacity(task: SerializedTask, max_size: i64) -> TaskId
+// Enqueue task only if queue has capacity, returns error if queue is full
+
+expire_pending_tasks(ttl: Duration) -> u64
+// Expire and cancel pending tasks older than TTL (prevents stale task processing)
+
+delete_tasks_by_criteria(state: Option<DbTaskState>, older_than: Duration) -> u64
+// Bulk delete tasks by state and age (flexible cleanup beyond existing purge methods)
+
+update_task_metadata(task_id: &TaskId, json_path: &str, value: &str) -> bool
+// Update specific JSON metadata fields without changing task state
+
+search_tasks_by_date_range(from: DateTime<Utc>, to: DateTime<Utc>, state: Option<DbTaskState>, limit: i64, offset: i64) -> Vec<TaskInfo>
+// Find tasks within specific time windows for analysis and time-based cleanup
+
+get_dlq_statistics() -> DlqStatistics
+// Comprehensive DLQ metrics including total count, counts by task name, avg/max retries
+
+recover_timed_out_tasks(timeout: Duration) -> u64
+// Detect and requeue tasks stuck in processing state beyond timeout threshold
+```
+
+### NEW: Production Optimizations (2025-12-07)
+```rust
+apply_dlq_retention(retention_period: Duration) -> u64
+// Automatically cleanup old DLQ entries based on retention policy
+
+get_optimal_batch_size(max_batch_size: Option<i64>) -> i64
+// Calculate optimal batch size based on current queue depth and load
+// Adaptive sizing: small batches for low load, large batches for high load
+
+get_pool_health() -> ConnectionDiagnostics
+// Enhanced connection pool health monitoring with utilization metrics
+
+vacuum_analyze() -> u64
+// Run OPTIMIZE TABLE + ANALYZE TABLE on all CeleRS tables for performance
+
+get_slow_queries(limit: i64) -> Vec<SlowQueryInfo>
+// Identify slow queries from MySQL performance_schema for optimization
+
+apply_priority_aging(age_threshold_secs: i64, priority_boost: i32) -> u64
+// Prevent task starvation by increasing priority of old pending tasks
+
+update_task_progress(task_id: &TaskId, progress_percent: f64, current_step: Option<&str>) -> bool
+// Update progress for long-running tasks
+
+get_task_progress(task_id: &TaskId) -> Option<TaskProgress>
+// Get current progress information for a task
+
+check_rate_limit(task_name: &str, max_per_minute: i64) -> RateLimitStatus
+// Check if rate limit is exceeded for a task type
+
+enqueue_deduplicated_window(task: SerializedTask, dedup_key: &str, window_secs: i64) -> TaskId
+// Enqueue with time-windowed deduplication (prevents duplicates within time window)
+
+cancel_cascade(task_id: &TaskId) -> u64
+// Cancel a task and all its dependent tasks (identified by parent_task_id in metadata)
 ```
 
 ## Schema Design

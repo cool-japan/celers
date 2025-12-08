@@ -2,9 +2,10 @@
 
 > Canvas workflow primitives for distributed task orchestration
 
-## Status: ✅ FEATURE COMPLETE
+## Status: ✅ ENHANCED - Production-Ready with Advanced Features
 
 All Canvas workflow primitives implemented and production-ready.
+Major enhancements added: cancellation, retry policies, timeouts, loops, state tracking, DAG export, error propagation control, sub-workflow isolation, workflow recovery/checkpointing, and workflow compilation/optimization framework.
 
 ## Completed Features
 
@@ -43,8 +44,31 @@ All Canvas workflow primitives implemented and production-ready.
   - [x] `with_link_error()` - Failure callback
 - [x] CanvasError utility methods
   - [x] `is_invalid()`, `is_broker()`, `is_serialization()` - Error type checks
+  - [x] `is_cancelled()`, `is_timeout()` - New error type checks
   - [x] `is_retryable()` - Retry decision logic
   - [x] `category()` - Error categorization for logging/metrics
+- [x] Workflow cancellation support (CancellationToken)
+- [x] Workflow-level retry policies (WorkflowRetryPolicy)
+- [x] Workflow-level timeout support (WorkflowTimeout, TimeoutEscalation)
+- [x] Workflow loops (ForEach, WhileLoop)
+- [x] Workflow state tracking (WorkflowState, WorkflowStatus)
+- [x] DAG export (DagExport trait for Chain, Group, Chord)
+- [x] Advanced result passing (NamedOutput, ResultTransform, AggregationStrategy)
+- [x] Result caching (ResultCache, CachePolicy)
+- [x] Workflow-level error handlers (WorkflowErrorHandler)
+- [x] Compensation workflows and Saga pattern (CompensationWorkflow, Saga, SagaIsolation)
+- [x] Advanced patterns (ScatterGather, Pipeline, FanOut, FanIn)
+- [x] Workflow validation (WorkflowValidator trait, ValidationResult)
+- [x] Loop control (LoopControl for break/continue)
+- [x] Error propagation control (ErrorPropagationMode, PartialFailureTracker)
+- [x] Sub-workflow isolation (IsolationLevel, SubWorkflowIsolation)
+- [x] Workflow checkpointing and recovery (WorkflowCheckpoint, WorkflowRecoveryPolicy)
+- [x] Workflow compilation/optimization framework (WorkflowCompiler, OptimizationPass)
+- [x] Type-safe result passing (TypedResult, TypeValidator)
+- [x] Data dependencies (TaskDependency, DependencyGraph with circular detection and topological sort)
+- [x] Parallel reduce (ParallelReduce for map-reduce)
+- [x] Workflow templates and parameterization (WorkflowTemplate, TemplateParameter)
+- [x] Event-driven workflows (WorkflowEvent, EventHandler, EventDrivenWorkflow)
 
 ### Integration ✅
 - [x] Broker integration (enqueue workflows)
@@ -54,58 +78,61 @@ All Canvas workflow primitives implemented and production-ready.
 ## Future Enhancements
 
 ### Advanced Workflows
-- [ ] Nested workflows (Chain of Groups, etc.)
-  - [ ] Deep nesting support (unlimited depth)
-  - [ ] Workflow composition patterns
-  - [ ] Sub-workflow isolation
-- [ ] Workflow cancellation
-  - [ ] Cancel entire workflow tree
-  - [ ] Cancel individual branches
-  - [ ] Cancellation propagation
-- [ ] Workflow retry policies
-  - [ ] Retry entire workflow
-  - [ ] Retry failed branches only
-  - [ ] Exponential backoff for workflows
-- [ ] Workflow timeout support
-  - [ ] Global workflow timeout
-  - [ ] Per-stage timeout
-  - [ ] Timeout escalation
-- [ ] Conditional workflows (if/else)
-  - [ ] Conditional branches based on results
-  - [ ] Switch/case patterns
-  - [ ] Dynamic path selection
-- [ ] Workflow loops and iteration
-  - [ ] For-each loops over collections
-  - [ ] While loops with conditions
-  - [ ] Break and continue support
-- [ ] Workflow templates and macros
-  - [ ] Reusable workflow patterns
-  - [ ] Template parameterization
+- [x] Nested workflows (Chain of Groups, etc.)
+  - [x] Deep nesting support (unlimited depth)
+  - [x] Workflow composition patterns (CanvasElement)
+  - [x] Sub-workflow isolation (IsolationLevel, SubWorkflowIsolation)
+- [x] Workflow cancellation
+  - [x] Cancel entire workflow tree
+  - [x] Cancel individual branches
+  - [x] Cancellation propagation (CancellationToken)
+- [x] Workflow retry policies
+  - [x] Retry entire workflow
+  - [x] Retry failed branches only
+  - [x] Exponential backoff for workflows
+- [x] Workflow timeout support
+  - [x] Global workflow timeout
+  - [x] Per-stage timeout
+  - [x] Timeout escalation
+- [x] Conditional workflows (if/else)
+  - [x] Conditional branches based on results (Branch)
+  - [x] Switch/case patterns (Switch)
+  - [x] Dynamic path selection (Condition)
+- [x] Workflow loops and iteration
+  - [x] For-each loops over collections (ForEach)
+  - [x] While loops with conditions (WhileLoop)
+  - [x] Break and continue support (LoopControl)
+- [x] Workflow templates and macros
+  - [x] Reusable workflow patterns (WorkflowTemplate)
+  - [x] Template parameterization (TemplateParameter)
 
 ### State Management
-- [ ] Workflow progress tracking
-  - [ ] Real-time progress updates
-  - [ ] Progress percentage calculation
-  - [ ] Stage-level progress
-- [ ] Partial result retrieval
-  - [ ] Get intermediate results
-  - [ ] Stream results as they complete
-  - [ ] Result aggregation strategies
-- [ ] Workflow persistence
-  - [ ] Serialize workflow state
-  - [ ] Checkpoint/snapshot support
+- [x] Workflow progress tracking
+  - [x] Real-time progress updates (WorkflowState)
+  - [x] Progress percentage calculation
+  - [x] Stage-level progress
+- [x] Partial result retrieval
+  - [x] Get intermediate results
+  - [x] Stream results as they complete
+  - [x] Result aggregation strategies (AggregationStrategy - already implemented)
+- [x] Workflow persistence
+  - [x] Serialize workflow state (via Serde)
+  - [x] Checkpoint/snapshot support (WorkflowCheckpoint)
   - [ ] State versioning
-- [ ] Workflow recovery after crashes
-  - [ ] Resume from last checkpoint
-  - [ ] Replay failed stages
-  - [ ] Automatic recovery policies
+- [x] Workflow recovery after crashes
+  - [x] Resume from last checkpoint (WorkflowCheckpoint)
+  - [x] Replay failed stages (WorkflowRecoveryPolicy)
+  - [x] Automatic recovery policies (WorkflowRecoveryPolicy)
 
 ### Optimizations
-- [ ] Workflow compilation/optimization
-  - [ ] Static analysis and optimization
-  - [ ] Common subexpression elimination
-  - [ ] Dead code elimination
-- [ ] Parallel workflow scheduling
+- [x] Workflow compilation/optimization
+  - [x] Static analysis and optimization (WorkflowCompiler framework)
+  - [x] Common subexpression elimination (OptimizationPass)
+  - [x] Dead code elimination (OptimizationPass)
+  - [x] Task fusion (OptimizationPass)
+  - [x] Parallel scheduling optimization (OptimizationPass)
+  - [x] Resource optimization (OptimizationPass)
+- [ ] Parallel workflow scheduling (implementation)
   - [ ] Intelligent task distribution
   - [ ] Load balancing across workers
   - [ ] Resource-aware scheduling
@@ -114,62 +141,63 @@ All Canvas workflow primitives implemented and production-ready.
   - [ ] Shared resource optimization
 
 ### Monitoring
-- [ ] Workflow metrics
-  - [ ] Execution time per stage
-  - [ ] Success/failure rates
+- [x] Workflow metrics
+  - [x] Execution time per stage (WorkflowState timestamps)
+  - [x] Success/failure rates (WorkflowState counters)
   - [ ] Resource utilization
 - [ ] Workflow visualization
   - [ ] Real-time workflow graphs
   - [ ] Interactive DAG viewer
   - [ ] Execution animation
-- [ ] Workflow DAG export
-  - [ ] GraphViz format (.dot)
-  - [ ] Mermaid format (.mmd)
-  - [ ] JSON representation
+- [x] Workflow DAG export
+  - [x] GraphViz format (.dot) - DagExport trait
+  - [x] Mermaid format (.mmd) - DagExport trait
+  - [x] JSON representation - DagExport trait
   - [ ] PNG/SVG rendering
 
 ### Data Flow & Passing
-- [ ] Advanced result passing
-  - [ ] Named result outputs
-  - [ ] Result transformation pipelines
-  - [ ] Type-safe result passing
-- [ ] Data dependencies
-  - [ ] Explicit dependency declaration
-  - [ ] Automatic dependency resolution
-  - [ ] Circular dependency detection
-- [ ] Result caching
-  - [ ] Memoization of expensive tasks
-  - [ ] Cache invalidation strategies
+- [x] Advanced result passing
+  - [x] Named result outputs (NamedOutput)
+  - [x] Result transformation pipelines (ResultTransform)
+  - [x] Aggregation strategies (AggregationStrategy)
+  - [x] Type-safe result passing (TypedResult, TypeValidator)
+- [x] Data dependencies
+  - [x] Explicit dependency declaration (TaskDependency)
+  - [x] Automatic dependency resolution (DependencyGraph::topological_sort)
+  - [x] Circular dependency detection (DependencyGraph::has_circular_dependency)
+- [x] Result caching
+  - [x] Memoization of expensive tasks (ResultCache)
+  - [x] Cache invalidation strategies (CachePolicy, TTL)
 
 ### Error Handling
-- [ ] Workflow-level error handlers
-  - [ ] Catch and handle errors
-  - [ ] Error recovery strategies
-  - [ ] Fallback workflows
-- [ ] Compensation workflows
-  - [ ] Saga pattern support
-  - [ ] Undo/rollback operations
-  - [ ] Transaction-like semantics
-- [ ] Error propagation control
-  - [ ] Stop on first error
-  - [ ] Continue on error
-  - [ ] Partial failure handling
+- [x] Workflow-level error handlers
+  - [x] Catch and handle errors (WorkflowErrorHandler)
+  - [x] Error recovery strategies
+  - [x] Fallback workflows (via ErrorStrategy)
+- [x] Compensation workflows
+  - [x] Saga pattern support (Saga, CompensationWorkflow)
+  - [x] Undo/rollback operations
+  - [x] Transaction-like semantics (SagaIsolation)
+- [x] Error propagation control
+  - [x] Stop on first error (ErrorPropagationMode::StopOnFirstError)
+  - [x] Continue on error (ErrorPropagationMode::ContinueOnError)
+  - [x] Partial failure handling (ErrorPropagationMode::PartialFailure, PartialFailureTracker)
 
 ### Advanced Patterns
-- [ ] Map-reduce improvements
-  - [ ] Custom reduce functions
-  - [ ] Parallel reduce
+- [x] Map-reduce improvements
+  - [x] Custom reduce functions (AggregationStrategy)
+  - [x] Parallel reduce (ParallelReduce)
   - [ ] Streaming map-reduce
-- [ ] Scatter-gather pattern
-- [ ] Pipeline pattern
-- [ ] Fan-out/fan-in pattern
-- [ ] Event-driven workflows
+- [x] Scatter-gather pattern (ScatterGather)
+- [x] Pipeline pattern (Pipeline with buffering)
+- [x] Fan-out/fan-in pattern (FanOut, FanIn)
+- [x] Event-driven workflows (WorkflowEvent, EventHandler, EventDrivenWorkflow)
 - [ ] Reactive workflows
 
 ### Debugging & Testing
-- [ ] Workflow dry-run mode
-  - [ ] Simulate without execution
-  - [ ] Validate workflow structure
+- [x] Workflow dry-run mode
+  - [x] Simulate without execution (WorkflowValidator trait)
+  - [x] Validate workflow structure (ValidationResult)
 - [ ] Workflow testing framework
   - [ ] Mock task implementations
   - [ ] Test data injection
@@ -179,7 +207,26 @@ All Canvas workflow primitives implemented and production-ready.
 
 ## Testing
 
-- [x] Unit tests for each primitive
+- [x] Unit tests for each primitive (68 comprehensive tests)
+  - [x] Basic workflow primitives
+  - [x] Cancellation, retry, timeout features
+  - [x] Loop constructs
+  - [x] State tracking
+  - [x] DAG export
+  - [x] Advanced result passing
+  - [x] Result caching
+  - [x] Error handlers and compensation
+  - [x] Advanced patterns
+  - [x] Workflow validation
+  - [x] Error propagation control
+  - [x] Sub-workflow isolation
+  - [x] Workflow checkpointing and recovery
+  - [x] Workflow compilation/optimization
+  - [x] Type-safe result passing
+  - [x] Data dependencies and circular detection
+  - [x] Parallel reduce
+  - [x] Workflow templates
+  - [x] Event-driven workflows
 - [ ] Integration tests with broker
 - [ ] Integration tests with backend
 - [ ] Chord barrier race condition tests

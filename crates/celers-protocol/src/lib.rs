@@ -60,7 +60,87 @@ pub mod zerocopy;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use uuid::Uuid;
+
+/// Validation errors for Celery protocol messages
+///
+/// # Examples
+///
+/// ```
+/// use celers_protocol::{Message, ValidationError};
+/// use uuid::Uuid;
+///
+/// // Create a message with an empty task name
+/// let msg = Message::new("".to_string(), Uuid::new_v4(), vec![1, 2, 3]);
+///
+/// // Validation will fail with a structured error
+/// match msg.validate() {
+///     Ok(_) => panic!("Should have failed"),
+///     Err(ValidationError::EmptyTaskName) => {
+///         println!("Task name cannot be empty");
+///     }
+///     Err(e) => panic!("Unexpected error: {}", e),
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationError {
+    /// Task name is empty
+    EmptyTaskName,
+    /// Retry count exceeds maximum
+    RetryLimitExceeded { retries: u32, max: u32 },
+    /// ETA is after expiration time
+    EtaAfterExpiration,
+    /// Invalid delivery mode (must be 1 or 2)
+    InvalidDeliveryMode { mode: u8 },
+    /// Invalid priority (must be 0-9)
+    InvalidPriority { priority: u8 },
+    /// Content type is empty
+    EmptyContentType,
+    /// Message body is empty
+    EmptyBody,
+    /// Message body exceeds size limit
+    BodyTooLarge { size: usize, max: usize },
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValidationError::EmptyTaskName => write!(f, "Task name cannot be empty"),
+            ValidationError::RetryLimitExceeded { retries, max } => {
+                write!(f, "Retries ({}) cannot exceed {}", retries, max)
+            }
+            ValidationError::EtaAfterExpiration => {
+                write!(f, "ETA cannot be after expiration time")
+            }
+            ValidationError::InvalidDeliveryMode { mode } => {
+                write!(
+                    f,
+                    "Invalid delivery mode ({}): must be 1 (non-persistent) or 2 (persistent)",
+                    mode
+                )
+            }
+            ValidationError::InvalidPriority { priority } => {
+                write!(
+                    f,
+                    "Invalid priority ({}): must be between 0 and 9",
+                    priority
+                )
+            }
+            ValidationError::EmptyContentType => write!(f, "Content type cannot be empty"),
+            ValidationError::EmptyBody => write!(f, "Message body cannot be empty"),
+            ValidationError::BodyTooLarge { size, max } => {
+                write!(
+                    f,
+                    "Message body too large: {} bytes (max {} bytes)",
+                    size, max
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
 
 /// Protocol version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -222,21 +302,21 @@ impl MessageHeaders {
     }
 
     /// Validate message headers
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         if self.task.is_empty() {
-            return Err("Task name cannot be empty".to_string());
+            return Err(ValidationError::EmptyTaskName);
         }
 
         if let Some(retries) = self.retries {
             if retries > 1000 {
-                return Err("Retries cannot exceed 1000".to_string());
+                return Err(ValidationError::RetryLimitExceeded { retries, max: 1000 });
             }
         }
 
         // Validate ETA and expiration relationship
         if let (Some(eta), Some(expires)) = (self.eta, self.expires) {
             if eta > expires {
-                return Err("ETA cannot be after expiration time".to_string());
+                return Err(ValidationError::EtaAfterExpiration);
             }
         }
 
@@ -281,14 +361,16 @@ impl Default for MessageProperties {
 
 impl MessageProperties {
     /// Validate message properties
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         if self.delivery_mode != 1 && self.delivery_mode != 2 {
-            return Err("Delivery mode must be 1 (non-persistent) or 2 (persistent)".to_string());
+            return Err(ValidationError::InvalidDeliveryMode {
+                mode: self.delivery_mode,
+            });
         }
 
         if let Some(priority) = self.priority {
             if priority > 9 {
-                return Err("Priority must be between 0 and 9".to_string());
+                return Err(ValidationError::InvalidPriority { priority });
             }
         }
 
@@ -399,7 +481,7 @@ impl Message {
     /// - Properties (delivery mode, priority)
     /// - Content type format
     /// - Body size
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         // Validate headers
         self.headers.validate()?;
 
@@ -408,44 +490,43 @@ impl Message {
 
         // Validate content type
         if self.content_type.is_empty() {
-            return Err("Content type cannot be empty".to_string());
+            return Err(ValidationError::EmptyContentType);
         }
 
         // Validate body
         if self.body.is_empty() {
-            return Err("Message body cannot be empty".to_string());
+            return Err(ValidationError::EmptyBody);
         }
 
         if self.body.len() > 10_485_760 {
             // 10MB limit
-            return Err(format!(
-                "Message body too large: {} bytes (max 10MB)",
-                self.body.len()
-            ));
+            return Err(ValidationError::BodyTooLarge {
+                size: self.body.len(),
+                max: 10_485_760,
+            });
         }
 
         Ok(())
     }
 
     /// Validate with custom body size limit
-    pub fn validate_with_limit(&self, max_body_bytes: usize) -> Result<(), String> {
+    pub fn validate_with_limit(&self, max_body_bytes: usize) -> Result<(), ValidationError> {
         self.headers.validate()?;
         self.properties.validate()?;
 
         if self.content_type.is_empty() {
-            return Err("Content type cannot be empty".to_string());
+            return Err(ValidationError::EmptyContentType);
         }
 
         if self.body.is_empty() {
-            return Err("Message body cannot be empty".to_string());
+            return Err(ValidationError::EmptyBody);
         }
 
         if self.body.len() > max_body_bytes {
-            return Err(format!(
-                "Message body too large: {} bytes (max {} bytes)",
-                self.body.len(),
-                max_body_bytes
-            ));
+            return Err(ValidationError::BodyTooLarge {
+                size: self.body.len(),
+                max: max_body_bytes,
+            });
         }
 
         Ok(())
@@ -613,7 +694,7 @@ mod tests {
         let headers = MessageHeaders::new("".to_string(), Uuid::new_v4());
         let result = headers.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Task name cannot be empty");
+        assert_eq!(result.unwrap_err(), ValidationError::EmptyTaskName);
     }
 
     #[test]
@@ -622,7 +703,13 @@ mod tests {
         headers.retries = Some(1001);
         let result = headers.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Retries cannot exceed 1000");
+        assert_eq!(
+            result.unwrap_err(),
+            ValidationError::RetryLimitExceeded {
+                retries: 1001,
+                max: 1000
+            }
+        );
     }
 
     #[test]
@@ -632,7 +719,7 @@ mod tests {
         headers.expires = Some(Utc::now() + chrono::Duration::hours(1));
         let result = headers.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "ETA cannot be after expiration time");
+        assert_eq!(result.unwrap_err(), ValidationError::EtaAfterExpiration);
     }
 
     #[test]
@@ -643,7 +730,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "Delivery mode must be 1 (non-persistent) or 2 (persistent)"
+            ValidationError::InvalidDeliveryMode { mode: 3 }
         );
     }
 
@@ -654,7 +741,10 @@ mod tests {
         props.priority = Some(10);
         let result = props.validate();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Priority must be between 0 and 9");
+        assert_eq!(
+            result.unwrap_err(),
+            ValidationError::InvalidPriority { priority: 10 }
+        );
     }
 
     #[test]

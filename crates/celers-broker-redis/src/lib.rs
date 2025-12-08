@@ -22,7 +22,10 @@ use celers_metrics::{
     DLQ_SIZE, PROCESSING_QUEUE_SIZE, QUEUE_SIZE, TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL,
 };
 
+pub mod advanced_queue;
+pub mod authorization;
 pub mod circuit_breaker;
+pub mod cluster;
 pub mod compression;
 pub mod connection;
 pub mod dedup;
@@ -31,14 +34,26 @@ pub mod health;
 pub mod integrity;
 pub mod lua_scripts;
 pub mod metrics_ext;
+pub mod partitioning;
 pub mod pool;
 pub mod queue_control;
 pub mod rate_limit;
 pub mod retry;
+pub mod sentinel;
+pub mod streams;
 pub mod visibility;
 
+pub use advanced_queue::{
+    AdvancedQueueManager, PriorityAgingConfig, PriorityAgingConfigBuilder, QueueWeight,
+    StarvationPrevention, StarvationStats, TaskAge, WeightedQueueSelector,
+};
+pub use authorization::{AuthorizationPolicy, UserPermissions};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
+};
+pub use cluster::{
+    ClusterConfig, ClusterConfigBuilder, ClusterNode, ClusterNodeRole, ClusterTopology, HashSlot,
+    RedisMode,
 };
 pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionStats, Compressor};
 pub use connection::{ConnectionStats, RedisConfig, TlsConfig};
@@ -51,6 +66,9 @@ pub use metrics_ext::{
     HistogramSnapshot, LatencyStats, MetricsSnapshot, MetricsTracker, SlowOperation,
     SlowOperationLogger, TaskAgeHistogram,
 };
+pub use partitioning::{
+    ConsistentHashRing, HashAlgorithm, PartitionManager, PartitionStats, PartitionStrategy,
+};
 pub use pool::{ConnectionPool, PoolConfig, PoolStats};
 pub use queue_control::{QueueController, QueueState};
 pub use rate_limit::{
@@ -58,6 +76,12 @@ pub use rate_limit::{
     TrackedRateLimiter,
 };
 pub use retry::{BackoffStrategy, RetryConfig, RetryExecutor, RetryResult};
+pub use sentinel::{
+    MasterAddress, SentinelClient, SentinelConfig, SentinelConfigBuilder, SentinelRole,
+};
+pub use streams::{
+    StreamConfig, StreamConfigBuilder, StreamEntry, StreamMessageId, StreamStats, StreamsClient,
+};
 use visibility::VisibilityManager;
 
 /// Queue mode for Redis broker
@@ -133,6 +157,29 @@ impl RedisBroker {
         let client = config.build_client()?;
 
         debug!("Created Redis broker with config: {}", config.describe());
+
+        Ok(Self {
+            client,
+            queue_name: queue_name.to_string(),
+            processing_queue: format!("{}:processing", queue_name),
+            dlq_name: format!("{}:dlq", queue_name),
+            delayed_queue: format!("{}:delayed", queue_name),
+            cancel_channel: format!("{}:cancel", queue_name),
+            mode,
+            visibility_manager: VisibilityManager::new(),
+            visibility_timeout_secs: 300, // 5 minutes default
+        })
+    }
+
+    /// Create a new Redis broker from a SentinelClient (for high availability)
+    pub async fn from_sentinel(
+        sentinel: &SentinelClient,
+        queue_name: &str,
+        mode: QueueMode,
+    ) -> Result<Self> {
+        let client = sentinel.get_client().await?;
+
+        info!("Created Redis broker with Sentinel support");
 
         Ok(Self {
             client,
@@ -310,6 +357,15 @@ impl RedisBroker {
     /// Create a script manager for Lua script optimization
     pub fn script_manager(&self) -> ScriptManager {
         ScriptManager::new(self.client.clone())
+    }
+
+    /// Create a partition manager for distributed queues
+    pub fn partition_manager(
+        &self,
+        num_partitions: usize,
+        strategy: PartitionStrategy,
+    ) -> PartitionManager {
+        PartitionManager::new(num_partitions, strategy, &self.queue_name)
     }
 
     /// Set TTL (time-to-live) for tasks in all queues

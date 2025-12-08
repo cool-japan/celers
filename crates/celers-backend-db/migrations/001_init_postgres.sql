@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS celers_chord_state (
     completed INTEGER NOT NULL DEFAULT 0,
     callback TEXT,
     task_ids JSONB NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    timeout_seconds BIGINT,
+    cancelled BOOLEAN NOT NULL DEFAULT FALSE,
+    cancellation_reason TEXT
 );
 
 -- Indexes for performance

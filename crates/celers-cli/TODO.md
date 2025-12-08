@@ -75,33 +75,56 @@ Full-featured CLI for worker management, queue inspection, and DLQ operations.
   - [x] Metric filtering by name pattern
   - [x] Export to JSON/Prometheus/text formats
   - [x] Save metrics to file
-  - [ ] Real-time metrics refresh with auto-update
+  - [x] Real-time metrics refresh with auto-update ✅
+    - [x] Watch mode with configurable refresh interval
+    - [x] Clear screen for better readability
+    - [x] Display last updated timestamp
 - [x] `task cancel <id>` - Cancel running task ✅
 - [x] `task retry <id>` - Retry failed task ✅
 - [x] `task result <id>` - Show task result ✅
-- [ ] `task logs <id>` - Show task execution logs
+- [x] `task logs <id>` - Show task execution logs ✅
+  - [x] Display structured JSON logs with color coding
+  - [x] Support for log levels (ERROR, WARN, INFO, DEBUG)
+  - [x] Limit number of log lines shown
+  - [x] Timestamp display
 - [x] `task requeue <id>` - Move task to different queue ✅
 
-### Worker Management
-- [ ] `worker list` - Show all running workers
-  - [ ] Show worker status (active, idle, draining)
-  - [ ] Display task counts and resources
-- [ ] `worker stop <id>` - Stop specific worker
-  - [ ] Graceful shutdown option
-  - [ ] Drain before stop
-- [ ] `worker scale <n>` - Scale to N workers
+### Worker Management ✅
+- [x] `worker-mgmt list` - Show all running workers ✅
+  - [x] Show worker status (active)
+  - [x] Display last heartbeat
+- [x] `worker-mgmt stop <id>` - Stop specific worker ✅
+  - [x] Graceful shutdown option
+  - [x] Immediate shutdown option
+  - [x] Pub/Sub command delivery
+- [x] `worker-mgmt scale <n>` - Scale to N workers ✅
+  - [x] Display current vs target worker count
+  - [x] Instructions for scaling up/down
   - [ ] Auto-scaling based on queue depth
-- [ ] `worker logs` - Stream worker logs
-  - [ ] Filter by log level
-  - [ ] Follow mode (tail -f)
-- [ ] `worker stats <id>` - Detailed worker statistics
-- [ ] `worker pause <id>` - Pause task processing
-- [ ] `worker resume <id>` - Resume task processing
-- [ ] `worker drain <id>` - Drain worker (no new tasks)
+- [x] `worker-mgmt logs <id>` - Stream worker logs ✅
+  - [x] Filter by log level (error, warn, info, debug)
+  - [x] Follow mode (tail -f)
+  - [x] Display initial N lines
+  - [x] Color-coded log levels
+  - [x] JSON log parsing
+  - [x] Detect worker shutdown
+- [x] `worker-mgmt stats <id>` - Detailed worker statistics ✅
+  - [x] Tasks processed/failed
+  - [x] Worker uptime
+  - [x] Heartbeat status
+- [x] `worker-mgmt pause <id>` - Pause task processing ✅
+  - [x] Set pause flag in Redis
+  - [x] Timestamp tracking
+- [x] `worker-mgmt resume <id>` - Resume task processing ✅
+  - [x] Remove pause flag
+  - [x] Restore normal operation
+- [x] `worker-mgmt drain <id>` - Drain worker (no new tasks) ✅
+  - [x] Set draining flag in Redis
+  - [x] Timestamp tracking
 
 ### Queue Management Enhancements
-- [ ] `queue pause <name>` - Pause queue processing
-- [ ] `queue resume <name>` - Resume queue processing
+- [x] `queue pause <name>` - Pause queue processing ✅
+- [x] `queue resume <name>` - Resume queue processing ✅
 - [x] `queue stats <name>` - Detailed queue statistics ✅
   - [x] Queue type detection (FIFO/Priority)
   - [x] Pending, processing, DLQ, and delayed task counts
@@ -125,20 +148,40 @@ Full-featured CLI for worker management, queue inspection, and DLQ operations.
   - [x] Queue type conversion support
   - [x] Confirmation requirement for safety
 
-### Scheduling & Beat
-- [ ] `schedule list` - List scheduled tasks
-- [ ] `schedule add` - Add new scheduled task
-- [ ] `schedule remove <name>` - Remove scheduled task
-- [ ] `schedule pause <name>` - Pause schedule
-- [ ] `schedule trigger <name>` - Manually trigger task
-- [ ] `schedule history <name>` - Show execution history
+### Scheduling & Beat ✅
+- [x] `schedule list` - List scheduled tasks ✅
+  - [x] Display task name, cron expression, status (active/paused)
+  - [x] Show last run time
+  - [x] Formatted table output
+- [x] `schedule add` - Add new scheduled task ✅
+  - [x] Cron expression validation
+  - [x] Task name and queue configuration
+  - [x] JSON arguments support
+  - [x] Duplicate schedule detection
+- [x] `schedule remove <name>` - Remove scheduled task ✅
+  - [x] Confirmation requirement
+  - [x] Remove pause flags
+- [x] `schedule pause <name>` - Pause schedule ✅
+  - [x] Timestamp tracking
+  - [x] Resume instructions
+- [x] `schedule resume <name>` - Resume paused schedule ✅
+  - [x] Pause status checking
+  - [x] Resume confirmation
+- [x] `schedule trigger <name>` - Manually trigger task ✅
+  - [x] Pub/Sub trigger command
+  - [x] Beat scheduler integration
+  - [x] Subscriber status reporting
+- [x] `schedule history <name>` - Show execution history ✅
+  - [x] Display execution history from Redis
+  - [x] Show timestamp, status, and task ID
+  - [x] Limit number of entries shown
 
 ### Configuration
 - [ ] Multiple broker support in single config
   - [ ] Broker failover configuration
-- [ ] Environment variable expansion
-  - [ ] ${VAR} syntax support
-  - [ ] Default values
+- [x] Environment variable expansion ✅
+  - [x] ${VAR} syntax support
+  - [x] ${VAR:default} default values support
 - [x] Config validation command ✅
   - [x] Schema validation (TOML parsing)
   - [x] Broker type validation
@@ -178,31 +221,84 @@ Full-featured CLI for worker management, queue inspection, and DLQ operations.
   - [ ] Latency measurement
   - [ ] Authentication verification
 
-### Debugging & Troubleshooting
-- [ ] `debug task <id>` - Debug task execution
-- [ ] `debug worker <id>` - Debug worker issues
-- [ ] `health check` - System health diagnostics
-- [ ] `doctor` - Automatic problem detection
+### Debugging & Troubleshooting ✅
+- [x] `debug task <id>` - Debug task execution ✅
+  - [x] Display task logs with color-coded levels
+  - [x] Show task metadata
+  - [x] Inspect task state in queue
+- [x] `debug worker <id>` - Debug worker issues ✅
+  - [x] Check worker heartbeat and status
+  - [x] Display worker statistics
+  - [x] Show pause/drain status
+  - [x] Display recent worker logs
+- [x] `health` - System health diagnostics ✅
+  - [x] Broker connection testing
+  - [x] Queue status checks
+  - [x] DLQ size monitoring
+  - [x] Queue pause status detection
+  - [x] Memory usage reporting
+  - [x] Health recommendations
+- [x] `doctor` - Automatic problem detection ✅
+  - [x] Broker connectivity checks
+  - [x] Queue health analysis
+  - [x] Worker availability monitoring
+  - [x] Queue pause status detection
+  - [x] Memory usage inspection
+  - [x] Issue prioritization (critical vs warnings)
+  - [x] Actionable recommendations
 
-### Reporting & Analytics
-- [ ] `report daily` - Daily execution report
-- [ ] `report weekly` - Weekly statistics
-- [ ] `analyze bottlenecks` - Find performance issues
-- [ ] `analyze failures` - Analyze failure patterns
+### Reporting & Analytics ✅
+- [x] `report daily` - Daily execution report ✅
+  - [x] Display daily task metrics
+  - [x] Show total tasks, succeeded, failed, retried
+  - [x] Calculate average execution time
+- [x] `report weekly` - Weekly statistics ✅
+  - [x] Aggregate daily metrics for 7 days
+  - [x] Calculate success and failure rates
+  - [x] Display percentage breakdowns
+- [x] `analyze bottlenecks` - Find performance issues ✅
+  - [x] Check queue depth and worker count
+  - [x] Detect high DLQ size
+  - [x] Identify bottlenecks
+  - [x] Provide actionable recommendations
+- [x] `analyze failures` - Analyze failure patterns ✅
+  - [x] Group failures by task type
+  - [x] Display top failing tasks
+  - [x] Provide troubleshooting recommendations
 
 ## Testing Status
 
-- [ ] Unit tests for command logic
+- [x] Unit tests for configuration parsing ✅
+  - [x] Default configuration tests
+  - [x] Serialization/deserialization tests
+  - [x] Validation tests
+  - [x] Environment variable expansion tests
+  - [x] File I/O tests
+- [x] Unit tests for command logic ✅
+  - [x] Task ID parsing validation
+  - [x] Worker ID extraction
+  - [x] Log level matching
+  - [x] Redis key formatting
+  - [x] Queue key formatting
+  - [x] JSON log parsing
+  - [x] Limit range calculations
+  - [x] Diagnostic thresholds
+  - [x] Shutdown channel naming
+  - [x] Timestamp formatting
 - [ ] Integration tests with real brokers
 - [ ] E2E tests for workflows
-- [ ] Configuration parsing tests
 
 ## Documentation
 
 - [x] CLI README
 - [x] Command usage examples
 - [ ] Advanced usage patterns
-- [ ] Shell completion scripts
+- [x] Shell completion scripts ✅
+  - [x] Bash support
+  - [x] Zsh support
+  - [x] Fish support
+  - [x] PowerShell support
+  - [x] Elvish support
 - [ ] Man pages
 
 ## Dependencies
@@ -225,13 +321,24 @@ Full-featured CLI for worker management, queue inspection, and DLQ operations.
 - Binary name: `celers`
 - Install: `cargo install --path crates/celers-cli`
 
-### Shell Completion
+### Shell Completion ✅
 
 Generate completion scripts:
 ```bash
+# Bash
 celers completions bash > /etc/bash_completion.d/celers
+
+# Zsh
 celers completions zsh > /usr/share/zsh/site-functions/_celers
+
+# Fish
 celers completions fish > ~/.config/fish/completions/celers.fish
+
+# PowerShell
+celers completions powershell > celers.ps1
+
+# Elvish
+celers completions elvish > celers.elv
 ```
 
 ## Configuration File

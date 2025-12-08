@@ -45,6 +45,12 @@ impl fmt::Display for MiddlewareError {
     }
 }
 
+impl From<crate::ValidationError> for MiddlewareError {
+    fn from(err: crate::ValidationError) -> Self {
+        MiddlewareError::Validation(err.to_string())
+    }
+}
+
 impl std::error::Error for MiddlewareError {}
 
 /// Middleware trait for message processing
@@ -116,7 +122,7 @@ pub struct ValidationMiddleware;
 
 impl Middleware for ValidationMiddleware {
     fn process(&self, message: Message) -> Result<Message, MiddlewareError> {
-        message.validate().map_err(MiddlewareError::Validation)?;
+        message.validate().map_err(MiddlewareError::from)?;
         Ok(message)
     }
 

@@ -56,6 +56,12 @@ impl fmt::Display for ExtensionError {
     }
 }
 
+impl From<crate::ValidationError> for ExtensionError {
+    fn from(err: crate::ValidationError) -> Self {
+        ExtensionError::Validation(err.to_string())
+    }
+}
+
 impl std::error::Error for ExtensionError {}
 
 #[cfg(feature = "signing")]
@@ -109,7 +115,7 @@ pub trait MessageExt {
 
 impl MessageExt for Message {
     fn validate_basic(&self) -> Result<(), ExtensionError> {
-        self.validate().map_err(ExtensionError::Validation)
+        self.validate().map_err(ExtensionError::from)
     }
 
     fn is_expired(&self) -> bool {

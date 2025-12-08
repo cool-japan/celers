@@ -2,9 +2,9 @@
 
 > PostgreSQL-based broker implementation for CeleRS
 
-## Status: ✅ FEATURE COMPLETE
+## Status: ✅ FEATURE COMPLETE + PRODUCTION-READY
 
-PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-performance batch operations, queue control, and comprehensive maintenance tools.
+PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-performance batch operations, queue control, comprehensive maintenance tools, **task chaining**, **DAG-based workflows**, **table partitioning**, and **query optimization**.
 
 ## Completed Features
 
@@ -126,6 +126,7 @@ PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, 
 ### Migrations ✅
 - [x] 001_init.sql - Initial schema (tasks, DLQ, history)
 - [x] 002_results.sql - Task results table with indexes
+- [x] 003_partitioning.sql - Table partitioning support for large-scale deployments
 - [x] Additional indexes for performance
 
 ### Recent Enhancements ✅
@@ -166,6 +167,37 @@ PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, 
 - [x] Configurable VACUUM vs ANALYZE-only mode
 - [x] Graceful error handling with tracing
 
+#### Task Chaining & Workflows (2025-12)
+- [x] `TaskChain` struct for sequential task execution
+- [x] `TaskWorkflow` struct for DAG-based orchestration
+- [x] `WorkflowStage` with dependency management
+- [x] `enqueue_chain()` - Create sequential task chains
+- [x] `complete_chain_task()` - Automatically schedule next task in chain
+- [x] `enqueue_workflow()` - Create workflows with multiple stages
+- [x] `complete_workflow_task()` - Track stage completion and trigger dependents
+- [x] `cancel_chain()` - Cancel entire task chains
+- [x] `cancel_workflow()` - Cancel entire workflows
+- [x] `get_chain_status()` - Get comprehensive chain status with progress
+- [x] `get_workflow_status()` - Get workflow status with per-stage details
+- [x] `ChainStatus` struct with completion tracking
+- [x] `WorkflowStatus` and `StageStatus` structs for detailed monitoring
+- [x] Metadata-based tracking (no additional tables required)
+- [x] Support for parallel execution within workflow stages
+- [x] Automatic dependency resolution and scheduling
+
+#### Multi-Tenant Support (2025-12)
+- [x] `with_tenant_id()` - Create tenant-scoped broker
+- [x] `TenantBroker` struct for automatic tenant isolation
+- [x] `list_tasks_by_tenant()` - Query tasks by tenant ID
+- [x] `count_tasks_by_tenant()` - Count tasks for a specific tenant
+- [x] Metadata-based tenant isolation using existing GIN index
+- [x] Cross-queue tenant monitoring
+
+#### Additional Production Features (2025-12)
+- [x] `bulk_update_state()` - Update multiple tasks to a specific state
+- [x] `find_tasks_by_time_range()` - Query tasks within time periods
+- [x] Enhanced task filtering for analytics and reporting
+
 #### Performance Benchmarks (2025-12)
 - [x] Criterion-based benchmark suite
 - [x] Retry strategy performance benchmarks
@@ -173,20 +205,53 @@ PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, 
 - [x] Scaling benchmarks for retry calculations
 - [x] Benchmarks for serialization/deserialization
 
+#### Table Partitioning (2025-12)
+- [x] Migration 003_partitioning.sql with partitioning functions
+- [x] `create_partition()` - Create monthly partition for specific date
+- [x] `create_partitions_range()` - Create partitions for date range
+- [x] `drop_partition()` - Drop old partitions for archiving
+- [x] `list_partitions()` - List all partitions with statistics
+- [x] `maintain_partitions()` - Auto-create future partitions
+- [x] `get_partition_name()` - Get partition name for date
+- [x] `detach_partition()` - Detach partition for archiving
+- [x] PostgreSQL functions for partition management
+- [x] Comprehensive documentation and examples
+
+#### Query Optimization (2025-12)
+- [x] `explain_dequeue_query()` - EXPLAIN ANALYZE for dequeue operation
+- [x] `get_query_stats()` - Table and index usage statistics
+- [x] `set_query_hints()` - Configure parallel query execution
+- [x] `get_pool_recommendations()` - Connection pool tuning recommendations
+- [x] Query performance monitoring and analysis tools
+
+#### Connection Health & Resilience (2025-12)
+- [x] `check_health_detailed()` - Comprehensive health check with diagnostics
+- [x] `test_connection_with_retry()` - Connection retry with exponential backoff
+- [x] `get_recommended_batch_size()` - Workload-based batch size recommendations
+- [x] `detect_connection_leaks()` - Connection leak detection and monitoring
+- [x] `DetailedHealthStatus` struct with warnings and recommendations
+- [x] `BatchSizeRecommendation` struct for optimization guidance
+- [x] Automatic connection recovery with retry logic
+- [x] Production-ready health monitoring and diagnostics
+
 ## Future Enhancements
 
 ### Performance
 - [x] Connection pool metrics exporter (get_pool_metrics, Prometheus integration)
-- [ ] Table partitioning for large queues (for very large deployments)
-- [ ] Query optimization for high throughput (current performance is good)
+- [x] Table partitioning for large queues (migration 003_partitioning.sql, 8 methods)
+- [x] Query optimization for high throughput (4 new analysis/tuning methods)
 
 ### Advanced Features
 - [x] Custom retry strategies (Exponential, ExponentialWithJitter, Linear, Fixed, Immediate)
 - [x] Task metadata query methods (find_tasks_by_metadata, count_tasks_by_metadata)
 - [x] Task name filtering (find_tasks_by_name)
-- [ ] Task dependencies/DAG support (would require schema changes)
-- [ ] Multi-tenant queue support with stronger isolation (beyond queue_name)
-- [ ] Task chaining and workflows
+- [x] Task chaining for sequential execution (enqueue_chain, complete_chain_task, get_chain_status)
+- [x] DAG-based workflows with dependencies (enqueue_workflow, complete_workflow_task, get_workflow_status)
+- [x] Workflow stage dependencies and automatic scheduling
+- [x] Chain and workflow cancellation (cancel_chain, cancel_workflow)
+- [x] Multi-tenant queue support with stronger isolation (with_tenant_id, TenantBroker)
+- [x] Bulk operations (bulk_update_state)
+- [x] Time-based filtering (find_tasks_by_time_range)
 
 ### Maintenance
 - [x] Manual VACUUM (`vacuum_tables()` method available)
@@ -198,9 +263,13 @@ PostgreSQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, 
 - [x] Unit tests for types (DbTaskState, TaskResultStatus, etc.)
 - [x] Unit tests for retry strategies (all 5 strategies tested)
 - [x] Unit tests for QueueStatistics
-- [x] Doc tests for module-level examples (6 total, 3 passing, 3 ignored)
+- [x] Doc tests for module-level examples (21 total, 18 passing, 3 ignored)
+- [x] Doc tests for partitioning methods (8 methods)
+- [x] Doc tests for query optimization methods (4 methods)
+- [x] Doc tests for connection health & resilience (4 methods)
 - [x] Integration test examples (marked as #[ignore])
-- [x] Total: 18 tests (15 passing, 3 ignored requiring PostgreSQL)
+- [x] Total: 18 unit tests (15 passing, 3 ignored requiring PostgreSQL)
+- [x] Total: 21 doc tests (18 passing, 3 ignored requiring PostgreSQL)
 - [x] Performance benchmarks (Criterion-based, 3 benchmark groups)
   - Retry strategy benchmarks (5 strategies)
   - State conversion benchmarks (4 operations)

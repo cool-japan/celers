@@ -47,6 +47,16 @@ serde_json = "1.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 thiserror = "2.0"
 
+# Optional tracing dependencies
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
+
+# Helper dependencies
+num_cpus = "1.16"
+
 [features]
 default = ["redis", "json"]
 
@@ -71,10 +81,13 @@ msgpack = ["celers-protocol/msgpack"]
 
 # Observability
 metrics = ["celers-metrics"]
-tracing = []
+tracing = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry", "dep:tracing", "dep:tracing-subscriber"]
+
+# Development utilities
+dev-utils = []
 
 # Full feature set
-full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-db", "backend-rpc", "beat", "json", "msgpack", "metrics", "tracing"]
+full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-db", "backend-rpc", "beat", "json", "msgpack", "metrics", "tracing", "dev-utils"]
 
 [dev-dependencies]
 tokio-test = "0.4"

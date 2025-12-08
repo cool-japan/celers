@@ -20,6 +20,7 @@ celers-broker-redis = { path = "../celers-broker-redis" }
 celers-broker-postgres = { path = "../celers-broker-postgres" }
 celers-metrics = { path = "../celers-metrics" }
 clap = { workspace = true }
+clap_complete = "4.5.38"
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -32,3 +33,6 @@ chrono = { workspace = true }
 toml = "0.8.19"
 tabled = "0.16.0"
 colored = "2.1.0"
+
+[dev-dependencies]
+tempfile = "3.15.0"

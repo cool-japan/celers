@@ -93,6 +93,19 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 - [x] `rollback_transaction()` - Rollback transaction
 - [x] `transaction_state()` - Get current transaction state
 
+### Management API Integration ✅
+- [x] `list_queues()` - List all queues with basic information
+- [x] `get_queue_stats()` - Get detailed statistics for a specific queue
+- [x] `get_server_overview()` - Get RabbitMQ server overview
+- [x] `list_connections()` - List all active connections
+- [x] `list_channels()` - List all active channels
+- [x] `list_exchanges()` - List all exchanges in a virtual host
+- [x] `list_queue_bindings()` - List all bindings for a specific queue
+- [x] `has_management_api()` - Check if Management API is configured
+- [x] `with_management_api()` - Configure Management API credentials
+- [x] HTTP client for Management API requests
+- [x] Comprehensive data structures (QueueInfo, QueueStats, ServerOverview, ConnectionInfo, ChannelInfo, ExchangeInfo, BindingInfo)
+
 ## Future Enhancements
 
 ### Advanced Features
@@ -108,7 +121,9 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 - [x] Connection health monitoring ✅
 - [x] Channel-level metrics ✅
 - [x] Publisher confirm tracking ✅
-- [ ] RabbitMQ Management API integration
+- [x] RabbitMQ Management API integration ✅
+- [x] Connection pool metrics (pool size, acquisitions, releases, discards) ✅
+- [x] Channel pool metrics (pool size, acquisitions, releases, discards) ✅
 
 ### Reliability
 - [x] Transaction support ✅
@@ -125,7 +140,7 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
 - [x] Virtual host URL tests
 - [x] Health status tests
 - [x] Transaction state tests
-- [x] Integration tests with RabbitMQ (14 comprehensive tests)
+- [x] Integration tests with RabbitMQ (21 comprehensive tests)
   - [x] Connection and disconnect
   - [x] Publish and consume
   - [x] Batch publishing
@@ -140,6 +155,13 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
   - [x] Message TTL
   - [x] Metrics tracking
   - [x] Message deduplication
+  - [x] Management API - List queues
+  - [x] Management API - Queue statistics
+  - [x] Management API - Server overview
+  - [x] Management API - List connections
+  - [x] Management API - List channels
+  - [x] Management API - List exchanges
+  - [x] Management API - List queue bindings
 
 ## Documentation
 
@@ -157,16 +179,33 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
   - Troubleshooting for common issues
   - Performance benchmarks
   - Testing instructions
+- [x] **7 Runnable Examples** in `examples/` directory:
+  - `basic_publish_consume.rs` - Basic message workflow
+  - `batch_publish.rs` - High-throughput batch operations
+  - `priority_queue.rs` - Priority-based message processing
+  - `dead_letter_exchange.rs` - DLX configuration and handling
+  - `management_api.rs` - RabbitMQ Management API usage
+  - `transaction.rs` - AMQP transaction support
+  - `streaming_consumer.rs` - Async streaming consumer pattern
 
 ## Dependencies
 
+**Production Dependencies:**
 - `lapin` - RabbitMQ/AMQP client (v2.5)
+- `reqwest` - HTTP client for Management API (v0.12)
+- `urlencoding` - URL encoding for Management API (v2.1)
 - `celers-protocol` - Message types
 - `celers-kombu` - Broker traits
 - `async-trait` - Async trait support
-- `tokio` - Async runtime
+- `tokio` - Async runtime (v1.42)
 - `tracing` - Logging
 - `serde_json` - JSON serialization
+
+**Development Dependencies:**
+- `tokio-test` - Testing utilities (v0.4)
+- `tracing-subscriber` - Logging for examples (v0.3)
+- `futures` - Stream utilities for examples (v0.3)
+- `criterion` - Benchmarking framework (v0.5)
 
 ## RabbitMQ Configuration
 
@@ -202,9 +241,57 @@ This implementation is **100% compatible** with Python Celery's AMQP backend:
 - Priority queues require RabbitMQ 3.5.0+
 - All queues are durable by default
 - Messages are persistent (delivery_mode = 2)
-- `list_queues()` not supported via AMQP protocol (requires Management API)
+- `list_queues()` available via Management API (requires configuration)
+
+## Management API Features
+
+The broker now supports comprehensive RabbitMQ Management API for advanced monitoring and management:
+
+### Queue Management
+- **list_queues()** - List all queues with basic information (name, vhost, messages, consumers, etc.)
+- **get_queue_stats()** - Get detailed statistics for a specific queue (message rates, memory usage, etc.)
+- **list_queue_bindings()** - List all bindings for a specific queue (source exchange, routing key, etc.)
+
+### Connection & Channel Monitoring
+- **list_connections()** - List all active connections (user, state, channels, peer info, traffic stats)
+- **list_channels()** - List all active channels (number, state, consumers, unacked messages, prefetch)
+
+### Exchange Management
+- **list_exchanges()** - List all exchanges in a virtual host (name, type, durability, message stats)
+
+### Server Monitoring
+- **get_server_overview()** - Get RabbitMQ server overview (version info, cluster info, totals)
+
+To use Management API features, configure the broker with:
+```rust
+let config = AmqpConfig::default()
+    .with_management_api("http://localhost:15672", "guest", "guest");
+```
+
+## Performance Testing
+
+Due to limitations with criterion's async API, formal benchmarks are disabled.
+For performance testing, use the example programs with timing:
+
+```bash
+# Test batch publish throughput
+time cargo run --release --example batch_publish
+
+# Test priority queue performance
+time cargo run --release --example priority_queue
+
+# Test transaction performance
+time cargo run --release --example transaction
+
+# Test streaming consumer performance
+time cargo run --release --example streaming_consumer
+```
+
+The examples include built-in throughput measurements and timing information.
 
 ## Known Limitations
 
-- `list_queues()` requires RabbitMQ Management API (not available via AMQP protocol)
-- Connection and channel pools require explicit configuration (disabled by default for backward compatibility)
+- Management API features require RabbitMQ Management Plugin to be enabled (enabled by default)
+- Management API requires HTTP access to RabbitMQ (default port: 15672)
+- Connection pool is disabled by default (connection_pool_size: 0)
+- Channel pool is enabled by default (channel_pool_size: 10)

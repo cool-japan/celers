@@ -361,9 +361,11 @@ mod tests {
 
     #[test]
     fn test_pool_stats_total_connections() {
-        let mut stats = PoolStats::default();
-        stats.active = 5;
-        stats.idle = 3;
+        let stats = PoolStats {
+            active: 5,
+            idle: 3,
+            ..Default::default()
+        };
         assert_eq!(stats.total_connections(), 8);
     }
 

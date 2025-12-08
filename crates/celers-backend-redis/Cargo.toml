@@ -20,6 +20,10 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 tracing = "0.1"
 tokio = { version = "1.48", features = ["sync"] }
+flate2 = "1.0"
+aes-gcm = "0.10"
+base64 = "0.22"
+hex = "0.4"
 
 # Core protocol
 celers-core = { path = "../celers-core" }

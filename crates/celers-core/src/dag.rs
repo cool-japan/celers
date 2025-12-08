@@ -469,4 +469,151 @@ mod tests {
         assert!(pos2 < pos3);
         assert!(pos3 < pos4);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn test_dag_node_count_matches_added_nodes(count in 1usize..20) {
+                let mut dag = TaskDag::new();
+                let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
+
+                for (i, id) in ids.iter().enumerate() {
+                    dag.add_node(*id, &format!("task_{}", i));
+                }
+
+                prop_assert_eq!(dag.node_count(), count);
+            }
+
+            #[test]
+            fn test_dag_linear_chain_sorts_correctly(count in 2usize..15) {
+                let mut dag = TaskDag::new();
+                let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
+
+                // Create linear chain: ids[0] -> ids[1] -> ids[2] -> ...
+                for (i, id) in ids.iter().enumerate() {
+                    dag.add_node(*id, &format!("task_{}", i));
+                }
+
+                for i in 1..ids.len() {
+                    dag.add_dependency(ids[i], ids[i - 1]).unwrap();
+                }
+
+                let sorted = dag.topological_sort().unwrap();
+                prop_assert_eq!(sorted.len(), count);
+
+                // Verify order: each node must appear after all its dependencies
+                for i in 1..ids.len() {
+                    let pos_parent = sorted.iter().position(|&t| t == ids[i - 1]).unwrap();
+                    let pos_child = sorted.iter().position(|&t| t == ids[i]).unwrap();
+                    prop_assert!(pos_parent < pos_child);
+                }
+            }
+
+            #[test]
+            fn test_dag_validate_always_succeeds_for_acyclic(count in 2usize..10) {
+                let mut dag = TaskDag::new();
+                let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
+
+                for (i, id) in ids.iter().enumerate() {
+                    dag.add_node(*id, &format!("task_{}", i));
+                }
+
+                // Create valid DAG structure
+                for i in 1..ids.len() {
+                    dag.add_dependency(ids[i], ids[i - 1]).unwrap();
+                }
+
+                prop_assert!(dag.validate().is_ok());
+            }
+
+            #[test]
+            fn test_dag_roots_have_no_dependencies(count in 2usize..10) {
+                let mut dag = TaskDag::new();
+                let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
+
+                for (i, id) in ids.iter().enumerate() {
+                    dag.add_node(*id, &format!("task_{}", i));
+                }
+
+                // Create linear chain
+                for i in 1..ids.len() {
+                    dag.add_dependency(ids[i], ids[i - 1]).unwrap();
+                }
+
+                let roots = dag.get_roots();
+
+                // Each root should have no dependencies
+                for root in roots {
+                    let deps = dag.get_dependencies(&root).unwrap();
+                    prop_assert_eq!(deps.len(), 0);
+                }
+            }
+
+            #[test]
+            fn test_dag_leaves_have_no_dependents(count in 2usize..10) {
+                let mut dag = TaskDag::new();
+                let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
+
+                for (i, id) in ids.iter().enumerate() {
+                    dag.add_node(*id, &format!("task_{}", i));
+                }
+
+                // Create linear chain
+                for i in 1..ids.len() {
+                    dag.add_dependency(ids[i], ids[i - 1]).unwrap();
+                }
+
+                let leaves = dag.get_leaves();
+
+                // Each leaf should have no dependents
+                for leaf in leaves {
+                    let dependents = dag.get_dependents(&leaf).unwrap();
+                    prop_assert_eq!(dependents.len(), 0);
+                }
+            }
+
+            #[test]
+            fn test_dag_edge_count_matches_added_dependencies(node_count in 2usize..10) {
+                let mut dag = TaskDag::new();
+                let ids: Vec<_> = (0..node_count).map(|_| TaskId::new_v4()).collect();
+
+                for (i, id) in ids.iter().enumerate() {
+                    dag.add_node(*id, &format!("task_{}", i));
+                }
+
+                // Add edges in a linear chain
+                let edge_count = node_count - 1;
+                for i in 1..ids.len() {
+                    dag.add_dependency(ids[i], ids[i - 1]).unwrap();
+                }
+
+                prop_assert_eq!(dag.edge_count(), edge_count);
+            }
+
+            #[test]
+            fn test_dag_remove_dependency_decreases_edge_count(node_count in 2usize..10) {
+                let mut dag = TaskDag::new();
+                let ids: Vec<_> = (0..node_count).map(|_| TaskId::new_v4()).collect();
+
+                for (i, id) in ids.iter().enumerate() {
+                    dag.add_node(*id, &format!("task_{}", i));
+                }
+
+                // Add all edges
+                for i in 1..ids.len() {
+                    dag.add_dependency(ids[i], ids[i - 1]).unwrap();
+                }
+
+                let initial_count = dag.edge_count();
+
+                // Remove one dependency
+                dag.remove_dependency(ids[1], ids[0]);
+
+                prop_assert_eq!(dag.edge_count(), initial_count - 1);
+            }
+        }
+    }
 }

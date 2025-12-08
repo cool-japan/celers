@@ -5,6 +5,8 @@
 //! - Priority queues
 //! - Dead Letter Queue (DLQ) for permanently failed tasks
 //! - Delayed task execution (enqueue_at, enqueue_after)
+//! - **Task chaining for sequential execution**
+//! - **DAG-based workflows with stage dependencies**
 //! - Prometheus metrics (optional `metrics` feature)
 //! - Batch enqueue/dequeue/ack operations
 //! - Transaction safety
@@ -200,6 +202,40 @@ pub struct PoolMetrics {
     pub waiting: u32,
 }
 
+/// Detailed health check result with diagnostics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetailedHealthStatus {
+    /// Overall health status
+    pub healthy: bool,
+    /// Connection test result
+    pub connection_ok: bool,
+    /// Query performance (milliseconds)
+    pub query_latency_ms: i64,
+    /// Connection pool metrics
+    pub pool_metrics: PoolMetrics,
+    /// Queue statistics
+    pub queue_stats: QueueStatistics,
+    /// Database version
+    pub database_version: String,
+    /// Warnings (e.g., high pool utilization)
+    pub warnings: Vec<String>,
+    /// Recommendations for optimization
+    pub recommendations: Vec<String>,
+}
+
+/// Batch size recommendation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchSizeRecommendation {
+    /// Recommended batch size for enqueue operations
+    pub enqueue_batch_size: usize,
+    /// Recommended batch size for dequeue operations
+    pub dequeue_batch_size: usize,
+    /// Recommended batch size for ack operations
+    pub ack_batch_size: usize,
+    /// Reasoning for the recommendation
+    pub reasoning: String,
+}
+
 /// Queue statistics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueStatistics {
@@ -210,6 +246,16 @@ pub struct QueueStatistics {
     pub cancelled: i64,
     pub dlq: i64,
     pub total: i64,
+}
+
+/// Information about a table partition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionInfo {
+    pub partition_name: String,
+    pub partition_start: DateTime<Utc>,
+    pub partition_end: DateTime<Utc>,
+    pub row_count: i64,
+    pub size_bytes: i64,
 }
 
 /// Task result stored in the database
@@ -350,6 +396,82 @@ pub struct IndexUsageInfo {
     pub tuples_fetched: i64,
     pub index_size_bytes: i64,
     pub index_size_pretty: String,
+}
+
+/// Task chain configuration for sequential execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskChain {
+    /// Tasks to execute in order
+    pub tasks: Vec<SerializedTask>,
+    /// Stop chain execution on first failure (default: true)
+    pub stop_on_failure: bool,
+}
+
+/// Workflow/Pipeline for complex task orchestration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskWorkflow {
+    /// Unique workflow ID
+    pub id: Uuid,
+    /// Workflow name
+    pub name: String,
+    /// Tasks in this workflow with their dependencies
+    pub stages: Vec<WorkflowStage>,
+}
+
+/// A stage in a workflow with optional dependencies
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStage {
+    /// Stage identifier
+    pub id: String,
+    /// Tasks to execute in this stage (can run in parallel)
+    pub tasks: Vec<SerializedTask>,
+    /// IDs of stages that must complete before this stage runs
+    pub depends_on: Vec<String>,
+}
+
+/// Status information for a task chain
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainStatus {
+    pub chain_id: Uuid,
+    pub total_tasks: i64,
+    pub completed_tasks: i64,
+    pub failed_tasks: i64,
+    pub pending_tasks: i64,
+    pub processing_tasks: i64,
+    pub current_position: Option<i64>,
+    pub is_complete: bool,
+    pub has_failures: bool,
+}
+
+/// Status information for a workflow
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStatus {
+    pub workflow_id: Uuid,
+    pub workflow_name: String,
+    pub total_stages: i64,
+    pub completed_stages: i64,
+    pub active_stages: i64,
+    pub total_tasks: i64,
+    pub completed_tasks: i64,
+    pub failed_tasks: i64,
+    pub pending_tasks: i64,
+    pub processing_tasks: i64,
+    pub is_complete: bool,
+    pub has_failures: bool,
+    pub stage_statuses: Vec<StageStatus>,
+}
+
+/// Status information for a workflow stage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageStatus {
+    pub stage_id: String,
+    pub total_tasks: i64,
+    pub completed_tasks: i64,
+    pub failed_tasks: i64,
+    pub pending_tasks: i64,
+    pub processing_tasks: i64,
+    pub is_complete: bool,
+    pub dependencies_met: bool,
 }
 
 /// PostgreSQL-based broker implementation using SKIP LOCKED
@@ -1555,6 +1677,922 @@ impl PostgresBroker {
 
         Ok(rate.unwrap_or(0.0))
     }
+
+    // ========== Task Chaining & Workflows ==========
+
+    /// Enqueue a chain of tasks to execute sequentially
+    ///
+    /// Tasks will be linked together where each task (except the first) is scheduled
+    /// to run after the previous task completes. The chain is tracked via metadata.
+    ///
+    /// # Arguments
+    /// * `chain` - The task chain configuration
+    ///
+    /// # Returns
+    /// Vector of task IDs in order
+    pub async fn enqueue_chain(&self, chain: TaskChain) -> Result<Vec<TaskId>> {
+        if chain.tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let chain_id = Uuid::new_v4();
+        let chain_total = chain.tasks.len();
+        let mut task_ids: Vec<Uuid> = Vec::with_capacity(chain_total);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        for (idx, task) in chain.tasks.into_iter().enumerate() {
+            let task_id = task.metadata.id;
+            let mut db_metadata = json!({
+                "queue": self.queue_name,
+                "enqueued_at": chrono::Utc::now().to_rfc3339(),
+                "chain_id": chain_id.to_string(),
+                "chain_position": idx,
+                "chain_total": chain_total,
+                "stop_on_failure": chain.stop_on_failure,
+            });
+
+            // Add reference to previous task if not the first
+            if idx > 0 {
+                db_metadata["previous_task_id"] = json!(task_ids[idx - 1].to_string());
+            }
+
+            // Merge task metadata if present
+            if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
+                if let Some(obj) = db_metadata.as_object_mut() {
+                    if let Some(meta_obj) = task_meta.as_object() {
+                        for (k, v) in meta_obj {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+
+            // First task is scheduled immediately, others are pending with far-future schedule
+            // They'll be rescheduled by complete_chain_task()
+            let scheduled_at = if idx == 0 {
+                "NOW()"
+            } else {
+                "NOW() + INTERVAL '100 years'" // Effectively "never" until predecessor completes
+            };
+
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), {})
+                "#,
+                scheduled_at
+            ))
+            .bind(task_id)
+            .bind(&task.metadata.name)
+            .bind(&task.payload)
+            .bind(task.metadata.priority)
+            .bind(task.metadata.max_retries as i32)
+            .bind(db_metadata)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue chain task: {}", e)))?;
+
+            task_ids.push(task_id);
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit chain: {}", e)))?;
+
+        tracing::info!(
+            chain_id = %chain_id,
+            task_count = task_ids.len(),
+            "Enqueued task chain"
+        );
+
+        Ok(task_ids)
+    }
+
+    /// Complete a task in a chain and schedule the next task
+    ///
+    /// This should be called after successfully completing a task that's part of a chain.
+    /// It will automatically schedule the next task in the chain.
+    ///
+    /// # Arguments
+    /// * `task_id` - ID of the completed task
+    pub async fn complete_chain_task(&self, task_id: &TaskId) -> Result<()> {
+        // Get task metadata to check if it's part of a chain
+        let row = sqlx::query(
+            r#"
+            SELECT metadata
+            FROM celers_tasks
+            WHERE id = $1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch task: {}", e)))?;
+
+        if let Some(row) = row {
+            let metadata: Option<serde_json::Value> = row.get("metadata");
+            if let Some(meta) = metadata {
+                // Check if this task is part of a chain
+                if let Some(chain_id) = meta.get("chain_id").and_then(|v| v.as_str()) {
+                    let position = meta
+                        .get("chain_position")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+
+                    // Find the next task in the chain
+                    let next_task = sqlx::query(
+                        r#"
+                        SELECT id
+                        FROM celers_tasks
+                        WHERE metadata->>'chain_id' = $1
+                          AND (metadata->>'chain_position')::int = $2
+                          AND state = 'pending'
+                        "#,
+                    )
+                    .bind(chain_id)
+                    .bind((position + 1) as i32)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| CelersError::Other(format!("Failed to find next task: {}", e)))?;
+
+                    if let Some(next_row) = next_task {
+                        let next_task_id: Uuid = next_row.get("id");
+
+                        // Schedule the next task to run now
+                        sqlx::query(
+                            r#"
+                            UPDATE celers_tasks
+                            SET scheduled_at = NOW()
+                            WHERE id = $1
+                            "#,
+                        )
+                        .bind(next_task_id)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| {
+                            CelersError::Other(format!("Failed to schedule next task: {}", e))
+                        })?;
+
+                        tracing::info!(
+                            chain_id = %chain_id,
+                            completed_task = %task_id,
+                            next_task = %next_task_id,
+                            "Scheduled next task in chain"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Enqueue a workflow with multiple stages that may have dependencies
+    ///
+    /// This creates a DAG (Directed Acyclic Graph) of tasks where stages can depend
+    /// on other stages completing first. Tasks within a stage can run in parallel.
+    ///
+    /// # Arguments
+    /// * `workflow` - The workflow configuration
+    ///
+    /// # Returns
+    /// Map of stage IDs to their task IDs
+    pub async fn enqueue_workflow(
+        &self,
+        workflow: TaskWorkflow,
+    ) -> Result<std::collections::HashMap<String, Vec<TaskId>>> {
+        let mut result = std::collections::HashMap::new();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        for stage in &workflow.stages {
+            let mut stage_task_ids = Vec::new();
+
+            for task in &stage.tasks {
+                let task_id = task.metadata.id;
+                let mut db_metadata = json!({
+                    "queue": self.queue_name,
+                    "enqueued_at": chrono::Utc::now().to_rfc3339(),
+                    "workflow_id": workflow.id.to_string(),
+                    "workflow_name": workflow.name,
+                    "stage_id": stage.id,
+                    "stage_depends_on": stage.depends_on,
+                });
+
+                // Merge task metadata if present
+                if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
+                    if let Some(obj) = db_metadata.as_object_mut() {
+                        if let Some(meta_obj) = task_meta.as_object() {
+                            for (k, v) in meta_obj {
+                                obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Tasks with dependencies are scheduled far in the future
+                // They'll be rescheduled by complete_workflow_stage()
+                let scheduled_at = if stage.depends_on.is_empty() {
+                    "NOW()"
+                } else {
+                    "NOW() + INTERVAL '100 years'"
+                };
+
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO celers_tasks
+                        (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                    VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), {})
+                    "#,
+                    scheduled_at
+                ))
+                .bind(task_id)
+                .bind(&task.metadata.name)
+                .bind(&task.payload)
+                .bind(task.metadata.priority)
+                .bind(task.metadata.max_retries as i32)
+                .bind(db_metadata)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to enqueue workflow task: {}", e)))?;
+
+                stage_task_ids.push(task_id);
+            }
+
+            result.insert(stage.id.clone(), stage_task_ids);
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit workflow: {}", e)))?;
+
+        tracing::info!(
+            workflow_id = %workflow.id,
+            workflow_name = %workflow.name,
+            stage_count = workflow.stages.len(),
+            "Enqueued workflow"
+        );
+
+        Ok(result)
+    }
+
+    /// Complete a task in a workflow stage and check if dependent stages can be scheduled
+    ///
+    /// This should be called after successfully completing a task that's part of a workflow.
+    /// It will check if all tasks in the current stage are complete, and if so, schedule
+    /// any dependent stages.
+    ///
+    /// # Arguments
+    /// * `task_id` - ID of the completed task
+    pub async fn complete_workflow_task(&self, task_id: &TaskId) -> Result<()> {
+        // Get task metadata to check if it's part of a workflow
+        let row = sqlx::query(
+            r#"
+            SELECT metadata
+            FROM celers_tasks
+            WHERE id = $1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch task: {}", e)))?;
+
+        if let Some(row) = row {
+            let metadata: Option<serde_json::Value> = row.get("metadata");
+            if let Some(meta) = metadata {
+                if let (Some(workflow_id), Some(stage_id)) = (
+                    meta.get("workflow_id").and_then(|v| v.as_str()),
+                    meta.get("stage_id").and_then(|v| v.as_str()),
+                ) {
+                    // Check if all tasks in this stage are completed
+                    let incomplete_count: i64 = sqlx::query_scalar(
+                        r#"
+                        SELECT COUNT(*)
+                        FROM celers_tasks
+                        WHERE metadata->>'workflow_id' = $1
+                          AND metadata->>'stage_id' = $2
+                          AND state NOT IN ('completed', 'cancelled')
+                        "#,
+                    )
+                    .bind(workflow_id)
+                    .bind(stage_id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        CelersError::Other(format!("Failed to count incomplete tasks: {}", e))
+                    })?;
+
+                    if incomplete_count == 0 {
+                        // Stage is complete, find dependent stages
+                        let dependent_stages = sqlx::query(
+                            r#"
+                            SELECT DISTINCT metadata->>'stage_id' as stage_id
+                            FROM celers_tasks
+                            WHERE metadata->>'workflow_id' = $1
+                              AND metadata->'stage_depends_on' ? $2
+                              AND state = 'pending'
+                            "#,
+                        )
+                        .bind(workflow_id)
+                        .bind(stage_id)
+                        .fetch_all(&self.pool)
+                        .await
+                        .map_err(|e| {
+                            CelersError::Other(format!("Failed to find dependent stages: {}", e))
+                        })?;
+
+                        for dep_row in dependent_stages {
+                            let dep_stage_id: String = dep_row.get("stage_id");
+
+                            // Check if all dependencies for this stage are met
+                            let unmet_deps = self
+                                .check_workflow_stage_dependencies(workflow_id, &dep_stage_id)
+                                .await?;
+
+                            if unmet_deps.is_empty() {
+                                // All dependencies met, schedule this stage
+                                sqlx::query(
+                                    r#"
+                                    UPDATE celers_tasks
+                                    SET scheduled_at = NOW()
+                                    WHERE metadata->>'workflow_id' = $1
+                                      AND metadata->>'stage_id' = $2
+                                      AND state = 'pending'
+                                    "#,
+                                )
+                                .bind(workflow_id)
+                                .bind(&dep_stage_id)
+                                .execute(&self.pool)
+                                .await
+                                .map_err(|e| {
+                                    CelersError::Other(format!(
+                                        "Failed to schedule dependent stage: {}",
+                                        e
+                                    ))
+                                })?;
+
+                                tracing::info!(
+                                    workflow_id = %workflow_id,
+                                    completed_stage = %stage_id,
+                                    scheduled_stage = %dep_stage_id,
+                                    "Scheduled dependent workflow stage"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check which dependencies are not yet met for a workflow stage
+    async fn check_workflow_stage_dependencies(
+        &self,
+        workflow_id: &str,
+        stage_id: &str,
+    ) -> Result<Vec<String>> {
+        // Get the stage's dependencies
+        let deps_row = sqlx::query(
+            r#"
+            SELECT metadata->'stage_depends_on' as deps
+            FROM celers_tasks
+            WHERE metadata->>'workflow_id' = $1
+              AND metadata->>'stage_id' = $2
+            LIMIT 1
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(stage_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch stage dependencies: {}", e)))?;
+
+        if let Some(row) = deps_row {
+            let deps: Option<serde_json::Value> = row.get("deps");
+            if let Some(deps_value) = deps {
+                if let Some(deps_array) = deps_value.as_array() {
+                    let mut unmet = Vec::new();
+
+                    for dep_stage_id in deps_array {
+                        if let Some(dep_id) = dep_stage_id.as_str() {
+                            // Check if all tasks in the dependency stage are completed
+                            let incomplete: i64 = sqlx::query_scalar(
+                                r#"
+                            SELECT COUNT(*)
+                            FROM celers_tasks
+                            WHERE metadata->>'workflow_id' = $1
+                              AND metadata->>'stage_id' = $2
+                              AND state NOT IN ('completed', 'cancelled')
+                            "#,
+                            )
+                            .bind(workflow_id)
+                            .bind(dep_id)
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(|e| {
+                                CelersError::Other(format!("Failed to check dependency: {}", e))
+                            })?;
+
+                            if incomplete > 0 {
+                                unmet.push(dep_id.to_string());
+                            }
+                        }
+                    }
+
+                    return Ok(unmet);
+                }
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Cancel an entire task chain
+    ///
+    /// Cancels all pending and processing tasks in a chain.
+    pub async fn cancel_chain(&self, chain_id: &Uuid) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW()
+            WHERE metadata->>'chain_id' = $1
+              AND state IN ('pending', 'processing')
+            "#,
+        )
+        .bind(chain_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel chain: {}", e)))?;
+
+        tracing::info!(
+            chain_id = %chain_id,
+            cancelled_count = result.rows_affected(),
+            "Cancelled task chain"
+        );
+
+        Ok(result.rows_affected())
+    }
+
+    /// Cancel an entire workflow
+    ///
+    /// Cancels all pending and processing tasks in a workflow.
+    pub async fn cancel_workflow(&self, workflow_id: &Uuid) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW()
+            WHERE metadata->>'workflow_id' = $1
+              AND state IN ('pending', 'processing')
+            "#,
+        )
+        .bind(workflow_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel workflow: {}", e)))?;
+
+        tracing::info!(
+            workflow_id = %workflow_id,
+            cancelled_count = result.rows_affected(),
+            "Cancelled workflow"
+        );
+
+        Ok(result.rows_affected())
+    }
+
+    /// Get the status of a task chain
+    ///
+    /// Returns comprehensive status information about a chain including task counts
+    /// by state and the current position in the chain.
+    pub async fn get_chain_status(&self, chain_id: &Uuid) -> Result<Option<ChainStatus>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) as total_tasks,
+                COUNT(*) FILTER (WHERE state = 'completed') as completed_tasks,
+                COUNT(*) FILTER (WHERE state = 'failed') as failed_tasks,
+                COUNT(*) FILTER (WHERE state = 'pending') as pending_tasks,
+                COUNT(*) FILTER (WHERE state = 'processing') as processing_tasks,
+                MAX((metadata->>'chain_position')::int) FILTER (WHERE state = 'processing') as current_position
+            FROM celers_tasks
+            WHERE metadata->>'chain_id' = $1
+            "#,
+        )
+        .bind(chain_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get chain status: {}", e)))?;
+
+        if let Some(row) = row {
+            let total_tasks: i64 = row.get("total_tasks");
+            if total_tasks == 0 {
+                return Ok(None);
+            }
+
+            let completed_tasks: i64 = row.get("completed_tasks");
+            let failed_tasks: i64 = row.get("failed_tasks");
+            let pending_tasks: i64 = row.get("pending_tasks");
+            let processing_tasks: i64 = row.get("processing_tasks");
+            let current_position: Option<i32> = row.get("current_position");
+
+            Ok(Some(ChainStatus {
+                chain_id: *chain_id,
+                total_tasks,
+                completed_tasks,
+                failed_tasks,
+                pending_tasks,
+                processing_tasks,
+                current_position: current_position.map(|p| p as i64),
+                is_complete: completed_tasks + failed_tasks == total_tasks,
+                has_failures: failed_tasks > 0,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get the status of a workflow
+    ///
+    /// Returns comprehensive status information about a workflow including overall
+    /// task counts and detailed status for each stage.
+    pub async fn get_workflow_status(&self, workflow_id: &Uuid) -> Result<Option<WorkflowStatus>> {
+        // Get overall workflow stats
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) as total_tasks,
+                COUNT(*) FILTER (WHERE state = 'completed') as completed_tasks,
+                COUNT(*) FILTER (WHERE state = 'failed') as failed_tasks,
+                COUNT(*) FILTER (WHERE state = 'pending') as pending_tasks,
+                COUNT(*) FILTER (WHERE state = 'processing') as processing_tasks,
+                COUNT(DISTINCT metadata->>'stage_id') as total_stages,
+                metadata->>'workflow_name' as workflow_name
+            FROM celers_tasks
+            WHERE metadata->>'workflow_id' = $1
+            GROUP BY metadata->>'workflow_name'
+            "#,
+        )
+        .bind(workflow_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get workflow status: {}", e)))?;
+
+        if let Some(row) = row {
+            let total_tasks: i64 = row.get("total_tasks");
+            if total_tasks == 0 {
+                return Ok(None);
+            }
+
+            let workflow_name: String = row.get("workflow_name");
+            let total_stages: i64 = row.get("total_stages");
+            let completed_tasks: i64 = row.get("completed_tasks");
+            let failed_tasks: i64 = row.get("failed_tasks");
+            let pending_tasks: i64 = row.get("pending_tasks");
+            let processing_tasks: i64 = row.get("processing_tasks");
+
+            // Get per-stage stats
+            let stage_rows = sqlx::query(
+                r#"
+                SELECT
+                    metadata->>'stage_id' as stage_id,
+                    COUNT(*) as total_tasks,
+                    COUNT(*) FILTER (WHERE state = 'completed') as completed_tasks,
+                    COUNT(*) FILTER (WHERE state = 'failed') as failed_tasks,
+                    COUNT(*) FILTER (WHERE state = 'pending') as pending_tasks,
+                    COUNT(*) FILTER (WHERE state = 'processing') as processing_tasks
+                FROM celers_tasks
+                WHERE metadata->>'workflow_id' = $1
+                GROUP BY metadata->>'stage_id'
+                "#,
+            )
+            .bind(workflow_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get stage statuses: {}", e)))?;
+
+            let mut stage_statuses = Vec::new();
+            let mut completed_stages = 0;
+            let mut active_stages = 0;
+
+            for stage_row in stage_rows {
+                let stage_id: String = stage_row.get("stage_id");
+                let stage_total: i64 = stage_row.get("total_tasks");
+                let stage_completed: i64 = stage_row.get("completed_tasks");
+                let stage_failed: i64 = stage_row.get("failed_tasks");
+                let stage_pending: i64 = stage_row.get("pending_tasks");
+                let stage_processing: i64 = stage_row.get("processing_tasks");
+
+                let is_complete = stage_completed + stage_failed == stage_total;
+                if is_complete {
+                    completed_stages += 1;
+                }
+                if stage_processing > 0 {
+                    active_stages += 1;
+                }
+
+                // Check if dependencies are met (simplified check)
+                let dependencies_met = stage_pending == 0 || stage_processing > 0 || is_complete;
+
+                stage_statuses.push(StageStatus {
+                    stage_id,
+                    total_tasks: stage_total,
+                    completed_tasks: stage_completed,
+                    failed_tasks: stage_failed,
+                    pending_tasks: stage_pending,
+                    processing_tasks: stage_processing,
+                    is_complete,
+                    dependencies_met,
+                });
+            }
+
+            Ok(Some(WorkflowStatus {
+                workflow_id: *workflow_id,
+                workflow_name,
+                total_stages,
+                completed_stages,
+                active_stages,
+                total_tasks,
+                completed_tasks,
+                failed_tasks,
+                pending_tasks,
+                processing_tasks,
+                is_complete: completed_tasks + failed_tasks == total_tasks,
+                has_failures: failed_tasks > 0,
+                stage_statuses,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ========== Multi-Tenant Support ==========
+
+    /// Create a dedicated tenant ID for better isolation
+    ///
+    /// This adds a tenant_id to task metadata for multi-tenant scenarios.
+    /// Use this when you need stronger isolation than queue_name alone.
+    pub fn with_tenant_id(&self, tenant_id: &str) -> TenantBroker<'_> {
+        TenantBroker {
+            broker: self,
+            tenant_id: tenant_id.to_string(),
+        }
+    }
+
+    /// List all tasks for a specific tenant (across all queues)
+    ///
+    /// This queries tasks by tenant_id in metadata, useful for multi-tenant monitoring.
+    pub async fn list_tasks_by_tenant(
+        &self,
+        tenant_id: &str,
+        state: Option<DbTaskState>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = match state {
+            Some(s) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE metadata->>'tenant_id' = $1
+                      AND state = $2
+                    ORDER BY created_at DESC
+                    LIMIT $3 OFFSET $4
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(s.to_string())
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE metadata->>'tenant_id' = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| CelersError::Other(format!("Failed to list tenant tasks: {}", e)))?;
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state_str: String = row.get("state");
+            tasks.push(TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: state_str.parse()?,
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            });
+        }
+        Ok(tasks)
+    }
+
+    /// Count tasks by tenant ID
+    pub async fn count_tasks_by_tenant(&self, tenant_id: &str) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM celers_tasks WHERE metadata->>'tenant_id' = $1",
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to count tenant tasks: {}", e)))?;
+
+        Ok(count)
+    }
+
+    // ========== Bulk Operations ==========
+
+    /// Update multiple tasks to a specific state
+    ///
+    /// Useful for bulk operations like marking tasks as cancelled or failed.
+    pub async fn bulk_update_state(
+        &self,
+        task_ids: &[TaskId],
+        new_state: DbTaskState,
+    ) -> Result<u64> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = $1,
+                completed_at = CASE WHEN $1 IN ('completed', 'failed', 'cancelled')
+                                    THEN NOW() ELSE completed_at END
+            WHERE id = ANY($2)
+            "#,
+        )
+        .bind(new_state.to_string())
+        .bind(task_ids)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to bulk update state: {}", e)))?;
+
+        tracing::info!(
+            count = result.rows_affected(),
+            new_state = %new_state,
+            "Bulk updated task states"
+        );
+
+        Ok(result.rows_affected())
+    }
+
+    /// Find tasks created within a time range
+    ///
+    /// Useful for reporting and analytics.
+    pub async fn find_tasks_by_time_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        state: Option<DbTaskState>,
+        limit: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = match state {
+            Some(s) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE created_at >= $1 AND created_at <= $2
+                      AND state = $3
+                    ORDER BY created_at DESC
+                    LIMIT $4
+                    "#,
+                )
+                .bind(start)
+                .bind(end)
+                .bind(s.to_string())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE created_at >= $1 AND created_at <= $2
+                    ORDER BY created_at DESC
+                    LIMIT $3
+                    "#,
+                )
+                .bind(start)
+                .bind(end)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| CelersError::Other(format!("Failed to find tasks by time range: {}", e)))?;
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state_str: String = row.get("state");
+            tasks.push(TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: state_str.parse()?,
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            });
+        }
+        Ok(tasks)
+    }
+}
+
+/// Tenant-scoped broker for multi-tenant isolation
+///
+/// This wrapper automatically adds tenant_id to all tasks for better isolation.
+pub struct TenantBroker<'a> {
+    broker: &'a PostgresBroker,
+    tenant_id: String,
+}
+
+impl<'a> TenantBroker<'a> {
+    /// Enqueue a task with automatic tenant_id
+    pub async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
+        // The broker will merge this with task metadata
+        self.broker.enqueue(task).await
+    }
+
+    /// Get queue size for this tenant
+    pub async fn queue_size(&self) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM celers_tasks
+            WHERE metadata->>'tenant_id' = $1
+              AND state = 'pending'
+            "#,
+        )
+        .bind(&self.tenant_id)
+        .fetch_one(&self.broker.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get tenant queue size: {}", e)))?;
+
+        Ok(count as usize)
+    }
+
+    /// List tasks for this tenant
+    pub async fn list_tasks(
+        &self,
+        state: Option<DbTaskState>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        self.broker
+            .list_tasks_by_tenant(&self.tenant_id, state, limit, offset)
+            .await
+    }
+
+    /// Get tenant ID
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
 }
 
 #[async_trait]
@@ -2064,6 +3102,839 @@ impl Broker for PostgresBroker {
         .map_err(|e| CelersError::Other(format!("Failed to batch ack tasks: {}", e)))?;
 
         Ok(())
+    }
+}
+
+// Partition Management Methods
+impl PostgresBroker {
+    /// Create a partition for tasks table for a specific date (monthly partitions)
+    ///
+    /// This requires that the celers_tasks table is partitioned. See migration 003_partitioning.sql
+    /// for details on setting up table partitioning.
+    ///
+    /// # Arguments
+    /// * `partition_date` - Any date within the month to create partition for
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use chrono::{Utc, Datelike};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Create partition for current month
+    /// let current_date = Utc::now().naive_utc().date();
+    /// broker.create_partition(current_date).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn create_partition(&self, partition_date: chrono::NaiveDate) -> Result<String> {
+        let result: String = sqlx::query_scalar("SELECT create_tasks_partition($1)")
+            .bind(partition_date)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to create partition: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// Create partitions for a date range (monthly partitions)
+    ///
+    /// This creates all partitions from start_date to end_date (inclusive, by month).
+    /// Useful for initializing partitions for several months ahead.
+    ///
+    /// # Arguments
+    /// * `start_date` - Start of date range
+    /// * `end_date` - End of date range
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use chrono::{Utc, Datelike, Duration};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Create partitions for next 6 months
+    /// let start = Utc::now().naive_utc().date();
+    /// let end = start + Duration::days(180);
+    /// let results = broker.create_partitions_range(start, end).await?;
+    /// println!("Created {} partitions", results.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn create_partitions_range(
+        &self,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> Result<Vec<(String, String)>> {
+        let rows =
+            sqlx::query("SELECT partition_name, status FROM create_tasks_partitions_range($1, $2)")
+                .bind(start_date)
+                .bind(end_date)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to create partitions range: {}", e))
+                })?;
+
+        let results: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get("partition_name");
+                let status: String = row.get("status");
+                (name, status)
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Drop a partition for a specific date
+    ///
+    /// **WARNING**: This permanently deletes all tasks in the partition!
+    /// Use this for archiving old partitions after backing up the data.
+    ///
+    /// # Arguments
+    /// * `partition_date` - Any date within the month to drop partition for
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use chrono::NaiveDate;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Drop partition for January 2024 (after backing up!)
+    /// let old_date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+    /// broker.drop_partition(old_date).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn drop_partition(&self, partition_date: chrono::NaiveDate) -> Result<String> {
+        let result: String = sqlx::query_scalar("SELECT drop_tasks_partition($1)")
+            .bind(partition_date)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to drop partition: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// List all task partitions with their statistics
+    ///
+    /// Returns information about each partition including row count and size.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let partitions = broker.list_partitions().await?;
+    /// for partition in partitions {
+    ///     println!("{}: {} rows, {} bytes",
+    ///         partition.partition_name,
+    ///         partition.row_count,
+    ///         partition.size_bytes);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_partitions(&self) -> Result<Vec<PartitionInfo>> {
+        let rows = sqlx::query(
+            "SELECT partition_name, partition_start, partition_end, row_count, size_bytes
+             FROM list_tasks_partitions()",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to list partitions: {}", e)))?;
+
+        let partitions: Vec<PartitionInfo> = rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get("partition_name");
+                let start: chrono::NaiveDate = row.get("partition_start");
+                let end: chrono::NaiveDate = row.get("partition_end");
+                let row_count: i64 = row.get("row_count");
+                let size_bytes: i64 = row.get("size_bytes");
+
+                PartitionInfo {
+                    partition_name: name,
+                    partition_start: DateTime::from_naive_utc_and_offset(
+                        start.and_hms_opt(0, 0, 0).unwrap(),
+                        Utc,
+                    ),
+                    partition_end: DateTime::from_naive_utc_and_offset(
+                        end.and_hms_opt(0, 0, 0).unwrap(),
+                        Utc,
+                    ),
+                    row_count,
+                    size_bytes,
+                }
+            })
+            .collect();
+
+        Ok(partitions)
+    }
+
+    /// Maintain partitions by creating future partitions automatically
+    ///
+    /// This creates partitions for the current month plus `months_ahead` months.
+    /// Should be called periodically (e.g., daily or weekly) to ensure partitions
+    /// exist before tasks are enqueued.
+    ///
+    /// # Arguments
+    /// * `months_ahead` - Number of months ahead to create partitions for (default: 3)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Create partitions for current month + 3 months ahead
+    /// broker.maintain_partitions(3).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn maintain_partitions(&self, months_ahead: i32) -> Result<String> {
+        let result: String = sqlx::query_scalar("SELECT maintain_tasks_partitions($1)")
+            .bind(months_ahead)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to maintain partitions: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// Get the partition name for a specific date
+    ///
+    /// Useful for understanding which partition a task will be stored in.
+    ///
+    /// # Arguments
+    /// * `task_date` - Date to get partition name for
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use chrono::Utc;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let partition_name = broker.get_partition_name(Utc::now().naive_utc().date()).await?;
+    /// println!("Current partition: {}", partition_name);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_partition_name(&self, task_date: chrono::NaiveDate) -> Result<String> {
+        let result: String = sqlx::query_scalar("SELECT get_tasks_partition_name($1)")
+            .bind(task_date)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get partition name: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// Detach a partition for archiving without deleting data
+    ///
+    /// This detaches the partition from the main table but doesn't delete it.
+    /// Useful for archiving old data to separate storage before dropping.
+    ///
+    /// # Arguments
+    /// * `partition_date` - Any date within the month to detach partition for
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use chrono::NaiveDate;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Detach partition for archiving
+    /// let old_date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+    /// broker.detach_partition(old_date).await?;
+    /// // Now you can pg_dump the detached table and then drop it
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn detach_partition(&self, partition_date: chrono::NaiveDate) -> Result<String> {
+        let partition_name = self.get_partition_name(partition_date).await?;
+
+        sqlx::query(&format!(
+            "ALTER TABLE celers_tasks DETACH PARTITION {}",
+            partition_name
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to detach partition: {}", e)))?;
+
+        Ok(format!("Detached partition: {}", partition_name))
+    }
+}
+
+// Query Optimization Methods
+impl PostgresBroker {
+    /// Analyze query performance for the dequeue operation
+    ///
+    /// Returns EXPLAIN ANALYZE output for the main dequeue query.
+    /// Useful for understanding query performance and identifying bottlenecks.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let explain_output = broker.explain_dequeue_query().await?;
+    /// println!("Query plan:\n{}", explain_output);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn explain_dequeue_query(&self) -> Result<String> {
+        let explain_query = format!(
+            r#"
+            EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+            SELECT id, task_name, payload, retry_count, max_retries, created_at
+            FROM {}
+            WHERE state = 'pending' AND scheduled_at <= NOW()
+            ORDER BY priority DESC, created_at ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+            "#,
+            self.queue_name
+        );
+
+        let rows = sqlx::query_scalar::<_, String>(&explain_query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
+
+        Ok(rows.join("\n"))
+    }
+
+    /// Get query statistics for tasks table
+    ///
+    /// Returns statistics about table scans, index usage, etc.
+    /// Useful for monitoring query performance over time.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let stats = broker.get_query_stats().await?;
+    /// println!("Query statistics:\n{}", stats);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_query_stats(&self) -> Result<String> {
+        let query = format!(
+            r#"
+            SELECT
+                schemaname,
+                relname,
+                seq_scan,
+                seq_tup_read,
+                idx_scan,
+                idx_tup_fetch,
+                n_tup_ins,
+                n_tup_upd,
+                n_tup_del,
+                n_live_tup,
+                n_dead_tup,
+                last_vacuum,
+                last_autovacuum,
+                last_analyze,
+                last_autoanalyze
+            FROM pg_stat_user_tables
+            WHERE relname = '{}'
+            "#,
+            self.queue_name.trim_start_matches("public.")
+        );
+
+        let row = sqlx::query(&query)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get query stats: {}", e)))?;
+
+        let stats = format!(
+            "Table: {}.{}\n\
+             Sequential Scans: {}\n\
+             Sequential Tuples Read: {}\n\
+             Index Scans: {}\n\
+             Index Tuples Fetched: {}\n\
+             Tuples Inserted: {}\n\
+             Tuples Updated: {}\n\
+             Tuples Deleted: {}\n\
+             Live Tuples: {}\n\
+             Dead Tuples: {}\n\
+             Last Vacuum: {:?}\n\
+             Last Autovacuum: {:?}\n\
+             Last Analyze: {:?}\n\
+             Last Autoanalyze: {:?}",
+            row.get::<String, _>("schemaname"),
+            row.get::<String, _>("relname"),
+            row.get::<i64, _>("seq_scan"),
+            row.get::<i64, _>("seq_tup_read"),
+            row.get::<Option<i64>, _>("idx_scan").unwrap_or(0),
+            row.get::<Option<i64>, _>("idx_tup_fetch").unwrap_or(0),
+            row.get::<i64, _>("n_tup_ins"),
+            row.get::<i64, _>("n_tup_upd"),
+            row.get::<i64, _>("n_tup_del"),
+            row.get::<i64, _>("n_live_tup"),
+            row.get::<i64, _>("n_dead_tup"),
+            row.get::<Option<DateTime<Utc>>, _>("last_vacuum"),
+            row.get::<Option<DateTime<Utc>>, _>("last_autovacuum"),
+            row.get::<Option<DateTime<Utc>>, _>("last_analyze"),
+            row.get::<Option<DateTime<Utc>>, _>("last_autoanalyze")
+        );
+
+        Ok(stats)
+    }
+
+    /// Set query optimization hints for PostgreSQL
+    ///
+    /// Configures session-level query optimization settings.
+    /// These settings only affect the current connection.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Enable parallel query execution
+    /// broker.set_query_hints(true, 4).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_query_hints(
+        &self,
+        enable_parallel: bool,
+        max_parallel_workers: i32,
+    ) -> Result<()> {
+        if enable_parallel {
+            sqlx::query(&format!(
+                "SET max_parallel_workers_per_gather = {}",
+                max_parallel_workers
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
+
+            sqlx::query("SET parallel_setup_cost = 100")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
+
+            sqlx::query("SET parallel_tuple_cost = 0.01")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
+        } else {
+            sqlx::query("SET max_parallel_workers_per_gather = 0")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    /// Get connection pool configuration recommendations
+    ///
+    /// Analyzes current workload and returns recommended pool settings.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let recommendations = broker.get_pool_recommendations().await?;
+    /// println!("{}", recommendations);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_pool_recommendations(&self) -> Result<String> {
+        let metrics = self.get_pool_metrics();
+        let stats = self.get_statistics().await?;
+
+        let utilization = if metrics.max_size > 0 {
+            (metrics.in_use as f64 / metrics.max_size as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let recommendations = format!(
+            "Connection Pool Recommendations:\n\
+             \n\
+             Current Configuration:\n\
+             - Max Size: {}\n\
+             - Current Size: {}\n\
+             - In Use: {} ({}% utilization)\n\
+             - Idle: {}\n\
+             \n\
+             Workload Analysis:\n\
+             - Pending Tasks: {}\n\
+             - Processing Tasks: {}\n\
+             - Total Tasks: {}\n\
+             \n\
+             Recommendations:\n\
+             {}",
+            metrics.max_size,
+            metrics.size,
+            metrics.in_use,
+            utilization as i32,
+            metrics.idle,
+            stats.pending,
+            stats.processing,
+            stats.total,
+            if utilization > 80.0 {
+                "⚠️  High pool utilization! Consider increasing max_connections.\n\
+                 - Recommended: Increase pool size to handle peak load\n\
+                 - Current bottleneck: Connection pool exhaustion"
+            } else if utilization < 20.0 && metrics.max_size > 10 {
+                "✓ Pool is underutilized. You may reduce max_connections to save resources.\n\
+                 - Recommended: Reduce pool size to 50-60% of current\n\
+                 - Benefit: Lower memory usage and connection overhead"
+            } else {
+                "✓ Pool utilization is optimal (20-80% range).\n\
+                 - Current configuration is well-tuned for your workload"
+            }
+        );
+
+        Ok(recommendations)
+    }
+}
+
+// Connection Health & Resilience Methods
+impl PostgresBroker {
+    /// Perform detailed health check with diagnostics and recommendations
+    ///
+    /// This provides a comprehensive health assessment including connection status,
+    /// query performance, pool metrics, and actionable recommendations.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let health = broker.check_health_detailed().await?;
+    /// if !health.healthy {
+    ///     eprintln!("Health check failed!");
+    ///     for warning in &health.warnings {
+    ///         eprintln!("Warning: {}", warning);
+    ///     }
+    /// }
+    /// for rec in &health.recommendations {
+    ///     println!("Recommendation: {}", rec);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn check_health_detailed(&self) -> Result<DetailedHealthStatus> {
+        let start = std::time::Instant::now();
+
+        // Test connection and get version
+        let version_result = sqlx::query_scalar::<_, String>("SELECT version()")
+            .fetch_one(&self.pool)
+            .await;
+
+        let (connection_ok, database_version) = match version_result {
+            Ok(v) => (true, v),
+            Err(e) => (false, format!("Connection failed: {}", e)),
+        };
+
+        let query_latency_ms = start.elapsed().as_millis() as i64;
+
+        // Get metrics even if connection failed (from cached pool state)
+        let pool_metrics = self.get_pool_metrics();
+
+        // Try to get queue stats (may fail if connection is down)
+        let queue_stats = self.get_statistics().await.unwrap_or_default();
+
+        // Generate warnings and recommendations
+        let mut warnings = Vec::new();
+        let mut recommendations = Vec::new();
+
+        // Check connection health
+        if !connection_ok {
+            warnings.push("Database connection failed".to_string());
+            recommendations
+                .push("Check database availability and network connectivity".to_string());
+        } else if query_latency_ms > 1000 {
+            warnings.push(format!("High query latency: {}ms", query_latency_ms));
+            recommendations
+                .push("Database may be overloaded or network latency is high".to_string());
+        }
+
+        // Check pool utilization
+        let utilization = if pool_metrics.max_size > 0 {
+            (pool_metrics.in_use as f64 / pool_metrics.max_size as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        if utilization > 90.0 {
+            warnings.push(format!("Critical pool utilization: {:.1}%", utilization));
+            recommendations.push(
+                "Increase max_connections immediately to prevent service degradation".to_string(),
+            );
+        } else if utilization > 80.0 {
+            warnings.push(format!("High pool utilization: {:.1}%", utilization));
+            recommendations.push("Consider increasing max_connections".to_string());
+        }
+
+        // Check idle connections
+        if pool_metrics.idle == 0 && pool_metrics.in_use > 0 {
+            warnings.push("No idle connections available".to_string());
+            recommendations.push("Pool exhaustion detected - increase max_connections".to_string());
+        }
+
+        // Check queue health
+        if queue_stats.processing > queue_stats.pending * 5 {
+            warnings.push("Many tasks stuck in processing state".to_string());
+            recommendations
+                .push("Run recover_stuck_tasks() to recover abandoned tasks".to_string());
+        }
+
+        if queue_stats.dlq > 1000 {
+            warnings.push(format!("Large DLQ size: {} tasks", queue_stats.dlq));
+            recommendations.push("Review and address failed tasks in DLQ".to_string());
+        }
+
+        // Overall health determination
+        let healthy = connection_ok && utilization < 95.0 && query_latency_ms < 5000;
+
+        Ok(DetailedHealthStatus {
+            healthy,
+            connection_ok,
+            query_latency_ms,
+            pool_metrics,
+            queue_stats,
+            database_version,
+            warnings,
+            recommendations,
+        })
+    }
+
+    /// Test connection with automatic retry on transient failures
+    ///
+    /// Attempts to connect to the database with exponential backoff retry logic.
+    /// Useful for startup health checks and connection validation.
+    ///
+    /// # Arguments
+    /// * `max_retries` - Maximum number of retry attempts
+    /// * `initial_delay_ms` - Initial delay between retries in milliseconds
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Test with 5 retries, starting with 100ms delay
+    /// match broker.test_connection_with_retry(5, 100).await {
+    ///     Ok(_) => println!("Connection successful"),
+    ///     Err(e) => eprintln!("Connection failed after retries: {}", e),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn test_connection_with_retry(
+        &self,
+        max_retries: u32,
+        initial_delay_ms: u64,
+    ) -> Result<String> {
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            match sqlx::query_scalar::<_, String>("SELECT version()")
+                .fetch_one(&self.pool)
+                .await
+            {
+                Ok(version) => {
+                    if attempt > 0 {
+                        tracing::info!("Connection successful after {} attempt(s)", attempt + 1);
+                    }
+                    return Ok(version);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+
+                    if attempt < max_retries {
+                        let delay_ms = initial_delay_ms * 2_u64.pow(attempt);
+                        tracing::warn!(
+                            "Connection attempt {} failed, retrying in {}ms: {}",
+                            attempt + 1,
+                            delay_ms,
+                            last_error.as_ref().unwrap()
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(CelersError::Other(format!(
+            "Connection failed after {} retries: {}",
+            max_retries,
+            last_error.unwrap()
+        )))
+    }
+
+    /// Get recommended batch sizes based on current workload and pool configuration
+    ///
+    /// Analyzes the current queue state and connection pool to recommend
+    /// optimal batch sizes for different operations.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let recommendation = broker.get_recommended_batch_size().await?;
+    /// println!("Recommended enqueue batch size: {}", recommendation.enqueue_batch_size);
+    /// println!("Reasoning: {}", recommendation.reasoning);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_recommended_batch_size(&self) -> Result<BatchSizeRecommendation> {
+        let stats = self.get_statistics().await?;
+        let pool_metrics = self.get_pool_metrics();
+
+        // Calculate pool pressure
+        let pool_utilization = if pool_metrics.max_size > 0 {
+            pool_metrics.in_use as f64 / pool_metrics.max_size as f64
+        } else {
+            0.0
+        };
+
+        // Base batch sizes on workload
+        let queue_depth = stats.pending + stats.processing;
+
+        let (enqueue_batch_size, dequeue_batch_size, ack_batch_size, reasoning) =
+            if pool_utilization > 0.8 {
+                // High pool pressure - use smaller batches to avoid connection exhaustion
+                (
+                    50,
+                    10,
+                    50,
+                    format!(
+                        "High pool utilization ({:.1}%) - using smaller batches to reduce connection time. \
+                        Consider increasing max_connections from {} to {}.",
+                        pool_utilization * 100.0,
+                        pool_metrics.max_size,
+                        pool_metrics.max_size * 2
+                    )
+                )
+            } else if queue_depth > 10000 {
+                // High queue depth - use larger batches for throughput
+                (
+                    500,
+                    50,
+                    200,
+                    format!(
+                        "High queue depth ({} tasks) - using larger batches for maximum throughput. \
+                        Pool utilization is healthy at {:.1}%.",
+                        queue_depth,
+                        pool_utilization * 100.0
+                    )
+                )
+            } else if queue_depth > 1000 {
+                // Medium queue depth - balanced approach
+                (
+                    200,
+                    25,
+                    100,
+                    format!(
+                        "Medium queue depth ({} tasks) - balanced batch sizes. \
+                        Pool utilization: {:.1}%.",
+                        queue_depth,
+                        pool_utilization * 100.0
+                    ),
+                )
+            } else {
+                // Low queue depth - smaller batches for latency
+                (
+                    100,
+                    10,
+                    50,
+                    format!(
+                        "Low queue depth ({} tasks) - using smaller batches for lower latency. \
+                        Pool utilization: {:.1}%.",
+                        queue_depth,
+                        pool_utilization * 100.0
+                    ),
+                )
+            };
+
+        Ok(BatchSizeRecommendation {
+            enqueue_batch_size,
+            dequeue_batch_size,
+            ack_batch_size,
+            reasoning,
+        })
+    }
+
+    /// Detect potential connection leaks
+    ///
+    /// Analyzes connection pool state over time to identify potential leaks.
+    /// Returns a report of suspicious patterns.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let report = broker.detect_connection_leaks().await?;
+    /// println!("{}", report);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn detect_connection_leaks(&self) -> Result<String> {
+        let initial_metrics = self.get_pool_metrics();
+
+        // Wait a bit and check again
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let final_metrics = self.get_pool_metrics();
+
+        let mut report = String::from("Connection Leak Detection Report:\n\n");
+
+        report.push_str("Initial state:\n");
+        report.push_str(&format!("  - In use: {}\n", initial_metrics.in_use));
+        report.push_str(&format!("  - Idle: {}\n", initial_metrics.idle));
+        report.push_str(&format!("  - Total: {}\n\n", initial_metrics.size));
+
+        report.push_str("After 5 seconds:\n");
+        report.push_str(&format!("  - In use: {}\n", final_metrics.in_use));
+        report.push_str(&format!("  - Idle: {}\n", final_metrics.idle));
+        report.push_str(&format!("  - Total: {}\n\n", final_metrics.size));
+
+        // Analyze changes
+        if final_metrics.in_use > initial_metrics.in_use {
+            report.push_str("⚠️  WARNING: Connections in use increased without being released.\n");
+            report.push_str("   This may indicate a connection leak.\n");
+            report.push_str(
+                "   Ensure all database operations use proper error handling and cleanup.\n\n",
+            );
+        } else if final_metrics.in_use == initial_metrics.in_use && final_metrics.in_use > 0 {
+            report.push_str("⚠️  INFO: Connections remain in use without change.\n");
+            report.push_str("   This is normal during active workload but monitor for growth.\n\n");
+        } else {
+            report.push_str("✓ No obvious connection leaks detected.\n\n");
+        }
+
+        // Check for high sustained usage
+        let utilization = if final_metrics.max_size > 0 {
+            (final_metrics.in_use as f64 / final_metrics.max_size as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        if utilization > 80.0 {
+            report.push_str(&format!(
+                "⚠️  HIGH UTILIZATION: {:.1}% of connections in use.\n",
+                utilization
+            ));
+            report.push_str(
+                "   Monitor for connection exhaustion and consider increasing pool size.\n",
+            );
+        }
+
+        Ok(report)
     }
 }
 

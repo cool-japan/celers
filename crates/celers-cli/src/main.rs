@@ -1,7 +1,9 @@
 mod commands;
 mod config;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
+use std::io;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -92,6 +94,10 @@ enum Commands {
         /// Filter metrics by name pattern
         #[arg(short = 'p', long)]
         pattern: Option<String>,
+
+        /// Watch mode - refresh metrics every N seconds
+        #[arg(short, long)]
+        watch: Option<u64>,
     },
 
     /// Validate configuration file
@@ -104,6 +110,63 @@ enum Commands {
         #[arg(short = 't', long)]
         test_connection: bool,
     },
+
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell type (bash, zsh, fish, powershell, elvish)
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+
+    /// Run system health diagnostics
+    Health {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Worker management operations
+    #[command(subcommand)]
+    WorkerMgmt(WorkerMgmtCommands),
+
+    /// Automatic problem detection and diagnostics
+    Doctor {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Scheduled task management
+    #[command(subcommand)]
+    Schedule(ScheduleCommands),
+
+    /// Debug commands for troubleshooting
+    #[command(subcommand)]
+    Debug(DebugCommands),
+
+    /// Generate execution reports
+    #[command(subcommand)]
+    Report(ReportCommands),
+
+    /// Analyze system performance and failures
+    #[command(subcommand)]
+    Analyze(AnalyzeCommands),
 }
 
 #[derive(Subcommand)]
@@ -276,6 +339,36 @@ enum QueueCommands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+
+    /// Pause queue processing
+    Pause {
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Resume queue processing
+    Resume {
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -364,6 +457,376 @@ enum TaskCommands {
         /// Broker URL
         #[arg(short, long)]
         broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Show task execution logs
+    Logs {
+        /// Task ID (UUID)
+        task_id: String,
+
+        /// Broker URL (for Redis storage)
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Number of log lines to show
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkerMgmtCommands {
+    /// List all running workers
+    List {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Show detailed statistics for a worker
+    Stats {
+        /// Worker ID
+        worker_id: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Stop a specific worker
+    Stop {
+        /// Worker ID
+        worker_id: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Graceful shutdown
+        #[arg(short, long)]
+        graceful: bool,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Pause task processing for a worker
+    Pause {
+        /// Worker ID
+        worker_id: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Resume task processing for a worker
+    Resume {
+        /// Worker ID
+        #[arg(short, long)]
+        worker_id: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Scale workers to N instances
+    Scale {
+        /// Target number of workers
+        count: usize,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Drain worker (stop accepting new tasks)
+    Drain {
+        /// Worker ID
+        worker_id: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Stream worker logs
+    Logs {
+        /// Worker ID
+        worker_id: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Filter by log level (error, warn, info, debug)
+        #[arg(short, long)]
+        level: Option<String>,
+
+        /// Follow mode (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Number of log lines to show initially
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommands {
+    /// List all scheduled tasks
+    List {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Add a new scheduled task
+    Add {
+        /// Schedule name
+        name: String,
+
+        /// Task name to execute
+        #[arg(short, long)]
+        task: String,
+
+        /// Cron expression (e.g., "0 0 * * *" for daily at midnight)
+        #[arg(short, long)]
+        cron: String,
+
+        /// Queue to send task to
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Task arguments as JSON
+        #[arg(short, long)]
+        args: Option<String>,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Remove a scheduled task
+    Remove {
+        /// Schedule name
+        name: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Confirm deletion
+        #[arg(long)]
+        confirm: bool,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Pause a schedule
+    Pause {
+        /// Schedule name
+        name: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Resume a paused schedule
+    Resume {
+        /// Schedule name
+        name: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Manually trigger a scheduled task
+    Trigger {
+        /// Schedule name
+        name: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Show execution history for a schedule
+    History {
+        /// Schedule name
+        name: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Limit number of history entries
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommands {
+    /// Debug task execution details
+    Task {
+        /// Task ID (UUID)
+        task_id: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Debug worker issues
+    Worker {
+        /// Worker ID
+        worker_id: String,
+
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReportCommands {
+    /// Generate daily execution report
+    Daily {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Generate weekly statistics report
+    Weekly {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnalyzeCommands {
+    /// Analyze performance bottlenecks
+    Bottlenecks {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Analyze failure patterns
+    Failures {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
 
         /// Configuration file path
         #[arg(long)]
@@ -539,6 +1002,30 @@ async fn main() -> anyhow::Result<()> {
 
                 commands::import_queue(&broker_url, &queue_name, &input, confirm).await?;
             }
+
+            QueueCommands::Pause {
+                queue,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::pause_queue(&broker_url, &queue_name).await?;
+            }
+
+            QueueCommands::Resume {
+                queue,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::resume_queue(&broker_url, &queue_name).await?;
+            }
         },
 
         Commands::Task(task_cmd) => match task_cmd {
@@ -604,6 +1091,18 @@ async fn main() -> anyhow::Result<()> {
 
                 commands::requeue_task(&broker_url, &from, &to, &task_id).await?;
             }
+
+            TaskCommands::Logs {
+                task_id,
+                broker,
+                limit,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::show_task_logs(&broker_url, &task_id, limit).await?;
+            }
         },
 
         Commands::Init { output } => {
@@ -614,8 +1113,9 @@ async fn main() -> anyhow::Result<()> {
             format,
             output,
             pattern,
+            watch,
         } => {
-            commands::show_metrics(&format, output.as_deref(), pattern.as_deref()).await?;
+            commands::show_metrics(&format, output.as_deref(), pattern.as_deref(), watch).await?;
         }
 
         Commands::Validate {
@@ -624,6 +1124,295 @@ async fn main() -> anyhow::Result<()> {
         } => {
             commands::validate_config(&config, test_connection).await?;
         }
+
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, bin_name, &mut io::stdout());
+        }
+
+        Commands::Health {
+            broker,
+            queue,
+            config,
+        } => {
+            let cfg = load_config(config)?;
+            let broker_url = broker.unwrap_or(cfg.broker.url);
+            let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+            commands::health_check(&broker_url, &queue_name).await?;
+        }
+
+        Commands::WorkerMgmt(worker_cmd) => match worker_cmd {
+            WorkerMgmtCommands::List { broker, config } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::list_workers(&broker_url).await?;
+            }
+
+            WorkerMgmtCommands::Stats {
+                worker_id,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::worker_stats(&broker_url, &worker_id).await?;
+            }
+
+            WorkerMgmtCommands::Stop {
+                worker_id,
+                broker,
+                graceful,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::stop_worker(&broker_url, &worker_id, graceful).await?;
+            }
+
+            WorkerMgmtCommands::Pause {
+                worker_id,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::pause_worker(&broker_url, &worker_id).await?;
+            }
+
+            WorkerMgmtCommands::Resume {
+                worker_id,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::resume_worker(&broker_url, &worker_id).await?;
+            }
+
+            WorkerMgmtCommands::Scale {
+                count,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::scale_workers(&broker_url, count).await?;
+            }
+
+            WorkerMgmtCommands::Drain {
+                worker_id,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::drain_worker(&broker_url, &worker_id).await?;
+            }
+
+            WorkerMgmtCommands::Logs {
+                worker_id,
+                broker,
+                level,
+                follow,
+                lines,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::worker_logs(&broker_url, &worker_id, level.as_deref(), follow, lines)
+                    .await?;
+            }
+        },
+
+        Commands::Doctor {
+            broker,
+            queue,
+            config,
+        } => {
+            let cfg = load_config(config)?;
+            let broker_url = broker.unwrap_or(cfg.broker.url);
+            let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+            commands::doctor(&broker_url, &queue_name).await?;
+        }
+
+        Commands::Schedule(schedule_cmd) => match schedule_cmd {
+            ScheduleCommands::List { broker, config } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::list_schedules(&broker_url).await?;
+            }
+
+            ScheduleCommands::Add {
+                name,
+                task,
+                cron,
+                queue,
+                args,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::add_schedule(
+                    &broker_url,
+                    &name,
+                    &task,
+                    &cron,
+                    &queue_name,
+                    args.as_deref(),
+                )
+                .await?;
+            }
+
+            ScheduleCommands::Remove {
+                name,
+                broker,
+                confirm,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::remove_schedule(&broker_url, &name, confirm).await?;
+            }
+
+            ScheduleCommands::Pause {
+                name,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::pause_schedule(&broker_url, &name).await?;
+            }
+
+            ScheduleCommands::Resume {
+                name,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::resume_schedule(&broker_url, &name).await?;
+            }
+
+            ScheduleCommands::Trigger {
+                name,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::trigger_schedule(&broker_url, &name).await?;
+            }
+
+            ScheduleCommands::History {
+                name,
+                broker,
+                limit,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::schedule_history(&broker_url, &name, limit).await?;
+            }
+        },
+
+        Commands::Debug(debug_cmd) => match debug_cmd {
+            DebugCommands::Task {
+                task_id,
+                broker,
+                queue,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::debug_task(&broker_url, &queue_name, &task_id).await?;
+            }
+
+            DebugCommands::Worker {
+                worker_id,
+                broker,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::debug_worker(&broker_url, &worker_id).await?;
+            }
+        },
+
+        Commands::Report(report_cmd) => match report_cmd {
+            ReportCommands::Daily {
+                broker,
+                queue,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::report_daily(&broker_url, &queue_name).await?;
+            }
+
+            ReportCommands::Weekly {
+                broker,
+                queue,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::report_weekly(&broker_url, &queue_name).await?;
+            }
+        },
+
+        Commands::Analyze(analyze_cmd) => match analyze_cmd {
+            AnalyzeCommands::Bottlenecks {
+                broker,
+                queue,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::analyze_bottlenecks(&broker_url, &queue_name).await?;
+            }
+
+            AnalyzeCommands::Failures {
+                broker,
+                queue,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::analyze_failures(&broker_url, &queue_name).await?;
+            }
+        },
     }
 
     Ok(())

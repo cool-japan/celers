@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS celers_chord_state (
     completed INT NOT NULL DEFAULT 0,
     callback TEXT,
     task_ids JSON NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    timeout_seconds BIGINT,
+    cancelled BOOLEAN NOT NULL DEFAULT FALSE,
+    cancellation_reason TEXT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Indexes for performance

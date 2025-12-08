@@ -6,6 +6,81 @@
 
 Provides ergonomic macros for defining tasks without boilerplate.
 
+## Recent Enhancements (2025)
+
+### December 5, 2025 - Part 2: Derive Macro, Examples, Edge Cases
+- ✅ Enhanced #[derive(Task)] macro (previously stub)
+  - Parse custom attributes (input, output, name)
+  - Automatic CamelCase to snake_case name conversion
+  - Support for generic structs
+  - Expects execute_impl method implementation
+  - Unit tests for name conversion logic
+- ✅ Added runnable examples directory
+  - basic_task.rs: Demonstrates #[task] macro usage
+  - derive_task.rs: Demonstrates #[derive(Task)] usage
+  - Both examples run successfully with comprehensive output
+- ✅ Expanded edge case test coverage (18 total integration tests now)
+  - No parameters task
+  - Many parameters (5+) task
+  - Unit return type task
+  - Nested types (Vec<Vec<T>>) task
+  - Tuple return types
+  - All new tests pass ✅
+- ✅ Updated dependencies for examples
+  - Added rt-multi-thread feature to tokio
+
+### December 5, 2025 - Part 1: Integration Tests, Generics, Documentation
+- ✅ Added comprehensive integration test suite (13 tests)
+  - Tests cover basic execution, configuration, optionals, errors, serialization
+  - All tests pass successfully
+- ✅ Implemented generic parameter support
+  - Generics are now parsed from function signatures
+  - Generic parameters propagated to generated structs
+  - Default implementation handles both generic and non-generic tasks
+  - Basic generics work correctly (HRTBs need careful handling)
+- ✅ Added validation infrastructure (foundation)
+  - FieldValidation struct for range, length, and pattern validation
+  - Code generation methods ready for validation logic
+  - Full implementation deferred (requires parameter attribute parsing)
+- ✅ Enhanced module documentation
+  - Added comprehensive overview with multiple examples
+  - Documented generated code structure
+  - Added usage examples for basic, configured, optional, and generic tasks
+  - Documented limitations and attribute parameters
+- ✅ Updated test dependencies (async-trait, serde, serde_json, tokio)
+
+### Earlier 2025 Enhancements
+
+#### New Attribute Parameters
+- ✅ `timeout`: Configure task timeout in seconds
+- ✅ `priority`: Set task priority (higher = more important)
+- ✅ `max_retries`: Specify maximum retry attempts
+
+#### Code Generation Improvements
+- ✅ Automatic documentation for generated structs
+- ✅ Optional field support with smart serde attributes
+- ✅ Configuration accessor methods on Task structs
+- ✅ Default derive for Input structs with all optional fields
+- ✅ Generic parameter support in generated code
+
+#### Error Handling & Validation
+- ✅ Enhanced error messages with detailed context
+- ✅ Duplicate attribute detection
+- ✅ Empty name validation
+- ✅ Zero timeout validation
+- ✅ Value range validation (u64, i32, u32)
+- ✅ Async function validation with helpful error messages
+
+#### Testing Infrastructure
+- ✅ 21 comprehensive unit tests (added name conversion test)
+- ✅ 18 integration tests (expanded with edge cases)
+- ✅ Attribute parsing tests (14 tests)
+- ✅ Type detection edge case tests (6 tests)
+- ✅ Tests for duplicate attributes
+- ✅ Tests for invalid values
+- ✅ Complex generic type tests
+- ✅ Edge case tests (no params, many params, unit return, nested types, tuples)
+
 ## Completed Features
 
 ### #[task] Attribute Macro ✅
@@ -15,6 +90,9 @@ Provides ergonomic macros for defining tasks without boilerplate.
 - [x] Async function support
 - [x] Name inference from function name
 - [x] Serde derive for input structs
+- [x] Attribute-based configuration (timeout, priority, max_retries)
+- [x] Optional field support with automatic serde attributes
+- [x] Documentation generation for generated structs
 
 ### Code Generation ✅
 - [x] Generate `{FunctionName}Task` struct
@@ -51,18 +129,31 @@ async fn process_data(id: u64, name: String) -> celers_core::Result<String> {
 ### Macro Features
 - [x] Custom task names via attribute parameters ✅
   - [x] `#[task(name = "custom.name")]` support
-- [ ] Default values for parameters
-- [ ] Validation attributes
-- [ ] Custom serialization formats
-- [ ] Timeout configuration via attributes
-- [ ] Priority configuration via attributes
+- [x] Timeout configuration via attributes ✅
+  - [x] `#[task(timeout = 60)]` support
+- [x] Priority configuration via attributes ✅
+  - [x] `#[task(priority = 10)]` support
+- [x] Max retries configuration via attributes ✅
+  - [x] `#[task(max_retries = 3)]` support
+- [x] Default values for parameters ✅
+  - [x] Automatic Default derive for all-optional Input structs
+  - [x] Serde default support for optional fields
+- [ ] Validation attributes (future)
+- [ ] Custom serialization formats (future)
 
 ### Code Generation Improvements
-- [ ] Better error messages
-- [ ] Span preservation for errors
-- [ ] Documentation generation
-- [ ] Optional field support
-- [ ] Generic parameter support
+- [x] Documentation generation ✅
+- [x] Optional field support ✅
+  - [x] Automatic serde attributes for Option<T> fields
+  - [x] Default derive for all-optional Input structs
+- [x] Better error messages ✅
+- [x] Span preservation for errors ✅
+- [x] Generic parameter support ✅ (COMPLETED 2025-12-05)
+  - [x] Parse generic parameters from function signatures
+  - [x] Propagate generics to generated structs
+  - [x] Handle where clauses
+  - [x] Support both generic and non-generic tasks
+  - [ ] Full HRTB support with serde (future enhancement)
 
 ### Developer Experience
 - [ ] IDE autocomplete support
@@ -72,20 +163,57 @@ async fn process_data(id: u64, name: String) -> celers_core::Result<String> {
 
 ## Testing Status
 
-- [x] Doc tests (2 tests, currently ignored)
-- [ ] Unit tests for macro expansion
-- [ ] Integration tests with task registry
-- [ ] Error case testing
-- [ ] Edge case testing (lifetimes, generics)
+- [x] Doc tests (8 tests, currently ignored - normal for proc macros)
+- [x] Unit tests for macro expansion ✅ (21 tests total)
+  - [x] is_option_type helper function tests (7 tests)
+  - [x] TaskAttr parsing tests (13 tests total)
+  - [x] Invalid input tests
+  - [x] Duplicate attribute tests
+  - [x] Value validation tests
+  - [x] Name conversion test (CamelCase to snake_case)
+- [x] Edge case testing ✅
+  - [x] Nested Option types
+  - [x] Complex generic types
+  - [x] Various container types
+- [x] Integration tests ✅ (18 tests - EXPANDED 2025-12-05)
+  - [x] Basic task execution tests
+  - [x] Custom configuration tests (name, timeout, priority, max_retries)
+  - [x] Optional parameter tests
+  - [x] Mixed type tests
+  - [x] Error handling tests
+  - [x] Serialization tests
+  - [x] Default derive tests
+  - [x] Complex return type tests
+  - [x] Generic parameter syntax tests
+  - [x] No parameters test ✅ (NEW)
+  - [x] Many parameters test ✅ (NEW)
+  - [x] Unit return type test ✅ (NEW)
+  - [x] Nested types test ✅ (NEW)
+  - [x] Tuple return types test ✅ (NEW)
+- [x] Examples ✅ (NEW - 2025-12-05)
+  - [x] basic_task.rs - Runnable example for #[task] macro
+  - [x] derive_task.rs - Runnable example for #[derive(Task)]
 
 ## Documentation
 
-- [x] Module-level documentation
+- [x] Module-level documentation ✅ (ENHANCED - 2025-12-05)
+  - [x] Comprehensive overview section
+  - [x] Multiple code examples (basic, configuration, optional params, generics)
+  - [x] Generated code structure explanation
+  - [x] Attribute parameters reference
+  - [x] Limitations section
 - [x] #[task] macro documentation with example
-- [ ] Detailed attribute parameter docs
-- [ ] Macro expansion guide
-- [ ] Common patterns and recipes
-- [ ] Troubleshooting guide
+- [x] Detailed attribute parameter docs ✅
+  - [x] name, timeout, priority, max_retries
+- [x] Generated struct documentation ✅
+- [x] Macro expansion guide ✅
+  - [x] Complete examples with before/after code
+  - [x] Configuration usage patterns
+  - [x] Optional parameter handling
+  - [x] Error message examples
+  - [x] Best practices guide
+- [ ] Common patterns and recipes (in expansion guide)
+- [ ] Troubleshooting guide (error messages cover this)
 
 ## Dependencies
 
@@ -95,10 +223,14 @@ async fn process_data(id: u64, name: String) -> celers_core::Result<String> {
 
 ## Known Limitations
 
-- Generic parameters not yet supported
+- Generic parameters: Basic support added ✅ (2025-12-05)
+  - Generic parameters are now parsed and propagated to generated structs
+  - Simple generics work correctly
+  - HRTBs (Higher-Ranked Trait Bounds) with serde may require careful handling
 - Lifetime parameters require specific handling
 - Complex return types may not parse correctly
 - No support for `impl Trait` return types
+- Validation attributes infrastructure in place but not yet fully implemented
 
 ## Notes
 

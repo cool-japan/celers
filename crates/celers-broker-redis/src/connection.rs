@@ -24,6 +24,13 @@ pub struct TlsConfig {
     pub client_cert_path: Option<String>,
     /// Path to client key file
     pub client_key_path: Option<String>,
+    /// Cipher suites to use (e.g., "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+    /// If None, uses the default cipher suites
+    pub cipher_suites: Option<String>,
+    /// Minimum TLS version (e.g., "1.2", "1.3")
+    pub min_tls_version: Option<String>,
+    /// Maximum TLS version (e.g., "1.2", "1.3")
+    pub max_tls_version: Option<String>,
 }
 
 impl TlsConfig {
@@ -60,6 +67,24 @@ impl TlsConfig {
         self.client_key_path = Some(key_path.into());
         self
     }
+
+    /// Set cipher suites (e.g., "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+    pub fn cipher_suites(mut self, suites: impl Into<String>) -> Self {
+        self.cipher_suites = Some(suites.into());
+        self
+    }
+
+    /// Set minimum TLS version (e.g., "1.2", "1.3")
+    pub fn min_tls_version(mut self, version: impl Into<String>) -> Self {
+        self.min_tls_version = Some(version.into());
+        self
+    }
+
+    /// Set maximum TLS version (e.g., "1.2", "1.3")
+    pub fn max_tls_version(mut self, version: impl Into<String>) -> Self {
+        self.max_tls_version = Some(version.into());
+        self
+    }
 }
 
 /// Redis connection configuration
@@ -79,6 +104,8 @@ pub struct RedisConfig {
     pub username: Option<String>,
     /// Password for authentication
     pub password: Option<String>,
+    /// ACL token for authentication (Redis 6+, alternative to username/password)
+    pub acl_token: Option<String>,
     /// Maximum number of retry attempts
     pub max_retry_attempts: usize,
     /// Retry delay
@@ -95,6 +122,7 @@ impl Default for RedisConfig {
             database: Some(0),
             username: None,
             password: None,
+            acl_token: None,
             max_retry_attempts: 3,
             retry_delay: Duration::from_millis(100),
         }
@@ -154,6 +182,13 @@ impl RedisConfig {
     /// Set password for authentication
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
+        self
+    }
+
+    /// Set ACL token for authentication (Redis 6+)
+    /// This is an alternative to username/password authentication
+    pub fn acl_token(mut self, token: impl Into<String>) -> Self {
+        self.acl_token = Some(token.into());
         self
     }
 
@@ -327,5 +362,58 @@ mod tests {
         let config = RedisConfig::from_url("invalid://bad-url");
         let result = config.build_client();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tls_config_cipher_suites() {
+        let tls = TlsConfig::new()
+            .enabled(true)
+            .cipher_suites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
+
+        assert!(tls.enabled);
+        assert_eq!(
+            tls.cipher_suites,
+            Some("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tls_config_tls_versions() {
+        let tls = TlsConfig::new()
+            .min_tls_version("1.2")
+            .max_tls_version("1.3");
+
+        assert_eq!(tls.min_tls_version, Some("1.2".to_string()));
+        assert_eq!(tls.max_tls_version, Some("1.3".to_string()));
+    }
+
+    #[test]
+    fn test_redis_config_acl_token() {
+        let config = RedisConfig::new().acl_token("my-secret-token");
+
+        assert_eq!(config.acl_token, Some("my-secret-token".to_string()));
+    }
+
+    #[test]
+    fn test_redis_config_with_full_tls() {
+        let tls = TlsConfig::new()
+            .enabled(true)
+            .ca_cert("/path/to/ca.crt")
+            .client_cert("/path/to/client.crt", "/path/to/client.key")
+            .cipher_suites("TLS_AES_256_GCM_SHA384")
+            .min_tls_version("1.3");
+
+        let config = RedisConfig::new()
+            .url("rediss://localhost:6380")
+            .tls(tls)
+            .database(1);
+
+        assert!(config.tls.enabled);
+        assert_eq!(config.tls.ca_cert_path, Some("/path/to/ca.crt".to_string()));
+        assert_eq!(
+            config.tls.cipher_suites,
+            Some("TLS_AES_256_GCM_SHA384".to_string())
+        );
+        assert_eq!(config.tls.min_tls_version, Some("1.3".to_string()));
     }
 }

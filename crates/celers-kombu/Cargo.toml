@@ -21,6 +21,11 @@ celers-protocol = { path = "../celers-protocol" }
 
 [dev-dependencies]
 tokio = { version = "1.42", features = ["full"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "broker_bench"
+harness = false
 
 [features]
 default = []

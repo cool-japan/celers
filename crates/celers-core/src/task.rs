@@ -8,6 +8,378 @@ use uuid::Uuid;
 /// Unique identifier for a task
 pub type TaskId = Uuid;
 
+/// Batch utility functions for working with multiple tasks
+pub mod batch {
+    use super::*;
+
+    /// Validate a collection of tasks, returning all errors
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1, 2, 3]),
+    ///     SerializedTask::new("task2".to_string(), vec![4, 5, 6]),
+    /// ];
+    ///
+    /// let errors = batch::validate_all(&tasks);
+    /// assert!(errors.is_empty());
+    /// ```
+    pub fn validate_all(tasks: &[SerializedTask]) -> Vec<(usize, String)> {
+        tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, task)| task.validate().err().map(|e| (idx, e)))
+            .collect()
+    }
+
+    /// Filter tasks by state
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, TaskState, task::batch};
+    ///
+    /// let mut tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1, 2, 3]),
+    ///     SerializedTask::new("task2".to_string(), vec![4, 5, 6]),
+    /// ];
+    /// tasks[0].metadata.state = TaskState::Running;
+    ///
+    /// let running = batch::filter_by_state(&tasks, |s| matches!(s, TaskState::Running));
+    /// assert_eq!(running.len(), 1);
+    /// ```
+    pub fn filter_by_state<F>(tasks: &[SerializedTask], predicate: F) -> Vec<&SerializedTask>
+    where
+        F: Fn(&TaskState) -> bool,
+    {
+        tasks
+            .iter()
+            .filter(|task| predicate(&task.metadata.state))
+            .collect()
+    }
+
+    /// Filter tasks by priority
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]).with_priority(10),
+    ///     SerializedTask::new("task2".to_string(), vec![2]).with_priority(5),
+    ///     SerializedTask::new("task3".to_string(), vec![3]),
+    /// ];
+    ///
+    /// let high_priority = batch::filter_high_priority(&tasks);
+    /// assert_eq!(high_priority.len(), 2);
+    /// ```
+    pub fn filter_high_priority(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
+        tasks
+            .iter()
+            .filter(|task| task.metadata.is_high_priority())
+            .collect()
+    }
+
+    /// Sort tasks by priority (highest first)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let mut tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]).with_priority(5),
+    ///     SerializedTask::new("task2".to_string(), vec![2]).with_priority(10),
+    ///     SerializedTask::new("task3".to_string(), vec![3]).with_priority(1),
+    /// ];
+    ///
+    /// batch::sort_by_priority(&mut tasks);
+    /// assert_eq!(tasks[0].metadata.priority, 10);
+    /// assert_eq!(tasks[1].metadata.priority, 5);
+    /// assert_eq!(tasks[2].metadata.priority, 1);
+    /// ```
+    pub fn sort_by_priority(tasks: &mut [SerializedTask]) {
+        tasks.sort_by(|a, b| b.metadata.priority.cmp(&a.metadata.priority));
+    }
+
+    /// Count tasks by state
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, TaskState, task::batch};
+    ///
+    /// let mut tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]),
+    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    /// ];
+    /// tasks[0].metadata.state = TaskState::Running;
+    ///
+    /// let counts = batch::count_by_state(&tasks);
+    /// assert_eq!(counts.get("RUNNING"), Some(&1));
+    /// assert_eq!(counts.get("PENDING"), Some(&1));
+    /// ```
+    pub fn count_by_state(tasks: &[SerializedTask]) -> std::collections::HashMap<String, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for task in tasks {
+            *counts
+                .entry(task.metadata.state.name().to_string())
+                .or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Check if any tasks have expired
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]).with_timeout(60),
+    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    /// ];
+    ///
+    /// // Fresh tasks shouldn't be expired
+    /// assert!(!batch::has_expired_tasks(&tasks));
+    /// ```
+    pub fn has_expired_tasks(tasks: &[SerializedTask]) -> bool {
+        tasks.iter().any(|task| task.is_expired())
+    }
+
+    /// Get tasks that have expired
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]).with_timeout(60),
+    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    /// ];
+    ///
+    /// let expired = batch::get_expired_tasks(&tasks);
+    /// // Fresh tasks shouldn't be expired
+    /// assert_eq!(expired.len(), 0);
+    /// ```
+    pub fn get_expired_tasks(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
+        tasks.iter().filter(|task| task.is_expired()).collect()
+    }
+
+    /// Calculate total payload size for a collection of tasks
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1, 2, 3]),
+    ///     SerializedTask::new("task2".to_string(), vec![4, 5]),
+    /// ];
+    ///
+    /// let total_size = batch::total_payload_size(&tasks);
+    /// assert_eq!(total_size, 5);
+    /// ```
+    pub fn total_payload_size(tasks: &[SerializedTask]) -> usize {
+        tasks.iter().map(|task| task.payload_size()).sum()
+    }
+
+    /// Find tasks with dependencies
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    /// use uuid::Uuid;
+    ///
+    /// let parent_id = Uuid::new_v4();
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]),
+    ///     SerializedTask::new("task2".to_string(), vec![2]).with_dependency(parent_id),
+    /// ];
+    ///
+    /// let with_deps = batch::filter_with_dependencies(&tasks);
+    /// assert_eq!(with_deps.len(), 1);
+    /// ```
+    pub fn filter_with_dependencies(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
+        tasks
+            .iter()
+            .filter(|task| task.metadata.has_dependencies())
+            .collect()
+    }
+
+    /// Find tasks that can be retried
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, TaskState, task::batch};
+    ///
+    /// let mut tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]).with_max_retries(3),
+    ///     SerializedTask::new("task2".to_string(), vec![2]).with_max_retries(3),
+    /// ];
+    /// tasks[0].metadata.state = TaskState::Failed("error".to_string());
+    /// tasks[1].metadata.state = TaskState::Succeeded(vec![]);
+    ///
+    /// let can_retry = batch::filter_retryable(&tasks);
+    /// assert_eq!(can_retry.len(), 1);
+    /// ```
+    pub fn filter_retryable(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
+        tasks.iter().filter(|task| task.can_retry()).collect()
+    }
+
+    /// Find tasks by name pattern (contains)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("process_data".to_string(), vec![1]),
+    ///     SerializedTask::new("process_image".to_string(), vec![2]),
+    ///     SerializedTask::new("send_email".to_string(), vec![3]),
+    /// ];
+    ///
+    /// let process_tasks = batch::filter_by_name_pattern(&tasks, "process");
+    /// assert_eq!(process_tasks.len(), 2);
+    /// ```
+    pub fn filter_by_name_pattern<'a>(
+        tasks: &'a [SerializedTask],
+        pattern: &str,
+    ) -> Vec<&'a SerializedTask> {
+        tasks
+            .iter()
+            .filter(|task| task.metadata.name.contains(pattern))
+            .collect()
+    }
+
+    /// Group tasks by their workflow group ID
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    /// use uuid::Uuid;
+    ///
+    /// let group1 = Uuid::new_v4();
+    /// let group2 = Uuid::new_v4();
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]).with_group_id(group1),
+    ///     SerializedTask::new("task2".to_string(), vec![2]).with_group_id(group1),
+    ///     SerializedTask::new("task3".to_string(), vec![3]).with_group_id(group2),
+    ///     SerializedTask::new("task4".to_string(), vec![4]),
+    /// ];
+    ///
+    /// let groups = batch::group_by_workflow_id(&tasks);
+    /// assert_eq!(groups.len(), 2);
+    /// ```
+    pub fn group_by_workflow_id(
+        tasks: &[SerializedTask],
+    ) -> std::collections::HashMap<Uuid, Vec<&SerializedTask>> {
+        let mut groups = std::collections::HashMap::new();
+        for task in tasks {
+            if let Some(group_id) = task.metadata.group_id {
+                groups.entry(group_id).or_insert_with(Vec::new).push(task);
+            }
+        }
+        groups
+    }
+
+    /// Find terminal tasks (succeeded or failed)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, TaskState, task::batch};
+    ///
+    /// let mut tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]),
+    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    /// ];
+    /// tasks[0].metadata.state = TaskState::Succeeded(vec![1, 2, 3]);
+    ///
+    /// let terminal = batch::filter_terminal(&tasks);
+    /// assert_eq!(terminal.len(), 1);
+    /// ```
+    pub fn filter_terminal(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
+        tasks.iter().filter(|task| task.is_terminal()).collect()
+    }
+
+    /// Find active tasks (pending, running, or retrying)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, TaskState, task::batch};
+    ///
+    /// let mut tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]),
+    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    /// ];
+    /// tasks[1].metadata.state = TaskState::Succeeded(vec![]);
+    ///
+    /// let active = batch::filter_active(&tasks);
+    /// assert_eq!(active.len(), 1);
+    /// ```
+    pub fn filter_active(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
+        tasks.iter().filter(|task| task.is_active()).collect()
+    }
+
+    /// Calculate average payload size
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1, 2, 3]),
+    ///     SerializedTask::new("task2".to_string(), vec![4, 5]),
+    /// ];
+    ///
+    /// let avg = batch::average_payload_size(&tasks);
+    /// assert_eq!(avg, 2); // (3 + 2) / 2 = 2
+    /// ```
+    pub fn average_payload_size(tasks: &[SerializedTask]) -> usize {
+        if tasks.is_empty() {
+            0
+        } else {
+            total_payload_size(tasks) / tasks.len()
+        }
+    }
+
+    /// Find the oldest task by creation time
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]),
+    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    /// ];
+    ///
+    /// let oldest = batch::find_oldest(&tasks);
+    /// assert!(oldest.is_some());
+    /// ```
+    pub fn find_oldest(tasks: &[SerializedTask]) -> Option<&SerializedTask> {
+        tasks.iter().min_by_key(|task| task.metadata.created_at)
+    }
+
+    /// Find the newest task by creation time
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{SerializedTask, task::batch};
+    ///
+    /// let tasks = vec![
+    ///     SerializedTask::new("task1".to_string(), vec![1]),
+    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    /// ];
+    ///
+    /// let newest = batch::find_newest(&tasks);
+    /// assert!(newest.is_some());
+    /// ```
+    pub fn find_newest(tasks: &[SerializedTask]) -> Option<&SerializedTask> {
+        tasks.iter().max_by_key(|task| task.metadata.created_at)
+    }
+}
+
 /// Task metadata including execution information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskMetadata {
@@ -224,6 +596,239 @@ impl TaskMetadata {
     /// Clear all dependencies
     pub fn clear_dependencies(&mut self) {
         self.dependencies.clear();
+    }
+
+    // ===== Convenience State Checks =====
+
+    /// Check if task is in Pending state
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        matches!(self.state, TaskState::Pending)
+    }
+
+    /// Check if task is in Running state
+    #[inline]
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, TaskState::Running)
+    }
+
+    /// Check if task is in Succeeded state
+    #[inline]
+    pub fn is_succeeded(&self) -> bool {
+        matches!(self.state, TaskState::Succeeded(_))
+    }
+
+    /// Check if task is in Failed state
+    #[inline]
+    pub fn is_failed(&self) -> bool {
+        matches!(self.state, TaskState::Failed(_))
+    }
+
+    /// Check if task is in Retrying state
+    #[inline]
+    pub fn is_retrying(&self) -> bool {
+        matches!(self.state, TaskState::Retrying(_))
+    }
+
+    /// Check if task is in Reserved state
+    #[inline]
+    pub fn is_reserved(&self) -> bool {
+        matches!(self.state, TaskState::Reserved)
+    }
+
+    // ===== Time-related Helpers =====
+
+    /// Get remaining time before timeout (None if no timeout or already expired)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::TaskMetadata;
+    ///
+    /// let task = TaskMetadata::new("test".to_string()).with_timeout(60);
+    /// if let Some(remaining) = task.time_remaining() {
+    ///     println!("Task has {} seconds remaining", remaining.num_seconds());
+    /// }
+    /// ```
+    pub fn time_remaining(&self) -> Option<chrono::Duration> {
+        self.timeout_secs.and_then(|timeout| {
+            let elapsed = Utc::now() - self.created_at;
+            let timeout_duration = chrono::Duration::seconds(timeout as i64);
+            let remaining = timeout_duration - elapsed;
+            if remaining.num_seconds() > 0 {
+                Some(remaining)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Get the time elapsed since task creation
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::TaskMetadata;
+    ///
+    /// let task = TaskMetadata::new("test".to_string());
+    /// let elapsed = task.time_elapsed();
+    /// assert!(elapsed.num_seconds() >= 0);
+    /// ```
+    pub fn time_elapsed(&self) -> chrono::Duration {
+        Utc::now() - self.created_at
+    }
+
+    // ===== Retry Helpers =====
+
+    /// Check if task can be retried based on current retry count
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{TaskMetadata, TaskState};
+    ///
+    /// let mut task = TaskMetadata::new("test".to_string()).with_max_retries(3);
+    /// task.state = TaskState::Failed("error".to_string());
+    /// assert!(task.can_retry());
+    ///
+    /// task.state = TaskState::Retrying(3);
+    /// assert!(!task.can_retry());
+    /// ```
+    pub fn can_retry(&self) -> bool {
+        self.state.can_retry(self.max_retries)
+    }
+
+    /// Get current retry count
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{TaskMetadata, TaskState};
+    ///
+    /// let mut task = TaskMetadata::new("test".to_string());
+    /// task.state = TaskState::Retrying(2);
+    /// assert_eq!(task.retry_count(), 2);
+    /// ```
+    #[inline]
+    pub fn retry_count(&self) -> u32 {
+        self.state.retry_count()
+    }
+
+    /// Get remaining retry attempts
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{TaskMetadata, TaskState};
+    ///
+    /// let mut task = TaskMetadata::new("test".to_string()).with_max_retries(5);
+    /// task.state = TaskState::Retrying(2);
+    /// assert_eq!(task.retries_remaining(), 3);
+    /// ```
+    pub fn retries_remaining(&self) -> u32 {
+        let current = self.retry_count();
+        self.max_retries.saturating_sub(current)
+    }
+
+    // ===== Workflow Helpers =====
+
+    /// Check if task is part of any workflow (group or chord)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::TaskMetadata;
+    /// use uuid::Uuid;
+    ///
+    /// let task = TaskMetadata::new("test".to_string())
+    ///     .with_group_id(Uuid::new_v4());
+    /// assert!(task.is_part_of_workflow());
+    /// ```
+    #[inline]
+    pub fn is_part_of_workflow(&self) -> bool {
+        self.group_id.is_some() || self.chord_id.is_some()
+    }
+
+    /// Get group ID if task is part of a group
+    #[inline]
+    pub fn get_group_id(&self) -> Option<&Uuid> {
+        self.group_id.as_ref()
+    }
+
+    /// Get chord ID if task is part of a chord
+    #[inline]
+    pub fn get_chord_id(&self) -> Option<&Uuid> {
+        self.chord_id.as_ref()
+    }
+
+    // ===== State Transition Helpers =====
+
+    /// Update task state to Running
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{TaskMetadata, TaskState};
+    ///
+    /// let mut task = TaskMetadata::new("test".to_string());
+    /// task.mark_as_running();
+    /// assert!(task.is_running());
+    /// ```
+    pub fn mark_as_running(&mut self) {
+        self.state = TaskState::Running;
+        self.updated_at = Utc::now();
+    }
+
+    /// Update task state to Succeeded with result
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{TaskMetadata, TaskState};
+    ///
+    /// let mut task = TaskMetadata::new("test".to_string());
+    /// task.mark_as_succeeded(vec![1, 2, 3]);
+    /// assert!(task.is_succeeded());
+    /// ```
+    pub fn mark_as_succeeded(&mut self, result: Vec<u8>) {
+        self.state = TaskState::Succeeded(result);
+        self.updated_at = Utc::now();
+    }
+
+    /// Update task state to Failed with error message
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{TaskMetadata, TaskState};
+    ///
+    /// let mut task = TaskMetadata::new("test".to_string());
+    /// task.mark_as_failed("Connection timeout");
+    /// assert!(task.is_failed());
+    /// ```
+    pub fn mark_as_failed(&mut self, error: impl Into<String>) {
+        self.state = TaskState::Failed(error.into());
+        self.updated_at = Utc::now();
+    }
+
+    /// Clone task with a new ID (useful for task retry/duplication)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::TaskMetadata;
+    ///
+    /// let task = TaskMetadata::new("test".to_string()).with_priority(5);
+    /// let cloned = task.with_new_id();
+    /// assert_ne!(task.id, cloned.id);
+    /// assert_eq!(task.name, cloned.name);
+    /// assert_eq!(task.priority, cloned.priority);
+    /// ```
+    pub fn with_new_id(&self) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            name: self.name.clone(),
+            state: TaskState::Pending,
+            created_at: now,
+            updated_at: now,
+            max_retries: self.max_retries,
+            timeout_secs: self.timeout_secs,
+            priority: self.priority,
+            group_id: self.group_id,
+            chord_id: self.chord_id,
+            dependencies: self.dependencies.clone(),
+        }
     }
 }
 
@@ -498,6 +1103,98 @@ impl SerializedTask {
     #[inline]
     pub fn is_low_priority(&self) -> bool {
         self.metadata.is_low_priority()
+    }
+
+    // ===== Convenience State Checks (Delegated) =====
+
+    /// Check if task is in Pending state
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.metadata.is_pending()
+    }
+
+    /// Check if task is in Running state
+    #[inline]
+    pub fn is_running(&self) -> bool {
+        self.metadata.is_running()
+    }
+
+    /// Check if task is in Succeeded state
+    #[inline]
+    pub fn is_succeeded(&self) -> bool {
+        self.metadata.is_succeeded()
+    }
+
+    /// Check if task is in Failed state
+    #[inline]
+    pub fn is_failed(&self) -> bool {
+        self.metadata.is_failed()
+    }
+
+    /// Check if task is in Retrying state
+    #[inline]
+    pub fn is_retrying(&self) -> bool {
+        self.metadata.is_retrying()
+    }
+
+    /// Check if task is in Reserved state
+    #[inline]
+    pub fn is_reserved(&self) -> bool {
+        self.metadata.is_reserved()
+    }
+
+    // ===== Time-related Helpers (Delegated) =====
+
+    /// Get remaining time before timeout
+    #[inline]
+    pub fn time_remaining(&self) -> Option<chrono::Duration> {
+        self.metadata.time_remaining()
+    }
+
+    /// Get the time elapsed since task creation
+    #[inline]
+    pub fn time_elapsed(&self) -> chrono::Duration {
+        self.metadata.time_elapsed()
+    }
+
+    // ===== Retry Helpers (Delegated) =====
+
+    /// Check if task can be retried
+    #[inline]
+    pub fn can_retry(&self) -> bool {
+        self.metadata.can_retry()
+    }
+
+    /// Get current retry count
+    #[inline]
+    pub fn retry_count(&self) -> u32 {
+        self.metadata.retry_count()
+    }
+
+    /// Get remaining retry attempts
+    #[inline]
+    pub fn retries_remaining(&self) -> u32 {
+        self.metadata.retries_remaining()
+    }
+
+    // ===== Workflow Helpers (Delegated) =====
+
+    /// Check if task is part of any workflow
+    #[inline]
+    pub fn is_part_of_workflow(&self) -> bool {
+        self.metadata.is_part_of_workflow()
+    }
+
+    /// Get group ID if task is part of a group
+    #[inline]
+    pub fn get_group_id(&self) -> Option<&Uuid> {
+        self.metadata.get_group_id()
+    }
+
+    /// Get chord ID if task is part of a chord
+    #[inline]
+    pub fn get_chord_id(&self) -> Option<&Uuid> {
+        self.metadata.get_chord_id()
     }
 }
 

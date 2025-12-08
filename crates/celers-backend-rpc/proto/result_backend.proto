@@ -57,6 +57,10 @@ message ChordState {
   uint32 completed = 3;
   optional string callback = 4;
   repeated string task_ids = 5;  // Array of task UUIDs
+  int64 created_at = 6;  // Unix timestamp (seconds)
+  optional uint64 timeout_seconds = 7;
+  bool cancelled = 8;
+  optional string cancellation_reason = 9;
 }
 
 // Store result request/response

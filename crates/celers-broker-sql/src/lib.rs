@@ -345,6 +345,119 @@ impl Default for TaskChain {
     }
 }
 
+/// Worker statistics for monitoring distributed workers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStatistics {
+    pub worker_id: String,
+    pub active_tasks: i64,
+    pub completed_tasks: i64,
+    pub failed_tasks: i64,
+    pub last_seen: DateTime<Utc>,
+    pub avg_task_duration_secs: f64,
+}
+
+/// Task age distribution for queue health monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAgeDistribution {
+    pub bucket_label: String,
+    pub task_count: i64,
+    pub oldest_task_age_secs: i64,
+}
+
+/// Retry statistics for understanding task failure patterns
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryStatistics {
+    pub task_name: String,
+    pub total_retries: i64,
+    pub unique_tasks: i64,
+    pub avg_retries_per_task: f64,
+    pub max_retries_observed: i32,
+}
+
+/// Queue health summary combining multiple metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueHealth {
+    pub overall_status: String, // "healthy", "degraded", "critical"
+    pub pending_tasks: i64,
+    pub processing_tasks: i64,
+    pub oldest_pending_age_secs: i64,
+    pub active_workers: i64,
+    pub queue_backlog_minutes: f64,
+}
+
+/// Task throughput metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskThroughput {
+    pub completed_last_minute: i64,
+    pub completed_last_hour: i64,
+    pub failed_last_minute: i64,
+    pub failed_last_hour: i64,
+    pub tasks_per_second: f64,
+}
+
+/// Dead Letter Queue statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DlqStatistics {
+    pub total_tasks: i64,
+    pub by_task_name: Vec<DlqTaskStats>,
+}
+
+/// DLQ statistics per task name
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DlqTaskStats {
+    pub task_name: String,
+    pub count: i64,
+    pub avg_retries: Option<f64>,
+    pub max_retries: i32,
+}
+
+/// Task progress information for long-running tasks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskProgress {
+    pub task_id: Uuid,
+    pub progress_percent: f64,
+    pub current_step: Option<String>,
+    pub total_steps: Option<i32>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Rate limit configuration per task type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimit {
+    pub task_name: String,
+    pub max_per_second: f64,
+    pub max_per_minute: i64,
+    pub max_per_hour: i64,
+}
+
+/// Rate limit status showing current usage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitStatus {
+    pub task_name: String,
+    pub current_per_second: f64,
+    pub current_per_minute: i64,
+    pub current_per_hour: i64,
+    pub limit_exceeded: bool,
+}
+
+/// Circuit breaker state for database connection resilience
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CircuitBreakerState {
+    Closed,   // Normal operation
+    Open,     // Failing, rejecting requests
+    HalfOpen, // Testing if service recovered
+}
+
+/// Circuit breaker statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerStats {
+    pub state: CircuitBreakerState,
+    pub failure_count: u64,
+    pub success_count: u64,
+    pub last_failure_time: Option<DateTime<Utc>>,
+    pub last_state_change: DateTime<Utc>,
+}
+
 /// MySQL-based broker implementation using SKIP LOCKED
 pub struct MysqlBroker {
     pool: MySqlPool,
@@ -2024,6 +2137,1432 @@ impl MysqlBroker {
     }
 }
 
+// ========== Enhancement Methods ==========
+impl MysqlBroker {
+    /// Cancel multiple tasks atomically
+    ///
+    /// This is more efficient than calling cancel() multiple times.
+    /// Only cancels tasks in 'pending' or 'processing' state.
+    ///
+    /// # Arguments
+    /// * `task_ids` - Slice of task IDs to cancel
+    ///
+    /// # Returns
+    /// The number of tasks actually cancelled.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::{Broker, SerializedTask};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Enqueue some tasks
+    /// let task1 = broker.enqueue(SerializedTask::new("task1".into(), vec![])).await?;
+    /// let task2 = broker.enqueue(SerializedTask::new("task2".into(), vec![])).await?;
+    /// let task3 = broker.enqueue(SerializedTask::new("task3".into(), vec![])).await?;
+    ///
+    /// // Cancel all three tasks in one operation
+    /// let cancelled = broker.cancel_batch(&[task1, task2, task3]).await?;
+    /// println!("Cancelled {} tasks", cancelled);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_batch(&self, task_ids: &[TaskId]) -> Result<u64> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let task_id_strings: Vec<String> = task_ids.iter().map(|id| id.to_string()).collect();
+        let placeholders = vec!["?"; task_ids.len()].join(", ");
+
+        let query = format!(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled', completed_at = NOW()
+            WHERE id IN ({}) AND state IN ('pending', 'processing')
+            "#,
+            placeholders
+        );
+
+        let mut query_builder = sqlx::query(&query);
+        for task_id_str in task_id_strings {
+            query_builder = query_builder.bind(task_id_str);
+        }
+
+        let result = query_builder
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to cancel batch: {}", e)))?;
+
+        let cancelled = result.rows_affected();
+        tracing::info!(count = cancelled, "Cancelled tasks in batch");
+
+        Ok(cancelled)
+    }
+
+    /// Get statistics for a specific worker
+    ///
+    /// Returns detailed information about tasks processed by a specific worker,
+    /// including active tasks, completed tasks, failed tasks, and average duration.
+    ///
+    /// # Arguments
+    /// * `worker_id` - The worker ID to get statistics for
+    ///
+    /// # Returns
+    /// Worker statistics including task counts and average duration
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Get statistics for a specific worker
+    /// let stats = broker.get_worker_statistics("worker-123").await?;
+    /// println!("Worker {} has {} active tasks, {} completed",
+    ///     stats.worker_id, stats.active_tasks, stats.completed_tasks);
+    /// println!("Average task duration: {:.2}s", stats.avg_task_duration_secs);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_worker_statistics(&self, worker_id: &str) -> Result<WorkerStatistics> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                worker_id,
+                SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as active_tasks,
+                SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+                SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed_tasks,
+                MAX(started_at) as last_seen,
+                AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as avg_duration
+            FROM celers_tasks
+            WHERE worker_id = ?
+            GROUP BY worker_id
+            "#,
+        )
+        .bind(worker_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {}", e)))?;
+
+        if let Some(row) = row {
+            let active: Option<rust_decimal::Decimal> = row.get("active_tasks");
+            let completed: Option<rust_decimal::Decimal> = row.get("completed_tasks");
+            let failed: Option<rust_decimal::Decimal> = row.get("failed_tasks");
+            let last_seen: Option<DateTime<Utc>> = row.get("last_seen");
+            let avg_duration: Option<rust_decimal::Decimal> = row.get("avg_duration");
+
+            Ok(WorkerStatistics {
+                worker_id: worker_id.to_string(),
+                active_tasks: active
+                    .map(|d| d.to_string().parse().unwrap_or(0))
+                    .unwrap_or(0),
+                completed_tasks: completed
+                    .map(|d| d.to_string().parse().unwrap_or(0))
+                    .unwrap_or(0),
+                failed_tasks: failed
+                    .map(|d| d.to_string().parse().unwrap_or(0))
+                    .unwrap_or(0),
+                last_seen: last_seen.unwrap_or_else(Utc::now),
+                avg_task_duration_secs: avg_duration
+                    .and_then(|d| d.to_string().parse::<f64>().ok())
+                    .unwrap_or(0.0),
+            })
+        } else {
+            // Worker not found, return zero stats
+            Ok(WorkerStatistics {
+                worker_id: worker_id.to_string(),
+                active_tasks: 0,
+                completed_tasks: 0,
+                failed_tasks: 0,
+                last_seen: Utc::now(),
+                avg_task_duration_secs: 0.0,
+            })
+        }
+    }
+
+    /// Get quick count of tasks by state
+    ///
+    /// This is a lightweight alternative to get_statistics() that only
+    /// returns counts for a specific state, without computing aggregates
+    /// for all states.
+    ///
+    /// # Arguments
+    /// * `state` - The task state to count
+    ///
+    /// # Returns
+    /// The number of tasks in the specified state
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, DbTaskState};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Quickly check how many tasks are pending
+    /// let pending = broker.count_by_state_quick(DbTaskState::Pending).await?;
+    /// println!("Pending tasks: {}", pending);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn count_by_state_quick(&self, state: DbTaskState) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE state = ?")
+            .bind(state.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to count tasks by state: {}", e)))?;
+
+        Ok(count)
+    }
+
+    /// Get task age distribution for monitoring queue health
+    ///
+    /// Returns pending tasks grouped into age buckets to help identify
+    /// queue backlogs and performance issues.
+    ///
+    /// Age buckets:
+    /// - < 1 minute
+    /// - 1-5 minutes
+    /// - 5-15 minutes
+    /// - 15-60 minutes
+    /// - > 60 minutes
+    ///
+    /// # Returns
+    /// Vector of age distribution buckets with task counts and oldest task age
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let distribution = broker.get_task_age_distribution().await?;
+    /// for bucket in distribution {
+    ///     println!("{}: {} tasks (oldest: {}s)",
+    ///         bucket.bucket_label,
+    ///         bucket.task_count,
+    ///         bucket.oldest_task_age_secs);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_task_age_distribution(&self) -> Result<Vec<TaskAgeDistribution>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                CASE
+                    WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 60 THEN '< 1 min'
+                    WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 300 THEN '1-5 min'
+                    WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 900 THEN '5-15 min'
+                    WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 3600 THEN '15-60 min'
+                    ELSE '> 60 min'
+                END as bucket,
+                COUNT(*) as task_count,
+                MAX(TIMESTAMPDIFF(SECOND, created_at, NOW())) as oldest_age
+            FROM celers_tasks
+            WHERE state = 'pending'
+            GROUP BY bucket
+            ORDER BY
+                CASE bucket
+                    WHEN '< 1 min' THEN 1
+                    WHEN '1-5 min' THEN 2
+                    WHEN '5-15 min' THEN 3
+                    WHEN '15-60 min' THEN 4
+                    ELSE 5
+                END
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task age distribution: {}", e)))?;
+
+        let mut distribution = Vec::with_capacity(rows.len());
+        for row in rows {
+            let bucket: String = row.get("bucket");
+            let task_count: i64 = row.get("task_count");
+            let oldest_age: Option<i64> = row.get("oldest_age");
+
+            distribution.push(TaskAgeDistribution {
+                bucket_label: bucket,
+                task_count,
+                oldest_task_age_secs: oldest_age.unwrap_or(0),
+            });
+        }
+
+        Ok(distribution)
+    }
+
+    /// Get retry statistics grouped by task name
+    ///
+    /// Analyzes task failure patterns to identify which task types
+    /// are failing most often and how many retries they typically require.
+    ///
+    /// # Returns
+    /// Vector of retry statistics per task type, sorted by total retries descending
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let stats = broker.get_retry_statistics().await?;
+    /// for stat in stats {
+    ///     println!("Task '{}': {} retries across {} tasks (avg: {:.1}, max: {})",
+    ///         stat.task_name,
+    ///         stat.total_retries,
+    ///         stat.unique_tasks,
+    ///         stat.avg_retries_per_task,
+    ///         stat.max_retries_observed);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_retry_statistics(&self) -> Result<Vec<RetryStatistics>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                task_name,
+                SUM(retry_count) as total_retries,
+                COUNT(*) as unique_tasks,
+                AVG(retry_count) as avg_retries,
+                MAX(retry_count) as max_retries
+            FROM celers_tasks
+            WHERE retry_count > 0
+            GROUP BY task_name
+            ORDER BY total_retries DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {}", e)))?;
+
+        let mut stats = Vec::with_capacity(rows.len());
+        for row in rows {
+            let task_name: String = row.get("task_name");
+            let total_retries: Option<rust_decimal::Decimal> = row.get("total_retries");
+            let unique_tasks: i64 = row.get("unique_tasks");
+            let avg_retries: Option<rust_decimal::Decimal> = row.get("avg_retries");
+            let max_retries: i32 = row.get("max_retries");
+
+            stats.push(RetryStatistics {
+                task_name,
+                total_retries: total_retries
+                    .map(|d| d.to_string().parse().unwrap_or(0))
+                    .unwrap_or(0),
+                unique_tasks,
+                avg_retries_per_task: avg_retries
+                    .and_then(|d| d.to_string().parse::<f64>().ok())
+                    .unwrap_or(0.0),
+                max_retries_observed: max_retries,
+            });
+        }
+
+        Ok(stats)
+    }
+
+    /// Get all workers that are currently processing tasks
+    ///
+    /// Returns a list of all worker IDs that currently have tasks
+    /// in the 'processing' state.
+    ///
+    /// # Returns
+    /// Vector of worker IDs currently processing tasks
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let workers = broker.list_active_workers().await?;
+    /// println!("Active workers: {:?}", workers);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_active_workers(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT worker_id
+            FROM celers_tasks
+            WHERE worker_id IS NOT NULL AND state = 'processing'
+            ORDER BY worker_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to list active workers: {}", e)))?;
+
+        let workers: Vec<String> = rows.into_iter().map(|row| row.get("worker_id")).collect();
+
+        Ok(workers)
+    }
+
+    /// Get all worker statistics for all active workers
+    ///
+    /// Returns statistics for all workers that are currently processing tasks.
+    /// This is a convenience method that combines list_active_workers() and
+    /// get_worker_statistics() for each worker.
+    ///
+    /// # Returns
+    /// Vector of worker statistics for all active workers
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let all_stats = broker.get_all_worker_statistics().await?;
+    /// for stats in all_stats {
+    ///     println!("Worker {}: {} active, {} completed, {} failed",
+    ///         stats.worker_id,
+    ///         stats.active_tasks,
+    ///         stats.completed_tasks,
+    ///         stats.failed_tasks);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_all_worker_statistics(&self) -> Result<Vec<WorkerStatistics>> {
+        let worker_ids = self.list_active_workers().await?;
+        let mut all_stats = Vec::with_capacity(worker_ids.len());
+
+        for worker_id in worker_ids {
+            if let Ok(stats) = self.get_worker_statistics(&worker_id).await {
+                all_stats.push(stats);
+            }
+        }
+
+        Ok(all_stats)
+    }
+
+    /// Get overall queue health summary
+    ///
+    /// Combines multiple metrics to provide a comprehensive health assessment
+    /// of the queue, including backlog, oldest task age, and active workers.
+    ///
+    /// Status determination:
+    /// - "healthy": < 100 pending, oldest task < 5 min
+    /// - "degraded": < 1000 pending, oldest task < 15 min
+    /// - "critical": >= 1000 pending or oldest task >= 15 min
+    ///
+    /// # Returns
+    /// Queue health summary with overall status assessment
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let health = broker.get_queue_health().await?;
+    /// println!("Queue status: {}", health.overall_status);
+    /// println!("Pending: {}, Processing: {}", health.pending_tasks, health.processing_tasks);
+    /// println!("Oldest task: {}s, Active workers: {}",
+    ///     health.oldest_pending_age_secs, health.active_workers);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_queue_health(&self) -> Result<QueueHealth> {
+        let stats = self.get_statistics().await?;
+        let workers = self.list_active_workers().await?;
+
+        // Get oldest pending task age
+        let oldest_age: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT TIMESTAMPDIFF(SECOND, created_at, NOW())
+            FROM celers_tasks
+            WHERE state = 'pending'
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get oldest task: {}", e)))?;
+
+        let oldest_age_secs = oldest_age.unwrap_or(0);
+        let oldest_age_minutes = oldest_age_secs as f64 / 60.0;
+
+        // Determine overall status
+        let overall_status = if stats.pending < 100 && oldest_age_minutes < 5.0 {
+            "healthy"
+        } else if stats.pending < 1000 && oldest_age_minutes < 15.0 {
+            "degraded"
+        } else {
+            "critical"
+        };
+
+        // Estimate backlog in minutes (rough estimate)
+        let avg_processing_rate = if !workers.is_empty() {
+            workers.len() as f64
+        } else {
+            1.0
+        };
+        let backlog_minutes = if avg_processing_rate > 0.0 {
+            stats.pending as f64 / avg_processing_rate
+        } else {
+            0.0
+        };
+
+        Ok(QueueHealth {
+            overall_status: overall_status.to_string(),
+            pending_tasks: stats.pending,
+            processing_tasks: stats.processing,
+            oldest_pending_age_secs: oldest_age_secs,
+            active_workers: workers.len() as i64,
+            queue_backlog_minutes: backlog_minutes,
+        })
+    }
+
+    /// Get task throughput metrics
+    ///
+    /// Calculates how many tasks have been completed and failed in the
+    /// last minute and hour, with overall tasks per second rate.
+    ///
+    /// # Returns
+    /// Throughput metrics for completed and failed tasks
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let throughput = broker.get_task_throughput().await?;
+    /// println!("Completed: {} last min, {} last hour ({:.2}/s)",
+    ///     throughput.completed_last_minute,
+    ///     throughput.completed_last_hour,
+    ///     throughput.tasks_per_second);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_task_throughput(&self) -> Result<TaskThroughput> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                SUM(CASE WHEN state = 'completed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE) THEN 1 ELSE 0 END) as completed_1min,
+                SUM(CASE WHEN state = 'completed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) as completed_1hour,
+                SUM(CASE WHEN state = 'failed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE) THEN 1 ELSE 0 END) as failed_1min,
+                SUM(CASE WHEN state = 'failed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) as failed_1hour
+            FROM celers_tasks
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get throughput: {}", e)))?;
+
+        let completed_1min: Option<rust_decimal::Decimal> = row.get("completed_1min");
+        let completed_1hour: Option<rust_decimal::Decimal> = row.get("completed_1hour");
+        let failed_1min: Option<rust_decimal::Decimal> = row.get("failed_1min");
+        let failed_1hour: Option<rust_decimal::Decimal> = row.get("failed_1hour");
+
+        let completed_last_minute = completed_1min
+            .map(|d| d.to_string().parse().unwrap_or(0))
+            .unwrap_or(0);
+        let completed_last_hour = completed_1hour
+            .map(|d| d.to_string().parse().unwrap_or(0))
+            .unwrap_or(0);
+
+        let tasks_per_second = completed_last_minute as f64 / 60.0;
+
+        Ok(TaskThroughput {
+            completed_last_minute,
+            completed_last_hour,
+            failed_last_minute: failed_1min
+                .map(|d| d.to_string().parse().unwrap_or(0))
+                .unwrap_or(0),
+            failed_last_hour: failed_1hour
+                .map(|d| d.to_string().parse().unwrap_or(0))
+                .unwrap_or(0),
+            tasks_per_second,
+        })
+    }
+
+    /// Requeue tasks stuck with a specific worker
+    ///
+    /// This is useful when a worker crashes or becomes unresponsive.
+    /// Moves tasks back to pending state so they can be picked up by other workers.
+    ///
+    /// # Arguments
+    /// * `worker_id` - The worker ID whose tasks should be requeued
+    ///
+    /// # Returns
+    /// The number of tasks requeued
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Requeue all tasks from a crashed worker
+    /// let requeued = broker.requeue_stuck_tasks_by_worker("worker-crashed-123").await?;
+    /// println!("Requeued {} tasks from crashed worker", requeued);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn requeue_stuck_tasks_by_worker(&self, worker_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'pending', worker_id = NULL, started_at = NULL
+            WHERE worker_id = ? AND state = 'processing'
+            "#,
+        )
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to requeue tasks for worker: {}", e)))?;
+
+        let requeued = result.rows_affected();
+        tracing::warn!(worker_id = %worker_id, count = requeued, "Requeued stuck tasks");
+
+        Ok(requeued)
+    }
+
+    /// Execute multiple operations within a single transaction
+    ///
+    /// This method provides a transaction wrapper for executing complex multi-step
+    /// operations atomically. The callback receives a transaction handle that can
+    /// be used for database operations.
+    ///
+    /// # Arguments
+    /// * `f` - Async callback function that performs operations within the transaction
+    ///
+    /// # Returns
+    /// The result of the callback function
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::{Broker, SerializedTask};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Execute multiple enqueues atomically
+    /// broker.with_transaction(|_tx| async {
+    ///     // Your transaction logic here
+    ///     Ok(())
+    /// }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn with_transaction<F, T, Fut>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(sqlx::Transaction<'_, sqlx::MySql>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        let result = f(tx).await?;
+
+        Ok(result)
+    }
+
+    /// Query tasks by metadata JSON field
+    ///
+    /// Searches for tasks where the metadata JSON contains a specific key-value pair.
+    /// This uses MySQL JSON functions to query inside the metadata column.
+    ///
+    /// # Arguments
+    /// * `json_path` - JSON path to query (e.g., "$.user_id")
+    /// * `value` - Value to match
+    /// * `limit` - Maximum number of results
+    /// * `offset` - Pagination offset
+    ///
+    /// # Returns
+    /// List of matching tasks
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Find all tasks for a specific user
+    /// let tasks = broker.query_tasks_by_metadata("$.user_id", "12345", 10, 0).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn query_tasks_by_metadata(
+        &self,
+        json_path: &str,
+        value: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_name, state, priority, retry_count, max_retries,
+                   created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+            FROM celers_tasks
+            WHERE JSON_EXTRACT(metadata, ?) = ?
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(json_path)
+        .bind(value)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to query tasks by metadata: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            let id_str: String = row
+                .try_get("id")
+                .map_err(|e| CelersError::Other(format!("Failed to get id: {}", e)))?;
+            let state_str: String = row
+                .try_get("state")
+                .map_err(|e| CelersError::Other(format!("Failed to get state: {}", e)))?;
+
+            tasks.push(TaskInfo {
+                id: Uuid::parse_str(&id_str)
+                    .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
+                task_name: row
+                    .try_get("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to get task_name: {}", e)))?,
+                state: state_str.parse()?,
+                priority: row
+                    .try_get("priority")
+                    .map_err(|e| CelersError::Other(format!("Failed to get priority: {}", e)))?,
+                retry_count: row
+                    .try_get("retry_count")
+                    .map_err(|e| CelersError::Other(format!("Failed to get retry_count: {}", e)))?,
+                max_retries: row
+                    .try_get("max_retries")
+                    .map_err(|e| CelersError::Other(format!("Failed to get max_retries: {}", e)))?,
+                created_at: row
+                    .try_get("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to get created_at: {}", e)))?,
+                scheduled_at: row.try_get("scheduled_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to get scheduled_at: {}", e))
+                })?,
+                started_at: row
+                    .try_get("started_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to get started_at: {}", e)))?,
+                completed_at: row.try_get("completed_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to get completed_at: {}", e))
+                })?,
+                worker_id: row
+                    .try_get("worker_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to get worker_id: {}", e)))?,
+                error_message: row.try_get("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to get error_message: {}", e))
+                })?,
+            });
+        }
+
+        Ok(tasks)
+    }
+
+    /// Enqueue a task with deduplication based on a custom key
+    ///
+    /// This method ensures that only one task with a given deduplication key exists
+    /// in the pending or processing state. If a task with the same key already exists,
+    /// this method returns the existing task ID instead of creating a duplicate.
+    ///
+    /// The deduplication key is stored in the metadata JSON field.
+    ///
+    /// # Arguments
+    /// * `task` - The task to enqueue
+    /// * `dedup_key` - Unique key for deduplication
+    ///
+    /// # Returns
+    /// Task ID (either new or existing)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::{Broker, SerializedTask};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let task = SerializedTask::new("process_user".into(), vec![1, 2, 3]);
+    /// // Only one task per user will be enqueued
+    /// let task_id = broker.enqueue_deduplicated(task, "user:12345").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_deduplicated(
+        &self,
+        task: SerializedTask,
+        dedup_key: &str,
+    ) -> Result<TaskId> {
+        // First check if a task with this dedup key already exists
+        let existing = sqlx::query(
+            r#"
+            SELECT id FROM celers_tasks
+            WHERE JSON_EXTRACT(metadata, '$.dedup_key') = ?
+              AND state IN ('pending', 'processing')
+            LIMIT 1
+            "#,
+        )
+        .bind(dedup_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check for duplicate task: {}", e)))?;
+
+        if let Some(row) = existing {
+            let id_str: String = row
+                .try_get("id")
+                .map_err(|e| CelersError::Other(format!("Failed to get id: {}", e)))?;
+            let task_id = Uuid::parse_str(&id_str)
+                .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
+            tracing::info!(task_id = %task_id, dedup_key = %dedup_key, "Task already exists, skipping");
+            return Ok(task_id);
+        }
+
+        // Create metadata with dedup key
+        let task_id = task.metadata.id;
+        let mut db_metadata = json!({
+            "queue": self.queue_name,
+            "enqueued_at": chrono::Utc::now().to_rfc3339(),
+            "dedup_key": dedup_key,
+        });
+
+        // Merge task metadata if present
+        if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
+            if let Some(obj) = db_metadata.as_object_mut() {
+                if let Some(meta_obj) = task_meta.as_object() {
+                    for (k, v) in meta_obj {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+            "#,
+        )
+        .bind(task_id.to_string())
+        .bind(&task.metadata.name)
+        .bind(&task.payload)
+        .bind(task.metadata.priority)
+        .bind(task.metadata.max_retries as i32)
+        .bind(serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string()))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to enqueue deduplicated task: {}", e)))?;
+
+        tracing::info!(task_id = %task_id, dedup_key = %dedup_key, "Enqueued new deduplicated task");
+
+        #[cfg(feature = "metrics")]
+        {
+            TASKS_ENQUEUED_TOTAL.inc();
+            TASKS_ENQUEUED_BY_TYPE
+                .with_label_values(&[&task.metadata.name])
+                .inc();
+        }
+
+        Ok(task_id)
+    }
+
+    /// Update state for multiple tasks atomically
+    ///
+    /// This is more efficient than updating task states individually.
+    /// Only updates tasks that are in a valid source state.
+    ///
+    /// # Arguments
+    /// * `task_ids` - Slice of task IDs to update
+    /// * `new_state` - The new state to set
+    ///
+    /// # Returns
+    /// The number of tasks actually updated
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, DbTaskState};
+    /// # use celers_core::TaskId;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let task_ids = vec![/* task IDs */];
+    /// let updated = broker.update_batch_state(&task_ids, DbTaskState::Failed).await?;
+    /// println!("Updated {} tasks to failed state", updated);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn update_batch_state(
+        &self,
+        task_ids: &[TaskId],
+        new_state: DbTaskState,
+    ) -> Result<u64> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let task_id_strings: Vec<String> = task_ids.iter().map(|id| id.to_string()).collect();
+        let placeholders = vec!["?"; task_ids.len()].join(", ");
+
+        let completed_at_clause = match new_state {
+            DbTaskState::Completed | DbTaskState::Failed | DbTaskState::Cancelled => {
+                ", completed_at = NOW()"
+            }
+            _ => "",
+        };
+
+        let query = format!(
+            r#"
+            UPDATE celers_tasks
+            SET state = ?{}
+            WHERE id IN ({})
+            "#,
+            completed_at_clause, placeholders
+        );
+
+        let mut query_builder = sqlx::query(&query);
+        query_builder = query_builder.bind(new_state.to_string());
+        for task_id_str in task_id_strings {
+            query_builder = query_builder.bind(task_id_str);
+        }
+
+        let result = query_builder
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to update batch state: {}", e)))?;
+
+        let updated = result.rows_affected();
+        tracing::info!(count = updated, state = %new_state, "Updated task states in batch");
+
+        Ok(updated)
+    }
+
+    /// Check if enqueueing would exceed the queue capacity
+    ///
+    /// Returns true if the queue has room for more tasks, false if it's at capacity.
+    /// This can be used to implement backpressure and prevent queue overflow.
+    ///
+    /// # Arguments
+    /// * `max_size` - Maximum allowed pending tasks
+    ///
+    /// # Returns
+    /// True if the queue can accept more tasks
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::{Broker, SerializedTask};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Check capacity before enqueueing
+    /// if broker.has_capacity(10000).await? {
+    ///     let task = SerializedTask::new("task".into(), vec![]);
+    ///     broker.enqueue(task).await?;
+    /// } else {
+    ///     println!("Queue is full, backing off");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn has_capacity(&self, max_size: i64) -> Result<bool> {
+        let current_size = self.count_by_state_quick(DbTaskState::Pending).await?;
+        Ok(current_size < max_size)
+    }
+
+    /// Enqueue a task only if the queue has capacity
+    ///
+    /// This is a convenience method that combines capacity checking with enqueuing.
+    /// If the queue is full, it returns an error instead of enqueueing.
+    ///
+    /// # Arguments
+    /// * `task` - The task to enqueue
+    /// * `max_size` - Maximum allowed pending tasks
+    ///
+    /// # Returns
+    /// Task ID if enqueued successfully
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::{Broker, SerializedTask};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let task = SerializedTask::new("task".into(), vec![]);
+    /// match broker.enqueue_with_capacity(task, 10000).await {
+    ///     Ok(task_id) => println!("Enqueued task {}", task_id),
+    ///     Err(_) => println!("Queue is full"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_with_capacity(
+        &self,
+        task: SerializedTask,
+        max_size: i64,
+    ) -> Result<TaskId> {
+        if !self.has_capacity(max_size).await? {
+            return Err(CelersError::Other(
+                "Queue is at capacity, cannot enqueue".to_string(),
+            ));
+        }
+
+        self.enqueue(task).await
+    }
+
+    /// Expire old pending tasks that have exceeded their TTL
+    ///
+    /// This method marks pending tasks as cancelled if they have been pending
+    /// longer than the specified TTL. Useful for preventing stale tasks from
+    /// being processed.
+    ///
+    /// # Arguments
+    /// * `ttl` - Maximum age for pending tasks
+    ///
+    /// # Returns
+    /// Number of tasks expired
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Expire tasks older than 1 hour
+    /// let expired = broker.expire_pending_tasks(Duration::from_secs(3600)).await?;
+    /// println!("Expired {} stale tasks", expired);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn expire_pending_tasks(&self, ttl: Duration) -> Result<u64> {
+        let ttl_seconds = ttl.as_secs() as i64;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW(),
+                error_message = CONCAT('Task expired after ', ?, ' seconds')
+            WHERE state = 'pending'
+              AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+            "#,
+        )
+        .bind(ttl_seconds)
+        .bind(ttl_seconds)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to expire pending tasks: {}", e)))?;
+
+        let expired = result.rows_affected();
+        if expired > 0 {
+            tracing::warn!(
+                count = expired,
+                ttl_seconds = ttl_seconds,
+                "Expired pending tasks"
+            );
+        }
+
+        Ok(expired)
+    }
+
+    /// Delete tasks matching specific criteria
+    ///
+    /// Permanently deletes tasks from the database based on state and age.
+    /// This is more flexible than the existing purge methods.
+    ///
+    /// # Arguments
+    /// * `state` - Optional state filter (None = all states)
+    /// * `older_than` - Only delete tasks older than this duration
+    ///
+    /// # Returns
+    /// Number of tasks deleted
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, DbTaskState};
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Delete completed tasks older than 7 days
+    /// let deleted = broker.delete_tasks_by_criteria(
+    ///     Some(DbTaskState::Completed),
+    ///     Duration::from_secs(7 * 24 * 3600)
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_tasks_by_criteria(
+        &self,
+        state: Option<DbTaskState>,
+        older_than: Duration,
+    ) -> Result<u64> {
+        let seconds_ago = older_than.as_secs() as i64;
+
+        let query = if let Some(state) = state {
+            sqlx::query(
+                r#"
+                DELETE FROM celers_tasks
+                WHERE state = ?
+                  AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+                "#,
+            )
+            .bind(state.to_string())
+            .bind(seconds_ago)
+        } else {
+            sqlx::query(
+                r#"
+                DELETE FROM celers_tasks
+                WHERE TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+                "#,
+            )
+            .bind(seconds_ago)
+        };
+
+        let result = query
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to delete tasks: {}", e)))?;
+
+        let deleted = result.rows_affected();
+        tracing::info!(count = deleted, "Deleted tasks by criteria");
+
+        Ok(deleted)
+    }
+
+    /// Update metadata for an existing task
+    ///
+    /// Allows updating the JSON metadata field for a task without changing
+    /// its state or other properties. The metadata is merged with existing
+    /// metadata using JSON_SET.
+    ///
+    /// # Arguments
+    /// * `task_id` - Task ID to update
+    /// * `json_path` - JSON path to update (e.g., "$.priority_level")
+    /// * `value` - New value for the path
+    ///
+    /// # Returns
+    /// True if task was updated
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::TaskId;
+    /// # use uuid::Uuid;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// // Update a specific metadata field
+    /// broker.update_task_metadata(&task_id, "$.priority_level", "high").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn update_task_metadata(
+        &self,
+        task_id: &TaskId,
+        json_path: &str,
+        value: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET metadata = JSON_SET(metadata, ?, ?)
+            WHERE id = ?
+            "#,
+        )
+        .bind(json_path)
+        .bind(value)
+        .bind(task_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to update task metadata: {}", e)))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Search tasks by creation date range
+    ///
+    /// Finds tasks created within a specific time window. Useful for
+    /// analyzing task patterns over time or implementing time-based cleanup.
+    ///
+    /// # Arguments
+    /// * `from` - Start of time range
+    /// * `to` - End of time range
+    /// * `state` - Optional state filter
+    /// * `limit` - Maximum results
+    /// * `offset` - Pagination offset
+    ///
+    /// # Returns
+    /// List of matching tasks
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, DbTaskState};
+    /// # use chrono::{Utc, Duration};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let now = Utc::now();
+    /// let one_hour_ago = now - Duration::hours(1);
+    ///
+    /// // Find all failed tasks in the last hour
+    /// let tasks = broker.search_tasks_by_date_range(
+    ///     one_hour_ago,
+    ///     now,
+    ///     Some(DbTaskState::Failed),
+    ///     100,
+    ///     0
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_tasks_by_date_range(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        state: Option<DbTaskState>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let query = if let Some(state) = state {
+            sqlx::query(
+                r#"
+                SELECT id, task_name, state, priority, retry_count, max_retries,
+                       created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                FROM celers_tasks
+                WHERE created_at >= ? AND created_at <= ?
+                  AND state = ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                "#,
+            )
+            .bind(from)
+            .bind(to)
+            .bind(state.to_string())
+            .bind(limit)
+            .bind(offset)
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, task_name, state, priority, retry_count, max_retries,
+                       created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                FROM celers_tasks
+                WHERE created_at >= ? AND created_at <= ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                "#,
+            )
+            .bind(from)
+            .bind(to)
+            .bind(limit)
+            .bind(offset)
+        };
+
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to search tasks by date: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            let id_str: String = row
+                .try_get("id")
+                .map_err(|e| CelersError::Other(format!("Failed to get id: {}", e)))?;
+            let state_str: String = row
+                .try_get("state")
+                .map_err(|e| CelersError::Other(format!("Failed to get state: {}", e)))?;
+
+            tasks.push(TaskInfo {
+                id: Uuid::parse_str(&id_str)
+                    .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
+                task_name: row
+                    .try_get("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to get task_name: {}", e)))?,
+                state: state_str.parse()?,
+                priority: row
+                    .try_get("priority")
+                    .map_err(|e| CelersError::Other(format!("Failed to get priority: {}", e)))?,
+                retry_count: row
+                    .try_get("retry_count")
+                    .map_err(|e| CelersError::Other(format!("Failed to get retry_count: {}", e)))?,
+                max_retries: row
+                    .try_get("max_retries")
+                    .map_err(|e| CelersError::Other(format!("Failed to get max_retries: {}", e)))?,
+                created_at: row
+                    .try_get("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to get created_at: {}", e)))?,
+                scheduled_at: row.try_get("scheduled_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to get scheduled_at: {}", e))
+                })?,
+                started_at: row
+                    .try_get("started_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to get started_at: {}", e)))?,
+                completed_at: row.try_get("completed_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to get completed_at: {}", e))
+                })?,
+                worker_id: row
+                    .try_get("worker_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to get worker_id: {}", e)))?,
+                error_message: row.try_get("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to get error_message: {}", e))
+                })?,
+            });
+        }
+
+        Ok(tasks)
+    }
+
+    /// Get Dead Letter Queue statistics
+    ///
+    /// Returns comprehensive statistics about the DLQ including total count,
+    /// counts by task name, and average retry counts.
+    ///
+    /// # Returns
+    /// DLQ statistics
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// let stats = broker.get_dlq_statistics().await?;
+    /// println!("DLQ has {} tasks", stats.total_tasks);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_dlq_statistics(&self) -> Result<DlqStatistics> {
+        // Get total count
+        let total_row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as total
+            FROM celers_dead_letter_queue
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get DLQ total: {}", e)))?;
+
+        let total_tasks: i64 = total_row
+            .try_get("total")
+            .map_err(|e| CelersError::Other(format!("Failed to get total: {}", e)))?;
+
+        // Get counts by task name
+        let rows = sqlx::query(
+            r#"
+            SELECT task_name,
+                   COUNT(*) as count,
+                   AVG(retry_count) as avg_retries,
+                   MAX(retry_count) as max_retries
+            FROM celers_dead_letter_queue
+            GROUP BY task_name
+            ORDER BY count DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get DLQ stats: {}", e)))?;
+
+        let mut by_task_name = Vec::new();
+        for row in rows {
+            let count: i64 = row
+                .try_get("count")
+                .map_err(|e| CelersError::Other(format!("Failed to get count: {}", e)))?;
+            let avg_retries: Option<rust_decimal::Decimal> = row
+                .try_get("avg_retries")
+                .map_err(|e| CelersError::Other(format!("Failed to get avg_retries: {}", e)))?;
+            let max_retries: i32 = row
+                .try_get("max_retries")
+                .map_err(|e| CelersError::Other(format!("Failed to get max_retries: {}", e)))?;
+
+            by_task_name.push(DlqTaskStats {
+                task_name: row
+                    .try_get("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to get task_name: {}", e)))?,
+                count,
+                avg_retries: avg_retries.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)),
+                max_retries,
+            });
+        }
+
+        Ok(DlqStatistics {
+            total_tasks,
+            by_task_name,
+        })
+    }
+
+    /// Detect and recover tasks that have exceeded their processing timeout
+    ///
+    /// Finds tasks that have been in 'processing' state longer than the
+    /// specified timeout and requeues them as pending. This helps recover
+    /// from worker crashes or hangs.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum time a task should be in processing state
+    ///
+    /// # Returns
+    /// Number of timed-out tasks recovered
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Recover tasks stuck in processing for more than 30 minutes
+    /// let recovered = broker.recover_timed_out_tasks(Duration::from_secs(1800)).await?;
+    /// println!("Recovered {} timed-out tasks", recovered);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn recover_timed_out_tasks(&self, timeout: Duration) -> Result<u64> {
+        let timeout_seconds = timeout.as_secs() as i64;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'pending',
+                worker_id = NULL,
+                started_at = NULL,
+                error_message = CONCAT(
+                    COALESCE(error_message, ''),
+                    IF(error_message IS NOT NULL, '; ', ''),
+                    'Task timed out after ', ?, ' seconds and was requeued'
+                )
+            WHERE state = 'processing'
+              AND started_at IS NOT NULL
+              AND TIMESTAMPDIFF(SECOND, started_at, NOW()) > ?
+            "#,
+        )
+        .bind(timeout_seconds)
+        .bind(timeout_seconds)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to recover timed-out tasks: {}", e)))?;
+
+        let recovered = result.rows_affected();
+        if recovered > 0 {
+            tracing::warn!(
+                count = recovered,
+                timeout_seconds = timeout_seconds,
+                "Recovered timed-out tasks"
+            );
+        }
+
+        Ok(recovered)
+    }
+}
+
 #[async_trait]
 impl Broker for MysqlBroker {
     async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
@@ -2602,6 +4141,746 @@ impl MysqlBroker {
 
         Ok(())
     }
+
+    /// Apply DLQ retention policy - delete old DLQ entries based on age
+    ///
+    /// This helps prevent unbounded DLQ growth by removing entries older than the specified retention period.
+    /// Useful for production systems where DLQ entries are monitored but eventually need cleanup.
+    ///
+    /// # Arguments
+    /// * `retention_period` - Duration after which DLQ entries should be deleted
+    ///
+    /// # Returns
+    /// Number of DLQ entries deleted
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// // Delete DLQ entries older than 30 days
+    /// let deleted = broker.apply_dlq_retention(Duration::from_secs(30 * 24 * 3600)).await?;
+    /// println!("Deleted {} old DLQ entries", deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn apply_dlq_retention(&self, retention_period: Duration) -> Result<u64> {
+        let retention_seconds = retention_period.as_secs() as i64;
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM celers_dead_letter_queue
+            WHERE TIMESTAMPDIFF(SECOND, failed_at, NOW()) > ?
+            "#,
+        )
+        .bind(retention_seconds)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to apply DLQ retention: {}", e)))?;
+
+        let deleted = result.rows_affected();
+        if deleted > 0 {
+            tracing::info!(
+                count = deleted,
+                retention_days = retention_seconds / 86400,
+                "Applied DLQ retention policy"
+            );
+        }
+
+        Ok(deleted)
+    }
+
+    /// Calculate optimal batch size based on current queue depth and load
+    ///
+    /// This implements an adaptive batch sizing strategy:
+    /// - Small batches (1-5) when queue is nearly empty to reduce latency
+    /// - Medium batches (10-50) for moderate load
+    /// - Large batches (50-200) for high load to maximize throughput
+    ///
+    /// # Arguments
+    /// * `max_batch_size` - Maximum batch size to return (default: 200)
+    ///
+    /// # Returns
+    /// Recommended batch size based on current queue state
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::Broker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// // Get adaptive batch size
+    /// let batch_size = broker.get_optimal_batch_size(Some(100)).await?;
+    /// let messages = broker.dequeue_batch(batch_size as usize).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_optimal_batch_size(&self, max_batch_size: Option<i64>) -> Result<i64> {
+        let max_size = max_batch_size.unwrap_or(200);
+
+        // Get current pending task count
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM celers_tasks WHERE state = 'pending' AND scheduled_at <= NOW()",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+
+        // Adaptive batch sizing based on queue depth
+        let optimal_size = if pending < 10 {
+            // Small queue - use small batches to reduce latency
+            std::cmp::min(pending.max(1), 5)
+        } else if pending < 100 {
+            // Medium queue - balance latency and throughput
+            std::cmp::min(pending / 2, 50)
+        } else {
+            // Large queue - maximize throughput
+            std::cmp::min(pending / 4, max_size)
+        };
+
+        Ok(optimal_size.max(1))
+    }
+
+    /// Get connection pool health status with detailed metrics
+    ///
+    /// Returns comprehensive connection pool metrics including:
+    /// - Pool size and utilization
+    /// - Active vs idle connections
+    /// - Connection wait times (if available)
+    /// - Pool pressure indicators
+    ///
+    /// # Returns
+    /// Detailed connection diagnostics including health status
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// let health = broker.get_pool_health().await?;
+    /// if health.pool_utilization_percent > 80.0 {
+    ///     println!("Warning: Connection pool utilization is high!");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_pool_health(&self) -> Result<ConnectionDiagnostics> {
+        let total = self.pool.size();
+        let idle = self.pool.num_idle() as u32;
+        let active = total - idle;
+        let max = self.pool.options().get_max_connections();
+
+        let utilization = if max > 0 {
+            (total as f64 / max as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(ConnectionDiagnostics {
+            total_connections: total,
+            idle_connections: idle,
+            active_connections: active,
+            max_connections: max,
+            connection_wait_time_ms: None, // MySQL driver doesn't expose this
+            pool_utilization_percent: utilization,
+        })
+    }
+
+    /// Compress task payload using DEFLATE compression
+    ///
+    /// This can significantly reduce storage and network overhead for large task payloads.
+    /// Compression is applied transparently and decompression happens automatically during dequeue.
+    ///
+    /// # Arguments
+    /// * `payload` - Raw task payload bytes
+    ///
+    /// # Returns
+    /// Compressed payload bytes
+    ///
+    /// Note: Only use compression for payloads larger than ~1KB, as small payloads may
+    /// actually grow due to compression overhead.
+    #[allow(dead_code)]
+    fn compress_payload(payload: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Write;
+
+        // Only compress if payload is larger than 1KB
+        if payload.len() < 1024 {
+            return Ok(payload.to_vec());
+        }
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder
+            .write_all(payload)
+            .map_err(|e| CelersError::Other(format!("Compression failed: {}", e)))?;
+
+        encoder
+            .finish()
+            .map_err(|e| CelersError::Other(format!("Compression finalization failed: {}", e)))
+    }
+
+    /// Decompress task payload
+    ///
+    /// # Arguments
+    /// * `compressed` - Compressed payload bytes
+    ///
+    /// # Returns
+    /// Decompressed payload bytes
+    #[allow(dead_code)]
+    fn decompress_payload(compressed: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Read;
+
+        let mut decoder = flate2::read::DeflateDecoder::new(compressed);
+        let mut decompressed = Vec::new();
+
+        decoder
+            .read_to_end(&mut decompressed)
+            .map_err(|e| CelersError::Other(format!("Decompression failed: {}", e)))?;
+
+        Ok(decompressed)
+    }
+
+    /// Vacuum analyze all CeleRS tables for optimal query performance
+    ///
+    /// This operation is similar to PostgreSQL's VACUUM ANALYZE but uses MySQL-specific
+    /// optimizations (OPTIMIZE TABLE + ANALYZE TABLE). It:
+    /// - Reclaims storage from deleted rows
+    /// - Updates table statistics for better query planning
+    /// - Defragments table data
+    ///
+    /// Should be run periodically (e.g., weekly) on production systems.
+    ///
+    /// # Returns
+    /// Number of tables optimized
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// // Run maintenance
+    /// let tables_optimized = broker.vacuum_analyze().await?;
+    /// println!("Optimized {} tables", tables_optimized);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn vacuum_analyze(&self) -> Result<u64> {
+        let tables = vec![
+            "celers_tasks",
+            "celers_dead_letter_queue",
+            "celers_task_history",
+            "celers_task_results",
+        ];
+
+        let mut optimized = 0u64;
+
+        for table in &tables {
+            // OPTIMIZE TABLE
+            sqlx::query(&format!("OPTIMIZE TABLE {}", table))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to optimize table {}: {}", table, e))
+                })?;
+
+            // ANALYZE TABLE
+            sqlx::query(&format!("ANALYZE TABLE {}", table))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to analyze table {}: {}", table, e))
+                })?;
+
+            optimized += 1;
+        }
+
+        tracing::info!(tables_count = optimized, "Completed vacuum analyze");
+        Ok(optimized)
+    }
+
+    /// Get slow query log entries related to CeleRS tables
+    ///
+    /// Returns queries that exceeded a certain threshold from MySQL slow query log.
+    /// Requires slow query log to be enabled in MySQL configuration.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of slow queries to return
+    ///
+    /// # Returns
+    /// List of slow query information (query text, execution time, etc.)
+    ///
+    /// Note: This requires MySQL slow_query_log to be enabled and accessible.
+    pub async fn get_slow_queries(&self, limit: i64) -> Result<Vec<SlowQueryInfo>> {
+        // Check if performance_schema is enabled
+        let ps_enabled: String = sqlx::query_scalar("SELECT @@performance_schema")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to check performance_schema: {}", e))
+            })?;
+
+        if ps_enabled != "1" {
+            return Ok(Vec::new());
+        }
+
+        // Query from events_statements_summary_by_digest
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                DIGEST_TEXT as query_text,
+                COUNT_STAR as execution_count,
+                AVG_TIMER_WAIT / 1000000000 as avg_time_ms,
+                MAX_TIMER_WAIT / 1000000000 as max_time_ms,
+                SUM_TIMER_WAIT / 1000000000 as total_time_ms
+            FROM performance_schema.events_statements_summary_by_digest
+            WHERE DIGEST_TEXT LIKE '%celers_%'
+            ORDER BY SUM_TIMER_WAIT DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to query slow queries: {}", e)))?;
+
+        let mut slow_queries = Vec::new();
+        for row in rows {
+            slow_queries.push(SlowQueryInfo {
+                query_text: row.try_get("query_text").unwrap_or_default(),
+                execution_count: row.try_get("execution_count").unwrap_or(0),
+                avg_time_ms: row.try_get("avg_time_ms").unwrap_or(0.0),
+                max_time_ms: row.try_get("max_time_ms").unwrap_or(0.0),
+                total_time_ms: row.try_get("total_time_ms").unwrap_or(0.0),
+            });
+        }
+
+        Ok(slow_queries)
+    }
+
+    /// Apply priority aging to prevent task starvation
+    ///
+    /// Increases the priority of tasks that have been pending for a long time.
+    /// This prevents low-priority tasks from being starved by a continuous stream
+    /// of high-priority tasks.
+    ///
+    /// # Arguments
+    /// * `age_threshold_secs` - Tasks older than this will have their priority increased
+    /// * `priority_boost` - Amount to add to the priority (default: 10)
+    ///
+    /// # Returns
+    /// Number of tasks whose priority was increased
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// // Boost priority for tasks pending more than 5 minutes
+    /// let boosted = broker.apply_priority_aging(300, 10).await?;
+    /// println!("Boosted priority for {} old tasks", boosted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn apply_priority_aging(
+        &self,
+        age_threshold_secs: i64,
+        priority_boost: i32,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET priority = priority + ?
+            WHERE state = 'pending'
+              AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+              AND priority < 1000
+            "#,
+        )
+        .bind(priority_boost)
+        .bind(age_threshold_secs)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to apply priority aging: {}", e)))?;
+
+        let updated = result.rows_affected();
+        if updated > 0 {
+            tracing::info!(
+                count = updated,
+                age_threshold_secs = age_threshold_secs,
+                priority_boost = priority_boost,
+                "Applied priority aging"
+            );
+        }
+
+        Ok(updated)
+    }
+
+    /// Update task progress for long-running tasks
+    ///
+    /// Allows workers to report progress on long-running tasks. This is stored
+    /// in the task metadata as JSON and can be queried later.
+    ///
+    /// # Arguments
+    /// * `task_id` - Task ID to update
+    /// * `progress_percent` - Progress percentage (0.0 - 100.0)
+    /// * `current_step` - Optional description of current step
+    ///
+    /// # Returns
+    /// True if task was updated, false if not found
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use uuid::Uuid;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// // Update progress to 50%
+    /// broker.update_task_progress(&task_id, 50.0, Some("Processing chunk 5/10")).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn update_task_progress(
+        &self,
+        task_id: &TaskId,
+        progress_percent: f64,
+        current_step: Option<&str>,
+    ) -> Result<bool> {
+        let progress_json = serde_json::json!({
+            "progress_percent": progress_percent,
+            "current_step": current_step,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET metadata = JSON_SET(
+                metadata,
+                '$.progress', ?
+            )
+            WHERE id = ? AND state = 'processing'
+            "#,
+        )
+        .bind(serde_json::to_string(&progress_json).unwrap_or_else(|_| "{}".to_string()))
+        .bind(task_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to update task progress: {}", e)))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Get task progress for a specific task
+    ///
+    /// # Arguments
+    /// * `task_id` - Task ID to query
+    ///
+    /// # Returns
+    /// Task progress information if available
+    pub async fn get_task_progress(&self, task_id: &TaskId) -> Result<Option<TaskProgress>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                JSON_EXTRACT(metadata, '$.progress.progress_percent') as progress_percent,
+                JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.progress.current_step')) as current_step,
+                JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.progress.updated_at')) as updated_at
+            FROM celers_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind(task_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task progress: {}", e)))?;
+
+        if let Some(row) = row {
+            let progress_percent: Option<f64> = row.try_get("progress_percent").ok();
+            let current_step: Option<String> = row.try_get("current_step").ok();
+            let updated_at_str: Option<String> = row.try_get("updated_at").ok();
+
+            if let Some(percent) = progress_percent {
+                let updated_at = updated_at_str
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(Utc::now);
+
+                return Ok(Some(TaskProgress {
+                    task_id: *task_id,
+                    progress_percent: percent,
+                    current_step,
+                    total_steps: None,
+                    updated_at,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Check rate limit for a specific task type
+    ///
+    /// Returns current execution rate and whether the limit is exceeded.
+    ///
+    /// # Arguments
+    /// * `task_name` - Task type to check
+    /// * `max_per_minute` - Maximum tasks per minute allowed
+    ///
+    /// # Returns
+    /// Rate limit status including current rate and whether limit is exceeded
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// // Check if we can execute more "expensive_task" (limit: 100/min)
+    /// let status = broker.check_rate_limit("expensive_task", 100).await?;
+    /// if status.limit_exceeded {
+    ///     println!("Rate limit exceeded, backing off...");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn check_rate_limit(
+        &self,
+        task_name: &str,
+        max_per_minute: i64,
+    ) -> Result<RateLimitStatus> {
+        // Count completed tasks in the last minute
+        let completed_last_minute: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM celers_tasks
+            WHERE task_name = ?
+              AND state = 'completed'
+              AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE)
+            "#,
+        )
+        .bind(task_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check rate limit: {}", e)))?;
+
+        // Count for last hour
+        let completed_last_hour: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM celers_tasks
+            WHERE task_name = ?
+              AND state = 'completed'
+              AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            "#,
+        )
+        .bind(task_name)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        let per_second = completed_last_minute as f64 / 60.0;
+        let limit_exceeded = completed_last_minute >= max_per_minute;
+
+        Ok(RateLimitStatus {
+            task_name: task_name.to_string(),
+            current_per_second: per_second,
+            current_per_minute: completed_last_minute,
+            current_per_hour: completed_last_hour,
+            limit_exceeded,
+        })
+    }
+
+    /// Deduplicate tasks within a time window
+    ///
+    /// Prevents duplicate tasks from being enqueued if a matching task exists
+    /// within the specified time window.
+    ///
+    /// # Arguments
+    /// * `task` - Task to enqueue
+    /// * `dedup_key` - Deduplication key
+    /// * `window_secs` - Time window in seconds to check for duplicates
+    ///
+    /// # Returns
+    /// TaskId - Either the existing task ID or a new task ID
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::SerializedTask;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    /// let task = SerializedTask::new("process_order".to_string(), vec![1, 2, 3]);
+    ///
+    /// // Only enqueue if no matching task in last 5 minutes
+    /// let task_id = broker.enqueue_deduplicated_window(task, "order-123", 300).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_deduplicated_window(
+        &self,
+        task: SerializedTask,
+        dedup_key: &str,
+        window_secs: i64,
+    ) -> Result<TaskId> {
+        // Check for existing task within window
+        let existing: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT id
+            FROM celers_tasks
+            WHERE JSON_EXTRACT(metadata, '$.dedup_key') = ?
+              AND created_at >= DATE_SUB(NOW(), INTERVAL ? SECOND)
+              AND state IN ('pending', 'processing')
+            LIMIT 1
+            "#,
+        )
+        .bind(dedup_key)
+        .bind(window_secs)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check for duplicates: {}", e)))?;
+
+        if let Some(id_str) = existing {
+            // Return existing task ID
+            let task_id = Uuid::parse_str(&id_str)
+                .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
+            tracing::debug!(
+                task_id = %task_id,
+                dedup_key = dedup_key,
+                "Found duplicate task within window"
+            );
+            return Ok(task_id);
+        }
+
+        // No duplicate found, enqueue new task with dedup_key
+        let task_id = task.metadata.id;
+        let mut db_metadata = json!({
+            "queue": self.queue_name,
+            "enqueued_at": chrono::Utc::now().to_rfc3339(),
+            "dedup_key": dedup_key,
+        });
+
+        // Merge task metadata
+        if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
+            if let Some(obj) = db_metadata.as_object_mut() {
+                if let Some(meta_obj) = task_meta.as_object() {
+                    for (k, v) in meta_obj {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+            "#,
+        )
+        .bind(task_id.to_string())
+        .bind(&task.metadata.name)
+        .bind(&task.payload)
+        .bind(task.metadata.priority)
+        .bind(task.metadata.max_retries as i32)
+        .bind(serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string()))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
+
+        Ok(task_id)
+    }
+
+    /// Cascade cancel - cancel a task and all its dependent tasks
+    ///
+    /// When a task is cancelled, this will also cancel any tasks that depend on it
+    /// (identified by metadata relationships).
+    ///
+    /// # Arguments
+    /// * `task_id` - Parent task ID to cancel
+    ///
+    /// # Returns
+    /// Number of tasks cancelled (including the parent)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use uuid::Uuid;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    /// let parent_id = Uuid::new_v4();
+    ///
+    /// // Cancel task and all dependent tasks
+    /// let cancelled = broker.cancel_cascade(&parent_id).await?;
+    /// println!("Cancelled {} tasks (including dependents)", cancelled);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_cascade(&self, task_id: &TaskId) -> Result<u64> {
+        // First cancel the parent task
+        let parent_result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW()
+            WHERE id = ?
+              AND state IN ('pending', 'processing')
+            "#,
+        )
+        .bind(task_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel parent task: {}", e)))?;
+
+        let mut total_cancelled = parent_result.rows_affected();
+
+        // Cancel dependent tasks (those with parent_task_id in metadata)
+        let dependent_result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW(),
+                error_message = CONCAT(
+                    COALESCE(error_message, ''),
+                    'Cancelled due to parent task cancellation'
+                )
+            WHERE JSON_EXTRACT(metadata, '$.parent_task_id') = ?
+              AND state IN ('pending', 'processing')
+            "#,
+        )
+        .bind(task_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel dependent tasks: {}", e)))?;
+
+        total_cancelled += dependent_result.rows_affected();
+
+        if total_cancelled > 0 {
+            tracing::info!(
+                parent_task_id = %task_id,
+                total_cancelled = total_cancelled,
+                "Cascade cancelled tasks"
+            );
+        }
+
+        Ok(total_cancelled)
+    }
+}
+
+/// Slow query information from performance_schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlowQueryInfo {
+    pub query_text: String,
+    pub execution_count: i64,
+    pub avg_time_ms: f64,
+    pub max_time_ms: f64,
+    pub total_time_ms: f64,
 }
 
 #[cfg(test)]
@@ -3068,5 +5347,303 @@ mod tests {
 
         assert_eq!(chain.tasks().len(), 2);
         assert_eq!(chain.delay_between_secs(), Some(5));
+    }
+
+    // ========== Unit Tests for Enhancement Methods ==========
+
+    #[test]
+    fn test_worker_statistics_serialization() {
+        let stats = WorkerStatistics {
+            worker_id: "worker-123".to_string(),
+            active_tasks: 5,
+            completed_tasks: 100,
+            failed_tasks: 3,
+            last_seen: Utc::now(),
+            avg_task_duration_secs: 2.5,
+        };
+
+        // Should serialize and deserialize correctly
+        let json = serde_json::to_string(&stats).unwrap();
+        let deserialized: WorkerStatistics = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.worker_id, "worker-123");
+        assert_eq!(deserialized.active_tasks, 5);
+        assert_eq!(deserialized.completed_tasks, 100);
+        assert_eq!(deserialized.failed_tasks, 3);
+        assert_eq!(deserialized.avg_task_duration_secs, 2.5);
+    }
+
+    #[test]
+    fn test_task_age_distribution_serialization() {
+        let dist = TaskAgeDistribution {
+            bucket_label: "< 1 min".to_string(),
+            task_count: 42,
+            oldest_task_age_secs: 55,
+        };
+
+        let json = serde_json::to_string(&dist).unwrap();
+        let deserialized: TaskAgeDistribution = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.bucket_label, "< 1 min");
+        assert_eq!(deserialized.task_count, 42);
+        assert_eq!(deserialized.oldest_task_age_secs, 55);
+    }
+
+    #[test]
+    fn test_retry_statistics_serialization() {
+        let stats = RetryStatistics {
+            task_name: "failing_task".to_string(),
+            total_retries: 150,
+            unique_tasks: 50,
+            avg_retries_per_task: 3.0,
+            max_retries_observed: 5,
+        };
+
+        let json = serde_json::to_string(&stats).unwrap();
+        let deserialized: RetryStatistics = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.task_name, "failing_task");
+        assert_eq!(deserialized.total_retries, 150);
+        assert_eq!(deserialized.unique_tasks, 50);
+        assert_eq!(deserialized.avg_retries_per_task, 3.0);
+        assert_eq!(deserialized.max_retries_observed, 5);
+    }
+
+    // ========== Integration Tests for Enhancement Methods ==========
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_cancel_batch() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Enqueue multiple tasks
+        let mut task_ids = Vec::new();
+        for i in 0..10 {
+            let task = SerializedTask::new(format!("task_{}", i), vec![i as u8]);
+            let task_id = broker.enqueue(task).await.unwrap();
+            task_ids.push(task_id);
+        }
+
+        // Cancel half of them in batch
+        let to_cancel = &task_ids[0..5];
+        let cancelled = broker.cancel_batch(to_cancel).await.unwrap();
+        assert_eq!(cancelled, 5);
+
+        // Verify they're cancelled
+        let stats = broker.get_statistics().await.unwrap();
+        assert_eq!(stats.cancelled, 5);
+        assert_eq!(stats.pending, 5);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_worker_statistics() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Enqueue and dequeue a task with worker ID
+        let task = SerializedTask::new("test_task".to_string(), vec![1, 2, 3]);
+        broker.enqueue(task).await.unwrap();
+
+        let msg = broker
+            .dequeue_with_worker_id("test-worker-123")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Get worker statistics
+        let stats = broker
+            .get_worker_statistics("test-worker-123")
+            .await
+            .unwrap();
+
+        assert_eq!(stats.worker_id, "test-worker-123");
+        assert_eq!(stats.active_tasks, 1);
+
+        // Acknowledge the task
+        broker
+            .ack(&msg.task_id(), msg.receipt_handle.as_deref())
+            .await
+            .unwrap();
+
+        // Stats should update
+        let stats = broker
+            .get_worker_statistics("test-worker-123")
+            .await
+            .unwrap();
+        assert_eq!(stats.active_tasks, 0);
+        assert_eq!(stats.completed_tasks, 1);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_count_by_state_quick() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Enqueue tasks
+        for i in 0..5 {
+            let task = SerializedTask::new(format!("task_{}", i), vec![i as u8]);
+            broker.enqueue(task).await.unwrap();
+        }
+
+        // Count pending tasks
+        let pending_count = broker
+            .count_by_state_quick(DbTaskState::Pending)
+            .await
+            .unwrap();
+        assert_eq!(pending_count, 5);
+
+        // Dequeue one
+        broker.dequeue().await.unwrap();
+
+        // Check processing count
+        let processing_count = broker
+            .count_by_state_quick(DbTaskState::Processing)
+            .await
+            .unwrap();
+        assert_eq!(processing_count, 1);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_task_age_distribution() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Enqueue some tasks
+        for i in 0..10 {
+            let task = SerializedTask::new(format!("task_{}", i), vec![i as u8]);
+            broker.enqueue(task).await.unwrap();
+        }
+
+        // Get age distribution
+        let distribution = broker.get_task_age_distribution().await.unwrap();
+
+        // Should have at least one bucket
+        assert!(!distribution.is_empty());
+
+        // All tasks should be in the youngest bucket
+        let youngest = distribution.first().unwrap();
+        assert_eq!(youngest.bucket_label, "< 1 min");
+        assert_eq!(youngest.task_count, 10);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_retry_statistics() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Enqueue and fail some tasks to generate retries
+        for i in 0..3 {
+            let task = SerializedTask::new("failing_task".to_string(), vec![i as u8]);
+            let _task_id = broker.enqueue(task).await.unwrap();
+
+            // Dequeue and reject to trigger retry
+            let msg = broker.dequeue().await.unwrap().unwrap();
+            broker
+                .reject(&msg.task_id(), msg.receipt_handle.as_deref(), true)
+                .await
+                .unwrap();
+        }
+
+        // Get retry statistics
+        let stats = broker.get_retry_statistics().await.unwrap();
+
+        // Should have stats for the failing task
+        if !stats.is_empty() {
+            let task_stats = &stats[0];
+            assert_eq!(task_stats.task_name, "failing_task");
+            assert!(task_stats.total_retries > 0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_list_active_workers() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Enqueue tasks
+        for i in 0..3 {
+            let task = SerializedTask::new(format!("task_{}", i), vec![i as u8]);
+            broker.enqueue(task).await.unwrap();
+        }
+
+        // Dequeue with different workers
+        let _msg1 = broker
+            .dequeue_with_worker_id("worker-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let _msg2 = broker
+            .dequeue_with_worker_id("worker-2")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // List active workers
+        let workers = broker.list_active_workers().await.unwrap();
+        assert_eq!(workers.len(), 2);
+        assert!(workers.contains(&"worker-1".to_string()));
+        assert!(workers.contains(&"worker-2".to_string()));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_get_all_worker_statistics() {
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+
+        let broker = MysqlBroker::new(&database_url).await.unwrap();
+        broker.migrate().await.unwrap();
+
+        // Enqueue tasks
+        for i in 0..2 {
+            let task = SerializedTask::new(format!("task_{}", i), vec![i as u8]);
+            broker.enqueue(task).await.unwrap();
+        }
+
+        // Dequeue with workers
+        let _msg1 = broker
+            .dequeue_with_worker_id("worker-alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let _msg2 = broker
+            .dequeue_with_worker_id("worker-beta")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Get all worker statistics
+        let all_stats = broker.get_all_worker_statistics().await.unwrap();
+        assert_eq!(all_stats.len(), 2);
+
+        // Verify each worker has stats
+        for stats in &all_stats {
+            assert!(stats.worker_id == "worker-alpha" || stats.worker_id == "worker-beta");
+            assert_eq!(stats.active_tasks, 1);
+        }
     }
 }

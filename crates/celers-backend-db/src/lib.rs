@@ -216,18 +216,25 @@ impl ResultBackend for PostgresResultBackend {
 
         sqlx::query(
             r#"
-            INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids)
-            VALUES ($1, $2, 0, $3, $4)
+            INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (chord_id) DO UPDATE SET
                 total = EXCLUDED.total,
                 callback = EXCLUDED.callback,
-                task_ids = EXCLUDED.task_ids
+                task_ids = EXCLUDED.task_ids,
+                timeout_seconds = EXCLUDED.timeout_seconds,
+                cancelled = EXCLUDED.cancelled,
+                cancellation_reason = EXCLUDED.cancellation_reason
             "#,
         )
         .bind(state.chord_id)
         .bind(state.total as i32)
         .bind(&state.callback)
         .bind(task_ids)
+        .bind(state.created_at)
+        .bind(state.timeout.map(|d| d.as_secs() as i64))
+        .bind(state.cancelled)
+        .bind(&state.cancellation_reason)
         .execute(&self.pool)
         .await
         .map_err(|e| BackendError::Connection(format!("Failed to init chord: {}", e)))?;
@@ -251,7 +258,7 @@ impl ResultBackend for PostgresResultBackend {
     async fn chord_get_state(&mut self, chord_id: Uuid) -> Result<Option<ChordState>> {
         let row = sqlx::query(
             r#"
-            SELECT chord_id, total, completed, callback, task_ids
+            SELECT chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason
             FROM celers_chord_state
             WHERE chord_id = $1
             "#,
@@ -273,6 +280,12 @@ impl ResultBackend for PostgresResultBackend {
                     completed: row.get::<i32, _>("completed") as usize,
                     callback: row.get("callback"),
                     task_ids,
+                    created_at: row.get("created_at"),
+                    timeout: row
+                        .get::<Option<i64>, _>("timeout_seconds")
+                        .map(|s| std::time::Duration::from_secs(s as u64)),
+                    cancelled: row.get("cancelled"),
+                    cancellation_reason: row.get("cancellation_reason"),
                 };
 
                 Ok(Some(state))
@@ -617,18 +630,25 @@ impl ResultBackend for MysqlResultBackend {
 
         sqlx::query(
             r#"
-            INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids)
-            VALUES (?, ?, 0, ?, ?)
+            INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
+            VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 total = VALUES(total),
                 callback = VALUES(callback),
-                task_ids = VALUES(task_ids)
+                task_ids = VALUES(task_ids),
+                timeout_seconds = VALUES(timeout_seconds),
+                cancelled = VALUES(cancelled),
+                cancellation_reason = VALUES(cancellation_reason)
             "#,
         )
         .bind(state.chord_id.to_string())
         .bind(state.total as i32)
         .bind(&state.callback)
         .bind(task_ids)
+        .bind(state.created_at)
+        .bind(state.timeout.map(|d| d.as_secs() as i64))
+        .bind(state.cancelled)
+        .bind(&state.cancellation_reason)
         .execute(&self.pool)
         .await
         .map_err(|e| BackendError::Connection(format!("Failed to init chord: {}", e)))?;
@@ -660,7 +680,7 @@ impl ResultBackend for MysqlResultBackend {
     async fn chord_get_state(&mut self, chord_id: Uuid) -> Result<Option<ChordState>> {
         let row = sqlx::query(
             r#"
-            SELECT chord_id, total, completed, callback, task_ids
+            SELECT chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason
             FROM celers_chord_state
             WHERE chord_id = ?
             "#,
@@ -684,6 +704,12 @@ impl ResultBackend for MysqlResultBackend {
                     completed: row.get::<i32, _>("completed") as usize,
                     callback: row.get("callback"),
                     task_ids,
+                    created_at: row.get("created_at"),
+                    timeout: row
+                        .get::<Option<i64>, _>("timeout_seconds")
+                        .map(|s| std::time::Duration::from_secs(s as u64)),
+                    cancelled: row.get("cancelled"),
+                    cancellation_reason: row.get("cancellation_reason"),
                 };
 
                 Ok(Some(state))

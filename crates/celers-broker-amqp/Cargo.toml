@@ -21,9 +21,20 @@ tracing = "0.1"
 lapin = "2.5"
 tokio = { version = "1.42", features = ["full"] }
 
+# HTTP client for RabbitMQ Management API
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2.1"
+
 # Core dependencies
 celers-protocol = { path = "../celers-protocol" }
 celers-kombu = { path = "../celers-kombu" }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tracing-subscriber = "0.3"
+futures = "0.3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "amqp_benchmarks"
+harness = false

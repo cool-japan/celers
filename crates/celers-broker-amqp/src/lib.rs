@@ -17,6 +17,7 @@
 //! - Virtual host support
 //! - **Health Monitoring** with `health_status()` and `is_healthy()`
 //! - **Transaction Support** with `start_transaction()`, `commit_transaction()`, `rollback_transaction()`
+//! - **Management API Integration** for queue listing, statistics, and server monitoring
 //!
 //! # Example
 //!
@@ -41,6 +42,44 @@
 //!
 //! // Consume messages
 //! let envelope = broker.consume("my_queue", std::time::Duration::from_secs(5)).await?;
+//!
+//! // With Management API for monitoring
+//! let config = AmqpConfig::default()
+//!     .with_management_api("http://localhost:15672", "guest", "guest");
+//! let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "celery", config).await?;
+//!
+//! // List all queues
+//! let queues = broker.list_queues().await?;
+//! for queue in queues {
+//!     println!("{}: {} messages", queue.name, queue.messages);
+//! }
+//!
+//! // Get detailed queue statistics
+//! let stats = broker.get_queue_stats("my_queue").await?;
+//! println!("Ready: {}, Unacked: {}", stats.messages_ready, stats.messages_unacknowledged);
+//!
+//! // Get server overview
+//! let overview = broker.get_server_overview().await?;
+//! println!("RabbitMQ version: {}", overview.rabbitmq_version);
+//!
+//! // Monitor connections and channels
+//! let connections = broker.list_connections().await?;
+//! println!("Active connections: {}", connections.len());
+//!
+//! let channels = broker.list_channels().await?;
+//! println!("Active channels: {}", channels.len());
+//!
+//! // List exchanges
+//! let exchanges = broker.list_exchanges(None).await?;
+//! for exchange in exchanges {
+//!     println!("{}: {} ({})", exchange.name, exchange.exchange_type, exchange.vhost);
+//! }
+//!
+//! // Inspect queue bindings
+//! let bindings = broker.list_queue_bindings("my_queue").await?;
+//! for binding in bindings {
+//!     println!("{} -> {} via '{}'", binding.source, binding.destination, binding.routing_key);
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -278,6 +317,12 @@ pub struct AmqpConfig {
     pub deduplication_cache_size: usize,
     /// Deduplication cache TTL (how long to remember message IDs)
     pub deduplication_ttl: Duration,
+    /// Management API URL (e.g., "http://localhost:15672")
+    pub management_url: Option<String>,
+    /// Management API username
+    pub management_username: Option<String>,
+    /// Management API password
+    pub management_password: Option<String>,
 }
 
 impl Default for AmqpConfig {
@@ -300,6 +345,9 @@ impl Default for AmqpConfig {
             enable_deduplication: false,
             deduplication_cache_size: 10000,
             deduplication_ttl: Duration::from_secs(3600), // 1 hour
+            management_url: None,
+            management_username: None,
+            management_password: None,
         }
     }
 }
@@ -391,6 +439,19 @@ impl AmqpConfig {
         self.deduplication_ttl = ttl;
         self
     }
+
+    /// Set Management API configuration
+    pub fn with_management_api(
+        mut self,
+        url: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.management_url = Some(url.into());
+        self.management_username = Some(username.into());
+        self.management_password = Some(password.into());
+        self
+    }
 }
 
 /// Connection health status
@@ -404,6 +465,10 @@ pub struct HealthStatus {
     pub connection_state: String,
     /// Channel state description
     pub channel_state: String,
+    /// Connection pool metrics (if connection pooling is enabled)
+    pub connection_pool_metrics: Option<ConnectionPoolMetrics>,
+    /// Channel pool metrics (if channel pooling is enabled)
+    pub channel_pool_metrics: Option<ChannelPoolMetrics>,
 }
 
 impl HealthStatus {
@@ -473,6 +538,44 @@ pub struct PublisherConfirmStats {
     pub pending_confirms: u64,
     /// Average confirmation latency in microseconds
     pub avg_confirm_latency_us: u64,
+}
+
+/// Connection pool metrics
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionPoolMetrics {
+    /// Current number of connections in pool
+    pub pool_size: usize,
+    /// Maximum pool size configured
+    pub max_pool_size: usize,
+    /// Total connections created
+    pub total_created: u64,
+    /// Total connections acquired from pool
+    pub total_acquired: u64,
+    /// Total connections released back to pool
+    pub total_released: u64,
+    /// Total connections discarded (dead/invalid)
+    pub total_discarded: u64,
+    /// Number of times pool was full
+    pub pool_full_count: u64,
+}
+
+/// Channel pool metrics
+#[derive(Debug, Clone, Default)]
+pub struct ChannelPoolMetrics {
+    /// Current number of channels in pool
+    pub pool_size: usize,
+    /// Maximum pool size configured
+    pub max_pool_size: usize,
+    /// Total channels created
+    pub total_created: u64,
+    /// Total channels acquired from pool
+    pub total_acquired: u64,
+    /// Total channels released back to pool
+    pub total_released: u64,
+    /// Total channels discarded (dead/invalid)
+    pub total_discarded: u64,
+    /// Number of times pool was full
+    pub pool_full_count: u64,
 }
 
 /// Message deduplication cache entry
@@ -547,6 +650,417 @@ impl DeduplicationCache {
     }
 }
 
+/// RabbitMQ Management API client
+#[derive(Clone)]
+struct ManagementApiClient {
+    base_url: String,
+    username: String,
+    password: String,
+    client: reqwest::Client,
+}
+
+impl ManagementApiClient {
+    /// Create a new Management API client
+    fn new(base_url: String, username: String, password: String) -> Self {
+        Self {
+            base_url,
+            username,
+            password,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// List all queues
+    async fn list_queues(&self) -> Result<Vec<QueueInfo>> {
+        let url = format!("{}/api/queues", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(BrokerError::Connection(format!(
+                "Management API returned error: {}",
+                response.status()
+            )));
+        }
+
+        let queues: Vec<QueueInfo> = response
+            .json()
+            .await
+            .map_err(|e| BrokerError::Connection(format!("Failed to parse queue info: {}", e)))?;
+
+        Ok(queues)
+    }
+
+    /// Get detailed queue statistics
+    async fn get_queue_stats(&self, vhost: &str, queue_name: &str) -> Result<QueueStats> {
+        let vhost_encoded = urlencoding::encode(vhost);
+        let queue_encoded = urlencoding::encode(queue_name);
+        let url = format!(
+            "{}/api/queues/{}/{}",
+            self.base_url, vhost_encoded, queue_encoded
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(BrokerError::Connection(format!(
+                "Management API returned error: {}",
+                response.status()
+            )));
+        }
+
+        let stats: QueueStats = response
+            .json()
+            .await
+            .map_err(|e| BrokerError::Connection(format!("Failed to parse queue stats: {}", e)))?;
+
+        Ok(stats)
+    }
+
+    /// Get overview of RabbitMQ server
+    async fn get_overview(&self) -> Result<ServerOverview> {
+        let url = format!("{}/api/overview", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(BrokerError::Connection(format!(
+                "Management API returned error: {}",
+                response.status()
+            )));
+        }
+
+        let overview: ServerOverview = response.json().await.map_err(|e| {
+            BrokerError::Connection(format!("Failed to parse server overview: {}", e))
+        })?;
+
+        Ok(overview)
+    }
+
+    /// List all connections
+    async fn list_connections(&self) -> Result<Vec<ConnectionInfo>> {
+        let url = format!("{}/api/connections", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(BrokerError::Connection(format!(
+                "Management API returned error: {}",
+                response.status()
+            )));
+        }
+
+        let connections: Vec<ConnectionInfo> = response.json().await.map_err(|e| {
+            BrokerError::Connection(format!("Failed to parse connection info: {}", e))
+        })?;
+
+        Ok(connections)
+    }
+
+    /// List all channels
+    async fn list_channels(&self) -> Result<Vec<ChannelInfo>> {
+        let url = format!("{}/api/channels", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(BrokerError::Connection(format!(
+                "Management API returned error: {}",
+                response.status()
+            )));
+        }
+
+        let channels: Vec<ChannelInfo> = response
+            .json()
+            .await
+            .map_err(|e| BrokerError::Connection(format!("Failed to parse channel info: {}", e)))?;
+
+        Ok(channels)
+    }
+
+    /// List all exchanges
+    async fn list_exchanges(&self, vhost: &str) -> Result<Vec<ExchangeInfo>> {
+        let vhost_encoded = urlencoding::encode(vhost);
+        let url = format!("{}/api/exchanges/{}", self.base_url, vhost_encoded);
+        let response = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(BrokerError::Connection(format!(
+                "Management API returned error: {}",
+                response.status()
+            )));
+        }
+
+        let exchanges: Vec<ExchangeInfo> = response.json().await.map_err(|e| {
+            BrokerError::Connection(format!("Failed to parse exchange info: {}", e))
+        })?;
+
+        Ok(exchanges)
+    }
+
+    /// List all bindings for a queue
+    async fn list_queue_bindings(&self, vhost: &str, queue_name: &str) -> Result<Vec<BindingInfo>> {
+        let vhost_encoded = urlencoding::encode(vhost);
+        let queue_encoded = urlencoding::encode(queue_name);
+        let url = format!(
+            "{}/api/queues/{}/{}/bindings",
+            self.base_url, vhost_encoded, queue_encoded
+        );
+        let response = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request failed: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(BrokerError::Connection(format!(
+                "Management API returned error: {}",
+                response.status()
+            )));
+        }
+
+        let bindings: Vec<BindingInfo> = response
+            .json()
+            .await
+            .map_err(|e| BrokerError::Connection(format!("Failed to parse binding info: {}", e)))?;
+
+        Ok(bindings)
+    }
+}
+
+/// Queue information from Management API
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct QueueInfo {
+    pub name: String,
+    pub vhost: String,
+    pub durable: bool,
+    pub auto_delete: bool,
+    #[serde(default)]
+    pub messages: u64,
+    #[serde(default)]
+    pub messages_ready: u64,
+    #[serde(default)]
+    pub messages_unacknowledged: u64,
+    #[serde(default)]
+    pub consumers: u32,
+    #[serde(default)]
+    pub memory: u64,
+}
+
+/// Detailed queue statistics from Management API
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct QueueStats {
+    pub name: String,
+    pub vhost: String,
+    pub durable: bool,
+    pub auto_delete: bool,
+    #[serde(default)]
+    pub messages: u64,
+    #[serde(default)]
+    pub messages_ready: u64,
+    #[serde(default)]
+    pub messages_unacknowledged: u64,
+    #[serde(default)]
+    pub consumers: u32,
+    #[serde(default)]
+    pub memory: u64,
+    #[serde(default)]
+    pub message_bytes: u64,
+    #[serde(default)]
+    pub message_bytes_ready: u64,
+    #[serde(default)]
+    pub message_bytes_unacknowledged: u64,
+    pub message_stats: Option<MessageStats>,
+}
+
+/// Message statistics
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct MessageStats {
+    #[serde(default)]
+    pub publish: u64,
+    #[serde(default)]
+    pub publish_details: Option<RateDetails>,
+    #[serde(default)]
+    pub deliver: u64,
+    #[serde(default)]
+    pub deliver_details: Option<RateDetails>,
+    #[serde(default)]
+    pub ack: u64,
+    #[serde(default)]
+    pub ack_details: Option<RateDetails>,
+}
+
+/// Rate details for statistics
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct RateDetails {
+    pub rate: f64,
+}
+
+/// Server overview from Management API
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ServerOverview {
+    pub management_version: String,
+    pub rabbitmq_version: String,
+    pub erlang_version: String,
+    pub cluster_name: String,
+    pub queue_totals: Option<QueueTotals>,
+    pub object_totals: Option<ObjectTotals>,
+}
+
+/// Queue totals
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct QueueTotals {
+    #[serde(default)]
+    pub messages: u64,
+    #[serde(default)]
+    pub messages_ready: u64,
+    #[serde(default)]
+    pub messages_unacknowledged: u64,
+}
+
+/// Object totals
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ObjectTotals {
+    #[serde(default)]
+    pub consumers: u32,
+    #[serde(default)]
+    pub queues: u32,
+    #[serde(default)]
+    pub exchanges: u32,
+    #[serde(default)]
+    pub connections: u32,
+    #[serde(default)]
+    pub channels: u32,
+}
+
+/// Connection information from Management API
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ConnectionInfo {
+    pub name: String,
+    #[serde(default)]
+    pub vhost: String,
+    pub user: String,
+    pub state: String,
+    #[serde(default)]
+    pub channels: u32,
+    pub peer_host: String,
+    pub peer_port: u16,
+    #[serde(default)]
+    pub recv_oct: u64,
+    #[serde(default)]
+    pub send_oct: u64,
+    #[serde(default)]
+    pub recv_cnt: u64,
+    #[serde(default)]
+    pub send_cnt: u64,
+}
+
+/// Channel information from Management API
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ChannelInfo {
+    pub name: String,
+    pub connection_details: Option<ConnectionDetails>,
+    pub vhost: String,
+    pub user: String,
+    pub number: u32,
+    #[serde(default)]
+    pub consumers: u32,
+    #[serde(default)]
+    pub messages_unacknowledged: u64,
+    #[serde(default)]
+    pub messages_uncommitted: u64,
+    #[serde(default)]
+    pub acks_uncommitted: u64,
+    #[serde(default)]
+    pub prefetch_count: u32,
+    pub state: String,
+}
+
+/// Connection details for a channel
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ConnectionDetails {
+    pub name: String,
+    pub peer_host: String,
+    pub peer_port: u16,
+}
+
+/// Exchange information from Management API
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ExchangeInfo {
+    pub name: String,
+    pub vhost: String,
+    #[serde(rename = "type")]
+    pub exchange_type: String,
+    pub durable: bool,
+    pub auto_delete: bool,
+    pub internal: bool,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+    pub message_stats: Option<MessageStats>,
+}
+
+/// Binding information from Management API
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct BindingInfo {
+    pub source: String,
+    pub vhost: String,
+    pub destination: String,
+    pub destination_type: String,
+    pub routing_key: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+    #[serde(default)]
+    pub properties_key: String,
+}
+
 /// Connection pool for managing multiple AMQP connections
 #[derive(Clone)]
 struct ConnectionPool {
@@ -554,15 +1068,21 @@ struct ConnectionPool {
     #[allow(dead_code)]
     max_size: usize,
     url: String,
+    /// Pool metrics
+    metrics: Arc<Mutex<ConnectionPoolMetrics>>,
 }
 
 impl ConnectionPool {
     /// Create a new connection pool
     fn new(url: String, max_size: usize) -> Self {
+        let mut metrics = ConnectionPoolMetrics::default();
+        metrics.max_pool_size = max_size;
+
         Self {
             connections: Arc::new(Mutex::new(VecDeque::with_capacity(max_size))),
             max_size,
             url,
+            metrics: Arc::new(Mutex::new(metrics)),
         }
     }
 
@@ -570,24 +1090,36 @@ impl ConnectionPool {
     #[allow(dead_code)]
     async fn acquire(&self) -> Result<Connection> {
         let mut pool = self.connections.lock().await;
+        let mut metrics = self.metrics.lock().await;
 
         // Try to get an existing connection
         while let Some(conn) = pool.pop_front() {
             if conn.status().connected() {
+                metrics.total_acquired += 1;
+                metrics.pool_size = pool.len();
                 return Ok(conn);
             }
             // Connection is dead, discard it
+            metrics.total_discarded += 1;
             debug!("Discarded dead connection from pool");
         }
 
         // No available connections, create a new one
+        metrics.pool_size = pool.len();
         drop(pool); // Release lock before creating connection
+        drop(metrics); // Release metrics lock
 
         let connection = Connection::connect(&self.url, ConnectionProperties::default())
             .await
             .map_err(|e| BrokerError::Connection(format!("Failed to connect: {}", e)))?;
 
         debug!("Created new connection for pool");
+
+        // Update metrics
+        let mut metrics = self.metrics.lock().await;
+        metrics.total_created += 1;
+        metrics.total_acquired += 1;
+
         Ok(connection)
     }
 
@@ -596,15 +1128,24 @@ impl ConnectionPool {
     async fn release(&self, connection: Connection) {
         if !connection.status().connected() {
             debug!("Not returning dead connection to pool");
+            let mut metrics = self.metrics.lock().await;
+            metrics.total_discarded += 1;
             return;
         }
 
         let mut pool = self.connections.lock().await;
+        let mut metrics = self.metrics.lock().await;
+
         if pool.len() < self.max_size {
             pool.push_back(connection);
+            metrics.total_released += 1;
+            metrics.pool_size = pool.len();
             debug!("Returned connection to pool (size: {})", pool.len());
         } else {
             debug!("Pool full, closing excess connection");
+            metrics.pool_full_count += 1;
+            drop(pool);
+            drop(metrics);
             // Pool is full, close the connection
             let _ = connection.close(200, "Pool full").await;
         }
@@ -617,6 +1158,14 @@ impl ConnectionPool {
             let _ = conn.close(200, "Closing pool").await;
         }
     }
+
+    /// Get current pool metrics
+    async fn get_metrics(&self) -> ConnectionPoolMetrics {
+        let pool = self.connections.lock().await;
+        let mut metrics = self.metrics.lock().await;
+        metrics.pool_size = pool.len();
+        metrics.clone()
+    }
 }
 
 /// Channel pool for managing multiple AMQP channels per connection
@@ -624,14 +1173,20 @@ struct ChannelPool {
     channels: Arc<Mutex<VecDeque<Channel>>>,
     #[allow(dead_code)]
     max_size: usize,
+    /// Pool metrics
+    metrics: Arc<Mutex<ChannelPoolMetrics>>,
 }
 
 impl ChannelPool {
     /// Create a new channel pool
     fn new(max_size: usize) -> Self {
+        let mut metrics = ChannelPoolMetrics::default();
+        metrics.max_pool_size = max_size;
+
         Self {
             channels: Arc::new(Mutex::new(VecDeque::with_capacity(max_size))),
             max_size,
+            metrics: Arc::new(Mutex::new(metrics)),
         }
     }
 
@@ -639,18 +1194,24 @@ impl ChannelPool {
     #[allow(dead_code)]
     async fn acquire(&self, connection: &Connection) -> Result<Channel> {
         let mut pool = self.channels.lock().await;
+        let mut metrics = self.metrics.lock().await;
 
         // Try to get an existing channel
         while let Some(ch) = pool.pop_front() {
             if ch.status().connected() {
+                metrics.total_acquired += 1;
+                metrics.pool_size = pool.len();
                 return Ok(ch);
             }
             // Channel is dead, discard it
+            metrics.total_discarded += 1;
             debug!("Discarded dead channel from pool");
         }
 
         // No available channels, create a new one
+        metrics.pool_size = pool.len();
         drop(pool); // Release lock before creating channel
+        drop(metrics); // Release metrics lock
 
         let channel = connection
             .create_channel()
@@ -658,6 +1219,12 @@ impl ChannelPool {
             .map_err(|e| BrokerError::Connection(format!("Failed to create channel: {}", e)))?;
 
         debug!("Created new channel for pool");
+
+        // Update metrics
+        let mut metrics = self.metrics.lock().await;
+        metrics.total_created += 1;
+        metrics.total_acquired += 1;
+
         Ok(channel)
     }
 
@@ -666,15 +1233,24 @@ impl ChannelPool {
     async fn release(&self, channel: Channel) {
         if !channel.status().connected() {
             debug!("Not returning dead channel to pool");
+            let mut metrics = self.metrics.lock().await;
+            metrics.total_discarded += 1;
             return;
         }
 
         let mut pool = self.channels.lock().await;
+        let mut metrics = self.metrics.lock().await;
+
         if pool.len() < self.max_size {
             pool.push_back(channel);
+            metrics.total_released += 1;
+            metrics.pool_size = pool.len();
             debug!("Returned channel to pool (size: {})", pool.len());
         } else {
             debug!("Channel pool full, closing excess channel");
+            metrics.pool_full_count += 1;
+            drop(pool);
+            drop(metrics);
             // Pool is full, close the channel
             let _ = channel.close(200, "Pool full").await;
         }
@@ -686,6 +1262,14 @@ impl ChannelPool {
         while let Some(ch) = pool.pop_front() {
             let _ = ch.close(200, "Closing pool").await;
         }
+    }
+
+    /// Get current pool metrics
+    async fn get_metrics(&self) -> ChannelPoolMetrics {
+        let pool = self.channels.lock().await;
+        let mut metrics = self.metrics.lock().await;
+        metrics.pool_size = pool.len();
+        metrics.clone()
     }
 }
 
@@ -713,6 +1297,8 @@ pub struct AmqpBroker {
     publisher_confirm_stats: PublisherConfirmStats,
     /// Message deduplication cache (if enabled)
     deduplication_cache: Option<DeduplicationCache>,
+    /// Management API client (if configured)
+    management_api_client: Option<ManagementApiClient>,
 }
 
 impl AmqpBroker {
@@ -747,6 +1333,16 @@ impl AmqpBroker {
             None
         };
 
+        let management_api_client = if let (Some(mgmt_url), Some(mgmt_user), Some(mgmt_pass)) = (
+            config.management_url.clone(),
+            config.management_username.clone(),
+            config.management_password.clone(),
+        ) {
+            Some(ManagementApiClient::new(mgmt_url, mgmt_user, mgmt_pass))
+        } else {
+            None
+        };
+
         Ok(Self {
             url: url.to_string(),
             queue_name: queue_name.to_string(),
@@ -761,6 +1357,7 @@ impl AmqpBroker {
             channel_metrics: ChannelMetrics::default(),
             publisher_confirm_stats: PublisherConfirmStats::default(),
             deduplication_cache,
+            management_api_client,
         })
     }
 
@@ -1066,7 +1663,7 @@ impl AmqpBroker {
     }
 
     /// Declare a queue with basic options
-    async fn declare_queue(&mut self, queue: &str, mode: QueueMode) -> Result<()> {
+    pub async fn declare_queue(&mut self, queue: &str, mode: QueueMode) -> Result<()> {
         let config = match mode {
             QueueMode::Priority => QueueConfig::new().with_max_priority(10),
             QueueMode::Fifo => QueueConfig::new(),
@@ -1313,7 +1910,7 @@ impl AmqpBroker {
     // ==================== Health Monitoring ====================
 
     /// Get the health status of the broker connection
-    pub fn health_status(&self) -> HealthStatus {
+    pub async fn health_status(&self) -> HealthStatus {
         let connected = self
             .connection
             .as_ref()
@@ -1338,17 +1935,45 @@ impl AmqpBroker {
             .map(|ch| format!("{:?}", ch.status().state()))
             .unwrap_or_else(|| "No channel".to_string());
 
+        // Get connection pool metrics if pooling is enabled
+        let connection_pool_metrics = if let Some(ref pool) = self.connection_pool {
+            Some(pool.get_metrics().await)
+        } else {
+            None
+        };
+
+        // Get channel pool metrics if pooling is enabled
+        let channel_pool_metrics = if let Some(ref pool) = self.channel_pool {
+            Some(pool.get_metrics().await)
+        } else {
+            None
+        };
+
         HealthStatus {
             connected,
             channel_open,
             connection_state,
             channel_state,
+            connection_pool_metrics,
+            channel_pool_metrics,
         }
     }
 
     /// Check if the broker is healthy
     pub fn is_healthy(&self) -> bool {
-        self.health_status().is_healthy()
+        let connected = self
+            .connection
+            .as_ref()
+            .map(|c| c.status().connected())
+            .unwrap_or(false);
+
+        let channel_open = self
+            .channel
+            .as_ref()
+            .map(|ch| ch.status().connected())
+            .unwrap_or(false);
+
+        connected && channel_open
     }
 
     // ==================== Consumer Streaming ====================
@@ -1485,6 +2110,192 @@ impl AmqpBroker {
     /// Get the current transaction state
     pub fn transaction_state(&self) -> TransactionState {
         self.transaction_state
+    }
+
+    /// List all queues via Management API
+    ///
+    /// Requires Management API to be configured via `with_management_api()`.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `QueueInfo` structs containing basic queue information.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Management API is not configured or if the request fails.
+    pub async fn list_queues(&self) -> Result<Vec<QueueInfo>> {
+        let client = self
+            .management_api_client
+            .as_ref()
+            .ok_or_else(|| BrokerError::Connection("Management API not configured".to_string()))?;
+
+        client.list_queues().await
+    }
+
+    /// Get detailed statistics for a specific queue via Management API
+    ///
+    /// Requires Management API to be configured via `with_management_api()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - Name of the queue
+    ///
+    /// # Returns
+    ///
+    /// A `QueueStats` struct containing detailed queue statistics including:
+    /// - Message counts (total, ready, unacknowledged)
+    /// - Consumer count
+    /// - Memory usage
+    /// - Message rates (publish, deliver, ack)
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Management API is not configured or if the request fails.
+    pub async fn get_queue_stats(&self, queue_name: &str) -> Result<QueueStats> {
+        let client = self
+            .management_api_client
+            .as_ref()
+            .ok_or_else(|| BrokerError::Connection("Management API not configured".to_string()))?;
+
+        let vhost = self.config.vhost.as_deref().unwrap_or("/");
+        client.get_queue_stats(vhost, queue_name).await
+    }
+
+    /// Get RabbitMQ server overview via Management API
+    ///
+    /// Requires Management API to be configured via `with_management_api()`.
+    ///
+    /// # Returns
+    ///
+    /// A `ServerOverview` struct containing:
+    /// - RabbitMQ version information
+    /// - Cluster information
+    /// - Queue totals across all queues
+    /// - Object counts (queues, exchanges, connections, channels)
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Management API is not configured or if the request fails.
+    pub async fn get_server_overview(&self) -> Result<ServerOverview> {
+        let client = self
+            .management_api_client
+            .as_ref()
+            .ok_or_else(|| BrokerError::Connection("Management API not configured".to_string()))?;
+
+        client.get_overview().await
+    }
+
+    /// Check if Management API is configured
+    pub fn has_management_api(&self) -> bool {
+        self.management_api_client.is_some()
+    }
+
+    /// List all active connections via Management API
+    ///
+    /// Requires Management API to be configured via `with_management_api()`.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `ConnectionInfo` structs containing:
+    /// - Connection name and state
+    /// - Virtual host and user
+    /// - Peer host and port
+    /// - Number of channels
+    /// - Sent/received bytes and packet counts
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Management API is not configured or if the request fails.
+    pub async fn list_connections(&self) -> Result<Vec<ConnectionInfo>> {
+        let client = self
+            .management_api_client
+            .as_ref()
+            .ok_or_else(|| BrokerError::Connection("Management API not configured".to_string()))?;
+
+        client.list_connections().await
+    }
+
+    /// List all active channels via Management API
+    ///
+    /// Requires Management API to be configured via `with_management_api()`.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `ChannelInfo` structs containing:
+    /// - Channel number and state
+    /// - Virtual host and user
+    /// - Consumer count
+    /// - Unacknowledged/uncommitted message counts
+    /// - Prefetch count
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Management API is not configured or if the request fails.
+    pub async fn list_channels(&self) -> Result<Vec<ChannelInfo>> {
+        let client = self
+            .management_api_client
+            .as_ref()
+            .ok_or_else(|| BrokerError::Connection("Management API not configured".to_string()))?;
+
+        client.list_channels().await
+    }
+
+    /// List all exchanges in a virtual host via Management API
+    ///
+    /// Requires Management API to be configured via `with_management_api()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `vhost` - Virtual host name (optional, uses configured vhost or "/" if None)
+    ///
+    /// # Returns
+    ///
+    /// A vector of `ExchangeInfo` structs containing:
+    /// - Exchange name and type
+    /// - Durability and auto-delete settings
+    /// - Arguments
+    /// - Message statistics (if available)
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Management API is not configured or if the request fails.
+    pub async fn list_exchanges(&self, vhost: Option<&str>) -> Result<Vec<ExchangeInfo>> {
+        let client = self
+            .management_api_client
+            .as_ref()
+            .ok_or_else(|| BrokerError::Connection("Management API not configured".to_string()))?;
+
+        let vhost = vhost.unwrap_or_else(|| self.config.vhost.as_deref().unwrap_or("/"));
+        client.list_exchanges(vhost).await
+    }
+
+    /// List all bindings for a specific queue via Management API
+    ///
+    /// Requires Management API to be configured via `with_management_api()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - Name of the queue
+    ///
+    /// # Returns
+    ///
+    /// A vector of `BindingInfo` structs containing:
+    /// - Source exchange
+    /// - Destination queue
+    /// - Routing key
+    /// - Binding arguments
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Management API is not configured or if the request fails.
+    pub async fn list_queue_bindings(&self, queue_name: &str) -> Result<Vec<BindingInfo>> {
+        let client = self
+            .management_api_client
+            .as_ref()
+            .ok_or_else(|| BrokerError::Connection("Management API not configured".to_string()))?;
+
+        let vhost = self.config.vhost.as_deref().unwrap_or("/");
+        client.list_queue_bindings(vhost, queue_name).await
     }
 }
 
@@ -2196,12 +3007,16 @@ mod tests {
             .await
             .unwrap();
 
-        let status = broker.health_status();
+        let status = broker.health_status().await;
         assert!(!status.connected);
         assert!(!status.channel_open);
         assert!(!status.is_healthy());
         assert_eq!(status.connection_state, "Not connected");
         assert_eq!(status.channel_state, "No channel");
+        // Connection pool is disabled by default (connection_pool_size: 0)
+        assert!(status.connection_pool_metrics.is_none());
+        // Channel pool is enabled by default (channel_pool_size: 10)
+        assert!(status.channel_pool_metrics.is_some());
     }
 
     #[tokio::test]
@@ -2242,6 +3057,8 @@ mod tests {
             channel_open: true,
             connection_state: "Connected".to_string(),
             channel_state: "Open".to_string(),
+            connection_pool_metrics: None,
+            channel_pool_metrics: None,
         };
         assert!(healthy.is_healthy());
 
@@ -2250,6 +3067,8 @@ mod tests {
             channel_open: true,
             connection_state: "Disconnected".to_string(),
             channel_state: "Open".to_string(),
+            connection_pool_metrics: None,
+            channel_pool_metrics: None,
         };
         assert!(!not_connected.is_healthy());
 
@@ -2258,6 +3077,8 @@ mod tests {
             channel_open: false,
             connection_state: "Connected".to_string(),
             channel_state: "Closed".to_string(),
+            connection_pool_metrics: None,
+            channel_pool_metrics: None,
         };
         assert!(!no_channel.is_healthy());
     }
@@ -2287,7 +3108,7 @@ mod tests {
         assert!(broker.is_healthy());
 
         // Test health status
-        let health = broker.health_status();
+        let health = broker.health_status().await;
         assert!(health.connected);
         assert!(health.channel_open);
 
@@ -2865,6 +3686,288 @@ mod tests {
         // Only one message should be in queue
         let size = broker.queue_size("test_dedup").await.unwrap();
         assert_eq!(size, 1);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[test]
+    fn test_management_api_config() {
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        assert_eq!(
+            config.management_url,
+            Some("http://localhost:15672".to_string())
+        );
+        assert_eq!(config.management_username, Some("guest".to_string()));
+        assert_eq!(config.management_password, Some("guest".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_management_api_not_configured() {
+        let broker = AmqpBroker::new("amqp://localhost:5672", "test_queue")
+            .await
+            .unwrap();
+
+        assert!(!broker.has_management_api());
+
+        let result = broker.list_queues().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn test_management_api_configured() {
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        let broker = AmqpBroker::with_config("amqp://localhost:5672", "test_queue", config)
+            .await
+            .unwrap();
+
+        assert!(broker.has_management_api());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ Management API to be running
+    async fn test_integration_list_queues() {
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_list", config)
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // Declare a test queue
+        broker
+            .declare_queue("test_mgmt_list", QueueMode::Fifo)
+            .await
+            .unwrap();
+
+        // List queues
+        let queues = broker.list_queues().await.unwrap();
+        assert!(!queues.is_empty());
+
+        // Find our test queue
+        let found = queues.iter().any(|q| q.name == "test_mgmt_list");
+        assert!(found);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ Management API to be running
+    async fn test_integration_queue_stats() {
+        use celers_protocol::builder::MessageBuilder;
+
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        let mut broker =
+            AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_stats", config)
+                .await
+                .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // Declare a test queue
+        broker
+            .declare_queue("test_mgmt_stats", QueueMode::Fifo)
+            .await
+            .unwrap();
+
+        let _ = broker.purge("test_mgmt_stats").await;
+
+        // Publish some messages
+        for i in 0..5 {
+            let msg = MessageBuilder::new("test.task")
+                .args(vec![serde_json::json!(i)])
+                .build()
+                .unwrap();
+            broker.publish("test_mgmt_stats", msg).await.unwrap();
+        }
+
+        // Give RabbitMQ time to update stats
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Get queue stats
+        let stats = broker.get_queue_stats("test_mgmt_stats").await.unwrap();
+        assert_eq!(stats.name, "test_mgmt_stats");
+        assert_eq!(stats.messages, 5);
+        assert_eq!(stats.messages_ready, 5);
+        assert_eq!(stats.messages_unacknowledged, 0);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ Management API to be running
+    async fn test_integration_server_overview() {
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        let mut broker =
+            AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_overview", config)
+                .await
+                .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // Get server overview
+        let overview = broker.get_server_overview().await.unwrap();
+
+        // Verify we got valid data
+        assert!(!overview.rabbitmq_version.is_empty());
+        assert!(!overview.erlang_version.is_empty());
+        assert!(!overview.management_version.is_empty());
+        assert!(!overview.cluster_name.is_empty());
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ Management API to be running
+    async fn test_integration_list_connections() {
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_conn", config)
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // List connections
+        let connections = broker.list_connections().await.unwrap();
+
+        // Should have at least our connection
+        assert!(!connections.is_empty());
+
+        // Verify connection data
+        let conn = &connections[0];
+        assert!(!conn.name.is_empty());
+        assert!(!conn.user.is_empty());
+        assert!(!conn.state.is_empty());
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ Management API to be running
+    async fn test_integration_list_channels() {
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_chan", config)
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // List channels
+        let channels = broker.list_channels().await.unwrap();
+
+        // Should have at least our channel
+        assert!(!channels.is_empty());
+
+        // Verify channel data
+        let chan = &channels[0];
+        assert!(!chan.name.is_empty());
+        assert!(!chan.user.is_empty());
+        assert!(!chan.state.is_empty());
+        assert!(chan.number > 0);
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ Management API to be running
+    async fn test_integration_list_exchanges() {
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_exch", config)
+            .await
+            .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // List exchanges
+        let exchanges = broker.list_exchanges(None).await.unwrap();
+
+        // Should have default exchanges
+        assert!(!exchanges.is_empty());
+
+        // Find the default exchange
+        let default_exch = exchanges.iter().find(|e| e.name.is_empty());
+        assert!(default_exch.is_some());
+
+        // Find the amq.direct exchange
+        let direct_exch = exchanges.iter().find(|e| e.name == "amq.direct");
+        assert!(direct_exch.is_some());
+        assert_eq!(direct_exch.unwrap().exchange_type, "direct");
+
+        broker.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires RabbitMQ Management API to be running
+    async fn test_integration_list_queue_bindings() {
+        let config =
+            AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
+
+        let mut broker =
+            AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_bindings", config)
+                .await
+                .unwrap();
+
+        if broker.connect().await.is_err() {
+            eprintln!("Skipping integration test - RabbitMQ not available");
+            return;
+        }
+
+        // Declare a test queue
+        broker
+            .declare_queue("test_mgmt_bindings", QueueMode::Fifo)
+            .await
+            .unwrap();
+
+        // Give RabbitMQ time to register the queue
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // List bindings
+        let bindings = broker
+            .list_queue_bindings("test_mgmt_bindings")
+            .await
+            .unwrap();
+
+        // Should have at least the default binding
+        assert!(!bindings.is_empty());
+
+        // Verify binding data
+        let binding = &bindings[0];
+        assert_eq!(binding.destination, "test_mgmt_bindings");
+        assert_eq!(binding.destination_type, "queue");
 
         broker.disconnect().await.unwrap();
     }
