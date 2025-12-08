@@ -27,7 +27,7 @@ default = []
 metrics = ["celers-metrics"]
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [[bench]]
 name = "broker_benchmarks"

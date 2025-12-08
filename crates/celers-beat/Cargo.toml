@@ -21,10 +21,10 @@ tokio = { version = "1.42", features = ["time"] }
 celers-protocol = { path = "../celers-protocol" }
 
 # Optional: Cron expression parsing
-cron = { version = "0.12", optional = true }
+cron = { version = "0.15", optional = true }
 
 # Optional: Solar event calculation
-sunrise = { version = "1.0", optional = true }
+sunrise = { version = "2.1", optional = true }
 
 [features]
 default = []
