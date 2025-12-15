@@ -146,7 +146,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
       - name: Upload documentation
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: documentation
           path: target/doc
@@ -184,7 +184,7 @@ jobs:
         run: cargo bench --workspace --all-features -- --output-format bencher | tee output.txt
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results
           path: output.txt
