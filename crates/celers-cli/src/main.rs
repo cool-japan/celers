@@ -3,6 +3,7 @@ mod config;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
+use colored::Colorize;
 use std::io;
 use std::path::PathBuf;
 
@@ -118,6 +119,13 @@ enum Commands {
         shell: Shell,
     },
 
+    /// Generate man pages
+    Manpages {
+        /// Output directory for man pages
+        #[arg(short, long, default_value = "./man")]
+        output: String,
+    },
+
     /// Run system health diagnostics
     Health {
         /// Broker URL
@@ -167,6 +175,37 @@ enum Commands {
     /// Analyze system performance and failures
     #[command(subcommand)]
     Analyze(AnalyzeCommands),
+
+    /// Auto-scaling operations
+    #[command(subcommand)]
+    Autoscale(AutoscaleCommands),
+
+    /// Alert monitoring operations
+    #[command(subcommand)]
+    Alert(AlertCommands),
+
+    /// Database operations
+    #[command(subcommand)]
+    Db(DbCommands),
+
+    /// Live dashboard for real-time monitoring
+    Dashboard {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Refresh interval in seconds
+        #[arg(short, long, default_value_t = 1)]
+        refresh: u64,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -834,6 +873,111 @@ enum AnalyzeCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum AutoscaleCommands {
+    /// Start auto-scaling service
+    Start {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Show auto-scaling status
+    Status {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AlertCommands {
+    /// Start alert monitoring service
+    Start {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Test webhook notification
+    Test {
+        /// Webhook URL
+        #[arg(short, long)]
+        webhook_url: String,
+
+        /// Test message
+        #[arg(short, long, default_value = "Test alert from CeleRS CLI")]
+        message: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCommands {
+    /// Test database connection
+    TestConnection {
+        /// Database URL (PostgreSQL, MySQL, etc.)
+        #[arg(short, long)]
+        url: String,
+
+        /// Run latency benchmark
+        #[arg(short, long)]
+        benchmark: bool,
+    },
+
+    /// Check database health
+    Health {
+        /// Database URL
+        #[arg(short, long)]
+        url: String,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Show connection pool statistics
+    PoolStats {
+        /// Database URL
+        #[arg(short, long)]
+        url: String,
+    },
+
+    /// Apply database migrations
+    Migrate {
+        /// Database URL
+        #[arg(short, long)]
+        url: String,
+
+        /// Migration action (apply, rollback, status)
+        #[arg(short, long, default_value = "apply")]
+        action: String,
+
+        /// Number of migrations to rollback (for rollback action)
+        #[arg(short, long, default_value_t = 1)]
+        steps: usize,
+    },
+}
+
 /// Load configuration from file or use defaults
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<config::Config> {
     if let Some(path) = config_path {
@@ -1131,6 +1275,32 @@ async fn main() -> anyhow::Result<()> {
             generate(shell, &mut cmd, bin_name, &mut io::stdout());
         }
 
+        Commands::Manpages { output } => {
+            use clap_mangen::Man;
+            use std::fs;
+
+            // Create output directory if it doesn't exist
+            fs::create_dir_all(&output)?;
+
+            let cmd = Cli::command();
+            let man = Man::new(cmd);
+            let mut buffer = Vec::new();
+            man.render(&mut buffer)?;
+
+            let man_path = format!("{}/celers.1", output);
+            fs::write(&man_path, buffer)?;
+
+            println!("{}", "✓ Man page generated successfully".green());
+            println!("  Output: {}", man_path.cyan());
+            println!();
+            println!("To install:");
+            println!("  sudo cp {} /usr/share/man/man1/", man_path);
+            println!("  sudo mandb");
+            println!();
+            println!("To view:");
+            println!("  man {}", man_path);
+        }
+
         Commands::Health {
             broker,
             queue,
@@ -1413,6 +1583,80 @@ async fn main() -> anyhow::Result<()> {
                 commands::analyze_failures(&broker_url, &queue_name).await?;
             }
         },
+
+        Commands::Autoscale(autoscale_cmd) => match autoscale_cmd {
+            AutoscaleCommands::Start {
+                broker,
+                queue,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::autoscale_start(&broker_url, &queue_name, cfg.autoscale).await?;
+            }
+
+            AutoscaleCommands::Status { broker, config } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+
+                commands::autoscale_status(&broker_url, cfg.autoscale).await?;
+            }
+        },
+
+        Commands::Alert(alert_cmd) => match alert_cmd {
+            AlertCommands::Start {
+                broker,
+                queue,
+                config,
+            } => {
+                let cfg = load_config(config)?;
+                let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+                commands::alert_start(&broker_url, &queue_name, cfg.alerts).await?;
+            }
+
+            AlertCommands::Test {
+                webhook_url,
+                message,
+            } => {
+                commands::alert_test(&webhook_url, &message).await?;
+            }
+        },
+
+        Commands::Db(db_cmd) => match db_cmd {
+            DbCommands::TestConnection { url, benchmark } => {
+                commands::db_test_connection(&url, benchmark).await?;
+            }
+
+            DbCommands::Health { url, config } => {
+                let _cfg = load_config(config)?;
+                commands::db_health(&url).await?;
+            }
+
+            DbCommands::PoolStats { url } => {
+                commands::db_pool_stats(&url).await?;
+            }
+
+            DbCommands::Migrate { url, action, steps } => {
+                commands::db_migrate(&url, &action, steps).await?;
+            }
+        },
+
+        Commands::Dashboard {
+            broker,
+            queue,
+            refresh,
+            config,
+        } => {
+            let cfg = load_config(config)?;
+            let broker_url = broker.unwrap_or(cfg.broker.url);
+            let queue_name = queue.unwrap_or(cfg.broker.queue);
+
+            commands::run_dashboard(&broker_url, &queue_name, refresh).await?;
+        }
     }
 
     Ok(())

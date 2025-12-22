@@ -107,11 +107,13 @@ impl Default for RetryStrategy {
 
 impl RetryStrategy {
     /// Create a fixed delay strategy
+    #[must_use]
     pub fn fixed(delay: u64) -> Self {
         Self::Fixed { delay }
     }
 
     /// Create a linear backoff strategy
+    #[must_use]
     pub fn linear(initial: u64, increment: u64) -> Self {
         Self::Linear {
             initial,
@@ -121,6 +123,7 @@ impl RetryStrategy {
     }
 
     /// Create a linear backoff strategy with max delay
+    #[must_use]
     pub fn linear_with_max(initial: u64, increment: u64, max_delay: u64) -> Self {
         Self::Linear {
             initial,
@@ -130,6 +133,7 @@ impl RetryStrategy {
     }
 
     /// Create an exponential backoff strategy
+    #[must_use]
     pub fn exponential(initial: u64, multiplier: f64) -> Self {
         Self::Exponential {
             initial,
@@ -139,6 +143,7 @@ impl RetryStrategy {
     }
 
     /// Create an exponential backoff strategy with max delay
+    #[must_use]
     pub fn exponential_with_max(initial: u64, multiplier: f64, max_delay: u64) -> Self {
         Self::Exponential {
             initial,
@@ -148,6 +153,7 @@ impl RetryStrategy {
     }
 
     /// Create a polynomial backoff strategy
+    #[must_use]
     pub fn polynomial(initial: u64, power: f64) -> Self {
         Self::Polynomial {
             initial,
@@ -157,6 +163,7 @@ impl RetryStrategy {
     }
 
     /// Create a Fibonacci backoff strategy
+    #[must_use]
     pub fn fibonacci(initial: u64) -> Self {
         Self::Fibonacci {
             initial,
@@ -165,11 +172,13 @@ impl RetryStrategy {
     }
 
     /// Create a decorrelated jitter strategy (AWS recommended)
+    #[must_use]
     pub fn decorrelated_jitter(base: u64, max_delay: u64) -> Self {
         Self::DecorrelatedJitter { base, max_delay }
     }
 
     /// Create a full jitter strategy
+    #[must_use]
     pub fn full_jitter(initial: u64, multiplier: f64, max_delay: u64) -> Self {
         Self::FullJitter {
             initial,
@@ -179,6 +188,7 @@ impl RetryStrategy {
     }
 
     /// Create an equal jitter strategy
+    #[must_use]
     pub fn equal_jitter(initial: u64, multiplier: f64, max_delay: u64) -> Self {
         Self::EqualJitter {
             initial,
@@ -188,11 +198,13 @@ impl RetryStrategy {
     }
 
     /// Create a custom delays strategy
+    #[must_use]
     pub fn custom(delays: Vec<u64>, fallback: u64) -> Self {
         Self::Custom { delays, fallback }
     }
 
     /// Create an immediate retry strategy (no delay)
+    #[must_use]
     pub fn immediate() -> Self {
         Self::Immediate
     }
@@ -205,6 +217,7 @@ impl RetryStrategy {
     ///
     /// # Returns
     /// Delay in seconds before the next retry
+    #[must_use]
     pub fn calculate_delay(&self, retry_count: u32, previous_delay: Option<u64>) -> u64 {
         match self {
             Self::Fixed { delay } => *delay,
@@ -293,6 +306,7 @@ impl RetryStrategy {
     }
 
     /// Get the strategy name as a string
+    #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
             Self::Fixed { .. } => "fixed",
@@ -309,6 +323,7 @@ impl RetryStrategy {
     }
 
     /// Check if this strategy uses randomness
+    #[must_use]
     pub fn is_jittered(&self) -> bool {
         matches!(
             self,
@@ -417,6 +432,7 @@ impl Default for RetryPolicy {
 
 impl RetryPolicy {
     /// Create a new retry policy
+    #[must_use]
     pub fn new(max_retries: u32, strategy: RetryStrategy) -> Self {
         Self {
             max_retries,
@@ -426,6 +442,7 @@ impl RetryPolicy {
     }
 
     /// Create a policy with no retries
+    #[must_use]
     pub fn no_retry() -> Self {
         Self {
             max_retries: 0,
@@ -435,36 +452,42 @@ impl RetryPolicy {
     }
 
     /// Set the maximum number of retries
+    #[must_use]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
     /// Set the retry strategy
+    #[must_use]
     pub fn with_strategy(mut self, strategy: RetryStrategy) -> Self {
         self.strategy = strategy;
         self
     }
 
     /// Add error patterns to retry on
+    #[must_use]
     pub fn retry_on(mut self, patterns: Vec<String>) -> Self {
         self.retry_on = patterns;
         self
     }
 
     /// Add error patterns to not retry on
+    #[must_use]
     pub fn dont_retry_on(mut self, patterns: Vec<String>) -> Self {
         self.dont_retry_on = patterns;
         self
     }
 
     /// Set whether to retry on timeout
+    #[must_use]
     pub fn with_retry_on_timeout(mut self, retry: bool) -> Self {
         self.retry_on_timeout = retry;
         self
     }
 
     /// Check if we should retry for the given error
+    #[must_use]
     pub fn should_retry(&self, error: &str, retry_count: u32) -> bool {
         // Check if we've exceeded max retries
         if retry_count >= self.max_retries {
@@ -494,11 +517,13 @@ impl RetryPolicy {
     }
 
     /// Get the delay before the next retry
+    #[must_use]
     pub fn get_retry_delay(&self, retry_count: u32, previous_delay: Option<u64>) -> u64 {
         self.strategy.calculate_delay(retry_count, previous_delay)
     }
 
     /// Check if this policy allows retries
+    #[must_use]
     pub fn allows_retry(&self) -> bool {
         self.max_retries > 0
     }

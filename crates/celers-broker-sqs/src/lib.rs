@@ -619,7 +619,10 @@ pub struct SqsBroker {
     client: Option<Client>,
     cloudwatch_client: Option<CloudWatchClient>,
     queue_name: String,
-    queue_url: Option<String>,
+    /// Cache of queue URLs for multiple queues (queue_name -> queue_url)
+    queue_url_cache: HashMap<String, String>,
+    /// Automatically create queue if it doesn't exist
+    auto_create_queue: bool,
     /// Visibility timeout in seconds (default 30)
     visibility_timeout: i32,
     /// Long polling wait time in seconds (default 20, max 20)
@@ -640,6 +643,12 @@ pub struct SqsBroker {
     cloudwatch_config: Option<CloudWatchConfig>,
     /// Adaptive polling configuration
     adaptive_polling: Option<AdaptivePollingConfig>,
+    /// Enable message compression for messages larger than threshold (in bytes)
+    compression_threshold: Option<usize>,
+    /// Maximum retry attempts for AWS API calls (default 3)
+    max_retries: u32,
+    /// Base delay for retry backoff in milliseconds (default 100)
+    retry_base_delay_ms: u64,
 }
 
 impl SqsBroker {
@@ -654,7 +663,8 @@ impl SqsBroker {
             client: None,
             cloudwatch_client: None,
             queue_name: queue_name.to_string(),
-            queue_url: None,
+            queue_url_cache: HashMap::new(),
+            auto_create_queue: false,
             visibility_timeout: 30,
             wait_time_seconds: 20, // Long polling
             max_messages: 1,
@@ -665,6 +675,9 @@ impl SqsBroker {
             delay_seconds: 0,
             cloudwatch_config: None,
             adaptive_polling: None,
+            compression_threshold: None,
+            max_retries: 3,
+            retry_base_delay_ms: 100,
         })
     }
 
@@ -739,6 +752,66 @@ impl SqsBroker {
     /// potentially reducing costs and improving efficiency.
     pub fn with_adaptive_polling(mut self, config: AdaptivePollingConfig) -> Self {
         self.adaptive_polling = Some(config);
+        self
+    }
+
+    /// Enable automatic queue creation if queue doesn't exist
+    ///
+    /// When enabled, the broker will automatically create the queue with configured
+    /// settings when it doesn't exist, instead of returning an error.
+    ///
+    /// # Arguments
+    /// * `enabled` - Whether to enable auto-creation (default: false)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let broker = SqsBroker::new("my-queue")
+    ///     .await?
+    ///     .with_auto_create_queue(true);
+    /// ```
+    pub fn with_auto_create_queue(mut self, enabled: bool) -> Self {
+        self.auto_create_queue = enabled;
+        self
+    }
+
+    /// Enable message compression for messages larger than threshold
+    ///
+    /// Automatically compresses messages using gzip when they exceed the specified
+    /// size threshold. This helps handle larger payloads while staying under SQS
+    /// message size limits (256 KB).
+    ///
+    /// # Arguments
+    /// * `threshold_bytes` - Minimum message size (in bytes) to trigger compression
+    ///
+    /// # Example
+    /// ```ignore
+    /// let broker = SqsBroker::new("my-queue")
+    ///     .await?
+    ///     .with_compression(10240); // Compress messages > 10KB
+    /// ```
+    pub fn with_compression(mut self, threshold_bytes: usize) -> Self {
+        self.compression_threshold = Some(threshold_bytes);
+        self
+    }
+
+    /// Configure retry behavior for AWS API calls
+    ///
+    /// Sets the maximum number of retry attempts and base delay for exponential
+    /// backoff when AWS API calls fail.
+    ///
+    /// # Arguments
+    /// * `max_retries` - Maximum retry attempts (default: 3)
+    /// * `base_delay_ms` - Base delay in milliseconds for exponential backoff (default: 100)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let broker = SqsBroker::new("my-queue")
+    ///     .await?
+    ///     .with_retry_config(5, 200); // 5 retries, 200ms base delay
+    /// ```
+    pub fn with_retry_config(mut self, max_retries: u32, base_delay_ms: u64) -> Self {
+        self.max_retries = max_retries;
+        self.retry_base_delay_ms = base_delay_ms;
         self
     }
 
@@ -867,12 +940,14 @@ impl SqsBroker {
             .ok_or_else(|| BrokerError::Connection("SQS client not initialized".to_string()))
     }
 
-    /// Get or create queue URL
+    /// Get or create queue URL with enhanced caching
+    ///
+    /// This method now caches queue URLs for multiple queues and supports
+    /// automatic queue creation when enabled.
     async fn get_queue_url(&mut self, queue: &str) -> Result<String> {
-        if let Some(ref url) = self.queue_url {
-            if queue == self.queue_name {
-                return Ok(url.clone());
-            }
+        // Check cache first
+        if let Some(url) = self.queue_url_cache.get(queue) {
+            return Ok(url.clone());
         }
 
         let client = self.get_client().await?;
@@ -887,18 +962,54 @@ impl SqsBroker {
                     })?
                     .to_string();
 
-                if queue == self.queue_name {
-                    self.queue_url = Some(url.clone());
-                }
+                // Cache the URL
+                self.queue_url_cache.insert(queue.to_string(), url.clone());
 
                 Ok(url)
             }
             Err(_) => {
-                // Queue doesn't exist, return error (use create_queue explicitly)
-                Err(BrokerError::OperationFailed(format!(
-                    "Queue '{}' does not exist. Call create_queue() first.",
-                    queue
-                )))
+                // Queue doesn't exist
+                if self.auto_create_queue {
+                    // Automatically create the queue
+                    info!("Auto-creating queue: {}", queue);
+                    let mode = if queue.ends_with(".fifo") {
+                        QueueMode::Fifo
+                    } else {
+                        QueueMode::Priority
+                    };
+                    self.create_queue(queue, mode).await?;
+
+                    // Retry getting the URL
+                    let output = client
+                        .get_queue_url()
+                        .queue_name(queue)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            BrokerError::OperationFailed(format!(
+                                "Failed to get queue URL after creation: {}",
+                                e
+                            ))
+                        })?;
+
+                    let url = output
+                        .queue_url()
+                        .ok_or_else(|| {
+                            BrokerError::OperationFailed("No queue URL returned".to_string())
+                        })?
+                        .to_string();
+
+                    // Cache the URL
+                    self.queue_url_cache.insert(queue.to_string(), url.clone());
+
+                    Ok(url)
+                } else {
+                    // Return error (use create_queue explicitly)
+                    Err(BrokerError::OperationFailed(format!(
+                        "Queue '{}' does not exist. Call create_queue() first or enable auto_create_queue.",
+                        queue
+                    )))
+                }
             }
         }
     }
@@ -1151,8 +1262,22 @@ impl SqsBroker {
         // Build batch entries
         let mut entries = Vec::new();
         for (idx, message) in batch_messages.iter().enumerate() {
-            let body = serde_json::to_string(message)
+            let mut body = serde_json::to_string(message)
                 .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+            // Apply compression if enabled and message exceeds threshold
+            if let Some(threshold) = self.compression_threshold {
+                let original_size = body.len();
+                if original_size > threshold {
+                    body = self.compress_message(&body)?;
+                    debug!(
+                        "Compressed batch message {} from {} to {} bytes",
+                        idx,
+                        original_size,
+                        body.len()
+                    );
+                }
+            }
 
             let mut entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
                 .id(idx.to_string())
@@ -1319,7 +1444,10 @@ impl SqsBroker {
                     })?
                     .to_string();
 
-                let message: Message = serde_json::from_str(body)
+                // Decompress message if it was compressed
+                let decompressed_body = self.decompress_message(body)?;
+
+                let message: Message = serde_json::from_str(&decompressed_body)
                     .map_err(|e| BrokerError::Serialization(e.to_string()))?;
 
                 let envelope = Envelope {
@@ -1435,8 +1563,21 @@ impl SqsBroker {
         let queue_url = self.get_queue_url(queue).await?;
 
         // Serialize message to JSON
-        let body = serde_json::to_string(&message)
+        let mut body = serde_json::to_string(&message)
             .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        // Apply compression if enabled and message exceeds threshold
+        if let Some(threshold) = self.compression_threshold {
+            let original_size = body.len();
+            if original_size > threshold {
+                body = self.compress_message(&body)?;
+                debug!(
+                    "Compressed FIFO message from {} to {} bytes",
+                    original_size,
+                    body.len()
+                );
+            }
+        }
 
         // Build message attributes
         let mut attributes = HashMap::new();
@@ -1540,8 +1681,22 @@ impl SqsBroker {
 
         let mut entries = Vec::new();
         for (idx, (message, group_id, dedup_id)) in batch_messages.iter().enumerate() {
-            let body = serde_json::to_string(message)
+            let mut body = serde_json::to_string(message)
                 .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+            // Apply compression if enabled and message exceeds threshold
+            if let Some(threshold) = self.compression_threshold {
+                let original_size = body.len();
+                if original_size > threshold {
+                    body = self.compress_message(&body)?;
+                    debug!(
+                        "Compressed FIFO batch message {} from {} to {} bytes",
+                        idx,
+                        original_size,
+                        body.len()
+                    );
+                }
+            }
 
             let mut entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
                 .id(idx.to_string())
@@ -1698,10 +1853,8 @@ impl SqsBroker {
         timeout_seconds: i32,
     ) -> Result<()> {
         let client = self.get_client().await?;
-        let queue_url = self
-            .queue_url
-            .as_ref()
-            .ok_or_else(|| BrokerError::Connection("Not connected".to_string()))?;
+        let queue_name = self.queue_name.clone();
+        let queue_url = self.get_queue_url(&queue_name).await?;
 
         client
             .change_message_visibility()
@@ -2145,6 +2298,198 @@ impl SqsBroker {
         }
     }
 
+    /// Clear the queue URL cache
+    ///
+    /// This forces the broker to fetch queue URLs from AWS on the next operation.
+    /// Useful when queue URLs might have changed or when troubleshooting.
+    pub fn clear_queue_url_cache(&mut self) {
+        self.queue_url_cache.clear();
+        debug!("Cleared queue URL cache");
+    }
+
+    /// Compress message body using gzip
+    ///
+    /// Returns the compressed data as a base64-encoded string with a compression marker.
+    fn compress_message(&self, data: &str) -> Result<String> {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(data.as_bytes())
+            .map_err(|e| BrokerError::Serialization(format!("Compression failed: {}", e)))?;
+
+        let compressed = encoder
+            .finish()
+            .map_err(|e| BrokerError::Serialization(format!("Compression finish failed: {}", e)))?;
+
+        // Add marker prefix to indicate compressed data
+        Ok(format!(
+            "__GZIP__:{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &compressed)
+        ))
+    }
+
+    /// Decompress message body from gzip
+    ///
+    /// Expects a base64-encoded compressed string with the compression marker.
+    fn decompress_message(&self, data: &str) -> Result<String> {
+        use std::io::Read;
+
+        // Check for compression marker
+        if !data.starts_with("__GZIP__:") {
+            return Ok(data.to_string()); // Not compressed
+        }
+
+        let encoded = &data[9..]; // Skip marker
+        let compressed =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                .map_err(|e| BrokerError::Serialization(format!("Base64 decode failed: {}", e)))?;
+
+        let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+        let mut decompressed = String::new();
+        decoder
+            .read_to_string(&mut decompressed)
+            .map_err(|e| BrokerError::Serialization(format!("Decompression failed: {}", e)))?;
+
+        Ok(decompressed)
+    }
+
+    /// Retry an async operation with exponential backoff
+    ///
+    /// Uses the configured max_retries and retry_base_delay_ms settings.
+    async fn retry_with_backoff<F, Fut, T>(&self, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut attempt = 0;
+
+        loop {
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= self.max_retries {
+                        return Err(e);
+                    }
+
+                    // Exponential backoff: base_delay * 2^attempt
+                    let delay_ms = self.retry_base_delay_ms * (1 << attempt);
+                    debug!(
+                        "Retry attempt {}/{}, waiting {}ms before retry",
+                        attempt, self.max_retries, delay_ms
+                    );
+
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    /// Get messages from the Dead Letter Queue (DLQ)
+    ///
+    /// Retrieves messages that failed processing and were moved to the DLQ.
+    /// Requires the DLQ ARN to be configured.
+    ///
+    /// # Arguments
+    /// * `max_messages` - Maximum messages to retrieve (1-10)
+    ///
+    /// # Returns
+    /// Vector of envelopes from the DLQ
+    ///
+    /// # Example
+    /// ```ignore
+    /// let dlq_messages = broker.get_dlq_messages(10).await?;
+    /// for envelope in dlq_messages {
+    ///     println!("Failed message: {:?}", envelope.message);
+    /// }
+    /// ```
+    pub async fn get_dlq_messages(&mut self, max_messages: i32) -> Result<Vec<Envelope>> {
+        let dlq_arn = self
+            .dlq_config
+            .as_ref()
+            .ok_or_else(|| BrokerError::OperationFailed("DLQ not configured".to_string()))?
+            .dlq_arn
+            .clone();
+
+        // Extract queue name from ARN (format: arn:aws:sqs:region:account:queue-name)
+        let dlq_name = dlq_arn
+            .split(':')
+            .next_back()
+            .ok_or_else(|| BrokerError::OperationFailed("Invalid DLQ ARN format".to_string()))?;
+
+        self.consume_batch(dlq_name, max_messages.clamp(1, 10), Duration::from_secs(20))
+            .await
+    }
+
+    /// Move a message from DLQ back to the main queue (redrive)
+    ///
+    /// Takes a message from the DLQ and republishes it to the main queue.
+    ///
+    /// # Arguments
+    /// * `envelope` - Message envelope from DLQ
+    ///
+    /// # Example
+    /// ```ignore
+    /// let dlq_messages = broker.get_dlq_messages(10).await?;
+    /// for envelope in dlq_messages {
+    ///     // Inspect and potentially redrive the message
+    ///     broker.redrive_dlq_message(&envelope).await?;
+    /// }
+    /// ```
+    pub async fn redrive_dlq_message(&mut self, envelope: &Envelope) -> Result<()> {
+        let dlq_arn = self
+            .dlq_config
+            .as_ref()
+            .ok_or_else(|| BrokerError::OperationFailed("DLQ not configured".to_string()))?
+            .dlq_arn
+            .clone();
+
+        let dlq_name = dlq_arn
+            .split(':')
+            .next_back()
+            .ok_or_else(|| BrokerError::OperationFailed("Invalid DLQ ARN format".to_string()))?;
+
+        // Republish to main queue
+        self.publish(&self.queue_name.clone(), envelope.message.clone())
+            .await?;
+
+        // Delete from DLQ
+        self.ack(&envelope.delivery_tag).await?;
+
+        info!("Redriven message from DLQ {} to main queue", dlq_name);
+        Ok(())
+    }
+
+    /// Get DLQ statistics
+    ///
+    /// Returns statistics about the Dead Letter Queue including message count
+    /// and oldest message age.
+    ///
+    /// # Returns
+    /// QueueStats for the DLQ
+    ///
+    /// # Example
+    /// ```ignore
+    /// let dlq_stats = broker.get_dlq_stats().await?;
+    /// println!("DLQ has {} messages", dlq_stats.approximate_message_count);
+    /// ```
+    pub async fn get_dlq_stats(&mut self) -> Result<QueueStats> {
+        let dlq_arn = self
+            .dlq_config
+            .as_ref()
+            .ok_or_else(|| BrokerError::OperationFailed("DLQ not configured".to_string()))?
+            .dlq_arn
+            .clone();
+
+        let dlq_name = dlq_arn
+            .split(':')
+            .next_back()
+            .ok_or_else(|| BrokerError::OperationFailed("Invalid DLQ ARN format".to_string()))?;
+
+        self.get_queue_stats(dlq_name).await
+    }
+
     /// Process messages in parallel with a handler function
     ///
     /// This method consumes messages in batches and processes them concurrently,
@@ -2252,9 +2597,9 @@ impl Transport for SqsBroker {
         // Initialize client
         let _ = self.get_client().await?;
 
-        // Get or create queue URL (clone queue_name to avoid borrow conflict)
+        // Get or create queue URL and cache it (clone queue_name to avoid borrow conflict)
         let queue_name = self.queue_name.clone();
-        self.queue_url = Some(self.get_queue_url(&queue_name).await?);
+        let _ = self.get_queue_url(&queue_name).await?;
 
         info!("Connected to SQS queue: {}", queue_name);
         Ok(())
@@ -2262,13 +2607,13 @@ impl Transport for SqsBroker {
 
     async fn disconnect(&mut self) -> Result<()> {
         self.client = None;
-        self.queue_url = None;
+        self.queue_url_cache.clear();
         info!("Disconnected from SQS");
         Ok(())
     }
 
     fn is_connected(&self) -> bool {
-        self.client.is_some() && self.queue_url.is_some()
+        self.client.is_some() && !self.queue_url_cache.is_empty()
     }
 
     fn name(&self) -> &str {
@@ -2283,8 +2628,21 @@ impl Producer for SqsBroker {
         let queue_url = self.get_queue_url(queue).await?;
 
         // Serialize message to JSON
-        let body = serde_json::to_string(&message)
+        let mut body = serde_json::to_string(&message)
             .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        // Apply compression if enabled and message exceeds threshold
+        if let Some(threshold) = self.compression_threshold {
+            let original_size = body.len();
+            if original_size > threshold {
+                body = self.compress_message(&body)?;
+                debug!(
+                    "Compressed message from {} to {} bytes",
+                    original_size,
+                    body.len()
+                );
+            }
+        }
 
         // Build message attributes
         let mut attributes = HashMap::new();
@@ -2313,19 +2671,23 @@ impl Producer for SqsBroker {
             );
         }
 
-        // Send message
-        client
-            .send_message()
-            .queue_url(&queue_url)
-            .message_body(&body)
-            .set_message_attributes(if attributes.is_empty() {
-                None
-            } else {
-                Some(attributes)
-            })
-            .send()
-            .await
-            .map_err(|e| BrokerError::OperationFailed(format!("Failed to send message: {}", e)))?;
+        // Send message with retry logic
+        let send_operation = || async {
+            client
+                .send_message()
+                .queue_url(&queue_url)
+                .message_body(&body)
+                .set_message_attributes(if attributes.is_empty() {
+                    None
+                } else {
+                    Some(attributes.clone())
+                })
+                .send()
+                .await
+                .map_err(|e| BrokerError::OperationFailed(format!("Failed to send message: {}", e)))
+        };
+
+        self.retry_with_backoff(send_operation).await?;
 
         debug!("Published message to SQS queue: {}", queue);
         Ok(())
@@ -2397,8 +2759,11 @@ impl Consumer for SqsBroker {
                     })?
                     .to_string();
 
+                // Decompress message if it was compressed
+                let decompressed_body = self.decompress_message(body)?;
+
                 // Deserialize message
-                let message: Message = serde_json::from_str(body)
+                let message: Message = serde_json::from_str(&decompressed_body)
                     .map_err(|e| BrokerError::Serialization(e.to_string()))?;
 
                 let envelope = Envelope {
@@ -2423,14 +2788,12 @@ impl Consumer for SqsBroker {
 
     async fn ack(&mut self, delivery_tag: &str) -> Result<()> {
         let client = self.get_client().await?;
-        let queue_url = self
-            .queue_url
-            .as_ref()
-            .ok_or_else(|| BrokerError::Connection("Not connected".to_string()))?;
+        let queue_name = self.queue_name.clone();
+        let queue_url = self.get_queue_url(&queue_name).await?;
 
         client
             .delete_message()
-            .queue_url(queue_url)
+            .queue_url(&queue_url)
             .receipt_handle(delivery_tag)
             .send()
             .await
@@ -2444,16 +2807,14 @@ impl Consumer for SqsBroker {
 
     async fn reject(&mut self, delivery_tag: &str, requeue: bool) -> Result<()> {
         let client = self.get_client().await?;
-        let queue_url = self
-            .queue_url
-            .as_ref()
-            .ok_or_else(|| BrokerError::Connection("Not connected".to_string()))?;
+        let queue_name = self.queue_name.clone();
+        let queue_url = self.get_queue_url(&queue_name).await?;
 
         if requeue {
             // Change visibility timeout to 0 to make message immediately available
             client
                 .change_message_visibility()
-                .queue_url(queue_url)
+                .queue_url(&queue_url)
                 .receipt_handle(delivery_tag)
                 .visibility_timeout(0)
                 .send()
@@ -2467,7 +2828,7 @@ impl Consumer for SqsBroker {
             // Delete message (don't requeue)
             client
                 .delete_message()
-                .queue_url(queue_url)
+                .queue_url(&queue_url)
                 .receipt_handle(delivery_tag)
                 .send()
                 .await
@@ -2531,7 +2892,6 @@ impl Broker for SqsBroker {
         let wait_time_seconds = self.wait_time_seconds;
         let message_retention_seconds = self.message_retention_seconds;
         let delay_seconds = self.delay_seconds;
-        let queue_name = self.queue_name.clone();
         let fifo_config = self.fifo_config.clone();
         let sse_config = self.sse_config.clone();
         let dlq_config = self.dlq_config.clone();
@@ -2643,9 +3003,9 @@ impl Broker for SqsBroker {
             .map_err(|e| BrokerError::OperationFailed(format!("Failed to create queue: {}", e)))?;
 
         if let Some(url) = result.queue_url() {
-            if queue == queue_name {
-                self.queue_url = Some(url.to_string());
-            }
+            // Cache the queue URL
+            self.queue_url_cache
+                .insert(queue.to_string(), url.to_string());
             debug!("Created SQS queue: {} ({})", queue, url);
         }
 
@@ -2663,9 +3023,8 @@ impl Broker for SqsBroker {
             .await
             .map_err(|e| BrokerError::OperationFailed(format!("Failed to delete queue: {}", e)))?;
 
-        if queue == self.queue_name {
-            self.queue_url = None;
-        }
+        // Remove from cache
+        self.queue_url_cache.remove(queue);
 
         debug!("Deleted SQS queue: {}", queue);
         Ok(())
@@ -3299,5 +3658,78 @@ mod tests {
         let total_size = broker.calculate_batch_size(&messages);
         assert!(total_size.is_ok());
         assert!(total_size.unwrap() > 0);
+    }
+
+    // Compression/decompression tests
+    #[tokio::test]
+    async fn test_compress_decompress() {
+        let broker = SqsBroker::new("test").await.unwrap();
+        let original_data = "This is a test message that will be compressed and decompressed";
+
+        // Compress
+        let compressed = broker.compress_message(original_data);
+        assert!(compressed.is_ok());
+        let compressed_data = compressed.unwrap();
+
+        // Should have compression marker
+        assert!(compressed_data.starts_with("__GZIP__:"));
+
+        // Decompress
+        let decompressed = broker.decompress_message(&compressed_data);
+        assert!(decompressed.is_ok());
+        assert_eq!(decompressed.unwrap(), original_data);
+    }
+
+    #[tokio::test]
+    async fn test_decompress_uncompressed() {
+        let broker = SqsBroker::new("test").await.unwrap();
+        let uncompressed_data = "This is not compressed";
+
+        // Should pass through uncompressed data unchanged
+        let result = broker.decompress_message(uncompressed_data);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), uncompressed_data);
+    }
+
+    #[tokio::test]
+    async fn test_compression_config() {
+        let broker = SqsBroker::new("test")
+            .await
+            .unwrap()
+            .with_compression(10240); // 10 KB threshold
+
+        assert_eq!(broker.compression_threshold, Some(10240));
+    }
+
+    #[tokio::test]
+    async fn test_compression_large_message() {
+        let broker = SqsBroker::new("test").await.unwrap();
+
+        // Create a large message
+        let large_message = "x".repeat(50000);
+
+        // Compress it
+        let compressed = broker.compress_message(&large_message);
+        assert!(compressed.is_ok());
+        let compressed_data = compressed.unwrap();
+
+        // Compressed should be smaller
+        assert!(compressed_data.len() < large_message.len());
+
+        // Should be able to decompress back
+        let decompressed = broker.decompress_message(&compressed_data);
+        assert!(decompressed.is_ok());
+        assert_eq!(decompressed.unwrap(), large_message);
+    }
+
+    #[tokio::test]
+    async fn test_retry_config() {
+        let broker = SqsBroker::new("test")
+            .await
+            .unwrap()
+            .with_retry_config(5, 200);
+
+        assert_eq!(broker.max_retries, 5);
+        assert_eq!(broker.retry_base_delay_ms, 200);
     }
 }

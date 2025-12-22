@@ -44,6 +44,8 @@ pub enum TaskState {
 
 impl TaskState {
     /// Check if the task is in a terminal state
+    #[inline]
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -55,6 +57,7 @@ impl TaskState {
     }
 
     /// Create a custom state with a name
+    #[must_use]
     pub fn custom(name: impl Into<String>) -> Self {
         Self::Custom {
             name: name.into(),
@@ -63,6 +66,7 @@ impl TaskState {
     }
 
     /// Create a custom state with name and JSON metadata
+    #[must_use]
     pub fn custom_with_metadata(name: impl Into<String>, metadata: Vec<u8>) -> Self {
         Self::Custom {
             name: name.into(),
@@ -71,11 +75,15 @@ impl TaskState {
     }
 
     /// Check if this is a custom state
+    #[inline]
+    #[must_use]
     pub fn is_custom(&self) -> bool {
         matches!(self, TaskState::Custom { .. })
     }
 
     /// Get the custom state name if this is a custom state
+    #[inline]
+    #[must_use]
     pub fn custom_name(&self) -> Option<&str> {
         match self {
             TaskState::Custom { name, .. } => Some(name),
@@ -84,6 +92,8 @@ impl TaskState {
     }
 
     /// Get the custom state metadata if this is a custom state with metadata
+    #[inline]
+    #[must_use]
     pub fn custom_metadata(&self) -> Option<&[u8]> {
         match self {
             TaskState::Custom { metadata, .. } => metadata.as_deref(),
@@ -92,21 +102,29 @@ impl TaskState {
     }
 
     /// Check if the task is revoked
+    #[inline]
+    #[must_use]
     pub fn is_revoked(&self) -> bool {
         matches!(self, TaskState::Revoked)
     }
 
     /// Check if the task is rejected
+    #[inline]
+    #[must_use]
     pub fn is_rejected(&self) -> bool {
         matches!(self, TaskState::Rejected)
     }
 
     /// Check if the task is received
+    #[inline]
+    #[must_use]
     pub fn is_received(&self) -> bool {
         matches!(self, TaskState::Received)
     }
 
     /// Check if the task can be retried
+    #[inline]
+    #[must_use]
     pub fn can_retry(&self, max_retries: u32) -> bool {
         match self {
             TaskState::Failed(_) => true,
@@ -116,6 +134,8 @@ impl TaskState {
     }
 
     /// Get the retry count
+    #[inline]
+    #[must_use]
     pub fn retry_count(&self) -> u32 {
         match self {
             TaskState::Retrying(count) => *count,
@@ -124,41 +144,57 @@ impl TaskState {
     }
 
     /// Check if the task is in an active (non-terminal) state
+    #[inline]
+    #[must_use]
     pub fn is_active(&self) -> bool {
         !self.is_terminal()
     }
 
     /// Check if the task is pending
+    #[inline]
+    #[must_use]
     pub fn is_pending(&self) -> bool {
         matches!(self, TaskState::Pending)
     }
 
     /// Check if the task is reserved
+    #[inline]
+    #[must_use]
     pub fn is_reserved(&self) -> bool {
         matches!(self, TaskState::Reserved)
     }
 
     /// Check if the task is running
+    #[inline]
+    #[must_use]
     pub fn is_running(&self) -> bool {
         matches!(self, TaskState::Running)
     }
 
     /// Check if the task is retrying
+    #[inline]
+    #[must_use]
     pub fn is_retrying(&self) -> bool {
         matches!(self, TaskState::Retrying(_))
     }
 
     /// Check if the task succeeded
+    #[inline]
+    #[must_use]
     pub fn is_succeeded(&self) -> bool {
         matches!(self, TaskState::Succeeded(_))
     }
 
     /// Check if the task failed
+    #[inline]
+    #[must_use]
     pub fn is_failed(&self) -> bool {
         matches!(self, TaskState::Failed(_))
     }
 
     /// Get the success result if the task succeeded
+    #[inline]
+    #[must_use]
     pub fn success_result(&self) -> Option<&[u8]> {
         match self {
             TaskState::Succeeded(result) => Some(result),
@@ -167,6 +203,8 @@ impl TaskState {
     }
 
     /// Get the error message if the task failed
+    #[inline]
+    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         match self {
             TaskState::Failed(error) => Some(error),
@@ -194,6 +232,7 @@ impl fmt::Display for TaskState {
 
 impl TaskState {
     /// Get a short string representation of the state name
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             TaskState::Pending => "PENDING",
@@ -231,6 +270,7 @@ pub struct StateTransition {
 
 impl StateTransition {
     /// Create a new state transition
+    #[must_use]
     pub fn new(from: TaskState, to: TaskState) -> Self {
         Self {
             from,
@@ -245,18 +285,21 @@ impl StateTransition {
     }
 
     /// Add a reason for the transition
+    #[must_use]
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
     }
 
     /// Add metadata to the transition
+    #[must_use]
     pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
         self.metadata = Some(metadata);
         self
     }
 
     /// Add a single metadata key-value pair
+    #[must_use]
     pub fn with_meta(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.metadata
             .get_or_insert_with(HashMap::new)
@@ -276,11 +319,13 @@ pub struct StateHistory {
 
 impl StateHistory {
     /// Create a new state history
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create a new state history with initial state
+    #[must_use]
     pub fn with_initial(state: TaskState) -> Self {
         Self {
             current: Some(state),
@@ -311,26 +356,31 @@ impl StateHistory {
     }
 
     /// Get the current state
+    #[must_use]
     pub fn current_state(&self) -> Option<&TaskState> {
         self.current.as_ref()
     }
 
     /// Get all transitions
+    #[must_use]
     pub fn get_transitions(&self) -> &[StateTransition] {
         &self.transitions
     }
 
     /// Get the last transition
+    #[must_use]
     pub fn last_transition(&self) -> Option<&StateTransition> {
         self.transitions.last()
     }
 
     /// Get the number of transitions
+    #[must_use]
     pub fn transition_count(&self) -> usize {
         self.transitions.len()
     }
 
     /// Check if task has ever been in a specific state
+    #[must_use]
     pub fn has_been_in_state(&self, state_name: &str) -> bool {
         self.transitions.iter().any(|t| t.to.name() == state_name)
             || self
@@ -340,6 +390,7 @@ impl StateHistory {
     }
 
     /// Get the time spent in a specific state (returns None if never in that state)
+    #[must_use]
     pub fn time_in_state(&self, state_name: &str) -> Option<f64> {
         let mut total_time = 0.0;
         let mut entry_time: Option<f64> = None;

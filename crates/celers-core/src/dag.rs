@@ -52,6 +52,7 @@ pub struct DagNode {
 
 impl DagNode {
     /// Create a new DAG node
+    #[must_use]
     pub fn new(task_id: TaskId, task_name: impl Into<String>) -> Self {
         Self {
             task_id,
@@ -62,21 +63,29 @@ impl DagNode {
     }
 
     /// Check if this node has any dependencies
+    #[inline]
+    #[must_use]
     pub fn has_dependencies(&self) -> bool {
         !self.dependencies.is_empty()
     }
 
     /// Check if this node has any dependents
+    #[inline]
+    #[must_use]
     pub fn has_dependents(&self) -> bool {
         !self.dependents.is_empty()
     }
 
     /// Check if this is a root node (no dependencies)
+    #[inline]
+    #[must_use]
     pub fn is_root(&self) -> bool {
         self.dependencies.is_empty()
     }
 
     /// Check if this is a leaf node (no dependents)
+    #[inline]
+    #[must_use]
     pub fn is_leaf(&self) -> bool {
         self.dependents.is_empty()
     }
@@ -91,6 +100,7 @@ pub struct TaskDag {
 
 impl TaskDag {
     /// Create a new empty DAG
+    #[must_use]
     pub fn new() -> Self {
         Self {
             nodes: HashMap::new(),
@@ -149,11 +159,13 @@ impl TaskDag {
     }
 
     /// Get a node by task ID
+    #[must_use]
     pub fn get_node(&self, task_id: &TaskId) -> Option<&DagNode> {
         self.nodes.get(task_id)
     }
 
     /// Get all root nodes (nodes with no dependencies)
+    #[must_use]
     pub fn get_roots(&self) -> Vec<TaskId> {
         self.nodes
             .values()
@@ -163,6 +175,7 @@ impl TaskDag {
     }
 
     /// Get all leaf nodes (nodes with no dependents)
+    #[must_use]
     pub fn get_leaves(&self) -> Vec<TaskId> {
         self.nodes
             .values()
@@ -172,6 +185,7 @@ impl TaskDag {
     }
 
     /// Get the dependencies of a task
+    #[must_use]
     pub fn get_dependencies(&self, task_id: &TaskId) -> Option<Vec<TaskId>> {
         self.nodes
             .get(task_id)
@@ -179,6 +193,7 @@ impl TaskDag {
     }
 
     /// Get the dependents of a task
+    #[must_use]
     pub fn get_dependents(&self, task_id: &TaskId) -> Option<Vec<TaskId>> {
         self.nodes
             .get(task_id)
@@ -285,11 +300,15 @@ impl TaskDag {
     }
 
     /// Get the number of nodes in the DAG
+    #[inline]
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
     /// Get the number of edges in the DAG
+    #[inline]
+    #[must_use]
     pub fn edge_count(&self) -> usize {
         self.nodes
             .values()
@@ -298,6 +317,8 @@ impl TaskDag {
     }
 
     /// Check if the DAG is empty
+    #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -481,7 +502,7 @@ mod tests {
                 let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, &format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{}", i));
                 }
 
                 prop_assert_eq!(dag.node_count(), count);
@@ -494,7 +515,7 @@ mod tests {
 
                 // Create linear chain: ids[0] -> ids[1] -> ids[2] -> ...
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, &format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{}", i));
                 }
 
                 for i in 1..ids.len() {
@@ -518,7 +539,7 @@ mod tests {
                 let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, &format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{}", i));
                 }
 
                 // Create valid DAG structure
@@ -535,7 +556,7 @@ mod tests {
                 let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, &format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{}", i));
                 }
 
                 // Create linear chain
@@ -558,7 +579,7 @@ mod tests {
                 let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, &format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{}", i));
                 }
 
                 // Create linear chain
@@ -581,7 +602,7 @@ mod tests {
                 let ids: Vec<_> = (0..node_count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, &format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{}", i));
                 }
 
                 // Add edges in a linear chain
@@ -599,7 +620,7 @@ mod tests {
                 let ids: Vec<_> = (0..node_count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, &format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{}", i));
                 }
 
                 // Add all edges

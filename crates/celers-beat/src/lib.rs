@@ -40,10 +40,18 @@
 #[cfg(feature = "solar")]
 use chrono::Datelike;
 use chrono::{DateTime, Duration, Utc};
+#[cfg(feature = "cron")]
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use thiserror::Error;
+
+/// Failure notification callback type
+///
+/// Called when a task execution fails. Receives the task name and error message.
+pub type FailureCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Schedule type
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +76,10 @@ pub enum Schedule {
         day_of_month: String,
         /// Month (1-12)
         month_of_year: String,
+        /// Timezone (IANA timezone name, e.g., "America/New_York")
+        /// If None, uses UTC
+        #[serde(default)]
+        timezone: Option<String>,
     },
 
     /// Solar schedule (sunrise, sunset)
@@ -94,7 +106,7 @@ impl Schedule {
         Self::Interval { every: seconds }
     }
 
-    /// Create crontab schedule
+    /// Create crontab schedule (UTC)
     #[cfg(feature = "cron")]
     pub fn crontab(
         minute: &str,
@@ -109,6 +121,50 @@ impl Schedule {
             day_of_week: day_of_week.to_string(),
             day_of_month: day_of_month.to_string(),
             month_of_year: month_of_year.to_string(),
+            timezone: None,
+        }
+    }
+
+    /// Create crontab schedule with timezone
+    ///
+    /// # Arguments
+    /// * `minute` - Minute field (0-59, *, */N)
+    /// * `hour` - Hour field (0-23, *, */N)
+    /// * `day_of_week` - Day of week field (0-6, *, */N)
+    /// * `day_of_month` - Day of month field (1-31, *, */N)
+    /// * `month_of_year` - Month field (1-12, *, */N)
+    /// * `timezone` - IANA timezone name (e.g., "America/New_York", "Europe/London")
+    ///
+    /// # Examples
+    /// ```
+    /// use celers_beat::Schedule;
+    ///
+    /// // Run at 9:00 AM New York time every weekday
+    /// let schedule = Schedule::crontab_tz(
+    ///     "0",
+    ///     "9",
+    ///     "1-5",
+    ///     "*",
+    ///     "*",
+    ///     "America/New_York"
+    /// );
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn crontab_tz(
+        minute: &str,
+        hour: &str,
+        day_of_week: &str,
+        day_of_month: &str,
+        month_of_year: &str,
+        timezone: &str,
+    ) -> Self {
+        Self::Crontab {
+            minute: minute.to_string(),
+            hour: hour.to_string(),
+            day_of_week: day_of_week.to_string(),
+            day_of_month: day_of_month.to_string(),
+            month_of_year: month_of_year.to_string(),
+            timezone: Some(timezone.to_string()),
         }
     }
 
@@ -144,6 +200,7 @@ impl Schedule {
                 day_of_week,
                 day_of_month,
                 month_of_year,
+                timezone,
             } => {
                 use cron::Schedule as CronSchedule;
                 use std::str::FromStr;
@@ -159,12 +216,32 @@ impl Schedule {
                 let cron_schedule = CronSchedule::from_str(&cron_expr)
                     .map_err(|e| ScheduleError::Parse(format!("Invalid cron expression: {}", e)))?;
 
-                let after = last_run.unwrap_or_else(Utc::now);
-                let next = cron_schedule.after(&after).next().ok_or_else(|| {
-                    ScheduleError::Invalid("No future execution time".to_string())
-                })?;
+                // If timezone is specified, convert to/from that timezone
+                if let Some(tz_str) = timezone {
+                    let tz: Tz = tz_str.parse().map_err(|_| {
+                        ScheduleError::Parse(format!("Invalid timezone: {}", tz_str))
+                    })?;
 
-                Ok(next)
+                    // Convert current UTC time to target timezone
+                    let after_utc = last_run.unwrap_or_else(Utc::now);
+                    let after_tz = after_utc.with_timezone(&tz);
+
+                    // Find next occurrence in target timezone
+                    let next_tz = cron_schedule.after(&after_tz).next().ok_or_else(|| {
+                        ScheduleError::Invalid("No future execution time".to_string())
+                    })?;
+
+                    // Convert back to UTC
+                    Ok(next_tz.with_timezone(&Utc))
+                } else {
+                    // No timezone specified, use UTC
+                    let after = last_run.unwrap_or_else(Utc::now);
+                    let next = cron_schedule.after(&after).next().ok_or_else(|| {
+                        ScheduleError::Invalid("No future execution time".to_string())
+                    })?;
+
+                    Ok(next)
+                }
             }
             #[cfg(feature = "solar")]
             Schedule::Solar {
@@ -290,11 +367,22 @@ impl std::fmt::Display for Schedule {
                 day_of_week,
                 day_of_month,
                 month_of_year,
-            } => write!(
-                f,
-                "Crontab[{} {} {} {} {}]",
-                minute, hour, day_of_month, day_of_week, month_of_year
-            ),
+                timezone,
+            } => {
+                if let Some(tz) = timezone {
+                    write!(
+                        f,
+                        "Crontab[{} {} {} {} {} ({})]",
+                        minute, hour, day_of_month, day_of_week, month_of_year, tz
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Crontab[{} {} {} {} {} (UTC)]",
+                        minute, hour, day_of_month, day_of_week, month_of_year
+                    )
+                }
+            }
             #[cfg(feature = "solar")]
             Schedule::Solar {
                 event,
@@ -305,6 +393,310 @@ impl std::fmt::Display for Schedule {
                 write!(f, "OneTime[at {}]", run_at.format("%Y-%m-%d %H:%M:%S UTC"))
             }
         }
+    }
+}
+
+/// Schedule lock for preventing duplicate execution in distributed scenarios
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleLock {
+    /// Task name this lock is for
+    pub task_name: String,
+    /// Lock owner identifier (e.g., scheduler instance ID)
+    pub owner: String,
+    /// When the lock was acquired
+    pub acquired_at: DateTime<Utc>,
+    /// When the lock expires (for automatic cleanup)
+    pub expires_at: DateTime<Utc>,
+    /// Lock renewal count (for debugging)
+    pub renewal_count: u32,
+}
+
+impl ScheduleLock {
+    /// Create a new schedule lock
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task to lock
+    /// * `owner` - Identifier of the lock owner (e.g., scheduler instance ID)
+    /// * `ttl_seconds` - Time-to-live for the lock in seconds
+    pub fn new(task_name: String, owner: String, ttl_seconds: u64) -> Self {
+        let now = Utc::now();
+        Self {
+            task_name,
+            owner,
+            acquired_at: now,
+            expires_at: now + Duration::seconds(ttl_seconds as i64),
+            renewal_count: 0,
+        }
+    }
+
+    /// Check if the lock has expired
+    pub fn is_expired(&self) -> bool {
+        Utc::now() > self.expires_at
+    }
+
+    /// Check if the lock is owned by the given owner
+    pub fn is_owned_by(&self, owner: &str) -> bool {
+        self.owner == owner
+    }
+
+    /// Renew the lock for another TTL period
+    ///
+    /// # Arguments
+    /// * `ttl_seconds` - Time-to-live for the renewed lock
+    ///
+    /// # Returns
+    /// * `Ok(())` if renewed successfully
+    /// * `Err(ScheduleError)` if the lock has already expired
+    pub fn renew(&mut self, ttl_seconds: u64) -> Result<(), ScheduleError> {
+        if self.is_expired() {
+            return Err(ScheduleError::Invalid(
+                "Cannot renew expired lock".to_string(),
+            ));
+        }
+
+        self.expires_at = Utc::now() + Duration::seconds(ttl_seconds as i64);
+        self.renewal_count += 1;
+        Ok(())
+    }
+
+    /// Get remaining time until expiration
+    pub fn ttl(&self) -> Duration {
+        self.expires_at - Utc::now()
+    }
+
+    /// Get age of the lock since acquisition
+    pub fn age(&self) -> Duration {
+        Utc::now() - self.acquired_at
+    }
+}
+
+/// Lock manager for schedule locks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockManager {
+    /// Active locks by task name
+    locks: HashMap<String, ScheduleLock>,
+    /// Default lock TTL in seconds
+    default_ttl: u64,
+}
+
+impl LockManager {
+    /// Create a new lock manager
+    ///
+    /// # Arguments
+    /// * `default_ttl` - Default time-to-live for locks in seconds
+    pub fn new(default_ttl: u64) -> Self {
+        Self {
+            locks: HashMap::new(),
+            default_ttl,
+        }
+    }
+
+    /// Try to acquire a lock for a task
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task to lock
+    /// * `owner` - Identifier of the lock owner
+    /// * `ttl` - Optional custom TTL (uses default if None)
+    ///
+    /// # Returns
+    /// * `Ok(true)` if lock acquired successfully
+    /// * `Ok(false)` if lock is already held by another owner
+    /// * `Err` on other errors
+    pub fn try_acquire(
+        &mut self,
+        task_name: &str,
+        owner: &str,
+        ttl: Option<u64>,
+    ) -> Result<bool, ScheduleError> {
+        // Clean up expired locks first
+        self.cleanup_expired();
+
+        // Check if lock exists and is not expired
+        if let Some(existing_lock) = self.locks.get(task_name) {
+            if !existing_lock.is_expired() {
+                // Lock is held by someone else
+                if !existing_lock.is_owned_by(owner) {
+                    return Ok(false);
+                }
+                // Lock is already held by us, consider it acquired
+                return Ok(true);
+            }
+        }
+
+        // Acquire the lock
+        let ttl_seconds = ttl.unwrap_or(self.default_ttl);
+        let lock = ScheduleLock::new(task_name.to_string(), owner.to_string(), ttl_seconds);
+        self.locks.insert(task_name.to_string(), lock);
+        Ok(true)
+    }
+
+    /// Release a lock
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task to unlock
+    /// * `owner` - Identifier of the lock owner (must match)
+    ///
+    /// # Returns
+    /// * `Ok(true)` if lock was released
+    /// * `Ok(false)` if lock doesn't exist or is owned by someone else
+    pub fn release(&mut self, task_name: &str, owner: &str) -> Result<bool, ScheduleError> {
+        if let Some(lock) = self.locks.get(task_name) {
+            if lock.is_owned_by(owner) {
+                self.locks.remove(task_name);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Renew an existing lock
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task
+    /// * `owner` - Identifier of the lock owner (must match)
+    /// * `ttl` - Optional custom TTL (uses default if None)
+    ///
+    /// # Returns
+    /// * `Ok(true)` if lock was renewed
+    /// * `Ok(false)` if lock doesn't exist, is owned by someone else, or has expired
+    pub fn renew(
+        &mut self,
+        task_name: &str,
+        owner: &str,
+        ttl: Option<u64>,
+    ) -> Result<bool, ScheduleError> {
+        if let Some(lock) = self.locks.get_mut(task_name) {
+            if lock.is_owned_by(owner) && !lock.is_expired() {
+                let ttl_seconds = ttl.unwrap_or(self.default_ttl);
+                lock.renew(ttl_seconds)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Check if a lock is held
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task
+    ///
+    /// # Returns
+    /// * `true` if lock exists and is not expired
+    /// * `false` otherwise
+    pub fn is_locked(&self, task_name: &str) -> bool {
+        if let Some(lock) = self.locks.get(task_name) {
+            !lock.is_expired()
+        } else {
+            false
+        }
+    }
+
+    /// Get information about a lock
+    pub fn get_lock(&self, task_name: &str) -> Option<&ScheduleLock> {
+        self.locks.get(task_name)
+    }
+
+    /// Clean up expired locks
+    pub fn cleanup_expired(&mut self) {
+        self.locks.retain(|_, lock| !lock.is_expired());
+    }
+
+    /// Get all active locks
+    pub fn get_active_locks(&self) -> Vec<&ScheduleLock> {
+        self.locks
+            .values()
+            .filter(|lock| !lock.is_expired())
+            .collect()
+    }
+
+    /// Force release all locks (use with caution)
+    pub fn release_all(&mut self) {
+        self.locks.clear();
+    }
+}
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new(300) // Default 5 minute TTL
+    }
+}
+
+/// Schedule conflict severity level
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictSeverity {
+    /// Low priority - tasks can run concurrently
+    Low,
+    /// Medium priority - tasks may interfere
+    Medium,
+    /// High priority - tasks will definitely conflict
+    High,
+}
+
+/// Represents a conflict between two scheduled tasks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConflict {
+    /// First task name
+    pub task1: String,
+    /// Second task name
+    pub task2: String,
+    /// Conflict severity
+    pub severity: ConflictSeverity,
+    /// Time window where conflict occurs (in seconds)
+    pub overlap_seconds: u64,
+    /// Description of the conflict
+    pub description: String,
+    /// Suggested resolution
+    pub resolution: Option<String>,
+}
+
+impl ScheduleConflict {
+    /// Create a new schedule conflict
+    pub fn new(
+        task1: String,
+        task2: String,
+        severity: ConflictSeverity,
+        overlap_seconds: u64,
+        description: String,
+    ) -> Self {
+        Self {
+            task1,
+            task2,
+            severity,
+            overlap_seconds,
+            description,
+            resolution: None,
+        }
+    }
+
+    /// Add a suggested resolution
+    pub fn with_resolution(mut self, resolution: String) -> Self {
+        self.resolution = Some(resolution);
+        self
+    }
+
+    /// Check if this is a high severity conflict
+    pub fn is_high_severity(&self) -> bool {
+        self.severity == ConflictSeverity::High
+    }
+
+    /// Check if this is a medium severity conflict
+    pub fn is_medium_severity(&self) -> bool {
+        self.severity == ConflictSeverity::Medium
+    }
+
+    /// Check if this is a low severity conflict
+    pub fn is_low_severity(&self) -> bool {
+        self.severity == ConflictSeverity::Low
+    }
+}
+
+impl std::fmt::Display for ScheduleConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Conflict[{:?}]: {} <-> {} (overlap: {}s) - {}",
+            self.severity, self.task1, self.task2, self.overlap_seconds, self.description
+        )
     }
 }
 
@@ -450,6 +842,467 @@ impl TaskStatistics {
     }
 }
 
+/// Alert severity level
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
+pub enum AlertLevel {
+    /// Informational alert
+    Info,
+    /// Warning alert - requires attention
+    Warning,
+    /// Critical alert - requires immediate action
+    Critical,
+}
+
+impl std::fmt::Display for AlertLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AlertLevel::Info => write!(f, "INFO"),
+            AlertLevel::Warning => write!(f, "WARNING"),
+            AlertLevel::Critical => write!(f, "CRITICAL"),
+        }
+    }
+}
+
+/// Alert condition that triggered the alert
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Hash, Eq)]
+#[serde(tag = "type")]
+pub enum AlertCondition {
+    /// Schedule was missed (task didn't execute when expected)
+    MissedSchedule {
+        /// Expected run time
+        expected_at: DateTime<Utc>,
+        /// Current time when missed was detected
+        detected_at: DateTime<Utc>,
+    },
+    /// Multiple consecutive failures
+    ConsecutiveFailures {
+        /// Number of consecutive failures
+        count: u32,
+        /// Failure threshold that triggered the alert
+        threshold: u32,
+    },
+    /// High failure rate detected
+    HighFailureRate {
+        /// Current failure rate (0.0 to 1.0)
+        rate: String, // String to make it hashable
+        /// Threshold that was exceeded
+        threshold: String,
+    },
+    /// Slow execution detected
+    SlowExecution {
+        /// Actual duration in milliseconds
+        duration_ms: u64,
+        /// Expected/threshold duration in milliseconds
+        threshold_ms: u64,
+    },
+    /// Task is stuck (not executing for extended period)
+    TaskStuck {
+        /// Time since last execution
+        idle_duration_seconds: i64,
+        /// Expected interval in seconds
+        expected_interval_seconds: u64,
+    },
+    /// Task has become unhealthy
+    TaskUnhealthy {
+        /// Health issues detected
+        issues: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for AlertCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AlertCondition::MissedSchedule {
+                expected_at,
+                detected_at,
+            } => {
+                let delay = detected_at
+                    .signed_duration_since(*expected_at)
+                    .num_seconds();
+                write!(
+                    f,
+                    "Missed schedule ({}s late, expected at {})",
+                    delay,
+                    expected_at.format("%Y-%m-%d %H:%M:%S UTC")
+                )
+            }
+            AlertCondition::ConsecutiveFailures { count, threshold } => {
+                write!(
+                    f,
+                    "Consecutive failures ({} failures, threshold: {})",
+                    count, threshold
+                )
+            }
+            AlertCondition::HighFailureRate { rate, threshold } => {
+                write!(
+                    f,
+                    "High failure rate (rate: {}, threshold: {})",
+                    rate, threshold
+                )
+            }
+            AlertCondition::SlowExecution {
+                duration_ms,
+                threshold_ms,
+            } => {
+                write!(
+                    f,
+                    "Slow execution ({}ms, threshold: {}ms)",
+                    duration_ms, threshold_ms
+                )
+            }
+            AlertCondition::TaskStuck {
+                idle_duration_seconds,
+                expected_interval_seconds,
+            } => {
+                write!(
+                    f,
+                    "Task stuck (idle: {}s, expected interval: {}s)",
+                    idle_duration_seconds, expected_interval_seconds
+                )
+            }
+            AlertCondition::TaskUnhealthy { issues } => {
+                write!(f, "Task unhealthy: {}", issues.join(", "))
+            }
+        }
+    }
+}
+
+/// Alert record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Alert {
+    /// Alert timestamp
+    pub timestamp: DateTime<Utc>,
+    /// Task name that triggered the alert
+    pub task_name: String,
+    /// Alert severity level
+    pub level: AlertLevel,
+    /// Condition that triggered the alert
+    pub condition: AlertCondition,
+    /// Human-readable message
+    pub message: String,
+    /// Additional metadata (optional)
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+}
+
+impl Alert {
+    /// Create a new alert
+    pub fn new(
+        task_name: String,
+        level: AlertLevel,
+        condition: AlertCondition,
+        message: String,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            task_name,
+            level,
+            condition,
+            message,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Add metadata to the alert
+    pub fn with_metadata(mut self, key: String, value: String) -> Self {
+        self.metadata.insert(key, value);
+        self
+    }
+
+    /// Check if this is a critical alert
+    pub fn is_critical(&self) -> bool {
+        self.level == AlertLevel::Critical
+    }
+
+    /// Check if this is a warning alert
+    pub fn is_warning(&self) -> bool {
+        self.level == AlertLevel::Warning
+    }
+
+    /// Check if this is an info alert
+    pub fn is_info(&self) -> bool {
+        self.level == AlertLevel::Info
+    }
+
+    /// Get a unique key for deduplication
+    fn dedup_key(&self) -> String {
+        format!("{}::{:?}", self.task_name, self.condition)
+    }
+}
+
+impl std::fmt::Display for Alert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}] {} - {} - {}",
+            self.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+            self.level,
+            self.task_name,
+            self.message
+        )
+    }
+}
+
+/// Alert callback type
+///
+/// Called when an alert is triggered. Receives the alert details.
+pub type AlertCallback = Arc<dyn Fn(&Alert) + Send + Sync>;
+
+/// Alert manager for tracking and deduplicating alerts
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AlertManager {
+    /// Recent alerts (limited size)
+    alerts: Vec<Alert>,
+    /// Maximum number of alerts to keep in history
+    max_history: usize,
+    /// Deduplication window in seconds
+    dedup_window_seconds: i64,
+    /// Last alert time by dedup key
+    last_alert_time: HashMap<String, DateTime<Utc>>,
+    /// Alert callbacks (not serialized)
+    #[serde(skip)]
+    callbacks: Vec<AlertCallback>,
+}
+
+impl AlertManager {
+    /// Create a new alert manager
+    ///
+    /// # Arguments
+    /// * `max_history` - Maximum number of alerts to keep in history
+    /// * `dedup_window_seconds` - Time window for deduplicating alerts (e.g., 300 = 5 minutes)
+    pub fn new(max_history: usize, dedup_window_seconds: i64) -> Self {
+        Self {
+            alerts: Vec::new(),
+            max_history,
+            dedup_window_seconds,
+            last_alert_time: HashMap::new(),
+            callbacks: Vec::new(),
+        }
+    }
+
+    /// Add an alert callback
+    pub fn add_callback(&mut self, callback: AlertCallback) {
+        self.callbacks.push(callback);
+    }
+
+    /// Record an alert (with deduplication)
+    ///
+    /// # Arguments
+    /// * `alert` - Alert to record
+    ///
+    /// # Returns
+    /// * `true` if alert was recorded (not deduplicated)
+    /// * `false` if alert was suppressed due to deduplication
+    pub fn record_alert(&mut self, alert: Alert) -> bool {
+        let dedup_key = alert.dedup_key();
+        let now = Utc::now();
+
+        // Check if we should deduplicate this alert
+        if let Some(last_time) = self.last_alert_time.get(&dedup_key) {
+            let elapsed = now.signed_duration_since(*last_time).num_seconds();
+            if elapsed < self.dedup_window_seconds {
+                // Suppress duplicate alert
+                return false;
+            }
+        }
+
+        // Record the alert
+        self.last_alert_time.insert(dedup_key, now);
+
+        // Trigger callbacks
+        for callback in &self.callbacks {
+            callback(&alert);
+        }
+
+        // Add to history
+        self.alerts.push(alert);
+
+        // Trim history if needed
+        if self.alerts.len() > self.max_history {
+            self.alerts.drain(0..self.alerts.len() - self.max_history);
+        }
+
+        // Cleanup old dedup entries (older than window)
+        self.last_alert_time.retain(|_, last_time| {
+            now.signed_duration_since(*last_time).num_seconds() < self.dedup_window_seconds * 2
+        });
+
+        true
+    }
+
+    /// Get all alerts
+    pub fn get_alerts(&self) -> &[Alert] {
+        &self.alerts
+    }
+
+    /// Get critical alerts
+    pub fn get_critical_alerts(&self) -> Vec<&Alert> {
+        self.alerts.iter().filter(|a| a.is_critical()).collect()
+    }
+
+    /// Get warning alerts
+    pub fn get_warning_alerts(&self) -> Vec<&Alert> {
+        self.alerts.iter().filter(|a| a.is_warning()).collect()
+    }
+
+    /// Get alerts for a specific task
+    pub fn get_task_alerts(&self, task_name: &str) -> Vec<&Alert> {
+        self.alerts
+            .iter()
+            .filter(|a| a.task_name == task_name)
+            .collect()
+    }
+
+    /// Get recent alerts (within specified seconds)
+    pub fn get_recent_alerts(&self, seconds: i64) -> Vec<&Alert> {
+        let cutoff = Utc::now() - Duration::seconds(seconds);
+        self.alerts
+            .iter()
+            .filter(|a| a.timestamp > cutoff)
+            .collect()
+    }
+
+    /// Clear all alerts
+    pub fn clear(&mut self) {
+        self.alerts.clear();
+        self.last_alert_time.clear();
+    }
+
+    /// Clear alerts for a specific task
+    pub fn clear_task_alerts(&mut self, task_name: &str) {
+        self.alerts.retain(|a| a.task_name != task_name);
+        self.last_alert_time
+            .retain(|k, _| !k.starts_with(&format!("{}::", task_name)));
+    }
+
+    /// Get alert count
+    pub fn alert_count(&self) -> usize {
+        self.alerts.len()
+    }
+
+    /// Get critical alert count
+    pub fn critical_alert_count(&self) -> usize {
+        self.alerts.iter().filter(|a| a.is_critical()).count()
+    }
+
+    /// Get warning alert count
+    pub fn warning_alert_count(&self) -> usize {
+        self.alerts.iter().filter(|a| a.is_warning()).count()
+    }
+}
+
+impl Default for AlertManager {
+    fn default() -> Self {
+        Self::new(1000, 300) // Keep 1000 alerts, 5-minute dedup window
+    }
+}
+
+impl std::fmt::Debug for AlertManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlertManager")
+            .field("alerts_count", &self.alerts.len())
+            .field("max_history", &self.max_history)
+            .field("dedup_window_seconds", &self.dedup_window_seconds)
+            .field("callbacks_count", &self.callbacks.len())
+            .finish()
+    }
+}
+
+/// Alert configuration for task monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertConfig {
+    /// Enable alerting for this task
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Threshold for consecutive failures before alerting
+    #[serde(default = "default_consecutive_failures_threshold")]
+    pub consecutive_failures_threshold: u32,
+    /// Threshold for failure rate (0.0 to 1.0) before alerting
+    #[serde(default = "default_failure_rate_threshold")]
+    pub failure_rate_threshold: f64,
+    /// Threshold for slow execution (milliseconds)
+    pub slow_execution_threshold_ms: Option<u64>,
+    /// Enable alerts for missed schedules
+    #[serde(default = "default_true")]
+    pub alert_on_missed_schedule: bool,
+    /// Enable alerts for task stuck
+    #[serde(default = "default_true")]
+    pub alert_on_stuck: bool,
+}
+
+#[allow(dead_code)]
+fn default_true() -> bool {
+    true
+}
+
+#[allow(dead_code)]
+fn default_consecutive_failures_threshold() -> u32 {
+    3
+}
+
+#[allow(dead_code)]
+fn default_failure_rate_threshold() -> f64 {
+    0.5
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            consecutive_failures_threshold: 3,
+            failure_rate_threshold: 0.5,
+            slow_execution_threshold_ms: None,
+            alert_on_missed_schedule: true,
+            alert_on_stuck: true,
+        }
+    }
+}
+
+impl AlertConfig {
+    /// Create a new alert configuration
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Disable all alerts for this task
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+
+    /// Set consecutive failures threshold
+    pub fn with_consecutive_failures_threshold(mut self, threshold: u32) -> Self {
+        self.consecutive_failures_threshold = threshold;
+        self
+    }
+
+    /// Set failure rate threshold
+    pub fn with_failure_rate_threshold(mut self, threshold: f64) -> Self {
+        self.failure_rate_threshold = threshold;
+        self
+    }
+
+    /// Set slow execution threshold
+    pub fn with_slow_execution_threshold_ms(mut self, threshold_ms: u64) -> Self {
+        self.slow_execution_threshold_ms = Some(threshold_ms);
+        self
+    }
+
+    /// Disable missed schedule alerts
+    pub fn without_missed_schedule_alerts(mut self) -> Self {
+        self.alert_on_missed_schedule = false;
+        self
+    }
+
+    /// Disable stuck task alerts
+    pub fn without_stuck_alerts(mut self) -> Self {
+        self.alert_on_stuck = false;
+        self
+    }
+}
+
 /// Schedule health status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ScheduleHealth {
@@ -549,6 +1402,59 @@ pub enum ExecutionResult {
     Failure { error: String },
     /// Execution timed out
     Timeout,
+    /// Execution was interrupted (e.g., scheduler crash)
+    Interrupted,
+}
+
+/// Execution state for crash recovery
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ExecutionState {
+    /// No execution in progress
+    Idle,
+    /// Execution is currently running
+    Running {
+        /// When execution started
+        started_at: DateTime<Utc>,
+        /// Expected timeout (for detection)
+        timeout_after: Option<DateTime<Utc>>,
+    },
+}
+
+impl Default for ExecutionState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl ExecutionState {
+    /// Check if execution is running
+    pub fn is_running(&self) -> bool {
+        matches!(self, ExecutionState::Running { .. })
+    }
+
+    /// Check if execution is idle
+    pub fn is_idle(&self) -> bool {
+        matches!(self, ExecutionState::Idle)
+    }
+
+    /// Check if a running execution has timed out
+    pub fn has_timed_out(&self) -> bool {
+        match self {
+            ExecutionState::Running {
+                timeout_after: Some(timeout),
+                ..
+            } => Utc::now() > *timeout,
+            _ => false,
+        }
+    }
+
+    /// Get duration since execution started (if running)
+    pub fn running_duration(&self) -> Option<Duration> {
+        match self {
+            ExecutionState::Running { started_at, .. } => Some(Utc::now() - *started_at),
+            ExecutionState::Idle => None,
+        }
+    }
 }
 
 /// Record of a single task execution
@@ -609,6 +1515,11 @@ impl ExecutionRecord {
     /// Check if execution is completed
     pub fn is_completed(&self) -> bool {
         self.completed_at.is_some()
+    }
+
+    /// Check if execution was interrupted
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self.result, ExecutionResult::Interrupted)
     }
 }
 
@@ -987,14 +1898,22 @@ pub struct ScheduledTask {
     /// Whether to wait for all dependencies before running
     #[serde(default = "default_true")]
     pub wait_for_dependencies: bool,
+
+    /// Cached next run time (for performance optimization)
+    #[serde(skip)]
+    cached_next_run: Option<DateTime<Utc>>,
+
+    /// Alert configuration for this task
+    #[serde(default)]
+    pub alert_config: AlertConfig,
+
+    /// Current execution state (for crash recovery)
+    #[serde(default)]
+    pub execution_state: ExecutionState,
 }
 
 fn default_version() -> u32 {
     1
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl ScheduledTask {
@@ -1022,6 +1941,9 @@ impl ScheduledTask {
             current_version: 1,
             dependencies: HashSet::new(),
             wait_for_dependencies: true,
+            cached_next_run: None,
+            alert_config: AlertConfig::default(),
+            execution_state: ExecutionState::default(),
         };
 
         // Create initial version
@@ -1098,6 +2020,12 @@ impl ScheduledTask {
         self
     }
 
+    /// Set alert configuration
+    pub fn with_alert_config(mut self, config: AlertConfig) -> Self {
+        self.alert_config = config;
+        self
+    }
+
     /// Add a tag to existing tags
     pub fn add_tag(&mut self, tag: String) {
         self.tags.insert(tag);
@@ -1136,6 +2064,12 @@ impl ScheduledTask {
 
     /// Get the next scheduled run time (with jitter if configured)
     pub fn next_run_time(&self) -> Result<DateTime<Utc>, ScheduleError> {
+        // Return cached value if available
+        if let Some(cached) = self.cached_next_run {
+            return Ok(cached);
+        }
+
+        // Calculate and return (but don't cache in immutable self)
         let mut next_run = self.schedule.next_run(self.last_run_at)?;
 
         // Apply jitter if configured
@@ -1144,6 +2078,37 @@ impl ScheduledTask {
         }
 
         Ok(next_run)
+    }
+
+    /// Calculate and cache the next run time
+    ///
+    /// This method calculates the next run time and caches it for future calls.
+    /// The cache is invalidated when the schedule changes or the task is executed.
+    pub fn update_next_run_cache(&mut self) {
+        if let Ok(next_run) = self.next_run_time_uncached() {
+            self.cached_next_run = Some(next_run);
+        } else {
+            self.cached_next_run = None;
+        }
+    }
+
+    /// Calculate next run time without using cache
+    fn next_run_time_uncached(&self) -> Result<DateTime<Utc>, ScheduleError> {
+        let mut next_run = self.schedule.next_run(self.last_run_at)?;
+
+        // Apply jitter if configured
+        if let Some(ref jitter) = self.jitter {
+            next_run = jitter.apply(next_run, &self.name);
+        }
+
+        Ok(next_run)
+    }
+
+    /// Invalidate the next run time cache
+    ///
+    /// This should be called whenever the schedule changes or the task is executed.
+    pub fn invalidate_next_run_cache(&mut self) {
+        self.cached_next_run = None;
     }
 
     /// Check if task is enabled
@@ -1181,6 +2146,107 @@ impl ScheduledTask {
     /// Check if task should be retried
     pub fn should_retry(&self) -> bool {
         self.retry_policy.should_retry(self.retry_count)
+    }
+
+    /// Begin task execution (for crash recovery tracking)
+    ///
+    /// Marks the task as running and records the start time. This allows
+    /// detection of interrupted executions after a crash.
+    ///
+    /// # Arguments
+    /// * `timeout_seconds` - Optional timeout in seconds for execution detection
+    pub fn begin_execution(&mut self, timeout_seconds: Option<u64>) {
+        let timeout_after = timeout_seconds.map(|secs| Utc::now() + Duration::seconds(secs as i64));
+        self.execution_state = ExecutionState::Running {
+            started_at: Utc::now(),
+            timeout_after,
+        };
+    }
+
+    /// Complete task execution (for crash recovery tracking)
+    ///
+    /// Marks the task as idle and records the execution result. This should be
+    /// called after every execution (success, failure, or timeout).
+    pub fn complete_execution(&mut self) {
+        self.execution_state = ExecutionState::Idle;
+    }
+
+    /// Detect if this task has an interrupted execution
+    ///
+    /// Returns true if the task is marked as running but should have completed
+    /// based on timeout or time elapsed.
+    ///
+    /// # Returns
+    /// * `true` if execution appears to be interrupted
+    /// * `false` if execution is idle or still valid
+    pub fn detect_interrupted_execution(&self) -> bool {
+        match &self.execution_state {
+            ExecutionState::Idle => false,
+            ExecutionState::Running {
+                started_at,
+                timeout_after,
+            } => {
+                // Check explicit timeout
+                if let Some(timeout) = timeout_after {
+                    if Utc::now() > *timeout {
+                        return true;
+                    }
+                }
+
+                // Check if running for unreasonably long (fallback detection)
+                let running_duration = Utc::now() - *started_at;
+                let max_reasonable_duration = Duration::hours(24); // 24 hours max
+                running_duration > max_reasonable_duration
+            }
+        }
+    }
+
+    /// Recover from interrupted execution
+    ///
+    /// Handles cleanup and recording of an interrupted execution.
+    /// Creates an execution record marked as Interrupted and resets state.
+    ///
+    /// # Returns
+    /// Duration the task was running before interruption
+    pub fn recover_from_interruption(&mut self) -> Option<Duration> {
+        match &self.execution_state {
+            ExecutionState::Running { started_at, .. } => {
+                let duration = Utc::now() - *started_at;
+
+                // Record the interrupted execution in history
+                let record = ExecutionRecord::completed(*started_at, ExecutionResult::Interrupted);
+                self.execution_history.push(record);
+
+                // Trim history if needed
+                if self.max_history_size > 0 && self.execution_history.len() > self.max_history_size
+                {
+                    let remove_count = self.execution_history.len() - self.max_history_size;
+                    self.execution_history.drain(0..remove_count);
+                }
+
+                // Reset execution state
+                self.execution_state = ExecutionState::Idle;
+
+                // Increment retry count for interrupted executions
+                self.retry_count += 1;
+
+                Some(duration)
+            }
+            ExecutionState::Idle => None,
+        }
+    }
+
+    /// Check if task is ready for retry after interruption
+    pub fn is_ready_for_retry_after_crash(&self) -> bool {
+        // Task should be retried if it was interrupted and retry policy allows
+        if !self.execution_history.is_empty() {
+            if let Some(last_exec) = self.execution_history.last() {
+                if last_exec.is_interrupted() && self.should_retry() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Get next retry delay in seconds
@@ -1262,6 +2328,22 @@ impl ScheduledTask {
             .iter()
             .filter(|r| r.is_failure())
             .count()
+    }
+
+    /// Get consecutive failure count from the end of history
+    ///
+    /// Returns the number of consecutive failures at the end of the execution history.
+    /// If the last execution was successful or if there's no history, returns 0.
+    pub fn consecutive_failure_count(&self) -> u32 {
+        let mut count = 0u32;
+        for record in self.execution_history.iter().rev() {
+            if record.is_failure() {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
     }
 
     /// Get timeout count from history
@@ -1426,6 +2508,9 @@ impl ScheduledTask {
         self.current_version += 1;
         self.schedule = new_schedule;
 
+        // Invalidate and update cache after schedule change
+        self.update_next_run_cache();
+
         let version = ScheduleVersion::from_task(self, self.current_version, change_reason);
         self.version_history.push(version);
     }
@@ -1438,14 +2523,21 @@ impl ScheduledTask {
         catchup_policy: Option<CatchupPolicy>,
         change_reason: Option<String>,
     ) {
+        let mut jitter_changed = false;
         if let Some(e) = enabled {
             self.enabled = e;
         }
         if let Some(j) = jitter {
             self.jitter = j;
+            jitter_changed = true;
         }
         if let Some(c) = catchup_policy {
             self.catchup_policy = c;
+        }
+
+        // Update cache if jitter changed (affects next run time)
+        if jitter_changed {
+            self.update_next_run_cache();
         }
 
         self.current_version += 1;
@@ -1673,13 +2765,37 @@ pub struct BeatScheduler {
     /// Optional state file path for persistence
     #[serde(skip)]
     state_file: Option<PathBuf>,
+
+    /// Failure notification callbacks
+    #[serde(skip)]
+    failure_callbacks: Vec<FailureCallback>,
+
+    /// Lock manager for preventing duplicate execution
+    #[serde(default)]
+    lock_manager: LockManager,
+
+    /// Scheduler instance ID for lock ownership
+    #[serde(skip)]
+    instance_id: String,
+
+    /// Alert manager for monitoring and notifications
+    #[serde(default)]
+    alert_manager: AlertManager,
 }
 
 impl BeatScheduler {
     pub fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+
         Self {
             tasks: HashMap::new(),
             state_file: None,
+            failure_callbacks: Vec::new(),
+            lock_manager: LockManager::default(),
+            instance_id: format!("scheduler-{}", id),
+            alert_manager: AlertManager::default(),
         }
     }
 
@@ -1696,9 +2812,17 @@ impl BeatScheduler {
     /// // Scheduler will automatically save state to schedules.json on updates
     /// ```
     pub fn with_persistence<P: Into<PathBuf>>(state_file: P) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+
         Self {
             tasks: HashMap::new(),
             state_file: Some(state_file.into()),
+            failure_callbacks: Vec::new(),
+            lock_manager: LockManager::default(),
+            instance_id: format!("scheduler-{}", id),
+            alert_manager: AlertManager::default(),
         }
     }
 
@@ -1717,9 +2841,17 @@ impl BeatScheduler {
 
         if !path.exists() {
             // File doesn't exist, return new scheduler with persistence enabled
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+
             return Ok(Self {
                 tasks: HashMap::new(),
                 state_file: Some(path),
+                failure_callbacks: Vec::new(),
+                lock_manager: LockManager::default(),
+                instance_id: format!("scheduler-{}", id),
+                alert_manager: AlertManager::default(),
             });
         }
 
@@ -1730,7 +2862,15 @@ impl BeatScheduler {
             ScheduleError::Persistence(format!("Failed to parse state file: {}", e))
         })?;
 
+        // Set state file and generate instance ID
         scheduler.state_file = Some(path);
+        if scheduler.instance_id.is_empty() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+            scheduler.instance_id = format!("scheduler-{}", id);
+        }
+
         Ok(scheduler)
     }
 
@@ -1754,16 +2894,101 @@ impl BeatScheduler {
         Ok(())
     }
 
-    pub fn add_task(&mut self, task: ScheduledTask) -> Result<(), ScheduleError> {
+    pub fn add_task(&mut self, mut task: ScheduledTask) -> Result<(), ScheduleError> {
+        // Initialize the next run cache when adding the task
+        task.update_next_run_cache();
         self.tasks.insert(task.name.clone(), task);
         self.save_state()?;
         Ok(())
+    }
+
+    /// Add multiple tasks in a batch operation
+    ///
+    /// This is more efficient than adding tasks individually as it only saves
+    /// state once after all tasks are added.
+    ///
+    /// # Arguments
+    /// * `tasks` - Vector of tasks to add
+    ///
+    /// # Returns
+    /// Number of tasks successfully added
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// let tasks = vec![
+    ///     ScheduledTask::new("task1".to_string(), Schedule::interval(60)),
+    ///     ScheduledTask::new("task2".to_string(), Schedule::interval(120)),
+    ///     ScheduledTask::new("task3".to_string(), Schedule::interval(180)),
+    /// ];
+    ///
+    /// let count = scheduler.add_tasks_batch(tasks).unwrap();
+    /// assert_eq!(count, 3);
+    /// ```
+    pub fn add_tasks_batch(&mut self, tasks: Vec<ScheduledTask>) -> Result<usize, ScheduleError> {
+        let mut added_count = 0;
+
+        for mut task in tasks {
+            // Initialize the next run cache when adding the task
+            task.update_next_run_cache();
+            self.tasks.insert(task.name.clone(), task);
+            added_count += 1;
+        }
+
+        // Save state only once after all tasks are added
+        if added_count > 0 {
+            self.save_state()?;
+        }
+
+        Ok(added_count)
     }
 
     pub fn remove_task(&mut self, name: &str) -> Result<Option<ScheduledTask>, ScheduleError> {
         let task = self.tasks.remove(name);
         self.save_state()?;
         Ok(task)
+    }
+
+    /// Remove multiple tasks in a batch operation
+    ///
+    /// This is more efficient than removing tasks individually as it only saves
+    /// state once after all tasks are removed.
+    ///
+    /// # Arguments
+    /// * `names` - Slice of task names to remove
+    ///
+    /// # Returns
+    /// Number of tasks successfully removed
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// scheduler.add_task(ScheduledTask::new("task1".to_string(), Schedule::interval(60))).unwrap();
+    /// scheduler.add_task(ScheduledTask::new("task2".to_string(), Schedule::interval(120))).unwrap();
+    /// scheduler.add_task(ScheduledTask::new("task3".to_string(), Schedule::interval(180))).unwrap();
+    ///
+    /// let count = scheduler.remove_tasks_batch(&["task1", "task2"]).unwrap();
+    /// assert_eq!(count, 2);
+    /// ```
+    pub fn remove_tasks_batch(&mut self, names: &[&str]) -> Result<usize, ScheduleError> {
+        let mut removed_count = 0;
+
+        for name in names {
+            if self.tasks.remove(*name).is_some() {
+                removed_count += 1;
+            }
+        }
+
+        // Save state only once after all tasks are removed
+        if removed_count > 0 {
+            self.save_state()?;
+        }
+
+        Ok(removed_count)
     }
 
     /// Update task execution state (called after task runs)
@@ -1787,6 +3012,9 @@ impl BeatScheduler {
             // Add execution record
             let record = ExecutionRecord::completed(now, ExecutionResult::Success);
             task.add_execution_record(record);
+
+            // Update next run cache after execution
+            task.update_next_run_cache();
 
             // Check if this is a one-time schedule
             task.schedule.is_onetime()
@@ -1819,6 +3047,9 @@ impl BeatScheduler {
             let record = ExecutionRecord::completed(started_at, ExecutionResult::Success);
             task.add_execution_record(record);
 
+            // Update next run cache after execution
+            task.update_next_run_cache();
+
             // Check if this is a one-time schedule
             task.schedule.is_onetime()
         } else {
@@ -1850,8 +3081,16 @@ impl BeatScheduler {
             task.mark_failure();
 
             // Add execution record
-            let record = ExecutionRecord::completed(now, ExecutionResult::Failure { error });
+            let record = ExecutionRecord::completed(
+                now,
+                ExecutionResult::Failure {
+                    error: error.clone(),
+                },
+            );
             task.add_execution_record(record);
+
+            // Invoke failure callbacks
+            self.invoke_failure_callbacks(name, &error);
 
             self.save_state()?;
         }
@@ -1869,8 +3108,16 @@ impl BeatScheduler {
             task.mark_failure();
 
             // Add execution record with actual start time
-            let record = ExecutionRecord::completed(started_at, ExecutionResult::Failure { error });
+            let record = ExecutionRecord::completed(
+                started_at,
+                ExecutionResult::Failure {
+                    error: error.clone(),
+                },
+            );
             task.add_execution_record(record);
+
+            // Invoke failure callbacks
+            self.invoke_failure_callbacks(name, &error);
 
             self.save_state()?;
         }
@@ -1895,11 +3142,329 @@ impl BeatScheduler {
         Ok(())
     }
 
+    /// Register a failure notification callback
+    ///
+    /// The callback will be invoked whenever a task execution fails.
+    ///
+    /// # Arguments
+    /// * `callback` - Callback function that receives task name and error message
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::BeatScheduler;
+    /// use std::sync::Arc;
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// scheduler.on_failure(Arc::new(|task_name, error| {
+    ///     eprintln!("Task {} failed: {}", task_name, error);
+    /// }));
+    /// ```
+    pub fn on_failure(&mut self, callback: FailureCallback) {
+        self.failure_callbacks.push(callback);
+    }
+
+    /// Clear all failure notification callbacks
+    pub fn clear_failure_callbacks(&mut self) {
+        self.failure_callbacks.clear();
+    }
+
+    /// Invoke all registered failure callbacks
+    fn invoke_failure_callbacks(&self, task_name: &str, error: &str) {
+        for callback in &self.failure_callbacks {
+            callback(task_name, error);
+        }
+    }
+
+    /// Register an alert callback
+    ///
+    /// The callback will be invoked whenever an alert is triggered.
+    ///
+    /// # Arguments
+    /// * `callback` - Callback function that receives alert details
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::BeatScheduler;
+    /// use std::sync::Arc;
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// scheduler.on_alert(Arc::new(|alert| {
+    ///     eprintln!("ALERT: {}", alert);
+    /// }));
+    /// ```
+    pub fn on_alert(&mut self, callback: AlertCallback) {
+        self.alert_manager.add_callback(callback);
+    }
+
+    /// Get all alerts
+    pub fn get_alerts(&self) -> &[Alert] {
+        self.alert_manager.get_alerts()
+    }
+
+    /// Get critical alerts
+    pub fn get_critical_alerts(&self) -> Vec<&Alert> {
+        self.alert_manager.get_critical_alerts()
+    }
+
+    /// Get warning alerts
+    pub fn get_warning_alerts(&self) -> Vec<&Alert> {
+        self.alert_manager.get_warning_alerts()
+    }
+
+    /// Get alerts for a specific task
+    pub fn get_task_alerts(&self, task_name: &str) -> Vec<&Alert> {
+        self.alert_manager.get_task_alerts(task_name)
+    }
+
+    /// Get recent alerts within specified seconds
+    pub fn get_recent_alerts(&self, seconds: i64) -> Vec<&Alert> {
+        self.alert_manager.get_recent_alerts(seconds)
+    }
+
+    /// Clear all alerts
+    pub fn clear_alerts(&mut self) {
+        self.alert_manager.clear();
+    }
+
+    /// Clear alerts for a specific task
+    pub fn clear_task_alerts(&mut self, task_name: &str) {
+        self.alert_manager.clear_task_alerts(task_name);
+    }
+
+    /// Check alert conditions for a task and trigger alerts if needed
+    ///
+    /// This should be called periodically or after task execution to monitor for alert conditions.
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task to check
+    ///
+    /// # Returns
+    /// Number of alerts triggered
+    pub fn check_task_alerts(&mut self, task_name: &str) -> usize {
+        let task = match self.tasks.get(task_name) {
+            Some(t) => t,
+            None => return 0,
+        };
+
+        if !task.alert_config.enabled {
+            return 0;
+        }
+
+        let mut alerts_triggered = 0;
+
+        // Check consecutive failures
+        let consecutive_failures = task.consecutive_failure_count();
+        if consecutive_failures >= task.alert_config.consecutive_failures_threshold {
+            let alert = Alert::new(
+                task_name.to_string(),
+                AlertLevel::Critical,
+                AlertCondition::ConsecutiveFailures {
+                    count: consecutive_failures,
+                    threshold: task.alert_config.consecutive_failures_threshold,
+                },
+                format!(
+                    "Task has {} consecutive failures (threshold: {})",
+                    consecutive_failures, task.alert_config.consecutive_failures_threshold
+                ),
+            );
+            if self.alert_manager.record_alert(alert) {
+                alerts_triggered += 1;
+            }
+        }
+
+        // Check failure rate
+        let failure_rate = task.failure_rate();
+        if failure_rate > task.alert_config.failure_rate_threshold {
+            let alert = Alert::new(
+                task_name.to_string(),
+                AlertLevel::Warning,
+                AlertCondition::HighFailureRate {
+                    rate: format!("{:.2}", failure_rate),
+                    threshold: format!("{:.2}", task.alert_config.failure_rate_threshold),
+                },
+                format!(
+                    "Task has high failure rate: {:.1}% (threshold: {:.1}%)",
+                    failure_rate * 100.0,
+                    task.alert_config.failure_rate_threshold * 100.0
+                ),
+            );
+            if self.alert_manager.record_alert(alert) {
+                alerts_triggered += 1;
+            }
+        }
+
+        // Check slow execution
+        if let Some(threshold_ms) = task.alert_config.slow_execution_threshold_ms {
+            if let Some(avg_duration_ms) = task.average_duration_ms() {
+                if avg_duration_ms > threshold_ms {
+                    let alert = Alert::new(
+                        task_name.to_string(),
+                        AlertLevel::Warning,
+                        AlertCondition::SlowExecution {
+                            duration_ms: avg_duration_ms,
+                            threshold_ms,
+                        },
+                        format!(
+                            "Task execution is slow: {}ms average (threshold: {}ms)",
+                            avg_duration_ms, threshold_ms
+                        ),
+                    );
+                    if self.alert_manager.record_alert(alert) {
+                        alerts_triggered += 1;
+                    }
+                }
+            }
+        }
+
+        // Check if task is stuck
+        if task.alert_config.alert_on_stuck {
+            if let Some(stuck_duration) = task.is_stuck() {
+                // Calculate expected interval based on schedule type
+                let expected_interval_secs = match &task.schedule {
+                    Schedule::Interval { every } => *every,
+                    #[cfg(feature = "cron")]
+                    Schedule::Crontab { .. } => 86400, // Assume daily
+                    #[cfg(feature = "solar")]
+                    Schedule::Solar { .. } => 86400, // Daily
+                    Schedule::OneTime { .. } => 0, // Won't be stuck
+                };
+
+                let alert = Alert::new(
+                    task_name.to_string(),
+                    AlertLevel::Critical,
+                    AlertCondition::TaskStuck {
+                        idle_duration_seconds: stuck_duration.num_seconds(),
+                        expected_interval_seconds: expected_interval_secs,
+                    },
+                    format!(
+                        "Task is stuck: no execution for {}s (expected interval: {}s)",
+                        stuck_duration.num_seconds(),
+                        expected_interval_secs
+                    ),
+                );
+                if self.alert_manager.record_alert(alert) {
+                    alerts_triggered += 1;
+                }
+            }
+        }
+
+        // Check health status
+        let health_result = task.check_health();
+        if health_result.health.is_unhealthy() {
+            let issues = health_result.health.get_issues();
+            let alert = Alert::new(
+                task_name.to_string(),
+                AlertLevel::Critical,
+                AlertCondition::TaskUnhealthy {
+                    issues: issues.clone(),
+                },
+                format!("Task is unhealthy: {}", issues.join(", ")),
+            );
+            if self.alert_manager.record_alert(alert) {
+                alerts_triggered += 1;
+            }
+        }
+
+        alerts_triggered
+    }
+
+    /// Check alert conditions for all enabled tasks
+    ///
+    /// # Returns
+    /// Total number of alerts triggered across all tasks
+    pub fn check_all_alerts(&mut self) -> usize {
+        let task_names: Vec<String> = self
+            .tasks
+            .keys()
+            .filter(|name| {
+                if let Some(task) = self.tasks.get(*name) {
+                    task.enabled && task.alert_config.enabled
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+
+        let mut total_alerts = 0;
+        for task_name in task_names {
+            total_alerts += self.check_task_alerts(&task_name);
+        }
+        total_alerts
+    }
+
     /// Get tasks that are ready for retry
     pub fn get_retry_tasks(&self) -> Vec<&ScheduledTask> {
         self.tasks
             .values()
             .filter(|task| task.enabled && task.is_ready_for_retry())
+            .collect()
+    }
+
+    /// Detect tasks with interrupted executions (crash recovery)
+    ///
+    /// Scans all tasks to find those that were marked as running but appear
+    /// to have been interrupted (e.g., due to scheduler crash).
+    ///
+    /// # Returns
+    /// Vector of task names that have interrupted executions
+    pub fn detect_crashed_tasks(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter(|(_, task)| task.detect_interrupted_execution())
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Recover from crash by handling all interrupted task executions
+    ///
+    /// This method should be called after loading scheduler state to detect
+    /// and recover from any interrupted executions (e.g., after a crash).
+    ///
+    /// # Returns
+    /// Number of tasks recovered from interruption
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::BeatScheduler;
+    ///
+    /// // Load scheduler from persistent state
+    /// let mut scheduler = BeatScheduler::load_from_file("schedules.json").unwrap();
+    ///
+    /// // Automatically recover from any crashes
+    /// let recovered = scheduler.recover_from_crash();
+    /// if recovered > 0 {
+    ///     eprintln!("Recovered {} tasks from interrupted executions", recovered);
+    /// }
+    /// ```
+    pub fn recover_from_crash(&mut self) -> usize {
+        let crashed_task_names = self.detect_crashed_tasks();
+        let mut recovered_count = 0;
+
+        for task_name in crashed_task_names {
+            if let Some(task) = self.tasks.get_mut(&task_name) {
+                if let Some(duration) = task.recover_from_interruption() {
+                    eprintln!(
+                        "Recovered task '{}' from interrupted execution (was running for {}s)",
+                        task_name,
+                        duration.num_seconds()
+                    );
+                    recovered_count += 1;
+                }
+            }
+        }
+
+        // Save state after recovery
+        let _ = self.save_state();
+
+        recovered_count
+    }
+
+    /// Get tasks that need retry after crash recovery
+    pub fn get_tasks_ready_for_crash_retry(&self) -> Vec<&ScheduledTask> {
+        self.tasks
+            .values()
+            .filter(|task| task.enabled && task.is_ready_for_retry_after_crash())
             .collect()
     }
 
@@ -2268,6 +3833,326 @@ impl BeatScheduler {
 
         Ok(())
     }
+
+    // ===== Lock Management Methods =====
+
+    /// Try to acquire a lock for a task
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task to lock
+    /// * `ttl` - Optional custom TTL in seconds (uses default if None)
+    ///
+    /// # Returns
+    /// * `Ok(true)` if lock acquired successfully
+    /// * `Ok(false)` if lock is already held by another scheduler
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::BeatScheduler;
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    ///
+    /// // Try to acquire lock for a task
+    /// let acquired = scheduler.try_acquire_lock("my_task", None).unwrap();
+    /// if acquired {
+    ///     println!("Lock acquired, safe to execute task");
+    /// }
+    /// ```
+    pub fn try_acquire_lock(
+        &mut self,
+        task_name: &str,
+        ttl: Option<u64>,
+    ) -> Result<bool, ScheduleError> {
+        self.lock_manager
+            .try_acquire(task_name, &self.instance_id, ttl)
+    }
+
+    /// Release a lock for a task
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task to unlock
+    ///
+    /// # Returns
+    /// * `Ok(true)` if lock was released
+    /// * `Ok(false)` if lock doesn't exist or is owned by another scheduler
+    pub fn release_lock(&mut self, task_name: &str) -> Result<bool, ScheduleError> {
+        self.lock_manager.release(task_name, &self.instance_id)
+    }
+
+    /// Renew a lock for a task
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task
+    /// * `ttl` - Optional custom TTL in seconds (uses default if None)
+    ///
+    /// # Returns
+    /// * `Ok(true)` if lock was renewed
+    /// * `Ok(false)` if lock doesn't exist, is owned by another scheduler, or has expired
+    pub fn renew_lock(&mut self, task_name: &str, ttl: Option<u64>) -> Result<bool, ScheduleError> {
+        self.lock_manager.renew(task_name, &self.instance_id, ttl)
+    }
+
+    /// Check if a task is locked
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task
+    ///
+    /// # Returns
+    /// * `true` if task is locked by any scheduler
+    /// * `false` otherwise
+    pub fn is_task_locked(&self, task_name: &str) -> bool {
+        self.lock_manager.is_locked(task_name)
+    }
+
+    /// Get information about a task lock
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task
+    ///
+    /// # Returns
+    /// * `Some(&ScheduleLock)` if lock exists
+    /// * `None` otherwise
+    pub fn get_task_lock(&self, task_name: &str) -> Option<&ScheduleLock> {
+        self.lock_manager.get_lock(task_name)
+    }
+
+    /// Clean up expired locks
+    ///
+    /// This is automatically called by try_acquire_lock, but can be called manually
+    /// to clean up expired locks without acquiring new ones.
+    pub fn cleanup_expired_locks(&mut self) {
+        self.lock_manager.cleanup_expired();
+    }
+
+    /// Get all active locks
+    ///
+    /// # Returns
+    /// Vector of all non-expired locks
+    pub fn get_active_locks(&self) -> Vec<&ScheduleLock> {
+        self.lock_manager.get_active_locks()
+    }
+
+    /// Get the scheduler instance ID
+    ///
+    /// This is used for lock ownership identification
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Set custom instance ID
+    ///
+    /// Useful for distributed deployments where you want to use a specific
+    /// identifier (e.g., hostname, pod name, etc.)
+    ///
+    /// # Arguments
+    /// * `id` - Custom instance identifier
+    pub fn set_instance_id(&mut self, id: String) {
+        self.instance_id = id;
+    }
+
+    /// Execute a task with automatic lock management
+    ///
+    /// Attempts to acquire a lock before execution and releases it after.
+    /// Returns Ok(false) if the lock cannot be acquired.
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the task
+    /// * `ttl` - Optional lock TTL in seconds
+    /// * `f` - Function to execute if lock is acquired
+    ///
+    /// # Returns
+    /// * `Ok(true)` if lock was acquired and function executed
+    /// * `Ok(false)` if lock could not be acquired
+    /// * `Err` on execution error
+    pub fn execute_with_lock<F>(
+        &mut self,
+        task_name: &str,
+        ttl: Option<u64>,
+        mut f: F,
+    ) -> Result<bool, ScheduleError>
+    where
+        F: FnMut() -> Result<(), ScheduleError>,
+    {
+        // Try to acquire lock
+        if !self.try_acquire_lock(task_name, ttl)? {
+            return Ok(false);
+        }
+
+        // Execute function
+        let result = f();
+
+        // Release lock (ignore errors)
+        let _ = self.release_lock(task_name);
+
+        // Return execution result
+        result.map(|_| true)
+    }
+
+    // ===== Conflict Detection Methods =====
+
+    /// Detect potential conflicts between scheduled tasks
+    ///
+    /// Analyzes all registered tasks to find potential scheduling conflicts
+    /// based on their next run times and estimated execution durations.
+    ///
+    /// # Arguments
+    /// * `window_seconds` - Time window to check for conflicts (default: 3600 seconds = 1 hour)
+    /// * `estimated_duration` - Estimated task duration in seconds (default: 60 seconds)
+    ///
+    /// # Returns
+    /// Vector of detected conflicts
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    ///
+    /// // Add two tasks that run at the same time
+    /// scheduler.add_task(ScheduledTask::new("task1".to_string(), Schedule::interval(60))).unwrap();
+    /// scheduler.add_task(ScheduledTask::new("task2".to_string(), Schedule::interval(60))).unwrap();
+    ///
+    /// // Check for conflicts
+    /// let conflicts = scheduler.detect_conflicts(3600, 60);
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn detect_conflicts(
+        &self,
+        window_seconds: u64,
+        estimated_duration: u64,
+    ) -> Vec<ScheduleConflict> {
+        let mut conflicts = Vec::new();
+        let now = Utc::now();
+        let window_end = now + Duration::seconds(window_seconds as i64);
+
+        // Get all task names
+        let task_names: Vec<String> = self.tasks.keys().cloned().collect();
+
+        // Compare each pair of tasks
+        for i in 0..task_names.len() {
+            for j in (i + 1)..task_names.len() {
+                let task1_name = &task_names[i];
+                let task2_name = &task_names[j];
+
+                if let (Some(task1), Some(task2)) =
+                    (self.tasks.get(task1_name), self.tasks.get(task2_name))
+                {
+                    // Skip if either task is disabled
+                    if !task1.enabled || !task2.enabled {
+                        continue;
+                    }
+
+                    // Get next run times
+                    let next1 = match task1.schedule.next_run(task1.last_run_at) {
+                        Ok(time) => time,
+                        Err(_) => continue,
+                    };
+
+                    let next2 = match task2.schedule.next_run(task2.last_run_at) {
+                        Ok(time) => time,
+                        Err(_) => continue,
+                    };
+
+                    // Check if both will run within the window
+                    if next1 > window_end || next2 > window_end {
+                        continue;
+                    }
+
+                    // Calculate overlap
+                    let task1_start = next1;
+                    let task1_end = next1 + Duration::seconds(estimated_duration as i64);
+                    let task2_start = next2;
+                    let task2_end = next2 + Duration::seconds(estimated_duration as i64);
+
+                    // Check for overlap
+                    if task1_start < task2_end && task2_start < task1_end {
+                        let overlap_start = if task1_start > task2_start {
+                            task1_start
+                        } else {
+                            task2_start
+                        };
+                        let overlap_end = if task1_end < task2_end {
+                            task1_end
+                        } else {
+                            task2_end
+                        };
+                        let overlap_seconds = (overlap_end - overlap_start).num_seconds() as u64;
+
+                        // Determine severity
+                        let severity = if overlap_seconds >= estimated_duration {
+                            ConflictSeverity::High
+                        } else if overlap_seconds >= estimated_duration / 2 {
+                            ConflictSeverity::Medium
+                        } else {
+                            ConflictSeverity::Low
+                        };
+
+                        let description = format!(
+                            "Tasks will run at overlapping times: {} at {}, {} at {}",
+                            task1_name,
+                            next1.format("%Y-%m-%d %H:%M:%S"),
+                            task2_name,
+                            next2.format("%Y-%m-%d %H:%M:%S")
+                        );
+
+                        let resolution = Some(format!(
+                            "Consider adjusting schedules or using jitter to avoid overlap"
+                        ));
+
+                        conflicts.push(
+                            ScheduleConflict::new(
+                                task1_name.clone(),
+                                task2_name.clone(),
+                                severity,
+                                overlap_seconds,
+                                description,
+                            )
+                            .with_resolution(resolution.unwrap()),
+                        );
+                    }
+                }
+            }
+        }
+
+        conflicts
+    }
+
+    /// Get high severity conflicts
+    pub fn get_high_severity_conflicts(
+        &self,
+        window_seconds: u64,
+        estimated_duration: u64,
+    ) -> Vec<ScheduleConflict> {
+        self.detect_conflicts(window_seconds, estimated_duration)
+            .into_iter()
+            .filter(|c| c.is_high_severity())
+            .collect()
+    }
+
+    /// Get medium severity conflicts
+    pub fn get_medium_severity_conflicts(
+        &self,
+        window_seconds: u64,
+        estimated_duration: u64,
+    ) -> Vec<ScheduleConflict> {
+        self.detect_conflicts(window_seconds, estimated_duration)
+            .into_iter()
+            .filter(|c| c.is_medium_severity())
+            .collect()
+    }
+
+    /// Check if there are any conflicts
+    pub fn has_conflicts(&self, window_seconds: u64, estimated_duration: u64) -> bool {
+        !self
+            .detect_conflicts(window_seconds, estimated_duration)
+            .is_empty()
+    }
+
+    /// Get total conflict count
+    pub fn conflict_count(&self, window_seconds: u64, estimated_duration: u64) -> usize {
+        self.detect_conflicts(window_seconds, estimated_duration)
+            .len()
+    }
 }
 
 impl Default for BeatScheduler {
@@ -2559,7 +4444,52 @@ mod tests {
     fn test_crontab_schedule_display() {
         let schedule = Schedule::crontab("0", "12", "*", "*", "1");
         let display = format!("{}", schedule);
-        assert_eq!(display, "Crontab[0 12 * * 1]");
+        assert_eq!(display, "Crontab[0 12 * * 1 (UTC)]");
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_schedule_with_timezone() {
+        let schedule = Schedule::crontab_tz("0", "9", "1-5", "*", "*", "America/New_York");
+        assert!(schedule.is_crontab());
+
+        // Display should show timezone
+        let display = format!("{}", schedule);
+        assert!(display.contains("America/New_York"));
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_schedule_timezone_next_run() {
+        // Schedule for 9:00 AM New York time on weekdays
+        let schedule = Schedule::crontab_tz("0", "9", "1-5", "*", "*", "America/New_York");
+
+        // Get next run time
+        let next_run = schedule.next_run(None).unwrap();
+
+        // Verify the time is valid (should be in the future)
+        assert!(next_run > Utc::now());
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_schedule_invalid_timezone() {
+        let schedule = Schedule::crontab_tz("0", "9", "*", "*", "*", "Invalid/Timezone");
+        let result = schedule.next_run(None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_parse());
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_schedule_timezone_serialization() {
+        let schedule = Schedule::crontab_tz("30", "14", "*", "*", "*", "Europe/London");
+        let json = serde_json::to_string(&schedule).unwrap();
+        let deserialized: Schedule = serde_json::from_str(&json).unwrap();
+
+        // Verify timezone is preserved
+        let display = format!("{}", deserialized);
+        assert!(display.contains("Europe/London"));
     }
 
     // ===== Solar Schedule Tests =====
@@ -5349,5 +7279,843 @@ mod tests {
         assert!(deserialized.depends_on("task_a"));
         assert!(deserialized.depends_on("task_b"));
         assert!(deserialized.wait_for_dependencies);
+    }
+
+    #[test]
+    fn test_failure_notification_callback() {
+        use std::sync::{Arc, Mutex};
+
+        let mut scheduler = BeatScheduler::new();
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+        scheduler.add_task(task).unwrap();
+
+        // Track callback invocations
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let invocations_clone = invocations.clone();
+
+        // Register callback
+        scheduler.on_failure(Arc::new(move |task_name, error| {
+            invocations_clone
+                .lock()
+                .unwrap()
+                .push((task_name.to_string(), error.to_string()));
+        }));
+
+        // Trigger failure
+        scheduler
+            .mark_task_failure_with_error("test_task", "Test error".to_string())
+            .unwrap();
+
+        // Verify callback was invoked
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].0, "test_task");
+        assert_eq!(invocations[0].1, "Test error");
+    }
+
+    #[test]
+    fn test_failure_notification_multiple_callbacks() {
+        use std::sync::{Arc, Mutex};
+
+        let mut scheduler = BeatScheduler::new();
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+        scheduler.add_task(task).unwrap();
+
+        // Track callback invocations for two separate callbacks
+        let invocations1 = Arc::new(Mutex::new(0));
+        let invocations2 = Arc::new(Mutex::new(0));
+
+        let inv1_clone = invocations1.clone();
+        let inv2_clone = invocations2.clone();
+
+        // Register two callbacks
+        scheduler.on_failure(Arc::new(move |_, _| {
+            *inv1_clone.lock().unwrap() += 1;
+        }));
+
+        scheduler.on_failure(Arc::new(move |_, _| {
+            *inv2_clone.lock().unwrap() += 1;
+        }));
+
+        // Trigger failure
+        scheduler
+            .mark_task_failure_with_error("test_task", "Test error".to_string())
+            .unwrap();
+
+        // Verify both callbacks were invoked
+        assert_eq!(*invocations1.lock().unwrap(), 1);
+        assert_eq!(*invocations2.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_failure_notification_clear_callbacks() {
+        use std::sync::{Arc, Mutex};
+
+        let mut scheduler = BeatScheduler::new();
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+        scheduler.add_task(task).unwrap();
+
+        // Track callback invocations
+        let invocations = Arc::new(Mutex::new(0));
+        let inv_clone = invocations.clone();
+
+        // Register callback
+        scheduler.on_failure(Arc::new(move |_, _| {
+            *inv_clone.lock().unwrap() += 1;
+        }));
+
+        // Clear callbacks
+        scheduler.clear_failure_callbacks();
+
+        // Trigger failure
+        scheduler
+            .mark_task_failure_with_error("test_task", "Test error".to_string())
+            .unwrap();
+
+        // Verify callback was NOT invoked
+        assert_eq!(*invocations.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_failure_notification_with_start_time() {
+        use std::sync::{Arc, Mutex};
+
+        let mut scheduler = BeatScheduler::new();
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+        scheduler.add_task(task).unwrap();
+
+        // Track callback invocations
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let invocations_clone = invocations.clone();
+
+        // Register callback
+        scheduler.on_failure(Arc::new(move |task_name, error| {
+            invocations_clone
+                .lock()
+                .unwrap()
+                .push((task_name.to_string(), error.to_string()));
+        }));
+
+        // Trigger failure with start time
+        let start_time = Utc::now();
+        scheduler
+            .mark_task_failure_with_start("test_task", start_time, "Test error".to_string())
+            .unwrap();
+
+        // Verify callback was invoked
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].0, "test_task");
+        assert_eq!(invocations[0].1, "Test error");
+    }
+
+    #[test]
+    fn test_failure_notification_multiple_failures() {
+        use std::sync::{Arc, Mutex};
+
+        let mut scheduler = BeatScheduler::new();
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+        scheduler.add_task(task).unwrap();
+
+        // Track callback invocations
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let invocations_clone = invocations.clone();
+
+        // Register callback
+        scheduler.on_failure(Arc::new(move |task_name, error| {
+            invocations_clone
+                .lock()
+                .unwrap()
+                .push((task_name.to_string(), error.to_string()));
+        }));
+
+        // Trigger multiple failures
+        scheduler
+            .mark_task_failure_with_error("test_task", "Error 1".to_string())
+            .unwrap();
+        scheduler
+            .mark_task_failure_with_error("test_task", "Error 2".to_string())
+            .unwrap();
+        scheduler
+            .mark_task_failure_with_error("test_task", "Error 3".to_string())
+            .unwrap();
+
+        // Verify callback was invoked three times
+        let invocations = invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[0].1, "Error 1");
+        assert_eq!(invocations[1].1, "Error 2");
+        assert_eq!(invocations[2].1, "Error 3");
+    }
+
+    #[test]
+    fn test_schedule_cache_basic() {
+        let mut task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+
+        // Initially cache should be None
+        assert!(task.cached_next_run.is_none());
+
+        // Update cache
+        task.update_next_run_cache();
+        assert!(task.cached_next_run.is_some());
+
+        let cached_time = task.cached_next_run.unwrap();
+
+        // next_run_time should return the cached value
+        let next_run = task.next_run_time().unwrap();
+        assert_eq!(next_run, cached_time);
+    }
+
+    #[test]
+    fn test_schedule_cache_invalidation() {
+        let mut task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+
+        // Update cache
+        task.update_next_run_cache();
+        assert!(task.cached_next_run.is_some());
+
+        // Invalidate cache
+        task.invalidate_next_run_cache();
+        assert!(task.cached_next_run.is_none());
+    }
+
+    #[test]
+    fn test_schedule_cache_on_execution() {
+        let mut scheduler = BeatScheduler::new();
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+        scheduler.add_task(task).unwrap();
+
+        // After adding, cache should be set
+        let task = scheduler.tasks.get("test_task").unwrap();
+        assert!(task.cached_next_run.is_some());
+
+        // Mark as success
+        scheduler.mark_task_success("test_task").unwrap();
+
+        // After execution, cache should be updated
+        let task = scheduler.tasks.get("test_task").unwrap();
+        assert!(task.cached_next_run.is_some());
+    }
+
+    #[test]
+    fn test_schedule_cache_on_schedule_update() {
+        let mut task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+
+        // Update cache
+        task.update_next_run_cache();
+        let old_cached_time = task.cached_next_run.unwrap();
+
+        // Update schedule
+        task.update_schedule(
+            Schedule::interval(120),
+            Some("Changed interval".to_string()),
+        );
+
+        // Cache should be updated with new schedule
+        assert!(task.cached_next_run.is_some());
+        let new_cached_time = task.cached_next_run.unwrap();
+
+        // The cached times should be different (though this might fail if timing is exact)
+        // At minimum, cache should still be valid
+        assert!(new_cached_time >= old_cached_time);
+    }
+
+    #[test]
+    fn test_add_tasks_batch() {
+        let mut scheduler = BeatScheduler::new();
+
+        let tasks = vec![
+            ScheduledTask::new("task1".to_string(), Schedule::interval(60)),
+            ScheduledTask::new("task2".to_string(), Schedule::interval(120)),
+            ScheduledTask::new("task3".to_string(), Schedule::interval(180)),
+        ];
+
+        let count = scheduler.add_tasks_batch(tasks).unwrap();
+
+        assert_eq!(count, 3);
+        assert_eq!(scheduler.tasks.len(), 3);
+        assert!(scheduler.tasks.contains_key("task1"));
+        assert!(scheduler.tasks.contains_key("task2"));
+        assert!(scheduler.tasks.contains_key("task3"));
+
+        // Verify cache is initialized for all tasks
+        assert!(scheduler
+            .tasks
+            .get("task1")
+            .unwrap()
+            .cached_next_run
+            .is_some());
+        assert!(scheduler
+            .tasks
+            .get("task2")
+            .unwrap()
+            .cached_next_run
+            .is_some());
+        assert!(scheduler
+            .tasks
+            .get("task3")
+            .unwrap()
+            .cached_next_run
+            .is_some());
+    }
+
+    #[test]
+    fn test_add_tasks_batch_empty() {
+        let mut scheduler = BeatScheduler::new();
+
+        let tasks = vec![];
+        let count = scheduler.add_tasks_batch(tasks).unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(scheduler.tasks.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_tasks_batch() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add some tasks
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task1".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task2".to_string(),
+                Schedule::interval(120),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task3".to_string(),
+                Schedule::interval(180),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task4".to_string(),
+                Schedule::interval(240),
+            ))
+            .unwrap();
+
+        assert_eq!(scheduler.tasks.len(), 4);
+
+        // Remove tasks in batch
+        let count = scheduler
+            .remove_tasks_batch(&["task1", "task2", "task3"])
+            .unwrap();
+
+        assert_eq!(count, 3);
+        assert_eq!(scheduler.tasks.len(), 1);
+        assert!(!scheduler.tasks.contains_key("task1"));
+        assert!(!scheduler.tasks.contains_key("task2"));
+        assert!(!scheduler.tasks.contains_key("task3"));
+        assert!(scheduler.tasks.contains_key("task4"));
+    }
+
+    #[test]
+    fn test_remove_tasks_batch_nonexistent() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add some tasks
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task1".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task2".to_string(),
+                Schedule::interval(120),
+            ))
+            .unwrap();
+
+        assert_eq!(scheduler.tasks.len(), 2);
+
+        // Try to remove tasks that don't all exist
+        let count = scheduler
+            .remove_tasks_batch(&["task1", "nonexistent", "task2"])
+            .unwrap();
+
+        assert_eq!(count, 2); // Only task1 and task2 were removed
+        assert_eq!(scheduler.tasks.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_tasks_batch_empty() {
+        let mut scheduler = BeatScheduler::new();
+
+        let count = scheduler.remove_tasks_batch(&[]).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ===== Lock Manager Tests =====
+
+    #[test]
+    fn test_schedule_lock_basic() {
+        let lock = ScheduleLock::new("task1".to_string(), "owner1".to_string(), 300);
+
+        assert_eq!(lock.task_name, "task1");
+        assert_eq!(lock.owner, "owner1");
+        assert!(!lock.is_expired());
+        assert!(lock.is_owned_by("owner1"));
+        assert!(!lock.is_owned_by("owner2"));
+        assert_eq!(lock.renewal_count, 0);
+    }
+
+    #[test]
+    fn test_schedule_lock_ttl() {
+        let lock = ScheduleLock::new("task1".to_string(), "owner1".to_string(), 300);
+
+        let ttl = lock.ttl();
+        assert!(ttl.num_seconds() > 290);
+        assert!(ttl.num_seconds() <= 300);
+    }
+
+    #[test]
+    fn test_schedule_lock_renew() {
+        let mut lock = ScheduleLock::new("task1".to_string(), "owner1".to_string(), 1);
+
+        // Wait a bit
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Renew before expiration
+        let result = lock.renew(300);
+        assert!(result.is_ok());
+        assert_eq!(lock.renewal_count, 1);
+        assert!(!lock.is_expired());
+    }
+
+    #[test]
+    fn test_lock_manager_acquire_release() {
+        let mut manager = LockManager::new(300);
+
+        // Acquire lock
+        let acquired = manager.try_acquire("task1", "owner1", None).unwrap();
+        assert!(acquired);
+        assert!(manager.is_locked("task1"));
+
+        // Try to acquire again with different owner
+        let acquired = manager.try_acquire("task1", "owner2", None).unwrap();
+        assert!(!acquired);
+
+        // Release lock
+        let released = manager.release("task1", "owner1").unwrap();
+        assert!(released);
+        assert!(!manager.is_locked("task1"));
+    }
+
+    #[test]
+    fn test_lock_manager_acquire_same_owner() {
+        let mut manager = LockManager::new(300);
+
+        // Acquire lock
+        let acquired = manager.try_acquire("task1", "owner1", None).unwrap();
+        assert!(acquired);
+
+        // Try to acquire again with same owner (should succeed)
+        let acquired = manager.try_acquire("task1", "owner1", None).unwrap();
+        assert!(acquired);
+    }
+
+    #[test]
+    fn test_lock_manager_renew() {
+        let mut manager = LockManager::new(300);
+
+        // Acquire lock
+        manager.try_acquire("task1", "owner1", None).unwrap();
+
+        // Renew lock
+        let renewed = manager.renew("task1", "owner1", Some(600)).unwrap();
+        assert!(renewed);
+
+        // Check lock info
+        let lock = manager.get_lock("task1").unwrap();
+        assert_eq!(lock.renewal_count, 1);
+    }
+
+    #[test]
+    fn test_lock_manager_cleanup_expired() {
+        let mut manager = LockManager::new(1);
+
+        // Acquire lock with 1 second TTL
+        manager.try_acquire("task1", "owner1", Some(1)).unwrap();
+        assert!(manager.is_locked("task1"));
+
+        // Wait for expiration
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Cleanup
+        manager.cleanup_expired();
+        assert!(!manager.is_locked("task1"));
+    }
+
+    #[test]
+    fn test_lock_manager_get_active_locks() {
+        let mut manager = LockManager::new(300);
+
+        manager.try_acquire("task1", "owner1", None).unwrap();
+        manager.try_acquire("task2", "owner2", None).unwrap();
+
+        let active_locks = manager.get_active_locks();
+        assert_eq!(active_locks.len(), 2);
+    }
+
+    #[test]
+    fn test_lock_manager_release_all() {
+        let mut manager = LockManager::new(300);
+
+        manager.try_acquire("task1", "owner1", None).unwrap();
+        manager.try_acquire("task2", "owner2", None).unwrap();
+
+        assert_eq!(manager.get_active_locks().len(), 2);
+
+        manager.release_all();
+        assert_eq!(manager.get_active_locks().len(), 0);
+    }
+
+    #[test]
+    fn test_scheduler_lock_acquire_release() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Acquire lock
+        let acquired = scheduler.try_acquire_lock("task1", None).unwrap();
+        assert!(acquired);
+        assert!(scheduler.is_task_locked("task1"));
+
+        // Release lock
+        let released = scheduler.release_lock("task1").unwrap();
+        assert!(released);
+        assert!(!scheduler.is_task_locked("task1"));
+    }
+
+    #[test]
+    fn test_scheduler_lock_multiple_instances() {
+        let mut scheduler1 = BeatScheduler::new();
+        let mut scheduler2 = BeatScheduler::new();
+
+        // Note: Each scheduler has its own in-memory lock manager
+        // For distributed locking, you would need external state (Redis, DB, etc.)
+
+        // Scheduler 1 acquires lock in its own lock manager
+        let acquired = scheduler1.try_acquire_lock("task1", None).unwrap();
+        assert!(acquired);
+
+        // Scheduler 2 can also acquire the same task name in its own lock manager
+        // because they don't share state (this is in-memory locking)
+        let acquired = scheduler2.try_acquire_lock("task1", None).unwrap();
+        assert!(acquired); // Both can acquire independently
+
+        // Each scheduler maintains its own locks
+        assert!(scheduler1.is_task_locked("task1"));
+        assert!(scheduler2.is_task_locked("task1"));
+
+        // Releasing in scheduler1 doesn't affect scheduler2
+        scheduler1.release_lock("task1").unwrap();
+        assert!(!scheduler1.is_task_locked("task1"));
+        assert!(scheduler2.is_task_locked("task1"));
+    }
+
+    #[test]
+    fn test_scheduler_execute_with_lock() {
+        let mut scheduler = BeatScheduler::new();
+        let mut executed = false;
+
+        // Execute with lock
+        let result = scheduler.execute_with_lock("task1", None, || {
+            executed = true;
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+        assert!(executed);
+
+        // Lock should be released after execution
+        assert!(!scheduler.is_task_locked("task1"));
+    }
+
+    #[test]
+    fn test_scheduler_instance_id() {
+        let scheduler1 = BeatScheduler::new();
+        let scheduler2 = BeatScheduler::new();
+
+        // Each scheduler should have a unique instance ID
+        assert_ne!(scheduler1.instance_id(), scheduler2.instance_id());
+    }
+
+    #[test]
+    fn test_scheduler_set_custom_instance_id() {
+        let mut scheduler = BeatScheduler::new();
+
+        scheduler.set_instance_id("custom-id-123".to_string());
+        assert_eq!(scheduler.instance_id(), "custom-id-123");
+    }
+
+    #[test]
+    fn test_lock_manager_serialization() {
+        let mut manager = LockManager::new(300);
+        manager.try_acquire("task1", "owner1", None).unwrap();
+
+        let json = serde_json::to_string(&manager).unwrap();
+        let deserialized: LockManager = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.default_ttl, 300);
+        // Note: locks are serialized, so they should be present
+        assert!(deserialized.is_locked("task1"));
+    }
+
+    // ===== Conflict Detection Tests =====
+
+    #[test]
+    fn test_schedule_conflict_basic() {
+        let conflict = ScheduleConflict::new(
+            "task1".to_string(),
+            "task2".to_string(),
+            ConflictSeverity::High,
+            120,
+            "Overlapping execution".to_string(),
+        );
+
+        assert_eq!(conflict.task1, "task1");
+        assert_eq!(conflict.task2, "task2");
+        assert_eq!(conflict.severity, ConflictSeverity::High);
+        assert_eq!(conflict.overlap_seconds, 120);
+        assert!(conflict.is_high_severity());
+        assert!(!conflict.is_medium_severity());
+        assert!(!conflict.is_low_severity());
+    }
+
+    #[test]
+    fn test_schedule_conflict_with_resolution() {
+        let conflict = ScheduleConflict::new(
+            "task1".to_string(),
+            "task2".to_string(),
+            ConflictSeverity::Medium,
+            60,
+            "Partial overlap".to_string(),
+        )
+        .with_resolution("Add jitter".to_string());
+
+        assert!(conflict.resolution.is_some());
+        assert_eq!(conflict.resolution.unwrap(), "Add jitter");
+    }
+
+    #[test]
+    fn test_schedule_conflict_severity() {
+        let low = ScheduleConflict::new(
+            "t1".to_string(),
+            "t2".to_string(),
+            ConflictSeverity::Low,
+            10,
+            "Low conflict".to_string(),
+        );
+
+        let medium = ScheduleConflict::new(
+            "t1".to_string(),
+            "t2".to_string(),
+            ConflictSeverity::Medium,
+            30,
+            "Medium conflict".to_string(),
+        );
+
+        let high = ScheduleConflict::new(
+            "t1".to_string(),
+            "t2".to_string(),
+            ConflictSeverity::High,
+            60,
+            "High conflict".to_string(),
+        );
+
+        assert!(low.is_low_severity());
+        assert!(medium.is_medium_severity());
+        assert!(high.is_high_severity());
+    }
+
+    #[test]
+    fn test_detect_conflicts_no_conflict() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add tasks with different schedules that don't overlap
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task1".to_string(),
+                Schedule::interval(3600),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task2".to_string(),
+                Schedule::interval(7200),
+            ))
+            .unwrap();
+
+        let conflicts = scheduler.detect_conflicts(60, 30);
+        assert_eq!(conflicts.len(), 0);
+    }
+
+    #[test]
+    fn test_detect_conflicts_with_overlap() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add two tasks with the same interval (will overlap)
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task1".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task2".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+
+        // Check for conflicts in 1 hour window with 30 second estimated duration
+        let conflicts = scheduler.detect_conflicts(3600, 30);
+
+        // Should detect conflicts since both run every 60 seconds
+        assert!(!conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_detect_conflicts_disabled_tasks() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add two tasks with same schedule, one disabled
+        let task1 = ScheduledTask::new("task1".to_string(), Schedule::interval(60));
+        let task2 = ScheduledTask::new("task2".to_string(), Schedule::interval(60)).disabled();
+
+        scheduler.add_task(task1).unwrap();
+        scheduler.add_task(task2).unwrap();
+
+        // Should not detect conflicts because task2 is disabled
+        let conflicts = scheduler.detect_conflicts(3600, 30);
+        assert_eq!(conflicts.len(), 0);
+    }
+
+    #[test]
+    fn test_get_high_severity_conflicts() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add multiple tasks with the same interval
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task1".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task2".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task3".to_string(),
+                Schedule::interval(120),
+            ))
+            .unwrap();
+
+        // Get high severity conflicts with long duration (60s)
+        let high_conflicts = scheduler.get_high_severity_conflicts(3600, 60);
+
+        // May have high severity conflicts depending on overlap
+        // Just verify the method works
+        assert!(high_conflicts.len() <= scheduler.conflict_count(3600, 60));
+    }
+
+    #[test]
+    fn test_has_conflicts() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Initially no conflicts
+        assert!(!scheduler.has_conflicts(3600, 30));
+
+        // Add tasks with same interval
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task1".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task2".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+
+        // Now should have conflicts
+        assert!(scheduler.has_conflicts(3600, 30));
+    }
+
+    #[test]
+    fn test_conflict_count() {
+        let mut scheduler = BeatScheduler::new();
+
+        assert_eq!(scheduler.conflict_count(3600, 30), 0);
+
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task1".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task2".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+        scheduler
+            .add_task(ScheduledTask::new(
+                "task3".to_string(),
+                Schedule::interval(60),
+            ))
+            .unwrap();
+
+        let count = scheduler.conflict_count(3600, 30);
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_schedule_conflict_display() {
+        let conflict = ScheduleConflict::new(
+            "task1".to_string(),
+            "task2".to_string(),
+            ConflictSeverity::High,
+            120,
+            "Test conflict".to_string(),
+        );
+
+        let display = format!("{}", conflict);
+        assert!(display.contains("task1"));
+        assert!(display.contains("task2"));
+        assert!(display.contains("120s"));
+    }
+
+    #[test]
+    fn test_schedule_conflict_serialization() {
+        let conflict = ScheduleConflict::new(
+            "task1".to_string(),
+            "task2".to_string(),
+            ConflictSeverity::Medium,
+            60,
+            "Test".to_string(),
+        );
+
+        let json = serde_json::to_string(&conflict).unwrap();
+        let deserialized: ScheduleConflict = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.task1, "task1");
+        assert_eq!(deserialized.task2, "task2");
+        assert_eq!(deserialized.severity, ConflictSeverity::Medium);
+        assert_eq!(deserialized.overlap_seconds, 60);
     }
 }

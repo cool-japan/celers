@@ -73,30 +73,35 @@ impl CallbackSignature {
     }
 
     /// Set task ID
+    #[must_use]
     pub fn with_task_id(mut self, task_id: Uuid) -> Self {
         self.task_id = Some(task_id);
         self
     }
 
     /// Set positional arguments
+    #[must_use]
     pub fn with_args(mut self, args: Vec<Value>) -> Self {
         self.args = args;
         self
     }
 
     /// Add a keyword argument
+    #[must_use]
     pub fn with_kwarg(mut self, key: impl Into<String>, value: Value) -> Self {
         self.kwargs.insert(key.into(), value);
         self
     }
 
     /// Set as immutable
+    #[must_use]
     pub fn immutable(mut self) -> Self {
         self.immutable = true;
         self
     }
 
     /// Add an option
+    #[must_use]
     pub fn with_option(mut self, key: impl Into<String>, value: Value) -> Self {
         self.options.insert(key.into(), value);
         self
@@ -146,42 +151,49 @@ impl EmbedOptions {
     }
 
     /// Add a success callback (link)
+    #[must_use]
     pub fn with_callback(mut self, callback: CallbackSignature) -> Self {
         self.callbacks.push(callback);
         self
     }
 
     /// Add an error callback (errback)
+    #[must_use]
     pub fn with_errback(mut self, errback: CallbackSignature) -> Self {
         self.errbacks.push(errback);
         self
     }
 
     /// Add a chain task
+    #[must_use]
     pub fn with_chain_task(mut self, task: CallbackSignature) -> Self {
         self.chain.push(task);
         self
     }
 
     /// Set the chord callback
+    #[must_use]
     pub fn with_chord(mut self, chord: CallbackSignature) -> Self {
         self.chord = Some(chord);
         self
     }
 
     /// Set the group ID
+    #[must_use]
     pub fn with_group(mut self, group: Uuid) -> Self {
         self.group = Some(group);
         self
     }
 
     /// Set the parent task ID
+    #[must_use]
     pub fn with_parent(mut self, parent_id: Uuid) -> Self {
         self.parent_id = Some(parent_id);
         self
     }
 
     /// Set the root task ID
+    #[must_use]
     pub fn with_root(mut self, root_id: Uuid) -> Self {
         self.root_id = Some(root_id);
         self
@@ -233,42 +245,49 @@ impl EmbeddedBody {
     }
 
     /// Set positional arguments
+    #[must_use]
     pub fn with_args(mut self, args: Vec<Value>) -> Self {
         self.args = args;
         self
     }
 
     /// Add a positional argument
+    #[must_use]
     pub fn with_arg(mut self, arg: Value) -> Self {
         self.args.push(arg);
         self
     }
 
     /// Set keyword arguments
+    #[must_use]
     pub fn with_kwargs(mut self, kwargs: HashMap<String, Value>) -> Self {
         self.kwargs = kwargs;
         self
     }
 
     /// Add a keyword argument
+    #[must_use]
     pub fn with_kwarg(mut self, key: impl Into<String>, value: Value) -> Self {
         self.kwargs.insert(key.into(), value);
         self
     }
 
     /// Set embed options
+    #[must_use]
     pub fn with_embed(mut self, embed: EmbedOptions) -> Self {
         self.embed = embed;
         self
     }
 
     /// Add a success callback
+    #[must_use]
     pub fn with_callback(mut self, callback: CallbackSignature) -> Self {
         self.embed.callbacks.push(callback);
         self
     }
 
     /// Add an error callback
+    #[must_use]
     pub fn with_errback(mut self, errback: CallbackSignature) -> Self {
         self.embed.errbacks.push(errback);
         self

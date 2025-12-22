@@ -24,6 +24,14 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 crc32fast = "1.4"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tracing-subscriber = { workspace = true }
+
 [features]
 default = []
 metrics = ["celers-metrics"]
+
+[[bench]]
+name = "redis_broker_benchmarks"
+harness = false

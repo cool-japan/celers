@@ -371,7 +371,7 @@ mod tests {
         // Wait for refill (1 second should add 5 tokens)
         sleep(Duration::from_secs(1)).await;
         let tokens = bucket.current_tokens();
-        assert!(tokens >= 4.0 && tokens <= 6.0); // Allow some timing variance
+        assert!((4.0..=6.0).contains(&tokens)); // Allow some timing variance
     }
 
     #[tokio::test]

@@ -423,36 +423,56 @@ mod tests {
 
     #[test]
     fn test_prefetch_config_validation() {
-        let mut config = PrefetchConfig::default();
-
         // Invalid: prefetch_count = 0
-        config.prefetch_count = 0;
+        let config = PrefetchConfig {
+            prefetch_count: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
-        config.prefetch_count = 5;
-        config.adaptive = true;
-
         // Invalid: min_buffer_size = 0
-        config.min_buffer_size = 0;
+        let config = PrefetchConfig {
+            prefetch_count: 5,
+            adaptive: true,
+            min_buffer_size: 0,
+            max_buffer_size: 10,
+        };
         assert!(config.validate().is_err());
 
         // Invalid: max < min
-        config.min_buffer_size = 10;
-        config.max_buffer_size = 5;
+        let config = PrefetchConfig {
+            prefetch_count: 5,
+            adaptive: true,
+            min_buffer_size: 10,
+            max_buffer_size: 5,
+        };
         assert!(config.validate().is_err());
 
         // Invalid: prefetch_count < min
-        config.min_buffer_size = 2;
-        config.max_buffer_size = 20;
-        config.prefetch_count = 1;
+        let config = PrefetchConfig {
+            prefetch_count: 1,
+            adaptive: true,
+            min_buffer_size: 2,
+            max_buffer_size: 20,
+        };
         assert!(config.validate().is_err());
 
         // Invalid: prefetch_count > max
-        config.prefetch_count = 25;
+        let config = PrefetchConfig {
+            prefetch_count: 25,
+            adaptive: true,
+            min_buffer_size: 2,
+            max_buffer_size: 20,
+        };
         assert!(config.validate().is_err());
 
         // Valid
-        config.prefetch_count = 10;
+        let config = PrefetchConfig {
+            prefetch_count: 10,
+            adaptive: true,
+            min_buffer_size: 2,
+            max_buffer_size: 20,
+        };
         assert!(config.validate().is_ok());
     }
 

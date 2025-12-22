@@ -31,3 +31,8 @@ celers-protocol = { path = "../celers-protocol" }
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["full"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "backend_bench"
+harness = false

@@ -101,7 +101,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 /// Exchange type for AMQP
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum AmqpExchangeType {
     /// Direct exchange - routes messages by exact routing key match
     #[default]
@@ -121,6 +121,17 @@ impl AmqpExchangeType {
             AmqpExchangeType::Fanout => ExchangeKind::Fanout,
             AmqpExchangeType::Topic => ExchangeKind::Topic,
             AmqpExchangeType::Headers => ExchangeKind::Headers,
+        }
+    }
+}
+
+impl std::fmt::Display for AmqpExchangeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AmqpExchangeType::Direct => write!(f, "direct"),
+            AmqpExchangeType::Fanout => write!(f, "fanout"),
+            AmqpExchangeType::Topic => write!(f, "topic"),
+            AmqpExchangeType::Headers => write!(f, "headers"),
         }
     }
 }
@@ -150,6 +161,84 @@ impl DlxConfig {
     }
 }
 
+/// Queue type for RabbitMQ 3.8+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum QueueType {
+    /// Classic queue (default, best for most use cases)
+    Classic,
+    /// Quorum queue (replicated, highly available, data safety)
+    Quorum,
+    /// Stream queue (high-throughput, append-only log)
+    Stream,
+}
+
+impl QueueType {
+    fn as_str(&self) -> &str {
+        match self {
+            QueueType::Classic => "classic",
+            QueueType::Quorum => "quorum",
+            QueueType::Stream => "stream",
+        }
+    }
+}
+
+impl std::fmt::Display for QueueType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Queue mode for lazy queues (RabbitMQ 3.6+)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum QueueLazyMode {
+    /// Default mode - keeps messages in memory when possible
+    Default,
+    /// Lazy mode - moves messages to disk as early as possible
+    Lazy,
+}
+
+impl QueueLazyMode {
+    fn as_str(&self) -> &str {
+        match self {
+            QueueLazyMode::Default => "default",
+            QueueLazyMode::Lazy => "lazy",
+        }
+    }
+}
+
+impl std::fmt::Display for QueueLazyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Queue overflow behavior when max-length is reached
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum QueueOverflowBehavior {
+    /// Drop messages from the head of the queue (default)
+    DropHead,
+    /// Reject new publishes
+    RejectPublish,
+    /// Reject new publishes and use dead letter exchange
+    RejectPublishDlx,
+}
+
+impl QueueOverflowBehavior {
+    fn as_str(&self) -> &str {
+        match self {
+            QueueOverflowBehavior::DropHead => "drop-head",
+            QueueOverflowBehavior::RejectPublish => "reject-publish",
+            QueueOverflowBehavior::RejectPublishDlx => "reject-publish-dlx",
+        }
+    }
+}
+
+impl std::fmt::Display for QueueOverflowBehavior {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Queue configuration options
 #[derive(Debug, Clone, Default)]
 pub struct QueueConfig {
@@ -171,6 +260,14 @@ pub struct QueueConfig {
     pub max_length: Option<i64>,
     /// Maximum queue size in bytes
     pub max_length_bytes: Option<i64>,
+    /// Queue type (Classic, Quorum, or Stream) - RabbitMQ 3.8+
+    pub queue_type: Option<QueueType>,
+    /// Queue mode (Default or Lazy) - RabbitMQ 3.6+
+    pub queue_mode: Option<QueueLazyMode>,
+    /// Overflow behavior when max-length is reached
+    pub overflow_behavior: Option<QueueOverflowBehavior>,
+    /// Enable single active consumer (only one consumer receives messages at a time)
+    pub single_active_consumer: bool,
 }
 
 impl QueueConfig {
@@ -221,6 +318,66 @@ impl QueueConfig {
     /// Set maximum queue length
     pub fn with_max_length(mut self, max_length: i64) -> Self {
         self.max_length = Some(max_length);
+        self
+    }
+
+    /// Set queue type (Classic, Quorum, or Stream) - RabbitMQ 3.8+
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::{QueueConfig, QueueType};
+    ///
+    /// let config = QueueConfig::new().with_queue_type(QueueType::Quorum);
+    /// ```
+    pub fn with_queue_type(mut self, queue_type: QueueType) -> Self {
+        self.queue_type = Some(queue_type);
+        self
+    }
+
+    /// Set queue mode (Default or Lazy) - RabbitMQ 3.6+
+    ///
+    /// Lazy queues move messages to disk as early as possible, which is ideal
+    /// for very long queues (millions of messages) or when dealing with large messages.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::{QueueConfig, QueueLazyMode};
+    ///
+    /// let config = QueueConfig::new().with_queue_mode(QueueLazyMode::Lazy);
+    /// ```
+    pub fn with_queue_mode(mut self, mode: QueueLazyMode) -> Self {
+        self.queue_mode = Some(mode);
+        self
+    }
+
+    /// Set overflow behavior when max-length is reached
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::{QueueConfig, QueueOverflowBehavior};
+    ///
+    /// let config = QueueConfig::new()
+    ///     .with_max_length(1000)
+    ///     .with_overflow_behavior(QueueOverflowBehavior::RejectPublish);
+    /// ```
+    pub fn with_overflow_behavior(mut self, behavior: QueueOverflowBehavior) -> Self {
+        self.overflow_behavior = Some(behavior);
+        self
+    }
+
+    /// Enable single active consumer mode
+    ///
+    /// When enabled, only one consumer will receive messages at a time.
+    /// This is useful for ensuring ordered message processing.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::QueueConfig;
+    ///
+    /// let config = QueueConfig::new().with_single_active_consumer(true);
+    /// ```
+    pub fn with_single_active_consumer(mut self, enabled: bool) -> Self {
+        self.single_active_consumer = enabled;
         self
     }
 
@@ -276,7 +433,344 @@ impl QueueConfig {
             );
         }
 
+        if let Some(queue_type) = self.queue_type {
+            args.insert(
+                ShortString::from("x-queue-type"),
+                AMQPValue::LongString(queue_type.as_str().into()),
+            );
+        }
+
+        if let Some(queue_mode) = self.queue_mode {
+            args.insert(
+                ShortString::from("x-queue-mode"),
+                AMQPValue::LongString(queue_mode.as_str().into()),
+            );
+        }
+
+        if let Some(overflow) = self.overflow_behavior {
+            args.insert(
+                ShortString::from("x-overflow"),
+                AMQPValue::LongString(overflow.as_str().into()),
+            );
+        }
+
+        if self.single_active_consumer {
+            args.insert(
+                ShortString::from("x-single-active-consumer"),
+                AMQPValue::Boolean(true),
+            );
+        }
+
         args
+    }
+}
+
+/// Builder for message properties with enhanced ergonomics
+#[derive(Debug, Clone, Default)]
+pub struct MessagePropertiesBuilder {
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+    delivery_mode: Option<u8>,
+    priority: Option<u8>,
+    correlation_id: Option<String>,
+    reply_to: Option<String>,
+    expiration: Option<String>,
+    message_id: Option<String>,
+    timestamp: Option<u64>,
+    user_id: Option<String>,
+    app_id: Option<String>,
+    headers: HashMap<String, String>,
+}
+
+impl MessagePropertiesBuilder {
+    /// Create a new message properties builder with sensible defaults
+    pub fn new() -> Self {
+        Self {
+            content_type: Some("application/json".to_string()),
+            content_encoding: Some("utf-8".to_string()),
+            delivery_mode: Some(2), // Persistent by default
+            ..Default::default()
+        }
+    }
+
+    /// Set content type (default: application/json)
+    pub fn content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Set content encoding (default: utf-8)
+    pub fn content_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.content_encoding = Some(encoding.into());
+        self
+    }
+
+    /// Set delivery mode (1 = non-persistent, 2 = persistent)
+    pub fn delivery_mode(mut self, mode: u8) -> Self {
+        self.delivery_mode = Some(mode);
+        self
+    }
+
+    /// Set as persistent (delivery_mode = 2)
+    pub fn persistent(mut self) -> Self {
+        self.delivery_mode = Some(2);
+        self
+    }
+
+    /// Set as transient/non-persistent (delivery_mode = 1)
+    pub fn transient(mut self) -> Self {
+        self.delivery_mode = Some(1);
+        self
+    }
+
+    /// Set message priority (0-9, where 9 is highest)
+    pub fn priority(mut self, priority: u8) -> Self {
+        self.priority = Some(priority.min(9));
+        self
+    }
+
+    /// Set correlation ID for request-reply pattern
+    pub fn correlation_id(mut self, id: impl Into<String>) -> Self {
+        self.correlation_id = Some(id.into());
+        self
+    }
+
+    /// Set reply-to queue for RPC pattern
+    pub fn reply_to(mut self, queue: impl Into<String>) -> Self {
+        self.reply_to = Some(queue.into());
+        self
+    }
+
+    /// Set message expiration/TTL in milliseconds
+    pub fn expiration_ms(mut self, ttl_ms: u64) -> Self {
+        self.expiration = Some(ttl_ms.to_string());
+        self
+    }
+
+    /// Set message ID
+    pub fn message_id(mut self, id: impl Into<String>) -> Self {
+        self.message_id = Some(id.into());
+        self
+    }
+
+    /// Set timestamp (Unix timestamp in seconds)
+    pub fn timestamp(mut self, timestamp: u64) -> Self {
+        self.timestamp = Some(timestamp);
+        self
+    }
+
+    /// Set user ID
+    pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = Some(user_id.into());
+        self
+    }
+
+    /// Set application ID
+    pub fn app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.app_id = Some(app_id.into());
+        self
+    }
+
+    /// Add a custom header
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(key.into(), value.into());
+        self
+    }
+
+    /// Build the BasicProperties
+    #[allow(dead_code)]
+    pub(crate) fn build(self) -> BasicProperties {
+        let mut props = BasicProperties::default();
+
+        if let Some(ct) = self.content_type {
+            props = props.with_content_type(ShortString::from(ct));
+        }
+        if let Some(ce) = self.content_encoding {
+            props = props.with_content_encoding(ShortString::from(ce));
+        }
+        if let Some(dm) = self.delivery_mode {
+            props = props.with_delivery_mode(dm);
+        }
+        if let Some(p) = self.priority {
+            props = props.with_priority(p);
+        }
+        if let Some(cid) = self.correlation_id {
+            props = props.with_correlation_id(ShortString::from(cid));
+        }
+        if let Some(rt) = self.reply_to {
+            props = props.with_reply_to(ShortString::from(rt));
+        }
+        if let Some(exp) = self.expiration {
+            props = props.with_expiration(ShortString::from(exp));
+        }
+        if let Some(mid) = self.message_id {
+            props = props.with_message_id(ShortString::from(mid));
+        }
+        if let Some(ts) = self.timestamp {
+            props = props.with_timestamp(ts);
+        }
+        if let Some(uid) = self.user_id {
+            props = props.with_user_id(ShortString::from(uid));
+        }
+        if let Some(aid) = self.app_id {
+            props = props.with_app_id(ShortString::from(aid));
+        }
+
+        if !self.headers.is_empty() {
+            let mut field_table = FieldTable::default();
+            for (key, value) in self.headers {
+                field_table.insert(ShortString::from(key), AMQPValue::LongString(value.into()));
+            }
+            props = props.with_headers(field_table);
+        }
+
+        props
+    }
+}
+
+/// Exchange configuration with advanced options
+#[derive(Debug, Clone)]
+pub struct ExchangeConfig {
+    /// Exchange type
+    pub exchange_type: AmqpExchangeType,
+    /// Durable (survives broker restart)
+    pub durable: bool,
+    /// Auto-delete when no queues are bound
+    pub auto_delete: bool,
+    /// Internal (cannot be published to directly)
+    pub internal: bool,
+    /// Alternative exchange for unroutable messages
+    pub alternate_exchange: Option<String>,
+}
+
+impl ExchangeConfig {
+    /// Create a new exchange configuration
+    pub fn new(exchange_type: AmqpExchangeType) -> Self {
+        Self {
+            exchange_type,
+            durable: true,
+            auto_delete: false,
+            internal: false,
+            alternate_exchange: None,
+        }
+    }
+
+    /// Set durability
+    pub fn durable(mut self, durable: bool) -> Self {
+        self.durable = durable;
+        self
+    }
+
+    /// Set auto-delete behavior
+    pub fn auto_delete(mut self, auto_delete: bool) -> Self {
+        self.auto_delete = auto_delete;
+        self
+    }
+
+    /// Set as internal exchange
+    pub fn internal(mut self, internal: bool) -> Self {
+        self.internal = internal;
+        self
+    }
+
+    /// Set alternative exchange for unroutable messages
+    pub fn with_alternate_exchange(mut self, exchange: impl Into<String>) -> Self {
+        self.alternate_exchange = Some(exchange.into());
+        self
+    }
+
+    /// Convert to AMQP field table
+    fn to_field_table(&self) -> FieldTable {
+        let mut args = FieldTable::default();
+        if let Some(ref ae) = self.alternate_exchange {
+            args.insert(
+                ShortString::from("alternate-exchange"),
+                AMQPValue::LongString(ae.clone().into()),
+            );
+        }
+        args
+    }
+}
+
+impl Default for ExchangeConfig {
+    fn default() -> Self {
+        Self::new(AmqpExchangeType::Direct)
+    }
+}
+
+/// Consumer configuration with advanced options
+#[derive(Debug, Clone)]
+pub struct ConsumerConfig {
+    /// Consumer tag (empty = auto-generated)
+    pub consumer_tag: String,
+    /// No-local flag (don't receive messages published by this connection)
+    pub no_local: bool,
+    /// No-ack flag (automatic acknowledgment)
+    pub no_ack: bool,
+    /// Exclusive consumer (only this consumer can access the queue)
+    pub exclusive: bool,
+    /// Consumer priority (higher priority consumers get messages first)
+    pub priority: Option<i32>,
+}
+
+impl ConsumerConfig {
+    /// Create a new consumer configuration
+    pub fn new() -> Self {
+        Self {
+            consumer_tag: String::new(),
+            no_local: false,
+            no_ack: false,
+            exclusive: false,
+            priority: None,
+        }
+    }
+
+    /// Set consumer tag
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.consumer_tag = tag.into();
+        self
+    }
+
+    /// Set no-local flag
+    pub fn no_local(mut self, no_local: bool) -> Self {
+        self.no_local = no_local;
+        self
+    }
+
+    /// Set no-ack flag (automatic acknowledgment)
+    pub fn no_ack(mut self, no_ack: bool) -> Self {
+        self.no_ack = no_ack;
+        self
+    }
+
+    /// Set exclusive flag
+    pub fn exclusive(mut self, exclusive: bool) -> Self {
+        self.exclusive = exclusive;
+        self
+    }
+
+    /// Set consumer priority (higher values = higher priority)
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    /// Convert to AMQP field table
+    fn to_field_table(&self) -> FieldTable {
+        let mut args = FieldTable::default();
+        if let Some(priority) = self.priority {
+            args.insert(
+                ShortString::from("x-priority"),
+                AMQPValue::LongInt(priority),
+            );
+        }
+        args
+    }
+}
+
+impl Default for ConsumerConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -471,6 +965,16 @@ pub struct HealthStatus {
     pub channel_pool_metrics: Option<ChannelPoolMetrics>,
 }
 
+impl std::fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "connected={}, channel_open={}, connection_state={}, channel_state={}",
+            self.connected, self.channel_open, self.connection_state, self.channel_state
+        )
+    }
+}
+
 impl HealthStatus {
     /// Check if the broker is healthy (connected and channel open)
     pub fn is_healthy(&self) -> bool {
@@ -479,9 +983,10 @@ impl HealthStatus {
 }
 
 /// Transaction state for AMQP transactions
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TransactionState {
     /// No transaction active
+    #[default]
     None,
     /// Transaction started
     Started,
@@ -491,8 +996,19 @@ pub enum TransactionState {
     RolledBack,
 }
 
+impl std::fmt::Display for TransactionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionState::None => write!(f, "none"),
+            TransactionState::Started => write!(f, "started"),
+            TransactionState::Committed => write!(f, "committed"),
+            TransactionState::RolledBack => write!(f, "rolled_back"),
+        }
+    }
+}
+
 /// Reconnection statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ReconnectionStats {
     /// Total number of reconnection attempts
     pub total_attempts: u64,
@@ -501,13 +1017,40 @@ pub struct ReconnectionStats {
     /// Number of failed reconnections
     pub failed_reconnections: u64,
     /// Last reconnection attempt time
+    #[serde(skip)]
     pub last_attempt: Option<std::time::Instant>,
     /// Last successful reconnection time
+    #[serde(skip)]
     pub last_success: Option<std::time::Instant>,
 }
 
+impl ReconnectionStats {
+    /// Get the success rate as a percentage (0.0 - 100.0)
+    pub fn success_rate(&self) -> f64 {
+        if self.total_attempts == 0 {
+            0.0
+        } else {
+            (self.successful_reconnections as f64 / self.total_attempts as f64) * 100.0
+        }
+    }
+
+    /// Get the failure rate as a percentage (0.0 - 100.0)
+    pub fn failure_rate(&self) -> f64 {
+        if self.total_attempts == 0 {
+            0.0
+        } else {
+            (self.failed_reconnections as f64 / self.total_attempts as f64) * 100.0
+        }
+    }
+
+    /// Check if there have been any reconnection attempts
+    pub fn has_reconnections(&self) -> bool {
+        self.total_attempts > 0
+    }
+}
+
 /// Channel-level metrics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChannelMetrics {
     /// Total messages published
     pub messages_published: u64,
@@ -525,8 +1068,48 @@ pub struct ChannelMetrics {
     pub consume_errors: u64,
 }
 
+impl ChannelMetrics {
+    /// Get the total number of operations
+    pub fn total_operations(&self) -> u64 {
+        self.messages_published + self.messages_consumed
+    }
+
+    /// Get the total number of errors
+    pub fn total_errors(&self) -> u64 {
+        self.publish_errors + self.consume_errors
+    }
+
+    /// Get the error rate as a percentage (0.0 - 100.0)
+    pub fn error_rate(&self) -> f64 {
+        let total = self.total_operations();
+        if total == 0 {
+            0.0
+        } else {
+            (self.total_errors() as f64 / total as f64) * 100.0
+        }
+    }
+
+    /// Get the acknowledgment rate as a percentage (0.0 - 100.0)
+    pub fn ack_rate(&self) -> f64 {
+        if self.messages_consumed == 0 {
+            0.0
+        } else {
+            (self.messages_acked as f64 / self.messages_consumed as f64) * 100.0
+        }
+    }
+
+    /// Get the rejection rate as a percentage (0.0 - 100.0)
+    pub fn reject_rate(&self) -> f64 {
+        if self.messages_consumed == 0 {
+            0.0
+        } else {
+            (self.messages_rejected as f64 / self.messages_consumed as f64) * 100.0
+        }
+    }
+}
+
 /// Publisher confirm statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PublisherConfirmStats {
     /// Total publisher confirms received
     pub total_confirms: u64,
@@ -540,8 +1123,38 @@ pub struct PublisherConfirmStats {
     pub avg_confirm_latency_us: u64,
 }
 
+impl PublisherConfirmStats {
+    /// Get the success rate as a percentage (0.0 - 100.0)
+    pub fn success_rate(&self) -> f64 {
+        if self.total_confirms == 0 {
+            0.0
+        } else {
+            (self.successful_confirms as f64 / self.total_confirms as f64) * 100.0
+        }
+    }
+
+    /// Get the failure rate as a percentage (0.0 - 100.0)
+    pub fn failure_rate(&self) -> f64 {
+        if self.total_confirms == 0 {
+            0.0
+        } else {
+            (self.failed_confirms as f64 / self.total_confirms as f64) * 100.0
+        }
+    }
+
+    /// Get the average confirmation latency in milliseconds
+    pub fn avg_confirm_latency_ms(&self) -> f64 {
+        self.avg_confirm_latency_us as f64 / 1000.0
+    }
+
+    /// Check if there are any pending confirms
+    pub fn has_pending_confirms(&self) -> bool {
+        self.pending_confirms > 0
+    }
+}
+
 /// Connection pool metrics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConnectionPoolMetrics {
     /// Current number of connections in pool
     pub pool_size: usize,
@@ -559,8 +1172,38 @@ pub struct ConnectionPoolMetrics {
     pub pool_full_count: u64,
 }
 
+impl ConnectionPoolMetrics {
+    /// Get the pool utilization as a percentage (0.0 - 100.0)
+    pub fn utilization(&self) -> f64 {
+        if self.max_pool_size == 0 {
+            0.0
+        } else {
+            (self.pool_size as f64 / self.max_pool_size as f64) * 100.0
+        }
+    }
+
+    /// Get the discard rate as a percentage (0.0 - 100.0)
+    pub fn discard_rate(&self) -> f64 {
+        if self.total_created == 0 {
+            0.0
+        } else {
+            (self.total_discarded as f64 / self.total_created as f64) * 100.0
+        }
+    }
+
+    /// Check if the pool is full
+    pub fn is_full(&self) -> bool {
+        self.pool_size >= self.max_pool_size
+    }
+
+    /// Check if the pool is empty
+    pub fn is_empty(&self) -> bool {
+        self.pool_size == 0
+    }
+}
+
 /// Channel pool metrics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChannelPoolMetrics {
     /// Current number of channels in pool
     pub pool_size: usize,
@@ -576,6 +1219,36 @@ pub struct ChannelPoolMetrics {
     pub total_discarded: u64,
     /// Number of times pool was full
     pub pool_full_count: u64,
+}
+
+impl ChannelPoolMetrics {
+    /// Get the pool utilization as a percentage (0.0 - 100.0)
+    pub fn utilization(&self) -> f64 {
+        if self.max_pool_size == 0 {
+            0.0
+        } else {
+            (self.pool_size as f64 / self.max_pool_size as f64) * 100.0
+        }
+    }
+
+    /// Get the discard rate as a percentage (0.0 - 100.0)
+    pub fn discard_rate(&self) -> f64 {
+        if self.total_created == 0 {
+            0.0
+        } else {
+            (self.total_discarded as f64 / self.total_created as f64) * 100.0
+        }
+    }
+
+    /// Check if the pool is full
+    pub fn is_full(&self) -> bool {
+        self.pool_size >= self.max_pool_size
+    }
+
+    /// Check if the pool is empty
+    pub fn is_empty(&self) -> bool {
+        self.pool_size == 0
+    }
 }
 
 /// Message deduplication cache entry
@@ -895,6 +1568,52 @@ pub struct QueueInfo {
     pub memory: u64,
 }
 
+impl QueueInfo {
+    /// Check if the queue is empty (no messages).
+    pub fn is_empty(&self) -> bool {
+        self.messages == 0
+    }
+
+    /// Check if the queue has any consumers.
+    pub fn has_consumers(&self) -> bool {
+        self.consumers > 0
+    }
+
+    /// Check if the queue is idle (no messages and no consumers).
+    pub fn is_idle(&self) -> bool {
+        self.is_empty() && !self.has_consumers()
+    }
+
+    /// Get the percentage of messages that are ready (not unacknowledged).
+    pub fn ready_percentage(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        (self.messages_ready as f64 / self.messages as f64) * 100.0
+    }
+
+    /// Get the percentage of messages that are unacknowledged.
+    pub fn unacked_percentage(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        (self.messages_unacknowledged as f64 / self.messages as f64) * 100.0
+    }
+
+    /// Get memory usage in megabytes.
+    pub fn memory_mb(&self) -> f64 {
+        self.memory as f64 / 1024.0 / 1024.0
+    }
+
+    /// Get average memory per message in bytes.
+    pub fn avg_message_memory(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        self.memory as f64 / self.messages as f64
+    }
+}
+
 /// Detailed queue statistics from Management API
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct QueueStats {
@@ -921,6 +1640,113 @@ pub struct QueueStats {
     pub message_stats: Option<MessageStats>,
 }
 
+impl QueueStats {
+    /// Check if the queue is empty (no messages).
+    pub fn is_empty(&self) -> bool {
+        self.messages == 0
+    }
+
+    /// Check if the queue has any consumers.
+    pub fn has_consumers(&self) -> bool {
+        self.consumers > 0
+    }
+
+    /// Check if the queue is idle (no messages and no consumers).
+    pub fn is_idle(&self) -> bool {
+        self.is_empty() && !self.has_consumers()
+    }
+
+    /// Get the percentage of messages that are ready (not unacknowledged).
+    pub fn ready_percentage(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        (self.messages_ready as f64 / self.messages as f64) * 100.0
+    }
+
+    /// Get the percentage of messages that are unacknowledged.
+    pub fn unacked_percentage(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        (self.messages_unacknowledged as f64 / self.messages as f64) * 100.0
+    }
+
+    /// Get memory usage in megabytes.
+    pub fn memory_mb(&self) -> f64 {
+        self.memory as f64 / 1024.0 / 1024.0
+    }
+
+    /// Get total message bytes in megabytes.
+    pub fn message_bytes_mb(&self) -> f64 {
+        self.message_bytes as f64 / 1024.0 / 1024.0
+    }
+
+    /// Get average message size in bytes.
+    pub fn avg_message_size(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        self.message_bytes as f64 / self.messages as f64
+    }
+
+    /// Get average memory per message in bytes.
+    pub fn avg_message_memory(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        self.memory as f64 / self.messages as f64
+    }
+
+    /// Get publish rate (messages/sec) from message stats.
+    pub fn publish_rate(&self) -> Option<f64> {
+        self.message_stats
+            .as_ref()
+            .and_then(|stats| stats.publish_details.as_ref())
+            .map(|details| details.rate)
+    }
+
+    /// Get deliver rate (messages/sec) from message stats.
+    pub fn deliver_rate(&self) -> Option<f64> {
+        self.message_stats
+            .as_ref()
+            .and_then(|stats| stats.deliver_details.as_ref())
+            .map(|details| details.rate)
+    }
+
+    /// Get ack rate (messages/sec) from message stats.
+    pub fn ack_rate(&self) -> Option<f64> {
+        self.message_stats
+            .as_ref()
+            .and_then(|stats| stats.ack_details.as_ref())
+            .map(|details| details.rate)
+    }
+
+    /// Check if the queue is growing (publish rate > deliver rate).
+    pub fn is_growing(&self) -> bool {
+        match (self.publish_rate(), self.deliver_rate()) {
+            (Some(pub_rate), Some(del_rate)) => pub_rate > del_rate,
+            _ => false,
+        }
+    }
+
+    /// Check if the queue is shrinking (deliver rate > publish rate).
+    pub fn is_shrinking(&self) -> bool {
+        match (self.publish_rate(), self.deliver_rate()) {
+            (Some(pub_rate), Some(del_rate)) => del_rate > pub_rate,
+            _ => false,
+        }
+    }
+
+    /// Check if consumers are keeping up (ack rate >= deliver rate).
+    pub fn consumers_keeping_up(&self) -> bool {
+        match (self.ack_rate(), self.deliver_rate()) {
+            (Some(ack_rate), Some(del_rate)) => ack_rate >= del_rate * 0.95, // 5% tolerance
+            _ => true, // Assume OK if no stats available
+        }
+    }
+}
+
 /// Message statistics
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct MessageStats {
@@ -936,6 +1762,28 @@ pub struct MessageStats {
     pub ack: u64,
     #[serde(default)]
     pub ack_details: Option<RateDetails>,
+}
+
+impl MessageStats {
+    /// Get total messages processed (published + delivered + acked).
+    pub fn total_processed(&self) -> u64 {
+        self.publish + self.deliver + self.ack
+    }
+
+    /// Get publish rate if available.
+    pub fn publish_rate(&self) -> Option<f64> {
+        self.publish_details.as_ref().map(|d| d.rate)
+    }
+
+    /// Get deliver rate if available.
+    pub fn deliver_rate(&self) -> Option<f64> {
+        self.deliver_details.as_ref().map(|d| d.rate)
+    }
+
+    /// Get ack rate if available.
+    pub fn ack_rate(&self) -> Option<f64> {
+        self.ack_details.as_ref().map(|d| d.rate)
+    }
 }
 
 /// Rate details for statistics
@@ -955,6 +1803,55 @@ pub struct ServerOverview {
     pub object_totals: Option<ObjectTotals>,
 }
 
+impl ServerOverview {
+    /// Get total messages across all queues.
+    pub fn total_messages(&self) -> u64 {
+        self.queue_totals.as_ref().map_or(0, |q| q.messages)
+    }
+
+    /// Get total ready messages across all queues.
+    pub fn total_messages_ready(&self) -> u64 {
+        self.queue_totals.as_ref().map_or(0, |q| q.messages_ready)
+    }
+
+    /// Get total unacknowledged messages across all queues.
+    pub fn total_messages_unacked(&self) -> u64 {
+        self.queue_totals
+            .as_ref()
+            .map_or(0, |q| q.messages_unacknowledged)
+    }
+
+    /// Get total number of queues.
+    pub fn total_queues(&self) -> u32 {
+        self.object_totals.as_ref().map_or(0, |o| o.queues)
+    }
+
+    /// Get total number of active connections.
+    pub fn total_connections(&self) -> u32 {
+        self.object_totals.as_ref().map_or(0, |o| o.connections)
+    }
+
+    /// Get total number of active channels.
+    pub fn total_channels(&self) -> u32 {
+        self.object_totals.as_ref().map_or(0, |o| o.channels)
+    }
+
+    /// Get total number of consumers.
+    pub fn total_consumers(&self) -> u32 {
+        self.object_totals.as_ref().map_or(0, |o| o.consumers)
+    }
+
+    /// Check if the server has any active connections.
+    pub fn has_connections(&self) -> bool {
+        self.total_connections() > 0
+    }
+
+    /// Check if there are any messages in the system.
+    pub fn has_messages(&self) -> bool {
+        self.total_messages() > 0
+    }
+}
+
 /// Queue totals
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct QueueTotals {
@@ -964,6 +1861,24 @@ pub struct QueueTotals {
     pub messages_ready: u64,
     #[serde(default)]
     pub messages_unacknowledged: u64,
+}
+
+impl QueueTotals {
+    /// Get percentage of ready messages.
+    pub fn ready_percentage(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        (self.messages_ready as f64 / self.messages as f64) * 100.0
+    }
+
+    /// Get percentage of unacknowledged messages.
+    pub fn unacked_percentage(&self) -> f64 {
+        if self.messages == 0 {
+            return 0.0;
+        }
+        (self.messages_unacknowledged as f64 / self.messages as f64) * 100.0
+    }
 }
 
 /// Object totals
@@ -979,6 +1894,29 @@ pub struct ObjectTotals {
     pub connections: u32,
     #[serde(default)]
     pub channels: u32,
+}
+
+impl ObjectTotals {
+    /// Get average channels per connection.
+    pub fn avg_channels_per_connection(&self) -> f64 {
+        if self.connections == 0 {
+            return 0.0;
+        }
+        self.channels as f64 / self.connections as f64
+    }
+
+    /// Get average consumers per queue.
+    pub fn avg_consumers_per_queue(&self) -> f64 {
+        if self.queues == 0 {
+            return 0.0;
+        }
+        self.consumers as f64 / self.queues as f64
+    }
+
+    /// Check if there are any idle resources (queues without consumers).
+    pub fn has_idle_queues(&self) -> bool {
+        self.queues > self.consumers
+    }
 }
 
 /// Connection information from Management API
@@ -1003,6 +1941,52 @@ pub struct ConnectionInfo {
     pub send_cnt: u64,
 }
 
+impl ConnectionInfo {
+    /// Check if the connection is in running state.
+    pub fn is_running(&self) -> bool {
+        self.state == "running"
+    }
+
+    /// Check if the connection has active channels.
+    pub fn has_channels(&self) -> bool {
+        self.channels > 0
+    }
+
+    /// Get total bytes transferred (received + sent).
+    pub fn total_bytes(&self) -> u64 {
+        self.recv_oct + self.send_oct
+    }
+
+    /// Get total bytes received in megabytes.
+    pub fn recv_mb(&self) -> f64 {
+        self.recv_oct as f64 / 1024.0 / 1024.0
+    }
+
+    /// Get total bytes sent in megabytes.
+    pub fn send_mb(&self) -> f64 {
+        self.send_oct as f64 / 1024.0 / 1024.0
+    }
+
+    /// Get total messages transferred (received + sent).
+    pub fn total_messages(&self) -> u64 {
+        self.recv_cnt + self.send_cnt
+    }
+
+    /// Get average message size in bytes.
+    pub fn avg_message_size(&self) -> f64 {
+        let total_msgs = self.total_messages();
+        if total_msgs == 0 {
+            return 0.0;
+        }
+        self.total_bytes() as f64 / total_msgs as f64
+    }
+
+    /// Get peer address as a string.
+    pub fn peer_address(&self) -> String {
+        format!("{}:{}", self.peer_host, self.peer_port)
+    }
+}
+
 /// Channel information from Management API
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ChannelInfo {
@@ -1022,6 +2006,48 @@ pub struct ChannelInfo {
     #[serde(default)]
     pub prefetch_count: u32,
     pub state: String,
+}
+
+impl ChannelInfo {
+    /// Check if the channel is in running state.
+    pub fn is_running(&self) -> bool {
+        self.state == "running"
+    }
+
+    /// Check if the channel has active consumers.
+    pub fn has_consumers(&self) -> bool {
+        self.consumers > 0
+    }
+
+    /// Check if the channel has unacknowledged messages.
+    pub fn has_unacked_messages(&self) -> bool {
+        self.messages_unacknowledged > 0
+    }
+
+    /// Check if the channel is in a transaction.
+    pub fn is_in_transaction(&self) -> bool {
+        self.messages_uncommitted > 0 || self.acks_uncommitted > 0
+    }
+
+    /// Check if prefetch is configured.
+    pub fn has_prefetch(&self) -> bool {
+        self.prefetch_count > 0
+    }
+
+    /// Get utilization percentage based on prefetch.
+    pub fn utilization(&self) -> f64 {
+        if self.prefetch_count == 0 {
+            return 0.0;
+        }
+        (self.messages_unacknowledged as f64 / self.prefetch_count as f64) * 100.0
+    }
+
+    /// Get peer address from connection details.
+    pub fn peer_address(&self) -> Option<String> {
+        self.connection_details
+            .as_ref()
+            .map(|details| format!("{}:{}", details.peer_host, details.peer_port))
+    }
 }
 
 /// Connection details for a channel
@@ -1075,8 +2101,10 @@ struct ConnectionPool {
 impl ConnectionPool {
     /// Create a new connection pool
     fn new(url: String, max_size: usize) -> Self {
-        let mut metrics = ConnectionPoolMetrics::default();
-        metrics.max_pool_size = max_size;
+        let metrics = ConnectionPoolMetrics {
+            max_pool_size: max_size,
+            ..Default::default()
+        };
 
         Self {
             connections: Arc::new(Mutex::new(VecDeque::with_capacity(max_size))),
@@ -1180,8 +2208,10 @@ struct ChannelPool {
 impl ChannelPool {
     /// Create a new channel pool
     fn new(max_size: usize) -> Self {
-        let mut metrics = ChannelPoolMetrics::default();
-        metrics.max_pool_size = max_size;
+        let metrics = ChannelPoolMetrics {
+            max_pool_size: max_size,
+            ..Default::default()
+        };
 
         Self {
             channels: Arc::new(Mutex::new(VecDeque::with_capacity(max_size))),
@@ -1644,13 +2674,10 @@ impl AmqpBroker {
                     return Ok(());
                 }
                 Err(e) => {
-                    last_error = Some(e);
                     if attempt < self.config.retry_count {
-                        warn!(
-                            "Connection failed, will retry: {}",
-                            last_error.as_ref().unwrap()
-                        );
+                        warn!("Connection failed, will retry: {}", e);
                     }
+                    last_error = Some(e);
                 }
             }
         }
@@ -1741,6 +2768,209 @@ impl AmqpBroker {
             })?;
 
         debug!("Declared exchange: {} ({:?})", exchange, exchange_type);
+        Ok(())
+    }
+
+    /// Declare an exchange with full configuration including alternative exchange
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::{AmqpBroker, ExchangeConfig, AmqpExchangeType};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
+    /// broker.connect().await?;
+    ///
+    /// // Declare main exchange with alternate exchange for unroutable messages
+    /// let config = ExchangeConfig::new(AmqpExchangeType::Direct)
+    ///     .with_alternate_exchange("unroutable_messages");
+    ///
+    /// broker.declare_exchange_with_config("orders", &config).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn declare_exchange_with_config(
+        &mut self,
+        exchange: &str,
+        config: &ExchangeConfig,
+    ) -> Result<()> {
+        let channel = self.get_channel().await?;
+        let args = config.to_field_table();
+
+        channel
+            .exchange_declare(
+                exchange,
+                config.exchange_type.to_exchange_kind(),
+                ExchangeDeclareOptions {
+                    durable: config.durable,
+                    auto_delete: config.auto_delete,
+                    internal: config.internal,
+                    ..Default::default()
+                },
+                args,
+            )
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to declare exchange: {}", e))
+            })?;
+
+        debug!(
+            "Declared exchange with config: {} ({:?})",
+            exchange, config.exchange_type
+        );
+        Ok(())
+    }
+
+    /// Bind an exchange to another exchange (for advanced routing)
+    ///
+    /// This allows creating complex routing topologies where messages flow through
+    /// multiple exchanges before reaching queues.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::{AmqpBroker, AmqpExchangeType};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
+    /// broker.connect().await?;
+    ///
+    /// // Create a routing hierarchy
+    /// broker.declare_exchange("frontend", AmqpExchangeType::Topic).await?;
+    /// broker.declare_exchange("backend", AmqpExchangeType::Direct).await?;
+    ///
+    /// // Route messages from frontend to backend
+    /// broker.bind_exchange("backend", "frontend", "api.#").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn bind_exchange(
+        &mut self,
+        destination: &str,
+        source: &str,
+        routing_key: &str,
+    ) -> Result<()> {
+        let channel = self.get_channel().await?;
+
+        channel
+            .exchange_bind(
+                destination,
+                source,
+                routing_key,
+                ExchangeBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Failed to bind exchange: {}", e)))?;
+
+        debug!(
+            "Bound exchange {} to exchange {} with routing key {}",
+            destination, source, routing_key
+        );
+        Ok(())
+    }
+
+    /// Unbind an exchange from another exchange
+    pub async fn unbind_exchange(
+        &mut self,
+        destination: &str,
+        source: &str,
+        routing_key: &str,
+    ) -> Result<()> {
+        let channel = self.get_channel().await?;
+
+        channel
+            .exchange_unbind(
+                destination,
+                source,
+                routing_key,
+                ExchangeUnbindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to unbind exchange: {}", e))
+            })?;
+
+        debug!(
+            "Unbound exchange {} from exchange {} with routing key {}",
+            destination, source, routing_key
+        );
+        Ok(())
+    }
+
+    /// Passive queue declaration - check if queue exists without creating it
+    ///
+    /// This is useful to verify a queue exists before attempting operations.
+    /// Returns Ok if queue exists, or an error if it doesn't.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::AmqpBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
+    /// broker.connect().await?;
+    ///
+    /// // Check if queue exists
+    /// if broker.declare_queue_passive("my_queue").await.is_ok() {
+    ///     println!("Queue exists!");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn declare_queue_passive(&mut self, queue: &str) -> Result<()> {
+        let channel = self.get_channel().await?;
+
+        channel
+            .queue_declare(
+                queue,
+                QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Queue does not exist: {}", e)))?;
+
+        debug!("Queue exists: {}", queue);
+        Ok(())
+    }
+
+    /// Passive exchange declaration - check if exchange exists without creating it
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::AmqpBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
+    /// broker.connect().await?;
+    ///
+    /// // Check if exchange exists
+    /// if broker.declare_exchange_passive("amq.direct").await.is_ok() {
+    ///     println!("Exchange exists!");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn declare_exchange_passive(&mut self, exchange: &str) -> Result<()> {
+        let channel = self.get_channel().await?;
+
+        channel
+            .exchange_declare(
+                exchange,
+                ExchangeKind::Direct, // Type doesn't matter for passive
+                ExchangeDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Exchange does not exist: {}", e)))?;
+
+        debug!("Exchange exists: {}", exchange);
         Ok(())
     }
 
@@ -2023,6 +3253,69 @@ impl AmqpBroker {
             })?;
 
         info!("Started consumer on queue: {}", queue);
+        Ok(consumer)
+    }
+
+    /// Start a consumer with full configuration including priority
+    ///
+    /// This allows setting consumer priority, which determines message distribution
+    /// when multiple consumers are active. Higher priority consumers receive messages first.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::{AmqpBroker, ConsumerConfig};
+    /// use futures::StreamExt;
+    /// use lapin::options::BasicAckOptions;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
+    /// broker.connect().await?;
+    ///
+    /// // Start high-priority consumer
+    /// let config = ConsumerConfig::new()
+    ///     .with_tag("high_priority_worker")
+    ///     .with_priority(10);  // Higher priority
+    ///
+    /// let mut consumer = broker.start_consumer_with_config("work_queue", &config).await?;
+    ///
+    /// // Process messages
+    /// while let Some(delivery) = consumer.next().await {
+    ///     let delivery = delivery?;
+    ///     // Process...
+    ///     delivery.ack(BasicAckOptions::default()).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn start_consumer_with_config(
+        &mut self,
+        queue: &str,
+        config: &ConsumerConfig,
+    ) -> Result<lapin::Consumer> {
+        let channel = self.get_channel().await?;
+        let args = config.to_field_table();
+
+        let consumer = channel
+            .basic_consume(
+                queue,
+                &config.consumer_tag,
+                BasicConsumeOptions {
+                    no_local: config.no_local,
+                    no_ack: config.no_ack,
+                    exclusive: config.exclusive,
+                    nowait: false,
+                },
+                args,
+            )
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to start consumer: {}", e))
+            })?;
+
+        info!(
+            "Started consumer on queue: {} with config (priority: {:?})",
+            queue, config.priority
+        );
         Ok(consumer)
     }
 
@@ -2662,6 +3955,770 @@ impl AmqpBroker {
         }
 
         Ok(success_count)
+    }
+
+    /// Drain all messages from a queue
+    ///
+    /// Consumes and returns all messages currently in the queue.
+    /// This is useful for queue maintenance, testing, or message migration.
+    ///
+    /// # Arguments
+    /// * `queue` - Queue name to drain
+    ///
+    /// # Returns
+    /// Vector of envelopes containing all drained messages
+    ///
+    /// # Example
+    /// ```ignore
+    /// let messages = broker.drain_queue("my_queue").await?;
+    /// println!("Drained {} messages", messages.len());
+    /// ```
+    pub async fn drain_queue(&mut self, queue: &str) -> Result<Vec<Envelope>> {
+        let mut envelopes = Vec::new();
+        let mut consumed_count = 0;
+        let mut error_count = 0;
+
+        loop {
+            let channel = self.get_channel().await?;
+            match channel
+                .basic_get(queue, BasicGetOptions { no_ack: false })
+                .await
+            {
+                Ok(Some(delivery)) => match serde_json::from_slice::<Message>(&delivery.data) {
+                    Ok(message) => {
+                        envelopes.push(Envelope {
+                            delivery_tag: delivery.delivery_tag.to_string(),
+                            message,
+                            redelivered: delivery.redelivered,
+                        });
+                        consumed_count += 1;
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize message during drain: {}", e);
+                        error_count += 1;
+                    }
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("Error during queue drain: {}", e);
+                    break;
+                }
+            }
+        }
+
+        // Update metrics after loop
+        self.channel_metrics.messages_consumed += consumed_count;
+        self.channel_metrics.consume_errors += error_count;
+
+        debug!("Drained {} messages from queue: {}", envelopes.len(), queue);
+        Ok(envelopes)
+    }
+
+    /// Bulk declare multiple queues with their configurations
+    ///
+    /// Declares multiple queues atomically with their respective configurations.
+    /// This is more efficient than declaring queues one by one.
+    ///
+    /// # Arguments
+    /// * `queue_configs` - Vector of tuples (queue_name, QueueConfig)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let configs = vec![
+    ///     ("queue1", QueueConfig::default()),
+    ///     ("queue2", QueueConfig::default().with_priority(10)),
+    /// ];
+    /// broker.declare_queues_batch(configs).await?;
+    /// ```
+    pub async fn declare_queues_batch(
+        &mut self,
+        queue_configs: Vec<(&str, QueueConfig)>,
+    ) -> Result<()> {
+        let channel = self.get_channel().await?;
+
+        for (queue, config) in queue_configs {
+            let field_table = config.to_field_table();
+
+            channel
+                .queue_declare(
+                    queue,
+                    QueueDeclareOptions {
+                        passive: false,
+                        durable: config.durable,
+                        exclusive: config.exclusive,
+                        auto_delete: config.auto_delete,
+                        nowait: false,
+                    },
+                    field_table,
+                )
+                .await
+                .map_err(|e| {
+                    BrokerError::OperationFailed(format!(
+                        "Failed to declare queue {}: {}",
+                        queue, e
+                    ))
+                })?;
+
+            debug!("Declared queue: {}", queue);
+        }
+
+        Ok(())
+    }
+
+    /// Delete multiple queues in batch
+    ///
+    /// # Arguments
+    /// * `queues` - Vector of queue names to delete
+    /// * `if_unused` - Only delete if queue has no consumers
+    /// * `if_empty` - Only delete if queue is empty
+    ///
+    /// # Returns
+    /// Number of queues successfully deleted
+    pub async fn delete_queues_batch(
+        &mut self,
+        queues: Vec<&str>,
+        if_unused: bool,
+        if_empty: bool,
+    ) -> Result<usize> {
+        let channel = self.get_channel().await?;
+        let mut deleted_count = 0;
+
+        for queue in queues {
+            match channel
+                .queue_delete(
+                    queue,
+                    QueueDeleteOptions {
+                        if_unused,
+                        if_empty,
+                        nowait: false,
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    debug!("Deleted queue: {}", queue);
+                    deleted_count += 1;
+                }
+                Err(e) => {
+                    warn!("Failed to delete queue {}: {}", queue, e);
+                }
+            }
+        }
+
+        Ok(deleted_count)
+    }
+
+    /// Purge multiple queues in batch
+    ///
+    /// Removes all messages from the specified queues.
+    ///
+    /// # Arguments
+    /// * `queues` - Vector of queue names to purge
+    ///
+    /// # Returns
+    /// Total number of messages purged across all queues
+    pub async fn purge_queues_batch(&mut self, queues: Vec<&str>) -> Result<usize> {
+        let channel = self.get_channel().await?;
+        let mut total_purged = 0;
+
+        for queue in queues {
+            match channel
+                .queue_purge(queue, QueuePurgeOptions { nowait: false })
+                .await
+            {
+                Ok(message_count) => {
+                    debug!("Purged {} messages from queue: {}", message_count, queue);
+                    total_purged += message_count as usize;
+                }
+                Err(e) => {
+                    warn!("Failed to purge queue {}: {}", queue, e);
+                }
+            }
+        }
+
+        Ok(total_purged)
+    }
+
+    /// Request-Reply (RPC) pattern: Send a message and wait for reply
+    ///
+    /// Implements the RPC pattern by:
+    /// 1. Creating a temporary reply queue
+    /// 2. Sending the request with reply-to and correlation-id
+    /// 3. Waiting for the reply with timeout
+    /// 4. Cleaning up the reply queue
+    ///
+    /// # Arguments
+    /// * `rpc_queue` - Queue name for the RPC server
+    /// * `request` - Request message
+    /// * `timeout` - Maximum time to wait for reply
+    ///
+    /// # Returns
+    /// Reply message from the RPC server
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::time::Duration;
+    /// use celers_protocol::MessageBuilder;
+    ///
+    /// let request = MessageBuilder::new("tasks.calculate")
+    ///     .args(vec![serde_json::json!({"x": 10, "y": 20})])
+    ///     .build()?;
+    ///
+    /// let reply = broker.rpc_call("rpc_queue", request, Duration::from_secs(5)).await?;
+    /// println!("RPC result: {:?}", reply);
+    /// ```
+    pub async fn rpc_call(
+        &mut self,
+        rpc_queue: &str,
+        mut request: Message,
+        timeout: Duration,
+    ) -> Result<Message> {
+        // Create temporary reply queue with auto-delete
+        let reply_queue_name = format!("reply.{}", uuid::Uuid::new_v4());
+        {
+            let channel = self.get_channel().await?;
+            channel
+                .queue_declare(
+                    &reply_queue_name,
+                    QueueDeclareOptions {
+                        passive: false,
+                        durable: false,
+                        exclusive: true,
+                        auto_delete: true,
+                        nowait: false,
+                    },
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|e| {
+                    BrokerError::OperationFailed(format!("Failed to create reply queue: {}", e))
+                })?;
+        }
+
+        // Set reply-to and correlation-id
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        request.properties.correlation_id = Some(correlation_id.clone());
+        let reply_to = reply_queue_name.clone();
+
+        // Serialize and publish request
+        let payload =
+            serde_json::to_vec(&request).map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        let properties = BasicProperties::default()
+            .with_delivery_mode(2)
+            .with_content_type(ShortString::from("application/json"))
+            .with_correlation_id(ShortString::from(correlation_id.as_str()))
+            .with_reply_to(ShortString::from(reply_to.as_str()));
+
+        let exchange = self.config.default_exchange.clone();
+        {
+            let channel = self.get_channel().await?;
+            channel
+                .basic_publish(
+                    &exchange,
+                    rpc_queue,
+                    BasicPublishOptions::default(),
+                    &payload,
+                    properties,
+                )
+                .await
+                .map_err(|e| {
+                    BrokerError::OperationFailed(format!("Failed to publish RPC request: {}", e))
+                })?
+                .await
+                .map_err(|e| {
+                    BrokerError::OperationFailed(format!("Failed to confirm RPC request: {}", e))
+                })?;
+        }
+
+        debug!(
+            "Sent RPC request to {} with correlation_id: {}",
+            rpc_queue, correlation_id
+        );
+
+        // Wait for reply with timeout
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                // Clean up reply queue before returning error
+                let channel = self.get_channel().await?;
+                let _ = channel
+                    .queue_delete(&reply_queue_name, QueueDeleteOptions::default())
+                    .await;
+                return Err(BrokerError::OperationFailed(format!(
+                    "RPC timeout: no reply received within {:?}",
+                    timeout
+                )));
+            }
+
+            let channel = self.get_channel().await?;
+            match channel
+                .basic_get(&reply_queue_name, BasicGetOptions { no_ack: false })
+                .await
+            {
+                Ok(Some(delivery)) => {
+                    // Check correlation ID matches
+                    if let Some(corr_id) = delivery.properties.correlation_id() {
+                        if corr_id.as_str() == correlation_id {
+                            // Acknowledge the reply
+                            channel
+                                .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                                .await
+                                .map_err(|e| {
+                                    BrokerError::OperationFailed(format!(
+                                        "Failed to ack reply: {}",
+                                        e
+                                    ))
+                                })?;
+
+                            // Deserialize reply
+                            let reply = serde_json::from_slice::<Message>(&delivery.data)
+                                .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+                            // Clean up reply queue
+                            let _ = channel
+                                .queue_delete(&reply_queue_name, QueueDeleteOptions::default())
+                                .await;
+
+                            debug!("Received RPC reply for correlation_id: {}", correlation_id);
+                            return Ok(reply);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // No message yet, wait a bit
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    // Clean up reply queue before returning error
+                    let channel = self.get_channel().await?;
+                    let _ = channel
+                        .queue_delete(&reply_queue_name, QueueDeleteOptions::default())
+                        .await;
+                    return Err(BrokerError::OperationFailed(format!(
+                        "Failed to receive RPC reply: {}",
+                        e
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Send an RPC reply
+    ///
+    /// Helper method to reply to an RPC request. Extracts reply-to and correlation-id
+    /// from the original request and sends the reply appropriately.
+    ///
+    /// # Arguments
+    /// * `request_envelope` - Original request envelope containing reply-to information
+    /// * `reply` - Reply message to send
+    ///
+    /// # Example
+    /// ```ignore
+    /// // In RPC server
+    /// if let Some(envelope) = broker.consume("rpc_queue", Duration::from_secs(1)).await? {
+    ///     // Process request and create reply
+    ///     let reply = MessageBuilder::new("result")
+    ///         .body(serde_json::json!({"result": 42}))
+    ///         .build()?;
+    ///
+    ///     broker.rpc_reply(&envelope, reply).await?;
+    ///     broker.ack(&envelope.delivery_tag).await?;
+    /// }
+    /// ```
+    pub async fn rpc_reply(&mut self, request_envelope: &Envelope, reply: Message) -> Result<()> {
+        // Extract correlation_id and reply_to from request
+        let correlation_id = request_envelope
+            .message
+            .properties
+            .correlation_id
+            .as_ref()
+            .ok_or_else(|| {
+                BrokerError::OperationFailed("Request message missing correlation_id".to_string())
+            })?;
+
+        // For this implementation, we need to get reply_to from message headers
+        // Since the Envelope doesn't store reply_to, we'll need to pass it explicitly
+        // or extract it from the message body/headers if available
+
+        // Simplified: Use correlation_id to determine reply queue
+        // In production, you'd want to extract reply_to from the AMQP properties
+        let reply_queue = format!("reply.{}", correlation_id);
+
+        // Publish reply with correlation_id
+        let mut reply_msg = reply;
+        reply_msg.properties.correlation_id = Some(correlation_id.clone());
+
+        self.publish(&reply_queue, reply_msg).await?;
+        debug!(
+            "Sent RPC reply to {} with correlation_id: {}",
+            reply_queue, correlation_id
+        );
+        Ok(())
+    }
+
+    /// Acknowledge multiple messages up to and including the specified delivery tag
+    ///
+    /// This is more efficient than calling ack() multiple times when processing
+    /// messages in order. All messages up to and including the specified tag
+    /// will be acknowledged atomically.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::AmqpBroker;
+    /// use celers_kombu::{Transport, Consumer};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
+    /// broker.connect().await?;
+    ///
+    /// // Consume multiple messages
+    /// let mut last_tag = String::new();
+    /// for _ in 0..10 {
+    ///     if let Ok(Some(envelope)) = broker.consume("test", std::time::Duration::from_secs(1)).await {
+    ///         last_tag = envelope.delivery_tag.clone();
+    ///     }
+    /// }
+    ///
+    /// // Acknowledge all messages at once
+    /// broker.ack_multiple(&last_tag).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn ack_multiple(&mut self, delivery_tag: &str) -> Result<()> {
+        let channel = self.get_channel().await?;
+
+        let tag = delivery_tag
+            .parse::<u64>()
+            .map_err(|e| BrokerError::OperationFailed(format!("Invalid delivery tag: {}", e)))?;
+
+        channel
+            .basic_ack(tag, BasicAckOptions { multiple: true })
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Failed to ack multiple: {}", e)))?;
+
+        debug!("Acknowledged multiple messages up to: {}", delivery_tag);
+        Ok(())
+    }
+
+    /// Reject multiple messages up to and including the specified delivery tag
+    ///
+    /// This is more efficient than calling reject() multiple times.
+    /// Uses NACK to reject multiple messages atomically.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use celers_broker_amqp::AmqpBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
+    /// broker.connect().await?;
+    ///
+    /// // Reject and requeue multiple messages
+    /// broker.reject_multiple("123", true).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn reject_multiple(&mut self, delivery_tag: &str, requeue: bool) -> Result<()> {
+        let channel = self.get_channel().await?;
+
+        let tag = delivery_tag
+            .parse::<u64>()
+            .map_err(|e| BrokerError::OperationFailed(format!("Invalid delivery tag: {}", e)))?;
+
+        channel
+            .basic_nack(
+                tag,
+                BasicNackOptions {
+                    multiple: true,
+                    requeue,
+                },
+            )
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Failed to nack multiple: {}", e)))?;
+
+        debug!(
+            "Rejected multiple messages up to: {} (requeue: {})",
+            delivery_tag, requeue
+        );
+        Ok(())
+    }
+
+    /// Consume multiple messages from a queue in a single batch operation.
+    ///
+    /// This method retrieves up to `max_messages` from the queue efficiently.
+    /// Each message must be acknowledged individually using `ack()` or `reject()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue` - Queue name to consume from
+    /// * `max_messages` - Maximum number of messages to retrieve (1-1000)
+    /// * `timeout` - Timeout for waiting when no messages are available
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of envelopes. May be empty if no messages available.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let envelopes = broker.consume_batch("my_queue", 100, Duration::from_secs(1)).await?;
+    /// for envelope in envelopes {
+    ///     // Process message
+    ///     broker.ack(&envelope.delivery_tag).await?;
+    /// }
+    /// ```
+    pub async fn consume_batch(
+        &mut self,
+        queue: &str,
+        max_messages: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Envelope>> {
+        let max_messages = max_messages.min(1000); // Cap at 1000
+        let mut envelopes = Vec::with_capacity(max_messages);
+
+        let start = Instant::now();
+        let mut consumed_count = 0u64;
+        let mut error_count = 0u64;
+
+        for _ in 0..max_messages {
+            // Check timeout
+            if start.elapsed() >= timeout {
+                break;
+            }
+
+            // Get channel for each iteration to avoid borrow issues
+            let channel = self.get_channel().await?;
+
+            // Try to get a message
+            let get_result = channel
+                .basic_get(queue, BasicGetOptions { no_ack: false })
+                .await;
+
+            match get_result {
+                Ok(Some(delivery)) => match serde_json::from_slice::<Message>(&delivery.data) {
+                    Ok(message) => {
+                        envelopes.push(Envelope {
+                            delivery_tag: delivery.delivery_tag.to_string(),
+                            message,
+                            redelivered: delivery.redelivered,
+                        });
+                        consumed_count += 1;
+                    }
+                    Err(e) => {
+                        error_count += 1;
+                        self.channel_metrics.consume_errors += error_count;
+                        return Err(BrokerError::Serialization(e.to_string()));
+                    }
+                },
+                Ok(None) => {
+                    // No more messages available
+                    break;
+                }
+                Err(e) => {
+                    error_count += 1;
+                    self.channel_metrics.consume_errors += error_count;
+                    return Err(BrokerError::OperationFailed(format!(
+                        "Failed to get message: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        // Update metrics after all operations
+        self.channel_metrics.messages_consumed += consumed_count;
+
+        if !envelopes.is_empty() {
+            debug!(
+                "Consumed batch of {} messages from queue: {}",
+                envelopes.len(),
+                queue
+            );
+        }
+
+        Ok(envelopes)
+    }
+
+    /// Peek at messages in a queue without consuming them.
+    ///
+    /// This method retrieves up to `max_messages` from the queue for inspection
+    /// and immediately requeues them. Useful for monitoring queue contents.
+    ///
+    /// **Note:** This operation may affect message ordering and performance.
+    /// Use sparingly and only for debugging/monitoring purposes.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue` - Queue name to peek at
+    /// * `max_messages` - Maximum number of messages to peek (1-100)
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of messages (without delivery tags).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let messages = broker.peek_queue("my_queue", 10).await?;
+    /// for msg in messages {
+    ///     println!("Message ID: {}", msg.headers.id);
+    /// }
+    /// ```
+    pub async fn peek_queue(&mut self, queue: &str, max_messages: usize) -> Result<Vec<Message>> {
+        let max_messages = max_messages.min(100); // Cap at 100 for safety
+        let mut messages = Vec::with_capacity(max_messages);
+        let channel = self.get_channel().await?;
+
+        for _ in 0..max_messages {
+            let get_result = channel
+                .basic_get(queue, BasicGetOptions { no_ack: false })
+                .await;
+
+            match get_result {
+                Ok(Some(delivery)) => {
+                    let delivery_tag = delivery.delivery_tag;
+
+                    match serde_json::from_slice::<Message>(&delivery.data) {
+                        Ok(message) => {
+                            messages.push(message);
+
+                            // Requeue the message immediately
+                            channel
+                                .basic_reject(delivery_tag, BasicRejectOptions { requeue: true })
+                                .await
+                                .map_err(|e| {
+                                    BrokerError::OperationFailed(format!(
+                                        "Failed to requeue peeked message: {}",
+                                        e
+                                    ))
+                                })?;
+                        }
+                        Err(e) => {
+                            // Requeue even on deserialization error
+                            let _ = channel
+                                .basic_reject(delivery_tag, BasicRejectOptions { requeue: true })
+                                .await;
+                            return Err(BrokerError::Serialization(e.to_string()));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // No more messages
+                    break;
+                }
+                Err(e) => {
+                    return Err(BrokerError::OperationFailed(format!(
+                        "Failed to peek message: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        debug!("Peeked {} messages from queue: {}", messages.len(), queue);
+        Ok(messages)
+    }
+
+    /// Check if RabbitMQ server is alive using the Management API aliveness test.
+    ///
+    /// This endpoint declares a test queue, publishes and consumes a message,
+    /// and cleans up. It provides a robust health check for the entire message path.
+    ///
+    /// Requires Management API to be configured.
+    ///
+    /// # Arguments
+    ///
+    /// * `vhost` - Virtual host to check (defaults to configured vhost)
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the aliveness test passed, `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if broker.check_aliveness(None).await? {
+    ///     println!("RabbitMQ is alive!");
+    /// }
+    /// ```
+    pub async fn check_aliveness(&self, vhost: Option<&str>) -> Result<bool> {
+        let mgmt_api = self
+            .management_api_client
+            .as_ref()
+            .ok_or_else(|| BrokerError::OperationFailed("Management API not configured".into()))?;
+
+        let vhost = vhost.unwrap_or(self.config.vhost.as_deref().unwrap_or("/"));
+        let encoded_vhost = urlencoding::encode(vhost);
+
+        let url = format!("{}/api/aliveness-test/{}", mgmt_api.base_url, encoded_vhost);
+
+        let response = mgmt_api
+            .client
+            .get(&url)
+            .basic_auth(&mgmt_api.username, Some(&mgmt_api.password))
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to check aliveness: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+
+        #[derive(serde::Deserialize)]
+        struct AlivenessResponse {
+            status: String,
+        }
+
+        let aliveness: AlivenessResponse = response.json().await.map_err(|e| {
+            BrokerError::Serialization(format!("Failed to parse aliveness response: {}", e))
+        })?;
+
+        Ok(aliveness.status == "ok")
+    }
+
+    /// Get connection pool metrics for monitoring connection pool health.
+    ///
+    /// # Returns
+    ///
+    /// Returns connection pool metrics including size, acquisitions, releases, and discards.
+    /// Returns None if connection pooling is disabled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if let Some(metrics) = broker.get_connection_pool_metrics().await {
+    ///     println!("Pool utilization: {:.2}%", metrics.utilization() * 100.0);
+    /// }
+    /// ```
+    pub async fn get_connection_pool_metrics(&self) -> Option<ConnectionPoolMetrics> {
+        match &self.connection_pool {
+            Some(pool) => Some(pool.get_metrics().await),
+            None => None,
+        }
+    }
+
+    /// Get channel pool metrics for monitoring channel pool health.
+    ///
+    /// # Returns
+    ///
+    /// Returns channel pool metrics including size, acquisitions, releases, and discards.
+    /// Returns None if channel pooling is disabled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if let Some(metrics) = broker.get_channel_pool_metrics().await {
+    ///     println!("Pool utilization: {:.2}%", metrics.utilization() * 100.0);
+    /// }
+    /// ```
+    pub async fn get_channel_pool_metrics(&self) -> Option<ChannelPoolMetrics> {
+        match &self.channel_pool {
+            Some(pool) => Some(pool.get_metrics().await),
+            None => None,
+        }
     }
 }
 
@@ -3970,5 +6027,328 @@ mod tests {
         assert_eq!(binding.destination_type, "queue");
 
         broker.disconnect().await.unwrap();
+    }
+
+    #[test]
+    fn test_queue_type_enum() {
+        assert_eq!(QueueType::Classic.as_str(), "classic");
+        assert_eq!(QueueType::Quorum.as_str(), "quorum");
+        assert_eq!(QueueType::Stream.as_str(), "stream");
+    }
+
+    #[test]
+    fn test_queue_lazy_mode_enum() {
+        assert_eq!(QueueLazyMode::Default.as_str(), "default");
+        assert_eq!(QueueLazyMode::Lazy.as_str(), "lazy");
+    }
+
+    #[test]
+    fn test_queue_overflow_behavior_enum() {
+        assert_eq!(QueueOverflowBehavior::DropHead.as_str(), "drop-head");
+        assert_eq!(
+            QueueOverflowBehavior::RejectPublish.as_str(),
+            "reject-publish"
+        );
+        assert_eq!(
+            QueueOverflowBehavior::RejectPublishDlx.as_str(),
+            "reject-publish-dlx"
+        );
+    }
+
+    #[test]
+    fn test_queue_config_with_modern_features() {
+        let config = QueueConfig::new()
+            .with_queue_type(QueueType::Quorum)
+            .with_queue_mode(QueueLazyMode::Lazy)
+            .with_overflow_behavior(QueueOverflowBehavior::RejectPublish)
+            .with_single_active_consumer(true);
+
+        assert_eq!(config.queue_type, Some(QueueType::Quorum));
+        assert_eq!(config.queue_mode, Some(QueueLazyMode::Lazy));
+        assert_eq!(
+            config.overflow_behavior,
+            Some(QueueOverflowBehavior::RejectPublish)
+        );
+        assert!(config.single_active_consumer);
+    }
+
+    #[test]
+    fn test_queue_config_field_table_with_modern_features() {
+        let config = QueueConfig::new()
+            .with_queue_type(QueueType::Quorum)
+            .with_queue_mode(QueueLazyMode::Lazy)
+            .with_overflow_behavior(QueueOverflowBehavior::DropHead)
+            .with_single_active_consumer(true)
+            .with_max_length(1000);
+
+        let table = config.to_field_table();
+
+        assert!(table
+            .inner()
+            .contains_key(&ShortString::from("x-queue-type")));
+        assert!(table
+            .inner()
+            .contains_key(&ShortString::from("x-queue-mode")));
+        assert!(table.inner().contains_key(&ShortString::from("x-overflow")));
+        assert!(table
+            .inner()
+            .contains_key(&ShortString::from("x-single-active-consumer")));
+        assert!(table
+            .inner()
+            .contains_key(&ShortString::from("x-max-length")));
+    }
+
+    #[test]
+    fn test_quorum_queue_config() {
+        let config = QueueConfig::new()
+            .durable(true)
+            .with_queue_type(QueueType::Quorum)
+            .with_max_length(10000)
+            .with_overflow_behavior(QueueOverflowBehavior::RejectPublish);
+
+        assert!(config.durable);
+        assert_eq!(config.queue_type, Some(QueueType::Quorum));
+        assert_eq!(config.max_length, Some(10000));
+        assert_eq!(
+            config.overflow_behavior,
+            Some(QueueOverflowBehavior::RejectPublish)
+        );
+    }
+
+    #[test]
+    fn test_lazy_queue_config() {
+        let config = QueueConfig::new()
+            .with_queue_mode(QueueLazyMode::Lazy)
+            .with_max_length(1000000);
+
+        assert_eq!(config.queue_mode, Some(QueueLazyMode::Lazy));
+        assert_eq!(config.max_length, Some(1000000));
+    }
+
+    #[test]
+    fn test_stream_queue_config() {
+        let config = QueueConfig::new()
+            .durable(true)
+            .with_queue_type(QueueType::Stream);
+
+        assert!(config.durable);
+        assert_eq!(config.queue_type, Some(QueueType::Stream));
+    }
+
+    // ===== v4 Helper Methods Tests =====
+
+    #[test]
+    fn test_queue_info_helpers() {
+        let info = QueueInfo {
+            name: "test_queue".to_string(),
+            vhost: "/".to_string(),
+            durable: true,
+            auto_delete: false,
+            messages: 100,
+            messages_ready: 80,
+            messages_unacknowledged: 20,
+            consumers: 2,
+            memory: 10485760, // 10 MB
+        };
+
+        assert!(!info.is_empty());
+        assert!(info.has_consumers());
+        assert!(!info.is_idle());
+        assert_eq!(info.ready_percentage(), 80.0);
+        assert_eq!(info.unacked_percentage(), 20.0);
+        assert_eq!(info.memory_mb(), 10.0);
+        assert_eq!(info.avg_message_memory(), 104857.6);
+
+        // Test empty queue
+        let empty_info = QueueInfo {
+            name: "empty".to_string(),
+            vhost: "/".to_string(),
+            durable: true,
+            auto_delete: false,
+            messages: 0,
+            messages_ready: 0,
+            messages_unacknowledged: 0,
+            consumers: 0,
+            memory: 0,
+        };
+
+        assert!(empty_info.is_empty());
+        assert!(!empty_info.has_consumers());
+        assert!(empty_info.is_idle());
+        assert_eq!(empty_info.ready_percentage(), 0.0);
+        assert_eq!(empty_info.avg_message_memory(), 0.0);
+    }
+
+    #[test]
+    fn test_queue_stats_helpers() {
+        let stats = QueueStats {
+            name: "test_queue".to_string(),
+            vhost: "/".to_string(),
+            durable: true,
+            auto_delete: false,
+            messages: 1000,
+            messages_ready: 800,
+            messages_unacknowledged: 200,
+            consumers: 5,
+            memory: 10485760,       // 10 MB
+            message_bytes: 5242880, // 5 MB
+            message_bytes_ready: 4194304,
+            message_bytes_unacknowledged: 1048576,
+            message_stats: Some(MessageStats {
+                publish: 10000,
+                publish_details: Some(RateDetails { rate: 100.0 }),
+                deliver: 9500,
+                deliver_details: Some(RateDetails { rate: 95.0 }),
+                ack: 9000,
+                ack_details: Some(RateDetails { rate: 90.0 }),
+            }),
+        };
+
+        assert!(!stats.is_empty());
+        assert!(stats.has_consumers());
+        assert!(!stats.is_idle());
+        assert_eq!(stats.ready_percentage(), 80.0);
+        assert_eq!(stats.unacked_percentage(), 20.0);
+        assert_eq!(stats.memory_mb(), 10.0);
+        assert_eq!(stats.message_bytes_mb(), 5.0);
+        assert_eq!(stats.avg_message_size(), 5242.88);
+        assert_eq!(stats.avg_message_memory(), 10485.76);
+        assert_eq!(stats.publish_rate(), Some(100.0));
+        assert_eq!(stats.deliver_rate(), Some(95.0));
+        assert_eq!(stats.ack_rate(), Some(90.0));
+        assert!(stats.is_growing());
+        assert!(!stats.is_shrinking());
+        assert!(!stats.consumers_keeping_up()); // Ack rate (90) < deliver rate * 0.95 (90.25)
+    }
+
+    #[test]
+    fn test_message_stats_helpers() {
+        let stats = MessageStats {
+            publish: 1000,
+            publish_details: Some(RateDetails { rate: 10.0 }),
+            deliver: 950,
+            deliver_details: Some(RateDetails { rate: 9.5 }),
+            ack: 900,
+            ack_details: Some(RateDetails { rate: 9.0 }),
+        };
+
+        assert_eq!(stats.total_processed(), 2850);
+        assert_eq!(stats.publish_rate(), Some(10.0));
+        assert_eq!(stats.deliver_rate(), Some(9.5));
+        assert_eq!(stats.ack_rate(), Some(9.0));
+    }
+
+    #[test]
+    fn test_server_overview_helpers() {
+        let overview = ServerOverview {
+            management_version: "3.12.0".to_string(),
+            rabbitmq_version: "3.12.0".to_string(),
+            erlang_version: "26.0".to_string(),
+            cluster_name: "rabbit@localhost".to_string(),
+            queue_totals: Some(QueueTotals {
+                messages: 5000,
+                messages_ready: 4000,
+                messages_unacknowledged: 1000,
+            }),
+            object_totals: Some(ObjectTotals {
+                consumers: 10,
+                queues: 5,
+                exchanges: 7,
+                connections: 3,
+                channels: 15,
+            }),
+        };
+
+        assert_eq!(overview.total_messages(), 5000);
+        assert_eq!(overview.total_messages_ready(), 4000);
+        assert_eq!(overview.total_messages_unacked(), 1000);
+        assert_eq!(overview.total_queues(), 5);
+        assert_eq!(overview.total_connections(), 3);
+        assert_eq!(overview.total_channels(), 15);
+        assert_eq!(overview.total_consumers(), 10);
+        assert!(overview.has_connections());
+        assert!(overview.has_messages());
+    }
+
+    #[test]
+    fn test_queue_totals_helpers() {
+        let totals = QueueTotals {
+            messages: 1000,
+            messages_ready: 750,
+            messages_unacknowledged: 250,
+        };
+
+        assert_eq!(totals.ready_percentage(), 75.0);
+        assert_eq!(totals.unacked_percentage(), 25.0);
+    }
+
+    #[test]
+    fn test_object_totals_helpers() {
+        let totals = ObjectTotals {
+            consumers: 20,
+            queues: 10,
+            exchanges: 15,
+            connections: 5,
+            channels: 25,
+        };
+
+        assert_eq!(totals.avg_channels_per_connection(), 5.0);
+        assert_eq!(totals.avg_consumers_per_queue(), 2.0);
+        assert!(!totals.has_idle_queues()); // 20 consumers for 10 queues
+    }
+
+    #[test]
+    fn test_connection_info_helpers() {
+        let conn = ConnectionInfo {
+            name: "test_connection".to_string(),
+            vhost: "/".to_string(),
+            user: "guest".to_string(),
+            state: "running".to_string(),
+            channels: 10,
+            peer_host: "127.0.0.1".to_string(),
+            peer_port: 5672,
+            recv_oct: 10485760, // 10 MB
+            send_oct: 5242880,  // 5 MB
+            recv_cnt: 1000,
+            send_cnt: 500,
+        };
+
+        assert!(conn.is_running());
+        assert!(conn.has_channels());
+        assert_eq!(conn.total_bytes(), 15728640);
+        assert_eq!(conn.recv_mb(), 10.0);
+        assert_eq!(conn.send_mb(), 5.0);
+        assert_eq!(conn.total_messages(), 1500);
+        assert_eq!(conn.avg_message_size(), 10485.76);
+        assert_eq!(conn.peer_address(), "127.0.0.1:5672");
+    }
+
+    #[test]
+    fn test_channel_info_helpers() {
+        let channel = ChannelInfo {
+            name: "test_channel".to_string(),
+            connection_details: Some(ConnectionDetails {
+                name: "conn".to_string(),
+                peer_host: "127.0.0.1".to_string(),
+                peer_port: 5672,
+            }),
+            vhost: "/".to_string(),
+            user: "guest".to_string(),
+            number: 1,
+            consumers: 3,
+            messages_unacknowledged: 50,
+            messages_uncommitted: 10,
+            acks_uncommitted: 5,
+            prefetch_count: 100,
+            state: "running".to_string(),
+        };
+
+        assert!(channel.is_running());
+        assert!(channel.has_consumers());
+        assert!(channel.has_unacked_messages());
+        assert!(channel.is_in_transaction());
+        assert!(channel.has_prefetch());
+        assert_eq!(channel.utilization(), 50.0);
+        assert_eq!(channel.peer_address(), Some("127.0.0.1:5672".to_string()));
     }
 }

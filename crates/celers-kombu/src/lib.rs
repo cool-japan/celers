@@ -3199,6 +3199,688 @@ impl MessageMiddleware for EncryptionMiddleware {
     }
 }
 
+/// Timeout middleware - enforces message processing time limits
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::TimeoutMiddleware;
+/// use std::time::Duration;
+///
+/// // Set 30 second timeout for message processing
+/// let middleware = TimeoutMiddleware::new(Duration::from_secs(30));
+/// ```
+pub struct TimeoutMiddleware {
+    timeout: Duration,
+}
+
+impl TimeoutMiddleware {
+    /// Create a new timeout middleware
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    /// Get the configured timeout
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for TimeoutMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        // Store timeout in message headers for consumer
+        message.headers.extra.insert(
+            "x-timeout-ms".to_string(),
+            serde_json::Value::Number((self.timeout.as_millis() as u64).into()),
+        );
+        Ok(())
+    }
+
+    async fn after_consume(&self, _message: &mut Message) -> Result<()> {
+        // Timeout checking is implementation-specific and would be handled
+        // by the consumer/worker. This middleware just sets the metadata.
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "timeout"
+    }
+}
+
+/// Filter middleware - filters messages based on custom criteria
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::FilterMiddleware;
+/// use celers_protocol::Message;
+///
+/// // Create filter that only allows high-priority tasks
+/// let filter = FilterMiddleware::new(|msg: &Message| {
+///     msg.task_name().starts_with("critical_")
+/// });
+/// ```
+pub struct FilterMiddleware {
+    predicate: Box<dyn Fn(&Message) -> bool + Send + Sync>,
+}
+
+impl FilterMiddleware {
+    /// Create a new filter middleware with a predicate function
+    pub fn new<F>(predicate: F) -> Self
+    where
+        F: Fn(&Message) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            predicate: Box::new(predicate),
+        }
+    }
+
+    /// Check if a message passes the filter
+    pub fn matches(&self, message: &Message) -> bool {
+        (self.predicate)(message)
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for FilterMiddleware {
+    async fn before_publish(&self, _message: &mut Message) -> Result<()> {
+        // No filtering on publish
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        if !self.matches(message) {
+            return Err(BrokerError::Configuration(
+                "Message filtered out by predicate".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "filter"
+    }
+}
+
+/// Sampling middleware for statistical message sampling.
+///
+/// Allows only a percentage of messages to pass through, useful for
+/// monitoring, testing, or load reduction.
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::SamplingMiddleware;
+///
+/// // Sample 10% of messages
+/// let sampler = SamplingMiddleware::new(0.1);
+/// assert_eq!(sampler.sample_rate(), 0.1);
+/// ```
+pub struct SamplingMiddleware {
+    sample_rate: f64,
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl SamplingMiddleware {
+    /// Create a new sampling middleware with the given sample rate.
+    ///
+    /// Sample rate should be between 0.0 and 1.0, where:
+    /// - 0.0 = sample nothing
+    /// - 1.0 = sample everything
+    /// - 0.1 = sample approximately 10% of messages
+    pub fn new(sample_rate: f64) -> Self {
+        Self {
+            sample_rate: sample_rate.clamp(0.0, 1.0),
+            counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Get the configured sample rate
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
+    /// Check if a message should be sampled
+    fn should_sample(&self) -> bool {
+        let count = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Deterministic sampling based on counter
+        let threshold = (u64::MAX as f64 * self.sample_rate) as u64;
+        (count % u64::MAX) < threshold
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for SamplingMiddleware {
+    async fn before_publish(&self, _message: &mut Message) -> Result<()> {
+        // No sampling on publish
+        Ok(())
+    }
+
+    async fn after_consume(&self, _message: &mut Message) -> Result<()> {
+        if !self.should_sample() {
+            return Err(BrokerError::Configuration(
+                "Message filtered out by sampling".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "sampling"
+    }
+}
+
+/// Transformation middleware for message content transformation.
+///
+/// Applies a transformation function to message bodies during processing.
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::TransformationMiddleware;
+///
+/// // Create a transformer that uppercases text
+/// let transformer = TransformationMiddleware::new(|body: Vec<u8>| {
+///     String::from_utf8_lossy(&body).to_uppercase().into_bytes()
+/// });
+/// ```
+pub struct TransformationMiddleware {
+    transform_fn: Box<dyn Fn(Vec<u8>) -> Vec<u8> + Send + Sync>,
+}
+
+impl TransformationMiddleware {
+    /// Create a new transformation middleware with a transform function
+    pub fn new<F>(transform_fn: F) -> Self
+    where
+        F: Fn(Vec<u8>) -> Vec<u8> + Send + Sync + 'static,
+    {
+        Self {
+            transform_fn: Box::new(transform_fn),
+        }
+    }
+
+    /// Apply the transformation to message body
+    fn transform(&self, body: Vec<u8>) -> Vec<u8> {
+        (self.transform_fn)(body)
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for TransformationMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        // Transform on publish
+        let transformed = self.transform(message.body.clone());
+        message.body = transformed;
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        // Transform on consume
+        let transformed = self.transform(message.body.clone());
+        message.body = transformed;
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "transformation"
+    }
+}
+
+/// Tracing middleware for distributed tracing
+///
+/// Injects trace IDs into message headers for distributed tracing.
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::{TracingMiddleware, MessageMiddleware};
+///
+/// let middleware = TracingMiddleware::new("service-name");
+/// assert_eq!(middleware.name(), "tracing");
+/// ```
+#[derive(Debug, Clone)]
+pub struct TracingMiddleware {
+    service_name: String,
+}
+
+impl TracingMiddleware {
+    /// Create a new tracing middleware
+    pub fn new(service_name: impl Into<String>) -> Self {
+        Self {
+            service_name: service_name.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for TracingMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        // Inject trace ID if not present
+        if !message.headers.extra.contains_key("trace-id") {
+            let trace_id = uuid::Uuid::new_v4().to_string();
+            message
+                .headers
+                .extra
+                .insert("trace-id".to_string(), serde_json::json!(trace_id));
+        }
+
+        // Add service name
+        message.headers.extra.insert(
+            "service-name".to_string(),
+            serde_json::json!(self.service_name.clone()),
+        );
+
+        // Add span ID for this operation
+        let span_id = uuid::Uuid::new_v4().to_string();
+        message
+            .headers
+            .extra
+            .insert("span-id".to_string(), serde_json::json!(span_id));
+
+        // Add timestamp
+        message.headers.extra.insert(
+            "trace-timestamp".to_string(),
+            serde_json::json!(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()),
+        );
+
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        // Extract and log trace information
+        if let Some(trace_id) = message.headers.extra.get("trace-id").cloned() {
+            // In production, this would be sent to a tracing system
+            message.headers.extra.insert(
+                "consumer-service".to_string(),
+                serde_json::json!(self.service_name.clone()),
+            );
+            message
+                .headers
+                .extra
+                .insert("trace-id-consumed".to_string(), trace_id);
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "tracing"
+    }
+}
+
+/// Batching middleware for automatic message batching
+///
+/// Automatically batches messages based on size or time thresholds.
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::{BatchingMiddleware, MessageMiddleware};
+///
+/// let middleware = BatchingMiddleware::new(100, 5000);
+/// assert_eq!(middleware.name(), "batching");
+/// ```
+#[derive(Debug, Clone)]
+pub struct BatchingMiddleware {
+    batch_size: usize,
+    batch_timeout_ms: u64,
+}
+
+impl BatchingMiddleware {
+    /// Create a new batching middleware
+    ///
+    /// # Arguments
+    ///
+    /// * `batch_size` - Maximum messages per batch
+    /// * `batch_timeout_ms` - Maximum wait time in milliseconds
+    pub fn new(batch_size: usize, batch_timeout_ms: u64) -> Self {
+        Self {
+            batch_size,
+            batch_timeout_ms,
+        }
+    }
+
+    /// Create with default settings (100 messages, 5 second timeout)
+    pub fn with_defaults() -> Self {
+        Self::new(100, 5000)
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for BatchingMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        // Add batching metadata
+        message.headers.extra.insert(
+            "batch-size-hint".to_string(),
+            serde_json::json!(self.batch_size),
+        );
+        message.headers.extra.insert(
+            "batch-timeout-ms".to_string(),
+            serde_json::json!(self.batch_timeout_ms),
+        );
+
+        // Mark message as batch-enabled
+        message
+            .headers
+            .extra
+            .insert("batching-enabled".to_string(), serde_json::json!(true));
+
+        Ok(())
+    }
+
+    async fn after_consume(&self, _message: &mut Message) -> Result<()> {
+        // No-op for consume side
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "batching"
+    }
+}
+
+/// Audit middleware for comprehensive audit logging
+///
+/// Logs all message operations for audit trails and compliance.
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::{AuditMiddleware, MessageMiddleware};
+///
+/// let middleware = AuditMiddleware::new(true);
+/// assert_eq!(middleware.name(), "audit");
+/// ```
+#[derive(Debug, Clone)]
+pub struct AuditMiddleware {
+    log_body: bool,
+}
+
+impl AuditMiddleware {
+    /// Create a new audit middleware
+    ///
+    /// # Arguments
+    ///
+    /// * `log_body` - Whether to include message body in audit logs
+    pub fn new(log_body: bool) -> Self {
+        Self { log_body }
+    }
+
+    /// Create audit middleware with body logging enabled
+    pub fn with_body_logging() -> Self {
+        Self::new(true)
+    }
+
+    /// Create audit middleware without body logging
+    pub fn without_body_logging() -> Self {
+        Self::new(false)
+    }
+
+    fn create_audit_entry(&self, message: &Message, operation: &str) -> String {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let body_info = if self.log_body {
+            format!("body_size={}", message.body.len())
+        } else {
+            "body=<redacted>".to_string()
+        };
+
+        format!(
+            "[AUDIT] timestamp={} operation={} task_id={} task_name={} {}",
+            timestamp,
+            operation,
+            message.task_id(),
+            message.task_name(),
+            body_info
+        )
+    }
+}
+
+#[async_trait]
+impl MessageMiddleware for AuditMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        let audit_entry = self.create_audit_entry(message, "PUBLISH");
+
+        // In production, this would be sent to an audit logging system
+        message
+            .headers
+            .extra
+            .insert("audit-publish".to_string(), serde_json::json!(audit_entry));
+
+        // Add audit ID
+        let audit_id = uuid::Uuid::new_v4().to_string();
+        message
+            .headers
+            .extra
+            .insert("audit-id".to_string(), serde_json::json!(audit_id));
+
+        Ok(())
+    }
+
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        let audit_entry = self.create_audit_entry(message, "CONSUME");
+
+        // In production, this would be sent to an audit logging system
+        message
+            .headers
+            .extra
+            .insert("audit-consume".to_string(), serde_json::json!(audit_entry));
+
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "audit"
+    }
+}
+
+/// Backpressure configuration for flow control
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::BackpressureConfig;
+///
+/// let config = BackpressureConfig::new()
+///     .with_max_pending(1000)
+///     .with_max_queue_size(10000)
+///     .with_high_watermark(0.8)
+///     .with_low_watermark(0.6);
+/// ```
+#[derive(Debug, Clone)]
+pub struct BackpressureConfig {
+    /// Maximum number of pending (unacknowledged) messages
+    pub max_pending: usize,
+    /// Maximum queue size before applying backpressure
+    pub max_queue_size: usize,
+    /// High watermark ratio (0.0-1.0) to start backpressure
+    pub high_watermark: f64,
+    /// Low watermark ratio (0.0-1.0) to stop backpressure
+    pub low_watermark: f64,
+}
+
+impl BackpressureConfig {
+    /// Create a new backpressure configuration with defaults
+    pub fn new() -> Self {
+        Self {
+            max_pending: 1000,
+            max_queue_size: 10000,
+            high_watermark: 0.8,
+            low_watermark: 0.6,
+        }
+    }
+
+    /// Set maximum pending messages
+    pub fn with_max_pending(mut self, max: usize) -> Self {
+        self.max_pending = max;
+        self
+    }
+
+    /// Set maximum queue size
+    pub fn with_max_queue_size(mut self, max: usize) -> Self {
+        self.max_queue_size = max;
+        self
+    }
+
+    /// Set high watermark ratio
+    pub fn with_high_watermark(mut self, ratio: f64) -> Self {
+        self.high_watermark = ratio.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set low watermark ratio
+    pub fn with_low_watermark(mut self, ratio: f64) -> Self {
+        self.low_watermark = ratio.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Check if backpressure should be applied based on pending count
+    pub fn should_apply_backpressure(&self, pending: usize) -> bool {
+        pending >= (self.max_pending as f64 * self.high_watermark) as usize
+    }
+
+    /// Check if backpressure should be released based on pending count
+    pub fn should_release_backpressure(&self, pending: usize) -> bool {
+        pending <= (self.max_pending as f64 * self.low_watermark) as usize
+    }
+
+    /// Check if queue is at capacity
+    pub fn is_at_capacity(&self, queue_size: usize) -> bool {
+        queue_size >= self.max_queue_size
+    }
+}
+
+impl Default for BackpressureConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Poison message detector - identifies repeatedly failing messages
+///
+/// # Examples
+///
+/// ```
+/// use celers_kombu::PoisonMessageDetector;
+///
+/// let detector = PoisonMessageDetector::new()
+///     .with_max_failures(5)
+///     .with_failure_window(std::time::Duration::from_secs(3600));
+/// ```
+#[derive(Debug, Clone)]
+pub struct PoisonMessageDetector {
+    /// Maximum failures before marking as poison
+    pub max_failures: u32,
+    /// Time window to track failures
+    pub failure_window: Duration,
+    /// Failure tracking map: task_id -> (failures, last_failure_time)
+    failures: std::sync::Arc<std::sync::Mutex<HashMap<uuid::Uuid, (u32, u64)>>>,
+}
+
+impl PoisonMessageDetector {
+    /// Create a new poison message detector
+    pub fn new() -> Self {
+        Self {
+            max_failures: 5,
+            failure_window: Duration::from_secs(3600),
+            failures: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Set maximum failures threshold
+    pub fn with_max_failures(mut self, max: u32) -> Self {
+        self.max_failures = max;
+        self
+    }
+
+    /// Set failure tracking window
+    pub fn with_failure_window(mut self, window: Duration) -> Self {
+        self.failure_window = window;
+        self
+    }
+
+    /// Record a message failure
+    pub fn record_failure(&self, task_id: uuid::Uuid) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut failures = self.failures.lock().unwrap();
+
+        let entry = failures.entry(task_id).or_insert((0, now));
+
+        // Reset if outside window
+        if now - entry.1 > self.failure_window.as_secs() {
+            *entry = (1, now);
+        } else {
+            entry.0 += 1;
+            entry.1 = now;
+        }
+    }
+
+    /// Check if a message is a poison message
+    pub fn is_poison(&self, task_id: uuid::Uuid) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let failures = self.failures.lock().unwrap();
+
+        if let Some((count, last_failure)) = failures.get(&task_id) {
+            if now - last_failure <= self.failure_window.as_secs() {
+                return *count >= self.max_failures;
+            }
+        }
+
+        false
+    }
+
+    /// Get failure count for a message
+    pub fn failure_count(&self, task_id: uuid::Uuid) -> u32 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let failures = self.failures.lock().unwrap();
+
+        if let Some((count, last_failure)) = failures.get(&task_id) {
+            if now - last_failure <= self.failure_window.as_secs() {
+                return *count;
+            }
+        }
+
+        0
+    }
+
+    /// Clear failure history for a message
+    pub fn clear_failures(&self, task_id: uuid::Uuid) {
+        let mut failures = self.failures.lock().unwrap();
+        failures.remove(&task_id);
+    }
+
+    /// Clear all failure history
+    pub fn clear_all(&self) {
+        let mut failures = self.failures.lock().unwrap();
+        failures.clear();
+    }
+}
+
+impl Default for PoisonMessageDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // =============================================================================
 // Mock Broker Implementation (for testing)
 // =============================================================================
@@ -3468,6 +4150,1223 @@ impl MetricsProvider for MockBroker {
 // Blanket implementations for middleware traits
 impl<T: Producer> MiddlewareProducer for T {}
 impl<T: Consumer> MiddlewareConsumer for T {}
+
+// =============================================================================
+// Utilities
+// =============================================================================
+
+/// Utility functions for broker operations and analysis.
+pub mod utils {
+    use super::*;
+
+    /// Calculate optimal batch size based on message size and target throughput.
+    ///
+    /// # Arguments
+    ///
+    /// * `avg_message_size` - Average message size in bytes
+    /// * `target_throughput_per_sec` - Target messages per second
+    /// * `max_batch_size` - Maximum allowed batch size
+    ///
+    /// # Returns
+    ///
+    /// Recommended batch size
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_optimal_batch_size;
+    ///
+    /// let batch_size = calculate_optimal_batch_size(1024, 1000, 100);
+    /// assert!(batch_size > 0 && batch_size <= 100);
+    /// ```
+    pub fn calculate_optimal_batch_size(
+        avg_message_size: usize,
+        target_throughput_per_sec: usize,
+        max_batch_size: usize,
+    ) -> usize {
+        if target_throughput_per_sec == 0 || avg_message_size == 0 {
+            return 1;
+        }
+
+        // For small messages, larger batches are more efficient
+        // For large messages, smaller batches reduce memory pressure
+        let size_factor = if avg_message_size < 1024 {
+            10 // Small messages: batch more
+        } else if avg_message_size < 10240 {
+            5 // Medium messages: moderate batching
+        } else {
+            2 // Large messages: batch less
+        };
+
+        // Calculate based on throughput (batch every 100ms)
+        let throughput_factor = (target_throughput_per_sec / 10).max(1);
+
+        // Combine factors
+        let calculated = (throughput_factor / size_factor).max(1);
+
+        // Clamp to max batch size
+        calculated.min(max_batch_size)
+    }
+
+    /// Match a routing key against a topic pattern (AMQP-style).
+    ///
+    /// Supports wildcards:
+    /// - `*` matches exactly one word
+    /// - `#` matches zero or more words
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::match_routing_pattern;
+    ///
+    /// assert!(match_routing_pattern("stock.usd.nyse", "stock.*.nyse"));
+    /// assert!(match_routing_pattern("stock.eur.nyse", "stock.#"));
+    /// assert!(match_routing_pattern("quick.orange.rabbit", "*.orange.*"));
+    /// assert!(!match_routing_pattern("quick.orange.rabbit", "*.blue.*"));
+    /// ```
+    pub fn match_routing_pattern(routing_key: &str, pattern: &str) -> bool {
+        let key_parts: Vec<&str> = routing_key.split('.').collect();
+        let pattern_parts: Vec<&str> = pattern.split('.').collect();
+
+        match_parts(&key_parts, &pattern_parts)
+    }
+
+    fn match_parts(key_parts: &[&str], pattern_parts: &[&str]) -> bool {
+        if pattern_parts.is_empty() {
+            return key_parts.is_empty();
+        }
+
+        if pattern_parts[0] == "#" {
+            if pattern_parts.len() == 1 {
+                return true; // # matches everything
+            }
+            // Try matching # with 0, 1, 2, ... words
+            for i in 0..=key_parts.len() {
+                if match_parts(&key_parts[i..], &pattern_parts[1..]) {
+                    return true;
+                }
+            }
+            false
+        } else if key_parts.is_empty() {
+            false
+        } else if pattern_parts[0] == "*" || pattern_parts[0] == key_parts[0] {
+            match_parts(&key_parts[1..], &pattern_parts[1..])
+        } else {
+            false
+        }
+    }
+
+    /// Analyze broker performance from metrics.
+    ///
+    /// Returns a tuple of (success_rate, error_rate, avg_ack_rate).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::{BrokerMetrics, utils::analyze_broker_performance};
+    ///
+    /// let mut metrics = BrokerMetrics::new();
+    /// metrics.messages_published = 100;
+    /// metrics.messages_consumed = 90;
+    /// metrics.messages_acknowledged = 85;
+    /// metrics.publish_errors = 5;
+    ///
+    /// let (success_rate, error_rate, ack_rate) = analyze_broker_performance(&metrics);
+    /// assert!(success_rate > 0.9);
+    /// assert!(error_rate < 0.1);
+    /// ```
+    pub fn analyze_broker_performance(metrics: &BrokerMetrics) -> (f64, f64, f64) {
+        let total_ops = metrics.messages_published + metrics.messages_consumed;
+        let total_errors = metrics.publish_errors + metrics.consume_errors;
+
+        let success_rate = if total_ops > 0 {
+            (total_ops - total_errors) as f64 / total_ops as f64
+        } else {
+            1.0
+        };
+
+        let error_rate = if total_ops > 0 {
+            total_errors as f64 / total_ops as f64
+        } else {
+            0.0
+        };
+
+        let ack_rate = if metrics.messages_consumed > 0 {
+            metrics.messages_acknowledged as f64 / metrics.messages_consumed as f64
+        } else {
+            0.0
+        };
+
+        (success_rate, error_rate, ack_rate)
+    }
+
+    /// Estimate serialized message size.
+    ///
+    /// Provides a rough estimate for planning purposes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::estimate_message_size;
+    /// use celers_protocol::Message;
+    /// use uuid::Uuid;
+    ///
+    /// let message = Message::new("my_task".to_string(), Uuid::new_v4(), vec![1, 2, 3, 4, 5]);
+    /// let size = estimate_message_size(&message);
+    /// assert!(size > 0);
+    /// ```
+    pub fn estimate_message_size(message: &Message) -> usize {
+        // Base overhead for message structure
+        let base = 200; // UUID, headers, metadata, etc.
+        let task_name = message.task_name().len();
+        let body = message.body.len();
+
+        base + task_name + body
+    }
+
+    /// Analyze queue health based on size and thresholds.
+    ///
+    /// Returns a health status:
+    /// - "healthy" if queue size is below low threshold
+    /// - "warning" if queue size is between low and high threshold
+    /// - "critical" if queue size is above high threshold
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::analyze_queue_health;
+    ///
+    /// assert_eq!(analyze_queue_health(50, 100, 1000), "healthy");
+    /// assert_eq!(analyze_queue_health(500, 100, 1000), "warning");
+    /// assert_eq!(analyze_queue_health(1500, 100, 1000), "critical");
+    /// ```
+    pub fn analyze_queue_health(
+        queue_size: usize,
+        low_threshold: usize,
+        high_threshold: usize,
+    ) -> &'static str {
+        if queue_size < low_threshold {
+            "healthy"
+        } else if queue_size < high_threshold {
+            "warning"
+        } else {
+            "critical"
+        }
+    }
+
+    /// Calculate message throughput (messages per second).
+    ///
+    /// # Arguments
+    ///
+    /// * `message_count` - Number of messages processed
+    /// * `duration_secs` - Time duration in seconds
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_throughput;
+    ///
+    /// let throughput = calculate_throughput(1000, 10.0);
+    /// assert_eq!(throughput, 100.0);
+    /// ```
+    pub fn calculate_throughput(message_count: u64, duration_secs: f64) -> f64 {
+        if duration_secs <= 0.0 {
+            0.0
+        } else {
+            message_count as f64 / duration_secs
+        }
+    }
+
+    /// Calculate average latency in milliseconds.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_latency_ms` - Total latency in milliseconds
+    /// * `message_count` - Number of messages
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_avg_latency;
+    ///
+    /// let avg = calculate_avg_latency(5000.0, 100);
+    /// assert_eq!(avg, 50.0);
+    /// ```
+    pub fn calculate_avg_latency(total_latency_ms: f64, message_count: u64) -> f64 {
+        if message_count == 0 {
+            0.0
+        } else {
+            total_latency_ms / message_count as f64
+        }
+    }
+
+    /// Estimate time to drain a queue at a given consumption rate.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_size` - Current queue size
+    /// * `consumption_rate_per_sec` - Messages consumed per second
+    ///
+    /// # Returns
+    ///
+    /// Estimated time in seconds to drain the queue
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::estimate_drain_time;
+    ///
+    /// let time = estimate_drain_time(1000, 100);
+    /// assert_eq!(time, 10.0);
+    /// ```
+    pub fn estimate_drain_time(queue_size: usize, consumption_rate_per_sec: usize) -> f64 {
+        if consumption_rate_per_sec == 0 {
+            f64::INFINITY
+        } else {
+            queue_size as f64 / consumption_rate_per_sec as f64
+        }
+    }
+
+    /// Calculate exponential backoff delay with optional jitter.
+    ///
+    /// # Arguments
+    ///
+    /// * `attempt` - Current retry attempt (0-based)
+    /// * `base_delay_ms` - Base delay in milliseconds
+    /// * `max_delay_ms` - Maximum delay cap in milliseconds
+    /// * `jitter_factor` - Jitter factor (0.0 = no jitter, 1.0 = full jitter)
+    ///
+    /// # Returns
+    ///
+    /// Delay in milliseconds with jitter applied
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_backoff_delay;
+    ///
+    /// // First retry: 100ms with no jitter
+    /// let delay = calculate_backoff_delay(0, 100, 60000, 0.0);
+    /// assert_eq!(delay, 100);
+    ///
+    /// // Third retry: ~400ms (100 * 2^2) with no jitter
+    /// let delay = calculate_backoff_delay(2, 100, 60000, 0.0);
+    /// assert_eq!(delay, 400);
+    /// ```
+    pub fn calculate_backoff_delay(
+        attempt: u32,
+        base_delay_ms: u64,
+        max_delay_ms: u64,
+        jitter_factor: f64,
+    ) -> u64 {
+        use std::cmp::min;
+
+        // Calculate exponential backoff: base * 2^attempt
+        let exponential = base_delay_ms.saturating_mul(2u64.saturating_pow(attempt));
+        let capped = min(exponential, max_delay_ms);
+
+        // Apply jitter if specified
+        if jitter_factor > 0.0 {
+            let jitter = (capped as f64 * jitter_factor.clamp(0.0, 1.0)) as u64;
+            // Simple deterministic jitter based on attempt number
+            let jitter_amount = jitter / 2 + (attempt as u64 * 17) % (jitter / 2 + 1);
+            capped.saturating_sub(jitter_amount)
+        } else {
+            capped
+        }
+    }
+
+    /// Analyze circuit breaker state and recommend action.
+    ///
+    /// Returns a tuple of (health_score, recommendation) where:
+    /// - health_score: 0.0 (unhealthy) to 1.0 (healthy)
+    /// - recommendation: suggested action
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::analyze_circuit_breaker;
+    ///
+    /// let (score, recommendation) = analyze_circuit_breaker(10, 90, 100);
+    /// assert!(score > 0.8);
+    /// assert_eq!(recommendation, "healthy");
+    ///
+    /// let (score, recommendation) = analyze_circuit_breaker(60, 40, 100);
+    /// assert!(score < 0.5);
+    /// assert_eq!(recommendation, "critical");
+    /// ```
+    pub fn analyze_circuit_breaker(
+        failures: u64,
+        successes: u64,
+        total_requests: u64,
+    ) -> (f64, &'static str) {
+        if total_requests == 0 {
+            return (1.0, "healthy");
+        }
+
+        let failure_rate = failures as f64 / total_requests as f64;
+        let success_rate = successes as f64 / total_requests as f64;
+
+        let health_score = success_rate;
+
+        let recommendation = if failure_rate > 0.5 {
+            "critical"
+        } else if failure_rate > 0.2 {
+            "warning"
+        } else {
+            "healthy"
+        };
+
+        (health_score, recommendation)
+    }
+
+    /// Calculate optimal number of consumer workers based on queue size and processing rate.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_size` - Current queue size
+    /// * `avg_processing_time_ms` - Average message processing time in milliseconds
+    /// * `target_drain_time_secs` - Target time to drain queue in seconds
+    /// * `max_workers` - Maximum number of workers allowed
+    ///
+    /// # Returns
+    ///
+    /// Recommended number of workers
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_optimal_workers;
+    ///
+    /// let workers = calculate_optimal_workers(1000, 100, 60, 10);
+    /// assert!(workers > 0 && workers <= 10);
+    /// ```
+    pub fn calculate_optimal_workers(
+        queue_size: usize,
+        avg_processing_time_ms: u64,
+        target_drain_time_secs: u64,
+        max_workers: usize,
+    ) -> usize {
+        if queue_size == 0 || target_drain_time_secs == 0 || avg_processing_time_ms == 0 {
+            return 1;
+        }
+
+        // Messages per second one worker can process
+        let msgs_per_sec_per_worker = 1000.0 / avg_processing_time_ms as f64;
+
+        // Total messages per second needed
+        let required_throughput = queue_size as f64 / target_drain_time_secs as f64;
+
+        // Calculate needed workers
+        let needed_workers = (required_throughput / msgs_per_sec_per_worker).ceil() as usize;
+
+        // Clamp to at least 1 and at most max_workers
+        needed_workers.clamp(1, max_workers)
+    }
+
+    /// Generate a stable message ID for deduplication based on task name and arguments.
+    ///
+    /// This creates a deterministic ID that can be used to detect duplicate messages.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::generate_deduplication_id;
+    ///
+    /// let id1 = generate_deduplication_id("my_task", b"args");
+    /// let id2 = generate_deduplication_id("my_task", b"args");
+    /// assert_eq!(id1, id2); // Same inputs = same ID
+    ///
+    /// let id3 = generate_deduplication_id("my_task", b"different");
+    /// assert_ne!(id1, id3); // Different inputs = different ID
+    /// ```
+    pub fn generate_deduplication_id(task_name: &str, args: &[u8]) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        task_name.hash(&mut hasher);
+        args.hash(&mut hasher);
+        format!("{:x}", hasher.finish())
+    }
+
+    /// Analyze connection pool health and efficiency.
+    ///
+    /// Returns a tuple of (efficiency_score, status) where:
+    /// - efficiency_score: 0.0 (inefficient) to 1.0 (efficient)
+    /// - status: pool health status
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::analyze_pool_health;
+    ///
+    /// let (efficiency, status) = analyze_pool_health(8, 2, 10, 100, 5);
+    /// assert!(efficiency > 0.0);
+    /// assert!(status.len() > 0);
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn analyze_pool_health(
+        active_connections: usize,
+        idle_connections: usize,
+        max_connections: usize,
+        total_requests: u64,
+        timeout_count: u64,
+    ) -> (f64, &'static str) {
+        let total_connections = active_connections + idle_connections;
+
+        if max_connections == 0 {
+            return (0.0, "invalid");
+        }
+
+        // Calculate utilization
+        let utilization = total_connections as f64 / max_connections as f64;
+
+        // Calculate timeout rate
+        let timeout_rate = if total_requests > 0 {
+            timeout_count as f64 / total_requests as f64
+        } else {
+            0.0
+        };
+
+        // Efficiency score: penalize high timeouts and extreme utilization
+        let timeout_penalty = timeout_rate * 0.5;
+        let utilization_score = if utilization > 0.9 {
+            0.7 // High utilization might indicate need for more connections
+        } else if utilization < 0.1 {
+            0.8 // Low utilization is okay but might indicate oversized pool
+        } else {
+            1.0 // Good utilization
+        };
+
+        let efficiency = (utilization_score - timeout_penalty).clamp(0.0, 1.0);
+
+        let status = if timeout_rate > 0.1 {
+            "critical"
+        } else if utilization > 0.95 {
+            "saturated"
+        } else if utilization < 0.05 {
+            "underutilized"
+        } else {
+            "healthy"
+        };
+
+        (efficiency, status)
+    }
+
+    /// Calculate load distribution across multiple queues.
+    ///
+    /// Returns a vector of (queue_index, recommended_workers) tuples.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_load_distribution;
+    ///
+    /// let queue_sizes = vec![100, 50, 200];
+    /// let distribution = calculate_load_distribution(&queue_sizes, 10);
+    /// assert_eq!(distribution.len(), 3);
+    /// assert!(distribution.iter().map(|(_, w)| w).sum::<usize>() <= 10);
+    /// ```
+    pub fn calculate_load_distribution(
+        queue_sizes: &[usize],
+        total_workers: usize,
+    ) -> Vec<(usize, usize)> {
+        if queue_sizes.is_empty() || total_workers == 0 {
+            return vec![];
+        }
+
+        let total_messages: usize = queue_sizes.iter().sum();
+        if total_messages == 0 {
+            // Distribute evenly if all queues are empty
+            let workers_per_queue = total_workers / queue_sizes.len();
+            let remainder = total_workers % queue_sizes.len();
+            return queue_sizes
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| {
+                    let workers = workers_per_queue + if idx < remainder { 1 } else { 0 };
+                    (idx, workers)
+                })
+                .collect();
+        }
+
+        // Distribute proportionally based on queue size
+        let mut distribution: Vec<(usize, usize)> = queue_sizes
+            .iter()
+            .enumerate()
+            .map(|(idx, &size)| {
+                let proportion = size as f64 / total_messages as f64;
+                let workers = (proportion * total_workers as f64).round() as usize;
+                (idx, workers)
+            })
+            .collect();
+
+        // Adjust to ensure total equals total_workers
+        let assigned: usize = distribution.iter().map(|(_, w)| w).sum();
+        if assigned < total_workers {
+            // Give remaining workers to largest queues
+            let diff = total_workers - assigned;
+            let dist_len = distribution.len();
+            for _i in 0..diff {
+                if let Some(max_queue) = queue_sizes
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, &size)| size)
+                    .map(|(idx, _)| idx)
+                {
+                    distribution[max_queue % dist_len].1 += 1;
+                }
+            }
+        }
+
+        distribution
+    }
+
+    /// Check if a routing key matches a direct exchange pattern.
+    ///
+    /// Direct exchanges route based on exact matching.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::match_direct_routing;
+    ///
+    /// assert!(match_direct_routing("user.created", "user.created"));
+    /// assert!(!match_direct_routing("user.created", "user.deleted"));
+    /// ```
+    pub fn match_direct_routing(routing_key: &str, pattern: &str) -> bool {
+        routing_key == pattern
+    }
+
+    /// Check if a routing key matches a fanout exchange.
+    ///
+    /// Fanout exchanges route to all bound queues regardless of routing key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::match_fanout_routing;
+    ///
+    /// assert!(match_fanout_routing("anything"));
+    /// assert!(match_fanout_routing(""));
+    /// ```
+    pub fn match_fanout_routing(_routing_key: &str) -> bool {
+        true // Fanout always matches
+    }
+
+    /// Estimate memory usage for a queue based on message count and average size.
+    ///
+    /// Returns estimated memory in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::estimate_queue_memory;
+    ///
+    /// let memory = estimate_queue_memory(1000, 1024);
+    /// assert!(memory > 1_000_000);
+    /// ```
+    pub fn estimate_queue_memory(message_count: usize, avg_message_size: usize) -> usize {
+        // Include overhead for queue metadata and message wrappers
+        let overhead_per_message = 100; // bytes
+        message_count * (avg_message_size + overhead_per_message)
+    }
+
+    /// Calculate priority score for message processing order.
+    ///
+    /// Higher scores should be processed first. Factors in priority level,
+    /// message age, and retry count.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_priority_score;
+    /// use celers_kombu::Priority;
+    ///
+    /// let score = calculate_priority_score(Priority::High, 100, 0);
+    /// assert!(score > 0.0);
+    ///
+    /// // Older messages get higher scores
+    /// let old_score = calculate_priority_score(Priority::Normal, 1000, 0);
+    /// let new_score = calculate_priority_score(Priority::Normal, 100, 0);
+    /// assert!(old_score > new_score);
+    /// ```
+    pub fn calculate_priority_score(priority: Priority, age_seconds: u64, retry_count: u32) -> f64 {
+        let priority_weight = match priority {
+            Priority::Highest => 10.0,
+            Priority::High => 7.0,
+            Priority::Normal => 5.0,
+            Priority::Low => 3.0,
+            Priority::Lowest => 1.0,
+        };
+
+        let age_factor = (age_seconds as f64).ln().max(1.0);
+        let retry_penalty = 0.9_f64.powi(retry_count as i32);
+
+        priority_weight * age_factor * retry_penalty
+    }
+
+    /// Suggest optimal message batch groups based on size constraints.
+    ///
+    /// Returns a vector of batch sizes that maximizes throughput while
+    /// staying within size limits.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::suggest_batch_groups;
+    ///
+    /// let message_sizes = vec![100, 200, 150, 300, 250, 400];
+    /// let groups = suggest_batch_groups(&message_sizes, 600);
+    /// assert!(groups.len() > 0);
+    /// ```
+    pub fn suggest_batch_groups(
+        message_sizes: &[usize],
+        max_batch_bytes: usize,
+    ) -> Vec<Vec<usize>> {
+        let mut groups = Vec::new();
+        let mut current_group = Vec::new();
+        let mut current_size = 0;
+
+        for (idx, &size) in message_sizes.iter().enumerate() {
+            if current_size + size <= max_batch_bytes {
+                current_group.push(idx);
+                current_size += size;
+            } else {
+                if !current_group.is_empty() {
+                    groups.push(current_group);
+                }
+                current_group = vec![idx];
+                current_size = size;
+            }
+        }
+
+        if !current_group.is_empty() {
+            groups.push(current_group);
+        }
+
+        groups
+    }
+
+    /// Calculate aggregate health score from multiple metrics.
+    ///
+    /// Returns a score from 0.0 (unhealthy) to 1.0 (healthy).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_health_score;
+    ///
+    /// let score = calculate_health_score(0.95, 100, 0.0, 500);
+    /// assert!(score > 0.8);
+    ///
+    /// let bad_score = calculate_health_score(0.5, 10000, 0.3, 5000);
+    /// assert!(bad_score < 0.5);
+    /// ```
+    pub fn calculate_health_score(
+        success_rate: f64,
+        queue_size: usize,
+        error_rate: f64,
+        latency_ms: u64,
+    ) -> f64 {
+        // Success rate component (0-1)
+        let success_component = success_rate;
+
+        // Queue size component (1 when empty, decreases with size)
+        let queue_component = if queue_size < 100 {
+            1.0
+        } else if queue_size < 1000 {
+            0.8
+        } else if queue_size < 10000 {
+            0.5
+        } else {
+            0.2
+        };
+
+        // Error rate component (1 when no errors)
+        let error_component = (1.0 - error_rate).max(0.0);
+
+        // Latency component (1 when fast, decreases with latency)
+        let latency_component = if latency_ms < 100 {
+            1.0
+        } else if latency_ms < 500 {
+            0.8
+        } else if latency_ms < 1000 {
+            0.5
+        } else {
+            0.2
+        };
+
+        // Weighted average
+        (success_component * 0.4
+            + queue_component * 0.2
+            + error_component * 0.2
+            + latency_component * 0.2)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Identify stale messages based on age threshold.
+    ///
+    /// Returns indices of messages that exceed the age threshold.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::identify_stale_messages;
+    ///
+    /// let ages = vec![10, 100, 500, 2000, 5000];
+    /// let stale = identify_stale_messages(&ages, 1000);
+    /// assert_eq!(stale, vec![3, 4]);
+    /// ```
+    pub fn identify_stale_messages(message_ages: &[u64], threshold_seconds: u64) -> Vec<usize> {
+        message_ages
+            .iter()
+            .enumerate()
+            .filter(|(_, &age)| age > threshold_seconds)
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Predict throughput based on historical data.
+    ///
+    /// Uses simple linear regression on recent throughput samples.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::predict_throughput;
+    ///
+    /// let history = vec![100.0, 110.0, 120.0, 130.0, 140.0];
+    /// let prediction = predict_throughput(&history, 2);
+    /// assert!(prediction > 140.0);
+    /// ```
+    pub fn predict_throughput(historical_throughput: &[f64], periods_ahead: usize) -> f64 {
+        if historical_throughput.is_empty() {
+            return 0.0;
+        }
+
+        if historical_throughput.len() < 2 {
+            return historical_throughput[0];
+        }
+
+        // Calculate average rate of change
+        let mut changes = Vec::new();
+        for i in 1..historical_throughput.len() {
+            changes.push(historical_throughput[i] - historical_throughput[i - 1]);
+        }
+
+        let avg_change = changes.iter().sum::<f64>() / changes.len() as f64;
+        let last_value = historical_throughput[historical_throughput.len() - 1];
+
+        (last_value + avg_change * periods_ahead as f64).max(0.0)
+    }
+
+    /// Calculate queue rebalancing recommendations.
+    ///
+    /// Returns suggested message redistribution across queues to balance load.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_rebalancing;
+    ///
+    /// let queue_sizes = vec![1000, 100, 500];
+    /// let target_total = 1600;
+    /// let balanced = calculate_rebalancing(&queue_sizes, target_total);
+    /// assert_eq!(balanced.len(), 3);
+    /// assert_eq!(balanced.iter().sum::<usize>(), target_total);
+    /// ```
+    pub fn calculate_rebalancing(current_sizes: &[usize], target_total: usize) -> Vec<usize> {
+        if current_sizes.is_empty() {
+            return vec![];
+        }
+
+        let num_queues = current_sizes.len();
+        let per_queue = target_total / num_queues;
+        let remainder = target_total % num_queues;
+
+        let mut result = vec![per_queue; num_queues];
+        // Distribute remainder to first queues
+        for item in result.iter_mut().take(remainder) {
+            *item += 1;
+        }
+
+        result
+    }
+
+    /// Estimate time to process remaining messages with current rate.
+    ///
+    /// Returns estimated seconds to completion.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::estimate_completion_time;
+    ///
+    /// let time = estimate_completion_time(1000, 100.0);
+    /// assert_eq!(time, 10);
+    /// ```
+    pub fn estimate_completion_time(remaining_messages: usize, current_rate_per_sec: f64) -> u64 {
+        if current_rate_per_sec <= 0.0 {
+            return u64::MAX;
+        }
+
+        (remaining_messages as f64 / current_rate_per_sec).ceil() as u64
+    }
+
+    /// Calculate message processing efficiency ratio.
+    ///
+    /// Returns ratio of useful work (0.0 to 1.0).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_efficiency;
+    ///
+    /// let efficiency = calculate_efficiency(900, 100, 50);
+    /// assert!(efficiency > 0.8);
+    /// ```
+    pub fn calculate_efficiency(successful: usize, failed: usize, rejected: usize) -> f64 {
+        let total = successful + failed + rejected;
+        if total == 0 {
+            return 1.0;
+        }
+
+        successful as f64 / total as f64
+    }
+
+    /// Calculate required queue capacity for a given workload.
+    ///
+    /// Returns the number of messages the queue should be able to hold
+    /// based on production rate, consumption rate, and desired buffer time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_queue_capacity;
+    ///
+    /// // 1000 msg/sec production, 800 msg/sec consumption, 60 sec buffer
+    /// let capacity = calculate_queue_capacity(1000, 800, 60);
+    /// assert_eq!(capacity, 12000); // (1000-800) * 60
+    /// ```
+    pub fn calculate_queue_capacity(
+        production_rate_per_sec: usize,
+        consumption_rate_per_sec: usize,
+        buffer_duration_secs: usize,
+    ) -> usize {
+        if production_rate_per_sec <= consumption_rate_per_sec {
+            // No backlog expected, minimal buffer
+            production_rate_per_sec * buffer_duration_secs.min(10)
+        } else {
+            // Calculate backlog accumulation
+            let backlog_rate = production_rate_per_sec - consumption_rate_per_sec;
+            backlog_rate * buffer_duration_secs
+        }
+    }
+
+    /// Suggest optimal partition count for distributed message queue.
+    ///
+    /// Recommends partition count based on throughput requirements,
+    /// consumer count, and target parallelism.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::suggest_partition_count;
+    ///
+    /// let partitions = suggest_partition_count(10000, 5, 1000);
+    /// assert!(partitions >= 5 && partitions <= 20);
+    /// ```
+    pub fn suggest_partition_count(
+        target_throughput_per_sec: usize,
+        consumer_count: usize,
+        max_partition_throughput: usize,
+    ) -> usize {
+        if max_partition_throughput == 0 {
+            return consumer_count.max(1);
+        }
+
+        // Calculate partitions needed for throughput
+        let throughput_partitions = target_throughput_per_sec.div_ceil(max_partition_throughput);
+
+        // Ensure at least one partition per consumer
+        let consumer_partitions = consumer_count;
+
+        // Use the larger of the two, but cap at 100
+        throughput_partitions.max(consumer_partitions).min(100)
+    }
+
+    /// Estimate operational cost for message broker usage.
+    ///
+    /// Returns estimated cost units based on message volume, storage,
+    /// and operation type costs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_cost_estimate;
+    ///
+    /// // 1M messages/day, 1KB average, $0.0001/msg, $0.10/GB/month
+    /// let monthly_cost = calculate_cost_estimate(1_000_000, 1024, 0.0001, 0.10, 30);
+    /// assert!(monthly_cost > 0.0);
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn calculate_cost_estimate(
+        messages_per_day: usize,
+        avg_message_size_bytes: usize,
+        cost_per_message: f64,
+        storage_cost_per_gb_month: f64,
+        retention_days: usize,
+    ) -> f64 {
+        // Calculate message operation costs
+        let daily_message_cost = messages_per_day as f64 * cost_per_message;
+
+        // Calculate storage costs
+        let daily_storage_gb =
+            (messages_per_day * avg_message_size_bytes) as f64 / (1024.0 * 1024.0 * 1024.0);
+        let total_storage_gb = daily_storage_gb * retention_days as f64;
+        let monthly_storage_cost = total_storage_gb * storage_cost_per_gb_month / 30.0;
+
+        // Total monthly cost
+        (daily_message_cost * 30.0) + monthly_storage_cost
+    }
+
+    /// Analyze message size and frequency patterns.
+    ///
+    /// Returns (min_size, max_size, avg_size, std_dev).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::analyze_message_patterns;
+    ///
+    /// let sizes = vec![100, 200, 150, 180, 220];
+    /// let (min, max, avg, std_dev) = analyze_message_patterns(&sizes);
+    /// assert_eq!(min, 100);
+    /// assert_eq!(max, 220);
+    /// assert!(avg > 150.0 && avg < 200.0);
+    /// assert!(std_dev > 0.0);
+    /// ```
+    pub fn analyze_message_patterns(message_sizes: &[usize]) -> (usize, usize, f64, f64) {
+        if message_sizes.is_empty() {
+            return (0, 0, 0.0, 0.0);
+        }
+
+        let min = *message_sizes.iter().min().unwrap();
+        let max = *message_sizes.iter().max().unwrap();
+
+        let sum: usize = message_sizes.iter().sum();
+        let avg = sum as f64 / message_sizes.len() as f64;
+
+        // Calculate standard deviation
+        let variance: f64 = message_sizes
+            .iter()
+            .map(|&size| {
+                let diff = size as f64 - avg;
+                diff * diff
+            })
+            .sum::<f64>()
+            / message_sizes.len() as f64;
+
+        let std_dev = variance.sqrt();
+
+        (min, max, avg, std_dev)
+    }
+
+    /// Calculate optimal buffer size for message batching.
+    ///
+    /// Returns buffer size in bytes based on network MTU, message overhead,
+    /// and target batch efficiency.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_buffer_size;
+    ///
+    /// let buffer = calculate_buffer_size(1024, 64, 0.9);
+    /// assert!(buffer > 0);
+    /// ```
+    pub fn calculate_buffer_size(
+        avg_message_size: usize,
+        message_overhead: usize,
+        target_efficiency: f64,
+    ) -> usize {
+        let effective_message_size = avg_message_size + message_overhead;
+
+        // Network MTU is typically 1500 bytes (Ethernet) or 9000 bytes (Jumbo frames)
+        let mtu = if effective_message_size < 1400 {
+            1500
+        } else {
+            9000
+        };
+
+        // Calculate messages per packet
+        let messages_per_packet = (mtu as f64 / effective_message_size as f64).floor() as usize;
+
+        if messages_per_packet == 0 {
+            return effective_message_size;
+        }
+
+        // Buffer should hold enough for target efficiency
+        let packets_needed = (1.0 / (1.0 - target_efficiency.min(0.99))).ceil() as usize;
+
+        messages_per_packet * packets_needed * effective_message_size
+    }
+
+    /// Estimate total memory footprint for broker operations.
+    ///
+    /// Returns estimated memory usage in bytes for given queue configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::estimate_memory_footprint;
+    ///
+    /// // 10 queues, 1000 messages each, 1KB average message
+    /// let memory = estimate_memory_footprint(10, 1000, 1024, 128);
+    /// assert!(memory > 10_000_000); // > 10MB
+    /// ```
+    pub fn estimate_memory_footprint(
+        queue_count: usize,
+        messages_per_queue: usize,
+        avg_message_size: usize,
+        metadata_overhead_per_msg: usize,
+    ) -> usize {
+        let per_message_total = avg_message_size + metadata_overhead_per_msg;
+        let per_queue_memory = messages_per_queue * per_message_total;
+
+        // Add per-queue overhead (data structures, indexes, etc.)
+        let queue_overhead = 1024 * 64; // ~64KB per queue
+
+        queue_count * (per_queue_memory + queue_overhead)
+    }
+
+    /// Suggest appropriate TTL (time-to-live) for messages based on patterns.
+    ///
+    /// Returns suggested TTL in seconds based on message processing time
+    /// and retry characteristics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::suggest_ttl;
+    ///
+    /// // 5 sec avg processing, 3 retries, 2x backoff
+    /// let ttl = suggest_ttl(5, 3, 2.0);
+    /// assert!(ttl > 5 * (1 + 2 + 4)); // Enough for all retries
+    /// ```
+    pub fn suggest_ttl(
+        avg_processing_time_secs: u64,
+        max_retries: u32,
+        backoff_multiplier: f64,
+    ) -> u64 {
+        let mut total_time = avg_processing_time_secs;
+
+        // Calculate total time including retries with exponential backoff
+        for retry in 0..max_retries {
+            let backoff = avg_processing_time_secs as f64 * backoff_multiplier.powi(retry as i32);
+            total_time += backoff as u64;
+        }
+
+        // Add 50% safety margin
+        (total_time as f64 * 1.5).ceil() as u64
+    }
+
+    /// Calculate acceptable replication lag for distributed queues.
+    ///
+    /// Returns maximum acceptable lag in milliseconds based on
+    /// consistency requirements and throughput.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_replication_lag;
+    ///
+    /// let lag_ms = calculate_replication_lag(1000, 3, true);
+    /// assert!(lag_ms > 0);
+    /// ```
+    pub fn calculate_replication_lag(
+        throughput_per_sec: usize,
+        replica_count: usize,
+        require_strong_consistency: bool,
+    ) -> u64 {
+        if require_strong_consistency {
+            // Strong consistency requires minimal lag
+            return 100; // 100ms max
+        }
+
+        // For eventual consistency, calculate based on throughput
+        let messages_per_ms = throughput_per_sec as f64 / 1000.0;
+
+        // Allow lag of up to 1000 messages per replica
+        let max_lag_messages = 1000 * replica_count;
+
+        if messages_per_ms <= 0.0 {
+            return 10000; // 10 seconds default
+        }
+
+        let lag_ms = (max_lag_messages as f64 / messages_per_ms).ceil() as u64;
+
+        // Cap between 100ms and 60 seconds
+        lag_ms.clamp(100, 60000)
+    }
+
+    /// Calculate network bandwidth required for message broker operations.
+    ///
+    /// Returns bandwidth in bytes per second.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::calculate_bandwidth_requirement;
+    ///
+    /// // 1000 msg/sec, 1KB average, with protocol overhead
+    /// let bandwidth = calculate_bandwidth_requirement(1000, 1024, 1.2);
+    /// assert_eq!(bandwidth, 1228800); // 1000 * 1024 * 1.2
+    /// ```
+    pub fn calculate_bandwidth_requirement(
+        messages_per_sec: usize,
+        avg_message_size: usize,
+        protocol_overhead_factor: f64,
+    ) -> usize {
+        let raw_bandwidth = messages_per_sec * avg_message_size;
+        (raw_bandwidth as f64 * protocol_overhead_factor) as usize
+    }
+
+    /// Suggest retry policy based on error patterns.
+    ///
+    /// Returns (max_retries, initial_delay_ms, max_delay_ms).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_kombu::utils::suggest_retry_policy;
+    ///
+    /// let (max_retries, initial_delay, max_delay) = suggest_retry_policy(0.1, 5);
+    /// assert!(max_retries > 0);
+    /// assert!(initial_delay > 0);
+    /// assert!(max_delay > initial_delay);
+    /// ```
+    pub fn suggest_retry_policy(failure_rate: f64, avg_recovery_time_secs: u64) -> (u32, u64, u64) {
+        // Higher failure rate = more retries
+        let max_retries = if failure_rate > 0.3 {
+            10
+        } else if failure_rate > 0.1 {
+            5
+        } else {
+            3
+        };
+
+        // Initial delay based on recovery time
+        let initial_delay_ms = (avg_recovery_time_secs * 100).max(100); // At least 100ms
+
+        // Max delay should be reasonable (not more than 5 minutes)
+        let max_delay_ms = (avg_recovery_time_secs * 1000 * 5).min(300000);
+
+        (max_retries, initial_delay_ms, max_delay_ms)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -4733,7 +6632,7 @@ mod tests {
 
         // Age should be approximately 100 seconds (with small tolerance)
         let age = stats.oldest_message_age_secs().unwrap();
-        assert!(age >= 99 && age <= 101);
+        assert!((99..=101).contains(&age));
     }
 
     #[test]
@@ -5026,5 +6925,431 @@ mod tests {
         // Test with no max
         let no_max_config = QuotaConfig::new();
         assert_eq!(usage.usage_percent(&no_max_config), None);
+    }
+
+    #[test]
+    fn test_timeout_middleware_creation() {
+        let timeout = TimeoutMiddleware::new(Duration::from_secs(30));
+        assert_eq!(timeout.timeout(), Duration::from_secs(30));
+        assert_eq!(timeout.name(), "timeout");
+    }
+
+    #[tokio::test]
+    async fn test_timeout_middleware_sets_header() {
+        let timeout = TimeoutMiddleware::new(Duration::from_secs(60));
+        let mut message = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3]);
+
+        timeout.before_publish(&mut message).await.unwrap();
+
+        assert!(message.headers.extra.contains_key("x-timeout-ms"));
+    }
+
+    #[test]
+    fn test_filter_middleware_creation() {
+        let filter = FilterMiddleware::new(|msg: &Message| msg.task_name().starts_with("test"));
+        let test_msg = Message::new("test_task".to_string(), Uuid::new_v4(), vec![]);
+        let other_msg = Message::new("other_task".to_string(), Uuid::new_v4(), vec![]);
+
+        assert!(filter.matches(&test_msg));
+        assert!(!filter.matches(&other_msg));
+        assert_eq!(filter.name(), "filter");
+    }
+
+    #[tokio::test]
+    async fn test_filter_middleware_rejects_non_matching() {
+        let filter = FilterMiddleware::new(|msg: &Message| msg.task_name() == "allowed");
+        let mut allowed = Message::new("allowed".to_string(), Uuid::new_v4(), vec![]);
+        let mut rejected = Message::new("rejected".to_string(), Uuid::new_v4(), vec![]);
+
+        assert!(filter.after_consume(&mut allowed).await.is_ok());
+        assert!(filter.after_consume(&mut rejected).await.is_err());
+    }
+
+    #[test]
+    fn test_sampling_middleware_creation() {
+        let sampler = SamplingMiddleware::new(0.5);
+        assert_eq!(sampler.sample_rate(), 0.5);
+        assert_eq!(sampler.name(), "sampling");
+
+        // Test clamping
+        let clamped_low = SamplingMiddleware::new(-0.1);
+        assert_eq!(clamped_low.sample_rate(), 0.0);
+
+        let clamped_high = SamplingMiddleware::new(1.5);
+        assert_eq!(clamped_high.sample_rate(), 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_sampling_middleware_samples_messages() {
+        // Sample everything
+        let sampler = SamplingMiddleware::new(1.0);
+        let mut msg = Message::new("test".to_string(), Uuid::new_v4(), vec![]);
+        assert!(sampler.after_consume(&mut msg).await.is_ok());
+
+        // Sample nothing
+        let sampler = SamplingMiddleware::new(0.0);
+        let mut msg = Message::new("test".to_string(), Uuid::new_v4(), vec![]);
+        assert!(sampler.after_consume(&mut msg).await.is_err());
+    }
+
+    #[test]
+    fn test_transformation_middleware_creation() {
+        let transformer = TransformationMiddleware::new(|body| {
+            String::from_utf8_lossy(&body).to_uppercase().into_bytes()
+        });
+        assert_eq!(transformer.name(), "transformation");
+    }
+
+    #[tokio::test]
+    async fn test_transformation_middleware_transforms() {
+        let transformer = TransformationMiddleware::new(|body| {
+            String::from_utf8_lossy(&body).to_uppercase().into_bytes()
+        });
+
+        let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"hello world".to_vec());
+
+        transformer.before_publish(&mut msg).await.unwrap();
+        assert_eq!(msg.body, b"HELLO WORLD");
+
+        // Reset for consume test
+        msg.body = b"hello again".to_vec();
+        transformer.after_consume(&mut msg).await.unwrap();
+        assert_eq!(msg.body, b"HELLO AGAIN");
+    }
+
+    #[test]
+    fn test_tracing_middleware_creation() {
+        let tracing = TracingMiddleware::new("my-service");
+        assert_eq!(tracing.name(), "tracing");
+    }
+
+    #[tokio::test]
+    async fn test_tracing_middleware_injects_trace_id() {
+        let tracing = TracingMiddleware::new("test-service");
+
+        let mut msg = Message::new(
+            "test_task".to_string(),
+            Uuid::new_v4(),
+            b"test body".to_vec(),
+        );
+
+        tracing.before_publish(&mut msg).await.unwrap();
+
+        // Verify trace ID was injected
+        assert!(msg.headers.extra.contains_key("trace-id"));
+        assert!(msg.headers.extra.contains_key("service-name"));
+        assert!(msg.headers.extra.contains_key("span-id"));
+        assert!(msg.headers.extra.contains_key("trace-timestamp"));
+        assert_eq!(
+            msg.headers
+                .extra
+                .get("service-name")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "test-service"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tracing_middleware_preserves_existing_trace_id() {
+        let tracing = TracingMiddleware::new("test-service");
+
+        let mut msg = Message::new(
+            "test_task".to_string(),
+            Uuid::new_v4(),
+            b"test body".to_vec(),
+        );
+
+        // Pre-set a trace ID
+        let original_trace_id = "existing-trace-id";
+        msg.headers
+            .extra
+            .insert("trace-id".to_string(), serde_json::json!(original_trace_id));
+
+        tracing.before_publish(&mut msg).await.unwrap();
+
+        // Verify original trace ID was preserved
+        assert_eq!(
+            msg.headers.extra.get("trace-id").unwrap().as_str().unwrap(),
+            original_trace_id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tracing_middleware_after_consume() {
+        let tracing = TracingMiddleware::new("consumer-service");
+
+        let mut msg = Message::new(
+            "test_task".to_string(),
+            Uuid::new_v4(),
+            b"test body".to_vec(),
+        );
+
+        msg.headers
+            .extra
+            .insert("trace-id".to_string(), serde_json::json!("trace-123"));
+
+        tracing.after_consume(&mut msg).await.unwrap();
+
+        // Verify consume-side headers were added
+        assert!(msg.headers.extra.contains_key("consumer-service"));
+        assert!(msg.headers.extra.contains_key("trace-id-consumed"));
+        assert_eq!(
+            msg.headers
+                .extra
+                .get("consumer-service")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "consumer-service"
+        );
+    }
+
+    #[test]
+    fn test_batching_middleware_creation() {
+        let batching = BatchingMiddleware::new(50, 3000);
+        assert_eq!(batching.name(), "batching");
+    }
+
+    #[test]
+    fn test_batching_middleware_with_defaults() {
+        let batching = BatchingMiddleware::with_defaults();
+        assert_eq!(batching.name(), "batching");
+    }
+
+    #[tokio::test]
+    async fn test_batching_middleware_adds_metadata() {
+        let batching = BatchingMiddleware::new(100, 5000);
+
+        let mut msg = Message::new(
+            "test_task".to_string(),
+            Uuid::new_v4(),
+            b"test body".to_vec(),
+        );
+
+        batching.before_publish(&mut msg).await.unwrap();
+
+        // Verify batching metadata was added
+        assert_eq!(
+            msg.headers
+                .extra
+                .get("batch-size-hint")
+                .unwrap()
+                .as_u64()
+                .unwrap(),
+            100
+        );
+        assert_eq!(
+            msg.headers
+                .extra
+                .get("batch-timeout-ms")
+                .unwrap()
+                .as_u64()
+                .unwrap(),
+            5000
+        );
+        assert!(msg
+            .headers
+            .extra
+            .get("batching-enabled")
+            .unwrap()
+            .as_bool()
+            .unwrap());
+    }
+
+    #[test]
+    fn test_audit_middleware_creation() {
+        let audit = AuditMiddleware::new(true);
+        assert_eq!(audit.name(), "audit");
+    }
+
+    #[test]
+    fn test_audit_middleware_with_body_logging() {
+        let audit = AuditMiddleware::with_body_logging();
+        assert_eq!(audit.name(), "audit");
+    }
+
+    #[test]
+    fn test_audit_middleware_without_body_logging() {
+        let audit = AuditMiddleware::without_body_logging();
+        assert_eq!(audit.name(), "audit");
+    }
+
+    #[tokio::test]
+    async fn test_audit_middleware_before_publish() {
+        let audit = AuditMiddleware::new(true);
+
+        let mut msg = Message::new(
+            "test_task".to_string(),
+            Uuid::new_v4(),
+            b"test body".to_vec(),
+        );
+
+        audit.before_publish(&mut msg).await.unwrap();
+
+        // Verify audit metadata was added
+        assert!(msg.headers.extra.contains_key("audit-publish"));
+        assert!(msg.headers.extra.contains_key("audit-id"));
+
+        let audit_entry = msg
+            .headers
+            .extra
+            .get("audit-publish")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(audit_entry.contains("PUBLISH"));
+        assert!(audit_entry.contains("body_size=9"));
+    }
+
+    #[tokio::test]
+    async fn test_audit_middleware_after_consume() {
+        let audit = AuditMiddleware::new(false);
+
+        let mut msg = Message::new(
+            "test_task".to_string(),
+            Uuid::new_v4(),
+            b"test body".to_vec(),
+        );
+
+        audit.after_consume(&mut msg).await.unwrap();
+
+        // Verify audit metadata was added
+        assert!(msg.headers.extra.contains_key("audit-consume"));
+
+        let audit_entry = msg
+            .headers
+            .extra
+            .get("audit-consume")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(audit_entry.contains("CONSUME"));
+        assert!(audit_entry.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_backpressure_config_creation() {
+        let config = BackpressureConfig::new()
+            .with_max_pending(500)
+            .with_max_queue_size(5000)
+            .with_high_watermark(0.9)
+            .with_low_watermark(0.5);
+
+        assert_eq!(config.max_pending, 500);
+        assert_eq!(config.max_queue_size, 5000);
+        assert_eq!(config.high_watermark, 0.9);
+        assert_eq!(config.low_watermark, 0.5);
+    }
+
+    #[test]
+    fn test_backpressure_config_watermarks() {
+        let config = BackpressureConfig::new()
+            .with_max_pending(1000)
+            .with_high_watermark(0.8)
+            .with_low_watermark(0.6);
+
+        // High watermark = 1000 * 0.8 = 800
+        assert!(!config.should_apply_backpressure(799));
+        assert!(config.should_apply_backpressure(800));
+        assert!(config.should_apply_backpressure(900));
+
+        // Low watermark = 1000 * 0.6 = 600
+        assert!(config.should_release_backpressure(600));
+        assert!(config.should_release_backpressure(500));
+        assert!(!config.should_release_backpressure(601));
+    }
+
+    #[test]
+    fn test_backpressure_config_capacity() {
+        let config = BackpressureConfig::new().with_max_queue_size(10000);
+
+        assert!(!config.is_at_capacity(9999));
+        assert!(config.is_at_capacity(10000));
+        assert!(config.is_at_capacity(10001));
+    }
+
+    #[test]
+    fn test_backpressure_config_default() {
+        let config = BackpressureConfig::default();
+        assert_eq!(config.max_pending, 1000);
+        assert_eq!(config.max_queue_size, 10000);
+        assert_eq!(config.high_watermark, 0.8);
+        assert_eq!(config.low_watermark, 0.6);
+    }
+
+    #[test]
+    fn test_poison_message_detector_creation() {
+        let detector = PoisonMessageDetector::new()
+            .with_max_failures(3)
+            .with_failure_window(Duration::from_secs(600));
+
+        assert_eq!(detector.max_failures, 3);
+        assert_eq!(detector.failure_window, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_poison_message_detector_tracking() {
+        let detector = PoisonMessageDetector::new().with_max_failures(3);
+        let task_id = Uuid::new_v4();
+
+        // Initially not poison
+        assert!(!detector.is_poison(task_id));
+        assert_eq!(detector.failure_count(task_id), 0);
+
+        // Record failures
+        detector.record_failure(task_id);
+        assert_eq!(detector.failure_count(task_id), 1);
+        assert!(!detector.is_poison(task_id));
+
+        detector.record_failure(task_id);
+        assert_eq!(detector.failure_count(task_id), 2);
+        assert!(!detector.is_poison(task_id));
+
+        detector.record_failure(task_id);
+        assert_eq!(detector.failure_count(task_id), 3);
+        assert!(detector.is_poison(task_id)); // Now poison
+    }
+
+    #[test]
+    fn test_poison_message_detector_clear() {
+        let detector = PoisonMessageDetector::new().with_max_failures(2);
+        let task_id = Uuid::new_v4();
+
+        detector.record_failure(task_id);
+        detector.record_failure(task_id);
+        assert!(detector.is_poison(task_id));
+
+        // Clear specific task
+        detector.clear_failures(task_id);
+        assert!(!detector.is_poison(task_id));
+        assert_eq!(detector.failure_count(task_id), 0);
+    }
+
+    #[test]
+    fn test_poison_message_detector_clear_all() {
+        let detector = PoisonMessageDetector::new().with_max_failures(2);
+        let task1 = Uuid::new_v4();
+        let task2 = Uuid::new_v4();
+
+        detector.record_failure(task1);
+        detector.record_failure(task1);
+        detector.record_failure(task2);
+        detector.record_failure(task2);
+
+        assert!(detector.is_poison(task1));
+        assert!(detector.is_poison(task2));
+
+        detector.clear_all();
+        assert!(!detector.is_poison(task1));
+        assert!(!detector.is_poison(task2));
+    }
+
+    #[test]
+    fn test_poison_message_detector_default() {
+        let detector = PoisonMessageDetector::default();
+        assert_eq!(detector.max_failures, 5);
+        assert_eq!(detector.failure_window, Duration::from_secs(3600));
     }
 }

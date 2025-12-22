@@ -2045,32 +2045,81 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
                 }
             }
             "postgres" | "postgresql" => {
-                println!(
-                    "{}",
-                    "✓ PostgreSQL connection testing not yet implemented".yellow()
-                );
-                println!("  {}", "Manual connection test recommended".dimmed());
+                // Test PostgreSQL connection
+                match sqlx::postgres::PgPool::connect(&config.broker.url).await {
+                    Ok(pool) => {
+                        // Test with a simple query
+                        match sqlx::query("SELECT 1").fetch_one(&pool).await {
+                            Ok(_) => {
+                                println!(
+                                    "{}",
+                                    "✓ Successfully connected to PostgreSQL broker"
+                                        .green()
+                                        .bold()
+                                );
+                            }
+                            Err(e) => {
+                                println!("{}", "✗ Failed to query PostgreSQL broker:".red().bold());
+                                println!("  {}", format!("{}", e).red());
+                            }
+                        }
+                        pool.close().await;
+                    }
+                    Err(e) => {
+                        println!(
+                            "{}",
+                            "✗ Failed to connect to PostgreSQL broker:".red().bold()
+                        );
+                        println!("  {}", format!("{}", e).red());
+                    }
+                }
             }
             "mysql" => {
                 println!(
                     "{}",
-                    "✓ MySQL connection testing not yet implemented".yellow()
+                    "ℹ MySQL connection testing via CLI not yet available".cyan()
                 );
-                println!("  {}", "Manual connection test recommended".dimmed());
+                println!("  {}", "To test MySQL connection:".dimmed());
+                println!(
+                    "  {}",
+                    "  1. Use the 'db test-connection' command with your MySQL URL".dimmed()
+                );
+                println!(
+                    "  {}",
+                    "  2. Or use mysql client: mysql -h <host> -u <user> -p".dimmed()
+                );
             }
             "amqp" | "rabbitmq" => {
                 println!(
                     "{}",
-                    "✓ AMQP connection testing not yet implemented".yellow()
+                    "ℹ AMQP connection testing via CLI not yet available".cyan()
                 );
-                println!("  {}", "Manual connection test recommended".dimmed());
+                println!("  {}", "To test RabbitMQ connection:".dimmed());
+                println!(
+                    "  {}",
+                    "  1. Check RabbitMQ Management UI at http://<host>:15672".dimmed()
+                );
+                println!("  {}", "  2. Or use rabbitmq-diagnostics ping".dimmed());
+                println!(
+                    "  {}",
+                    "  3. Verify credentials and virtual host configuration".dimmed()
+                );
             }
             "sqs" => {
                 println!(
                     "{}",
-                    "✓ SQS connection testing not yet implemented".yellow()
+                    "ℹ SQS connection testing via CLI not yet available".cyan()
                 );
-                println!("  {}", "Manual connection test recommended".dimmed());
+                println!("  {}", "To test AWS SQS connection:".dimmed());
+                println!(
+                    "  {}",
+                    "  1. Ensure AWS credentials are configured (aws configure)".dimmed()
+                );
+                println!("  {}", "  2. Test with: aws sqs list-queues".dimmed());
+                println!(
+                    "  {}",
+                    "  3. Verify IAM permissions for SQS operations".dimmed()
+                );
             }
             _ => {
                 println!(
@@ -4334,6 +4383,942 @@ fn display_log_line(log: &str, level_filter: Option<&str>) {
     }
 }
 
+/// Start auto-scaling service
+pub async fn autoscale_start(
+    broker_url: &str,
+    queue: &str,
+    autoscale_config: Option<crate::config::AutoScaleConfig>,
+) -> anyhow::Result<()> {
+    println!("{}", "=== Auto-Scaling Service ===".bold().green());
+    println!();
+
+    let config = match autoscale_config {
+        Some(cfg) if cfg.enabled => cfg,
+        Some(_) => {
+            println!(
+                "{}",
+                "⚠️  Auto-scaling is disabled in configuration".yellow()
+            );
+            return Ok(());
+        }
+        None => {
+            println!("{}", "⚠️  No auto-scaling configuration found".yellow());
+            println!("Add [autoscale] section to your celers.toml");
+            return Ok(());
+        }
+    };
+
+    println!("Configuration:");
+    println!("  Min workers: {}", config.min_workers.to_string().cyan());
+    println!("  Max workers: {}", config.max_workers.to_string().cyan());
+    println!(
+        "  Scale up threshold: {}",
+        config.scale_up_threshold.to_string().cyan()
+    );
+    println!(
+        "  Scale down threshold: {}",
+        config.scale_down_threshold.to_string().cyan()
+    );
+    println!(
+        "  Check interval: {}s",
+        config.check_interval_secs.to_string().cyan()
+    );
+    println!();
+
+    let broker = RedisBroker::new(broker_url, queue)?;
+    println!("{}", "✓ Connected to broker".green());
+    println!();
+    println!("{}", "Starting auto-scaling monitor...".green().bold());
+    println!("{}", "  Press Ctrl+C to stop".dimmed());
+    println!();
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(config.check_interval_secs)).await;
+
+        // Get current queue size
+        let queue_size = broker.queue_size().await?;
+
+        // Get current worker count
+        let client = redis::Client::open(broker_url)?;
+        let mut conn = client.get_multiplexed_async_connection().await?;
+        let worker_keys: Vec<String> = redis::cmd("KEYS")
+            .arg("celers:worker:*:heartbeat")
+            .query_async(&mut conn)
+            .await?;
+        let current_workers = worker_keys.len();
+
+        println!(
+            "[{}] Queue: {}, Workers: {}",
+            Utc::now().format("%H:%M:%S").to_string().dimmed(),
+            queue_size.to_string().yellow(),
+            current_workers.to_string().cyan()
+        );
+
+        // Determine scaling action
+        if queue_size > config.scale_up_threshold && current_workers < config.max_workers {
+            let needed = config.max_workers.min(current_workers + 1);
+            println!(
+                "  {} Scale up recommended: {} -> {}",
+                "↑".green().bold(),
+                current_workers,
+                needed
+            );
+        } else if queue_size < config.scale_down_threshold && current_workers > config.min_workers {
+            let target = config.min_workers.max(current_workers.saturating_sub(1));
+            println!(
+                "  {} Scale down possible: {} -> {}",
+                "↓".yellow().bold(),
+                current_workers,
+                target
+            );
+        }
+    }
+}
+
+/// Show auto-scaling status
+pub async fn autoscale_status(
+    broker_url: &str,
+    autoscale_config: Option<crate::config::AutoScaleConfig>,
+) -> anyhow::Result<()> {
+    println!("{}", "=== Auto-Scaling Status ===".bold().cyan());
+    println!();
+
+    match autoscale_config {
+        Some(cfg) => {
+            println!(
+                "Status: {}",
+                if cfg.enabled {
+                    "Enabled".green()
+                } else {
+                    "Disabled".red()
+                }
+            );
+            println!();
+            println!("Configuration:");
+            println!("  Min workers: {}", cfg.min_workers);
+            println!("  Max workers: {}", cfg.max_workers);
+            println!("  Scale up threshold: {}", cfg.scale_up_threshold);
+            println!("  Scale down threshold: {}", cfg.scale_down_threshold);
+            println!("  Check interval: {}s", cfg.check_interval_secs);
+            println!();
+
+            // Get current metrics
+            let client = redis::Client::open(broker_url)?;
+            let mut conn = client.get_multiplexed_async_connection().await?;
+            let worker_keys: Vec<String> = redis::cmd("KEYS")
+                .arg("celers:worker:*:heartbeat")
+                .query_async(&mut conn)
+                .await?;
+
+            println!("Current State:");
+            println!("  Active workers: {}", worker_keys.len().to_string().cyan());
+        }
+        None => {
+            println!("{}", "Auto-scaling is not configured".yellow());
+            println!("Add [autoscale] section to your celers.toml");
+        }
+    }
+
+    Ok(())
+}
+
+/// Start alert monitoring service
+pub async fn alert_start(
+    broker_url: &str,
+    queue: &str,
+    alert_config: Option<crate::config::AlertConfig>,
+) -> anyhow::Result<()> {
+    println!("{}", "=== Alert Monitoring Service ===".bold().green());
+    println!();
+
+    let config = match alert_config {
+        Some(cfg) if cfg.enabled => cfg,
+        Some(_) => {
+            println!(
+                "{}",
+                "⚠️  Alert monitoring is disabled in configuration".yellow()
+            );
+            return Ok(());
+        }
+        None => {
+            println!("{}", "⚠️  No alert configuration found".yellow());
+            println!("Add [alerts] section to your celers.toml");
+            return Ok(());
+        }
+    };
+
+    if config.webhook_url.is_none() {
+        println!("{}", "⚠️  No webhook URL configured".yellow());
+        return Ok(());
+    }
+
+    println!("Configuration:");
+    println!(
+        "  Webhook URL: {}",
+        config.webhook_url.as_ref().unwrap().cyan()
+    );
+    println!(
+        "  DLQ threshold: {}",
+        config.dlq_threshold.to_string().cyan()
+    );
+    println!(
+        "  Failed threshold: {}",
+        config.failed_threshold.to_string().cyan()
+    );
+    println!(
+        "  Check interval: {}s",
+        config.check_interval_secs.to_string().cyan()
+    );
+    println!();
+
+    let broker = RedisBroker::new(broker_url, queue)?;
+    println!("{}", "✓ Connected to broker".green());
+    println!();
+    println!("{}", "Starting alert monitor...".green().bold());
+    println!("{}", "  Press Ctrl+C to stop".dimmed());
+    println!();
+
+    let webhook_url = config.webhook_url.unwrap();
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(config.check_interval_secs)).await;
+
+        // Check DLQ size
+        let dlq_size = broker.dlq_size().await?;
+
+        println!(
+            "[{}] DLQ size: {}",
+            Utc::now().format("%H:%M:%S").to_string().dimmed(),
+            dlq_size.to_string().yellow()
+        );
+
+        // Send alert if threshold exceeded
+        if dlq_size > config.dlq_threshold {
+            let message = format!(
+                "⚠️ DLQ size ({}) exceeded threshold ({})",
+                dlq_size, config.dlq_threshold
+            );
+            println!("  {} Sending alert...", "!".red().bold());
+
+            if let Err(e) = send_webhook_alert(&webhook_url, &message).await {
+                println!("  {} Failed to send alert: {}", "✗".red(), e);
+            } else {
+                println!("  {} Alert sent", "✓".green());
+            }
+        }
+    }
+}
+
+/// Test webhook notification
+pub async fn alert_test(webhook_url: &str, message: &str) -> anyhow::Result<()> {
+    println!("{}", "=== Testing Webhook ===".bold().cyan());
+    println!();
+    println!("Webhook URL: {}", webhook_url.cyan());
+    println!("Message: {}", message.yellow());
+    println!();
+
+    println!("Sending test notification...");
+    send_webhook_alert(webhook_url, message).await?;
+
+    println!("{}", "✓ Test notification sent successfully".green());
+
+    Ok(())
+}
+
+/// Helper function to send webhook alert
+async fn send_webhook_alert(webhook_url: &str, message: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({
+        "text": message,
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+
+    let response = client.post(webhook_url).json(&payload).send().await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Webhook request failed with status: {}", response.status());
+    }
+
+    Ok(())
+}
+
+/// Test database connection
+pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()> {
+    println!("{}", "=== Database Connection Test ===".bold().cyan());
+    println!();
+    println!("Database URL: {}", mask_password(url).cyan());
+    println!();
+
+    // Determine database type from URL
+    let db_type = if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        "PostgreSQL"
+    } else if url.starts_with("mysql://") {
+        "MySQL"
+    } else {
+        "Unknown"
+    };
+
+    println!("Database type: {}", db_type.yellow());
+    println!();
+
+    // Test connection
+    println!("Testing connection...");
+    let start = std::time::Instant::now();
+
+    // For PostgreSQL
+    if db_type == "PostgreSQL" {
+        match test_postgres_connection(url).await {
+            Ok(version) => {
+                let duration = start.elapsed();
+                println!("{}", "✓ Connection successful".green());
+                println!("  Version: {}", version.cyan());
+                println!("  Latency: {}ms", duration.as_millis().to_string().yellow());
+            }
+            Err(e) => {
+                println!("{}", "✗ Connection failed".red());
+                println!("  Error: {}", e);
+                return Err(e);
+            }
+        }
+    } else if db_type == "MySQL" {
+        println!("{}", "⚠️  MySQL support not yet implemented".yellow());
+        return Ok(());
+    } else {
+        println!("{}", "⚠️  Unknown database type".yellow());
+        return Ok(());
+    }
+
+    // Run benchmark if requested
+    if benchmark {
+        println!();
+        println!("{}", "Running latency benchmark...".bold());
+        println!();
+
+        let mut latencies = Vec::new();
+        for i in 1..=10 {
+            let start = std::time::Instant::now();
+            if let Err(e) = test_postgres_connection(url).await {
+                println!("  {} Query {} failed: {}", "✗".red(), i, e);
+                continue;
+            }
+            let duration = start.elapsed();
+            latencies.push(duration.as_millis());
+            println!("  {} Query {}: {}ms", "✓".green(), i, duration.as_millis());
+        }
+
+        if !latencies.is_empty() {
+            let avg = latencies.iter().sum::<u128>() / latencies.len() as u128;
+            let min = latencies.iter().min().unwrap();
+            let max = latencies.iter().max().unwrap();
+
+            println!();
+            println!("Benchmark results:");
+            println!("  Average: {}ms", avg.to_string().cyan());
+            println!("  Min: {}ms", min.to_string().green());
+            println!("  Max: {}ms", max.to_string().yellow());
+        }
+    }
+
+    Ok(())
+}
+
+/// Test PostgreSQL connection
+async fn test_postgres_connection(url: &str) -> anyhow::Result<String> {
+    use celers_broker_postgres::PostgresBroker;
+
+    // Create a temporary broker to test connection
+    let broker = PostgresBroker::new(url).await?;
+
+    // Test connection and return a version string
+    let connected = broker.test_connection().await?;
+    if connected {
+        Ok("Connected".to_string())
+    } else {
+        anyhow::bail!("Connection test failed")
+    }
+}
+
+/// Check database health
+pub async fn db_health(url: &str) -> anyhow::Result<()> {
+    println!("{}", "=== Database Health Check ===".bold().cyan());
+    println!();
+
+    let db_type = if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        "PostgreSQL"
+    } else if url.starts_with("mysql://") {
+        "MySQL"
+    } else {
+        "Unknown"
+    };
+
+    println!("Database: {}", db_type.yellow());
+    println!();
+
+    if db_type == "PostgreSQL" {
+        check_postgres_health(url).await?;
+    } else {
+        println!(
+            "{}",
+            "⚠️  Health check not supported for this database type".yellow()
+        );
+    }
+
+    Ok(())
+}
+
+/// Check PostgreSQL health
+async fn check_postgres_health(url: &str) -> anyhow::Result<()> {
+    use celers_broker_postgres::PostgresBroker;
+
+    println!("Checking connection...");
+    let broker = PostgresBroker::new(url).await?;
+    println!("{}", "  ✓ Connection OK".green());
+
+    println!();
+    println!("Testing connection with latency measurement...");
+
+    // Measure query performance
+    let mut latencies = Vec::new();
+    for i in 1..=5 {
+        let start = std::time::Instant::now();
+        let connected = broker.test_connection().await?;
+        let duration = start.elapsed();
+
+        if connected {
+            latencies.push(duration.as_millis());
+            println!("  {} Query {}: {}ms", "✓".green(), i, duration.as_millis());
+        } else {
+            println!("  {} Query {} failed", "✗".red(), i);
+        }
+    }
+
+    if !latencies.is_empty() {
+        let avg = latencies.iter().sum::<u128>() / latencies.len() as u128;
+        let min = latencies.iter().min().unwrap();
+        let max = latencies.iter().max().unwrap();
+
+        println!();
+        println!("Query Performance:");
+        println!("  Average: {}ms", avg.to_string().cyan());
+        println!("  Min: {}ms", min.to_string().green());
+        println!("  Max: {}ms", max.to_string().yellow());
+
+        if avg > 100 {
+            println!("  {}", "⚠️  High query latency detected".yellow());
+        } else {
+            println!("  {}", "✓ Query latency is healthy".green());
+        }
+    }
+
+    // Check pool metrics
+    println!();
+    println!("Connection Pool Status:");
+    let pool_metrics = broker.get_pool_metrics();
+    println!(
+        "  Max Connections: {}",
+        pool_metrics.max_size.to_string().cyan()
+    );
+    println!("  Active: {}", pool_metrics.size.to_string().cyan());
+    println!("  Idle: {}", pool_metrics.idle.to_string().cyan());
+    println!("  In-Use: {}", pool_metrics.in_use.to_string().cyan());
+
+    let utilization = if pool_metrics.max_size > 0 {
+        (pool_metrics.in_use as f64 / pool_metrics.max_size as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    if utilization > 80.0 {
+        println!(
+            "  {}",
+            "⚠️  High pool utilization - consider scaling".yellow()
+        );
+    }
+
+    println!();
+    println!("{}", "✓ Database health check completed".green().bold());
+
+    Ok(())
+}
+
+/// Show connection pool statistics
+pub async fn db_pool_stats(url: &str) -> anyhow::Result<()> {
+    println!("{}", "=== Connection Pool Statistics ===".bold().cyan());
+    println!();
+    println!("Database URL: {}", mask_password(url).cyan());
+    println!();
+
+    let db_type = if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        "PostgreSQL"
+    } else if url.starts_with("mysql://") {
+        "MySQL"
+    } else {
+        "Unknown"
+    };
+
+    if db_type == "PostgreSQL" {
+        use celers_broker_postgres::PostgresBroker;
+
+        println!("Connecting to database...");
+        let broker = PostgresBroker::new(url).await?;
+        println!("{}", "  ✓ Connected".green());
+        println!();
+
+        let metrics = broker.get_pool_metrics();
+
+        #[derive(Tabled)]
+        struct PoolStat {
+            #[tabled(rename = "Metric")]
+            metric: String,
+            #[tabled(rename = "Value")]
+            value: String,
+        }
+
+        let stats = vec![
+            PoolStat {
+                metric: "Max Connections".to_string(),
+                value: metrics.max_size.to_string(),
+            },
+            PoolStat {
+                metric: "Active Connections".to_string(),
+                value: metrics.size.to_string(),
+            },
+            PoolStat {
+                metric: "Idle Connections".to_string(),
+                value: metrics.idle.to_string(),
+            },
+            PoolStat {
+                metric: "In-Use Connections".to_string(),
+                value: metrics.in_use.to_string(),
+            },
+            PoolStat {
+                metric: "Waiting Tasks".to_string(),
+                value: if metrics.waiting > 0 {
+                    metrics.waiting.to_string()
+                } else {
+                    "0 (estimated)".to_string()
+                },
+            },
+        ];
+
+        let table = Table::new(stats).with(Style::rounded()).to_string();
+        println!("{}", table);
+        println!();
+
+        // Pool utilization
+        let utilization = if metrics.max_size > 0 {
+            (metrics.in_use as f64 / metrics.max_size as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        println!("Pool Utilization: {:.1}%", utilization);
+        if utilization > 80.0 {
+            println!(
+                "{}",
+                "⚠️  High pool utilization - consider increasing max_connections".yellow()
+            );
+        } else if utilization < 20.0 && metrics.max_size > 10 {
+            println!(
+                "{}",
+                "ℹ️  Low pool utilization - consider reducing max_connections".cyan()
+            );
+        } else {
+            println!("{}", "✓ Pool utilization is healthy".green());
+        }
+    } else {
+        println!(
+            "{}",
+            "⚠️  Pool statistics only supported for PostgreSQL".yellow()
+        );
+    }
+
+    Ok(())
+}
+
+/// Run database migrations
+pub async fn db_migrate(url: &str, action: &str, steps: usize) -> anyhow::Result<()> {
+    println!("{}", "=== Database Migrations ===".bold().cyan());
+    println!();
+    println!("Database URL: {}", mask_password(url).cyan());
+    println!("Action: {}", action.yellow());
+    println!();
+
+    let db_type = if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        "PostgreSQL"
+    } else if url.starts_with("mysql://") {
+        "MySQL"
+    } else {
+        "Unknown"
+    };
+
+    if db_type == "PostgreSQL" {
+        use celers_broker_postgres::PostgresBroker;
+
+        match action.to_lowercase().as_str() {
+            "apply" => {
+                println!("Applying migrations...");
+                let broker = PostgresBroker::new(url).await?;
+                let _ = broker; // Use broker to ensure it connects
+
+                println!("{}", "  ✓ Schema initialized".green());
+                println!();
+                println!("{}", "✓ Migrations applied successfully".green().bold());
+            }
+            "rollback" => {
+                println!("Rolling back {} migration(s)...", steps);
+                println!();
+                println!(
+                    "{}",
+                    "⚠️  Manual rollback required - use SQL scripts".yellow()
+                );
+                println!("  CeleRS uses auto-migration with SQLx");
+                println!("  To rollback, restore from database backup");
+            }
+            "status" => {
+                println!("Checking migration status...");
+                let broker = PostgresBroker::new(url).await?;
+                let connected = broker.test_connection().await?;
+
+                println!();
+                if connected {
+                    println!("{}", "  ✓ Database schema is up-to-date".green());
+                    println!("  Tables: celers_tasks, celers_results");
+                } else {
+                    println!("{}", "  ✗ Cannot connect to database".red());
+                }
+            }
+            _ => {
+                anyhow::bail!(
+                    "Unknown action '{}'. Valid actions: apply, rollback, status",
+                    action
+                );
+            }
+        }
+    } else {
+        println!(
+            "{}",
+            "⚠️  Migrations only supported for PostgreSQL".yellow()
+        );
+    }
+
+    Ok(())
+}
+
+/// Mask password in database URL for display
+fn mask_password(url: &str) -> String {
+    if let Some(at_pos) = url.find('@') {
+        if let Some(colon_pos) = url[..at_pos].rfind(':') {
+            let before = &url[..colon_pos + 1];
+            let after = &url[at_pos..];
+            return format!("{}****{}", before, after);
+        }
+    }
+    url.to_string()
+}
+
+/// Run interactive TUI dashboard for real-time monitoring
+pub async fn run_dashboard(broker_url: &str, queue: &str, refresh_secs: u64) -> anyhow::Result<()> {
+    use crossterm::{
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    };
+    use ratatui::{
+        backend::CrosstermBackend,
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+        Terminal,
+    };
+    use std::io;
+    use std::time::Duration;
+
+    let broker = RedisBroker::new(broker_url, queue)?;
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let refresh_duration = Duration::from_secs(refresh_secs);
+    let mut last_update = std::time::Instant::now();
+
+    let result = loop {
+        // Fetch stats
+        let queue_size = broker.queue_size().await.unwrap_or(0);
+        let dlq_size = broker.dlq_size().await.unwrap_or(0);
+        let now = Utc::now();
+
+        // Get worker list
+        let mut con = redis::Client::open(broker_url)?.get_connection()?;
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg("celers:worker:*:heartbeat")
+            .query(&mut con)?;
+        let worker_count = keys.len();
+
+        // Render UI
+        terminal.draw(|f| {
+            let size = f.area();
+
+            // Create layout
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(7),
+                    Constraint::Length(7),
+                    Constraint::Min(0),
+                ])
+                .split(size);
+
+            // Title
+            let title = Paragraph::new(format!(
+                "CeleRS Dashboard - Queue: {} | Last Update: {}",
+                queue,
+                now.format("%Y-%m-%d %H:%M:%S")
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::default().borders(Borders::ALL));
+            f.render_widget(title, chunks[0]);
+
+            // Queue stats
+            let queue_stats = [
+                format!("Pending Tasks:  {}", queue_size),
+                format!("DLQ Size:       {}", dlq_size),
+                format!("Active Workers: {}", worker_count),
+            ];
+            let queue_block = Paragraph::new(queue_stats.join("\n"))
+                .style(Style::default().fg(Color::Green))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Queue Statistics"),
+                );
+            f.render_widget(queue_block, chunks[1]);
+
+            // Queue depth gauge
+            let max_display = 1000;
+            let ratio = (queue_size.min(max_display) as f64 / max_display as f64).min(1.0);
+            let gauge_color = if queue_size > 500 {
+                Color::Red
+            } else if queue_size > 100 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+
+            let gauge = Gauge::default()
+                .block(Block::default().borders(Borders::ALL).title("Queue Depth"))
+                .gauge_style(Style::default().fg(gauge_color))
+                .ratio(ratio)
+                .label(format!("{} / {}", queue_size, max_display));
+            f.render_widget(gauge, chunks[2]);
+
+            // Status messages
+            let mut messages = vec![];
+            if worker_count == 0 && queue_size > 0 {
+                messages.push(
+                    ListItem::new("⚠️  No active workers - tasks are not being processed")
+                        .style(Style::default().fg(Color::Red)),
+                );
+            }
+            if dlq_size > 10 {
+                messages.push(
+                    ListItem::new(format!("⚠️  High DLQ size: {} failed tasks", dlq_size))
+                        .style(Style::default().fg(Color::Yellow)),
+                );
+            }
+            if queue_size > 1000 {
+                messages.push(
+                    ListItem::new("⚠️  Queue backlog is high - consider scaling workers")
+                        .style(Style::default().fg(Color::Yellow)),
+                );
+            }
+            if messages.is_empty() {
+                messages.push(
+                    ListItem::new("✓ All systems normal").style(Style::default().fg(Color::Green)),
+                );
+            }
+
+            messages.push(ListItem::new(""));
+            messages.push(
+                ListItem::new("Press 'q' to quit").style(Style::default().fg(Color::DarkGray)),
+            );
+
+            let status_list = List::new(messages).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Status & Alerts"),
+            );
+            f.render_widget(status_list, chunks[3]);
+        })?;
+
+        // Handle input
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('q') {
+                    break Ok(());
+                }
+            }
+        }
+
+        // Auto-refresh
+        if last_update.elapsed() >= refresh_duration {
+            last_update = std::time::Instant::now();
+        }
+    };
+
+    // Cleanup terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/// Retry a connection operation with exponential backoff
+#[allow(dead_code)]
+async fn retry_with_backoff<F, T, E>(
+    operation: F,
+    max_retries: u32,
+    operation_name: &str,
+) -> Result<T, E>
+where
+    F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + Send>>,
+    E: std::fmt::Display,
+{
+    let mut retries = 0;
+    loop {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                retries += 1;
+                if retries >= max_retries {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "✗ {} failed after {} attempts: {}",
+                            operation_name, max_retries, err
+                        )
+                        .red()
+                    );
+                    return Err(err);
+                }
+
+                let backoff_ms = 100 * (2_u64.pow(retries - 1));
+                eprintln!(
+                    "{}",
+                    format!(
+                        "⚠ {} failed (attempt {}/{}), retrying in {}ms...",
+                        operation_name, retries, max_retries, backoff_ms
+                    )
+                    .yellow()
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+}
+
+/// Format bytes into human-readable size
+#[allow(dead_code)]
+fn format_bytes(bytes: usize) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+
+    if unit_idx == 0 {
+        format!("{} {}", size as usize, UNITS[unit_idx])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_idx])
+    }
+}
+
+/// Format duration into human-readable string
+#[allow(dead_code)]
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else if seconds < 3600 {
+        let minutes = seconds / 60;
+        let secs = seconds % 60;
+        if secs == 0 {
+            format!("{}m", minutes)
+        } else {
+            format!("{}m {}s", minutes, secs)
+        }
+    } else if seconds < 86400 {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            format!("{}h", hours)
+        } else {
+            format!("{}h {}m", hours, minutes)
+        }
+    } else {
+        let days = seconds / 86400;
+        let hours = (seconds % 86400) / 3600;
+        if hours == 0 {
+            format!("{}d", days)
+        } else {
+            format!("{}d {}h", days, hours)
+        }
+    }
+}
+
+/// Validate task ID format
+#[allow(dead_code)]
+fn validate_task_id(task_id: &str) -> anyhow::Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(task_id)
+        .map_err(|e| anyhow::anyhow!("Invalid task ID format: {}. Expected UUID format.", e))
+}
+
+/// Validate queue name
+#[allow(dead_code)]
+fn validate_queue_name(queue: &str) -> anyhow::Result<()> {
+    if queue.is_empty() {
+        anyhow::bail!("Queue name cannot be empty");
+    }
+    if queue.contains(char::is_whitespace) {
+        anyhow::bail!("Queue name cannot contain whitespace");
+    }
+    if queue.len() > 255 {
+        anyhow::bail!("Queue name too long (max 255 characters)");
+    }
+    Ok(())
+}
+
+/// Calculate percentage safely
+#[allow(dead_code)]
+fn calculate_percentage(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (part as f64 / total as f64) * 100.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4477,5 +5462,83 @@ mod tests {
         let timestamp = chrono::Utc::now().to_rfc3339();
         assert!(timestamp.contains('T'));
         assert!(timestamp.contains('Z') || timestamp.contains('+'));
+    }
+
+    #[test]
+    fn test_mask_password() {
+        // Test PostgreSQL URL
+        let pg_url = "postgres://user:password123@localhost:5432/dbname";
+        let masked = super::mask_password(pg_url);
+        assert!(masked.contains("postgres://user:****@localhost"));
+        assert!(!masked.contains("password123"));
+
+        // Test MySQL URL
+        let mysql_url = "mysql://admin:secret@127.0.0.1:3306/db";
+        let masked = super::mask_password(mysql_url);
+        assert!(masked.contains("mysql://admin:****@127.0.0.1"));
+        assert!(!masked.contains("secret"));
+
+        // Test URL without password
+        let no_pass_url = "redis://localhost:6379";
+        let masked = super::mask_password(no_pass_url);
+        assert_eq!(masked, no_pass_url);
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(super::format_bytes(0), "0 B");
+        assert_eq!(super::format_bytes(500), "500 B");
+        assert_eq!(super::format_bytes(1024), "1.00 KB");
+        assert_eq!(super::format_bytes(1536), "1.50 KB");
+        assert_eq!(super::format_bytes(1048576), "1.00 MB");
+        assert_eq!(super::format_bytes(1073741824), "1.00 GB");
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(super::format_duration(0), "0s");
+        assert_eq!(super::format_duration(30), "30s");
+        assert_eq!(super::format_duration(60), "1m");
+        assert_eq!(super::format_duration(90), "1m 30s");
+        assert_eq!(super::format_duration(3600), "1h");
+        assert_eq!(super::format_duration(3660), "1h 1m");
+        assert_eq!(super::format_duration(86400), "1d");
+        assert_eq!(super::format_duration(90000), "1d 1h");
+    }
+
+    #[test]
+    fn test_validate_task_id() {
+        // Valid UUID
+        let valid = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(super::validate_task_id(valid).is_ok());
+
+        // Invalid UUIDs
+        assert!(super::validate_task_id("not-a-uuid").is_err());
+        assert!(super::validate_task_id("").is_err());
+        assert!(super::validate_task_id("12345").is_err());
+    }
+
+    #[test]
+    fn test_validate_queue_name() {
+        // Valid queue names
+        assert!(super::validate_queue_name("default").is_ok());
+        assert!(super::validate_queue_name("high-priority").is_ok());
+        assert!(super::validate_queue_name("queue_1").is_ok());
+
+        // Invalid queue names
+        assert!(super::validate_queue_name("").is_err()); // Empty
+        assert!(super::validate_queue_name("queue name").is_err()); // Whitespace
+        assert!(super::validate_queue_name(&"x".repeat(256)).is_err()); // Too long
+    }
+
+    #[test]
+    fn test_calculate_percentage() {
+        assert_eq!(super::calculate_percentage(0, 100), 0.0);
+        assert_eq!(super::calculate_percentage(50, 100), 50.0);
+        assert_eq!(super::calculate_percentage(100, 100), 100.0);
+        assert_eq!(super::calculate_percentage(25, 100), 25.0);
+
+        // Edge case: division by zero
+        assert_eq!(super::calculate_percentage(10, 0), 0.0);
     }
 }

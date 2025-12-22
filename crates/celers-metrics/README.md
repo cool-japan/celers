@@ -597,7 +597,6 @@ pub static ref OVERSIZED_RESULTS_TOTAL: Counter
 
 ## See Also
 
-- **Examples**: `examples/prometheus_metrics.rs` - HTTP endpoint example
 - **Worker**: `celers-worker` - Worker runtime with metrics
 - **Broker**: `celers-broker-redis` - Redis broker with metrics
 - **Prometheus**: https://prometheus.io/docs/

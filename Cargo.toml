@@ -136,3 +136,31 @@ harness = false
 [[bench]]
 name = "batch_operations"
 harness = false
+
+# Bundle size optimization profiles
+[profile.release]
+# Enable link-time optimization for smaller binaries
+lto = true
+# Use a single code generation unit for better optimization
+codegen-units = 1
+# Strip debug symbols to reduce binary size
+strip = true
+# Maximum optimization level
+opt-level = 3
+
+[profile.release-small]
+# Optimize for size rather than speed
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-fast]
+# Optimize for speed with moderate size
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true

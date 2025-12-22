@@ -140,54 +140,63 @@ impl MessageBuilder {
     }
 
     /// Set the task ID
+    #[must_use]
     pub fn id(mut self, id: Uuid) -> Self {
         self.task_id = Some(id);
         self
     }
 
     /// Set positional arguments
+    #[must_use]
     pub fn args(mut self, args: Vec<Value>) -> Self {
         self.args = args;
         self
     }
 
     /// Add a positional argument
+    #[must_use]
     pub fn arg(mut self, arg: Value) -> Self {
         self.args.push(arg);
         self
     }
 
     /// Set keyword arguments
+    #[must_use]
     pub fn kwargs(mut self, kwargs: HashMap<String, Value>) -> Self {
         self.kwargs = kwargs;
         self
     }
 
     /// Add a keyword argument
+    #[must_use]
     pub fn kwarg(mut self, key: impl Into<String>, value: Value) -> Self {
         self.kwargs.insert(key.into(), value);
         self
     }
 
     /// Set task priority (0-9, higher = more urgent)
+    #[must_use]
     pub fn priority(mut self, priority: u8) -> Self {
         self.priority = Some(priority.min(9));
         self
     }
 
     /// Set the queue name
+    #[must_use]
     pub fn queue(mut self, queue: impl Into<String>) -> Self {
         self.queue = Some(queue.into());
         self
     }
 
     /// Set the routing key
+    #[must_use]
     pub fn routing_key(mut self, key: impl Into<String>) -> Self {
         self.routing_key = Some(key.into());
         self
     }
 
     /// Set ETA (scheduled execution time)
+    #[must_use]
     pub fn eta(mut self, eta: DateTime<Utc>) -> Self {
         self.eta = Some(eta);
         self.countdown = None; // ETA takes precedence
@@ -195,6 +204,7 @@ impl MessageBuilder {
     }
 
     /// Set countdown (delay in seconds)
+    #[must_use]
     pub fn countdown(mut self, seconds: i64) -> Self {
         self.countdown = Some(seconds);
         self.eta = None; // Countdown takes precedence
@@ -202,102 +212,119 @@ impl MessageBuilder {
     }
 
     /// Set expiration time
+    #[must_use]
     pub fn expires(mut self, expires: DateTime<Utc>) -> Self {
         self.expires = Some(expires);
         self
     }
 
     /// Set expiration as duration from now
+    #[must_use]
     pub fn expires_in(mut self, duration: Duration) -> Self {
         self.expires = Some(Utc::now() + duration);
         self
     }
 
     /// Set maximum retries
+    #[must_use]
     pub fn max_retries(mut self, max: u32) -> Self {
         self.max_retries = Some(max);
         self
     }
 
     /// Set current retry count
+    #[must_use]
     pub fn retries(mut self, count: u32) -> Self {
         self.retries = Some(count);
         self
     }
 
     /// Set parent task ID
+    #[must_use]
     pub fn parent(mut self, parent_id: Uuid) -> Self {
         self.parent_id = Some(parent_id);
         self
     }
 
     /// Set root task ID
+    #[must_use]
     pub fn root(mut self, root_id: Uuid) -> Self {
         self.root_id = Some(root_id);
         self
     }
 
     /// Set group ID
+    #[must_use]
     pub fn group(mut self, group_id: Uuid) -> Self {
         self.group_id = Some(group_id);
         self
     }
 
     /// Add a success callback (link)
+    #[must_use]
     pub fn link(mut self, task: impl Into<String>) -> Self {
         self.callbacks.push(CallbackSignature::new(task));
         self
     }
 
     /// Add a success callback with full signature
+    #[must_use]
     pub fn link_signature(mut self, callback: CallbackSignature) -> Self {
         self.callbacks.push(callback);
         self
     }
 
     /// Add an error callback (errback)
+    #[must_use]
     pub fn link_error(mut self, task: impl Into<String>) -> Self {
         self.errbacks.push(CallbackSignature::new(task));
         self
     }
 
     /// Add an error callback with full signature
+    #[must_use]
     pub fn link_error_signature(mut self, errback: CallbackSignature) -> Self {
         self.errbacks.push(errback);
         self
     }
 
     /// Add a chain task
+    #[must_use]
     pub fn chain_task(mut self, task: impl Into<String>) -> Self {
         self.chain.push(CallbackSignature::new(task));
         self
     }
 
     /// Set chord callback
+    #[must_use]
     pub fn chord(mut self, callback: impl Into<String>) -> Self {
         self.chord = Some(CallbackSignature::new(callback));
         self
     }
 
     /// Set content type
+    #[must_use]
     pub fn content_type(mut self, ct: ContentType) -> Self {
         self.content_type = ct;
         self
     }
 
     /// Set message persistence
+    #[must_use]
     pub fn persistent(mut self, persistent: bool) -> Self {
         self.persistent = persistent;
         self
     }
 
     /// Set reply-to queue
+    #[must_use]
     pub fn reply_to(mut self, queue: impl Into<String>) -> Self {
         self.reply_to = Some(queue.into());
         self
     }
 
     /// Add extra header
+    #[must_use]
     pub fn header(mut self, key: impl Into<String>, value: Value) -> Self {
         self.extra_headers.insert(key.into(), value);
         self

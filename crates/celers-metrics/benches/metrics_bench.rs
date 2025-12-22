@@ -109,7 +109,7 @@ fn bench_distributed_aggregation(c: &mut Criterion) {
 
         let mut counter = 0;
         b.iter(|| {
-            let snapshot = MetricSnapshot::new(&format!("worker-{}", counter % 10), stats.clone());
+            let snapshot = MetricSnapshot::new(format!("worker-{}", counter % 10), stats.clone());
             aggregator.update(snapshot);
             counter += 1;
         })
@@ -124,7 +124,7 @@ fn bench_distributed_aggregation(c: &mut Criterion) {
             for j in 0..100 {
                 stats.observe((i * 100 + j) as f64);
             }
-            let snapshot = MetricSnapshot::new(&format!("worker-{}", i), stats);
+            let snapshot = MetricSnapshot::new(format!("worker-{}", i), stats);
             aggregator.update(snapshot);
         }
 

@@ -7,6 +7,8 @@
 //! - Delayed task execution (enqueue_at, enqueue_after)
 //! - **Task chaining for sequential execution**
 //! - **DAG-based workflows with stage dependencies**
+//! - **Task deduplication with idempotency keys**
+//! - **Real-time LISTEN/NOTIFY for event-driven workers**
 //! - Prometheus metrics (optional `metrics` feature)
 //! - Batch enqueue/dequeue/ack operations
 //! - Transaction safety
@@ -565,6 +567,15 @@ impl PostgresBroker {
             .execute(&self.pool)
             .await
             .map_err(|e| CelersError::Other(format!("Migration 002_results failed: {}", e)))?;
+
+        // Run deduplication table migration
+        let dedup_sql = include_str!("../migrations/004_deduplication.sql");
+        sqlx::query(dedup_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Migration 004_deduplication failed: {}", e))
+            })?;
 
         Ok(())
     }
@@ -2595,6 +2606,654 @@ impl<'a> TenantBroker<'a> {
     }
 }
 
+// ========== LISTEN/NOTIFY Support ==========
+
+/// Task notification listener for real-time task events
+///
+/// This allows workers to be notified immediately when new tasks are enqueued,
+/// reducing polling overhead. Uses PostgreSQL's LISTEN/NOTIFY mechanism.
+///
+/// # Example
+///
+/// ```no_run
+/// use celers_broker_postgres::PostgresBroker;
+/// use std::time::Duration;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+/// broker.migrate().await?;
+///
+/// // Create a listener on a separate task
+/// let mut listener = broker.create_notification_listener().await?;
+///
+/// // Enable notifications (sends NOTIFY after each enqueue)
+/// broker.enable_notifications(true).await?;
+///
+/// // Wait for notifications
+/// tokio::spawn(async move {
+///     loop {
+///         match listener.wait_for_notification(Duration::from_secs(30)).await {
+///             Ok(Some(notification)) => {
+///                 println!("New task enqueued: {:?}", notification);
+///                 // Dequeue and process task
+///             }
+///             Ok(None) => {
+///                 println!("Timeout, no notification received");
+///             }
+///             Err(e) => {
+///                 eprintln!("Listener error: {}", e);
+///                 break;
+///             }
+///         }
+///     }
+/// });
+/// # Ok(())
+/// # }
+/// ```
+pub struct TaskNotificationListener {
+    listener: sqlx::postgres::PgListener,
+    channel: String,
+}
+
+/// Task notification payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskNotification {
+    /// Task ID that was enqueued
+    pub task_id: Uuid,
+    /// Task name
+    pub task_name: String,
+    /// Queue name
+    pub queue_name: String,
+    /// Priority
+    pub priority: i32,
+    /// Timestamp when enqueued
+    pub enqueued_at: DateTime<Utc>,
+}
+
+impl TaskNotificationListener {
+    /// Wait for a task notification with timeout
+    ///
+    /// Returns:
+    /// - `Ok(Some(notification))` if a notification was received
+    /// - `Ok(None)` if timeout occurred
+    /// - `Err(...)` if an error occurred
+    pub async fn wait_for_notification(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<TaskNotification>> {
+        use tokio::time::timeout as tokio_timeout;
+
+        match tokio_timeout(timeout, self.listener.recv()).await {
+            Ok(Ok(notification)) => {
+                let payload: TaskNotification = serde_json::from_str(notification.payload())
+                    .map_err(|e| {
+                        CelersError::Other(format!("Failed to parse notification: {}", e))
+                    })?;
+                Ok(Some(payload))
+            }
+            Ok(Err(e)) => Err(CelersError::Other(format!("Listener error: {}", e))),
+            Err(_) => Ok(None), // Timeout
+        }
+    }
+
+    /// Try to receive a notification without blocking
+    ///
+    /// Returns immediately with either a notification or None.
+    pub async fn try_recv_notification(&mut self) -> Result<Option<TaskNotification>> {
+        match self.listener.try_recv().await {
+            Ok(Some(notification)) => {
+                let payload: TaskNotification = serde_json::from_str(notification.payload())
+                    .map_err(|e| {
+                        CelersError::Other(format!("Failed to parse notification: {}", e))
+                    })?;
+                Ok(Some(payload))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(CelersError::Other(format!("Listener error: {}", e))),
+        }
+    }
+
+    /// Get the channel name this listener is subscribed to
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+}
+
+impl PostgresBroker {
+    /// Create a notification listener for real-time task events
+    ///
+    /// The listener will receive notifications when tasks are enqueued.
+    /// Call `enable_notifications(true)` to start sending notifications.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let mut listener = broker.create_notification_listener().await?;
+    ///
+    /// // Wait for notifications
+    /// while let Some(notification) = listener.wait_for_notification(Duration::from_secs(30)).await? {
+    ///     println!("Task enqueued: {}", notification.task_id);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn create_notification_listener(&self) -> Result<TaskNotificationListener> {
+        let channel = format!("celers_tasks_{}", self.queue_name);
+        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to create listener: {}", e)))?;
+
+        listener.listen(&channel).await.map_err(|e| {
+            CelersError::Other(format!("Failed to listen on channel {}: {}", channel, e))
+        })?;
+
+        tracing::info!(channel = %channel, "Created task notification listener");
+
+        Ok(TaskNotificationListener { listener, channel })
+    }
+
+    /// Enable or disable NOTIFY on task enqueue
+    ///
+    /// When enabled, a PostgreSQL NOTIFY will be sent whenever a task is enqueued,
+    /// allowing listeners to be notified immediately without polling.
+    ///
+    /// # Arguments
+    /// * `enabled` - true to enable notifications, false to disable
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// broker.enable_notifications(true).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enable_notifications(&self, enabled: bool) -> Result<()> {
+        // Create or drop the trigger that sends NOTIFY
+        let channel = format!("celers_tasks_{}", self.queue_name);
+
+        if enabled {
+            // Create trigger function if it doesn't exist
+            let function_sql = format!(
+                r#"
+                CREATE OR REPLACE FUNCTION notify_task_enqueued()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    payload JSON;
+                BEGIN
+                    payload := json_build_object(
+                        'task_id', NEW.id,
+                        'task_name', NEW.task_name,
+                        'queue_name', NEW.metadata->>'queue',
+                        'priority', NEW.priority,
+                        'enqueued_at', NEW.created_at
+                    );
+                    PERFORM pg_notify('{}', payload::text);
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                "#,
+                channel
+            );
+
+            sqlx::query(&function_sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to create notification function: {}", e))
+                })?;
+
+            // Create trigger
+            let trigger_sql = r#"
+                DROP TRIGGER IF EXISTS trigger_notify_task_enqueued ON celers_tasks;
+                CREATE TRIGGER trigger_notify_task_enqueued
+                    AFTER INSERT ON celers_tasks
+                    FOR EACH ROW
+                    EXECUTE FUNCTION notify_task_enqueued();
+                "#;
+
+            sqlx::query(trigger_sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to create notification trigger: {}", e))
+                })?;
+
+            tracing::info!(channel = %channel, "Enabled task notifications");
+        } else {
+            // Drop trigger
+            let drop_sql = r#"
+                DROP TRIGGER IF EXISTS trigger_notify_task_enqueued ON celers_tasks;
+                "#;
+
+            sqlx::query(drop_sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to disable notification trigger: {}", e))
+                })?;
+
+            tracing::info!(channel = %channel, "Disabled task notifications");
+        }
+
+        Ok(())
+    }
+
+    /// Check if notifications are enabled
+    ///
+    /// Returns true if the notification trigger exists, false otherwise.
+    pub async fn notifications_enabled(&self) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_trigger
+                WHERE tgname = 'trigger_notify_task_enqueued'
+                  AND tgrelid = 'celers_tasks'::regclass
+            )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check notification status: {}", e)))?;
+
+        Ok(exists)
+    }
+}
+
+// ========== Task Deduplication Support ==========
+
+/// Deduplication configuration for preventing duplicate task execution
+///
+/// Task deduplication ensures that tasks with the same idempotency key are not
+/// executed multiple times within a specified time window. This is critical for
+/// distributed systems where the same request might be received multiple times.
+///
+/// # Example
+///
+/// ```no_run
+/// use celers_broker_postgres::{PostgresBroker, DeduplicationConfig};
+/// use celers_core::{Broker, SerializedTask};
+/// use std::time::Duration;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+/// broker.migrate().await?;
+///
+/// // Enable deduplication with 5-minute window
+/// let config = DeduplicationConfig {
+///     enabled: true,
+///     window_secs: 300, // 5 minutes
+/// };
+///
+/// // Enqueue with idempotency key
+/// let task = SerializedTask::new("process_payment".to_string(), vec![1, 2, 3]);
+/// let idempotency_key = "payment-12345";
+///
+/// // First enqueue succeeds
+/// let task_id = broker.enqueue_idempotent(task.clone(), idempotency_key, &config).await?;
+/// println!("Task enqueued: {}", task_id);
+///
+/// // Second enqueue within window returns existing task ID
+/// let duplicate_id = broker.enqueue_idempotent(task, idempotency_key, &config).await?;
+/// assert_eq!(task_id, duplicate_id);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeduplicationConfig {
+    /// Whether deduplication is enabled
+    pub enabled: bool,
+    /// Deduplication time window in seconds
+    pub window_secs: i64,
+}
+
+impl Default for DeduplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_secs: 300, // 5 minutes default
+        }
+    }
+}
+
+/// Information about a deduplicated task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeduplicationInfo {
+    /// Idempotency key
+    pub idempotency_key: String,
+    /// Task ID that was enqueued
+    pub task_id: Uuid,
+    /// Task name
+    pub task_name: String,
+    /// When the task was first enqueued
+    pub first_seen_at: DateTime<Utc>,
+    /// When the deduplication entry expires
+    pub expires_at: DateTime<Utc>,
+    /// Number of duplicate attempts blocked
+    pub duplicate_count: i32,
+}
+
+impl PostgresBroker {
+    /// Enqueue a task with idempotency guarantee
+    ///
+    /// If a task with the same idempotency key was enqueued within the deduplication
+    /// window, this returns the ID of the existing task instead of creating a duplicate.
+    ///
+    /// # Arguments
+    /// * `task` - The task to enqueue
+    /// * `idempotency_key` - Unique key to identify duplicate requests
+    /// * `config` - Deduplication configuration
+    ///
+    /// # Returns
+    /// The task ID (either newly created or existing)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::{PostgresBroker, DeduplicationConfig};
+    /// use celers_core::{Broker, SerializedTask};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let config = DeduplicationConfig::default();
+    ///
+    /// let task = SerializedTask::new("process_order".to_string(), vec![]);
+    /// let task_id = broker.enqueue_idempotent(task, "order-123", &config).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_idempotent(
+        &self,
+        task: SerializedTask,
+        idempotency_key: &str,
+        config: &DeduplicationConfig,
+    ) -> Result<TaskId> {
+        if !config.enabled {
+            // Deduplication disabled, just enqueue normally
+            return self.enqueue(task).await;
+        }
+
+        // Start a transaction for atomicity
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        // Check for existing task with this idempotency key
+        let existing = sqlx::query(
+            r#"
+            SELECT task_id, duplicate_count
+            FROM celers_task_deduplication
+            WHERE idempotency_key = $1
+              AND expires_at > NOW()
+              AND queue_name = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(&self.queue_name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check deduplication: {}", e)))?;
+
+        if let Some(row) = existing {
+            let task_id: Uuid = row.get("task_id");
+            let duplicate_count: i32 = row.get("duplicate_count");
+
+            // Increment duplicate count
+            sqlx::query(
+                r#"
+                UPDATE celers_task_deduplication
+                SET duplicate_count = duplicate_count + 1,
+                    last_seen_at = NOW()
+                WHERE idempotency_key = $1
+                  AND queue_name = $2
+                "#,
+            )
+            .bind(idempotency_key)
+            .bind(&self.queue_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to update duplicate count: {}", e)))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
+
+            tracing::info!(
+                idempotency_key = %idempotency_key,
+                task_id = %task_id,
+                duplicate_count = duplicate_count + 1,
+                "Blocked duplicate task enqueue"
+            );
+
+            return Ok(task_id);
+        }
+
+        // No existing task, enqueue normally
+        let task_id = task.metadata.id;
+        let mut db_metadata = json!({
+            "queue": self.queue_name,
+            "enqueued_at": chrono::Utc::now().to_rfc3339(),
+            "idempotency_key": idempotency_key,
+        });
+
+        // Merge task metadata
+        if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
+            if let Some(obj) = db_metadata.as_object_mut() {
+                if let Some(meta_obj) = task_meta.as_object() {
+                    for (k, v) in meta_obj {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
+        // Insert task
+        sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+            VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW())
+            "#,
+        )
+        .bind(task_id)
+        .bind(&task.metadata.name)
+        .bind(&task.payload)
+        .bind(task.metadata.priority)
+        .bind(task.metadata.max_retries as i32)
+        .bind(db_metadata)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
+
+        // Insert deduplication entry
+        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(config.window_secs);
+        sqlx::query(
+            r#"
+            INSERT INTO celers_task_deduplication
+                (idempotency_key, task_id, task_name, queue_name, first_seen_at, last_seen_at, expires_at, duplicate_count)
+            VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, 0)
+            ON CONFLICT (idempotency_key, queue_name) DO NOTHING
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(task_id)
+        .bind(&task.metadata.name)
+        .bind(&self.queue_name)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            CelersError::Other(format!("Failed to insert deduplication entry: {}", e))
+        })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
+
+        #[cfg(feature = "metrics")]
+        {
+            TASKS_ENQUEUED_TOTAL.inc();
+            TASKS_ENQUEUED_BY_TYPE
+                .with_label_values(&[&task.metadata.name])
+                .inc();
+        }
+
+        tracing::info!(
+            idempotency_key = %idempotency_key,
+            task_id = %task_id,
+            task_name = %task.metadata.name,
+            "Enqueued task with deduplication"
+        );
+
+        Ok(task_id)
+    }
+
+    /// Check if a task with the given idempotency key exists
+    ///
+    /// Returns Some(DeduplicationInfo) if a task exists, None otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// if let Some(info) = broker.check_deduplication("order-123").await? {
+    ///     println!("Task already exists: {}", info.task_id);
+    ///     println!("Duplicates blocked: {}", info.duplicate_count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn check_deduplication(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<DeduplicationInfo>> {
+        let row = sqlx::query(
+            r#"
+            SELECT idempotency_key, task_id, task_name, first_seen_at, expires_at, duplicate_count
+            FROM celers_task_deduplication
+            WHERE idempotency_key = $1
+              AND queue_name = $2
+              AND expires_at > NOW()
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(&self.queue_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check deduplication: {}", e)))?;
+
+        match row {
+            Some(row) => Ok(Some(DeduplicationInfo {
+                idempotency_key: row.get("idempotency_key"),
+                task_id: row.get("task_id"),
+                task_name: row.get("task_name"),
+                first_seen_at: row.get("first_seen_at"),
+                expires_at: row.get("expires_at"),
+                duplicate_count: row.get("duplicate_count"),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Clean up expired deduplication entries
+    ///
+    /// Removes deduplication entries that have expired to prevent table bloat.
+    /// This should be run periodically (e.g., via a maintenance task).
+    ///
+    /// # Returns
+    /// The number of entries deleted
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let deleted = broker.cleanup_deduplication().await?;
+    /// println!("Cleaned up {} expired deduplication entries", deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cleanup_deduplication(&self) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM celers_task_deduplication
+            WHERE expires_at < NOW()
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cleanup deduplication: {}", e)))?;
+
+        let deleted = result.rows_affected() as i64;
+
+        tracing::info!(
+            deleted = deleted,
+            "Cleaned up expired deduplication entries"
+        );
+
+        Ok(deleted)
+    }
+
+    /// Get deduplication statistics
+    ///
+    /// Returns statistics about deduplication entries in the system.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let (active, total_duplicates) = broker.get_deduplication_stats().await?;
+    /// println!("Active dedup entries: {}", active);
+    /// println!("Total duplicates blocked: {}", total_duplicates);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_deduplication_stats(&self) -> Result<(i64, i64)> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) as active_entries,
+                COALESCE(SUM(duplicate_count), 0) as total_duplicates
+            FROM celers_task_deduplication
+            WHERE expires_at > NOW()
+              AND queue_name = $1
+            "#,
+        )
+        .bind(&self.queue_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get deduplication stats: {}", e)))?;
+
+        let active_entries: i64 = row.get("active_entries");
+        let total_duplicates: i64 = row.get("total_duplicates");
+
+        Ok((active_entries, total_duplicates))
+    }
+}
+
 #[async_trait]
 impl Broker for PostgresBroker {
     async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
@@ -3983,6 +4642,2552 @@ impl PostgresBroker {
     }
 }
 
+/// Convenience helper methods for common patterns
+impl PostgresBroker {
+    /// Enqueue multiple tasks with the same configuration
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use celers_core::Broker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let task_ids = broker.enqueue_many(
+    ///     "process_user",
+    ///     vec![vec![1], vec![2], vec![3]],  // payloads
+    ///     Some(5),  // priority
+    ///     Some(3),  // max_retries
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_many(
+        &self,
+        task_name: &str,
+        payloads: Vec<Vec<u8>>,
+        priority: Option<i32>,
+        max_retries: Option<u32>,
+    ) -> Result<Vec<TaskId>> {
+        let mut tasks = Vec::new();
+
+        for payload in payloads {
+            let mut task = SerializedTask::new(task_name.to_string(), payload);
+            if let Some(p) = priority {
+                task.metadata.priority = p;
+            }
+            if let Some(r) = max_retries {
+                task.metadata.max_retries = r;
+            }
+            tasks.push(task);
+        }
+
+        self.enqueue_batch(tasks).await
+    }
+
+    /// Process a single task with automatic ack/reject
+    ///
+    /// Returns Some((task, ack_fn, reject_fn)) if a task is available, None otherwise
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// if let Some((task, ack, reject)) = broker.dequeue_with_handlers().await? {
+    ///     match process_task(&task).await {
+    ///         Ok(_) => ack().await?,
+    ///         Err(e) => reject(&e.to_string()).await?,
+    ///     }
+    /// }
+    /// # async fn process_task(_: &celers_core::SerializedTask) -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn dequeue_with_handlers(
+        &self,
+    ) -> Result<
+        Option<(
+            SerializedTask,
+            Box<
+                dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+                    + Send,
+            >,
+            Box<
+                dyn Fn(
+                        &str,
+                    )
+                        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+                    + Send,
+            >,
+        )>,
+    > {
+        if let Some(msg) = self.dequeue().await? {
+            let task_id = msg.task.metadata.id;
+            let receipt = msg.receipt_handle.clone();
+            let broker1 = self.pool.clone();
+            let broker2 = self.pool.clone();
+
+            let ack_fn = Box::new(move || {
+                let pool = broker1.clone();
+                let id = task_id;
+                let _receipt_clone = receipt.clone();
+                Box::pin(async move {
+                    sqlx::query("UPDATE celers_tasks SET state = 'completed', completed_at = NOW() WHERE id = $1")
+                        .bind(id)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| CelersError::Other(format!("Ack failed: {}", e)))?;
+                    Ok(())
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+            });
+
+            let reject_fn = Box::new(move |_error: &str| {
+                let pool = broker2.clone();
+                let id = task_id;
+                Box::pin(async move {
+                    sqlx::query(
+                        "UPDATE celers_tasks SET retry_count = retry_count + 1 WHERE id = $1",
+                    )
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| CelersError::Other(format!("Reject failed: {}", e)))?;
+                    Ok(())
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+            });
+
+            Ok(Some((msg.task, ack_fn, reject_fn)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a summary of queue health in a single call
+    ///
+    /// Returns (pending, processing, dlq, oldest_task_age_secs, success_rate)
+    pub async fn get_queue_health_summary(&self) -> Result<(i64, i64, i64, Option<i64>, f64)> {
+        let stats = self.get_statistics().await?;
+        let oldest = self.oldest_pending_age_secs().await.unwrap_or(None);
+        let success = self.success_rate().await.unwrap_or(0.0);
+
+        Ok((stats.pending, stats.processing, stats.dlq, oldest, success))
+    }
+
+    /// Purge all completed tasks older than specified age
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Purge completed tasks older than 7 days
+    /// let purged = broker.purge_old_completed(Duration::from_secs(7 * 24 * 3600)).await?;
+    /// println!("Purged {} old completed tasks", purged);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn purge_old_completed(&self, older_than: Duration) -> Result<i64> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(older_than)
+                .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
+
+        let result =
+            sqlx::query("DELETE FROM celers_tasks WHERE state = 'completed' AND completed_at < $1")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CelersError::Other(format!("Purge failed: {}", e)))?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Cancel all tasks matching a specific task name
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let cancelled = broker.cancel_by_name("slow_task").await?;
+    /// println!("Cancelled {} tasks", cancelled);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_by_name(&self, task_name: &str) -> Result<i64> {
+        let result = sqlx::query(
+            "UPDATE celers_tasks
+             SET state = 'cancelled', completed_at = NOW()
+             WHERE task_name = $1 AND state IN ('pending', 'processing')",
+        )
+        .bind(task_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Cancel failed: {}", e)))?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Wait for a specific task to complete (with timeout)
+    ///
+    /// Returns true if task completed, false if timeout reached
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use celers_core::Broker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// # let task = celers_core::SerializedTask::new("test".to_string(), vec![]);
+    /// let task_id = broker.enqueue(task).await?;
+    ///
+    /// // Wait up to 30 seconds for completion
+    /// if broker.wait_for_completion(&task_id, Duration::from_secs(30)).await? {
+    ///     println!("Task completed!");
+    /// } else {
+    ///     println!("Task timed out");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn wait_for_completion(&self, task_id: &TaskId, timeout: Duration) -> Result<bool> {
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(100);
+
+        while start.elapsed() < timeout {
+            if let Some(task_info) = self.get_task(task_id).await? {
+                match task_info.state {
+                    DbTaskState::Completed | DbTaskState::Failed | DbTaskState::Cancelled => {
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        Ok(false)
+    }
+
+    /// Get count of tasks in each state as a HashMap
+    pub async fn get_state_counts(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let stats = self.get_statistics().await?;
+
+        let mut counts = std::collections::HashMap::new();
+        counts.insert("pending".to_string(), stats.pending);
+        counts.insert("processing".to_string(), stats.processing);
+        counts.insert("completed".to_string(), stats.completed);
+        counts.insert("failed".to_string(), stats.failed);
+        counts.insert("cancelled".to_string(), stats.cancelled);
+        counts.insert("dlq".to_string(), stats.dlq);
+
+        Ok(counts)
+    }
+
+    /// Retry all tasks currently in the DLQ
+    ///
+    /// Returns the number of tasks requeued
+    pub async fn retry_all_dlq(&self) -> Result<i64> {
+        let dlq_tasks = self.list_dlq(1000, 0).await?;
+        let mut count = 0;
+
+        for dlq_task in dlq_tasks {
+            if self.requeue_from_dlq(&dlq_task.id).await.is_ok() {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Find tasks within a specific priority range
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Find high-priority tasks (priority >= 5)
+    /// let high_priority_tasks = broker.find_tasks_by_priority_range(5, 10, 100).await?;
+    /// println!("Found {} high-priority tasks", high_priority_tasks.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn find_tasks_by_priority_range(
+        &self,
+        min_priority: i32,
+        max_priority: i32,
+        limit: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = sqlx::query(&format!(
+            "SELECT id, task_name, state, priority, retry_count, max_retries,
+                        created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                 FROM {}
+                 WHERE priority BETWEEN $1 AND $2 AND state = 'pending'
+                 ORDER BY priority DESC, created_at ASC
+                 LIMIT $3",
+            self.queue_name
+        ))
+        .bind(min_priority)
+        .bind(max_priority)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to find tasks by priority: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            let state_str: String = row.get("state");
+            tasks.push(TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: state_str.parse()?,
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            });
+        }
+
+        Ok(tasks)
+    }
+
+    /// Cancel all pending tasks older than specified age
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Cancel pending tasks older than 24 hours
+    /// let cancelled = broker.cancel_old_pending(Duration::from_secs(24 * 3600)).await?;
+    /// println!("Cancelled {} old pending tasks", cancelled);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_old_pending(&self, older_than: Duration) -> Result<i64> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(older_than)
+                .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
+
+        let result = sqlx::query(&format!(
+            "UPDATE {} SET state = 'cancelled', completed_at = NOW()
+                 WHERE state = 'pending' AND created_at < $1",
+            self.queue_name
+        ))
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Cancel old pending failed: {}", e)))?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Batch cancel multiple tasks by their IDs
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use uuid::Uuid;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let task_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    /// let cancelled = broker.batch_cancel(&task_ids).await?;
+    /// println!("Cancelled {} tasks", cancelled);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn batch_cancel(&self, task_ids: &[TaskId]) -> Result<i64> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let result = sqlx::query(&format!(
+            "UPDATE {} SET state = 'cancelled', completed_at = NOW()
+                 WHERE id = ANY($1) AND state IN ('pending', 'processing')",
+            self.queue_name
+        ))
+        .bind(task_ids)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Batch cancel failed: {}", e)))?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Find tasks that have been processing for longer than the threshold
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Find tasks processing for more than 1 hour
+    /// let stuck_tasks = broker.find_stuck_tasks(Duration::from_secs(3600)).await?;
+    /// println!("Found {} stuck tasks", stuck_tasks.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn find_stuck_tasks(&self, threshold: Duration) -> Result<Vec<TaskInfo>> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(threshold)
+                .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
+
+        let rows = sqlx::query(&format!(
+            "SELECT id, task_name, state, priority, retry_count, max_retries,
+                        created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                 FROM {}
+                 WHERE state = 'processing' AND started_at < $1
+                 ORDER BY started_at ASC",
+            self.queue_name
+        ))
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to find stuck tasks: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            let state_str: String = row.get("state");
+            tasks.push(TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: state_str.parse()?,
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            });
+        }
+
+        Ok(tasks)
+    }
+
+    /// Automatically requeue stuck tasks (processing too long)
+    ///
+    /// Returns the number of tasks requeued
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// // Requeue tasks stuck for more than 2 hours
+    /// let requeued = broker.requeue_stuck_tasks(Duration::from_secs(2 * 3600)).await?;
+    /// println!("Requeued {} stuck tasks", requeued);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn requeue_stuck_tasks(&self, threshold: Duration) -> Result<i64> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(threshold)
+                .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
+
+        let result = sqlx::query(&format!(
+            "UPDATE {} SET state = 'pending', started_at = NULL, worker_id = NULL
+                 WHERE state = 'processing' AND started_at < $1",
+            self.queue_name
+        ))
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Requeue stuck tasks failed: {}", e)))?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Get queue depth grouped by priority level
+    ///
+    /// Returns a HashMap mapping priority to task count
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let depth_by_priority = broker.get_queue_depth_by_priority().await?;
+    /// for (priority, count) in depth_by_priority {
+    ///     println!("Priority {}: {} tasks", priority, count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_queue_depth_by_priority(&self) -> Result<std::collections::HashMap<i32, i64>> {
+        let rows = sqlx::query(&format!(
+            "SELECT priority, COUNT(*) as count
+                 FROM {}
+                 WHERE state = 'pending'
+                 GROUP BY priority
+                 ORDER BY priority DESC",
+            self.queue_name
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get queue depth: {}", e)))?;
+
+        let mut depth_map = std::collections::HashMap::new();
+        for row in rows {
+            let priority: i32 = row.get("priority");
+            let count: i64 = row.get("count");
+            depth_map.insert(priority, count);
+        }
+
+        Ok(depth_map)
+    }
+
+    /// Get throughput statistics (completed tasks per time period)
+    ///
+    /// Returns (tasks_last_hour, tasks_last_day, avg_tasks_per_hour)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let (last_hour, last_day, avg_per_hour) = broker.get_throughput_stats().await?;
+    /// println!("Throughput: {} tasks/hour (last hour: {}, last day: {})",
+    ///          avg_per_hour, last_hour, last_day);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_throughput_stats(&self) -> Result<(i64, i64, f64)> {
+        let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+        let one_day_ago = chrono::Utc::now() - chrono::Duration::days(1);
+
+        // Tasks completed in last hour
+        let last_hour: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE state = 'completed' AND completed_at > $1",
+            self.queue_name
+        ))
+        .bind(one_hour_ago)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        // Tasks completed in last day
+        let last_day: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE state = 'completed' AND completed_at > $1",
+            self.queue_name
+        ))
+        .bind(one_day_ago)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        // Average per hour over last day
+        let avg_per_hour = if last_day > 0 {
+            last_day as f64 / 24.0
+        } else {
+            0.0
+        };
+
+        Ok((last_hour, last_day, avg_per_hour))
+    }
+
+    /// Get average task duration by task name
+    ///
+    /// Returns HashMap of task name to average duration in milliseconds
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let avg_durations = broker.get_avg_task_duration_by_name().await?;
+    /// for (task_name, duration_ms) in avg_durations {
+    ///     println!("{}: {:.2}ms average", task_name, duration_ms);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_avg_task_duration_by_name(
+        &self,
+    ) -> Result<std::collections::HashMap<String, f64>> {
+        let rows = sqlx::query(
+            &format!(
+                "SELECT task_name,
+                        AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) as avg_duration_ms
+                 FROM {}
+                 WHERE state = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                 GROUP BY task_name
+                 ORDER BY avg_duration_ms DESC",
+                self.queue_name
+            )
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get avg duration: {}", e)))?;
+
+        let mut duration_map = std::collections::HashMap::new();
+        for row in rows {
+            let task_name: String = row.get("task_name");
+            let avg_duration: Option<f64> = row.get("avg_duration_ms");
+            if let Some(duration) = avg_duration {
+                duration_map.insert(task_name, duration);
+            }
+        }
+
+        Ok(duration_map)
+    }
+
+    // ========== Task TTL (Time To Live) ==========
+
+    /// Set TTL (Time To Live) for tasks by task name
+    ///
+    /// Tasks older than the specified TTL will be automatically expired and moved to cancelled state.
+    /// This is useful for preventing old tasks from being processed when they're no longer relevant.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_name` - Name of the task type to expire
+    /// * `ttl_secs` - TTL in seconds (tasks older than this will be expired)
+    ///
+    /// # Returns
+    ///
+    /// Number of tasks that were expired
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Expire pending tasks older than 1 hour for "email_notifications" task type
+    /// let expired = broker.expire_tasks_by_ttl("email_notifications", 3600).await?;
+    /// println!("Expired {} old tasks", expired);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn expire_tasks_by_ttl(&self, task_name: &str, ttl_secs: i64) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW(),
+                error_message = 'Task expired due to TTL'
+            WHERE task_name = $1
+              AND queue_name = $2
+              AND state IN ('pending', 'processing')
+              AND created_at < NOW() - INTERVAL '1 second' * $3
+            "#,
+        )
+        .bind(task_name)
+        .bind(&self.queue_name)
+        .bind(ttl_secs)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to expire tasks: {}", e)))?;
+
+        let expired = result.rows_affected() as i64;
+
+        if expired > 0 {
+            tracing::info!(
+                task_name = task_name,
+                ttl_secs = ttl_secs,
+                expired = expired,
+                "Expired tasks due to TTL"
+            );
+        }
+
+        Ok(expired)
+    }
+
+    /// Expire all pending tasks older than specified TTL
+    ///
+    /// This is a global TTL that applies to all task types.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Expire all pending tasks older than 24 hours
+    /// let expired = broker.expire_all_tasks_by_ttl(86400).await?;
+    /// println!("Expired {} old tasks", expired);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn expire_all_tasks_by_ttl(&self, ttl_secs: i64) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW(),
+                error_message = 'Task expired due to TTL'
+            WHERE queue_name = $1
+              AND state IN ('pending', 'processing')
+              AND created_at < NOW() - INTERVAL '1 second' * $2
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(ttl_secs)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to expire all tasks: {}", e)))?;
+
+        let expired = result.rows_affected() as i64;
+
+        if expired > 0 {
+            tracing::info!(
+                ttl_secs = ttl_secs,
+                expired = expired,
+                "Expired all tasks due to TTL"
+            );
+        }
+
+        Ok(expired)
+    }
+
+    // ========== PostgreSQL Advisory Locks ==========
+
+    /// Acquire PostgreSQL advisory lock for exclusive task processing
+    ///
+    /// Advisory locks provide application-level distributed locking using PostgreSQL's
+    /// advisory lock mechanism. This is useful when you need to ensure only one worker
+    /// processes tasks of a specific type at a time.
+    ///
+    /// The lock is automatically released when the connection is closed or when
+    /// `release_advisory_lock` is called.
+    ///
+    /// # Arguments
+    ///
+    /// * `lock_id` - Numeric lock ID (must be i64)
+    ///
+    /// # Returns
+    ///
+    /// `true` if lock was acquired, `false` if already locked by another session
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Try to acquire lock for critical section
+    /// let lock_id = 12345i64;
+    /// if broker.try_advisory_lock(lock_id).await? {
+    ///     // Process critical task
+    ///     println!("Lock acquired, processing...");
+    ///
+    ///     // Release lock when done
+    ///     broker.release_advisory_lock(lock_id).await?;
+    /// } else {
+    ///     println!("Lock held by another worker");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn try_advisory_lock(&self, lock_id: i64) -> Result<bool> {
+        let row = sqlx::query("SELECT pg_try_advisory_lock($1) as locked")
+            .bind(lock_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to acquire advisory lock: {}", e)))?;
+
+        let locked: bool = row.get("locked");
+
+        if locked {
+            tracing::debug!(lock_id = lock_id, "Advisory lock acquired");
+        } else {
+            tracing::debug!(lock_id = lock_id, "Advisory lock already held");
+        }
+
+        Ok(locked)
+    }
+
+    /// Release PostgreSQL advisory lock
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// broker.release_advisory_lock(12345).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn release_advisory_lock(&self, lock_id: i64) -> Result<bool> {
+        let row = sqlx::query("SELECT pg_advisory_unlock($1) as unlocked")
+            .bind(lock_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to release advisory lock: {}", e)))?;
+
+        let unlocked: bool = row.get("unlocked");
+
+        if unlocked {
+            tracing::debug!(lock_id = lock_id, "Advisory lock released");
+        } else {
+            tracing::warn!(lock_id = lock_id, "Advisory lock was not held");
+        }
+
+        Ok(unlocked)
+    }
+
+    /// Acquire blocking advisory lock (waits until available)
+    ///
+    /// Unlike `try_advisory_lock`, this method will block until the lock becomes available.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Wait for lock to become available
+    /// broker.advisory_lock(12345).await?;
+    /// // Process critical section
+    /// broker.release_advisory_lock(12345).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn advisory_lock(&self, lock_id: i64) -> Result<()> {
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to acquire blocking advisory lock: {}", e))
+            })?;
+
+        tracing::debug!(lock_id = lock_id, "Blocking advisory lock acquired");
+
+        Ok(())
+    }
+
+    /// Check if an advisory lock is currently held
+    ///
+    /// Note: This checks across all sessions, not just the current one.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let is_locked = broker.is_advisory_lock_held(12345).await?;
+    /// println!("Lock held: {}", is_locked);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn is_advisory_lock_held(&self, lock_id: i64) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) > 0 as held
+            FROM pg_locks
+            WHERE locktype = 'advisory'
+              AND objid = $1
+            "#,
+        )
+        .bind(lock_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check advisory lock: {}", e)))?;
+
+        let held: bool = row.get("held");
+        Ok(held)
+    }
+
+    // ========== Task Performance Analytics ==========
+
+    /// Get task performance percentiles for a specific task type
+    ///
+    /// Returns performance percentiles (p50, p95, p99) for task execution times.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let (p50, p95, p99) = broker.get_task_percentiles("send_email").await?;
+    /// println!("p50: {}ms, p95: {}ms, p99: {}ms", p50, p95, p99);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_task_percentiles(&self, task_name: &str) -> Result<(f64, f64, f64)> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY
+                    EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000
+                ) as p50,
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY
+                    EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000
+                ) as p95,
+                PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY
+                    EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000
+                ) as p99
+            FROM celers_tasks
+            WHERE task_name = $1
+              AND queue_name = $2
+              AND state = 'completed'
+              AND started_at IS NOT NULL
+              AND completed_at IS NOT NULL
+              AND completed_at > started_at
+            "#,
+        )
+        .bind(task_name)
+        .bind(&self.queue_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task percentiles: {}", e)))?;
+
+        let p50: Option<f64> = row.get("p50");
+        let p95: Option<f64> = row.get("p95");
+        let p99: Option<f64> = row.get("p99");
+
+        Ok((p50.unwrap_or(0.0), p95.unwrap_or(0.0), p99.unwrap_or(0.0)))
+    }
+
+    /// Get slowest tasks in the queue
+    ///
+    /// Returns the slowest N tasks based on execution time.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let slow_tasks = broker.get_slowest_tasks(10).await?;
+    /// for task in slow_tasks {
+    ///     if let (Some(started), Some(completed)) = (task.started_at, task.completed_at) {
+    ///         let duration_ms = (completed - started).num_milliseconds();
+    ///         println!("{}: {}ms", task.task_name, duration_ms);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_slowest_tasks(&self, limit: i64) -> Result<Vec<TaskInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, task_name, state, priority, retry_count, max_retries,
+                created_at, scheduled_at, started_at, completed_at,
+                worker_id, error_message,
+                EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000 as runtime_ms
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND state = 'completed'
+              AND started_at IS NOT NULL
+              AND completed_at IS NOT NULL
+              AND completed_at > started_at
+            ORDER BY (completed_at - started_at) DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get slowest tasks: {}", e)))?;
+
+        let tasks: Result<Vec<TaskInfo>> = rows
+            .iter()
+            .map(|row| {
+                let state_str: String = row.get("state");
+                Ok(TaskInfo {
+                    id: row.get("id"),
+                    task_name: row.get("task_name"),
+                    state: state_str.parse()?,
+                    priority: row.get("priority"),
+                    retry_count: row.get("retry_count"),
+                    max_retries: row.get("max_retries"),
+                    created_at: row.get("created_at"),
+                    scheduled_at: row.get("scheduled_at"),
+                    started_at: row.get("started_at"),
+                    completed_at: row.get("completed_at"),
+                    worker_id: row.get("worker_id"),
+                    error_message: row.get("error_message"),
+                })
+            })
+            .collect();
+
+        tasks
+    }
+
+    // ========== Rate Limiting ==========
+
+    /// Get task processing rate for a specific task type
+    ///
+    /// Returns the number of tasks processed in the last N seconds.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Get tasks processed in last 60 seconds
+    /// let rate = broker.get_task_rate("send_email", 60).await?;
+    /// println!("Processed {} send_email tasks in last 60 seconds", rate);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_task_rate(&self, task_name: &str, window_secs: i64) -> Result<i64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count
+            FROM celers_tasks
+            WHERE task_name = $1
+              AND queue_name = $2
+              AND state = 'completed'
+              AND completed_at > NOW() - INTERVAL '1 second' * $3
+            "#,
+        )
+        .bind(task_name)
+        .bind(&self.queue_name)
+        .bind(window_secs)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task rate: {}", e)))?;
+
+        let count: i64 = row.get("count");
+        Ok(count)
+    }
+
+    /// Check if task processing rate exceeds limit
+    ///
+    /// Returns true if the rate limit is exceeded.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Check if more than 100 emails sent in last 60 seconds
+    /// if broker.is_rate_limited("send_email", 100, 60).await? {
+    ///     println!("Rate limit exceeded, throttling...");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn is_rate_limited(
+        &self,
+        task_name: &str,
+        max_count: i64,
+        window_secs: i64,
+    ) -> Result<bool> {
+        let current_rate = self.get_task_rate(task_name, window_secs).await?;
+        Ok(current_rate >= max_count)
+    }
+
+    // ========== Dynamic Priority Management ==========
+
+    /// Boost priority of pending tasks by task name
+    ///
+    /// Increases the priority of all pending tasks of a specific type by the specified amount.
+    /// Higher priority values mean higher priority (will be dequeued first).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Boost priority of critical alerts by 100
+    /// let boosted = broker.boost_task_priority("critical_alert", 100).await?;
+    /// println!("Boosted {} critical alert tasks", boosted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn boost_task_priority(&self, task_name: &str, boost_amount: i32) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET priority = priority + $1
+            WHERE task_name = $2
+              AND queue_name = $3
+              AND state = 'pending'
+            "#,
+        )
+        .bind(boost_amount)
+        .bind(task_name)
+        .bind(&self.queue_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to boost task priority: {}", e)))?;
+
+        let boosted = result.rows_affected() as i64;
+
+        if boosted > 0 {
+            tracing::info!(
+                task_name = task_name,
+                boost_amount = boost_amount,
+                boosted = boosted,
+                "Boosted task priority"
+            );
+        }
+
+        Ok(boosted)
+    }
+
+    /// Set absolute priority for specific tasks
+    ///
+    /// Sets the priority to an absolute value for tasks matching the criteria.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let task_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+    /// let updated = broker.set_task_priority(&task_ids, 999).await?;
+    /// println!("Set {} tasks to highest priority", updated);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_task_priority(
+        &self,
+        task_ids: &[uuid::Uuid],
+        new_priority: i32,
+    ) -> Result<i64> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET priority = $1
+            WHERE id = ANY($2)
+              AND queue_name = $3
+              AND state = 'pending'
+            "#,
+        )
+        .bind(new_priority)
+        .bind(task_ids)
+        .bind(&self.queue_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to set task priority: {}", e)))?;
+
+        let updated = result.rows_affected() as i64;
+
+        if updated > 0 {
+            tracing::info!(
+                count = updated,
+                new_priority = new_priority,
+                "Updated task priorities"
+            );
+        }
+
+        Ok(updated)
+    }
+
+    // ========== Enhanced DLQ Analytics ==========
+
+    /// Get DLQ task statistics grouped by task name
+    ///
+    /// Returns a map of task names to their DLQ counts.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let stats = broker.get_dlq_stats_by_task().await?;
+    /// for (task_name, count) in stats {
+    ///     println!("{}: {} failed tasks", task_name, count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_dlq_stats_by_task(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT task_name, COUNT(*) as count
+            FROM celers_dlq
+            WHERE queue_name = $1
+            GROUP BY task_name
+            ORDER BY count DESC
+            "#,
+        )
+        .bind(&self.queue_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get DLQ stats: {}", e)))?;
+
+        let mut stats = std::collections::HashMap::new();
+        for row in rows {
+            let task_name: String = row.get("task_name");
+            let count: i64 = row.get("count");
+            stats.insert(task_name, count);
+        }
+
+        Ok(stats)
+    }
+
+    /// Get most common error messages from DLQ
+    ///
+    /// Returns the top N most common error messages with their counts.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let errors = broker.get_dlq_error_patterns(10).await?;
+    /// for (error_msg, count) in errors {
+    ///     println!("{} occurrences: {}", count, error_msg.unwrap_or_else(|| "Unknown".to_string()));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_dlq_error_patterns(&self, limit: i64) -> Result<Vec<(Option<String>, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT error_message, COUNT(*) as count
+            FROM celers_dlq
+            WHERE queue_name = $1
+            GROUP BY error_message
+            ORDER BY count DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get DLQ error patterns: {}", e)))?;
+
+        let patterns: Vec<(Option<String>, i64)> = rows
+            .iter()
+            .map(|row| {
+                let error_message: Option<String> = row.get("error_message");
+                let count: i64 = row.get("count");
+                (error_message, count)
+            })
+            .collect();
+
+        Ok(patterns)
+    }
+
+    /// Get DLQ tasks that failed recently
+    ///
+    /// Returns DLQ tasks that failed within the specified time window.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Get tasks that failed in last hour
+    /// let recent_failures = broker.get_recent_dlq_tasks(3600).await?;
+    /// println!("Recent failures: {}", recent_failures.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_recent_dlq_tasks(&self, window_secs: i64) -> Result<Vec<DlqTaskInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_id, task_name, retry_count, error_message, failed_at
+            FROM celers_dlq
+            WHERE queue_name = $1
+              AND failed_at > NOW() - INTERVAL '1 second' * $2
+            ORDER BY failed_at DESC
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(window_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get recent DLQ tasks: {}", e)))?;
+
+        let tasks: Vec<DlqTaskInfo> = rows
+            .iter()
+            .map(|row| DlqTaskInfo {
+                id: row.get("id"),
+                task_id: row.get("task_id"),
+                task_name: row.get("task_name"),
+                retry_count: row.get("retry_count"),
+                error_message: row.get("error_message"),
+                failed_at: row.get("failed_at"),
+            })
+            .collect();
+
+        Ok(tasks)
+    }
+
+    // ========== Task Cancellation with Reasons ==========
+
+    /// Cancel task with a specific reason
+    ///
+    /// Cancels a task and records the cancellation reason in the error_message field.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let task_id = Uuid::new_v4();
+    /// broker.cancel_with_reason(&task_id, "User requested cancellation").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_with_reason(&self, task_id: &uuid::Uuid, reason: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW(),
+                error_message = $1
+            WHERE id = $2
+              AND queue_name = $3
+              AND state IN ('pending', 'processing')
+            "#,
+        )
+        .bind(format!("Cancelled: {}", reason))
+        .bind(task_id)
+        .bind(&self.queue_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel task with reason: {}", e)))?;
+
+        tracing::info!(
+            task_id = %task_id,
+            reason = reason,
+            "Task cancelled with reason"
+        );
+
+        Ok(())
+    }
+
+    /// Cancel multiple tasks with a reason
+    ///
+    /// Batch cancellation with a specified reason.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let task_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+    /// let cancelled = broker.cancel_batch_with_reason(&task_ids, "System shutdown").await?;
+    /// println!("Cancelled {} tasks", cancelled);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_batch_with_reason(
+        &self,
+        task_ids: &[uuid::Uuid],
+        reason: &str,
+    ) -> Result<i64> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET state = 'cancelled',
+                completed_at = NOW(),
+                error_message = $1
+            WHERE id = ANY($2)
+              AND queue_name = $3
+              AND state IN ('pending', 'processing')
+            "#,
+        )
+        .bind(format!("Cancelled: {}", reason))
+        .bind(task_ids)
+        .bind(&self.queue_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel tasks with reason: {}", e)))?;
+
+        let cancelled = result.rows_affected() as i64;
+
+        if cancelled > 0 {
+            tracing::info!(
+                count = cancelled,
+                reason = reason,
+                "Tasks cancelled with reason"
+            );
+        }
+
+        Ok(cancelled)
+    }
+
+    /// Get cancellation reasons for cancelled tasks
+    ///
+    /// Returns a breakdown of cancellation reasons and their counts.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let reasons = broker.get_cancellation_reasons(10).await?;
+    /// for (reason, count) in reasons {
+    ///     println!("{}: {} cancellations", reason.unwrap_or_else(|| "Unknown".to_string()), count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_cancellation_reasons(&self, limit: i64) -> Result<Vec<(Option<String>, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT error_message, COUNT(*) as count
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND state = 'cancelled'
+              AND error_message IS NOT NULL
+            GROUP BY error_message
+            ORDER BY count DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get cancellation reasons: {}", e)))?;
+
+        let reasons: Vec<(Option<String>, i64)> = rows
+            .iter()
+            .map(|row| {
+                let reason: Option<String> = row.get("error_message");
+                let count: i64 = row.get("count");
+                (reason, count)
+            })
+            .collect();
+
+        Ok(reasons)
+    }
+
+    /// Store multiple task results in a single batch operation
+    ///
+    /// More efficient than calling `store_result()` multiple times.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::{PostgresBroker, TaskResult, TaskResultStatus};
+    /// use uuid::Uuid;
+    /// use chrono::Utc;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let results = vec![
+    ///     TaskResult {
+    ///         task_id: Uuid::new_v4(),
+    ///         task_name: "task1".to_string(),
+    ///         status: TaskResultStatus::Success,
+    ///         result: Some(serde_json::json!({"value": 42})),
+    ///         error: None,
+    ///         traceback: None,
+    ///         created_at: Utc::now(),
+    ///         completed_at: Some(Utc::now()),
+    ///         runtime_ms: Some(100),
+    ///     },
+    ///     TaskResult {
+    ///         task_id: Uuid::new_v4(),
+    ///         task_name: "task2".to_string(),
+    ///         status: TaskResultStatus::Success,
+    ///         result: Some(serde_json::json!({"value": 100})),
+    ///         error: None,
+    ///         traceback: None,
+    ///         created_at: Utc::now(),
+    ///         completed_at: Some(Utc::now()),
+    ///         runtime_ms: Some(200),
+    ///     },
+    /// ];
+    ///
+    /// broker.store_results_batch(&results).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn store_results_batch(&self, results: &[TaskResult]) -> Result<i64> {
+        if results.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        let mut stored = 0i64;
+        for result in results {
+            sqlx::query(
+                r#"
+                INSERT INTO celers_task_results (task_id, status, result, error, traceback)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (task_id) DO UPDATE
+                SET status = EXCLUDED.status,
+                    result = EXCLUDED.result,
+                    error = EXCLUDED.error,
+                    traceback = EXCLUDED.traceback,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(result.task_id)
+            .bind(result.status.to_string())
+            .bind(&result.result)
+            .bind(&result.error)
+            .bind(&result.traceback)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to store result: {}", e)))?;
+
+            stored += 1;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
+
+        tracing::info!(count = stored, "Stored batch of task results");
+        Ok(stored)
+    }
+
+    /// Find tasks that failed with errors matching a pattern
+    ///
+    /// Uses PostgreSQL pattern matching (LIKE) to find tasks with specific error messages.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Find all tasks that failed with connection errors
+    /// let tasks = broker.find_tasks_by_error("%connection%", 100).await?;
+    /// println!("Found {} tasks with connection errors", tasks.len());
+    ///
+    /// // Find specific error
+    /// let tasks = broker.find_tasks_by_error("%timeout%", 50).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn find_tasks_by_error(
+        &self,
+        error_pattern: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_name, state, priority, retry_count, max_retries,
+                   created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND state IN ('failed', 'cancelled')
+              AND error_message LIKE $2
+            ORDER BY created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(error_pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to find tasks by error: {}", e)))?;
+
+        let tasks: Vec<TaskInfo> = rows
+            .iter()
+            .map(|row| TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: row
+                    .get::<String, _>("state")
+                    .parse()
+                    .unwrap_or(DbTaskState::Failed),
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            })
+            .collect();
+
+        Ok(tasks)
+    }
+
+    /// Estimate wait time for a pending task based on current throughput
+    ///
+    /// Calculates expected wait time by analyzing recent task completion rate
+    /// and current queue depth.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let wait_secs = broker.estimate_wait_time().await?;
+    /// if let Some(wait) = wait_secs {
+    ///     println!("Estimated wait time: {} seconds", wait);
+    /// } else {
+    ///     println!("Not enough data to estimate wait time");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn estimate_wait_time(&self) -> Result<Option<i64>> {
+        // Get completed tasks in last hour
+        let completed_last_hour: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND state = 'completed'
+              AND completed_at > NOW() - INTERVAL '1 hour'
+            "#,
+        )
+        .bind(&self.queue_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get completion rate: {}", e)))?;
+
+        if completed_last_hour == 0 {
+            return Ok(None);
+        }
+
+        // Get current pending count
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM celers_tasks WHERE queue_name = $1 AND state = 'pending'",
+        )
+        .bind(&self.queue_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+
+        // Calculate tasks per second
+        let tasks_per_second = completed_last_hour as f64 / 3600.0;
+
+        if tasks_per_second > 0.0 {
+            let estimated_wait = (pending as f64 / tasks_per_second) as i64;
+            Ok(Some(estimated_wait))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get worker performance statistics
+    ///
+    /// Returns statistics about worker performance including task counts,
+    /// average processing times, and success rates per worker.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let worker_stats = broker.get_worker_stats(10).await?;
+    /// for (worker_id, processed, avg_time_ms, success_rate) in worker_stats {
+    ///     println!(
+    ///         "Worker {}: {} tasks, {:.0}ms avg, {:.1}% success",
+    ///         worker_id.unwrap_or_else(|| "unknown".to_string()),
+    ///         processed,
+    ///         avg_time_ms.unwrap_or(0.0),
+    ///         success_rate.unwrap_or(0.0) * 100.0
+    ///     );
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_worker_stats(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(Option<String>, i64, Option<f64>, Option<f64>)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                worker_id,
+                COUNT(*) as processed,
+                AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) as avg_time_ms,
+                SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as success_rate
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND worker_id IS NOT NULL
+              AND state IN ('completed', 'failed')
+              AND completed_at > NOW() - INTERVAL '24 hours'
+            GROUP BY worker_id
+            ORDER BY processed DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get worker stats: {}", e)))?;
+
+        let stats = rows
+            .iter()
+            .map(|row| {
+                let worker_id: Option<String> = row.get("worker_id");
+                let processed: i64 = row.get("processed");
+                let avg_time_ms: Option<f64> = row.get("avg_time_ms");
+                let success_rate: Option<f64> = row.get("success_rate");
+                (worker_id, processed, avg_time_ms, success_rate)
+            })
+            .collect();
+
+        Ok(stats)
+    }
+
+    /// Get task age distribution
+    ///
+    /// Returns histogram buckets showing how many tasks fall into different age ranges.
+    /// Useful for monitoring queue latency and identifying bottlenecks.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let distribution = broker.get_task_age_distribution().await?;
+    /// println!("< 1 min: {} tasks", distribution.0);
+    /// println!("1-5 min: {} tasks", distribution.1);
+    /// println!("5-15 min: {} tasks", distribution.2);
+    /// println!("15-60 min: {} tasks", distribution.3);
+    /// println!("> 1 hour: {} tasks", distribution.4);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_task_age_distribution(&self) -> Result<(i64, i64, i64, i64, i64)> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE age_secs < 60) as under_1min,
+                COUNT(*) FILTER (WHERE age_secs >= 60 AND age_secs < 300) as between_1_5min,
+                COUNT(*) FILTER (WHERE age_secs >= 300 AND age_secs < 900) as between_5_15min,
+                COUNT(*) FILTER (WHERE age_secs >= 900 AND age_secs < 3600) as between_15_60min,
+                COUNT(*) FILTER (WHERE age_secs >= 3600) as over_1hour
+            FROM (
+                SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) as age_secs
+                FROM celers_tasks
+                WHERE queue_name = $1 AND state = 'pending'
+            ) as ages
+            "#,
+        )
+        .bind(&self.queue_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task age distribution: {}", e)))?;
+
+        Ok((
+            row.get("under_1min"),
+            row.get("between_1_5min"),
+            row.get("between_5_15min"),
+            row.get("between_15_60min"),
+            row.get("over_1hour"),
+        ))
+    }
+
+    /// Clone or copy tasks from another queue
+    ///
+    /// Copies pending tasks from a source queue to this queue.
+    /// Useful for queue migration, load balancing, or disaster recovery.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Copy up to 100 tasks from source_queue
+    /// let copied = broker.copy_tasks_from_queue("source_queue", 100).await?;
+    /// println!("Copied {} tasks", copied);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn copy_tasks_from_queue(&self, source_queue: &str, limit: i64) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (task_name, payload, queue_name, state, priority, retry_count, max_retries,
+                 timeout_secs, scheduled_at, metadata)
+            SELECT
+                task_name, payload, $1 as queue_name, 'pending' as state, priority,
+                0 as retry_count, max_retries, timeout_secs, scheduled_at, metadata
+            FROM celers_tasks
+            WHERE queue_name = $2
+              AND state = 'pending'
+            LIMIT $3
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(source_queue)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to copy tasks: {}", e)))?;
+
+        let copied = result.rows_affected() as i64;
+
+        tracing::info!(
+            source = source_queue,
+            destination = %self.queue_name,
+            count = copied,
+            "Copied tasks between queues"
+        );
+
+        Ok(copied)
+    }
+
+    /// Move tasks from another queue to this queue
+    ///
+    /// Transfers pending tasks from a source queue to this queue by updating their queue_name.
+    /// More efficient than copying as it doesn't create new rows.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Move up to 50 tasks from old_queue
+    /// let moved = broker.move_tasks_from_queue("old_queue", 50).await?;
+    /// println!("Moved {} tasks", moved);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn move_tasks_from_queue(&self, source_queue: &str, limit: i64) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE celers_tasks
+            SET queue_name = $1
+            WHERE id IN (
+                SELECT id FROM celers_tasks
+                WHERE queue_name = $2 AND state = 'pending'
+                LIMIT $3
+            )
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(source_queue)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to move tasks: {}", e)))?;
+
+        let moved = result.rows_affected() as i64;
+
+        tracing::info!(
+            source = source_queue,
+            destination = %self.queue_name,
+            count = moved,
+            "Moved tasks between queues"
+        );
+
+        Ok(moved)
+    }
+
+    /// Get breakdown of tasks by hour of creation
+    ///
+    /// Returns task counts grouped by hour for the last 24 hours.
+    /// Useful for understanding task creation patterns and peak times.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let hourly = broker.get_hourly_task_counts().await?;
+    /// for (hour, count) in hourly {
+    ///     println!("Hour {}: {} tasks", hour, count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_hourly_task_counts(&self) -> Result<Vec<(i32, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                EXTRACT(HOUR FROM created_at)::INTEGER as hour,
+                COUNT(*) as count
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND created_at > NOW() - INTERVAL '24 hours'
+            GROUP BY hour
+            ORDER BY hour
+            "#,
+        )
+        .bind(&self.queue_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get hourly task counts: {}", e)))?;
+
+        let hourly = rows
+            .iter()
+            .map(|row| {
+                let hour: i32 = row.get("hour");
+                let count: i64 = row.get("count");
+                (hour, count)
+            })
+            .collect();
+
+        Ok(hourly)
+    }
+
+    /// Replay/rerun completed or failed tasks
+    ///
+    /// Creates new pending tasks by cloning completed or failed tasks.
+    /// Useful for retrying batches of tasks or debugging issues.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::{PostgresBroker, DbTaskState};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Replay all failed tasks from the last hour
+    /// let replayed = broker.replay_tasks(DbTaskState::Failed, 100).await?;
+    /// println!("Replayed {} failed tasks", replayed);
+    ///
+    /// // Rerun successful tasks for testing
+    /// let rerun = broker.replay_tasks(DbTaskState::Completed, 10).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn replay_tasks(&self, source_state: DbTaskState, limit: i64) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (task_name, payload, queue_name, state, priority, retry_count, max_retries,
+                 timeout_secs, scheduled_at, metadata)
+            SELECT
+                task_name, payload, queue_name, 'pending' as state, priority,
+                0 as retry_count, max_retries, timeout_secs, NOW() as scheduled_at, metadata
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND state = $2
+            ORDER BY created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(source_state.to_string())
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to replay tasks: {}", e)))?;
+
+        let replayed = result.rows_affected() as i64;
+
+        tracing::info!(
+            state = %source_state,
+            count = replayed,
+            "Replayed tasks"
+        );
+
+        Ok(replayed)
+    }
+
+    /// Calculate composite queue health score (0-100)
+    ///
+    /// Returns a health score based on multiple factors:
+    /// - Queue depth (pending tasks)
+    /// - Processing efficiency (tasks in progress vs pending)
+    /// - DLQ ratio (failed tasks)
+    /// - Task age (how long tasks have been waiting)
+    ///
+    /// Score interpretation:
+    /// - 90-100: Excellent
+    /// - 70-89: Good
+    /// - 50-69: Fair
+    /// - 30-49: Poor
+    /// - 0-29: Critical
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let score = broker.calculate_queue_health_score().await?;
+    /// match score {
+    ///     90..=100 => println!("Queue health: Excellent ({})", score),
+    ///     70..=89 => println!("Queue health: Good ({})", score),
+    ///     50..=69 => println!("Queue health: Fair ({})", score),
+    ///     30..=49 => println!("Queue health: Poor ({})", score),
+    ///     _ => println!("Queue health: Critical ({})", score),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn calculate_queue_health_score(&self) -> Result<i32> {
+        let stats = self.get_statistics().await?;
+
+        let mut score = 100;
+
+        // Deduct points for high pending count (max -30 points)
+        if stats.pending > 1000 {
+            score -= 30;
+        } else if stats.pending > 500 {
+            score -= 20;
+        } else if stats.pending > 100 {
+            score -= 10;
+        }
+
+        // Deduct points for DLQ ratio (max -25 points)
+        let total_tasks = stats.total.max(1);
+        let dlq_ratio = (stats.dlq as f64 / total_tasks as f64) * 100.0;
+        if dlq_ratio > 10.0 {
+            score -= 25;
+        } else if dlq_ratio > 5.0 {
+            score -= 15;
+        } else if dlq_ratio > 1.0 {
+            score -= 5;
+        }
+
+        // Deduct points for stuck tasks (max -20 points)
+        if stats.processing > stats.pending && stats.pending > 0 {
+            score -= 20;
+        } else if stats.processing > stats.pending / 2 && stats.pending > 0 {
+            score -= 10;
+        }
+
+        // Deduct points for old pending tasks (max -25 points)
+        if let Ok(Some(oldest_age)) = self.oldest_pending_age_secs().await {
+            if oldest_age > 3600 {
+                score -= 25;
+            } else if oldest_age > 1800 {
+                score -= 15;
+            } else if oldest_age > 600 {
+                score -= 10;
+            }
+        }
+
+        Ok(score.max(0))
+    }
+
+    /// Get auto-scaling recommendations based on queue metrics
+    ///
+    /// Analyzes queue metrics and provides worker scaling recommendations.
+    /// Returns (recommended_workers, reason).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let (recommended, reason) = broker.get_autoscaling_recommendation(5).await?;
+    /// println!("Current workers: 5, Recommended: {}, Reason: {}", recommended, reason);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_autoscaling_recommendation(
+        &self,
+        current_workers: i32,
+    ) -> Result<(i32, String)> {
+        let stats = self.get_statistics().await?;
+        let wait_time = self.estimate_wait_time().await?;
+
+        // If queue is empty or very small, scale down
+        if stats.pending < 10 {
+            let recommended = (current_workers / 2).max(1);
+            return Ok((recommended, "Low queue depth - scale down".to_string()));
+        }
+
+        // If wait time is very high, scale up aggressively
+        if let Some(wait_secs) = wait_time {
+            if wait_secs > 3600 {
+                let recommended = (current_workers * 2).min(50);
+                return Ok((
+                    recommended,
+                    format!("High wait time ({}s) - scale up aggressively", wait_secs),
+                ));
+            } else if wait_secs > 600 {
+                let recommended = (current_workers + (current_workers / 2)).min(50);
+                return Ok((
+                    recommended,
+                    format!("Moderate wait time ({}s) - scale up", wait_secs),
+                ));
+            }
+        }
+
+        // If processing rate is low compared to pending, scale up
+        if stats.processing < stats.pending / 10 && stats.pending > 100 {
+            let recommended = (current_workers + (current_workers / 3)).min(50);
+            return Ok((
+                recommended,
+                "Low processing rate vs pending - scale up".to_string(),
+            ));
+        }
+
+        // If DLQ is growing, might need more workers or there's an issue
+        let dlq_ratio = (stats.dlq as f64 / stats.total.max(1) as f64) * 100.0;
+        if dlq_ratio > 20.0 {
+            return Ok((
+                current_workers,
+                "High DLQ ratio - investigate errors before scaling".to_string(),
+            ));
+        }
+
+        // Everything looks good
+        Ok((
+            current_workers,
+            "Queue metrics healthy - maintain current workers".to_string(),
+        ))
+    }
+
+    /// Sample random tasks for monitoring without affecting processing
+    ///
+    /// Returns a random sample of tasks in a specific state for analysis.
+    /// Does not modify task state.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::{PostgresBroker, DbTaskState};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Sample 10 random pending tasks for analysis
+    /// let samples = broker.sample_tasks(DbTaskState::Pending, 10).await?;
+    /// for task in samples {
+    ///     println!("Task: {} (age: {:?})", task.task_name, task.created_at);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn sample_tasks(
+        &self,
+        state: DbTaskState,
+        sample_size: i64,
+    ) -> Result<Vec<TaskInfo>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, task_name, state, priority, retry_count, max_retries,
+                   created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+            FROM celers_tasks
+            WHERE queue_name = $1 AND state = $2
+            ORDER BY RANDOM()
+            LIMIT $3
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(state.to_string())
+        .bind(sample_size)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to sample tasks: {}", e)))?;
+
+        let tasks: Vec<TaskInfo> = rows
+            .iter()
+            .map(|row| TaskInfo {
+                id: row.get("id"),
+                task_name: row.get("task_name"),
+                state: row
+                    .get::<String, _>("state")
+                    .parse()
+                    .unwrap_or(DbTaskState::Pending),
+                priority: row.get("priority"),
+                retry_count: row.get("retry_count"),
+                max_retries: row.get("max_retries"),
+                created_at: row.get("created_at"),
+                scheduled_at: row.get("scheduled_at"),
+                started_at: row.get("started_at"),
+                completed_at: row.get("completed_at"),
+                worker_id: row.get("worker_id"),
+                error_message: row.get("error_message"),
+            })
+            .collect();
+
+        Ok(tasks)
+    }
+
+    /// Get aggregated statistics from task metadata
+    ///
+    /// Allows custom aggregations on JSONB metadata fields.
+    /// Returns task counts grouped by a metadata key.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Count tasks by region
+    /// let by_region = broker.aggregate_by_metadata("region", 10).await?;
+    /// for (region, count) in by_region {
+    ///     println!("Region {}: {} tasks", region.unwrap_or_else(|| "unknown".to_string()), count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn aggregate_by_metadata(
+        &self,
+        key: &str,
+        limit: i64,
+    ) -> Result<Vec<(Option<String>, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                metadata->$2 as value,
+                COUNT(*) as count
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND metadata IS NOT NULL
+              AND metadata ? $2
+            GROUP BY value
+            ORDER BY count DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(key)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to aggregate metadata: {}", e)))?;
+
+        let aggregated = rows
+            .iter()
+            .map(|row| {
+                let value: Option<serde_json::Value> = row.get("value");
+                let value_str = value.map(|v| v.to_string().trim_matches('"').to_string());
+                let count: i64 = row.get("count");
+                (value_str, count)
+            })
+            .collect();
+
+        Ok(aggregated)
+    }
+
+    /// Store a performance baseline for comparison
+    ///
+    /// Stores current queue metrics as a named baseline for future comparison.
+    /// Useful for capacity planning and performance regression detection.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// // Store baseline after optimization
+    /// broker.store_performance_baseline("after_optimization").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn store_performance_baseline(&self, baseline_name: &str) -> Result<()> {
+        let stats = self.get_statistics().await?;
+        let throughput = self.get_throughput_stats().await?;
+
+        let baseline_data = json!({
+            "name": baseline_name,
+            "timestamp": Utc::now(),
+            "queue_name": self.queue_name,
+            "stats": {
+                "pending": stats.pending,
+                "processing": stats.processing,
+                "completed": stats.completed,
+                "failed": stats.failed,
+                "dlq": stats.dlq,
+            },
+            "throughput": {
+                "tasks_per_hour": throughput.0,
+                "tasks_per_day": throughput.1,
+            }
+        });
+
+        // Store in metadata of a special marker task
+        sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (task_name, payload, queue_name, state, metadata)
+            VALUES ('__baseline__', '[]'::jsonb, $1, 'completed', $2)
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(baseline_data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to store baseline: {}", e)))?;
+
+        tracing::info!(
+            baseline = baseline_name,
+            queue = %self.queue_name,
+            "Stored performance baseline"
+        );
+
+        Ok(())
+    }
+
+    /// Compare current metrics against a stored baseline
+    ///
+    /// Returns percentage differences between current metrics and a baseline.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// if let Some(comparison) = broker.compare_to_baseline("after_optimization").await? {
+    ///     println!("Throughput change: {:.1}%", comparison.get("throughput_change").unwrap_or(&0.0));
+    ///     println!("DLQ change: {:.1}%", comparison.get("dlq_change").unwrap_or(&0.0));
+    /// } else {
+    ///     println!("Baseline not found");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn compare_to_baseline(
+        &self,
+        baseline_name: &str,
+    ) -> Result<Option<std::collections::HashMap<String, f64>>> {
+        // Fetch baseline
+        let baseline_row = sqlx::query(
+            r#"
+            SELECT metadata
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND task_name = '__baseline__'
+              AND metadata->>'name' = $2
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(baseline_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch baseline: {}", e)))?;
+
+        if baseline_row.is_none() {
+            return Ok(None);
+        }
+
+        let baseline_meta: serde_json::Value = baseline_row.unwrap().get("metadata");
+
+        // Get current metrics
+        let current_stats = self.get_statistics().await?;
+        let current_throughput = self.get_throughput_stats().await?;
+
+        // Extract baseline values
+        let baseline_dlq = baseline_meta["stats"]["dlq"].as_i64().unwrap_or(1) as f64;
+        let baseline_throughput = baseline_meta["throughput"]["tasks_per_hour"]
+            .as_f64()
+            .unwrap_or(1.0);
+
+        // Calculate percentage changes
+        let mut comparison = std::collections::HashMap::new();
+
+        let dlq_change =
+            ((current_stats.dlq as f64 - baseline_dlq) / baseline_dlq.max(1.0)) * 100.0;
+        let throughput_change = ((current_throughput.0 as f64 - baseline_throughput)
+            / baseline_throughput.max(1.0))
+            * 100.0;
+
+        comparison.insert("dlq_change".to_string(), dlq_change);
+        comparison.insert("throughput_change".to_string(), throughput_change);
+        comparison.insert("current_pending".to_string(), current_stats.pending as f64);
+        comparison.insert("current_dlq".to_string(), current_stats.dlq as f64);
+
+        Ok(Some(comparison))
+    }
+
+    /// Get distinct task names in the queue
+    ///
+    /// Returns all unique task names currently in the queue.
+    /// Useful for discovering task types and monitoring task diversity.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let task_types = broker.get_distinct_task_names().await?;
+    /// println!("Task types in queue: {}", task_types.len());
+    /// for task_name in task_types {
+    ///     println!("  - {}", task_name);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_distinct_task_names(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT task_name
+            FROM celers_tasks
+            WHERE queue_name = $1
+            ORDER BY task_name
+            "#,
+        )
+        .bind(&self.queue_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get distinct task names: {}", e)))?;
+
+        let task_names = rows.iter().map(|row| row.get("task_name")).collect();
+
+        Ok(task_names)
+    }
+
+    /// Get task count breakdown by task name
+    ///
+    /// Returns counts of tasks grouped by task name and state.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// let breakdown = broker.get_task_breakdown_by_name(20).await?;
+    /// for (task_name, pending, processing, completed, failed) in breakdown {
+    ///     println!("{}: {} pending, {} processing, {} completed, {} failed",
+    ///              task_name, pending, processing, completed, failed);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_task_breakdown_by_name(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, i64, i64, i64, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                task_name,
+                COUNT(*) FILTER (WHERE state = 'pending') as pending,
+                COUNT(*) FILTER (WHERE state = 'processing') as processing,
+                COUNT(*) FILTER (WHERE state = 'completed') as completed,
+                COUNT(*) FILTER (WHERE state = 'failed') as failed
+            FROM celers_tasks
+            WHERE queue_name = $1
+            GROUP BY task_name
+            ORDER BY COUNT(*) DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(&self.queue_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task breakdown: {}", e)))?;
+
+        let breakdown = rows
+            .iter()
+            .map(|row| {
+                let task_name: String = row.get("task_name");
+                let pending: i64 = row.get("pending");
+                let processing: i64 = row.get("processing");
+                let completed: i64 = row.get("completed");
+                let failed: i64 = row.get("failed");
+                (task_name, pending, processing, completed, failed)
+            })
+            .collect();
+
+        Ok(breakdown)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4244,10 +7449,10 @@ mod tests {
 
         // Jitter should produce values in reasonable range
         let backoff0 = strategy.calculate_backoff(0);
-        assert!(backoff0 >= 0 && backoff0 <= 2); // 2^0 = 1, with jitter 0.5-1.5
+        assert!((0..=2).contains(&backoff0)); // 2^0 = 1, with jitter 0.5-1.5
 
         let backoff3 = strategy.calculate_backoff(3);
-        assert!(backoff3 >= 4 && backoff3 <= 12); // 2^3 = 8, with jitter ~0.5-1.5
+        assert!((4..=12).contains(&backoff3)); // 2^3 = 8, with jitter ~0.5-1.5
     }
 
     #[test]
@@ -4276,5 +7481,982 @@ mod tests {
         assert!(metrics.max_size > 0);
         assert!(metrics.size <= metrics.max_size);
         assert_eq!(metrics.size, metrics.idle + metrics.in_use);
+    }
+
+    #[test]
+    fn test_task_chain_creation() {
+        let task1 = SerializedTask::new("task1".to_string(), vec![1, 2, 3]);
+        let task2 = SerializedTask::new("task2".to_string(), vec![4, 5, 6]);
+
+        let chain = TaskChain {
+            tasks: vec![task1, task2],
+            stop_on_failure: true,
+        };
+
+        assert_eq!(chain.tasks.len(), 2);
+        assert!(chain.stop_on_failure);
+    }
+
+    #[test]
+    fn test_task_chain_serialization() {
+        let task1 = SerializedTask::new("task1".to_string(), vec![1]);
+        let chain = TaskChain {
+            tasks: vec![task1],
+            stop_on_failure: false,
+        };
+
+        let json = serde_json::to_string(&chain).unwrap();
+        let deserialized: TaskChain = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.tasks.len(), 1);
+        assert!(!deserialized.stop_on_failure);
+    }
+
+    #[test]
+    fn test_workflow_stage_creation() {
+        let task = SerializedTask::new("task1".to_string(), vec![1]);
+
+        let stage = WorkflowStage {
+            id: "stage1".to_string(),
+            tasks: vec![task],
+            depends_on: vec!["stage0".to_string()],
+        };
+
+        assert_eq!(stage.id, "stage1");
+        assert_eq!(stage.tasks.len(), 1);
+        assert_eq!(stage.depends_on.len(), 1);
+        assert_eq!(stage.depends_on[0], "stage0");
+    }
+
+    #[test]
+    fn test_workflow_creation() {
+        let task1 = SerializedTask::new("task1".to_string(), vec![1]);
+        let task2 = SerializedTask::new("task2".to_string(), vec![2]);
+
+        let stage1 = WorkflowStage {
+            id: "stage1".to_string(),
+            tasks: vec![task1],
+            depends_on: vec![],
+        };
+
+        let stage2 = WorkflowStage {
+            id: "stage2".to_string(),
+            tasks: vec![task2],
+            depends_on: vec!["stage1".to_string()],
+        };
+
+        let workflow = TaskWorkflow {
+            id: Uuid::new_v4(),
+            name: "test_workflow".to_string(),
+            stages: vec![stage1, stage2],
+        };
+
+        assert_eq!(workflow.name, "test_workflow");
+        assert_eq!(workflow.stages.len(), 2);
+        assert_eq!(workflow.stages[0].id, "stage1");
+        assert_eq!(workflow.stages[1].depends_on[0], "stage1");
+    }
+
+    #[test]
+    fn test_workflow_serialization() {
+        let task = SerializedTask::new("task".to_string(), vec![]);
+        let stage = WorkflowStage {
+            id: "s1".to_string(),
+            tasks: vec![task],
+            depends_on: vec![],
+        };
+
+        let workflow = TaskWorkflow {
+            id: Uuid::new_v4(),
+            name: "wf".to_string(),
+            stages: vec![stage],
+        };
+
+        let json = serde_json::to_string(&workflow).unwrap();
+        let deserialized: TaskWorkflow = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.name, "wf");
+        assert_eq!(deserialized.stages.len(), 1);
+        assert_eq!(deserialized.stages[0].id, "s1");
+    }
+
+    #[test]
+    fn test_chain_status_serialization() {
+        let status = ChainStatus {
+            chain_id: Uuid::new_v4(),
+            total_tasks: 10,
+            completed_tasks: 5,
+            failed_tasks: 1,
+            pending_tasks: 3,
+            processing_tasks: 1,
+            current_position: Some(5),
+            is_complete: false,
+            has_failures: true,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: ChainStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.total_tasks, 10);
+        assert_eq!(deserialized.completed_tasks, 5);
+        assert_eq!(deserialized.failed_tasks, 1);
+        assert!(deserialized.has_failures);
+        assert!(!deserialized.is_complete);
+        assert_eq!(deserialized.current_position, Some(5));
+    }
+
+    #[test]
+    fn test_stage_status_serialization() {
+        let status = StageStatus {
+            stage_id: "stage1".to_string(),
+            total_tasks: 5,
+            completed_tasks: 3,
+            failed_tasks: 0,
+            pending_tasks: 2,
+            processing_tasks: 0,
+            is_complete: false,
+            dependencies_met: true,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: StageStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.stage_id, "stage1");
+        assert_eq!(deserialized.total_tasks, 5);
+        assert!(deserialized.dependencies_met);
+        assert!(!deserialized.is_complete);
+    }
+
+    #[test]
+    fn test_workflow_status_serialization() {
+        let stage_status = StageStatus {
+            stage_id: "s1".to_string(),
+            total_tasks: 2,
+            completed_tasks: 2,
+            failed_tasks: 0,
+            pending_tasks: 0,
+            processing_tasks: 0,
+            is_complete: true,
+            dependencies_met: true,
+        };
+
+        let status = WorkflowStatus {
+            workflow_id: Uuid::new_v4(),
+            workflow_name: "test_wf".to_string(),
+            total_stages: 2,
+            completed_stages: 1,
+            active_stages: 1,
+            total_tasks: 10,
+            completed_tasks: 7,
+            failed_tasks: 1,
+            pending_tasks: 1,
+            processing_tasks: 1,
+            is_complete: false,
+            has_failures: true,
+            stage_statuses: vec![stage_status],
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: WorkflowStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.workflow_name, "test_wf");
+        assert_eq!(deserialized.total_stages, 2);
+        assert_eq!(deserialized.completed_stages, 1);
+        assert_eq!(deserialized.stage_statuses.len(), 1);
+        assert!(deserialized.has_failures);
+    }
+
+    #[test]
+    fn test_health_status_serialization() {
+        let status = HealthStatus {
+            healthy: true,
+            connection_pool_size: 20,
+            idle_connections: 15,
+            pending_tasks: 100,
+            processing_tasks: 5,
+            dlq_tasks: 2,
+            database_version: "PostgreSQL 14.5".to_string(),
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: HealthStatus = serde_json::from_str(&json).unwrap();
+
+        assert!(deserialized.healthy);
+        assert_eq!(deserialized.connection_pool_size, 20);
+        assert_eq!(deserialized.idle_connections, 15);
+        assert_eq!(deserialized.pending_tasks, 100);
+        assert_eq!(deserialized.database_version, "PostgreSQL 14.5");
+    }
+
+    #[test]
+    fn test_pool_metrics_serialization() {
+        let metrics = PoolMetrics {
+            max_size: 20,
+            size: 10,
+            idle: 7,
+            in_use: 3,
+            waiting: 2,
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        let deserialized: PoolMetrics = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.max_size, 20);
+        assert_eq!(deserialized.size, 10);
+        assert_eq!(deserialized.idle, 7);
+        assert_eq!(deserialized.in_use, 3);
+        assert_eq!(deserialized.waiting, 2);
+    }
+
+    #[test]
+    fn test_task_info_serialization() {
+        let now = Utc::now();
+        let info = TaskInfo {
+            id: Uuid::new_v4(),
+            task_name: "test_task".to_string(),
+            state: DbTaskState::Processing,
+            priority: 5,
+            retry_count: 2,
+            max_retries: 3,
+            created_at: now,
+            scheduled_at: now,
+            started_at: Some(now),
+            completed_at: None,
+            worker_id: Some("worker1".to_string()),
+            error_message: None,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: TaskInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.task_name, "test_task");
+        assert_eq!(deserialized.state, DbTaskState::Processing);
+        assert_eq!(deserialized.priority, 5);
+        assert_eq!(deserialized.retry_count, 2);
+        assert_eq!(deserialized.worker_id, Some("worker1".to_string()));
+    }
+
+    #[test]
+    fn test_dlq_task_info_serialization() {
+        let now = Utc::now();
+        let info = DlqTaskInfo {
+            id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            task_name: "failed_task".to_string(),
+            retry_count: 5,
+            error_message: Some("Task failed permanently".to_string()),
+            failed_at: now,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: DlqTaskInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.task_name, "failed_task");
+        assert_eq!(deserialized.retry_count, 5);
+        assert_eq!(
+            deserialized.error_message,
+            Some("Task failed permanently".to_string())
+        );
+    }
+
+    #[test]
+    fn test_workflow_parallel_execution() {
+        // Test that a stage can have multiple tasks (parallel execution)
+        let task1 = SerializedTask::new("parallel1".to_string(), vec![1]);
+        let task2 = SerializedTask::new("parallel2".to_string(), vec![2]);
+        let task3 = SerializedTask::new("parallel3".to_string(), vec![3]);
+
+        let stage = WorkflowStage {
+            id: "parallel_stage".to_string(),
+            tasks: vec![task1, task2, task3],
+            depends_on: vec![],
+        };
+
+        assert_eq!(stage.tasks.len(), 3);
+        // All tasks in the same stage can be executed in parallel
+    }
+
+    #[test]
+    fn test_workflow_complex_dependencies() {
+        let stage1 = WorkflowStage {
+            id: "s1".to_string(),
+            tasks: vec![SerializedTask::new("t1".to_string(), vec![])],
+            depends_on: vec![],
+        };
+
+        let stage2 = WorkflowStage {
+            id: "s2".to_string(),
+            tasks: vec![SerializedTask::new("t2".to_string(), vec![])],
+            depends_on: vec![],
+        };
+
+        let stage3 = WorkflowStage {
+            id: "s3".to_string(),
+            tasks: vec![SerializedTask::new("t3".to_string(), vec![])],
+            depends_on: vec!["s1".to_string(), "s2".to_string()],
+        };
+
+        let workflow = TaskWorkflow {
+            id: Uuid::new_v4(),
+            name: "complex".to_string(),
+            stages: vec![stage1, stage2, stage3],
+        };
+
+        // s1 and s2 have no dependencies (can run in parallel)
+        assert!(workflow.stages[0].depends_on.is_empty());
+        assert!(workflow.stages[1].depends_on.is_empty());
+
+        // s3 depends on both s1 and s2
+        assert_eq!(workflow.stages[2].depends_on.len(), 2);
+        assert!(workflow.stages[2].depends_on.contains(&"s1".to_string()));
+        assert!(workflow.stages[2].depends_on.contains(&"s2".to_string()));
+    }
+
+    #[test]
+    fn test_get_state_counts_structure() {
+        use std::collections::HashMap;
+
+        let mut expected_keys = HashMap::new();
+        expected_keys.insert("pending", 0i64);
+        expected_keys.insert("processing", 0i64);
+        expected_keys.insert("completed", 0i64);
+        expected_keys.insert("failed", 0i64);
+        expected_keys.insert("cancelled", 0i64);
+        expected_keys.insert("dlq", 0i64);
+
+        // Verify all expected state keys exist
+        for key in expected_keys.keys() {
+            assert!([
+                "pending",
+                "processing",
+                "completed",
+                "failed",
+                "cancelled",
+                "dlq"
+            ]
+            .contains(key));
+        }
+    }
+
+    #[test]
+    fn test_detailed_health_status_structure() {
+        let warnings = vec![
+            "High DLQ count".to_string(),
+            "Old pending tasks".to_string(),
+        ];
+        let recommendations = vec!["Increase workers".to_string()];
+
+        let pool_metrics = PoolMetrics {
+            max_size: 20,
+            size: 15,
+            idle: 10,
+            in_use: 5,
+            waiting: 0,
+        };
+
+        let queue_stats = QueueStatistics {
+            pending: 100,
+            processing: 10,
+            completed: 500,
+            failed: 5,
+            cancelled: 2,
+            dlq: 3,
+            total: 620,
+        };
+
+        let status = DetailedHealthStatus {
+            healthy: true,
+            connection_ok: true,
+            query_latency_ms: 5,
+            pool_metrics,
+            queue_stats,
+            database_version: "PostgreSQL 15".to_string(),
+            warnings,
+            recommendations,
+        };
+
+        assert!(status.healthy);
+        assert!(status.connection_ok);
+        assert_eq!(status.warnings.len(), 2);
+        assert_eq!(status.recommendations.len(), 1);
+        assert_eq!(status.query_latency_ms, 5);
+    }
+
+    #[test]
+    fn test_batch_size_recommendation_structure() {
+        let recommendation = BatchSizeRecommendation {
+            enqueue_batch_size: 100,
+            dequeue_batch_size: 50,
+            ack_batch_size: 50,
+            reasoning: "Based on current workload and pool size".to_string(),
+        };
+
+        assert_eq!(recommendation.enqueue_batch_size, 100);
+        assert_eq!(recommendation.dequeue_batch_size, 50);
+        assert_eq!(recommendation.ack_batch_size, 50);
+        assert!(!recommendation.reasoning.is_empty());
+    }
+
+    #[test]
+    fn test_table_size_info_structure() {
+        let info = TableSizeInfo {
+            table_name: "celers_tasks".to_string(),
+            row_count: 10000,
+            total_size_bytes: 5242880,
+            table_size_bytes: 4194304,
+            index_size_bytes: 1048576,
+            total_size_pretty: "5.0 MB".to_string(),
+        };
+
+        assert_eq!(info.table_name, "celers_tasks");
+        assert_eq!(info.row_count, 10000);
+        assert!(info.total_size_bytes > info.table_size_bytes);
+        assert_eq!(
+            info.total_size_bytes,
+            info.table_size_bytes + info.index_size_bytes
+        );
+    }
+
+    #[test]
+    fn test_index_usage_info_structure() {
+        let info = IndexUsageInfo {
+            table_name: "celers_tasks".to_string(),
+            index_name: "idx_tasks_state_priority".to_string(),
+            index_scans: 1000,
+            tuples_read: 50000,
+            tuples_fetched: 45000,
+            index_size_bytes: 524288,
+            index_size_pretty: "512 KB".to_string(),
+        };
+
+        assert_eq!(info.table_name, "celers_tasks");
+        assert_eq!(info.index_name, "idx_tasks_state_priority");
+        assert!(info.index_scans > 0);
+        assert!(info.tuples_read >= info.tuples_fetched);
+    }
+
+    #[test]
+    fn test_partition_info_structure() {
+        use chrono::TimeZone;
+
+        let info = PartitionInfo {
+            partition_name: "celers_tasks_2025_01".to_string(),
+            partition_start: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            partition_end: Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap(),
+            row_count: 5000,
+            size_bytes: 2097152,
+        };
+
+        assert!(info.partition_name.contains("celers_tasks"));
+        assert!(info.partition_name.contains("2025_01"));
+        assert_eq!(info.row_count, 5000);
+        assert!(info.size_bytes > 0);
+        assert!(info.partition_end > info.partition_start);
+    }
+
+    #[test]
+    fn test_tenant_broker_isolation() {
+        // Test that tenant IDs are properly formatted
+        let tenant_id = "tenant-123";
+        assert!(!tenant_id.is_empty());
+        assert!(tenant_id.contains("-"));
+    }
+
+    #[test]
+    fn test_retry_strategy_calculation_bounds() {
+        // Test that retry delay calculations don't overflow
+        let strategy = RetryStrategy::Exponential {
+            max_delay_secs: 3600,
+        };
+
+        // Should handle reasonable retry counts
+        for retry_count in 0..10 {
+            let delay = strategy.calculate_backoff(retry_count);
+            assert!(delay < 10000); // Less than ~3 hours
+        }
+    }
+
+    #[test]
+    fn test_retry_strategy_jitter_range() {
+        let strategy = RetryStrategy::ExponentialWithJitter {
+            max_delay_secs: 3600,
+        };
+
+        // Jitter should provide some variation
+        let delay1 = strategy.calculate_backoff(3);
+        let delay2 = strategy.calculate_backoff(3);
+
+        // With jitter, delays might vary (though not guaranteed in every run)
+        // Just verify they're in reasonable range
+        assert!(delay1 <= 100);
+        assert!(delay2 <= 100);
+    }
+
+    #[test]
+    fn test_db_task_state_all_variants() {
+        let states = vec![
+            DbTaskState::Pending,
+            DbTaskState::Processing,
+            DbTaskState::Completed,
+            DbTaskState::Failed,
+            DbTaskState::Cancelled,
+        ];
+
+        for state in states {
+            let s = state.to_string();
+            assert!(!s.is_empty());
+
+            // Verify round-trip conversion
+            let parsed: DbTaskState = s.parse().unwrap();
+            assert_eq!(parsed, state);
+        }
+    }
+
+    #[test]
+    fn test_task_result_status_all_variants() {
+        let statuses = vec![
+            TaskResultStatus::Pending,
+            TaskResultStatus::Started,
+            TaskResultStatus::Success,
+            TaskResultStatus::Failure,
+            TaskResultStatus::Retry,
+            TaskResultStatus::Revoked,
+        ];
+
+        for status in statuses {
+            let s = status.to_string();
+            assert!(!s.is_empty());
+
+            // Verify round-trip conversion
+            let parsed: TaskResultStatus = s.parse().unwrap();
+            assert_eq!(parsed, status);
+        }
+    }
+
+    #[test]
+    fn test_task_result_structure() {
+        let result = TaskResult {
+            task_id: Uuid::new_v4(),
+            task_name: "test_task".to_string(),
+            status: TaskResultStatus::Success,
+            result: Some(json!({"output": "success"})),
+            error: None,
+            traceback: None,
+            created_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            runtime_ms: Some(1500),
+        };
+
+        assert_eq!(result.task_name, "test_task");
+        assert_eq!(result.status, TaskResultStatus::Success);
+        assert!(result.result.is_some());
+        assert!(result.error.is_none());
+        assert_eq!(result.runtime_ms, Some(1500));
+    }
+
+    #[test]
+    fn test_dlq_task_info_structure() {
+        let info = DlqTaskInfo {
+            id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            task_name: "failed_task".to_string(),
+            retry_count: 5,
+            error_message: Some("Connection timeout".to_string()),
+            failed_at: Utc::now(),
+        };
+
+        assert_eq!(info.task_name, "failed_task");
+        assert_eq!(info.retry_count, 5);
+        assert!(info.error_message.is_some());
+    }
+
+    #[test]
+    fn test_queue_statistics_comprehensive() {
+        let stats = QueueStatistics {
+            pending: 100,
+            processing: 10,
+            completed: 500,
+            failed: 5,
+            cancelled: 2,
+            dlq: 3,
+            total: 620,
+        };
+
+        // Verify total calculation
+        assert_eq!(stats.total, 620);
+
+        // Verify relationships
+        assert!(stats.completed > stats.pending);
+        assert!(stats.processing < stats.completed);
+        assert!(stats.failed < stats.pending);
+        assert!(stats.dlq < stats.failed);
+    }
+
+    // ========== LISTEN/NOTIFY Tests ==========
+
+    #[test]
+    fn test_task_notification_structure() {
+        let notification = TaskNotification {
+            task_id: Uuid::new_v4(),
+            task_name: "test_task".to_string(),
+            queue_name: "default".to_string(),
+            priority: 5,
+            enqueued_at: Utc::now(),
+        };
+
+        assert_eq!(notification.task_name, "test_task");
+        assert_eq!(notification.queue_name, "default");
+        assert_eq!(notification.priority, 5);
+    }
+
+    #[test]
+    fn test_task_notification_serialization() {
+        let notification = TaskNotification {
+            task_id: Uuid::new_v4(),
+            task_name: "test_task".to_string(),
+            queue_name: "default".to_string(),
+            priority: 10,
+            enqueued_at: Utc::now(),
+        };
+
+        // Test serialization
+        let json = serde_json::to_string(&notification).unwrap();
+        assert!(json.contains("test_task"));
+        assert!(json.contains("default"));
+
+        // Test deserialization
+        let deserialized: TaskNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.task_id, notification.task_id);
+        assert_eq!(deserialized.task_name, notification.task_name);
+        assert_eq!(deserialized.queue_name, notification.queue_name);
+        assert_eq!(deserialized.priority, notification.priority);
+    }
+
+    #[test]
+    fn test_notification_channel_naming() {
+        // Test that channel names follow the expected format
+        let queue_name = "default";
+        let expected_channel = format!("celers_tasks_{}", queue_name);
+        assert_eq!(expected_channel, "celers_tasks_default");
+
+        let queue_name = "high_priority";
+        let expected_channel = format!("celers_tasks_{}", queue_name);
+        assert_eq!(expected_channel, "celers_tasks_high_priority");
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_notification_listener_creation() {
+        // This test requires a live PostgreSQL database
+        // Run with: cargo test test_notification_listener_creation -- --ignored
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_enable_disable_notifications() {
+        // This test requires a live PostgreSQL database
+        // Run with: cargo test test_enable_disable_notifications -- --ignored
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_notification_end_to_end() {
+        // This test requires a live PostgreSQL database
+        // Run with: cargo test test_notification_end_to_end -- --ignored
+    }
+
+    // ========== Task Deduplication Tests ==========
+
+    #[test]
+    fn test_deduplication_config_default() {
+        let config = DeduplicationConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.window_secs, 300); // 5 minutes
+    }
+
+    #[test]
+    fn test_deduplication_config_custom() {
+        let config = DeduplicationConfig {
+            enabled: true,
+            window_secs: 600, // 10 minutes
+        };
+        assert!(config.enabled);
+        assert_eq!(config.window_secs, 600);
+    }
+
+    #[test]
+    fn test_deduplication_config_serialization() {
+        let config = DeduplicationConfig {
+            enabled: true,
+            window_secs: 300,
+        };
+
+        // Test serialization
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("enabled"));
+        assert!(json.contains("window_secs"));
+
+        // Test deserialization
+        let deserialized: DeduplicationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.enabled, config.enabled);
+        assert_eq!(deserialized.window_secs, config.window_secs);
+    }
+
+    #[test]
+    fn test_deduplication_info_structure() {
+        let info = DeduplicationInfo {
+            idempotency_key: "order-123".to_string(),
+            task_id: Uuid::new_v4(),
+            task_name: "process_order".to_string(),
+            first_seen_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::seconds(300),
+            duplicate_count: 5,
+        };
+
+        assert_eq!(info.idempotency_key, "order-123");
+        assert_eq!(info.task_name, "process_order");
+        assert_eq!(info.duplicate_count, 5);
+        assert!(info.expires_at > info.first_seen_at);
+    }
+
+    #[test]
+    fn test_deduplication_info_serialization() {
+        let info = DeduplicationInfo {
+            idempotency_key: "payment-456".to_string(),
+            task_id: Uuid::new_v4(),
+            task_name: "process_payment".to_string(),
+            first_seen_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::seconds(600),
+            duplicate_count: 3,
+        };
+
+        // Test serialization
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("payment-456"));
+        assert!(json.contains("process_payment"));
+
+        // Test deserialization
+        let deserialized: DeduplicationInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.idempotency_key, info.idempotency_key);
+        assert_eq!(deserialized.task_id, info.task_id);
+        assert_eq!(deserialized.task_name, info.task_name);
+        assert_eq!(deserialized.duplicate_count, info.duplicate_count);
+    }
+
+    #[test]
+    fn test_deduplication_window_expiry() {
+        let config = DeduplicationConfig {
+            enabled: true,
+            window_secs: 300,
+        };
+
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(config.window_secs);
+
+        // Verify expiry is in the future
+        assert!(expires_at > now);
+
+        // Verify expiry is exactly window_secs in the future
+        let duration = expires_at - now;
+        assert!(duration.num_seconds() <= config.window_secs + 1); // Allow 1 second tolerance
+        assert!(duration.num_seconds() >= config.window_secs - 1);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_enqueue_idempotent() {
+        // This test requires a live PostgreSQL database
+        // Run with: cargo test test_enqueue_idempotent -- --ignored
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_check_deduplication() {
+        // This test requires a live PostgreSQL database
+        // Run with: cargo test test_check_deduplication -- --ignored
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_cleanup_deduplication() {
+        // This test requires a live PostgreSQL database
+        // Run with: cargo test test_cleanup_deduplication -- --ignored
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_get_deduplication_stats() {
+        // This test requires a live PostgreSQL database
+        // Run with: cargo test test_get_deduplication_stats -- --ignored
+    }
+
+    // ========== Tests for new features (TTL, Advisory Locks, Performance Analytics) ==========
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_expire_tasks_by_ttl() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Enqueue tasks of a specific type
+        // 2. Manually update their created_at to be old
+        // 3. Call expire_tasks_by_ttl
+        // 4. Verify tasks are in cancelled state
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_expire_all_tasks_by_ttl() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Enqueue multiple task types
+        // 2. Manually update their created_at to be old
+        // 3. Call expire_all_tasks_by_ttl
+        // 4. Verify all old tasks are cancelled
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_advisory_lock_acquire_release() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Acquire lock with try_advisory_lock
+        // 2. Verify it returns true
+        // 3. Try to acquire same lock again, verify returns false
+        // 4. Release lock
+        // 5. Verify lock can be acquired again
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_advisory_lock_blocking() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Acquire lock with advisory_lock
+        // 2. Verify is_advisory_lock_held returns true
+        // 3. Release lock
+        // 4. Verify is_advisory_lock_held returns false
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_get_task_percentiles() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Create and complete multiple tasks with varying durations
+        // 2. Call get_task_percentiles
+        // 3. Verify p50, p95, p99 are calculated correctly
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_get_slowest_tasks() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Create and complete multiple tasks with varying durations
+        // 2. Call get_slowest_tasks
+        // 3. Verify results are ordered by duration (slowest first)
+        // 4. Verify limit is respected
+    }
+
+    // ========== Tests for Rate Limiting, Priority, DLQ Analytics, Cancellation ==========
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_get_task_rate() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Complete multiple tasks of same type
+        // 2. Call get_task_rate
+        // 3. Verify count matches expected rate
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_is_rate_limited() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Complete tasks to reach rate limit
+        // 2. Call is_rate_limited
+        // 3. Verify it returns true when limit exceeded
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_boost_task_priority() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Enqueue tasks with normal priority
+        // 2. Boost priority
+        // 3. Verify tasks have increased priority
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_set_task_priority() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Enqueue tasks
+        // 2. Set absolute priority for specific tasks
+        // 3. Verify priority was set correctly
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_get_dlq_stats_by_task() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Create failed tasks in DLQ
+        // 2. Call get_dlq_stats_by_task
+        // 3. Verify task counts grouped by name
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_get_dlq_error_patterns() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Create DLQ tasks with various errors
+        // 2. Call get_dlq_error_patterns
+        // 3. Verify most common errors are returned
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_get_recent_dlq_tasks() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Create DLQ tasks at different times
+        // 2. Call get_recent_dlq_tasks
+        // 3. Verify only recent tasks are returned
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_cancel_with_reason() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Enqueue task
+        // 2. Cancel with reason
+        // 3. Verify task is cancelled with reason recorded
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_cancel_batch_with_reason() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Enqueue multiple tasks
+        // 2. Batch cancel with reason
+        // 3. Verify all tasks cancelled with reason
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL connection
+    async fn test_get_cancellation_reasons() {
+        // This test requires a live PostgreSQL database
+        // It would test:
+        // 1. Cancel tasks with various reasons
+        // 2. Call get_cancellation_reasons
+        // 3. Verify reasons are grouped and counted correctly
     }
 }

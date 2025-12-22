@@ -7,6 +7,10 @@ use std::path::Path;
 /// CLI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Configuration profile name (dev, staging, prod, etc.)
+    #[serde(default)]
+    pub profile: Option<String>,
+
     /// Broker configuration
     pub broker: BrokerConfig,
 
@@ -17,6 +21,65 @@ pub struct Config {
     /// Queue names
     #[serde(default)]
     pub queues: Vec<String>,
+
+    /// Auto-scaling configuration
+    #[serde(default)]
+    pub autoscale: Option<AutoScaleConfig>,
+
+    /// Alert configuration
+    #[serde(default)]
+    pub alerts: Option<AlertConfig>,
+}
+
+/// Auto-scaling configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoScaleConfig {
+    /// Enable auto-scaling
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Minimum number of workers
+    #[serde(default = "default_min_workers")]
+    pub min_workers: usize,
+
+    /// Maximum number of workers
+    #[serde(default = "default_max_workers")]
+    pub max_workers: usize,
+
+    /// Queue depth threshold for scaling up
+    #[serde(default = "default_scale_up_threshold")]
+    pub scale_up_threshold: usize,
+
+    /// Queue depth threshold for scaling down
+    #[serde(default = "default_scale_down_threshold")]
+    pub scale_down_threshold: usize,
+
+    /// Check interval in seconds
+    #[serde(default = "default_autoscale_check_interval")]
+    pub check_interval_secs: u64,
+}
+
+/// Alert configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertConfig {
+    /// Enable alerts
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Webhook URL for notifications
+    pub webhook_url: Option<String>,
+
+    /// DLQ size threshold for alerts
+    #[serde(default = "default_dlq_threshold")]
+    pub dlq_threshold: usize,
+
+    /// Failed task threshold for alerts
+    #[serde(default = "default_failed_threshold")]
+    pub failed_threshold: usize,
+
+    /// Alert check interval in seconds
+    #[serde(default = "default_alert_check_interval")]
+    pub check_interval_secs: u64,
 }
 
 /// Broker configuration
@@ -28,6 +91,18 @@ pub struct BrokerConfig {
 
     /// Connection URL
     pub url: String,
+
+    /// Failover broker URLs (optional)
+    #[serde(default)]
+    pub failover_urls: Vec<String>,
+
+    /// Failover retry attempts
+    #[serde(default = "default_failover_retries")]
+    pub failover_retries: u32,
+
+    /// Failover timeout in seconds
+    #[serde(default = "default_failover_timeout")]
+    pub failover_timeout_secs: u64,
 
     /// Default queue name
     #[serde(default = "default_queue_name")]
@@ -93,6 +168,46 @@ fn default_timeout() -> u64 {
     300
 }
 
+fn default_failover_retries() -> u32 {
+    3
+}
+
+fn default_failover_timeout() -> u64 {
+    5
+}
+
+fn default_min_workers() -> usize {
+    1
+}
+
+fn default_max_workers() -> usize {
+    10
+}
+
+fn default_scale_up_threshold() -> usize {
+    100
+}
+
+fn default_scale_down_threshold() -> usize {
+    10
+}
+
+fn default_autoscale_check_interval() -> u64 {
+    30
+}
+
+fn default_dlq_threshold() -> usize {
+    50
+}
+
+fn default_failed_threshold() -> usize {
+    100
+}
+
+fn default_alert_check_interval() -> u64 {
+    60
+}
+
 /// Expand environment variables in a string
 /// Supports ${VAR} and ${VAR:default_value} syntax
 fn expand_env_vars(s: &str) -> String {
@@ -153,15 +268,78 @@ impl Config {
     /// Create a default configuration file
     pub fn default_config() -> Self {
         Self {
+            profile: None,
             broker: BrokerConfig {
                 broker_type: "redis".to_string(),
                 url: "redis://localhost:6379".to_string(),
+                failover_urls: vec![],
+                failover_retries: default_failover_retries(),
+                failover_timeout_secs: default_failover_timeout(),
                 queue: "celers".to_string(),
                 mode: "fifo".to_string(),
             },
             worker: WorkerConfig::default(),
             queues: vec!["celers".to_string()],
+            autoscale: None,
+            alerts: None,
         }
+    }
+
+    /// Load configuration for a specific profile
+    #[allow(dead_code)]
+    pub fn from_file_with_profile<P: AsRef<Path>>(path: P, profile: &str) -> anyhow::Result<Self> {
+        let base_config = Self::from_file(&path)?;
+
+        // Try to load profile-specific configuration
+        let profile_path = path
+            .as_ref()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("celers.{}.toml", profile));
+
+        if profile_path.exists() {
+            let profile_config = Self::from_file(profile_path)?;
+            Ok(base_config.merge_with(profile_config))
+        } else {
+            Ok(base_config)
+        }
+    }
+
+    /// Merge this configuration with another, with the other taking precedence
+    #[allow(dead_code)]
+    fn merge_with(mut self, other: Self) -> Self {
+        // Merge broker config
+        if !other.broker.url.is_empty() {
+            self.broker.url = other.broker.url;
+        }
+        if !other.broker.broker_type.is_empty() {
+            self.broker.broker_type = other.broker.broker_type;
+        }
+        if !other.broker.failover_urls.is_empty() {
+            self.broker.failover_urls = other.broker.failover_urls;
+        }
+
+        // Merge worker config
+        if other.worker.concurrency > 0 {
+            self.worker.concurrency = other.worker.concurrency;
+        }
+
+        // Merge queues
+        if !other.queues.is_empty() {
+            self.queues = other.queues;
+        }
+
+        // Merge autoscale
+        if other.autoscale.is_some() {
+            self.autoscale = other.autoscale;
+        }
+
+        // Merge alerts
+        if other.alerts.is_some() {
+            self.alerts = other.alerts;
+        }
+
+        self
     }
 
     /// Validate configuration settings
@@ -208,6 +386,34 @@ impl Config {
             warnings.push("Very low poll interval may cause excessive CPU usage".to_string());
         }
 
+        // Validate autoscale configuration
+        if let Some(ref autoscale) = self.autoscale {
+            if autoscale.enabled {
+                if autoscale.min_workers == 0 {
+                    warnings.push("Autoscale min_workers is 0".to_string());
+                }
+                if autoscale.max_workers < autoscale.min_workers {
+                    warnings.push(format!(
+                        "Autoscale max_workers ({}) is less than min_workers ({})",
+                        autoscale.max_workers, autoscale.min_workers
+                    ));
+                }
+                if autoscale.scale_down_threshold >= autoscale.scale_up_threshold {
+                    warnings.push(
+                        "Autoscale scale_down_threshold should be less than scale_up_threshold"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        // Validate alert configuration
+        if let Some(ref alerts) = self.alerts {
+            if alerts.enabled && alerts.webhook_url.is_none() {
+                warnings.push("Alerts enabled but no webhook_url configured".to_string());
+            }
+        }
+
         Ok(warnings)
     }
 }
@@ -219,15 +425,21 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default_config();
+        assert_eq!(config.profile, None);
         assert_eq!(config.broker.broker_type, "redis");
         assert_eq!(config.broker.url, "redis://localhost:6379");
         assert_eq!(config.broker.queue, "celers");
         assert_eq!(config.broker.mode, "fifo");
+        assert_eq!(config.broker.failover_urls, Vec::<String>::new());
+        assert_eq!(config.broker.failover_retries, 3);
+        assert_eq!(config.broker.failover_timeout_secs, 5);
         assert_eq!(config.worker.concurrency, 4);
         assert_eq!(config.worker.poll_interval_ms, 1000);
         assert_eq!(config.worker.max_retries, 3);
         assert_eq!(config.worker.default_timeout_secs, 300);
         assert_eq!(config.queues, vec!["celers"]);
+        assert!(config.autoscale.is_none());
+        assert!(config.alerts.is_none());
     }
 
     #[test]
@@ -456,5 +668,160 @@ mode = "fifo"
 
         let config: Config = toml::from_str(&expanded).unwrap();
         assert_eq!(config.broker.url, "redis://localhost:6379");
+    }
+
+    #[test]
+    fn test_broker_failover_config() {
+        let toml_str = r#"
+[broker]
+type = "redis"
+url = "redis://primary:6379"
+failover_urls = ["redis://backup1:6379", "redis://backup2:6379"]
+failover_retries = 5
+failover_timeout_secs = 10
+queue = "celers"
+mode = "fifo"
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.broker.failover_urls.len(), 2);
+        assert_eq!(config.broker.failover_urls[0], "redis://backup1:6379");
+        assert_eq!(config.broker.failover_urls[1], "redis://backup2:6379");
+        assert_eq!(config.broker.failover_retries, 5);
+        assert_eq!(config.broker.failover_timeout_secs, 10);
+    }
+
+    #[test]
+    fn test_autoscale_config() {
+        let toml_str = r#"
+[broker]
+type = "redis"
+url = "redis://localhost:6379"
+
+[autoscale]
+enabled = true
+min_workers = 2
+max_workers = 20
+scale_up_threshold = 200
+scale_down_threshold = 20
+check_interval_secs = 60
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.autoscale.is_some());
+        let autoscale = config.autoscale.unwrap();
+        assert!(autoscale.enabled);
+        assert_eq!(autoscale.min_workers, 2);
+        assert_eq!(autoscale.max_workers, 20);
+        assert_eq!(autoscale.scale_up_threshold, 200);
+        assert_eq!(autoscale.scale_down_threshold, 20);
+        assert_eq!(autoscale.check_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_alert_config() {
+        let toml_str = r#"
+[broker]
+type = "redis"
+url = "redis://localhost:6379"
+
+[alerts]
+enabled = true
+webhook_url = "https://hooks.slack.com/services/xxx"
+dlq_threshold = 100
+failed_threshold = 200
+check_interval_secs = 120
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.alerts.is_some());
+        let alerts = config.alerts.unwrap();
+        assert!(alerts.enabled);
+        assert_eq!(
+            alerts.webhook_url,
+            Some("https://hooks.slack.com/services/xxx".to_string())
+        );
+        assert_eq!(alerts.dlq_threshold, 100);
+        assert_eq!(alerts.failed_threshold, 200);
+        assert_eq!(alerts.check_interval_secs, 120);
+    }
+
+    #[test]
+    fn test_config_validation_autoscale_invalid() {
+        let mut config = Config::default_config();
+        config.autoscale = Some(AutoScaleConfig {
+            enabled: true,
+            min_workers: 0,
+            max_workers: 5,
+            scale_up_threshold: 100,
+            scale_down_threshold: 10,
+            check_interval_secs: 30,
+        });
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings.iter().any(|w| w.contains("min_workers is 0")));
+    }
+
+    #[test]
+    fn test_config_validation_autoscale_max_less_than_min() {
+        let mut config = Config::default_config();
+        config.autoscale = Some(AutoScaleConfig {
+            enabled: true,
+            min_workers: 10,
+            max_workers: 5,
+            scale_up_threshold: 100,
+            scale_down_threshold: 10,
+            check_interval_secs: 30,
+        });
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("max_workers") && w.contains("min_workers")));
+    }
+
+    #[test]
+    fn test_config_validation_autoscale_threshold_invalid() {
+        let mut config = Config::default_config();
+        config.autoscale = Some(AutoScaleConfig {
+            enabled: true,
+            min_workers: 1,
+            max_workers: 10,
+            scale_up_threshold: 50,
+            scale_down_threshold: 100,
+            check_interval_secs: 30,
+        });
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings.iter().any(|w| w.contains("scale_down_threshold")));
+    }
+
+    #[test]
+    fn test_config_validation_alert_no_webhook() {
+        let mut config = Config::default_config();
+        config.alerts = Some(AlertConfig {
+            enabled: true,
+            webhook_url: None,
+            dlq_threshold: 50,
+            failed_threshold: 100,
+            check_interval_secs: 60,
+        });
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings.iter().any(|w| w.contains("webhook_url")));
+    }
+
+    #[test]
+    fn test_profile_config() {
+        let toml_str = r#"
+profile = "production"
+
+[broker]
+type = "redis"
+url = "redis://localhost:6379"
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.profile, Some("production".to_string()));
     }
 }

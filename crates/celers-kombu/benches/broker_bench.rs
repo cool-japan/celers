@@ -5,10 +5,12 @@ use std::time::Duration;
 use uuid::Uuid;
 
 // Mock broker for benchmarking (same as in tests but simplified)
+#[allow(dead_code)]
 struct BenchBroker {
     connected: bool,
 }
 
+#[allow(dead_code)]
 impl BenchBroker {
     fn new() -> Self {
         Self { connected: false }
@@ -151,10 +153,11 @@ fn bench_middleware_chain(c: &mut Criterion) {
 
     c.bench_function("middleware_chain_3_middlewares", |b| {
         b.to_async(&runtime).iter(|| async {
+            let metrics = std::sync::Arc::new(std::sync::Mutex::new(BrokerMetrics::default()));
             let chain = MiddlewareChain::new()
                 .with_middleware(Box::new(ValidationMiddleware::new()))
-                .with_middleware(Box::new(LoggingMiddleware::new()))
-                .with_middleware(Box::new(MetricsMiddleware::new()));
+                .with_middleware(Box::new(LoggingMiddleware::new("[BENCH]")))
+                .with_middleware(Box::new(MetricsMiddleware::new(metrics)));
 
             let task_id = Uuid::new_v4();
             let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
@@ -194,7 +197,7 @@ fn bench_batch_publish_result(c: &mut Criterion) {
     for size in [10, 100, 1000].iter() {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             b.iter(|| {
-                let result = BatchPublishResult::new(black_box(size), black_box(0));
+                let result = BatchPublishResult::success(black_box(size));
                 assert!(result.is_complete_success());
                 black_box(result)
             })
@@ -205,12 +208,280 @@ fn bench_batch_publish_result(c: &mut Criterion) {
 
 fn bench_broker_metrics(c: &mut Criterion) {
     c.bench_function("broker_metrics_increment", |b| {
-        let mut metrics = BrokerMetrics::default();
         b.iter(|| {
-            metrics.messages_published += 1;
-            metrics.messages_consumed += 1;
-            metrics.messages_acknowledged += 1;
-            black_box(&metrics)
+            let mut metrics = BrokerMetrics::default();
+            metrics.messages_published += black_box(1);
+            metrics.messages_consumed += black_box(1);
+            metrics.messages_acknowledged += black_box(1);
+            black_box(metrics)
+        })
+    });
+}
+
+fn bench_new_middleware(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("tracing_middleware", |b| {
+        b.to_async(&runtime).iter(|| async {
+            let middleware = TracingMiddleware::new("bench-service");
+            let task_id = Uuid::new_v4();
+            let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
+            let _ = middleware.before_publish(&mut message).await;
+            black_box(message)
+        })
+    });
+
+    c.bench_function("batching_middleware", |b| {
+        b.to_async(&runtime).iter(|| async {
+            let middleware = BatchingMiddleware::new(100, 5000);
+            let task_id = Uuid::new_v4();
+            let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
+            let _ = middleware.before_publish(&mut message).await;
+            black_box(message)
+        })
+    });
+
+    c.bench_function("audit_middleware", |b| {
+        b.to_async(&runtime).iter(|| async {
+            let middleware = AuditMiddleware::new(true);
+            let task_id = Uuid::new_v4();
+            let mut message = Message::new("test_task".to_string(), task_id, vec![1, 2, 3]);
+            let _ = middleware.before_publish(&mut message).await;
+            black_box(message)
+        })
+    });
+}
+
+fn bench_utility_functions(c: &mut Criterion) {
+    c.bench_function("calculate_optimal_batch_size", |b| {
+        b.iter(|| {
+            let size = utils::calculate_optimal_batch_size(
+                black_box(1024),
+                black_box(1000),
+                black_box(100),
+            );
+            black_box(size)
+        })
+    });
+
+    c.bench_function("calculate_queue_capacity", |b| {
+        b.iter(|| {
+            let capacity =
+                utils::calculate_queue_capacity(black_box(1000), black_box(800), black_box(60));
+            black_box(capacity)
+        })
+    });
+
+    c.bench_function("suggest_partition_count", |b| {
+        b.iter(|| {
+            let partitions =
+                utils::suggest_partition_count(black_box(10000), black_box(5), black_box(1000));
+            black_box(partitions)
+        })
+    });
+
+    c.bench_function("analyze_message_patterns", |b| {
+        let sizes = vec![100, 200, 150, 180, 220, 190, 210, 170, 195, 185];
+        b.iter(|| {
+            let result = utils::analyze_message_patterns(black_box(&sizes));
+            black_box(result)
+        })
+    });
+
+    c.bench_function("match_routing_pattern", |b| {
+        b.iter(|| {
+            let matched = utils::match_routing_pattern(
+                black_box("stock.usd.nyse"),
+                black_box("stock.*.nyse"),
+            );
+            black_box(matched)
+        })
+    });
+
+    c.bench_function("suggest_retry_policy", |b| {
+        b.iter(|| {
+            let policy = utils::suggest_retry_policy(black_box(0.1), black_box(5));
+            black_box(policy)
+        })
+    });
+
+    c.bench_function("calculate_optimal_workers", |b| {
+        b.iter(|| {
+            let workers = utils::calculate_optimal_workers(
+                black_box(5000),
+                black_box(200),
+                black_box(60),
+                black_box(16),
+            );
+            black_box(workers)
+        })
+    });
+
+    c.bench_function("analyze_broker_performance", |b| {
+        let metrics = BrokerMetrics {
+            messages_published: 10000,
+            messages_consumed: 9500,
+            messages_acknowledged: 9000,
+            messages_rejected: 500,
+            publish_errors: 50,
+            consume_errors: 100,
+            active_connections: 5,
+            connection_attempts: 10,
+            connection_failures: 1,
+        };
+        b.iter(|| {
+            let perf = utils::analyze_broker_performance(black_box(&metrics));
+            black_box(perf)
+        })
+    });
+
+    c.bench_function("calculate_throughput", |b| {
+        b.iter(|| {
+            let throughput = utils::calculate_throughput(black_box(9500), black_box(60.0));
+            black_box(throughput)
+        })
+    });
+
+    c.bench_function("analyze_queue_health", |b| {
+        b.iter(|| {
+            let health =
+                utils::analyze_queue_health(black_box(1500), black_box(1000), black_box(5000));
+            black_box(health)
+        })
+    });
+
+    c.bench_function("estimate_drain_time", |b| {
+        b.iter(|| {
+            let time = utils::estimate_drain_time(black_box(1500), black_box(100));
+            black_box(time)
+        })
+    });
+
+    c.bench_function("calculate_load_distribution", |b| {
+        let queue_sizes = vec![100, 500, 200, 800, 300];
+        b.iter(|| {
+            let dist = utils::calculate_load_distribution(black_box(&queue_sizes), black_box(10));
+            black_box(dist)
+        })
+    });
+
+    c.bench_function("analyze_circuit_breaker", |b| {
+        b.iter(|| {
+            let result =
+                utils::analyze_circuit_breaker(black_box(50), black_box(950), black_box(1000));
+            black_box(result)
+        })
+    });
+
+    c.bench_function("analyze_pool_health", |b| {
+        b.iter(|| {
+            let result = utils::analyze_pool_health(
+                black_box(15),
+                black_box(5),
+                black_box(20),
+                black_box(10000),
+                black_box(5),
+            );
+            black_box(result)
+        })
+    });
+
+    c.bench_function("calculate_backoff_delay", |b| {
+        b.iter(|| {
+            let delay = utils::calculate_backoff_delay(
+                black_box(5),
+                black_box(100),
+                black_box(60000),
+                black_box(0.1),
+            );
+            black_box(delay)
+        })
+    });
+
+    c.bench_function("calculate_priority_score", |b| {
+        b.iter(|| {
+            let score = utils::calculate_priority_score(
+                black_box(Priority::High),
+                black_box(30),
+                black_box(2),
+            );
+            black_box(score)
+        })
+    });
+
+    c.bench_function("identify_stale_messages", |b| {
+        let ages = vec![30, 150, 45, 200, 10, 180, 25];
+        b.iter(|| {
+            let stale = utils::identify_stale_messages(black_box(&ages), black_box(100));
+            black_box(stale)
+        })
+    });
+
+    c.bench_function("suggest_batch_groups", |b| {
+        let sizes = vec![1024, 2048, 512, 4096, 1536, 3072, 768];
+        b.iter(|| {
+            let groups = utils::suggest_batch_groups(black_box(&sizes), black_box(8192));
+            black_box(groups)
+        })
+    });
+
+    c.bench_function("predict_throughput", |b| {
+        let historical = vec![100.0, 150.0, 180.0, 220.0, 250.0];
+        b.iter(|| {
+            let predicted = utils::predict_throughput(black_box(&historical), black_box(5));
+            black_box(predicted)
+        })
+    });
+
+    c.bench_function("calculate_efficiency", |b| {
+        b.iter(|| {
+            let eff = utils::calculate_efficiency(black_box(9000), black_box(500), black_box(500));
+            black_box(eff)
+        })
+    });
+
+    c.bench_function("calculate_health_score", |b| {
+        b.iter(|| {
+            let score = utils::calculate_health_score(
+                black_box(0.95),
+                black_box(1500),
+                black_box(0.05),
+                black_box(25),
+            );
+            black_box(score)
+        })
+    });
+}
+
+fn bench_config_builders(c: &mut Criterion) {
+    c.bench_function("backpressure_config", |b| {
+        b.iter(|| {
+            let config = BackpressureConfig::new()
+                .with_max_pending(black_box(1000))
+                .with_max_queue_size(black_box(10000))
+                .with_high_watermark(black_box(0.8))
+                .with_low_watermark(black_box(0.6));
+            black_box(config)
+        })
+    });
+
+    c.bench_function("circuit_breaker_config", |b| {
+        b.iter(|| {
+            let config = CircuitBreakerConfig::new()
+                .with_failure_threshold(black_box(5))
+                .with_success_threshold(black_box(2))
+                .with_open_duration(black_box(Duration::from_secs(60)));
+            black_box(config)
+        })
+    });
+
+    c.bench_function("pool_config", |b| {
+        b.iter(|| {
+            let config = PoolConfig::new()
+                .with_min_connections(black_box(2))
+                .with_max_connections(black_box(10))
+                .with_idle_timeout(black_box(Duration::from_secs(300)));
+            black_box(config)
         })
     });
 }
@@ -226,5 +497,8 @@ criterion_group!(
     bench_dlq_config,
     bench_batch_publish_result,
     bench_broker_metrics,
+    bench_new_middleware,
+    bench_utility_functions,
+    bench_config_builders,
 );
 criterion_main!(benches);

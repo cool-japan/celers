@@ -26,6 +26,7 @@ pub mod batch {
     /// let errors = batch::validate_all(&tasks);
     /// assert!(errors.is_empty());
     /// ```
+    #[must_use]
     pub fn validate_all(tasks: &[SerializedTask]) -> Vec<(usize, String)> {
         tasks
             .iter()
@@ -49,6 +50,7 @@ pub mod batch {
     /// let running = batch::filter_by_state(&tasks, |s| matches!(s, TaskState::Running));
     /// assert_eq!(running.len(), 1);
     /// ```
+    #[must_use]
     pub fn filter_by_state<F>(tasks: &[SerializedTask], predicate: F) -> Vec<&SerializedTask>
     where
         F: Fn(&TaskState) -> bool,
@@ -74,6 +76,7 @@ pub mod batch {
     /// let high_priority = batch::filter_high_priority(&tasks);
     /// assert_eq!(high_priority.len(), 2);
     /// ```
+    #[must_use]
     pub fn filter_high_priority(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
         tasks
             .iter()
@@ -118,6 +121,7 @@ pub mod batch {
     /// assert_eq!(counts.get("RUNNING"), Some(&1));
     /// assert_eq!(counts.get("PENDING"), Some(&1));
     /// ```
+    #[must_use]
     pub fn count_by_state(tasks: &[SerializedTask]) -> std::collections::HashMap<String, usize> {
         let mut counts = std::collections::HashMap::new();
         for task in tasks {
@@ -142,6 +146,7 @@ pub mod batch {
     /// // Fresh tasks shouldn't be expired
     /// assert!(!batch::has_expired_tasks(&tasks));
     /// ```
+    #[must_use]
     pub fn has_expired_tasks(tasks: &[SerializedTask]) -> bool {
         tasks.iter().any(|task| task.is_expired())
     }
@@ -161,6 +166,7 @@ pub mod batch {
     /// // Fresh tasks shouldn't be expired
     /// assert_eq!(expired.len(), 0);
     /// ```
+    #[must_use]
     pub fn get_expired_tasks(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
         tasks.iter().filter(|task| task.is_expired()).collect()
     }
@@ -179,6 +185,7 @@ pub mod batch {
     /// let total_size = batch::total_payload_size(&tasks);
     /// assert_eq!(total_size, 5);
     /// ```
+    #[must_use]
     pub fn total_payload_size(tasks: &[SerializedTask]) -> usize {
         tasks.iter().map(|task| task.payload_size()).sum()
     }
@@ -199,6 +206,7 @@ pub mod batch {
     /// let with_deps = batch::filter_with_dependencies(&tasks);
     /// assert_eq!(with_deps.len(), 1);
     /// ```
+    #[must_use]
     pub fn filter_with_dependencies(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
         tasks
             .iter()
@@ -222,6 +230,7 @@ pub mod batch {
     /// let can_retry = batch::filter_retryable(&tasks);
     /// assert_eq!(can_retry.len(), 1);
     /// ```
+    #[must_use]
     pub fn filter_retryable(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
         tasks.iter().filter(|task| task.can_retry()).collect()
     }
@@ -241,6 +250,7 @@ pub mod batch {
     /// let process_tasks = batch::filter_by_name_pattern(&tasks, "process");
     /// assert_eq!(process_tasks.len(), 2);
     /// ```
+    #[must_use]
     pub fn filter_by_name_pattern<'a>(
         tasks: &'a [SerializedTask],
         pattern: &str,
@@ -271,6 +281,7 @@ pub mod batch {
     /// let groups = batch::group_by_workflow_id(&tasks);
     /// assert_eq!(groups.len(), 2);
     /// ```
+    #[must_use]
     pub fn group_by_workflow_id(
         tasks: &[SerializedTask],
     ) -> std::collections::HashMap<Uuid, Vec<&SerializedTask>> {
@@ -298,6 +309,7 @@ pub mod batch {
     /// let terminal = batch::filter_terminal(&tasks);
     /// assert_eq!(terminal.len(), 1);
     /// ```
+    #[must_use]
     pub fn filter_terminal(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
         tasks.iter().filter(|task| task.is_terminal()).collect()
     }
@@ -317,6 +329,7 @@ pub mod batch {
     /// let active = batch::filter_active(&tasks);
     /// assert_eq!(active.len(), 1);
     /// ```
+    #[must_use]
     pub fn filter_active(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
         tasks.iter().filter(|task| task.is_active()).collect()
     }
@@ -335,6 +348,7 @@ pub mod batch {
     /// let avg = batch::average_payload_size(&tasks);
     /// assert_eq!(avg, 2); // (3 + 2) / 2 = 2
     /// ```
+    #[must_use]
     pub fn average_payload_size(tasks: &[SerializedTask]) -> usize {
         if tasks.is_empty() {
             0
@@ -357,6 +371,7 @@ pub mod batch {
     /// let oldest = batch::find_oldest(&tasks);
     /// assert!(oldest.is_some());
     /// ```
+    #[must_use]
     pub fn find_oldest(tasks: &[SerializedTask]) -> Option<&SerializedTask> {
         tasks.iter().min_by_key(|task| task.metadata.created_at)
     }
@@ -375,6 +390,7 @@ pub mod batch {
     /// let newest = batch::find_newest(&tasks);
     /// assert!(newest.is_some());
     /// ```
+    #[must_use]
     pub fn find_newest(tasks: &[SerializedTask]) -> Option<&SerializedTask> {
         tasks.iter().max_by_key(|task| task.metadata.created_at)
     }
@@ -422,6 +438,7 @@ pub struct TaskMetadata {
 
 impl TaskMetadata {
     #[inline]
+    #[must_use]
     pub fn new(name: String) -> Self {
         let now = Utc::now();
         Self {
@@ -440,18 +457,21 @@ impl TaskMetadata {
     }
 
     #[inline]
+    #[must_use]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
     #[inline]
+    #[must_use]
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = Some(timeout_secs);
         self
     }
 
     #[inline]
+    #[must_use]
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = priority;
         self
@@ -459,6 +479,7 @@ impl TaskMetadata {
 
     /// Set the group ID for workflow grouping
     #[inline]
+    #[must_use]
     pub fn with_group_id(mut self, group_id: Uuid) -> Self {
         self.group_id = Some(group_id);
         self
@@ -466,17 +487,20 @@ impl TaskMetadata {
 
     /// Set the chord ID for barrier synchronization
     #[inline]
+    #[must_use]
     pub fn with_chord_id(mut self, chord_id: Uuid) -> Self {
         self.chord_id = Some(chord_id);
         self
     }
 
     /// Get the age of the task (time since creation)
+    #[must_use]
     pub fn age(&self) -> chrono::Duration {
         Utc::now() - self.created_at
     }
 
     /// Check if the task has expired based on its timeout
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         if let Some(timeout_secs) = self.timeout_secs {
             let elapsed = (Utc::now() - self.created_at).num_seconds();
@@ -487,11 +511,13 @@ impl TaskMetadata {
     }
 
     /// Check if the task is in a terminal state (Succeeded or Failed)
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.state.is_terminal()
     }
 
     /// Check if the task is in a running or active state
+    #[must_use]
     pub fn is_active(&self) -> bool {
         matches!(
             self.state,
@@ -528,43 +554,51 @@ impl TaskMetadata {
     }
 
     /// Check if task has a timeout configured
+    #[must_use]
     pub fn has_timeout(&self) -> bool {
         self.timeout_secs.is_some()
     }
 
     /// Check if task is part of a group
+    #[must_use]
     pub fn has_group_id(&self) -> bool {
         self.group_id.is_some()
     }
 
     /// Check if task is part of a chord
+    #[must_use]
     pub fn has_chord_id(&self) -> bool {
         self.chord_id.is_some()
     }
 
     /// Check if task has custom priority (non-zero)
+    #[must_use]
     pub fn has_priority(&self) -> bool {
         self.priority != 0
     }
 
     /// Check if task has high priority (priority > 0)
+    #[must_use]
     pub fn is_high_priority(&self) -> bool {
         self.priority > 0
     }
 
     /// Check if task has low priority (priority < 0)
+    #[must_use]
     pub fn is_low_priority(&self) -> bool {
         self.priority < 0
     }
 
     /// Add a task dependency
     #[inline]
+    #[must_use]
     pub fn with_dependency(mut self, dependency: TaskId) -> Self {
         self.dependencies.insert(dependency);
         self
     }
 
     /// Add multiple task dependencies
+    #[must_use]
     pub fn with_dependencies(mut self, dependencies: impl IntoIterator<Item = TaskId>) -> Self {
         self.dependencies.extend(dependencies);
         self
@@ -572,18 +606,21 @@ impl TaskMetadata {
 
     /// Check if task has any dependencies
     #[inline]
+    #[must_use]
     pub fn has_dependencies(&self) -> bool {
         !self.dependencies.is_empty()
     }
 
     /// Get the number of dependencies
     #[inline]
+    #[must_use]
     pub fn dependency_count(&self) -> usize {
         self.dependencies.len()
     }
 
     /// Check if a specific task is a dependency
     #[inline]
+    #[must_use]
     pub fn depends_on(&self, task_id: &TaskId) -> bool {
         self.dependencies.contains(task_id)
     }
@@ -602,36 +639,42 @@ impl TaskMetadata {
 
     /// Check if task is in Pending state
     #[inline]
+    #[must_use]
     pub fn is_pending(&self) -> bool {
         matches!(self.state, TaskState::Pending)
     }
 
     /// Check if task is in Running state
     #[inline]
+    #[must_use]
     pub fn is_running(&self) -> bool {
         matches!(self.state, TaskState::Running)
     }
 
     /// Check if task is in Succeeded state
     #[inline]
+    #[must_use]
     pub fn is_succeeded(&self) -> bool {
         matches!(self.state, TaskState::Succeeded(_))
     }
 
     /// Check if task is in Failed state
     #[inline]
+    #[must_use]
     pub fn is_failed(&self) -> bool {
         matches!(self.state, TaskState::Failed(_))
     }
 
     /// Check if task is in Retrying state
     #[inline]
+    #[must_use]
     pub fn is_retrying(&self) -> bool {
         matches!(self.state, TaskState::Retrying(_))
     }
 
     /// Check if task is in Reserved state
     #[inline]
+    #[must_use]
     pub fn is_reserved(&self) -> bool {
         matches!(self.state, TaskState::Reserved)
     }
@@ -649,6 +692,7 @@ impl TaskMetadata {
     ///     println!("Task has {} seconds remaining", remaining.num_seconds());
     /// }
     /// ```
+    #[must_use]
     pub fn time_remaining(&self) -> Option<chrono::Duration> {
         self.timeout_secs.and_then(|timeout| {
             let elapsed = Utc::now() - self.created_at;
@@ -672,6 +716,7 @@ impl TaskMetadata {
     /// let elapsed = task.time_elapsed();
     /// assert!(elapsed.num_seconds() >= 0);
     /// ```
+    #[must_use]
     pub fn time_elapsed(&self) -> chrono::Duration {
         Utc::now() - self.created_at
     }
@@ -691,6 +736,7 @@ impl TaskMetadata {
     /// task.state = TaskState::Retrying(3);
     /// assert!(!task.can_retry());
     /// ```
+    #[must_use]
     pub fn can_retry(&self) -> bool {
         self.state.can_retry(self.max_retries)
     }
@@ -706,6 +752,7 @@ impl TaskMetadata {
     /// assert_eq!(task.retry_count(), 2);
     /// ```
     #[inline]
+    #[must_use]
     pub fn retry_count(&self) -> u32 {
         self.state.retry_count()
     }
@@ -720,6 +767,7 @@ impl TaskMetadata {
     /// task.state = TaskState::Retrying(2);
     /// assert_eq!(task.retries_remaining(), 3);
     /// ```
+    #[must_use]
     pub fn retries_remaining(&self) -> u32 {
         let current = self.retry_count();
         self.max_retries.saturating_sub(current)
@@ -739,18 +787,21 @@ impl TaskMetadata {
     /// assert!(task.is_part_of_workflow());
     /// ```
     #[inline]
+    #[must_use]
     pub fn is_part_of_workflow(&self) -> bool {
         self.group_id.is_some() || self.chord_id.is_some()
     }
 
     /// Get group ID if task is part of a group
     #[inline]
+    #[must_use]
     pub fn get_group_id(&self) -> Option<&Uuid> {
         self.group_id.as_ref()
     }
 
     /// Get chord ID if task is part of a chord
     #[inline]
+    #[must_use]
     pub fn get_chord_id(&self) -> Option<&Uuid> {
         self.chord_id.as_ref()
     }
@@ -814,6 +865,7 @@ impl TaskMetadata {
     /// assert_eq!(task.name, cloned.name);
     /// assert_eq!(task.priority, cloned.priority);
     /// ```
+    #[must_use]
     pub fn with_new_id(&self) -> Self {
         let now = Utc::now();
         Self {
@@ -922,6 +974,7 @@ pub struct SerializedTask {
 
 impl SerializedTask {
     #[inline]
+    #[must_use]
     pub fn new(name: String, payload: Vec<u8>) -> Self {
         Self {
             metadata: TaskMetadata::new(name),
@@ -930,18 +983,21 @@ impl SerializedTask {
     }
 
     #[inline]
+    #[must_use]
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.metadata.priority = priority;
         self
     }
 
     #[inline]
+    #[must_use]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.metadata.max_retries = max_retries;
         self
     }
 
     #[inline]
+    #[must_use]
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.metadata.timeout_secs = Some(timeout_secs);
         self
@@ -949,6 +1005,7 @@ impl SerializedTask {
 
     /// Set the group ID for workflow grouping
     #[inline]
+    #[must_use]
     pub fn with_group_id(mut self, group_id: Uuid) -> Self {
         self.metadata.group_id = Some(group_id);
         self
@@ -956,6 +1013,7 @@ impl SerializedTask {
 
     /// Set the chord ID for barrier synchronization
     #[inline]
+    #[must_use]
     pub fn with_chord_id(mut self, chord_id: Uuid) -> Self {
         self.metadata.chord_id = Some(chord_id);
         self
@@ -963,24 +1021,28 @@ impl SerializedTask {
 
     /// Get the age of the task (time since creation)
     #[inline]
+    #[must_use]
     pub fn age(&self) -> chrono::Duration {
         self.metadata.age()
     }
 
     /// Check if the task has expired based on its timeout
     #[inline]
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         self.metadata.is_expired()
     }
 
     /// Check if the task is in a terminal state (Success or Failure)
     #[inline]
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.metadata.is_terminal()
     }
 
     /// Check if the task is in a running or active state
     #[inline]
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.metadata.is_active()
     }
@@ -1028,48 +1090,56 @@ impl SerializedTask {
 
     /// Check if task has a timeout configured
     #[inline]
+    #[must_use]
     pub fn has_timeout(&self) -> bool {
         self.metadata.has_timeout()
     }
 
     /// Check if task is part of a group
     #[inline]
+    #[must_use]
     pub fn has_group_id(&self) -> bool {
         self.metadata.has_group_id()
     }
 
     /// Check if task is part of a chord
     #[inline]
+    #[must_use]
     pub fn has_chord_id(&self) -> bool {
         self.metadata.has_chord_id()
     }
 
     /// Check if task has custom priority (non-zero)
     #[inline]
+    #[must_use]
     pub fn has_priority(&self) -> bool {
         self.metadata.has_priority()
     }
 
     /// Get payload size in bytes
     #[inline]
+    #[must_use]
     pub fn payload_size(&self) -> usize {
         self.payload.len()
     }
 
     /// Check if payload is empty
     #[inline]
+    #[must_use]
     pub fn has_empty_payload(&self) -> bool {
         self.payload.is_empty()
     }
 
     /// Add a task dependency
     #[inline]
+    #[must_use]
     pub fn with_dependency(mut self, dependency: TaskId) -> Self {
         self.metadata.dependencies.insert(dependency);
         self
     }
 
     /// Add multiple task dependencies
+    #[must_use]
     pub fn with_dependencies(mut self, dependencies: impl IntoIterator<Item = TaskId>) -> Self {
         self.metadata.dependencies.extend(dependencies);
         self
@@ -1077,30 +1147,35 @@ impl SerializedTask {
 
     /// Check if task has any dependencies
     #[inline]
+    #[must_use]
     pub fn has_dependencies(&self) -> bool {
         self.metadata.has_dependencies()
     }
 
     /// Get the number of dependencies
     #[inline]
+    #[must_use]
     pub fn dependency_count(&self) -> usize {
         self.metadata.dependency_count()
     }
 
     /// Check if a specific task is a dependency
     #[inline]
+    #[must_use]
     pub fn depends_on(&self, task_id: &TaskId) -> bool {
         self.metadata.depends_on(task_id)
     }
 
     /// Check if task has high priority (priority > 0)
     #[inline]
+    #[must_use]
     pub fn is_high_priority(&self) -> bool {
         self.metadata.is_high_priority()
     }
 
     /// Check if task has low priority (priority < 0)
     #[inline]
+    #[must_use]
     pub fn is_low_priority(&self) -> bool {
         self.metadata.is_low_priority()
     }
@@ -1109,36 +1184,42 @@ impl SerializedTask {
 
     /// Check if task is in Pending state
     #[inline]
+    #[must_use]
     pub fn is_pending(&self) -> bool {
         self.metadata.is_pending()
     }
 
     /// Check if task is in Running state
     #[inline]
+    #[must_use]
     pub fn is_running(&self) -> bool {
         self.metadata.is_running()
     }
 
     /// Check if task is in Succeeded state
     #[inline]
+    #[must_use]
     pub fn is_succeeded(&self) -> bool {
         self.metadata.is_succeeded()
     }
 
     /// Check if task is in Failed state
     #[inline]
+    #[must_use]
     pub fn is_failed(&self) -> bool {
         self.metadata.is_failed()
     }
 
     /// Check if task is in Retrying state
     #[inline]
+    #[must_use]
     pub fn is_retrying(&self) -> bool {
         self.metadata.is_retrying()
     }
 
     /// Check if task is in Reserved state
     #[inline]
+    #[must_use]
     pub fn is_reserved(&self) -> bool {
         self.metadata.is_reserved()
     }
@@ -1147,12 +1228,14 @@ impl SerializedTask {
 
     /// Get remaining time before timeout
     #[inline]
+    #[must_use]
     pub fn time_remaining(&self) -> Option<chrono::Duration> {
         self.metadata.time_remaining()
     }
 
     /// Get the time elapsed since task creation
     #[inline]
+    #[must_use]
     pub fn time_elapsed(&self) -> chrono::Duration {
         self.metadata.time_elapsed()
     }
@@ -1161,18 +1244,21 @@ impl SerializedTask {
 
     /// Check if task can be retried
     #[inline]
+    #[must_use]
     pub fn can_retry(&self) -> bool {
         self.metadata.can_retry()
     }
 
     /// Get current retry count
     #[inline]
+    #[must_use]
     pub fn retry_count(&self) -> u32 {
         self.metadata.retry_count()
     }
 
     /// Get remaining retry attempts
     #[inline]
+    #[must_use]
     pub fn retries_remaining(&self) -> u32 {
         self.metadata.retries_remaining()
     }
@@ -1181,18 +1267,21 @@ impl SerializedTask {
 
     /// Check if task is part of any workflow
     #[inline]
+    #[must_use]
     pub fn is_part_of_workflow(&self) -> bool {
         self.metadata.is_part_of_workflow()
     }
 
     /// Get group ID if task is part of a group
     #[inline]
+    #[must_use]
     pub fn get_group_id(&self) -> Option<&Uuid> {
         self.metadata.get_group_id()
     }
 
     /// Get chord ID if task is part of a chord
     #[inline]
+    #[must_use]
     pub fn get_chord_id(&self) -> Option<&Uuid> {
         self.metadata.get_chord_id()
     }
@@ -1456,7 +1545,7 @@ mod tests {
             assert!(valid_task.validate().is_ok());
 
             // Invalid task - empty name
-            let mut invalid_task = SerializedTask::new("".to_string(), vec![1, 2, 3]);
+            let mut invalid_task = SerializedTask::new(String::new(), vec![1, 2, 3]);
             assert!(invalid_task.metadata.validate().is_err());
 
             // Invalid task - excessive retries

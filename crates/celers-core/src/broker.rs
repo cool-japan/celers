@@ -28,31 +28,37 @@ impl BrokerMessage {
     }
 
     /// Check if message has a receipt handle
+    #[inline]
     pub fn has_receipt_handle(&self) -> bool {
         self.receipt_handle.is_some()
     }
 
     /// Get task ID
+    #[inline]
     pub fn task_id(&self) -> crate::TaskId {
         self.task.metadata.id
     }
 
     /// Get task name
+    #[inline]
     pub fn task_name(&self) -> &str {
         &self.task.metadata.name
     }
 
     /// Get task priority
+    #[inline]
     pub fn priority(&self) -> i32 {
         self.task.metadata.priority
     }
 
     /// Check if task is expired
+    #[inline]
     pub fn is_expired(&self) -> bool {
         self.task.is_expired()
     }
 
     /// Get task age
+    #[inline]
     pub fn age(&self) -> chrono::Duration {
         self.task.age()
     }
@@ -153,6 +159,147 @@ pub trait Broker: Send + Sync {
     async fn enqueue_after(&self, task: SerializedTask, _delay_secs: u64) -> Result<TaskId> {
         // Default: execute immediately
         self.enqueue(task).await
+    }
+}
+
+/// Batch utilities for BrokerMessage collections
+pub mod broker_batch {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Sort messages by priority (highest first)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{BrokerMessage, SerializedTask, broker::broker_batch};
+    ///
+    /// let mut messages = vec![
+    ///     BrokerMessage::new(SerializedTask::new("task1".to_string(), vec![1]).with_priority(1)),
+    ///     BrokerMessage::new(SerializedTask::new("task2".to_string(), vec![2]).with_priority(10)),
+    ///     BrokerMessage::new(SerializedTask::new("task3".to_string(), vec![3]).with_priority(5)),
+    /// ];
+    ///
+    /// broker_batch::sort_by_priority(&mut messages);
+    /// assert_eq!(messages[0].priority(), 10);
+    /// assert_eq!(messages[2].priority(), 1);
+    /// ```
+    pub fn sort_by_priority(messages: &mut [BrokerMessage]) {
+        messages.sort_by_key(|b| std::cmp::Reverse(b.priority()));
+    }
+
+    /// Group messages by task name
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{BrokerMessage, SerializedTask, broker::broker_batch};
+    ///
+    /// let messages = vec![
+    ///     BrokerMessage::new(SerializedTask::new("task1".to_string(), vec![1])),
+    ///     BrokerMessage::new(SerializedTask::new("task2".to_string(), vec![2])),
+    ///     BrokerMessage::new(SerializedTask::new("task1".to_string(), vec![3])),
+    /// ];
+    ///
+    /// let grouped = broker_batch::group_by_task_name(&messages);
+    /// assert_eq!(grouped.get("task1").unwrap().len(), 2);
+    /// assert_eq!(grouped.get("task2").unwrap().len(), 1);
+    /// ```
+    pub fn group_by_task_name(messages: &[BrokerMessage]) -> HashMap<String, Vec<&BrokerMessage>> {
+        let mut map: HashMap<String, Vec<&BrokerMessage>> = HashMap::new();
+        for msg in messages {
+            map.entry(msg.task_name().to_string())
+                .or_default()
+                .push(msg);
+        }
+        map
+    }
+
+    /// Filter messages by task name pattern
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{BrokerMessage, SerializedTask, broker::broker_batch};
+    ///
+    /// let messages = vec![
+    ///     BrokerMessage::new(SerializedTask::new("process_data".to_string(), vec![1])),
+    ///     BrokerMessage::new(SerializedTask::new("send_email".to_string(), vec![2])),
+    ///     BrokerMessage::new(SerializedTask::new("process_image".to_string(), vec![3])),
+    /// ];
+    ///
+    /// let process_messages = broker_batch::filter_by_name_prefix(&messages, "process");
+    /// assert_eq!(process_messages.len(), 2);
+    /// ```
+    pub fn filter_by_name_prefix<'a>(
+        messages: &'a [BrokerMessage],
+        prefix: &str,
+    ) -> Vec<&'a BrokerMessage> {
+        messages
+            .iter()
+            .filter(|msg| msg.task_name().starts_with(prefix))
+            .collect()
+    }
+
+    /// Get total payload size of all messages
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{BrokerMessage, SerializedTask, broker::broker_batch};
+    ///
+    /// let messages = vec![
+    ///     BrokerMessage::new(SerializedTask::new("task1".to_string(), vec![1, 2, 3])),
+    ///     BrokerMessage::new(SerializedTask::new("task2".to_string(), vec![4, 5])),
+    /// ];
+    ///
+    /// let total_size = broker_batch::total_payload_size(&messages);
+    /// assert_eq!(total_size, 5);
+    /// ```
+    pub fn total_payload_size(messages: &[BrokerMessage]) -> usize {
+        messages.iter().map(|msg| msg.task.payload.len()).sum()
+    }
+
+    /// Filter expired messages
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{BrokerMessage, SerializedTask, broker::broker_batch};
+    ///
+    /// let messages = vec![
+    ///     BrokerMessage::new(SerializedTask::new("task1".to_string(), vec![1])),
+    ///     BrokerMessage::new(SerializedTask::new("task2".to_string(), vec![2])),
+    /// ];
+    ///
+    /// let expired = broker_batch::filter_expired(&messages);
+    /// // Newly created tasks should not be expired
+    /// assert_eq!(expired.len(), 0);
+    /// ```
+    pub fn filter_expired(messages: &[BrokerMessage]) -> Vec<&BrokerMessage> {
+        messages.iter().filter(|msg| msg.is_expired()).collect()
+    }
+
+    /// Extract task IDs and receipt handles for batch acknowledgement
+    ///
+    /// # Example
+    /// ```
+    /// use celers_core::{BrokerMessage, SerializedTask, broker::broker_batch};
+    ///
+    /// let messages = vec![
+    ///     BrokerMessage::with_receipt_handle(
+    ///         SerializedTask::new("task1".to_string(), vec![1]),
+    ///         "receipt1".to_string()
+    ///     ),
+    ///     BrokerMessage::with_receipt_handle(
+    ///         SerializedTask::new("task2".to_string(), vec![2]),
+    ///         "receipt2".to_string()
+    ///     ),
+    /// ];
+    ///
+    /// let ack_data = broker_batch::prepare_ack_batch(&messages);
+    /// assert_eq!(ack_data.len(), 2);
+    /// ```
+    pub fn prepare_ack_batch(messages: &[BrokerMessage]) -> Vec<(TaskId, Option<String>)> {
+        messages
+            .iter()
+            .map(|msg| (msg.task_id(), msg.receipt_handle.clone()))
+            .collect()
     }
 }
 

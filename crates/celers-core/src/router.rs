@@ -51,6 +51,7 @@ pub enum PatternMatcher {
 
 impl PatternMatcher {
     /// Create an exact match pattern
+    #[must_use]
     pub fn exact(name: impl Into<String>) -> Self {
         Self::Exact(name.into())
     }
@@ -71,6 +72,7 @@ impl PatternMatcher {
     /// assert!(matcher.matches("tasks.multiply"));
     /// assert!(!matcher.matches("other.task"));
     /// ```
+    #[must_use]
     pub fn glob(pattern: impl Into<String>) -> Self {
         Self::Glob(GlobPattern::new(pattern))
     }
@@ -91,11 +93,13 @@ impl PatternMatcher {
     }
 
     /// Create a matcher that matches all tasks
+    #[must_use]
     pub fn all() -> Self {
         Self::All
     }
 
     /// Check if a task name matches this pattern
+    #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         match self {
             Self::Exact(name) => task_name == name,
@@ -115,6 +119,7 @@ pub struct GlobPattern {
 
 impl GlobPattern {
     /// Create a new glob pattern
+    #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
         let pattern = pattern.into();
         let regex_str = glob_to_regex(&pattern);
@@ -123,11 +128,13 @@ impl GlobPattern {
     }
 
     /// Check if a task name matches this glob pattern
+    #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         self.regex.is_match(task_name)
     }
 
     /// Get the original pattern string
+    #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
@@ -151,11 +158,13 @@ impl RegexPattern {
     }
 
     /// Check if a task name matches this regex pattern
+    #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         self.regex.is_match(task_name)
     }
 
     /// Get the original pattern string
+    #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
@@ -201,6 +210,7 @@ pub struct RouteRule {
 
 impl RouteRule {
     /// Create a new routing rule
+    #[must_use]
     pub fn new(matcher: PatternMatcher, queue: impl Into<String>) -> Self {
         Self {
             matcher,
@@ -213,30 +223,35 @@ impl RouteRule {
     }
 
     /// Set the rule priority
+    #[must_use]
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = priority;
         self
     }
 
     /// Set the routing key (for AMQP)
+    #[must_use]
     pub fn with_routing_key(mut self, routing_key: impl Into<String>) -> Self {
         self.routing_key = Some(routing_key.into());
         self
     }
 
     /// Set the exchange name (for AMQP)
+    #[must_use]
     pub fn with_exchange(mut self, exchange: impl Into<String>) -> Self {
         self.exchange = Some(exchange.into());
         self
     }
 
     /// Set the argument condition for argument-based routing
+    #[must_use]
     pub fn with_argument_condition(mut self, condition: ArgumentCondition) -> Self {
         self.argument_condition = Some(condition);
         self
     }
 
     /// Check if this rule matches a task name
+    #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         self.matcher.matches(task_name)
     }
@@ -246,6 +261,7 @@ impl RouteRule {
     /// Returns true if:
     /// - The task name matches the pattern matcher
     /// - AND (if argument_condition is set) the arguments match the condition
+    #[must_use]
     pub fn matches_with_args(
         &self,
         task_name: &str,
@@ -363,17 +379,20 @@ pub enum ArgumentCondition {
 }
 
 impl ArgumentCondition {
-    /// Create a condition that checks if arg[index] == value
+    /// Create a condition that checks if arg\[index\] == value
+    #[must_use]
     pub fn arg_equals(index: usize, value: serde_json::Value) -> Self {
         Self::ArgEquals { index, value }
     }
 
-    /// Create a condition that checks if arg[index] exists
+    /// Create a condition that checks if arg\[index\] exists
+    #[must_use]
     pub fn arg_exists(index: usize) -> Self {
         Self::ArgExists { index }
     }
 
-    /// Create a condition that checks if kwargs[key] == value
+    /// Create a condition that checks if kwargs\[key\] == value
+    #[must_use]
     pub fn kwarg_equals(key: impl Into<String>, value: serde_json::Value) -> Self {
         Self::KwargEquals {
             key: key.into(),
@@ -381,12 +400,14 @@ impl ArgumentCondition {
         }
     }
 
-    /// Create a condition that checks if kwargs[key] exists
+    /// Create a condition that checks if kwargs\[key\] exists
+    #[must_use]
     pub fn kwarg_exists(key: impl Into<String>) -> Self {
         Self::KwargExists { key: key.into() }
     }
 
-    /// Create a condition that checks if kwargs[key] matches a regex pattern
+    /// Create a condition that checks if kwargs\[key\] matches a regex pattern
+    #[must_use]
     pub fn kwarg_matches(key: impl Into<String>, pattern: impl Into<String>) -> Self {
         Self::KwargMatches {
             key: key.into(),
@@ -394,17 +415,20 @@ impl ArgumentCondition {
         }
     }
 
-    /// Create a condition that checks if arg[index] > threshold
+    /// Create a condition that checks if arg\[index\] > threshold
+    #[must_use]
     pub fn arg_greater_than(index: usize, threshold: f64) -> Self {
         Self::ArgGreaterThan { index, threshold }
     }
 
-    /// Create a condition that checks if arg[index] < threshold
+    /// Create a condition that checks if arg\[index\] < threshold
+    #[must_use]
     pub fn arg_less_than(index: usize, threshold: f64) -> Self {
         Self::ArgLessThan { index, threshold }
     }
 
-    /// Create a condition that checks if kwargs[key] > threshold
+    /// Create a condition that checks if kwargs\[key\] > threshold
+    #[must_use]
     pub fn kwarg_greater_than(key: impl Into<String>, threshold: f64) -> Self {
         Self::KwargGreaterThan {
             key: key.into(),
@@ -412,7 +436,8 @@ impl ArgumentCondition {
         }
     }
 
-    /// Create a condition that checks if kwargs[key] < threshold
+    /// Create a condition that checks if kwargs\[key\] < threshold
+    #[must_use]
     pub fn kwarg_less_than(key: impl Into<String>, threshold: f64) -> Self {
         Self::KwargLessThan {
             key: key.into(),
@@ -420,7 +445,8 @@ impl ArgumentCondition {
         }
     }
 
-    /// Create a condition that checks if kwargs[key] contains value
+    /// Create a condition that checks if kwargs\[key\] contains value
+    #[must_use]
     pub fn kwarg_contains(key: impl Into<String>, value: serde_json::Value) -> Self {
         Self::KwargContains {
             key: key.into(),
@@ -429,11 +455,13 @@ impl ArgumentCondition {
     }
 
     /// Create an always-true condition
+    #[must_use]
     pub fn always() -> Self {
         Self::Always
     }
 
     /// Combine with AND
+    #[must_use]
     pub fn and(self, other: ArgumentCondition) -> Self {
         match self {
             Self::And(mut conditions) => {
@@ -445,6 +473,7 @@ impl ArgumentCondition {
     }
 
     /// Combine with OR
+    #[must_use]
     pub fn or(self, other: ArgumentCondition) -> Self {
         match self {
             Self::Or(mut conditions) => {
@@ -456,6 +485,7 @@ impl ArgumentCondition {
     }
 
     /// Negate the condition
+    #[must_use]
     pub fn negate(self) -> Self {
         Self::Not(Box::new(self))
     }
@@ -465,6 +495,7 @@ impl ArgumentCondition {
     /// # Arguments
     /// * `args` - Positional arguments as JSON values
     /// * `kwargs` - Keyword arguments as a JSON object
+    #[must_use]
     pub fn evaluate(
         &self,
         args: &[serde_json::Value],
@@ -594,6 +625,7 @@ pub struct RouteResult {
 
 impl RouteResult {
     /// Create a new route result
+    #[must_use]
     pub fn new(queue: impl Into<String>) -> Self {
         Self {
             queue: queue.into(),
@@ -603,6 +635,7 @@ impl RouteResult {
     }
 
     /// Create from a route rule
+    #[must_use]
     pub fn from_rule(rule: &RouteRule) -> Self {
         Self {
             queue: rule.queue.clone(),
@@ -625,11 +658,13 @@ pub struct Router {
 
 impl Router {
     /// Create a new empty router
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create a router with a default queue
+    #[must_use]
     pub fn with_default_queue(queue: impl Into<String>) -> Self {
         Self {
             rules: Vec::new(),
@@ -662,6 +697,7 @@ impl Router {
     /// Route a task to a queue
     ///
     /// Returns `None` if no matching rule and no default queue
+    #[must_use]
     pub fn route(&self, task_name: &str) -> Option<String> {
         self.route_full(task_name).map(|r| r.queue)
     }
@@ -669,6 +705,7 @@ impl Router {
     /// Route a task and get full routing information
     ///
     /// Returns `None` if no matching rule and no default queue
+    #[must_use]
     pub fn route_full(&self, task_name: &str) -> Option<RouteResult> {
         // Check direct routes first
         if let Some(result) = self.direct_routes.get(task_name) {
@@ -690,6 +727,7 @@ impl Router {
     ///
     /// This method considers both task name patterns and argument conditions.
     /// Returns `None` if no matching rule and no default queue.
+    #[must_use]
     pub fn route_with_args(
         &self,
         task_name: &str,
@@ -704,6 +742,7 @@ impl Router {
     ///
     /// This method considers both task name patterns and argument conditions.
     /// Returns `None` if no matching rule and no default queue.
+    #[must_use]
     pub fn route_full_with_args(
         &self,
         task_name: &str,
@@ -727,6 +766,7 @@ impl Router {
     }
 
     /// Check if a task has any matching route
+    #[must_use]
     pub fn has_route(&self, task_name: &str) -> bool {
         self.direct_routes.contains_key(task_name)
             || self.rules.iter().any(|r| r.matches(task_name))
@@ -734,6 +774,7 @@ impl Router {
     }
 
     /// Get all registered rules
+    #[must_use]
     pub fn rules(&self) -> &[RouteRule] {
         &self.rules
     }
@@ -758,11 +799,13 @@ pub struct RouterBuilder {
 
 impl RouterBuilder {
     /// Create a new router builder
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add a rule that routes tasks matching a glob pattern to a queue
+    #[must_use]
     pub fn route_glob(mut self, pattern: &str, queue: &str) -> Self {
         self.router
             .add_rule(RouteRule::new(PatternMatcher::glob(pattern), queue));
@@ -777,6 +820,7 @@ impl RouterBuilder {
     }
 
     /// Add a rule that routes a specific task to a queue
+    #[must_use]
     pub fn route_exact(mut self, task_name: &str, queue: &str) -> Self {
         self.router
             .add_rule(RouteRule::new(PatternMatcher::exact(task_name), queue));
@@ -784,6 +828,7 @@ impl RouterBuilder {
     }
 
     /// Add a direct route for a specific task
+    #[must_use]
     pub fn direct_route(mut self, task_name: &str, queue: &str) -> Self {
         self.router
             .add_direct_route(task_name, RouteResult::new(queue));
@@ -810,6 +855,7 @@ impl RouterBuilder {
     ///     .default_queue("default")
     ///     .build();
     /// ```
+    #[must_use]
     pub fn route_with_args(
         mut self,
         matcher: PatternMatcher,
@@ -822,6 +868,7 @@ impl RouterBuilder {
     }
 
     /// Add a rule with both priority and argument condition
+    #[must_use]
     pub fn route_with_args_priority(
         mut self,
         matcher: PatternMatcher,
@@ -838,12 +885,14 @@ impl RouterBuilder {
     }
 
     /// Set the default queue for unmatched tasks
+    #[must_use]
     pub fn default_queue(mut self, queue: &str) -> Self {
         self.router.set_default_queue(queue);
         self
     }
 
     /// Build the router
+    #[must_use]
     pub fn build(self) -> Router {
         self.router
     }
@@ -865,6 +914,7 @@ pub struct RoutingConfig {
 
 impl RoutingConfig {
     /// Create a new empty routing configuration
+    #[must_use]
     pub fn new() -> Self {
         Self {
             default_queue: None,
@@ -874,6 +924,7 @@ impl RoutingConfig {
     }
 
     /// Create a router from this configuration
+    #[must_use]
     pub fn into_router(self) -> Router {
         let mut router = match self.default_queue {
             Some(queue) => Router::with_default_queue(queue),

@@ -666,7 +666,7 @@ mod tests {
                 thread::spawn(move || {
                     for _ in 0..10 {
                         l.has_limit("my.task");
-                        l.create_tracker(&format!("task-{}", i), "my.task");
+                        l.create_tracker(&format!("task-{i}"), "my.task");
                     }
                 })
             })

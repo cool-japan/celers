@@ -168,7 +168,8 @@ fn bench_dag_operations(c: &mut Criterion) {
     c.bench_function("dag_add_node", |b| {
         b.iter(|| {
             let mut dag = TaskDag::new();
-            black_box(dag.add_node(Uuid::new_v4(), "test_task"));
+            dag.add_node(Uuid::new_v4(), "test_task");
+            black_box(());
         });
     });
 
@@ -187,7 +188,7 @@ fn bench_dag_operations(c: &mut Criterion) {
         let mut dag = TaskDag::new();
         let ids: Vec<_> = (0..5).map(|_| Uuid::new_v4()).collect();
         for (i, id) in ids.iter().enumerate() {
-            dag.add_node(*id, &format!("task_{}", i));
+            dag.add_node(*id, format!("task_{i}"));
         }
         for i in 1..ids.len() {
             dag.add_dependency(ids[i], ids[i - 1]).unwrap();
@@ -201,7 +202,7 @@ fn bench_dag_operations(c: &mut Criterion) {
         let mut dag = TaskDag::new();
         let ids: Vec<_> = (0..5).map(|_| Uuid::new_v4()).collect();
         for (i, id) in ids.iter().enumerate() {
-            dag.add_node(*id, &format!("task_{}", i));
+            dag.add_node(*id, format!("task_{i}"));
         }
         for i in 1..ids.len() {
             dag.add_dependency(ids[i], ids[i - 1]).unwrap();
@@ -215,7 +216,7 @@ fn bench_dag_operations(c: &mut Criterion) {
         let mut dag = TaskDag::new();
         let ids: Vec<_> = (0..20).map(|_| Uuid::new_v4()).collect();
         for (i, id) in ids.iter().enumerate() {
-            dag.add_node(*id, &format!("task_{}", i));
+            dag.add_node(*id, format!("task_{i}"));
         }
         // Create a more complex dependency graph
         for i in 2..ids.len() {

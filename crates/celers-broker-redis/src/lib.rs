@@ -11,6 +11,7 @@
 //! - Circuit breaker for resilience
 //! - Rate limiting (local and distributed)
 //! - Automatic retry with configurable backoff
+//! - Geo-distribution with multi-region replication
 
 use async_trait::async_trait;
 use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
@@ -24,23 +25,31 @@ use celers_metrics::{
 
 pub mod advanced_queue;
 pub mod authorization;
+pub mod backup_restore;
+pub mod batch_ext;
 pub mod circuit_breaker;
 pub mod cluster;
 pub mod compression;
 pub mod connection;
 pub mod dedup;
 pub mod degradation;
+pub mod geo;
 pub mod health;
 pub mod integrity;
+pub mod locks;
 pub mod lua_scripts;
 pub mod metrics_ext;
 pub mod partitioning;
 pub mod pool;
+pub mod priority_mgmt;
 pub mod queue_control;
 pub mod rate_limit;
+pub mod result_backend;
 pub mod retry;
 pub mod sentinel;
 pub mod streams;
+pub mod task_groups;
+pub mod task_query;
 pub mod visibility;
 
 pub use advanced_queue::{
@@ -48,6 +57,8 @@ pub use advanced_queue::{
     StarvationPrevention, StarvationStats, TaskAge, WeightedQueueSelector,
 };
 pub use authorization::{AuthorizationPolicy, UserPermissions};
+pub use backup_restore::{BackupManager, QueueSnapshot, SnapshotComparison};
+pub use batch_ext::{BatchOperations, TaskFilter};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
 };
@@ -59,8 +70,13 @@ pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionStats,
 pub use connection::{ConnectionStats, RedisConfig, TlsConfig};
 pub use dedup::{DedupResult, DedupStrategy, Deduplicator};
 pub use degradation::{DegradationManager, DegradationMode, DegradationStats, QueuedOperation};
+pub use geo::{
+    ConflictResolution, GeoReplicationManager, Region, RegionId, RegionStats, RegionStatsSnapshot,
+    RegionalReadRouter, ReplicationConfig, ReplicationConfigBuilder, RoutingStrategy, SyncMode,
+};
 pub use health::{HealthChecker, KeyspaceStats, QueueStats, RedisHealthStatus, ReplicationInfo};
 pub use integrity::{ChecksumAlgorithm, IntegrityStats, IntegrityValidator, IntegrityWrappedTask};
+pub use locks::{DistributedLock, LockConfig, LockGuard, LockToken};
 pub use lua_scripts::{ScriptId, ScriptManager, ScriptPerformance, ScriptStats, SCRIPT_VERSION};
 pub use metrics_ext::{
     HistogramSnapshot, LatencyStats, MetricsSnapshot, MetricsTracker, SlowOperation,
@@ -70,11 +86,13 @@ pub use partitioning::{
     ConsistentHashRing, HashAlgorithm, PartitionManager, PartitionStats, PartitionStrategy,
 };
 pub use pool::{ConnectionPool, PoolConfig, PoolStats};
+pub use priority_mgmt::{PriorityAdjustment, PriorityManager};
 pub use queue_control::{QueueController, QueueState};
 pub use rate_limit::{
     DistributedRateLimiter, QueueRateLimitConfig, QueueRateLimiter, TokenBucketLimiter,
     TrackedRateLimiter,
 };
+pub use result_backend::{ResultBackend, ResultBackendConfig, TaskResult, TaskStatus};
 pub use retry::{BackoffStrategy, RetryConfig, RetryExecutor, RetryResult};
 pub use sentinel::{
     MasterAddress, SentinelClient, SentinelConfig, SentinelConfigBuilder, SentinelRole,
@@ -82,10 +100,12 @@ pub use sentinel::{
 pub use streams::{
     StreamConfig, StreamConfigBuilder, StreamEntry, StreamMessageId, StreamStats, StreamsClient,
 };
+pub use task_groups::{GroupConfig, GroupMetadata, GroupStatus, TaskGroup};
+pub use task_query::{TaskQuery, TaskSearchCriteria, TaskStats};
 use visibility::VisibilityManager;
 
 /// Queue mode for Redis broker
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QueueMode {
     /// Standard FIFO queue using Redis lists
     Fifo,
@@ -368,6 +388,39 @@ impl RedisBroker {
         PartitionManager::new(num_partitions, strategy, &self.queue_name)
     }
 
+    /// Create a batch operations handler for advanced batch processing
+    pub fn batch_operations(&self) -> BatchOperations {
+        BatchOperations::new(self.client.clone(), self.queue_name.clone(), self.mode)
+    }
+
+    /// Create a priority manager for dynamic priority adjustments
+    pub fn priority_manager(&self) -> PriorityManager {
+        PriorityManager::new(self.client.clone(), self.queue_name.clone(), self.mode)
+    }
+
+    /// Create a task query interface for inspecting tasks
+    pub fn task_query(&self) -> TaskQuery {
+        TaskQuery::new(
+            self.client.clone(),
+            self.queue_name.clone(),
+            self.processing_queue.clone(),
+            self.dlq_name.clone(),
+            self.mode,
+        )
+    }
+
+    /// Create a backup manager for queue backup and restore
+    pub fn backup_manager(&self) -> BackupManager {
+        BackupManager::new(
+            self.client.clone(),
+            self.queue_name.clone(),
+            self.processing_queue.clone(),
+            self.dlq_name.clone(),
+            self.delayed_queue.clone(),
+            self.mode,
+        )
+    }
+
     /// Set TTL (time-to-live) for tasks in all queues
     ///
     /// This helps prevent unbounded queue growth by automatically expiring old tasks.
@@ -581,6 +634,164 @@ impl RedisBroker {
         }
 
         Ok(sizes)
+    }
+
+    /// Move all tasks from processing queue back to main queue
+    ///
+    /// Useful for recovering tasks that were being processed when a worker crashed.
+    /// Returns the number of tasks moved.
+    pub async fn recover_processing_tasks(&self) -> Result<usize> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let items: Vec<String> = conn
+            .lrange(&self.processing_queue, 0, -1)
+            .await
+            .map_err(|e| {
+                CelersError::Broker(format!("Failed to get processing queue items: {}", e))
+            })?;
+
+        if items.is_empty() {
+            return Ok(0);
+        }
+
+        let count = items.len();
+        let mut pipe = redis::pipe();
+
+        for item in &items {
+            // Parse to get task
+            if let Ok(task) = serde_json::from_str::<SerializedTask>(item) {
+                // Add back to main queue based on mode
+                match self.mode {
+                    QueueMode::Fifo => {
+                        pipe.rpush(&self.queue_name, item);
+                    }
+                    QueueMode::Priority => {
+                        let score = -(task.metadata.priority as f64);
+                        pipe.zadd(&self.queue_name, item, score);
+                    }
+                }
+                // Remove from processing queue
+                pipe.lrem(&self.processing_queue, 1, item);
+            }
+        }
+
+        pipe.query_async::<redis::Value>(&mut conn)
+            .await
+            .map_err(|e| {
+                CelersError::Broker(format!("Failed to recover processing tasks: {}", e))
+            })?;
+
+        info!("Recovered {} tasks from processing queue", count);
+        Ok(count)
+    }
+
+    /// Get the total number of tasks across all queues (main, processing, DLQ, delayed)
+    pub async fn total_task_count(&self) -> Result<usize> {
+        let sizes = self.get_all_queue_sizes().await?;
+        Ok(sizes.values().sum())
+    }
+
+    /// Check if the broker is idle (all queues empty)
+    pub async fn is_idle(&self) -> Result<bool> {
+        let total = self.total_task_count().await?;
+        Ok(total == 0)
+    }
+
+    /// Estimate memory usage of tasks in all queues (in bytes)
+    ///
+    /// This is an approximation based on serialized task sizes.
+    pub async fn estimate_memory_usage(&self) -> Result<usize> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let mut total_bytes = 0usize;
+
+        // Check each queue
+        for queue_name in self.queue_names() {
+            let memory: usize = redis::cmd("MEMORY")
+                .arg("USAGE")
+                .arg(&queue_name)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(0);
+            total_bytes += memory;
+        }
+
+        Ok(total_bytes)
+    }
+
+    /// Move tasks from DLQ back to main queue in bulk
+    ///
+    /// Returns the number of tasks moved.
+    pub async fn bulk_replay_from_dlq(&self, max_count: Option<usize>) -> Result<usize> {
+        let limit = max_count.unwrap_or(isize::MAX as usize) as isize;
+        let tasks = self.inspect_dlq(limit).await?;
+        let count = tasks.len();
+
+        for task in tasks {
+            self.replay_from_dlq(&task.metadata.id).await?;
+        }
+
+        Ok(count)
+    }
+
+    /// Peek at the next task without dequeueing it
+    ///
+    /// Useful for inspecting what will be processed next without removing it from the queue.
+    pub async fn peek_next(&self) -> Result<Option<SerializedTask>> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+
+        let data: Option<String> = match self.mode {
+            QueueMode::Fifo => {
+                // Get last item (will be next to dequeue)
+                conn.lindex(&self.queue_name, -1)
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to peek: {}", e)))?
+            }
+            QueueMode::Priority => {
+                // Get first item in sorted set (lowest score = highest priority)
+                let items: Vec<String> = conn
+                    .zrange(&self.queue_name, 0, 0)
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to peek: {}", e)))?;
+                items.into_iter().next()
+            }
+        };
+
+        if let Some(serialized) = data {
+            let task: SerializedTask = serde_json::from_str(&serialized)
+                .map_err(|e| CelersError::Deserialization(e.to_string()))?;
+            Ok(Some(task))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get queue depth percentage (current size / max recommended size)
+    ///
+    /// Returns a value between 0.0 and 1.0+ where > 0.8 suggests the queue is getting full.
+    /// max_recommended_size defaults to 10000 if not specified.
+    pub async fn queue_depth_percentage(&self, max_recommended_size: Option<usize>) -> Result<f64> {
+        let max_size = max_recommended_size.unwrap_or(10000) as f64;
+        let current_size = self.queue_size().await? as f64;
+        Ok(current_size / max_size)
+    }
+
+    /// Check if the queue is approaching capacity (> 80% of recommended max)
+    pub async fn is_near_capacity(&self, max_recommended_size: Option<usize>) -> Result<bool> {
+        let percentage = self.queue_depth_percentage(max_recommended_size).await?;
+        Ok(percentage > 0.8)
     }
 
     /// Move ready delayed tasks to the main queue

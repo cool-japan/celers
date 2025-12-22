@@ -14,7 +14,7 @@ categories = ["asynchronous", "network-programming", "concurrency"]
 # Re-export core functionality
 celers-core = { path = "../celers-core", version = "0.1.0" }
 celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
-celers-kombu = { path = "../celers-kombu", version = "0.1.0" }
+celers-kombu = { path = "../celers-kombu", version = "0.4.0" }
 celers-worker = { path = "../celers-worker", version = "0.1.0" }
 celers-canvas = { path = "../celers-canvas", version = "0.1.0" }
 celers-macros = { path = "../celers-macros", version = "0.1.0" }

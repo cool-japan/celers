@@ -80,7 +80,138 @@ All schedule types implemented and production-ready.
 
 ## Recently Completed Enhancements
 
-### Task Dependency Tracking ✅ (Latest)
+### Crash Recovery System ✅ (Latest - 2025-12-20)
+- [x] Execution state tracking
+  - [x] `ExecutionState` enum - Idle/Running states for crash detection
+  - [x] `ExecutionResult::Interrupted` - New result type for interrupted executions
+  - [x] Per-task execution state persistence
+  - [x] Execution timeout tracking
+  - [x] Running duration calculation
+- [x] Task-level recovery
+  - [x] `begin_execution()` - Mark execution start with optional timeout
+  - [x] `complete_execution()` - Mark execution completion
+  - [x] `detect_interrupted_execution()` - Detect if task was interrupted
+  - [x] `recover_from_interruption()` - Handle interrupted executions
+  - [x] `is_ready_for_retry_after_crash()` - Check if task needs retry after crash
+  - [x] Automatic execution record creation for interrupted tasks
+  - [x] Retry count increment for interrupted executions
+- [x] Scheduler-level recovery
+  - [x] `detect_crashed_tasks()` - Find all tasks with interrupted executions
+  - [x] `recover_from_crash()` - Automatically recover all interrupted tasks
+  - [x] `get_tasks_ready_for_crash_retry()` - Get tasks needing retry after recovery
+  - [x] Automatic state persistence after recovery
+  - [x] Recovery logging for debugging
+- [x] Detection mechanisms
+  - [x] Explicit timeout detection (configurable per execution)
+  - [x] Fallback detection (24-hour max execution time)
+  - [x] State validation on scheduler load
+- [x] Zero warnings, all tests passing (225 tests + 9 doc tests)
+
+### Alerting System ✅ (2025-12-20)
+- [x] Alert infrastructure
+  - [x] `AlertLevel` enum - Info/Warning/Critical severity levels
+  - [x] `AlertCondition` enum - Various alert trigger conditions
+  - [x] `Alert` struct - Alert records with timestamp, task, level, condition, message
+  - [x] `AlertCallback` type - Callback function for alert notifications
+  - [x] `AlertManager` - Centralized alert management with deduplication
+  - [x] `AlertConfig` - Per-task alert configuration
+- [x] Alert conditions
+  - [x] MissedSchedule - Task didn't execute when expected
+  - [x] ConsecutiveFailures - Multiple consecutive failures detected
+  - [x] HighFailureRate - Failure rate exceeds threshold
+  - [x] SlowExecution - Task execution slower than threshold
+  - [x] TaskStuck - Task hasn't executed for extended period
+  - [x] TaskUnhealthy - Task health check failed
+- [x] Alert manager features
+  - [x] Deduplication with configurable time window (default: 5 minutes)
+  - [x] Alert history tracking (default: 1000 alerts)
+  - [x] Query methods (by task, by severity, by time range)
+  - [x] Alert callbacks for custom notification handlers
+  - [x] Automatic cleanup of old dedup entries
+- [x] Scheduler integration
+  - [x] `on_alert()` - Register alert callbacks
+  - [x] `check_task_alerts()` - Check conditions for a specific task
+  - [x] `check_all_alerts()` - Check conditions for all enabled tasks
+  - [x] `get_alerts()`, `get_critical_alerts()`, `get_warning_alerts()` - Query alerts
+  - [x] `clear_alerts()`, `clear_task_alerts()` - Alert management
+- [x] Per-task configuration
+  - [x] Configurable consecutive failure threshold (default: 3)
+  - [x] Configurable failure rate threshold (default: 0.5 / 50%)
+  - [x] Optional slow execution threshold in milliseconds
+  - [x] Toggle alerts for missed schedules
+  - [x] Toggle alerts for stuck tasks
+  - [x] Fluent API (`with_alert_config()`)
+- [x] Supporting features
+  - [x] `consecutive_failure_count()` - Track consecutive failures from history
+  - [x] Alert metadata support for additional context
+  - [x] Serialization support for persistence
+  - [x] Display implementations for debugging
+- [x] Zero warnings, all tests passing (225 tests + 8 doc tests)
+
+### Schedule Conflict Detection ✅ (2025-12-14)
+- [x] Conflict detection and analysis
+  - [x] `ScheduleConflict` - Structure representing conflicts between tasks
+  - [x] `ConflictSeverity` - Low/Medium/High severity levels
+  - [x] `detect_conflicts()` - Detect overlapping schedules
+  - [x] `get_high_severity_conflicts()` - Filter high severity conflicts
+  - [x] `get_medium_severity_conflicts()` - Filter medium severity conflicts
+  - [x] `has_conflicts()` - Check if any conflicts exist
+  - [x] `conflict_count()` - Count total conflicts
+- [x] Conflict features
+  - [x] Time window analysis (configurable window in seconds)
+  - [x] Estimated duration consideration
+  - [x] Overlap calculation in seconds
+  - [x] Automatic severity determination based on overlap
+  - [x] Suggested resolutions
+  - [x] Disabled task filtering (skipped in analysis)
+- [x] Comprehensive testing
+  - [x] 11 new tests covering all scenarios
+  - [x] Basic conflict detection tests
+  - [x] Severity level tests
+  - [x] Disabled task handling
+  - [x] Serialization tests
+  - [x] Display tests
+- [x] Zero warnings, all tests passing (238 tests + 8 doc tests)
+
+### Timezone Support for Crontab ✅ (2025-12-13)
+- [x] Timezone-aware cron scheduling
+  - [x] `Schedule::crontab_tz()` - Create timezone-aware crontab schedules
+  - [x] Integration with chrono-tz for IANA timezone database
+  - [x] Automatic conversion between UTC and target timezone
+  - [x] DST handling built into chrono-tz
+  - [x] Display shows timezone in output (e.g., "Crontab[... (America/New_York)]")
+- [x] Comprehensive testing
+  - [x] 4 new tests covering timezone functionality
+  - [x] Timezone serialization/deserialization tests
+  - [x] Invalid timezone error handling
+  - [x] Next run calculation with timezone conversion
+- [x] Zero warnings, all tests passing (227 tests + 7 doc tests)
+
+### Schedule Locking ✅ (Latest - 2025-12-13)
+- [x] In-memory lock management for preventing duplicate execution
+  - [x] `ScheduleLock` - Lock structure with owner, TTL, and renewal tracking
+  - [x] `LockManager` - Centralized lock management with automatic cleanup
+  - [x] `try_acquire_lock()` - Acquire lock for a task
+  - [x] `release_lock()` - Release owned locks
+  - [x] `renew_lock()` - Extend lock TTL
+  - [x] `execute_with_lock()` - Execute with automatic lock management
+  - [x] Scheduler instance ID tracking for lock ownership
+  - [x] `set_instance_id()` - Custom instance identifier support
+- [x] Lock features
+  - [x] Configurable TTL (default 5 minutes)
+  - [x] Automatic expiration and cleanup
+  - [x] Lock renewal with counter tracking
+  - [x] Active lock queries
+  - [x] Serialization support
+- [x] Comprehensive testing
+  - [x] 14 new tests covering all lock scenarios
+  - [x] Acquire/release/renew tests
+  - [x] Multiple instance tests
+  - [x] Expiration and cleanup tests
+  - [x] Serialization tests
+- [x] Zero warnings, all tests passing (227 tests + 7 doc tests)
+
+### Task Dependency Tracking ✅
 - [x] Dependency management
   - [x] `add_dependency()`, `remove_dependency()`, `clear_dependencies()` - Manage dependencies
   - [x] `depends_on()`, `has_dependencies()` - Query dependency status
@@ -221,7 +352,7 @@ All schedule types implemented and production-ready.
 ### Code Quality ✅
 - [x] Zero warnings in cargo test
 - [x] Zero warnings in cargo build
-- [x] All tests passing (185 tests + 2 doc tests)
+- [x] All tests passing (225 tests + 9 doc tests)
 - [x] Comprehensive test coverage
 
 ## Future Enhancements
@@ -233,10 +364,13 @@ All schedule types implemented and production-ready.
   - [x] Comprehensive tests (10 new tests)
   - [x] Serialization support
   - [x] Display implementation
-- [ ] Crontab with timezone support
-  - [ ] Timezone-aware parsing
-  - [ ] DST handling
-  - [ ] UTC conversion utilities
+- [x] Crontab with timezone support ✅
+  - [x] Timezone-aware parsing with chrono-tz
+  - [x] Automatic DST handling
+  - [x] UTC conversion utilities
+  - [x] `crontab_tz()` constructor for timezone-aware schedules
+  - [x] Comprehensive tests (4 new tests)
+  - [x] Serialization support with timezone preservation
 - [ ] Solar schedules enhancements
   - [ ] Twilight schedules (civil, nautical, astronomical)
   - [ ] Golden hour calculations
@@ -256,14 +390,24 @@ All schedule types implemented and production-ready.
   - [x] Track schedule modifications
   - [x] Rollback to previous versions
   - [x] Version history with timestamps and change reasons
-- [ ] Schedule locking (prevent duplicates)
-  - [ ] Distributed lock acquisition
-  - [ ] Lock timeout handling
-  - [ ] Lock renewal mechanism
-- [ ] Schedule conflict detection
-  - [ ] Overlapping schedule detection
-  - [ ] Resource conflict resolution
-  - [ ] Priority-based execution order
+- [x] Schedule locking (prevent duplicates) ✅
+  - [x] In-memory lock acquisition and management
+  - [x] Lock timeout handling with TTL
+  - [x] Lock renewal mechanism
+  - [x] Lock ownership tracking by scheduler instance
+  - [x] `try_acquire_lock()`, `release_lock()`, `renew_lock()` methods
+  - [x] `execute_with_lock()` for automatic lock management
+  - [x] Comprehensive tests (14 new tests)
+  - [x] Serialization support
+  - [x] Lock cleanup for expired locks
+  - [x] Custom instance ID support
+  - [ ] Distributed lock backend (Redis/etcd) - requires external state
+- [x] Schedule conflict detection ✅
+  - [x] Overlapping schedule detection
+  - [x] Severity-based conflict classification
+  - [x] Conflict resolution suggestions
+  - [ ] Resource conflict resolution (requires resource tracking)
+  - [ ] Priority-based automatic resolution
 
 ### Task Management
 - [x] Task dependency tracking ✅
@@ -276,10 +420,13 @@ All schedule types implemented and production-ready.
   - [x] Retry on failure
   - [x] Exponential backoff
   - [ ] Failure notifications
-- [ ] Task retry on scheduler crash
-  - [ ] Crash detection
-  - [ ] Automatic retry
-  - [ ] State recovery
+- [x] Task retry on scheduler crash ✅ (2025-12-20)
+  - [x] Crash detection with execution state tracking
+  - [x] Automatic retry with retry policy enforcement
+  - [x] State recovery with interrupted execution detection
+  - [x] Execution timeout tracking (configurable per execution)
+  - [x] Fallback detection (24-hour max execution time)
+  - [x] Recovery logging and metrics
 - [x] Task result tracking ✅
   - [x] Store execution results
   - [x] Result history
@@ -319,10 +466,21 @@ All schedule types implemented and production-ready.
   - [x] Execution timestamps
   - [x] Execution duration
   - [x] Execution results
-- [ ] Alerting
-  - [ ] Alert on missed schedules
-  - [ ] Alert on failures
-  - [ ] Alert on slow execution
+- [x] Alerting ✅ (Latest - 2025-12-20)
+  - [x] Alert levels (Info, Warning, Critical)
+  - [x] Alert conditions (MissedSchedule, ConsecutiveFailures, HighFailureRate, SlowExecution, TaskStuck, TaskUnhealthy)
+  - [x] Alert manager with deduplication (5-minute window)
+  - [x] Alert callbacks for notifications
+  - [x] Per-task alert configuration (AlertConfig)
+  - [x] Configurable thresholds (consecutive failures, failure rate, slow execution)
+  - [x] Alert history tracking (up to 1000 alerts)
+  - [x] Alert queries (by task, by severity, by time range)
+  - [x] Automatic alert checking (check_task_alerts, check_all_alerts)
+  - [x] Consecutive failure tracking from execution history
+  - [x] Alert metadata support for additional context
+  - [x] Serialization support for persistence
+  - [ ] Email/SMS notification integration (requires external service)
+  - [ ] Webhook alert delivery
 
 ### Calendar Integration
 - [ ] Holiday calendar support
@@ -391,6 +549,7 @@ All schedule types implemented and production-ready.
 ## Dependencies
 
 - `chrono` - Date/time handling
+- `chrono-tz` - Timezone support
 - `serde` - Serialization
 - `thiserror` - Error types
 

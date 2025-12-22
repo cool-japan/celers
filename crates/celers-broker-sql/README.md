@@ -609,13 +609,21 @@ async fn migrate_pending_tasks(
 
 ## Examples
 
-See the [examples](../../examples) directory for complete working examples:
+See the [examples](examples/) directory for complete working examples:
 
-- `basic_queue.rs` - Simple enqueue/dequeue
-- `batch_operations.rs` - High-throughput batch processing
-- `scheduled_tasks.rs` - Delayed task execution
-- `worker_pool.rs` - Multi-worker setup
-- `monitoring.rs` - Health checks and metrics
+- **task_producer.rs** - Comprehensive task enqueueing with different patterns (single, batch, scheduled, priority)
+- **worker_pool.rs** - Production-ready worker pool with health monitoring and graceful shutdown
+- **circuit_breaker.rs** - Circuit breaker pattern for resilient database operations
+- **bulk_import_export.rs** - Data migration and backup utilities using JSON format
+- **recurring_tasks.rs** - Scheduled periodic task execution (cron-like functionality)
+- **advanced_retry.rs** - Sophisticated retry strategies with exponential backoff and jitter
+
+Each example includes detailed documentation and can be run with:
+```bash
+cargo run --example <example_name>
+```
+
+For detailed usage instructions, see [examples/README.md](examples/README.md).
 
 ## License
 

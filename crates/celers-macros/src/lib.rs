@@ -101,6 +101,92 @@
 //! };
 //! ```
 //!
+//! ## Task with Parameter Validation
+//!
+//! ```ignore
+//! #[task]
+//! async fn register_user(
+//!     #[validate(min = 18, max = 120)]
+//!     age: i32,
+//!     #[validate(min_length = 3, max_length = 50)]
+//!     username: String,
+//!     #[validate(pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")]
+//!     email: String,
+//! ) -> Result<String> {
+//!     // Validation happens automatically before execution
+//!     Ok(format!("User {} registered with email {}", username, email))
+//! }
+//!
+//! // Valid input succeeds:
+//! let input = RegisterUserTaskInput {
+//!     age: 25,
+//!     username: "alice".to_string(),
+//!     email: "alice@example.com".to_string(),
+//! };
+//! let result = task.execute(input).await?; // Ok
+//!
+//! // Invalid input returns error:
+//! let input = RegisterUserTaskInput {
+//!     age: 15, // Below minimum
+//!     username: "alice".to_string(),
+//!     email: "alice@example.com".to_string(),
+//! };
+//! let result = task.execute(input).await; // Err: "Field 'age' value 15 is below minimum 18"
+//! ```
+//!
+//! ## Task with Custom Validation Messages
+//!
+//! ```ignore
+//! #[task]
+//! async fn create_account(
+//!     #[validate(min = 18, message = "You must be at least 18 years old to create an account")]
+//!     age: i32,
+//!     #[validate(min_length = 3, max_length = 20, message = "Username must be between 3 and 20 characters")]
+//!     username: String,
+//!     #[validate(pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", message = "Please provide a valid email address")]
+//!     email: String,
+//! ) -> Result<String> {
+//!     Ok(format!("Account created for {}", username))
+//! }
+//!
+//! // Invalid input returns custom error message:
+//! let input = CreateAccountTaskInput {
+//!     age: 15,
+//!     username: "alice".to_string(),
+//!     email: "alice@example.com".to_string(),
+//! };
+//! let result = task.execute(input).await; // Err: "You must be at least 18 years old to create an account"
+//! ```
+//!
+//! ## Task with Predefined Validators
+//!
+//! ```ignore
+//! #[task]
+//! async fn register_user(
+//!     #[validate(email, message = "Please enter a valid email")]
+//!     email: String,
+//!     #[validate(phone)]
+//!     phone: String,
+//!     #[validate(url)]
+//!     website: String,
+//!     #[validate(positive)]
+//!     age: i32,
+//!     #[validate(alphanumeric)]
+//!     username: String,
+//! ) -> Result<String> {
+//!     Ok(format!("User {} registered", username))
+//! }
+//!
+//! // Predefined validators provide convenient shortcuts:
+//! let input = RegisterUserTaskInput {
+//!     email: "user@example.com".to_string(),  // Must be valid email
+//!     phone: "+1234567890".to_string(),        // Must be valid phone (10-15 digits)
+//!     website: "https://example.com".to_string(), // Must be valid URL
+//!     age: 25,                                  // Must be positive (> 0)
+//!     username: "user123".to_string(),         // Must be alphanumeric
+//! };
+//! ```
+//!
 //! # Generated Code Structure
 //!
 //! For a function named `my_task`, the macro generates:
@@ -143,23 +229,310 @@
 //!
 //! # Attribute Parameters
 //!
+//! ## Task-level Attributes (on `#[task(...)]`)
+//!
 //! - `name` - Custom task name (default: function name)
 //! - `timeout` - Task timeout in seconds (must be > 0)
 //! - `priority` - Task priority as i32 (higher = more important)
 //! - `max_retries` - Maximum retry attempts as u32
+//!
+//! ## Parameter-level Attributes (on function parameters)
+//!
+//! Use `#[validate(...)]` to add validation rules to parameters:
+//!
+//! ### Numeric Validation
+//! - `min` - Minimum value (inclusive) for numeric types
+//! - `max` - Maximum value (inclusive) for numeric types
+//!
+//! Example: `#[validate(min = 0, max = 100)] score: i32`
+//!
+//! ### String/Collection Length Validation
+//! - `min_length` - Minimum length for strings or collections
+//! - `max_length` - Maximum length for strings or collections
+//!
+//! Example: `#[validate(min_length = 3, max_length = 50)] username: String`
+//!
+//! ### Pattern Validation
+//! - `pattern` - Regex pattern for string validation
+//!
+//! Example: `#[validate(pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")] email: String`
+//!
+//! **Note:** Pattern validation requires the `regex` crate to be added to your dependencies:
+//! ```toml
+//! [dependencies]
+//! regex = "1.11"
+//! ```
+//!
+//! ### Predefined Validation Shortcuts
+//!
+//! For common validation patterns, you can use convenient predefined validators:
+//!
+//! #### String Validators
+//! - `email` - Validates email addresses (shorthand for email regex pattern)
+//! - `url` - Validates HTTP/HTTPS URLs
+//! - `phone` - Validates phone numbers (10-15 digits, optional + prefix)
+//! - `not_empty` - Ensures string is not empty
+//! - `alphabetic` - Ensures string contains only alphabetic characters
+//! - `alphanumeric` - Ensures string contains only alphanumeric characters
+//!
+//! #### Numeric Validators
+//! - `positive` - Ensures number is greater than 0
+//! - `negative` - Ensures number is less than 0
+//!
+//! Examples:
+//! ```ignore
+//! #[task]
+//! async fn register(
+//!     #[validate(email)] email: String,
+//!     #[validate(url)] website: String,
+//!     #[validate(phone)] contact: String,
+//!     #[validate(not_empty)] name: String,
+//!     #[validate(positive)] quantity: i32,
+//!     #[validate(alphabetic)] first_name: String,
+//!     #[validate(alphanumeric)] username: String,
+//! ) -> Result<String> {
+//!     Ok(format!("Registered {}", email))
+//! }
+//! ```
+//!
+//! **Note:** Predefined validators (`email`, `url`, `phone`) require the `regex` crate.
+//!
+//! ### Custom Error Messages
+//! - `message` - Custom error message for validation failures
+//!
+//! All validation rules can include a custom `message` parameter to provide clearer, domain-specific error messages:
+//!
+//! Example: `#[validate(min = 18, max = 120, message = "Age must be between 18 and 120")] age: i32`
 //!
 //! # Limitations
 //!
 //! - Functions must be `async`
 //! - Return type must be wrapped in `Result<T>`
 //! - Generic parameters with complex trait bounds (HRTBs) may require careful handling
-//! - Validation attributes are not yet fully implemented
+//!
+//! # Macro Expansion Guide
+//!
+//! Understanding what code the macros generate can help with debugging and IDE support.
+//!
+//! ## Using cargo-expand
+//!
+//! To see the expanded macro output, install and use `cargo-expand`:
+//!
+//! ```bash
+//! cargo install cargo-expand
+//! cargo expand --lib  # Expand library code
+//! cargo expand --example basic_task  # Expand example code
+//! ```
+//!
+//! ## Expansion Examples
+//!
+//! ### Basic Task Expansion
+//!
+//! **Input:**
+//! ```ignore
+//! #[task]
+//! async fn add(a: i32, b: i32) -> Result<i32> {
+//!     Ok(a + b)
+//! }
+//! ```
+//!
+//! **Expands to (simplified):**
+//! ```ignore
+//! #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+//! pub struct AddTaskInput {
+//!     pub a: i32,
+//!     pub b: i32,
+//! }
+//!
+//! pub type AddTaskOutput = i32;
+//!
+//! #[derive(Default)]
+//! pub struct AddTask;
+//!
+//! #[async_trait::async_trait]
+//! impl celers_core::Task for AddTask {
+//!     type Input = AddTaskInput;
+//!     type Output = i32;
+//!
+//!     async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
+//!         let AddTaskInput { a, b } = input;
+//!         { Ok(a + b) }
+//!     }
+//!
+//!     fn name(&self) -> &str {
+//!         "add"
+//!     }
+//! }
+//!
+//! impl AddTask {}
+//! ```
+//!
+//! ### Task with Configuration
+//!
+//! **Input:**
+//! ```ignore
+//! #[task(name = "math.multiply", timeout = 60, priority = 10)]
+//! async fn multiply(x: i32, y: i32) -> Result<i32> {
+//!     Ok(x * y)
+//! }
+//! ```
+//!
+//! **Expands to (configuration methods added):**
+//! ```ignore
+//! impl MultiplyTask {
+//!     pub fn timeout(&self) -> Option<u64> {
+//!         Some(60)
+//!     }
+//!     pub fn priority(&self) -> Option<i32> {
+//!         Some(10)
+//!     }
+//! }
+//! ```
+//!
+//! ### Task with Optional Parameters
+//!
+//! **Input:**
+//! ```ignore
+//! #[task]
+//! async fn notify(user: String, email: Option<String>) -> Result<bool> {
+//!     Ok(true)
+//! }
+//! ```
+//!
+//! **Expands to (with serde attributes):**
+//! ```ignore
+//! #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+//! pub struct NotifyTaskInput {
+//!     pub user: String,
+//!     #[serde(skip_serializing_if = "Option::is_none", default)]
+//!     pub email: Option<String>,
+//! }
+//! ```
+//!
+//! ### Generic Task Expansion
+//!
+//! **Input:**
+//! ```ignore
+//! #[task]
+//! async fn process<T>(items: Vec<T>) -> Result<usize>
+//! where
+//!     T: Send + Clone,
+//! {
+//!     Ok(items.len())
+//! }
+//! ```
+//!
+//! **Expands to (with generics):**
+//! ```ignore
+//! #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+//! pub struct ProcessTaskInput<T>
+//! where
+//!     T: Send + Clone,
+//! {
+//!     pub items: Vec<T>,
+//! }
+//!
+//! pub type ProcessTaskOutput<T> = usize;
+//!
+//! pub struct ProcessTask<T>
+//! where
+//!     T: Send + Clone;
+//!
+//! impl<T> Default for ProcessTask<T>
+//! where
+//!     T: Send + Clone,
+//! {
+//!     fn default() -> Self {
+//!         ProcessTask
+//!     }
+//! }
+//!
+//! #[async_trait::async_trait]
+//! impl<T> celers_core::Task for ProcessTask<T>
+//! where
+//!     T: Send + Clone,
+//! {
+//!     type Input = ProcessTaskInput<T>;
+//!     type Output = usize;
+//!
+//!     async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
+//!         let ProcessTaskInput { items } = input;
+//!         { Ok(items.len()) }
+//!     }
+//!
+//!     fn name(&self) -> &str {
+//!         "process"
+//!     }
+//! }
+//! ```
+//!
+//! ### Validation Expansion
+//!
+//! **Input:**
+//! ```ignore
+//! #[task]
+//! async fn validate_age(#[validate(min = 0, max = 120)] age: i32) -> Result<String> {
+//!     Ok(format!("Age: {}", age))
+//! }
+//! ```
+//!
+//! **Expands to (validation checks added):**
+//! ```ignore
+//! impl celers_core::Task for ValidateAgeTask {
+//!     async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
+//!         let ValidateAgeTaskInput { age } = input;
+//!
+//!         // Validation checks are inserted here
+//!         if (age as i64) < 0 {
+//!             return Err(celers_core::CelersError(format!(
+//!                 "Field 'age' value {} is below minimum 0",
+//!                 age
+//!             )));
+//!         }
+//!         if (age as i64) > 120 {
+//!             return Err(celers_core::CelersError(format!(
+//!                 "Field 'age' value {} exceeds maximum 120",
+//!                 age
+//!             )));
+//!         }
+//!
+//!         // Original function body executes after validation
+//!         { Ok(format!("Age: {}", age)) }
+//!     }
+//! }
+//! ```
+//!
+//! ## Best Practices
+//!
+//! 1. **Use descriptive function names** - They become task names (e.g., `process_payment` → `"process_payment"`)
+//! 2. **Leverage optional parameters** - Use `Option<T>` for fields that may be omitted
+//! 3. **Configure timeouts and retries** - Use attributes to set task-specific configurations
+//! 4. **Keep functions focused** - Each task should do one thing well
+//! 5. **Add validation to parameters** - Use `#[validate(...)]` to enforce constraints early
+//! 6. **Use cargo-expand** - Inspect generated code when debugging macro issues
+//!
+//! ## Troubleshooting
+//!
+//! ### "the #[task] attribute can only be applied to async functions"
+//! **Solution:** Add the `async` keyword before `fn`
+//!
+//! ### "timeout must be greater than 0 seconds"
+//! **Solution:** Use a positive timeout value: `#[task(timeout = 30)]`
+//!
+//! ### "duplicate 'name' attribute"
+//! **Solution:** Each attribute can only be specified once
+//!
+//! ### "task name cannot be empty"
+//! **Solution:** Provide a non-empty string: `#[task(name = "my_task")]`
+//!
+//! ### Serde serialization errors
+//! **Solution:** Ensure all types in the function signature implement `Serialize` and `Deserialize`
 
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
     parse::Parse, parse::ParseStream, parse_macro_input, Attribute, DeriveInput, FnArg,
-    GenericArgument, ItemFn, Lit, Meta, Pat, PathArguments, ReturnType, Token, Type, TypePath,
+    GenericArgument, ItemFn, Lit, Pat, PathArguments, ReturnType, Token, Type, TypePath,
 };
 
 /// Helper function to check if a type is Option<T>
@@ -182,7 +555,7 @@ struct TaskAttr {
 
 /// Field validation configuration
 ///
-/// Infrastructure for future validation attribute support
+/// Infrastructure for validation attribute support with custom error messages
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct FieldValidation {
@@ -191,6 +564,16 @@ struct FieldValidation {
     min_length: Option<usize>,
     max_length: Option<usize>,
     pattern: Option<String>,
+    message: Option<String>,
+    // Predefined validation shortcuts
+    email: bool,
+    url: bool,
+    phone: bool,
+    not_empty: bool,
+    positive: bool,
+    negative: bool,
+    alphabetic: bool,
+    alphanumeric: bool,
 }
 
 #[allow(dead_code)]
@@ -202,6 +585,15 @@ impl FieldValidation {
             min_length: None,
             max_length: None,
             pattern: None,
+            message: None,
+            email: false,
+            url: false,
+            phone: false,
+            not_empty: false,
+            positive: false,
+            negative: false,
+            alphabetic: false,
+            alphanumeric: false,
         }
     }
 
@@ -210,53 +602,51 @@ impl FieldValidation {
         let mut has_validation = false;
 
         for attr in attrs {
-            if let Meta::List(meta_list) = &attr.meta {
-                let path_str = meta_list
-                    .path
-                    .segments
-                    .last()
-                    .map(|s| s.ident.to_string())
-                    .unwrap_or_default();
-
-                match path_str.as_str() {
-                    "validate_range" => {
-                        has_validation = true;
-                        attr.parse_nested_meta(|meta| {
-                            if meta.path.is_ident("min") {
-                                let value: syn::LitInt = meta.value()?.parse()?;
-                                validation.min_value = Some(value.base10_parse()?);
-                            } else if meta.path.is_ident("max") {
-                                let value: syn::LitInt = meta.value()?.parse()?;
-                                validation.max_value = Some(value.base10_parse()?);
-                            }
-                            Ok(())
-                        })?;
+            if attr.path().is_ident("validate") {
+                has_validation = true;
+                attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("min") {
+                        let value: syn::LitInt = meta.value()?.parse()?;
+                        validation.min_value = Some(value.base10_parse()?);
+                    } else if meta.path.is_ident("max") {
+                        let value: syn::LitInt = meta.value()?.parse()?;
+                        validation.max_value = Some(value.base10_parse()?);
+                    } else if meta.path.is_ident("min_length") {
+                        let value: syn::LitInt = meta.value()?.parse()?;
+                        validation.min_length = Some(value.base10_parse()?);
+                    } else if meta.path.is_ident("max_length") {
+                        let value: syn::LitInt = meta.value()?.parse()?;
+                        validation.max_length = Some(value.base10_parse()?);
+                    } else if meta.path.is_ident("pattern") {
+                        let value: syn::LitStr = meta.value()?.parse()?;
+                        validation.pattern = Some(value.value());
+                    } else if meta.path.is_ident("message") {
+                        let value: syn::LitStr = meta.value()?.parse()?;
+                        validation.message = Some(value.value());
+                    } else if meta.path.is_ident("email") {
+                        validation.email = true;
+                    } else if meta.path.is_ident("url") {
+                        validation.url = true;
+                    } else if meta.path.is_ident("phone") {
+                        validation.phone = true;
+                    } else if meta.path.is_ident("not_empty") {
+                        validation.not_empty = true;
+                    } else if meta.path.is_ident("positive") {
+                        validation.positive = true;
+                    } else if meta.path.is_ident("negative") {
+                        validation.negative = true;
+                    } else if meta.path.is_ident("alphabetic") {
+                        validation.alphabetic = true;
+                    } else if meta.path.is_ident("alphanumeric") {
+                        validation.alphanumeric = true;
+                    } else {
+                        return Err(meta.error(format!(
+                            "unknown validation parameter '{}'. Valid parameters: min, max, min_length, max_length, pattern, message, email, url, phone, not_empty, positive, negative, alphabetic, alphanumeric",
+                            meta.path.get_ident().map(|i| i.to_string()).unwrap_or_default()
+                        )));
                     }
-                    "validate_length" => {
-                        has_validation = true;
-                        attr.parse_nested_meta(|meta| {
-                            if meta.path.is_ident("min") {
-                                let value: syn::LitInt = meta.value()?.parse()?;
-                                validation.min_length = Some(value.base10_parse()?);
-                            } else if meta.path.is_ident("max") {
-                                let value: syn::LitInt = meta.value()?.parse()?;
-                                validation.max_length = Some(value.base10_parse()?);
-                            }
-                            Ok(())
-                        })?;
-                    }
-                    "validate_pattern" => {
-                        has_validation = true;
-                        attr.parse_nested_meta(|meta| {
-                            if meta.path.is_ident("regex") {
-                                let value: syn::LitStr = meta.value()?.parse()?;
-                                validation.pattern = Some(value.value());
-                            }
-                            Ok(())
-                        })?;
-                    }
-                    _ => {}
-                }
+                    Ok(())
+                })?;
             }
         }
 
@@ -276,27 +666,43 @@ impl FieldValidation {
 
         // Range validation for numeric types
         if let Some(min) = self.min_value {
-            validations.push(quote! {
-                if (#field_name as i64) < #min {
-                    return Err(celers_core::CelersError::from(format!(
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
                         "Field '{}' value {} is below minimum {}",
                         stringify!(#field_name),
                         #field_name,
                         #min
-                    )));
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if (#field_name as i64) < #min {
+                    return Err(celers_core::CelersError(#error_msg));
                 }
             });
         }
 
         if let Some(max) = self.max_value {
-            validations.push(quote! {
-                if (#field_name as i64) > #max {
-                    return Err(celers_core::CelersError::from(format!(
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
                         "Field '{}' value {} exceeds maximum {}",
                         stringify!(#field_name),
                         #field_name,
                         #max
-                    )));
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if (#field_name as i64) > #max {
+                    return Err(celers_core::CelersError(#error_msg));
                 }
             });
         }
@@ -304,27 +710,43 @@ impl FieldValidation {
         // Length validation for strings and collections
         if self.min_length.is_some() || self.max_length.is_some() {
             if let Some(min) = self.min_length {
-                validations.push(quote! {
-                    if #field_name.len() < #min {
-                        return Err(celers_core::CelersError::from(format!(
+                let error_msg = if let Some(msg) = &self.message {
+                    quote! { #msg.to_string() }
+                } else {
+                    quote! {
+                        format!(
                             "Field '{}' length {} is below minimum {}",
                             stringify!(#field_name),
                             #field_name.len(),
                             #min
-                        )));
+                        )
+                    }
+                };
+
+                validations.push(quote! {
+                    if #field_name.len() < #min {
+                        return Err(celers_core::CelersError(#error_msg));
                     }
                 });
             }
 
             if let Some(max) = self.max_length {
-                validations.push(quote! {
-                    if #field_name.len() > #max {
-                        return Err(celers_core::CelersError::from(format!(
+                let error_msg = if let Some(msg) = &self.message {
+                    quote! { #msg.to_string() }
+                } else {
+                    quote! {
+                        format!(
                             "Field '{}' length {} exceeds maximum {}",
                             stringify!(#field_name),
                             #field_name.len(),
                             #max
-                        )));
+                        )
+                    }
+                };
+
+                validations.push(quote! {
+                    if #field_name.len() > #max {
+                        return Err(celers_core::CelersError(#error_msg));
                     }
                 });
             }
@@ -332,21 +754,201 @@ impl FieldValidation {
 
         // Pattern validation for strings
         if let Some(pattern) = &self.pattern {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' does not match required pattern",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
             validations.push(quote! {
                 {
                     let regex = regex::Regex::new(#pattern).map_err(|e| {
-                        celers_core::CelersError::from(format!(
+                        celers_core::CelersError(format!(
                             "Invalid regex pattern for field '{}': {}",
                             stringify!(#field_name),
                             e
                         ))
                     })?;
-                    if !regex.is_match(#field_name) {
-                        return Err(celers_core::CelersError::from(format!(
-                            "Field '{}' does not match required pattern",
-                            stringify!(#field_name)
-                        )));
+                    if !regex.is_match(&#field_name) {
+                        return Err(celers_core::CelersError(#error_msg));
                     }
+                }
+            });
+        }
+
+        // Predefined validation: email
+        if self.email {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid email address",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    let email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
+                    let regex = regex::Regex::new(email_pattern).unwrap();
+                    if !regex.is_match(&#field_name) {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: url
+        if self.url {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid URL",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    let url_pattern = r"^https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$";
+                    let regex = regex::Regex::new(url_pattern).unwrap();
+                    if !regex.is_match(&#field_name) {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: phone
+        if self.phone {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid phone number",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    let phone_pattern = r"^\+?[0-9]{10,15}$";
+                    let regex = regex::Regex::new(phone_pattern).unwrap();
+                    if !regex.is_match(&#field_name) {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: not_empty
+        if self.not_empty {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must not be empty",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if #field_name.is_empty() {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: positive
+        if self.positive {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be positive (greater than 0)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if #field_name <= 0 {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: negative
+        if self.negative {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be negative (less than 0)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if #field_name >= 0 {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: alphabetic
+        if self.alphabetic {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must contain only alphabetic characters",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if !#field_name.chars().all(|c| c.is_alphabetic()) {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: alphanumeric
+        if self.alphanumeric {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must contain only alphanumeric characters",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if !#field_name.chars().all(|c| c.is_alphanumeric()) {
+                    return Err(celers_core::CelersError(#error_msg));
                 }
             });
         }
@@ -573,9 +1175,10 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn_name.span(),
     );
 
-    // Extract input parameters (skip self)
+    // Extract input parameters (skip self) and parse validation attributes
     let mut input_fields = Vec::new();
     let mut input_field_names = Vec::new();
+    let mut field_validations = Vec::new();
     let mut all_fields_optional = true;
 
     for arg in fn_inputs.iter() {
@@ -590,6 +1193,12 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                     all_fields_optional = false;
                 }
 
+                // Parse validation attributes from the parameter
+                let validation = match FieldValidation::from_attributes(&pat_type.attrs) {
+                    Ok(v) => v,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+
                 let field_def = if is_option {
                     quote! {
                         #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -600,7 +1209,8 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
 
                 input_fields.push(field_def);
-                input_field_names.push(field_name);
+                input_field_names.push(field_name.clone());
+                field_validations.push((field_name.clone(), field_type.clone(), validation));
             }
         }
     }
@@ -693,6 +1303,16 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Generate validation code for fields that have validation rules
+    let validation_code: Vec<_> = field_validations
+        .iter()
+        .filter_map(|(name, ty, validation)| {
+            validation
+                .as_ref()
+                .map(|v| v.generate_validation_code(name, ty))
+        })
+        .collect();
+
     let expanded = quote! {
         /// Input struct for the task
         ///
@@ -725,6 +1345,9 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
                 // Destructure input
                 let #input_struct_name { #(#input_field_names),* } = input;
+
+                // Validate input fields
+                #(#validation_code)*
 
                 // Execute the original function body inline
                 #fn_block

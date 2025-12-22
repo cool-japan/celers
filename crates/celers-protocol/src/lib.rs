@@ -37,12 +37,21 @@
 //! - [`lazy`] - Lazy deserialization for large messages
 //! - [`pool`] - Message pooling for memory efficiency
 //! - [`extension_api`] - Custom protocol extensions API
+//! - [`utils`] - Message utility helpers
+//! - [`batch`] - Batch message processing utilities
+//! - [`routing`] - Message routing helpers
+//! - [`retry`] - Retry strategy utilities
+//! - [`dedup`] - Message deduplication utilities
+//! - [`priority_queue`] - Priority-based message queues
+//! - [`workflow`] - Workflow and task chain utilities
 
 pub mod auth;
+pub mod batch;
 pub mod builder;
 pub mod compat;
 pub mod compression;
 pub mod crypto;
+pub mod dedup;
 pub mod embed;
 pub mod event;
 pub mod extension_api;
@@ -52,9 +61,14 @@ pub mod middleware;
 pub mod migration;
 pub mod negotiation;
 pub mod pool;
+pub mod priority_queue;
 pub mod result;
+pub mod retry;
+pub mod routing;
 pub mod security;
 pub mod serializer;
+pub mod utils;
+pub mod workflow;
 pub mod zerocopy;
 
 use chrono::{DateTime, Utc};
@@ -182,6 +196,7 @@ pub enum ContentType {
 }
 
 impl ContentType {
+    #[inline]
     pub fn as_str(&self) -> &str {
         match self {
             ContentType::Json => "application/json",
@@ -218,6 +233,7 @@ pub enum ContentEncoding {
 }
 
 impl ContentEncoding {
+    #[inline]
     pub fn as_str(&self) -> &str {
         match self {
             ContentEncoding::Utf8 => "utf-8",
@@ -439,36 +455,42 @@ impl Message {
     }
 
     /// Set priority (0-9)
+    #[must_use]
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.properties.priority = Some(priority);
         self
     }
 
     /// Set parent task ID
+    #[must_use]
     pub fn with_parent(mut self, parent_id: Uuid) -> Self {
         self.headers.parent_id = Some(parent_id);
         self
     }
 
     /// Set root task ID
+    #[must_use]
     pub fn with_root(mut self, root_id: Uuid) -> Self {
         self.headers.root_id = Some(root_id);
         self
     }
 
     /// Set group ID
+    #[must_use]
     pub fn with_group(mut self, group: Uuid) -> Self {
         self.headers.group = Some(group);
         self
     }
 
     /// Set ETA (delayed execution)
+    #[must_use]
     pub fn with_eta(mut self, eta: DateTime<Utc>) -> Self {
         self.headers.eta = Some(eta);
         self
     }
 
     /// Set expiration
+    #[must_use]
     pub fn with_expires(mut self, expires: DateTime<Utc>) -> Self {
         self.headers.expires = Some(expires);
         self
@@ -533,48 +555,157 @@ impl Message {
     }
 
     /// Check if the message has an ETA (delayed execution)
+    #[inline]
     pub fn has_eta(&self) -> bool {
         self.headers.eta.is_some()
     }
 
     /// Check if the message has an expiration time
+    #[inline]
     pub fn has_expires(&self) -> bool {
         self.headers.expires.is_some()
     }
 
     /// Check if the message is part of a group
+    #[inline]
     pub fn has_group(&self) -> bool {
         self.headers.group.is_some()
     }
 
     /// Check if the message has a parent task
+    #[inline]
     pub fn has_parent(&self) -> bool {
         self.headers.parent_id.is_some()
     }
 
     /// Check if the message has a root task
+    #[inline]
     pub fn has_root(&self) -> bool {
         self.headers.root_id.is_some()
     }
 
     /// Check if the message is persistent
+    #[inline]
     pub fn is_persistent(&self) -> bool {
         self.properties.delivery_mode == 2
     }
 
     /// Get the task ID
+    #[inline]
     pub fn task_id(&self) -> uuid::Uuid {
         self.headers.id
     }
 
     /// Get the task name
+    #[inline]
     pub fn task_name(&self) -> &str {
         &self.headers.task
+    }
+
+    /// Get the content type as a string slice
+    #[inline]
+    pub fn content_type_str(&self) -> &str {
+        &self.content_type
+    }
+
+    /// Get the content encoding as a string slice
+    #[inline]
+    pub fn content_encoding_str(&self) -> &str {
+        &self.content_encoding
+    }
+
+    /// Get the message body size in bytes
+    #[inline]
+    pub fn body_size(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Check if the message body is empty
+    #[inline]
+    pub fn has_empty_body(&self) -> bool {
+        self.body.is_empty()
+    }
+
+    /// Get the retry count (0 if not set)
+    #[inline]
+    pub fn retry_count(&self) -> u32 {
+        self.headers.retries.unwrap_or(0)
+    }
+
+    /// Get the priority (None if not set)
+    #[inline]
+    pub fn priority(&self) -> Option<u8> {
+        self.properties.priority
+    }
+
+    /// Check if message has a correlation ID
+    #[inline]
+    pub fn has_correlation_id(&self) -> bool {
+        self.properties.correlation_id.is_some()
+    }
+
+    /// Get the correlation ID
+    #[inline]
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.properties.correlation_id.as_deref()
+    }
+
+    /// Get the reply-to queue
+    #[inline]
+    pub fn reply_to(&self) -> Option<&str> {
+        self.properties.reply_to.as_deref()
+    }
+
+    /// Check if this is a workflow message (has parent, root, or group)
+    #[inline]
+    pub fn is_workflow_message(&self) -> bool {
+        self.has_parent() || self.has_root() || self.has_group()
+    }
+
+    /// Clone the message with a new task ID
+    #[must_use]
+    pub fn with_new_id(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.headers.id = Uuid::new_v4();
+        cloned
+    }
+
+    /// Create a builder from this message (for modification)
+    ///
+    /// Note: This creates a new builder with the message's metadata.
+    /// The body (args/kwargs) must be set separately on the builder.
+    pub fn to_builder(&self) -> crate::builder::MessageBuilder {
+        let mut builder = crate::builder::MessageBuilder::new(&self.headers.task);
+
+        // Set basic properties
+        builder = builder.id(self.headers.id);
+
+        // Set optional fields
+        if let Some(priority) = self.properties.priority {
+            builder = builder.priority(priority);
+        }
+        if let Some(parent_id) = self.headers.parent_id {
+            builder = builder.parent(parent_id);
+        }
+        if let Some(root_id) = self.headers.root_id {
+            builder = builder.root(root_id);
+        }
+        if let Some(group) = self.headers.group {
+            builder = builder.group(group);
+        }
+        if let Some(eta) = self.headers.eta {
+            builder = builder.eta(eta);
+        }
+        if let Some(expires) = self.headers.expires {
+            builder = builder.expires(expires);
+        }
+
+        builder
     }
 }
 
 /// Task arguments (args, kwargs)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TaskArgs {
     /// Positional arguments
     #[serde(default)]
@@ -586,18 +717,75 @@ pub struct TaskArgs {
 }
 
 impl TaskArgs {
+    /// Create a new empty TaskArgs
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set all positional arguments at once (builder pattern)
+    #[must_use]
     pub fn with_args(mut self, args: Vec<serde_json::Value>) -> Self {
         self.args = args;
         self
     }
 
+    /// Set all keyword arguments at once (builder pattern)
+    #[must_use]
     pub fn with_kwargs(mut self, kwargs: HashMap<String, serde_json::Value>) -> Self {
         self.kwargs = kwargs;
         self
+    }
+
+    /// Add a single positional argument
+    pub fn add_arg(&mut self, arg: serde_json::Value) {
+        self.args.push(arg);
+    }
+
+    /// Add a single keyword argument
+    pub fn add_kwarg(&mut self, key: String, value: serde_json::Value) {
+        self.kwargs.insert(key, value);
+    }
+
+    /// Check if both args and kwargs are empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.args.is_empty() && self.kwargs.is_empty()
+    }
+
+    /// Get the total number of arguments (positional + keyword)
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.args.len() + self.kwargs.len()
+    }
+
+    /// Check if there are any positional arguments
+    #[inline]
+    pub fn has_args(&self) -> bool {
+        !self.args.is_empty()
+    }
+
+    /// Check if there are any keyword arguments
+    #[inline]
+    pub fn has_kwargs(&self) -> bool {
+        !self.kwargs.is_empty()
+    }
+
+    /// Clear all arguments
+    pub fn clear(&mut self) {
+        self.args.clear();
+        self.kwargs.clear();
+    }
+
+    /// Get a positional argument by index
+    #[inline]
+    pub fn get_arg(&self, index: usize) -> Option<&serde_json::Value> {
+        self.args.get(index)
+    }
+
+    /// Get a keyword argument by key
+    #[inline]
+    pub fn get_kwarg(&self, key: &str) -> Option<&serde_json::Value> {
+        self.kwargs.get(key)
     }
 }
 
@@ -779,5 +967,141 @@ mod tests {
 
         assert_eq!(msg.task_id(), task_id);
         assert_eq!(msg.task_name(), "my_task");
+    }
+
+    #[test]
+    fn test_task_args_add_methods() {
+        let mut args = TaskArgs::new();
+        assert!(args.is_empty());
+
+        args.add_arg(serde_json::json!(1));
+        args.add_arg(serde_json::json!(2));
+        assert_eq!(args.len(), 2);
+        assert!(args.has_args());
+        assert!(!args.has_kwargs());
+
+        args.add_kwarg("key1".to_string(), serde_json::json!("value1"));
+        assert_eq!(args.len(), 3);
+        assert!(args.has_kwargs());
+    }
+
+    #[test]
+    fn test_task_args_get_methods() {
+        let mut args = TaskArgs::new();
+        args.add_arg(serde_json::json!(42));
+        args.add_kwarg("name".to_string(), serde_json::json!("test"));
+
+        assert_eq!(args.get_arg(0), Some(&serde_json::json!(42)));
+        assert_eq!(args.get_arg(1), None);
+        assert_eq!(args.get_kwarg("name"), Some(&serde_json::json!("test")));
+        assert_eq!(args.get_kwarg("missing"), None);
+    }
+
+    #[test]
+    fn test_task_args_clear() {
+        let mut args = TaskArgs::new()
+            .with_args(vec![serde_json::json!(1)])
+            .with_kwargs({
+                let mut map = HashMap::new();
+                map.insert("key".to_string(), serde_json::json!("value"));
+                map
+            });
+
+        assert!(!args.is_empty());
+        args.clear();
+        assert!(args.is_empty());
+        assert_eq!(args.len(), 0);
+    }
+
+    #[test]
+    fn test_task_args_partial_eq() {
+        let args1 = TaskArgs::new().with_args(vec![serde_json::json!(1), serde_json::json!(2)]);
+        let args2 = TaskArgs::new().with_args(vec![serde_json::json!(1), serde_json::json!(2)]);
+        let args3 = TaskArgs::new().with_args(vec![serde_json::json!(1)]);
+
+        assert_eq!(args1, args2);
+        assert_ne!(args1, args3);
+    }
+
+    #[test]
+    fn test_message_body_methods() {
+        let msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(msg.body_size(), 5);
+        assert!(!msg.has_empty_body());
+
+        let empty_msg = Message::new("test".to_string(), Uuid::new_v4(), vec![]);
+        assert_eq!(empty_msg.body_size(), 0);
+        assert!(empty_msg.has_empty_body());
+    }
+
+    #[test]
+    fn test_message_content_accessors() {
+        let msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1]);
+        assert_eq!(msg.content_type_str(), "application/json");
+        assert_eq!(msg.content_encoding_str(), "utf-8");
+    }
+
+    #[test]
+    fn test_message_retry_and_priority() {
+        let mut msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1]);
+        assert_eq!(msg.retry_count(), 0);
+        assert_eq!(msg.priority(), None);
+
+        msg.headers.retries = Some(3);
+        msg.properties.priority = Some(5);
+        assert_eq!(msg.retry_count(), 3);
+        assert_eq!(msg.priority(), Some(5));
+    }
+
+    #[test]
+    fn test_message_correlation_and_reply() {
+        let mut msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1]);
+        assert!(!msg.has_correlation_id());
+        assert_eq!(msg.correlation_id(), None);
+        assert_eq!(msg.reply_to(), None);
+
+        msg.properties.correlation_id = Some("corr-123".to_string());
+        msg.properties.reply_to = Some("reply-queue".to_string());
+        assert!(msg.has_correlation_id());
+        assert_eq!(msg.correlation_id(), Some("corr-123"));
+        assert_eq!(msg.reply_to(), Some("reply-queue"));
+    }
+
+    #[test]
+    fn test_message_workflow_check() {
+        let msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1]);
+        assert!(!msg.is_workflow_message());
+
+        let workflow_msg = msg.with_parent(Uuid::new_v4());
+        assert!(workflow_msg.is_workflow_message());
+    }
+
+    #[test]
+    fn test_message_with_new_id() {
+        let task_id = Uuid::new_v4();
+        let msg = Message::new("test".to_string(), task_id, vec![1, 2, 3]);
+        let new_msg = msg.with_new_id();
+
+        assert_ne!(msg.task_id(), new_msg.task_id());
+        assert_eq!(msg.task_name(), new_msg.task_name());
+        assert_eq!(msg.body, new_msg.body);
+    }
+
+    #[test]
+    fn test_message_to_builder() {
+        let task_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let msg = Message::new("test.task".to_string(), task_id, vec![1, 2, 3])
+            .with_priority(5)
+            .with_parent(parent_id);
+
+        let builder = msg.to_builder();
+        // Need to add args since builder doesn't copy body automatically
+        let rebuilt = builder.args(vec![serde_json::json!(1)]).build().unwrap();
+
+        assert_eq!(rebuilt.task_id(), msg.task_id());
+        assert_eq!(rebuilt.task_name(), msg.task_name());
+        assert_eq!(rebuilt.priority(), msg.priority());
+        assert_eq!(rebuilt.headers.parent_id, msg.headers.parent_id);
     }
 }

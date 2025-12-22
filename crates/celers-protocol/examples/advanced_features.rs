@@ -120,9 +120,9 @@ fn main() {
         use celers_protocol::compression::{CompressionType, Compressor};
 
         let data = b"Hello, Celery! ".repeat(100);
-        let compressor = Compressor::new(CompressionType::Gzip, 6);
+        let compressor = Compressor::new(CompressionType::Gzip).with_level(6);
 
-        match compressor.compress(data) {
+        match compressor.compress(&data) {
             Ok(compressed) => {
                 println!("   Original size: {} bytes", data.len());
                 println!("   Compressed size: {} bytes", compressed.len());
@@ -148,7 +148,7 @@ fn main() {
         println!("   Message: {:?}", String::from_utf8_lossy(message));
         println!("   Signature: {}", signature);
 
-        let valid = signer.verify_hex(message, &signature);
+        let valid = signer.verify_hex(message, &signature).is_ok();
         println!(
             "   Verification: {}\n",
             if valid { "✓ Valid" } else { "✗ Invalid" }
@@ -162,18 +162,21 @@ fn main() {
         use celers_protocol::crypto::MessageEncryptor;
 
         let key = b"12345678901234567890123456789012"; // 32 bytes for AES-256
-        let encryptor = MessageEncryptor::new(key);
+        let encryptor = MessageEncryptor::new(key).unwrap();
 
         let plaintext = b"sensitive data";
         match encryptor.encrypt_hex(plaintext) {
-            Ok(encrypted) => {
+            Ok((ciphertext_hex, nonce_hex)) => {
                 println!("   Plaintext: {:?}", String::from_utf8_lossy(plaintext));
-                println!("   Encrypted: {}...", &encrypted[..40]);
+                println!(
+                    "   Encrypted: {}...",
+                    &ciphertext_hex[..40.min(ciphertext_hex.len())]
+                );
 
-                match encryptor.decrypt_hex(&encrypted) {
+                match encryptor.decrypt_hex(&ciphertext_hex, &nonce_hex) {
                     Ok(decrypted) => {
                         println!("   Decrypted: {:?}", String::from_utf8_lossy(&decrypted));
-                        println!("   Match: {}\n", decrypted == plaintext);
+                        println!("   Match: {}\n", &decrypted[..] == plaintext);
                     }
                     Err(e) => println!("   Decryption error: {}\n", e),
                 }

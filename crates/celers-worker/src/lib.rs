@@ -42,14 +42,20 @@
 
 pub mod cancellation;
 pub mod circuit_breaker;
+pub mod degradation;
+pub mod dlq;
+pub mod feature_flags;
 pub mod health;
 pub mod memory;
+pub mod metadata;
 pub mod middleware;
 pub mod performance_metrics;
 pub mod prefetch;
 pub mod queue_monitor;
 pub mod rate_limit;
 pub mod resource_tracker;
+pub mod retry;
+pub mod routing;
 pub mod shutdown;
 
 // Internal metrics wrapper module
@@ -73,8 +79,8 @@ use celers_core::{
 };
 
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -82,18 +88,115 @@ use tracing::{debug, error, info, warn};
 
 pub use cancellation::{CancellationError, CancellationRegistry, CancellationToken};
 pub use circuit_breaker::{CircuitBreaker as WorkerCircuitBreaker, CircuitState};
+pub use degradation::{DegradationLevel, DegradationPolicy, DegradationThresholds};
+pub use dlq::{DlqConfig, DlqEntry, DlqHandler, DlqStats};
+pub use feature_flags::{FeatureFlags, TaskFeatureRequirements};
+pub use metadata::{WorkerMetadata, WorkerMetadataBuilder};
+pub use middleware::{
+    Middleware, MiddlewareError, MiddlewareStack, TaskContext, TracingMiddleware,
+};
 pub use performance_metrics::{PerformanceConfig, PerformanceStats, PerformanceTracker};
 pub use prefetch::{PrefetchBuffer, PrefetchConfig, PrefetchStats};
 pub use queue_monitor::{QueueAlertLevel, QueueMonitor, QueueMonitorConfig, QueueStats};
 pub use rate_limit::{RateLimitConfig, RateLimiter};
 pub use resource_tracker::{ResourceLimits, ResourceStats, ResourceTracker};
+pub use retry::{RetryConfig, RetryStrategy};
+pub use routing::{RoutingStrategy, TaskRoutingRequirements, WorkerTags};
 pub use shutdown::wait_for_signal;
+
+#[cfg(feature = "metrics")]
+pub use middleware::MetricsMiddleware;
 
 #[cfg(feature = "metrics")]
 use celers_metrics::{
     TASKS_COMPLETED_BY_TYPE, TASKS_COMPLETED_TOTAL, TASKS_FAILED_BY_TYPE, TASKS_FAILED_TOTAL,
     TASKS_RETRIED_BY_TYPE, TASKS_RETRIED_TOTAL, TASK_EXECUTION_TIME, TASK_EXECUTION_TIME_BY_TYPE,
 };
+
+/// Worker operational mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WorkerMode {
+    /// Normal operation - accepting and processing tasks
+    Normal = 0,
+    /// Maintenance mode - not accepting new tasks, completing existing ones
+    Maintenance = 1,
+    /// Draining - gracefully stopping after completing current tasks
+    Draining = 2,
+}
+
+impl WorkerMode {
+    /// Check if the worker should accept new tasks
+    pub fn should_accept_tasks(&self) -> bool {
+        matches!(self, WorkerMode::Normal)
+    }
+
+    /// Check if the worker is in maintenance mode
+    pub fn is_maintenance(&self) -> bool {
+        matches!(self, WorkerMode::Maintenance)
+    }
+
+    /// Check if the worker is draining
+    pub fn is_draining(&self) -> bool {
+        matches!(self, WorkerMode::Draining)
+    }
+
+    /// Check if the worker should continue running
+    pub fn should_continue(&self) -> bool {
+        !matches!(self, WorkerMode::Draining)
+    }
+}
+
+impl From<u8> for WorkerMode {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => WorkerMode::Maintenance,
+            2 => WorkerMode::Draining,
+            _ => WorkerMode::Normal,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerMode::Normal => write!(f, "Normal"),
+            WorkerMode::Maintenance => write!(f, "Maintenance"),
+            WorkerMode::Draining => write!(f, "Draining"),
+        }
+    }
+}
+
+/// Dynamic worker configuration that can be updated at runtime
+#[derive(Debug, Clone)]
+pub struct DynamicConfig {
+    /// Polling interval when queue is empty (milliseconds)
+    pub poll_interval_ms: u64,
+    /// Default task timeout in seconds
+    pub default_timeout_secs: u64,
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+}
+
+impl Default for DynamicConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: 1000,
+            default_timeout_secs: 300,
+            max_retries: 3,
+        }
+    }
+}
+
+impl DynamicConfig {
+    /// Validate the dynamic configuration
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.default_timeout_secs == 0 {
+            return Err("Default timeout must be at least 1 second".to_string());
+        }
+        Ok(())
+    }
+}
 
 /// Worker configuration
 #[derive(Clone)]
@@ -111,10 +214,16 @@ pub struct WorkerConfig {
     pub max_retries: u32,
 
     /// Base delay for exponential backoff (milliseconds)
+    /// DEPRECATED: Use retry_config instead
     pub retry_base_delay_ms: u64,
 
     /// Maximum delay between retries (milliseconds)
+    /// DEPRECATED: Use retry_config instead
     pub retry_max_delay_ms: u64,
+
+    /// Retry configuration (strategy and options)
+    /// If set, this overrides retry_base_delay_ms and retry_max_delay_ms
+    pub retry_config: Option<RetryConfig>,
 
     /// Default task timeout in seconds
     pub default_timeout_secs: u64,
@@ -139,6 +248,23 @@ pub struct WorkerConfig {
     /// Circuit breaker configuration
     pub circuit_breaker_config: CircuitBreakerConfig,
 
+    // Dead Letter Queue options
+    /// Enable Dead Letter Queue for permanently failed tasks
+    pub enable_dlq: bool,
+
+    /// DLQ configuration
+    pub dlq_config: DlqConfig,
+
+    // Routing options
+    /// Enable worker tagging and routing
+    pub enable_routing: bool,
+
+    /// Worker tags for task routing
+    pub worker_tags: WorkerTags,
+
+    /// Routing strategy
+    pub routing_strategy: RoutingStrategy,
+
     // Event emission options
     /// Worker hostname for event identification
     pub hostname: String,
@@ -148,6 +274,12 @@ pub struct WorkerConfig {
 
     /// Heartbeat interval in seconds (0 = disabled)
     pub heartbeat_interval_secs: u64,
+
+    /// Worker metadata (version, build info, labels)
+    pub metadata: WorkerMetadata,
+
+    /// Feature flags enabled on this worker
+    pub feature_flags: FeatureFlags,
 }
 
 impl Default for WorkerConfig {
@@ -159,6 +291,7 @@ impl Default for WorkerConfig {
             max_retries: 3,
             retry_base_delay_ms: 1000,
             retry_max_delay_ms: 60000,
+            retry_config: None, // Use legacy config by default
             default_timeout_secs: 300,
             enable_batch_dequeue: false,
             batch_size: 10,
@@ -166,9 +299,16 @@ impl Default for WorkerConfig {
             track_memory_usage: false,
             enable_circuit_breaker: false,
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            enable_dlq: false,
+            dlq_config: DlqConfig::default(),
+            enable_routing: false,
+            worker_tags: WorkerTags::new(),
+            routing_strategy: RoutingStrategy::default(),
             hostname: gethostname(),
             enable_events: false,
             heartbeat_interval_secs: 0, // disabled by default
+            metadata: WorkerMetadata::default(),
+            feature_flags: FeatureFlags::default(),
         }
     }
 }
@@ -197,6 +337,84 @@ impl WorkerConfig {
     /// ```
     pub fn builder() -> WorkerConfigBuilder {
         WorkerConfigBuilder::new()
+    }
+
+    /// Create configuration for development environment
+    ///
+    /// Optimized for fast iteration and debugging:
+    /// - Low concurrency (2 tasks)
+    /// - Short poll interval (500ms)
+    /// - Memory tracking enabled
+    /// - Verbose logging via metadata
+    pub fn for_development() -> Self {
+        Self::builder()
+            .preset_development()
+            .metadata(WorkerMetadata::builder().environment("development").build())
+            .build_unchecked()
+    }
+
+    /// Create configuration for staging environment
+    ///
+    /// Balanced configuration for testing:
+    /// - Moderate concurrency (8 tasks)
+    /// - Circuit breaker enabled
+    /// - Memory tracking enabled
+    /// - Events enabled for monitoring
+    pub fn for_staging() -> Self {
+        Self::builder()
+            .concurrency(8)
+            .enable_circuit_breaker(true)
+            .track_memory_usage(true)
+            .enable_events(true)
+            .heartbeat_interval_secs(30)
+            .metadata(WorkerMetadata::builder().environment("staging").build())
+            .build_unchecked()
+    }
+
+    /// Create configuration for production environment
+    ///
+    /// Optimized for reliability and performance:
+    /// - High concurrency (16 tasks)
+    /// - Batch dequeue enabled
+    /// - Circuit breaker enabled
+    /// - High retry count (5)
+    /// - Events and heartbeat enabled
+    pub fn for_production() -> Self {
+        Self::builder()
+            .preset_high_throughput()
+            .max_retries(5)
+            .enable_events(true)
+            .heartbeat_interval_secs(30)
+            .metadata(WorkerMetadata::builder().environment("production").build())
+            .build_unchecked()
+    }
+
+    /// Create configuration based on environment variable
+    ///
+    /// Reads the `CELERS_ENV` environment variable and returns:
+    /// - "development" or "dev" -> `for_development()`
+    /// - "staging" or "stage" -> `for_staging()`
+    /// - "production" or "prod" -> `for_production()`
+    /// - Otherwise -> `for_development()` (default)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use celers_worker::WorkerConfig;
+    ///
+    /// // Set environment: export CELERS_ENV=production
+    /// let config = WorkerConfig::from_env();
+    /// ```
+    pub fn from_env() -> Self {
+        let env = std::env::var("CELERS_ENV")
+            .unwrap_or_else(|_| "development".to_string())
+            .to_lowercase();
+
+        match env.as_str() {
+            "production" | "prod" => Self::for_production(),
+            "staging" | "stage" => Self::for_staging(),
+            "development" | "dev" | _ => Self::for_development(),
+        }
     }
 
     /// Check if batch dequeue is enabled
@@ -234,6 +452,39 @@ impl WorkerConfig {
         self.heartbeat_interval_secs > 0
     }
 
+    /// Check if DLQ is enabled
+    pub fn has_dlq(&self) -> bool {
+        self.enable_dlq
+    }
+
+    /// Check if routing is enabled
+    pub fn has_routing(&self) -> bool {
+        self.enable_routing
+    }
+
+    /// Check if using new retry configuration
+    pub fn has_retry_config(&self) -> bool {
+        self.retry_config.is_some()
+    }
+
+    /// Get the effective retry configuration
+    ///
+    /// Returns the new retry_config if set, otherwise creates a legacy config
+    /// from retry_base_delay_ms and retry_max_delay_ms
+    pub fn get_retry_config(&self) -> RetryConfig {
+        self.retry_config.clone().unwrap_or_else(|| {
+            // Use legacy config
+            RetryConfig::new(
+                self.max_retries,
+                RetryStrategy::Exponential {
+                    base_delay: Duration::from_millis(self.retry_base_delay_ms),
+                    max_delay: Duration::from_millis(self.retry_max_delay_ms),
+                    multiplier: 2.0,
+                },
+            )
+        })
+    }
+
     /// Validate the worker configuration
     ///
     /// Returns an error if any configuration values are invalid:
@@ -266,6 +517,14 @@ impl WorkerConfig {
             return Err("Circuit breaker configuration is invalid".to_string());
         }
 
+        if self.enable_dlq {
+            self.dlq_config.validate()?;
+        }
+
+        if let Some(ref retry_config) = self.retry_config {
+            retry_config.validate()?;
+        }
+
         Ok(())
     }
 }
@@ -294,6 +553,12 @@ impl std::fmt::Display for WorkerConfig {
         }
         if self.heartbeat_interval_secs > 0 {
             write!(f, ", heartbeat={}s", self.heartbeat_interval_secs)?;
+        }
+        if self.enable_dlq {
+            write!(f, ", dlq=enabled")?;
+        }
+        if self.enable_routing {
+            write!(f, ", routing=enabled")?;
         }
         write!(f, "]")
     }
@@ -361,6 +626,14 @@ impl WorkerConfigBuilder {
         self
     }
 
+    /// Set the retry configuration (strategy and options)
+    ///
+    /// This overrides retry_base_delay_ms and retry_max_delay_ms
+    pub fn retry_config(mut self, config: RetryConfig) -> Self {
+        self.config.retry_config = Some(config);
+        self
+    }
+
     /// Set the default task timeout in seconds
     ///
     /// Default: 300s (5 minutes)
@@ -415,6 +688,40 @@ impl WorkerConfigBuilder {
         self
     }
 
+    /// Enable Dead Letter Queue for permanently failed tasks
+    ///
+    /// Default: false
+    pub fn enable_dlq(mut self, enabled: bool) -> Self {
+        self.config.enable_dlq = enabled;
+        self
+    }
+
+    /// Set the DLQ configuration
+    pub fn dlq_config(mut self, config: DlqConfig) -> Self {
+        self.config.dlq_config = config;
+        self
+    }
+
+    /// Enable worker tagging and routing
+    ///
+    /// Default: false
+    pub fn enable_routing(mut self, enabled: bool) -> Self {
+        self.config.enable_routing = enabled;
+        self
+    }
+
+    /// Set worker tags for task routing
+    pub fn worker_tags(mut self, tags: WorkerTags) -> Self {
+        self.config.worker_tags = tags;
+        self
+    }
+
+    /// Set routing strategy
+    pub fn routing_strategy(mut self, strategy: RoutingStrategy) -> Self {
+        self.config.routing_strategy = strategy;
+        self
+    }
+
     /// Set the worker hostname for event identification
     ///
     /// Default: system hostname
@@ -436,6 +743,22 @@ impl WorkerConfigBuilder {
     /// Default: 0 (disabled)
     pub fn heartbeat_interval_secs(mut self, interval: u64) -> Self {
         self.config.heartbeat_interval_secs = interval;
+        self
+    }
+
+    /// Set the worker metadata
+    ///
+    /// Default: Auto-generated metadata with package version
+    pub fn metadata(mut self, metadata: WorkerMetadata) -> Self {
+        self.config.metadata = metadata;
+        self
+    }
+
+    /// Set the feature flags
+    ///
+    /// Default: No features enabled
+    pub fn feature_flags(mut self, flags: FeatureFlags) -> Self {
+        self.config.feature_flags = flags;
         self
     }
 
@@ -580,14 +903,21 @@ pub struct Worker<B: Broker, E: EventEmitter = NoOpEventEmitter> {
     registry: Arc<TaskRegistry>,
     config: WorkerConfig,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
+    dlq_handler: Option<Arc<DlqHandler>>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     event_emitter: Arc<E>,
     stats: Arc<WorkerStats>,
+    mode: Arc<AtomicU8>, // Stores WorkerMode as u8
+    dynamic_config: Arc<RwLock<DynamicConfig>>,
+    middleware_stack: Option<Arc<middleware::MiddlewareStack>>,
 }
 
 /// Handle for controlling a running worker
 pub struct WorkerHandle {
     shutdown_tx: mpsc::Sender<()>,
+    mode: Arc<AtomicU8>,
+    stats: Arc<WorkerStats>,
+    dynamic_config: Arc<RwLock<DynamicConfig>>,
 }
 
 impl WorkerHandle {
@@ -597,6 +927,94 @@ impl WorkerHandle {
             celers_core::CelersError::Other("Failed to send shutdown signal".to_string())
         })?;
         Ok(())
+    }
+
+    /// Enter maintenance mode (stop accepting new tasks, complete existing ones)
+    pub fn enter_maintenance(&self) {
+        info!("Worker entering maintenance mode");
+        self.mode
+            .store(WorkerMode::Maintenance as u8, Ordering::SeqCst);
+    }
+
+    /// Exit maintenance mode (resume normal operation)
+    pub fn exit_maintenance(&self) {
+        info!("Worker exiting maintenance mode");
+        self.mode.store(WorkerMode::Normal as u8, Ordering::SeqCst);
+    }
+
+    /// Start draining (gracefully stop after completing current tasks)
+    pub async fn drain(&self) -> Result<()> {
+        info!("Worker starting drain");
+        self.mode
+            .store(WorkerMode::Draining as u8, Ordering::SeqCst);
+
+        // Wait for all active tasks to complete
+        while self.stats.active() > 0 {
+            debug!(
+                "Waiting for {} active tasks to complete",
+                self.stats.active()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        info!("Worker drain complete");
+        Ok(())
+    }
+
+    /// Get the current worker mode
+    pub fn mode(&self) -> WorkerMode {
+        WorkerMode::from(self.mode.load(Ordering::SeqCst))
+    }
+
+    /// Get the worker statistics
+    pub fn stats(&self) -> &WorkerStats {
+        &self.stats
+    }
+
+    /// Update the dynamic configuration
+    ///
+    /// This allows changing certain configuration parameters without restarting the worker.
+    /// Returns an error if the new configuration is invalid.
+    pub fn update_config(&self, config: DynamicConfig) -> std::result::Result<(), String> {
+        config.validate()?;
+
+        let mut current = self.dynamic_config.write().unwrap();
+        info!(
+            "Updating worker config: poll_interval={}ms, timeout={}s, max_retries={}",
+            config.poll_interval_ms, config.default_timeout_secs, config.max_retries
+        );
+        *current = config;
+        Ok(())
+    }
+
+    /// Get a copy of the current dynamic configuration
+    pub fn get_config(&self) -> DynamicConfig {
+        self.dynamic_config.read().unwrap().clone()
+    }
+
+    /// Update the poll interval (in milliseconds)
+    pub fn set_poll_interval(&self, interval_ms: u64) {
+        let mut config = self.dynamic_config.write().unwrap();
+        info!("Updating poll interval to {}ms", interval_ms);
+        config.poll_interval_ms = interval_ms;
+    }
+
+    /// Update the default task timeout (in seconds)
+    pub fn set_timeout(&self, timeout_secs: u64) -> std::result::Result<(), String> {
+        if timeout_secs == 0 {
+            return Err("Timeout must be at least 1 second".to_string());
+        }
+        let mut config = self.dynamic_config.write().unwrap();
+        info!("Updating default timeout to {}s", timeout_secs);
+        config.default_timeout_secs = timeout_secs;
+        Ok(())
+    }
+
+    /// Update the maximum retry count
+    pub fn set_max_retries(&self, max_retries: u32) {
+        let mut config = self.dynamic_config.write().unwrap();
+        info!("Updating max retries to {}", max_retries);
+        config.max_retries = max_retries;
     }
 }
 
@@ -623,20 +1041,75 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             None
         };
 
+        let dlq_handler = if config.enable_dlq {
+            Some(Arc::new(DlqHandler::new(config.dlq_config.clone())))
+        } else {
+            None
+        };
+
+        // Initialize dynamic config from static config
+        let dynamic_config = DynamicConfig {
+            poll_interval_ms: config.poll_interval_ms,
+            default_timeout_secs: config.default_timeout_secs,
+            max_retries: config.max_retries,
+        };
+
         Self {
             broker: Arc::new(broker),
             registry: Arc::new(registry),
             config,
             circuit_breaker,
+            dlq_handler,
             shutdown_tx: None,
             event_emitter: Arc::new(event_emitter),
             stats: Arc::new(WorkerStats::new()),
+            mode: Arc::new(AtomicU8::new(WorkerMode::Normal as u8)),
+            dynamic_config: Arc::new(RwLock::new(dynamic_config)),
+            middleware_stack: None,
         }
+    }
+
+    /// Set a custom middleware stack
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_worker::{Worker, WorkerConfig, MiddlewareStack, TracingMiddleware};
+    /// use celers_core::TaskRegistry;
+    /// # use celers_core::Broker;
+    /// # async fn example<B: Broker + 'static>(broker: B) {
+    /// let registry = TaskRegistry::new();
+    /// let config = WorkerConfig::default();
+    ///
+    /// let middleware = MiddlewareStack::new()
+    ///     .add(TracingMiddleware::new(true));
+    ///
+    /// let worker = Worker::new(broker, registry, config)
+    ///     .with_middleware(middleware);
+    /// # }
+    /// ```
+    pub fn with_middleware(mut self, stack: middleware::MiddlewareStack) -> Self {
+        self.middleware_stack = Some(Arc::new(stack));
+        self
     }
 
     /// Get the worker statistics
     pub fn stats(&self) -> &WorkerStats {
         &self.stats
+    }
+
+    /// Get the DLQ handler (if enabled)
+    pub fn dlq_handler(&self) -> Option<&Arc<DlqHandler>> {
+        self.dlq_handler.as_ref()
+    }
+
+    /// Check if this worker can handle a specific task type based on routing configuration
+    fn can_handle_task(&self, task_name: &str) -> bool {
+        if !self.config.enable_routing {
+            return true; // Routing disabled, accept all tasks
+        }
+
+        self.config.worker_tags.can_handle_task(task_name)
     }
 
     /// Start the worker loop with graceful shutdown support
@@ -645,6 +1118,9 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         let handle = WorkerHandle {
             shutdown_tx: shutdown_tx.clone(),
+            mode: Arc::clone(&self.mode),
+            stats: Arc::clone(&self.stats),
+            dynamic_config: Arc::clone(&self.dynamic_config),
         };
 
         self.shutdown_tx = Some(shutdown_tx);
@@ -779,6 +1255,20 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         pid: u32,
     ) -> Result<()> {
         loop {
+            // Check current worker mode
+            let current_mode = WorkerMode::from(self.mode.load(Ordering::SeqCst));
+
+            // If draining, wait for active tasks to complete and exit
+            if current_mode.is_draining() {
+                info!("Worker in draining mode, waiting for active tasks to complete");
+                while self.stats.active() > 0 {
+                    debug!("Waiting for {} active tasks", self.stats.active());
+                    sleep(Duration::from_millis(100)).await;
+                }
+                info!("All tasks completed, exiting");
+                return Ok(());
+            }
+
             // Check for shutdown signal if receiver is provided
             if let Some(ref mut rx) = shutdown_rx {
                 match rx.try_recv() {
@@ -794,6 +1284,17 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                         // No shutdown signal, continue
                     }
                 }
+            }
+
+            // If in maintenance mode, skip dequeuing and sleep
+            if current_mode.is_maintenance() {
+                let poll_interval = self.dynamic_config.read().unwrap().poll_interval_ms;
+                debug!(
+                    "Worker in maintenance mode, sleeping for {}ms",
+                    poll_interval
+                );
+                sleep(Duration::from_millis(poll_interval)).await;
+                continue;
             }
 
             // Dequeue tasks (single or batch depending on configuration)
@@ -835,6 +1336,38 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             }
                         }
 
+                        // Check routing - can this worker handle this task type?
+                        if !self.can_handle_task(&task_name) {
+                            warn!(
+                                "Worker routing: cannot handle task type '{}', rejecting task {}",
+                                task_name, task_id
+                            );
+
+                            // Emit task-rejected event
+                            if self.config.enable_events {
+                                let event = Event::Task(celers_core::TaskEvent::Rejected {
+                                    task_id,
+                                    task_name: Some(task_name.clone()),
+                                    hostname: hostname.to_string(),
+                                    timestamp: chrono::Utc::now(),
+                                    reason: "Worker routing mismatch".to_string(),
+                                });
+                                if let Err(e) = self.event_emitter.emit(event).await {
+                                    debug!("Failed to emit task-rejected event: {}", e);
+                                }
+                            }
+
+                            // Reject task with requeue (another worker might handle it)
+                            if let Err(e) = self
+                                .broker
+                                .reject(&task_id, msg.receipt_handle.as_deref(), true)
+                                .await
+                            {
+                                error!("Failed to reject task {}: {}", task_id, e);
+                            }
+                            continue;
+                        }
+
                         // Check circuit breaker
                         if let Some(ref cb) = self.circuit_breaker {
                             if !cb.should_allow(&task_name).await {
@@ -869,12 +1402,11 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             }
                         }
 
-                        // Execute task with timeout
-                        let timeout_secs = msg
-                            .task
-                            .metadata
-                            .timeout_secs
-                            .unwrap_or(self.config.default_timeout_secs);
+                        // Execute task with timeout (use dynamic config if task doesn't specify)
+                        let default_timeout =
+                            self.dynamic_config.read().unwrap().default_timeout_secs;
+                        let timeout_secs =
+                            msg.task.metadata.timeout_secs.unwrap_or(default_timeout);
 
                         let broker = Arc::clone(&self.broker);
                         let registry = Arc::clone(&self.registry);
@@ -885,12 +1417,26 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                         let enable_events = self.config.enable_events;
                         let hostname = hostname.to_string();
                         let stats = Arc::clone(&self.stats);
+                        let middleware = self.middleware_stack.clone();
+                        let dlq_handler = self.dlq_handler.clone();
 
                         tokio::spawn(async move {
                             let start_time = Instant::now();
 
                             // Track active task
                             stats.task_started();
+
+                            // Create middleware context
+                            let mut ctx = middleware::TaskContext {
+                                task_id: task_id.to_string(),
+                                task_name: task.metadata.name.clone(),
+                                retry_count: match task.metadata.state {
+                                    TaskState::Retrying(count) => count,
+                                    _ => 0,
+                                },
+                                worker_name: hostname.clone(),
+                                metadata: std::collections::HashMap::new(),
+                            };
 
                             // Emit task-started event
                             if enable_events {
@@ -900,6 +1446,13 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                     .started();
                                 if let Err(e) = event_emitter.emit(event).await {
                                     debug!("Failed to emit task-started event: {}", e);
+                                }
+                            }
+
+                            // Call before_task middleware
+                            if let Some(ref mw) = middleware {
+                                if let Err(e) = mw.before_task(&mut ctx).await {
+                                    warn!("Middleware before_task error: {}", e);
                                 }
                             }
 
@@ -917,6 +1470,17 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                         task_id, duration
                                     );
                                     debug!("Result size: {} bytes", result.len());
+
+                                    // Parse result as JSON for middleware (best effort)
+                                    let result_json = serde_json::from_slice(&result)
+                                        .unwrap_or(serde_json::json!({"result": "binary"}));
+
+                                    // Call after_task middleware
+                                    if let Some(ref mw) = middleware {
+                                        if let Err(e) = mw.after_task(&ctx, &result_json).await {
+                                            warn!("Middleware after_task error: {}", e);
+                                        }
+                                    }
 
                                     // Emit task-succeeded event
                                     if enable_events {
@@ -976,6 +1540,15 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                             task.metadata.max_retries
                                         );
 
+                                        // Call on_retry middleware
+                                        if let Some(ref mw) = middleware {
+                                            if let Err(e) =
+                                                mw.on_retry(&ctx, current_retry + 1).await
+                                            {
+                                                warn!("Middleware on_retry error: {}", e);
+                                            }
+                                        }
+
                                         // Emit task-retried event
                                         if enable_events {
                                             let event =
@@ -1012,6 +1585,13 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                             task_id, current_retry
                                         );
 
+                                        // Call on_error middleware
+                                        if let Some(ref mw) = middleware {
+                                            if let Err(e) = mw.on_error(&ctx, &error_msg).await {
+                                                warn!("Middleware on_error error: {}", e);
+                                            }
+                                        }
+
                                         // Emit task-failed event
                                         if enable_events {
                                             let event =
@@ -1027,6 +1607,25 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                         // Record failure in circuit breaker
                                         if let Some(ref cb) = circuit_breaker {
                                             cb.record_failure(&task.metadata.name).await;
+                                        }
+
+                                        // Add to DLQ if enabled
+                                        if let Some(ref dlq) = dlq_handler {
+                                            let dlq_entry = dlq::DlqEntry::new(
+                                                task.clone(),
+                                                task_id,
+                                                current_retry,
+                                                error_msg.clone(),
+                                                hostname.clone(),
+                                            )
+                                            .with_metadata("failure_type", "execution_error");
+
+                                            if let Err(e) = dlq.add_entry(dlq_entry).await {
+                                                warn!(
+                                                    "Failed to add task {} to DLQ: {}",
+                                                    task_id, e
+                                                );
+                                            }
                                         }
 
                                         #[cfg(feature = "metrics")]
@@ -1061,6 +1660,15 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                     };
 
                                     if current_retry < task.metadata.max_retries {
+                                        // Call on_retry middleware
+                                        if let Some(ref mw) = middleware {
+                                            if let Err(e) =
+                                                mw.on_retry(&ctx, current_retry + 1).await
+                                            {
+                                                warn!("Middleware on_retry error: {}", e);
+                                            }
+                                        }
+
                                         // Emit task-retried event
                                         if enable_events {
                                             let event =
@@ -1091,9 +1699,39 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                             error!("Failed to requeue task {}: {}", task_id, e);
                                         }
                                     } else {
+                                        // Call on_error middleware
+                                        if let Some(ref mw) = middleware {
+                                            if let Err(e) = mw.on_error(&ctx, &error_msg).await {
+                                                warn!("Middleware on_error error: {}", e);
+                                            }
+                                        }
+
                                         // Record timeout failure in circuit breaker
                                         if let Some(ref cb) = circuit_breaker {
                                             cb.record_failure(&task.metadata.name).await;
+                                        }
+
+                                        // Add to DLQ if enabled
+                                        if let Some(ref dlq) = dlq_handler {
+                                            let dlq_entry = dlq::DlqEntry::new(
+                                                task.clone(),
+                                                task_id,
+                                                current_retry,
+                                                error_msg.clone(),
+                                                hostname.clone(),
+                                            )
+                                            .with_metadata("failure_type", "timeout")
+                                            .with_metadata(
+                                                "timeout_secs",
+                                                timeout_secs.to_string(),
+                                            );
+
+                                            if let Err(e) = dlq.add_entry(dlq_entry).await {
+                                                warn!(
+                                                    "Failed to add task {} to DLQ: {}",
+                                                    task_id, e
+                                                );
+                                            }
                                         }
 
                                         // Emit task-failed event
@@ -1136,15 +1774,14 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                 }
                 Ok(_) => {
                     // Queue is empty (messages vec is empty), sleep before next poll
-                    debug!(
-                        "Queue empty, sleeping for {}ms",
-                        self.config.poll_interval_ms
-                    );
-                    sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+                    let poll_interval = self.dynamic_config.read().unwrap().poll_interval_ms;
+                    debug!("Queue empty, sleeping for {}ms", poll_interval);
+                    sleep(Duration::from_millis(poll_interval)).await;
                 }
                 Err(e) => {
+                    let poll_interval = self.dynamic_config.read().unwrap().poll_interval_ms;
                     error!("Error dequeueing tasks: {}", e);
-                    sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+                    sleep(Duration::from_millis(poll_interval)).await;
                 }
             }
         }
@@ -1166,14 +1803,19 @@ mod tests {
     #[test]
     fn test_backoff_calculation() {
         let config = WorkerConfig::default();
+        let dynamic_config = DynamicConfig::default();
         let worker: Worker<MockBroker, NoOpEventEmitter> = Worker {
             broker: Arc::new(MockBroker),
             registry: Arc::new(TaskRegistry::new()),
             config,
             circuit_breaker: None,
+            dlq_handler: None,
             shutdown_tx: None,
             event_emitter: Arc::new(NoOpEventEmitter::new()),
             stats: Arc::new(WorkerStats::new()),
+            mode: Arc::new(AtomicU8::new(WorkerMode::Normal as u8)),
+            dynamic_config: Arc::new(RwLock::new(dynamic_config)),
+            middleware_stack: None,
         };
 
         assert_eq!(worker.calculate_backoff_delay(0).as_millis(), 1000);
@@ -1251,8 +1893,10 @@ mod tests {
 
     #[test]
     fn test_worker_config_validate_concurrency_zero() {
-        let mut config = WorkerConfig::default();
-        config.concurrency = 0;
+        let config = WorkerConfig {
+            concurrency: 0,
+            ..Default::default()
+        };
         let result = config.validate();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Concurrency must be at least 1");
@@ -1260,9 +1904,11 @@ mod tests {
 
     #[test]
     fn test_worker_config_validate_batch_size_zero() {
-        let mut config = WorkerConfig::default();
-        config.enable_batch_dequeue = true;
-        config.batch_size = 0;
+        let config = WorkerConfig {
+            enable_batch_dequeue: true,
+            batch_size: 0,
+            ..Default::default()
+        };
         let result = config.validate();
         assert!(result.is_err());
         assert_eq!(
@@ -1273,8 +1919,10 @@ mod tests {
 
     #[test]
     fn test_worker_config_validate_timeout_zero() {
-        let mut config = WorkerConfig::default();
-        config.default_timeout_secs = 0;
+        let config = WorkerConfig {
+            default_timeout_secs: 0,
+            ..Default::default()
+        };
         let result = config.validate();
         assert!(result.is_err());
         assert_eq!(
@@ -1285,14 +1933,19 @@ mod tests {
 
     #[test]
     fn test_worker_config_validate_retry_delays() {
-        let mut config = WorkerConfig::default();
-        config.retry_base_delay_ms = 0;
+        let config = WorkerConfig {
+            retry_base_delay_ms: 0,
+            ..Default::default()
+        };
         let result = config.validate();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Retry base delay must be at least 1ms");
 
-        config.retry_base_delay_ms = 1000;
-        config.retry_max_delay_ms = 500;
+        let config = WorkerConfig {
+            retry_base_delay_ms: 1000,
+            retry_max_delay_ms: 500,
+            ..Default::default()
+        };
         let result = config.validate();
         assert!(result.is_err());
         assert_eq!(
@@ -1465,6 +2118,74 @@ mod tests {
         let display = format!("{}", config);
         assert!(display.contains("events=enabled"));
         assert!(display.contains("heartbeat=60s"));
+    }
+
+    #[test]
+    fn test_worker_config_for_development() {
+        let config = WorkerConfig::for_development();
+        assert_eq!(config.concurrency, 2);
+        assert_eq!(config.poll_interval_ms, 500);
+        assert!(config.track_memory_usage);
+        assert_eq!(config.metadata.environment(), Some("development"));
+    }
+
+    #[test]
+    fn test_worker_config_for_staging() {
+        let config = WorkerConfig::for_staging();
+        assert_eq!(config.concurrency, 8);
+        assert!(config.enable_circuit_breaker);
+        assert!(config.track_memory_usage);
+        assert!(config.enable_events);
+        assert_eq!(config.heartbeat_interval_secs, 30);
+        assert_eq!(config.metadata.environment(), Some("staging"));
+    }
+
+    #[test]
+    fn test_worker_config_for_production() {
+        let config = WorkerConfig::for_production();
+        assert_eq!(config.concurrency, 16);
+        assert!(config.enable_batch_dequeue);
+        assert!(config.enable_circuit_breaker);
+        assert_eq!(config.max_retries, 5);
+        assert!(config.enable_events);
+        assert_eq!(config.heartbeat_interval_secs, 30);
+        assert_eq!(config.metadata.environment(), Some("production"));
+    }
+
+    #[test]
+    fn test_worker_config_from_env() {
+        // Test default (development)
+        std::env::remove_var("CELERS_ENV");
+        let config = WorkerConfig::from_env();
+        assert_eq!(config.metadata.environment(), Some("development"));
+
+        // Test production
+        std::env::set_var("CELERS_ENV", "production");
+        let config = WorkerConfig::from_env();
+        assert_eq!(config.metadata.environment(), Some("production"));
+
+        // Test prod alias
+        std::env::set_var("CELERS_ENV", "prod");
+        let config = WorkerConfig::from_env();
+        assert_eq!(config.metadata.environment(), Some("production"));
+
+        // Test staging
+        std::env::set_var("CELERS_ENV", "staging");
+        let config = WorkerConfig::from_env();
+        assert_eq!(config.metadata.environment(), Some("staging"));
+
+        // Test stage alias
+        std::env::set_var("CELERS_ENV", "stage");
+        let config = WorkerConfig::from_env();
+        assert_eq!(config.metadata.environment(), Some("staging"));
+
+        // Test dev alias
+        std::env::set_var("CELERS_ENV", "dev");
+        let config = WorkerConfig::from_env();
+        assert_eq!(config.metadata.environment(), Some("development"));
+
+        // Clean up
+        std::env::remove_var("CELERS_ENV");
     }
 
     // Mock broker for testing

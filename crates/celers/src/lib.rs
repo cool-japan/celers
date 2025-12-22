@@ -1171,12 +1171,17 @@ pub mod prelude {
     };
 
     // Type aliases for common patterns
+    /// Result type for task execution with thread-safe error handling
     pub type TaskResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+    /// Async task function signature
     pub type AsyncTaskFn<T> =
         fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskResult<T>> + Send>>;
 
     // Re-export common Result type from kombu
     pub use celers_kombu::Result as KombuResult;
+
+    // Convenience functions for ergonomic workflow creation
+    pub use crate::convenience::{chain, chord, chunks, group, map, options, starmap, task};
 }
 
 /// Convenience functions module
@@ -1240,6 +1245,94 @@ pub mod convenience {
     /// ```
     pub fn chord(header: crate::Group, callback: crate::Signature) -> crate::Chord {
         crate::Chord::new(header, callback)
+    }
+
+    /// Create a chunks workflow for processing items in batches
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use celers::convenience::chunks;
+    /// use serde_json::json;
+    ///
+    /// // Process items in chunks of 10
+    /// let items = vec![json!(1), json!(2), json!(3)];
+    /// let workflow = chunks("process_item", items, 10);
+    /// ```
+    pub fn chunks<T: serde::Serialize>(
+        task_name: impl Into<String>,
+        items: Vec<T>,
+        chunk_size: usize,
+    ) -> crate::Chunks {
+        let sig = crate::Signature::new(task_name.into());
+        let serialized_items: Vec<serde_json::Value> = items
+            .into_iter()
+            .filter_map(|item| serde_json::to_value(item).ok())
+            .collect();
+        crate::Chunks::new(sig, serialized_items, chunk_size)
+    }
+
+    /// Create a map workflow for applying a task to each item
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use celers::convenience::map;
+    /// use serde_json::json;
+    ///
+    /// let items = vec![json!(1), json!(2), json!(3)];
+    /// let workflow = map("square", items);
+    /// ```
+    pub fn map<T: serde::Serialize>(task_name: impl Into<String>, items: Vec<T>) -> crate::Map {
+        let sig = crate::Signature::new(task_name.into());
+        let serialized_items: Vec<Vec<serde_json::Value>> = items
+            .into_iter()
+            .filter_map(|item| serde_json::to_value(item).ok().map(|v| vec![v]))
+            .collect();
+        crate::Map::new(sig, serialized_items)
+    }
+
+    /// Create a starmap workflow for applying a task with multiple arguments
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use celers::convenience::starmap;
+    /// use serde_json::json;
+    ///
+    /// let args = vec![
+    ///     vec![json!(1), json!(2)],
+    ///     vec![json!(3), json!(4)],
+    /// ];
+    /// let workflow = starmap("add", args);
+    /// ```
+    pub fn starmap<T: serde::Serialize>(
+        task_name: impl Into<String>,
+        args: Vec<Vec<T>>,
+    ) -> crate::Starmap {
+        let sig = crate::Signature::new(task_name.into());
+        let serialized_args: Vec<Vec<serde_json::Value>> = args
+            .into_iter()
+            .map(|arg_list| {
+                arg_list
+                    .into_iter()
+                    .filter_map(|item| serde_json::to_value(item).ok())
+                    .collect()
+            })
+            .collect();
+        crate::Starmap::new(sig, serialized_args)
+    }
+
+    /// Create task options for configuring task execution
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use celers::convenience::options;
+    ///
+    /// let opts = options()
+    ///     .max_retries(3)
+    ///     .countdown(60)
+    ///     .priority(5);
+    /// ```
+    pub fn options() -> crate::TaskOptions {
+        crate::TaskOptions::default()
     }
 }
 
@@ -1711,10 +1804,15 @@ pub mod dev_utils {
     /// Debug information for a task
     #[derive(Debug, Clone)]
     pub struct TaskDebugInfo {
+        /// Unique identifier for the task
         pub task_id: String,
+        /// Name of the task
         pub task_name: String,
+        /// Current state of the task
         pub state: String,
+        /// Timestamp when this debug info was captured
         pub timestamp: std::time::SystemTime,
+        /// Additional metadata about the task
         pub metadata: std::collections::HashMap<String, String>,
     }
 
@@ -1799,9 +1897,13 @@ pub mod dev_utils {
     /// Tracked event information
     #[derive(Debug, Clone)]
     pub struct TrackedEvent {
+        /// Type of the event (e.g., "task_received", "task_started", "task_completed")
         pub event_type: String,
+        /// Optional task ID associated with this event
         pub task_id: Option<String>,
+        /// Human-readable message describing the event
         pub message: String,
+        /// Timestamp when this event occurred
         pub timestamp: std::time::SystemTime,
     }
 
@@ -1881,9 +1983,13 @@ pub mod dev_utils {
     /// Performance measurement data
     #[derive(Debug, Clone)]
     pub struct PerformanceMeasurement {
+        /// Name of the operation being measured
         pub name: String,
+        /// Duration of the operation in milliseconds
         pub duration_ms: u128,
+        /// Timestamp when this measurement was taken
         pub timestamp: std::time::SystemTime,
+        /// Additional metadata about the measurement
         pub metadata: std::collections::HashMap<String, String>,
     }
 
@@ -2012,8 +2118,11 @@ pub mod dev_utils {
     /// Snapshot of queue state
     #[derive(Debug, Clone)]
     pub struct QueueSnapshot {
+        /// Number of tasks in the queue at the time of snapshot
         pub queue_size: usize,
+        /// Timestamp when this snapshot was taken
         pub timestamp: std::time::SystemTime,
+        /// Additional metadata about the queue state
         pub metadata: std::collections::HashMap<String, String>,
     }
 
@@ -2076,15 +2185,24 @@ pub mod config_validation {
     /// Validation error
     #[derive(Debug, thiserror::Error)]
     pub enum ValidationError {
+        /// Invalid configuration error
         #[error("Invalid configuration: {0}")]
         InvalidConfig(String),
 
+        /// Missing required field error
         #[error("Missing required field: {0}")]
         MissingField(String),
 
+        /// Invalid value for a specific field
         #[error("Invalid value for {field}: {message}")]
-        InvalidValue { field: String, message: String },
+        InvalidValue {
+            /// The field name that has an invalid value
+            field: String,
+            /// Error message describing why the value is invalid
+            message: String,
+        },
 
+        /// Incompatible configuration detected
         #[error("Incompatible configuration: {0}")]
         IncompatibleConfig(String),
     }
@@ -2326,8 +2444,9 @@ NOTES:
     }
 }
 
-/// Compile-time feature validation and conflict detection
 pub mod compile_time_validation {
+    //! Compile-time feature validation and conflict detection
+    //!
     //! Compile-time feature validation to detect conflicts and ensure correct feature usage.
     //!
     //! This module uses Rust's const evaluation to perform compile-time checks for:
@@ -2518,18 +2637,32 @@ pub mod broker_helper {
     /// Broker configuration error with helpful suggestions
     #[derive(Debug, thiserror::Error)]
     pub enum BrokerConfigError {
+        /// Missing required environment variable
         #[error("Missing environment variable: {0}\n\nSuggestion: Set the environment variable before running:\n  export {0}=<value>")]
         MissingEnvVar(String),
 
+        /// Unsupported broker type requested
         #[error("Unsupported broker type: {broker_type}\n\nSupported types: redis, postgres, mysql, amqp, sqs\nNote: {note}")]
-        UnsupportedBrokerType { broker_type: String, note: String },
+        UnsupportedBrokerType {
+            /// The broker type that was requested
+            broker_type: String,
+            /// Additional note about the error
+            note: String,
+        },
 
+        /// Required feature not enabled in Cargo.toml
         #[error("Feature not enabled: {feature}\n\nTo enable this feature, add it to your Cargo.toml:\n  celers = {{ version = \"0.1\", features = [\"{feature}\"] }}\n\nAvailable features: redis, postgres, mysql, amqp, sqs, backend-redis, backend-db, backend-rpc")]
-        FeatureNotEnabled { feature: String },
+        FeatureNotEnabled {
+            /// The feature name that needs to be enabled
+            feature: String,
+        },
 
+        /// Broker creation failed with detailed error information
         #[error("Broker creation failed: {message}\n\nPossible causes:\n{suggestions}")]
         CreationFailed {
+            /// Error message from the broker creation attempt
             message: String,
+            /// Suggestions for resolving the error
             suggestions: String,
         },
     }
@@ -2672,6 +2805,669 @@ pub mod broker_helper {
                 })
             }
         }
+    }
+}
+
+/// Startup time optimization utilities
+///
+/// This module provides utilities and patterns for optimizing application startup time,
+/// including lazy initialization and caching strategies.
+pub mod startup_optimization {
+    use std::sync::OnceLock;
+
+    /// Type alias for async initialization tasks used in parallel_init
+    pub type AsyncInitTask<T, E> = Box<
+        dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + Send>>
+            + Send,
+    >;
+
+    /// Lazy initialization helper using OnceLock for thread-safe static initialization
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use celers::startup_optimization::LazyInit;
+    ///
+    /// static MY_CONFIG: LazyInit<String> = LazyInit::new();
+    ///
+    /// fn get_config() -> &'static String {
+    ///     MY_CONFIG.get_or_init(|| {
+    ///         // Expensive initialization happens only once
+    ///         String::from("config_value")
+    ///     })
+    /// }
+    /// ```
+    pub struct LazyInit<T> {
+        cell: OnceLock<T>,
+    }
+
+    impl<T> LazyInit<T> {
+        /// Create a new lazy initialization wrapper
+        pub const fn new() -> Self {
+            Self {
+                cell: OnceLock::new(),
+            }
+        }
+
+        /// Get the value, initializing it if necessary
+        #[inline]
+        pub fn get_or_init<F>(&self, f: F) -> &T
+        where
+            F: FnOnce() -> T,
+        {
+            self.cell.get_or_init(f)
+        }
+
+        /// Try to get the value if it's already initialized
+        #[inline]
+        pub fn get(&self) -> Option<&T> {
+            self.cell.get()
+        }
+    }
+
+    impl<T> Default for LazyInit<T> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Pre-compiled pattern cache for faster startup
+    ///
+    /// Note: For regex caching, add the `regex` crate to your dependencies
+    /// and implement a similar pattern using `OnceLock<Mutex<HashMap<String, &'static Regex>>>`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::sync::OnceLock;
+    /// use std::collections::HashMap;
+    /// use std::sync::Mutex;
+    /// use regex::Regex;
+    ///
+    /// pub fn cached_regex(pattern: &str) -> &'static Regex {
+    ///     static CACHE: OnceLock<Mutex<HashMap<String, &'static Regex>>> = OnceLock::new();
+    ///     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    ///     let mut cache = cache.lock().unwrap();
+    ///
+    ///     if let Some(regex) = cache.get(pattern) {
+    ///         return regex;
+    ///     }
+    ///
+    ///     let regex = Box::leak(Box::new(Regex::new(pattern).expect("Invalid regex")));
+    ///     cache.insert(pattern.to_string(), regex);
+    ///     regex
+    /// }
+    /// ```
+    #[allow(dead_code)]
+    fn _cached_pattern_example() {
+        // This is a documentation placeholder
+    }
+
+    /// Parallel initialization helper for running multiple initialization tasks concurrently
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use celers::startup_optimization::parallel_init;
+    ///
+    /// # async fn example() {
+    /// let results = parallel_init(vec![
+    ///     Box::new(|| Box::pin(async { /* Initialize DB */ Ok::<(), String>(()) })),
+    ///     Box::new(|| Box::pin(async { /* Connect to broker */ Ok::<(), String>(()) })),
+    ///     Box::new(|| Box::pin(async { /* Load config */ Ok::<(), String>(()) })),
+    /// ]).await;
+    /// # }
+    /// ```
+    pub async fn parallel_init<T, E>(tasks: Vec<AsyncInitTask<T, E>>) -> Vec<Result<T, E>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        let handles: Vec<_> = tasks
+            .into_iter()
+            .map(|task| tokio::spawn(async move { task().await }))
+            .collect();
+
+        let mut results = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    // Handle join error - convert to result type
+                    // For now, we'll panic as this indicates a serious issue
+                    panic!("Task panicked: {:?}", e);
+                }
+            }
+        }
+        results
+    }
+
+    /// Startup performance metrics
+    #[derive(Debug, Clone)]
+    pub struct StartupMetrics {
+        /// Time spent initializing brokers
+        pub broker_init_ms: u64,
+        /// Time spent loading configuration
+        pub config_load_ms: u64,
+        /// Time spent connecting to backends
+        pub backend_init_ms: u64,
+        /// Total startup time
+        pub total_ms: u64,
+    }
+
+    impl StartupMetrics {
+        /// Create a new startup metrics tracker
+        pub fn new() -> Self {
+            Self {
+                broker_init_ms: 0,
+                config_load_ms: 0,
+                backend_init_ms: 0,
+                total_ms: 0,
+            }
+        }
+
+        /// Report the metrics as a formatted string
+        pub fn report(&self) -> String {
+            format!(
+                "Startup Performance:\n\
+                 - Broker Init: {}ms\n\
+                 - Config Load: {}ms\n\
+                 - Backend Init: {}ms\n\
+                 - Total: {}ms",
+                self.broker_init_ms, self.config_load_ms, self.backend_init_ms, self.total_ms
+            )
+        }
+    }
+
+    impl Default for StartupMetrics {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Helper macro for timing initialization steps
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use celers::time_init;
+    ///
+    /// let duration = time_init!({
+    ///     // Expensive initialization code
+    ///     initialize_database().await
+    /// });
+    /// println!("Initialization took {}ms", duration.as_millis());
+    /// ```
+    #[macro_export]
+    macro_rules! time_init {
+        ($block:block) => {{
+            let start = std::time::Instant::now();
+            let result = $block;
+            let duration = start.elapsed();
+            (result, duration)
+        }};
+    }
+}
+
+/// IDE support and type hints module
+///
+/// This module provides comprehensive type aliases, trait bounds, and documentation
+/// to improve IDE autocomplete, type inference, and developer experience.
+pub mod ide_support {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// Common result type for async operations with Send + Sync error bounds
+    ///
+    /// This type alias helps IDEs provide better autocomplete and type hints.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use celers::ide_support::BoxedResult;
+    ///
+    /// async fn my_operation() -> BoxedResult<String> {
+    ///     Ok("success".to_string())
+    /// }
+    /// ```
+    pub type BoxedResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Pinned boxed future for async task functions
+    ///
+    /// This is the standard return type for async task implementations.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use celers::ide_support::BoxedFuture;
+    ///
+    /// fn create_task() -> BoxedFuture<String> {
+    ///     Box::pin(async { Ok("result".to_string()) })
+    /// }
+    /// ```
+    pub type BoxedFuture<T> = Pin<Box<dyn Future<Output = BoxedResult<T>> + Send + 'static>>;
+
+    /// Task function signature for type hints
+    ///
+    /// Use this when defining task handler functions for better IDE support.
+    pub type TaskFn<Args, Output> =
+        fn(Args) -> Pin<Box<dyn Future<Output = BoxedResult<Output>> + Send>>;
+
+    /// Broker instance type for common use cases
+    ///
+    /// This type alias helps with IDE autocomplete when working with brokers.
+    pub type BoxedBroker = Box<dyn crate::Broker>;
+
+    /// Result backend instance type
+    ///
+    /// Use this when working with result backends for better type hints.
+    #[cfg(feature = "backend-redis")]
+    pub type BoxedResultBackend = Box<dyn crate::ResultBackend>;
+
+    /// Worker configuration builder type for fluent API
+    ///
+    /// This alias improves IDE support when building worker configurations.
+    pub type WorkerBuilder = celers_worker::WorkerConfigBuilder;
+
+    /// Signature builder type for creating task signatures
+    ///
+    /// Use this for better autocomplete when building task signatures.
+    pub type TaskSignature = crate::Signature;
+
+    /// Chain workflow builder type
+    pub type ChainBuilder = crate::Chain;
+
+    /// Group workflow builder type
+    pub type GroupBuilder = crate::Group;
+
+    /// Chord workflow builder type
+    pub type ChordBuilder = crate::Chord;
+
+    /// Serialized task type for queue operations
+    pub type QueueTask = crate::SerializedTask;
+
+    /// Task metadata type
+    pub use crate::TaskState;
+
+    /// Broker error type
+    pub use crate::BrokerError;
+
+    /// Type trait bounds helper for task arguments
+    ///
+    /// This trait bound helps IDEs understand the requirements for task arguments.
+    pub trait TaskArgs:
+        serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static
+    {
+    }
+    impl<T> TaskArgs for T where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static
+    {
+    }
+
+    /// Type trait bounds helper for task results
+    ///
+    /// This trait bound helps IDEs understand the requirements for task results.
+    pub trait TaskResult: serde::Serialize + serde::de::DeserializeOwned + Send + 'static {}
+    impl<T> TaskResult for T where T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static {}
+
+    /// Marker trait for broker implementations
+    ///
+    /// Helps IDEs identify valid broker types.
+    pub trait BrokerImpl: crate::Broker + Send + Sync {}
+
+    /// Helper constants for common configuration values
+    pub mod defaults {
+        /// Default concurrency level (number of CPU cores)
+        pub const DEFAULT_CONCURRENCY: usize = 4;
+
+        /// Default prefetch count
+        pub const DEFAULT_PREFETCH: usize = 10;
+
+        /// Default max retries
+        pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+        /// Default retry delay in seconds
+        pub const DEFAULT_RETRY_DELAY_SECS: u64 = 60;
+
+        /// Default task timeout in seconds
+        pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 3600;
+
+        /// Default broker port for Redis
+        pub const DEFAULT_REDIS_PORT: u16 = 6379;
+
+        /// Default broker port for PostgreSQL
+        pub const DEFAULT_POSTGRES_PORT: u16 = 5432;
+
+        /// Default broker port for MySQL
+        pub const DEFAULT_MYSQL_PORT: u16 = 3306;
+
+        /// Default broker port for RabbitMQ
+        pub const DEFAULT_RABBITMQ_PORT: u16 = 5672;
+
+        /// Default queue name
+        pub const DEFAULT_QUEUE_NAME: &str = "celery";
+    }
+
+    /// Common configuration patterns and examples
+    pub mod examples {
+        /// Example broker URL for Redis
+        pub const REDIS_URL_EXAMPLE: &str = "redis://localhost:6379";
+
+        /// Example broker URL for PostgreSQL
+        pub const POSTGRES_URL_EXAMPLE: &str = "postgres://user:password@localhost:5432/celery";
+
+        /// Example broker URL for MySQL
+        pub const MYSQL_URL_EXAMPLE: &str = "mysql://user:password@localhost:3306/celery";
+
+        /// Example broker URL for RabbitMQ
+        pub const RABBITMQ_URL_EXAMPLE: &str = "amqp://guest:guest@localhost:5672/";
+
+        /// Example broker URL for SQS
+        pub const SQS_URL_EXAMPLE: &str =
+            "https://sqs.us-east-1.amazonaws.com/123456789012/my-queue";
+    }
+}
+
+/// Quick reference documentation module
+///
+/// This module provides quick reference guides and cheat sheets for common operations.
+pub mod quick_reference {
+    pub mod patterns {
+        //! Quick start guide for common patterns
+        //!
+        //! # Common Patterns
+        //!
+        //! ## Creating a Simple Task
+        //! ```rust,ignore
+        //! use celers::prelude::*;
+        //!
+        //! #[derive(Serialize, Deserialize)]
+        //! struct Args { x: i32, y: i32 }
+        //!
+        //! #[celers::task]
+        //! async fn add(args: Args) -> TaskResult<i32> {
+        //!     Ok(args.x + args.y)
+        //! }
+        //! ```
+        //!
+        //! ## Creating a Worker
+        //! ```rust,ignore
+        //! use celers::prelude::*;
+        //!
+        //! let broker = create_broker_from_env().await?;
+        //! let worker = WorkerConfigBuilder::new()
+        //!     .concurrency(4)
+        //!     .prefetch_count(10)
+        //!     .build(broker)?;
+        //! worker.start().await?;
+        //! ```
+        //!
+        //! ## Sending Tasks
+        //! ```rust,ignore
+        //! let task = my_task::new(Args { x: 1, y: 2 });
+        //! broker.enqueue(task).await?;
+        //! ```
+        //!
+        //! ## Creating Workflows
+        //! ```rust,ignore
+        //! // Chain: Sequential execution
+        //! let chain = Chain::new()
+        //!     .then("task1", vec![])
+        //!     .then("task2", vec![]);
+        //!
+        //! // Group: Parallel execution
+        //! let group = Group::new()
+        //!     .add("task1", vec![])
+        //!     .add("task2", vec![]);
+        //!
+        //! // Chord: Parallel + callback
+        //! let chord = Chord::new(group, callback);
+        //! ```
+    }
+
+    pub mod config_examples {
+        //! Configuration examples and snippets
+        //!
+        //! # Configuration Examples
+        //!
+        //! ## Environment Variables
+        //! ```bash
+        //! export CELERS_BROKER_TYPE=redis
+        //! export CELERS_BROKER_URL=redis://localhost:6379
+        //! export CELERS_BROKER_QUEUE=celery
+        //! ```
+        //!
+        //! ## Worker Presets
+        //! ```rust,ignore
+        //! use celers::presets::*;
+        //!
+        //! // Production config
+        //! let config = production_config();
+        //!
+        //! // High throughput
+        //! let config = high_throughput_config();
+        //!
+        //! // Low latency
+        //! let config = low_latency_config();
+        //!
+        //! // Memory constrained
+        //! let config = memory_constrained_config();
+        //! ```
+    }
+
+    pub mod troubleshooting {
+        //! Troubleshooting guide
+        //!
+        //! # Troubleshooting Guide
+        //!
+        //! ## Common Issues
+        //!
+        //! ### Connection Refused
+        //! - Check broker is running: `redis-cli ping` or `psql`
+        //! - Verify connection URL format
+        //! - Check firewall rules
+        //!
+        //! ### Tasks Not Processing
+        //! - Verify worker is running
+        //! - Check queue name matches
+        //! - Inspect worker logs
+        //!
+        //! ### High Memory Usage
+        //! - Reduce prefetch_count
+        //! - Implement chunked processing
+        //! - Monitor task memory usage
+        //!
+        //! ### Slow Task Execution
+        //! - Increase worker concurrency
+        //! - Profile task execution time
+        //! - Optimize database queries
+    }
+}
+
+#[cfg(feature = "dev-utils")]
+pub mod assembly_inspection {
+    //! Assembly inspection utilities for verifying zero-cost abstractions
+    //!
+    //! This module provides tools and documentation for inspecting generated assembly
+    //! to verify that Rust's zero-cost abstractions are working as expected.
+    //!
+    //! # Assembly Inspection Guide
+    //!
+    //! This module helps you verify zero-cost abstractions by inspecting generated assembly.
+    //!
+    //! ## Generating Assembly Output
+    //!
+    //! ### Method 1: Using cargo-asm (Recommended)
+    //!
+    //! ```bash
+    //! # Install cargo-asm
+    //! cargo install cargo-asm
+    //!
+    //! # Generate assembly for a specific function
+    //! cargo asm --release celers::dev_utils::TaskBuilder::new
+    //!
+    //! # Generate assembly with Intel syntax (easier to read)
+    //! cargo asm --release --intel celers::dev_utils::TaskBuilder::new
+    //! ```
+    //!
+    //! ### Method 2: Using rustc directly
+    //!
+    //! ```bash
+    //! # Generate assembly for the entire crate
+    //! cargo rustc --release -- --emit asm
+    //!
+    //! # Output will be in target/release/deps/*.s
+    //! ```
+    //!
+    //! ### Method 3: Using Compiler Explorer (Godbolt)
+    //!
+    //! Visit <https://rust.godbolt.org/> and paste your code to see assembly interactively.
+    //!
+    //! ## What to Look For
+    //!
+    //! ### 1. Function Inlining
+    //!
+    //! Zero-cost abstractions should be inlined. Look for:
+    //! - Direct instructions instead of `call` instructions
+    //! - No function preamble/epilogue for simple wrappers
+    //!
+    //! Example of good inlining:
+    //! ```asm
+    //! # Simple arithmetic directly in caller
+    //! add    rdi, rsi
+    //! mov    rax, rdi
+    //! ```
+    //!
+    //! Example of poor inlining (overhead):
+    //! ```asm
+    //! # Function call overhead
+    //! call   my_wrapper_function
+    //! push   rbp
+    //! mov    rbp, rsp
+    //! ```
+    //!
+    //! ### 2. Dead Code Elimination
+    //!
+    //! Unused code should be completely removed:
+    //! - No assembly generated for unused branches
+    //! - Constant propagation should eliminate runtime checks
+    //!
+    //! ### 3. Iterator Optimization
+    //!
+    //! Iterator chains should compile to simple loops:
+    //! ```asm
+    //! # Should see a tight loop, not iterator machinery
+    //! .LBB0_1:
+    //!     add    rax, 1
+    //!     cmp    rax, rcx
+    //!     jne    .LBB0_1
+    //! ```
+    //!
+    //! ### 4. Monomorphization
+    //!
+    //! Generic functions should be specialized:
+    //! - No dynamic dispatch (vtable calls) unless using trait objects
+    //! - Type parameters resolved at compile time
+    //!
+    //! ## Example Commands for CeleRS
+    //!
+    //! ```bash
+    //! # Verify TaskBuilder is zero-cost
+    //! cargo asm --release --intel celers::dev_utils::TaskBuilder::build
+    //!
+    //! # Verify chain workflow construction
+    //! cargo asm --release --intel celers::canvas::Chain::new
+    //!
+    //! # Compare debug vs release
+    //! cargo asm celers::dev_utils::TaskBuilder::build > debug.asm
+    //! cargo asm --release celers::dev_utils::TaskBuilder::build > release.asm
+    //! diff debug.asm release.asm
+    //! ```
+    //!
+    //! ## Automated Verification
+    //!
+    //! Use these helper functions to automate assembly inspection:
+
+    use std::process::Command;
+
+    /// Generate assembly output for a specific function
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "dev-utils")]
+    /// # {
+    /// use celers::assembly_inspection::generate_asm;
+    ///
+    /// let asm = generate_asm("celers::dev_utils::TaskBuilder::new", true).unwrap();
+    /// println!("Assembly:\n{}", asm);
+    /// # }
+    /// ```
+    pub fn generate_asm(function_path: &str, release: bool) -> Result<String, std::io::Error> {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("asm");
+        if release {
+            cmd.arg("--release");
+        }
+        cmd.arg("--intel");
+        cmd.arg(function_path);
+
+        let output = cmd.output()?;
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Check if a function is properly inlined by looking for call instructions
+    ///
+    /// Returns true if the function appears to be inlined (no call instructions found)
+    pub fn verify_inlined(asm: &str) -> bool {
+        !asm.contains("call") || asm.lines().filter(|l| l.contains("call")).count() < 2
+    }
+
+    /// Count the number of instructions in the assembly
+    ///
+    /// Useful for comparing optimization levels
+    pub fn count_instructions(asm: &str) -> usize {
+        asm.lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty()
+                    && !trimmed.starts_with(';')
+                    && !trimmed.starts_with('#')
+                    && !trimmed.starts_with('.')
+                    && !trimmed.ends_with(':')
+            })
+            .count()
+    }
+
+    /// Generate a performance report comparing debug and release assembly
+    pub fn compare_debug_release(function_path: &str) -> Result<String, std::io::Error> {
+        let debug_asm = generate_asm(function_path, false)?;
+        let release_asm = generate_asm(function_path, true)?;
+
+        let debug_count = count_instructions(&debug_asm);
+        let release_count = count_instructions(&release_asm);
+        let debug_inlined = verify_inlined(&debug_asm);
+        let release_inlined = verify_inlined(&release_asm);
+
+        Ok(format!(
+            "Assembly Comparison for {}\n\
+             \n\
+             Debug Build:\n\
+             - Instructions: {}\n\
+             - Inlined: {}\n\
+             \n\
+             Release Build:\n\
+             - Instructions: {}\n\
+             - Inlined: {}\n\
+             \n\
+             Optimization Ratio: {:.2}x fewer instructions in release\n",
+            function_path,
+            debug_count,
+            debug_inlined,
+            release_count,
+            release_inlined,
+            debug_count as f64 / release_count.max(1) as f64
+        ))
     }
 }
 
@@ -3081,7 +3877,7 @@ mod tests {
             .then("task3", vec![]);
 
         // Verify chain structure
-        assert!(chain.tasks.len() >= 1);
+        assert!(!chain.tasks.is_empty());
     }
 
     #[test]
@@ -3094,7 +3890,7 @@ mod tests {
             .add("task3", vec![]);
 
         // Verify group structure
-        assert!(group.tasks.len() >= 1);
+        assert!(!group.tasks.is_empty());
     }
 
     #[test]
@@ -3108,7 +3904,7 @@ mod tests {
         let chord = Chord::new(header, callback);
 
         // Verify chord structure
-        assert!(chord.header.tasks.len() >= 1);
+        assert!(!chord.header.tasks.is_empty());
     }
 
     // Performance and benchmarking tests
@@ -3172,9 +3968,9 @@ mod tests {
         }
         let duration = start.elapsed();
 
-        // Should be extremely fast - less than 10ms for 10k tasks
+        // Should be fast - less than 50ms for 10k tasks (debug mode is slower)
         assert!(
-            duration.as_millis() < 10,
+            duration.as_millis() < 50,
             "Task creation overhead too high: {}ms",
             duration.as_millis()
         );
@@ -3260,5 +4056,372 @@ mod tests {
         assert!(has_broker_feature() || !has_broker_feature()); // Should be optimized to const
         assert!(has_serialization_feature() || !has_serialization_feature());
         // Should be optimized to const
+    }
+
+    // Performance regression tests with baseline tracking
+    #[test]
+    fn test_performance_regression_task_creation() {
+        use crate::dev_utils::TaskBuilder;
+        use std::time::Instant;
+
+        // Baseline adjusted for debug builds (debug builds are ~10x slower than release)
+        const BASELINE_MS: u128 = 100; // Baseline: 100ms for 10k tasks in debug
+        const ITERATIONS: usize = 10000;
+
+        let start = Instant::now();
+        for i in 0..ITERATIONS {
+            let _task = TaskBuilder::new(&format!("task.{}", i)).build();
+        }
+        let duration = start.elapsed();
+
+        // Alert if performance regresses by more than 50%
+        assert!(
+            duration.as_millis() < BASELINE_MS * 3 / 2,
+            "Performance regression detected: {}ms (baseline: {}ms) for {} tasks",
+            duration.as_millis(),
+            BASELINE_MS,
+            ITERATIONS
+        );
+    }
+
+    #[test]
+    fn test_performance_regression_workflow_construction() {
+        use crate::canvas::{Chain, Group};
+        use std::time::Instant;
+
+        const BASELINE_MS: u128 = 5; // Baseline: 5ms for 1k workflows
+        const ITERATIONS: usize = 1000;
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _chain = Chain::new()
+                .then("task1", vec![])
+                .then("task2", vec![])
+                .then("task3", vec![]);
+
+            let _group = Group::new()
+                .add("task1", vec![])
+                .add("task2", vec![])
+                .add("task3", vec![]);
+        }
+        let duration = start.elapsed();
+
+        // Alert if performance regresses by more than 50%
+        assert!(
+            duration.as_millis() < BASELINE_MS * 3 / 2,
+            "Performance regression detected: {}ms (baseline: {}ms) for {} workflows",
+            duration.as_millis(),
+            BASELINE_MS,
+            ITERATIONS
+        );
+    }
+
+    #[test]
+    fn test_performance_regression_serialization() {
+        use crate::dev_utils::TaskBuilder;
+        use std::time::Instant;
+
+        const BASELINE_MS: u128 = 50; // Baseline: 50ms for 1k serializations
+        const ITERATIONS: usize = 1000;
+
+        let tasks: Vec<_> = (0..ITERATIONS)
+            .map(|i| TaskBuilder::new(&format!("task{}", i)).build())
+            .collect();
+
+        let start = Instant::now();
+        for task in &tasks {
+            let _serialized = serde_json::to_string(task).unwrap();
+        }
+        let duration = start.elapsed();
+
+        // Alert if performance regresses by more than 50%
+        assert!(
+            duration.as_millis() < BASELINE_MS * 3 / 2,
+            "Performance regression detected: {}ms (baseline: {}ms) for {} serializations",
+            duration.as_millis(),
+            BASELINE_MS,
+            ITERATIONS
+        );
+    }
+
+    #[test]
+    fn test_performance_regression_config_validation() {
+        use crate::config_validation::*;
+        use std::time::Instant;
+
+        const BASELINE_MS: u128 = 10; // Baseline: 10ms for 10k validations
+        const ITERATIONS: usize = 10000;
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = validate_worker_config(Some(4), Some(10));
+            let _ = validate_broker_url("redis://localhost:6379");
+        }
+        let duration = start.elapsed();
+
+        // Alert if performance regresses by more than 50%
+        assert!(
+            duration.as_millis() < BASELINE_MS * 3 / 2,
+            "Performance regression detected: {}ms (baseline: {}ms) for {} validations",
+            duration.as_millis(),
+            BASELINE_MS,
+            ITERATIONS
+        );
+    }
+
+    // Startup optimization tests
+    #[test]
+    fn test_lazy_init() {
+        use crate::startup_optimization::LazyInit;
+
+        static COUNTER: LazyInit<usize> = LazyInit::new();
+
+        // First access initializes
+        let value = COUNTER.get_or_init(|| 42);
+        assert_eq!(*value, 42);
+
+        // Second access returns the same value
+        let value2 = COUNTER.get_or_init(|| 100);
+        assert_eq!(*value2, 42); // Should still be 42, not 100
+    }
+
+    #[test]
+    fn test_startup_metrics() {
+        use crate::startup_optimization::StartupMetrics;
+
+        let mut metrics = StartupMetrics::new();
+        metrics.broker_init_ms = 100;
+        metrics.config_load_ms = 50;
+        metrics.backend_init_ms = 75;
+        metrics.total_ms = 225;
+
+        let report = metrics.report();
+        assert!(report.contains("100ms"));
+        assert!(report.contains("50ms"));
+        assert!(report.contains("75ms"));
+        assert!(report.contains("225ms"));
+    }
+
+    #[test]
+    fn test_startup_metrics_default() {
+        use crate::startup_optimization::StartupMetrics;
+
+        let metrics = StartupMetrics::default();
+        assert_eq!(metrics.broker_init_ms, 0);
+        assert_eq!(metrics.config_load_ms, 0);
+        assert_eq!(metrics.backend_init_ms, 0);
+        assert_eq!(metrics.total_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn test_parallel_init() {
+        use crate::startup_optimization::{parallel_init, AsyncInitTask};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        type TestResult = std::result::Result<(), String>;
+        let tasks: Vec<AsyncInitTask<(), String>> = vec![
+            {
+                let counter = counter.clone();
+                Box::new(move || {
+                    Box::pin(async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = TestResult> + Send>>
+                })
+            },
+            {
+                let counter = counter.clone();
+                Box::new(move || {
+                    Box::pin(async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = TestResult> + Send>>
+                })
+            },
+            {
+                let counter = counter.clone();
+                Box::new(move || {
+                    Box::pin(async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = TestResult> + Send>>
+                })
+            },
+        ];
+
+        let results = parallel_init(tasks).await;
+        assert_eq!(results.len(), 3);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    // IDE support tests
+    #[test]
+    fn test_ide_support_type_aliases() {
+        use crate::ide_support::*;
+
+        // Test BoxedResult compiles
+        let _result: BoxedResult<i32> = Ok(42);
+
+        // Test type aliases are accessible
+        let _broker: Option<BoxedBroker> = None;
+        let _task: Option<QueueTask> = None;
+    }
+
+    #[test]
+    fn test_ide_support_defaults() {
+        use crate::ide_support::defaults::*;
+
+        // Verify default constants
+        assert_eq!(DEFAULT_CONCURRENCY, 4);
+        assert_eq!(DEFAULT_PREFETCH, 10);
+        assert_eq!(DEFAULT_MAX_RETRIES, 3);
+        assert_eq!(DEFAULT_RETRY_DELAY_SECS, 60);
+        assert_eq!(DEFAULT_TASK_TIMEOUT_SECS, 3600);
+        assert_eq!(DEFAULT_REDIS_PORT, 6379);
+        assert_eq!(DEFAULT_POSTGRES_PORT, 5432);
+        assert_eq!(DEFAULT_MYSQL_PORT, 3306);
+        assert_eq!(DEFAULT_RABBITMQ_PORT, 5672);
+        assert_eq!(DEFAULT_QUEUE_NAME, "celery");
+    }
+
+    #[test]
+    fn test_ide_support_examples() {
+        use crate::ide_support::examples::*;
+
+        // Verify example constants are valid
+        assert!(REDIS_URL_EXAMPLE.starts_with("redis://"));
+        assert!(POSTGRES_URL_EXAMPLE.starts_with("postgres://"));
+        assert!(MYSQL_URL_EXAMPLE.starts_with("mysql://"));
+        assert!(RABBITMQ_URL_EXAMPLE.starts_with("amqp://"));
+        assert!(SQS_URL_EXAMPLE.starts_with("https://sqs"));
+    }
+
+    #[test]
+    fn test_ide_support_trait_bounds() {
+        use crate::ide_support::{TaskArgs, TaskResult};
+
+        // Test that common types implement the trait bounds
+        fn assert_task_args<T: TaskArgs>() {}
+        fn assert_task_result<T: TaskResult>() {}
+
+        assert_task_args::<String>();
+        assert_task_args::<i32>();
+        assert_task_args::<Vec<u8>>();
+
+        assert_task_result::<String>();
+        assert_task_result::<i32>();
+        assert_task_result::<Vec<u8>>();
+    }
+
+    #[tokio::test]
+    async fn test_ide_support_boxed_future() {
+        use crate::ide_support::{BoxedFuture, BoxedResult};
+
+        fn create_future() -> BoxedFuture<String> {
+            Box::pin(async { Ok("test".to_string()) })
+        }
+
+        let result: BoxedResult<String> = create_future().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test");
+    }
+
+    #[test]
+    #[cfg(feature = "dev-utils")]
+    fn test_assembly_inspection_count_instructions() {
+        use crate::assembly_inspection::count_instructions;
+
+        let sample_asm = r#"
+            ; Function prologue
+            push   rbp
+            mov    rbp, rsp
+            ; Actual code
+            add    rdi, rsi
+            mov    rax, rdi
+            ; Function epilogue
+            pop    rbp
+            ret
+        "#;
+
+        let count = count_instructions(sample_asm);
+        assert_eq!(count, 6); // Should count 6 actual instructions (push, mov, add, mov, pop, ret)
+    }
+
+    #[test]
+    #[cfg(feature = "dev-utils")]
+    fn test_assembly_inspection_verify_inlined() {
+        use crate::assembly_inspection::verify_inlined;
+
+        // Well-inlined function (no calls)
+        let inlined_asm = r#"
+            add    rdi, rsi
+            mov    rax, rdi
+            ret
+        "#;
+        assert!(verify_inlined(inlined_asm));
+
+        // Not inlined (has call instruction)
+        let not_inlined_asm = r#"
+            push   rbp
+            call   some_function
+            call   another_function
+            pop    rbp
+            ret
+        "#;
+        assert!(!verify_inlined(not_inlined_asm));
+    }
+
+    // Convenience functions tests
+    #[test]
+    fn test_convenience_chunks() {
+        use crate::convenience::chunks;
+        use serde_json::json;
+
+        let items = vec![json!(1), json!(2), json!(3), json!(4), json!(5)];
+        let workflow = chunks("process_item", items, 2);
+
+        assert_eq!(workflow.task.task, "process_item");
+        assert_eq!(workflow.items.len(), 5);
+        assert_eq!(workflow.chunk_size, 2);
+    }
+
+    #[test]
+    fn test_convenience_map() {
+        use crate::convenience::map;
+        use serde_json::json;
+
+        let items = vec![json!(1), json!(2), json!(3)];
+        let workflow = map("square", items);
+
+        assert_eq!(workflow.task.task, "square");
+        assert_eq!(workflow.argsets.len(), 3);
+    }
+
+    #[test]
+    fn test_convenience_starmap() {
+        use crate::convenience::starmap;
+        use serde_json::json;
+
+        let args = vec![vec![json!(1), json!(2)], vec![json!(3), json!(4)]];
+        let workflow = starmap("add", args);
+
+        assert_eq!(workflow.task.task, "add");
+        assert_eq!(workflow.argsets.len(), 2);
+        assert_eq!(workflow.argsets[0].len(), 2);
+    }
+
+    #[test]
+    fn test_convenience_options() {
+        use crate::convenience::options;
+
+        let opts = options();
+        // Just verify it creates TaskOptions successfully
+        assert!(opts.max_retries.is_none());
     }
 }

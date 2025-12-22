@@ -101,6 +101,31 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 - [x] `publish_batch_chunked()` - Auto-chunk large batches into groups of 10
 - [x] Prevent API errors from oversized messages
 
+### Enhanced Caching & Auto-creation ✅
+- [x] Multi-queue URL caching with HashMap (improves multi-queue performance)
+- [x] `with_auto_create_queue()` - Automatically create queue if it doesn't exist
+- [x] `clear_queue_url_cache()` - Clear queue URL cache for troubleshooting
+- [x] Improved cache management in connect/disconnect operations
+
+### Message Compression ✅
+- [x] `with_compression()` - Enable compression for messages larger than threshold
+- [x] Gzip compression support for large messages
+- [x] Automatic decompression on receive
+- [x] Base64 encoding for compressed payloads
+- [x] Compression marker for backward compatibility
+
+### Retry & Resilience ✅
+- [x] `with_retry_config()` - Configure retry behavior for AWS API calls
+- [x] Exponential backoff retry mechanism
+- [x] Configurable max retries and base delay
+- [x] Automatic retry for transient AWS failures
+
+### DLQ Monitoring & Management ✅
+- [x] `get_dlq_messages()` - Retrieve messages from Dead Letter Queue
+- [x] `redrive_dlq_message()` - Move message from DLQ back to main queue
+- [x] `get_dlq_stats()` - Get DLQ statistics
+- [x] Simplified DLQ management and troubleshooting
+
 ## AWS SQS Specifics
 
 ### Message Attributes
@@ -185,7 +210,9 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 - [x] CloudWatch Alarms tests (6 tests)
 - [x] Configuration presets tests (3 tests)
 - [x] Message size validation tests (3 tests)
-- [x] 48 total unit tests passing
+- [x] 53 total unit tests passing (includes 5 compression/retry tests)
+- [x] 17 doc tests (all ignored for AWS credentials)
+- [x] Zero warnings (cargo test, cargo clippy --all-targets -- -D warnings)
 - [x] Integration tests with LocalStack (12 tests in `/tmp/celers_sqs_integration_tests.rs`)
 - [x] Integration tests with real AWS SQS (same tests work with real credentials)
 - [x] Performance benchmarks (8 scenarios in `/tmp/celers_sqs_benchmarks.rs`)
@@ -211,6 +238,8 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 - `aws-sdk-cloudwatch`: CloudWatch metrics publishing
 - `serde_json`: Message serialization
 - `tracing`: Logging
+- `flate2`: Gzip compression support
+- `base64`: Base64 encoding for compressed messages
 
 ## AWS IAM Requirements
 

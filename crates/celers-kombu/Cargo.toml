@@ -1,6 +1,6 @@
 [package]
 name = "celers-kombu"
-version = "0.1.0"
+version = "0.4.5"
 edition = "2021"
 authors = ["CeleRS Contributors"]
 description = "Broker abstraction layer for CeleRS (inspired by Python Kombu)"

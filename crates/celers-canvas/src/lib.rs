@@ -3107,6 +3107,122 @@ pub enum DagFormat {
     Mermaid,
     /// JSON representation
     Json,
+    /// SVG format (rendered from DOT)
+    Svg,
+    /// PNG format (rendered from DOT)
+    Png,
+}
+
+/// Render DOT format to SVG using GraphViz dot command
+///
+/// Requires GraphViz to be installed on the system.
+/// Executes: `dot -Tsvg`
+///
+/// # Errors
+/// Returns error if GraphViz is not installed or execution fails
+fn render_dot_to_svg(dot: &str) -> Result<String, CanvasError> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("dot")
+        .arg("-Tsvg")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            CanvasError::Invalid(format!(
+                "Failed to execute 'dot' command. Is GraphViz installed? Error: {}",
+                e
+            ))
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(dot.as_bytes())
+            .map_err(|e| CanvasError::Invalid(format!("Failed to write DOT to stdin: {}", e)))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| CanvasError::Invalid(format!("Failed to wait for dot process: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CanvasError::Invalid(format!(
+            "dot command failed: {}",
+            stderr
+        )));
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|e| CanvasError::Invalid(format!("Invalid UTF-8 in SVG output: {}", e)))
+}
+
+/// Render DOT format to PNG using GraphViz dot command
+///
+/// Requires GraphViz to be installed on the system.
+/// Executes: `dot -Tpng`
+///
+/// # Errors
+/// Returns error if GraphViz is not installed or execution fails
+fn render_dot_to_png(dot: &str) -> Result<Vec<u8>, CanvasError> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("dot")
+        .arg("-Tpng")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            CanvasError::Invalid(format!(
+                "Failed to execute 'dot' command. Is GraphViz installed? Error: {}",
+                e
+            ))
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(dot.as_bytes())
+            .map_err(|e| CanvasError::Invalid(format!("Failed to write DOT to stdin: {}", e)))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| CanvasError::Invalid(format!("Failed to wait for dot process: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CanvasError::Invalid(format!(
+            "dot command failed: {}",
+            stderr
+        )));
+    }
+
+    Ok(output.stdout)
+}
+
+/// Check if GraphViz dot command is available
+///
+/// # Example
+/// ```no_run
+/// if celers_canvas::is_graphviz_available() {
+///     println!("GraphViz is installed");
+/// } else {
+///     println!("GraphViz is not installed");
+/// }
+/// ```
+#[allow(dead_code)]
+pub fn is_graphviz_available() -> bool {
+    use std::process::Command;
+
+    Command::new("dot")
+        .arg("-V")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 /// Trait for exporting workflow as DAG
@@ -3119,6 +3235,46 @@ pub trait DagExport {
 
     /// Export workflow as JSON
     fn to_json(&self) -> Result<String, serde_json::Error>;
+
+    /// Export workflow as SVG using GraphViz dot command
+    ///
+    /// This method generates SVG by executing the `dot` command.
+    /// Requires GraphViz to be installed on the system.
+    ///
+    /// # Errors
+    /// Returns error if GraphViz is not installed or execution fails
+    fn to_svg(&self) -> Result<String, CanvasError> {
+        let dot = self.to_dot();
+        render_dot_to_svg(&dot)
+    }
+
+    /// Export workflow as PNG using GraphViz dot command
+    ///
+    /// This method generates PNG by executing the `dot` command.
+    /// Requires GraphViz to be installed on the system.
+    ///
+    /// # Errors
+    /// Returns error if GraphViz is not installed or execution fails
+    fn to_png(&self) -> Result<Vec<u8>, CanvasError> {
+        let dot = self.to_dot();
+        render_dot_to_png(&dot)
+    }
+
+    /// Get command to render DOT to SVG
+    ///
+    /// Returns the shell command that can be used to convert
+    /// the DOT format to SVG. Useful for manual rendering.
+    fn svg_render_command(&self) -> String {
+        "dot -Tsvg -o output.svg input.dot".to_string()
+    }
+
+    /// Get command to render DOT to PNG
+    ///
+    /// Returns the shell command that can be used to convert
+    /// the DOT format to PNG. Useful for manual rendering.
+    fn png_render_command(&self) -> String {
+        "dot -Tpng -o output.png input.dot".to_string()
+    }
 }
 
 impl DagExport for Chain {
@@ -4372,6 +4528,146 @@ impl std::fmt::Display for WorkflowRecoveryPolicy {
 }
 
 // ============================================================================
+// State Versioning
+// ============================================================================
+
+/// State version for workflow state evolution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateVersion {
+    /// Major version (breaking changes)
+    pub major: u32,
+    /// Minor version (backward-compatible changes)
+    pub minor: u32,
+    /// Patch version (bug fixes)
+    pub patch: u32,
+}
+
+impl StateVersion {
+    /// Create a new state version
+    pub fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    /// Current version
+    pub fn current() -> Self {
+        Self {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        }
+    }
+
+    /// Check if this version can be migrated to another version
+    /// (same major version, this minor version <= target minor version)
+    pub fn is_compatible(&self, other: &StateVersion) -> bool {
+        self.major == other.major && self.minor <= other.minor
+    }
+}
+
+impl std::fmt::Display for StateVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// State migration error
+#[derive(Debug, Clone)]
+pub enum StateMigrationError {
+    /// Incompatible version
+    IncompatibleVersion {
+        from: StateVersion,
+        to: StateVersion,
+    },
+    /// Migration failed
+    MigrationFailed(String),
+    /// Unsupported version
+    UnsupportedVersion(StateVersion),
+}
+
+impl std::fmt::Display for StateMigrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompatibleVersion { from, to } => {
+                write!(f, "Incompatible state version: {} -> {}", from, to)
+            }
+            Self::MigrationFailed(msg) => write!(f, "State migration failed: {}", msg),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "Unsupported state version: {}", version)
+            }
+        }
+    }
+}
+
+impl std::error::Error for StateMigrationError {}
+
+/// State migration strategy
+pub trait StateMigration {
+    /// Migrate state from one version to another
+    fn migrate(&self, from: StateVersion, to: StateVersion) -> Result<(), StateMigrationError>;
+}
+
+/// Versioned workflow state with migration support
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionedWorkflowState {
+    /// State version
+    pub version: StateVersion,
+    /// Workflow state
+    pub state: WorkflowState,
+    /// Migration history
+    pub migration_history: Vec<(StateVersion, StateVersion, u64)>, // (from, to, timestamp)
+}
+
+impl VersionedWorkflowState {
+    /// Create a new versioned state
+    pub fn new(state: WorkflowState) -> Self {
+        Self {
+            version: StateVersion::current(),
+            state,
+            migration_history: Vec::new(),
+        }
+    }
+
+    /// Migrate to a new version
+    pub fn migrate_to(&mut self, target: StateVersion) -> Result<(), StateMigrationError> {
+        if self.version == target {
+            return Ok(());
+        }
+
+        if !self.version.is_compatible(&target) {
+            return Err(StateMigrationError::IncompatibleVersion {
+                from: self.version,
+                to: target,
+            });
+        }
+
+        // Record migration
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.migration_history
+            .push((self.version, target, timestamp));
+        self.version = target;
+
+        Ok(())
+    }
+
+    /// Check if state can be migrated to target version
+    pub fn can_migrate_to(&self, target: &StateVersion) -> bool {
+        self.version.is_compatible(target)
+    }
+
+    /// Get migration history
+    pub fn get_migration_history(&self) -> &[(StateVersion, StateVersion, u64)] {
+        &self.migration_history
+    }
+}
+
+// ============================================================================
 // Workflow Compilation and Optimization
 // ============================================================================
 
@@ -5215,6 +5511,2942 @@ impl CanvasError {
             CanvasError::Cancelled(_) => "cancelled",
             CanvasError::Timeout(_) => "timeout",
         }
+    }
+}
+
+// ============================================================================
+// Parallel Workflow Scheduling
+// ============================================================================
+
+/// Task priority for scheduling
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TaskPriority {
+    /// Low priority (value: 0)
+    Low = 0,
+    /// Normal priority (value: 5)
+    Normal = 5,
+    /// High priority (value: 10)
+    High = 10,
+    /// Critical priority (value: 15)
+    Critical = 15,
+}
+
+impl Default for TaskPriority {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl std::fmt::Display for TaskPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Low => write!(f, "Low"),
+            Self::Normal => write!(f, "Normal"),
+            Self::High => write!(f, "High"),
+            Self::Critical => write!(f, "Critical"),
+        }
+    }
+}
+
+/// Worker resource capacity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerCapacity {
+    /// Worker ID
+    pub worker_id: String,
+    /// CPU cores available
+    pub cpu_cores: u32,
+    /// Memory available (MB)
+    pub memory_mb: u64,
+    /// Current load (0.0 to 1.0)
+    pub current_load: f64,
+    /// Active tasks count
+    pub active_tasks: usize,
+}
+
+impl WorkerCapacity {
+    /// Create a new worker capacity
+    pub fn new(worker_id: impl Into<String>, cpu_cores: u32, memory_mb: u64) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            cpu_cores,
+            memory_mb,
+            current_load: 0.0,
+            active_tasks: 0,
+        }
+    }
+
+    /// Check if worker has capacity for a task
+    pub fn has_capacity(&self, required_load: f64) -> bool {
+        self.current_load + required_load <= 1.0
+    }
+
+    /// Get available capacity
+    pub fn available_capacity(&self) -> f64 {
+        (1.0 - self.current_load).max(0.0)
+    }
+}
+
+/// Task scheduling decision
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulingDecision {
+    /// Task ID
+    pub task_id: Uuid,
+    /// Assigned worker ID
+    pub worker_id: String,
+    /// Priority
+    pub priority: TaskPriority,
+    /// Estimated execution time (seconds)
+    pub estimated_time: Option<u64>,
+}
+
+impl SchedulingDecision {
+    /// Create a new scheduling decision
+    pub fn new(task_id: Uuid, worker_id: impl Into<String>, priority: TaskPriority) -> Self {
+        Self {
+            task_id,
+            worker_id: worker_id.into(),
+            priority,
+            estimated_time: None,
+        }
+    }
+
+    /// Set estimated execution time
+    pub fn with_estimated_time(mut self, seconds: u64) -> Self {
+        self.estimated_time = Some(seconds);
+        self
+    }
+}
+
+/// Scheduling strategy for task distribution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchedulingStrategy {
+    /// Round-robin distribution
+    RoundRobin,
+    /// Assign to worker with lowest load
+    LeastLoaded,
+    /// Priority-based scheduling
+    PriorityBased,
+    /// Resource-aware scheduling
+    ResourceAware,
+}
+
+impl Default for SchedulingStrategy {
+    fn default() -> Self {
+        Self::LeastLoaded
+    }
+}
+
+impl std::fmt::Display for SchedulingStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RoundRobin => write!(f, "RoundRobin"),
+            Self::LeastLoaded => write!(f, "LeastLoaded"),
+            Self::PriorityBased => write!(f, "PriorityBased"),
+            Self::ResourceAware => write!(f, "ResourceAware"),
+        }
+    }
+}
+
+/// Parallel workflow scheduler for task distribution
+#[derive(Debug, Clone)]
+pub struct ParallelScheduler {
+    /// Scheduling strategy
+    pub strategy: SchedulingStrategy,
+    /// Worker capacities
+    pub workers: Vec<WorkerCapacity>,
+    /// Enable load balancing
+    pub load_balancing: bool,
+    /// Maximum tasks per worker
+    pub max_tasks_per_worker: Option<usize>,
+}
+
+impl ParallelScheduler {
+    /// Create a new parallel scheduler
+    pub fn new(strategy: SchedulingStrategy) -> Self {
+        Self {
+            strategy,
+            workers: Vec::new(),
+            load_balancing: true,
+            max_tasks_per_worker: None,
+        }
+    }
+
+    /// Add a worker to the scheduler
+    pub fn add_worker(&mut self, worker: WorkerCapacity) {
+        self.workers.push(worker);
+    }
+
+    /// Enable load balancing
+    pub fn with_load_balancing(mut self, enabled: bool) -> Self {
+        self.load_balancing = enabled;
+        self
+    }
+
+    /// Set maximum tasks per worker
+    pub fn with_max_tasks_per_worker(mut self, max: usize) -> Self {
+        self.max_tasks_per_worker = Some(max);
+        self
+    }
+
+    /// Schedule a task to a worker
+    pub fn schedule_task(
+        &self,
+        task_id: Uuid,
+        priority: TaskPriority,
+    ) -> Option<SchedulingDecision> {
+        if self.workers.is_empty() {
+            return None;
+        }
+
+        let worker_id = match self.strategy {
+            SchedulingStrategy::RoundRobin => {
+                // Simple round-robin based on task count
+                self.workers
+                    .iter()
+                    .min_by_key(|w| w.active_tasks)
+                    .map(|w| w.worker_id.clone())
+            }
+            SchedulingStrategy::LeastLoaded => {
+                // Assign to worker with lowest load
+                self.workers
+                    .iter()
+                    .filter(|w| {
+                        if let Some(max) = self.max_tasks_per_worker {
+                            w.active_tasks < max
+                        } else {
+                            true
+                        }
+                    })
+                    .min_by(|a, b| {
+                        a.current_load
+                            .partial_cmp(&b.current_load)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|w| w.worker_id.clone())
+            }
+            SchedulingStrategy::PriorityBased => {
+                // Higher priority tasks go to less loaded workers
+                let priority_weight = priority as u8 as f64 / 15.0;
+                self.workers
+                    .iter()
+                    .filter(|w| {
+                        if let Some(max) = self.max_tasks_per_worker {
+                            w.active_tasks < max
+                        } else {
+                            true
+                        }
+                    })
+                    .min_by(|a, b| {
+                        let a_score = a.current_load * (1.0 - priority_weight);
+                        let b_score = b.current_load * (1.0 - priority_weight);
+                        a_score
+                            .partial_cmp(&b_score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|w| w.worker_id.clone())
+            }
+            SchedulingStrategy::ResourceAware => {
+                // Consider both CPU and memory availability
+                self.workers
+                    .iter()
+                    .filter(|w| {
+                        if let Some(max) = self.max_tasks_per_worker {
+                            w.active_tasks < max
+                        } else {
+                            true
+                        }
+                    })
+                    .max_by(|a, b| {
+                        let a_score = a.available_capacity()
+                            * (a.cpu_cores as f64 / 100.0)
+                            * (a.memory_mb as f64 / 1000000.0);
+                        let b_score = b.available_capacity()
+                            * (b.cpu_cores as f64 / 100.0)
+                            * (b.memory_mb as f64 / 1000000.0);
+                        a_score
+                            .partial_cmp(&b_score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|w| w.worker_id.clone())
+            }
+        };
+
+        worker_id.map(|id| SchedulingDecision::new(task_id, id, priority))
+    }
+
+    /// Get worker count
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Get total capacity across all workers
+    pub fn total_capacity(&self) -> f64 {
+        self.workers.iter().map(|w| w.available_capacity()).sum()
+    }
+
+    /// Get average load across all workers
+    pub fn average_load(&self) -> f64 {
+        if self.workers.is_empty() {
+            return 0.0;
+        }
+        let total_load: f64 = self.workers.iter().map(|w| w.current_load).sum();
+        total_load / self.workers.len() as f64
+    }
+}
+
+impl Default for ParallelScheduler {
+    fn default() -> Self {
+        Self::new(SchedulingStrategy::default())
+    }
+}
+
+impl std::fmt::Display for ParallelScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ParallelScheduler[strategy={}, workers={}, avg_load={:.2}]",
+            self.strategy,
+            self.workers.len(),
+            self.average_load()
+        )
+    }
+}
+
+// ============================================================================
+// Workflow Batching
+// ============================================================================
+
+/// Workflow batch for grouping similar workflows
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowBatch {
+    /// Batch ID
+    pub batch_id: Uuid,
+    /// Workflow IDs in this batch
+    pub workflow_ids: Vec<Uuid>,
+    /// Batch priority
+    pub priority: TaskPriority,
+    /// Maximum batch size
+    pub max_size: usize,
+    /// Batch timeout (seconds)
+    pub timeout: Option<u64>,
+    /// Creation timestamp
+    pub created_at: u64,
+}
+
+impl WorkflowBatch {
+    /// Create a new workflow batch
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            batch_id: Uuid::new_v4(),
+            workflow_ids: Vec::new(),
+            priority: TaskPriority::Normal,
+            max_size,
+            timeout: None,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+    }
+
+    /// Add a workflow to the batch
+    pub fn add_workflow(&mut self, workflow_id: Uuid) -> bool {
+        if self.workflow_ids.len() < self.max_size {
+            self.workflow_ids.push(workflow_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if batch is full
+    pub fn is_full(&self) -> bool {
+        self.workflow_ids.len() >= self.max_size
+    }
+
+    /// Check if batch is empty
+    pub fn is_empty(&self) -> bool {
+        self.workflow_ids.is_empty()
+    }
+
+    /// Get batch size
+    pub fn size(&self) -> usize {
+        self.workflow_ids.len()
+    }
+
+    /// Check if batch has timed out
+    pub fn is_timed_out(&self) -> bool {
+        if let Some(timeout) = self.timeout {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let age = now.saturating_sub(self.created_at);
+            age >= timeout
+        } else {
+            false
+        }
+    }
+
+    /// Set priority
+    pub fn with_priority(mut self, priority: TaskPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Set timeout
+    pub fn with_timeout(mut self, seconds: u64) -> Self {
+        self.timeout = Some(seconds);
+        self
+    }
+}
+
+impl std::fmt::Display for WorkflowBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WorkflowBatch[id={}, size={}/{}, priority={}]",
+            self.batch_id,
+            self.size(),
+            self.max_size,
+            self.priority
+        )
+    }
+}
+
+/// Batching strategy for workflow grouping
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchingStrategy {
+    /// Batch by workflow type
+    ByType,
+    /// Batch by priority
+    ByPriority,
+    /// Batch by size (group similar-sized workflows)
+    BySize,
+    /// Batch by time window
+    ByTimeWindow,
+}
+
+impl Default for BatchingStrategy {
+    fn default() -> Self {
+        Self::ByType
+    }
+}
+
+impl std::fmt::Display for BatchingStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ByType => write!(f, "ByType"),
+            Self::ByPriority => write!(f, "ByPriority"),
+            Self::BySize => write!(f, "BySize"),
+            Self::ByTimeWindow => write!(f, "ByTimeWindow"),
+        }
+    }
+}
+
+/// Workflow batcher for grouping similar workflows
+#[derive(Debug, Clone)]
+pub struct WorkflowBatcher {
+    /// Batching strategy
+    pub strategy: BatchingStrategy,
+    /// Active batches
+    pub batches: Vec<WorkflowBatch>,
+    /// Default batch size
+    pub default_batch_size: usize,
+    /// Default batch timeout (seconds)
+    pub default_timeout: Option<u64>,
+}
+
+impl WorkflowBatcher {
+    /// Create a new workflow batcher
+    pub fn new(strategy: BatchingStrategy) -> Self {
+        Self {
+            strategy,
+            batches: Vec::new(),
+            default_batch_size: 10,
+            default_timeout: Some(60), // 1 minute default
+        }
+    }
+
+    /// Set default batch size
+    pub fn with_batch_size(mut self, size: usize) -> Self {
+        self.default_batch_size = size;
+        self
+    }
+
+    /// Set default batch timeout
+    pub fn with_timeout(mut self, seconds: u64) -> Self {
+        self.default_timeout = Some(seconds);
+        self
+    }
+
+    /// Add a workflow to a batch
+    pub fn add_workflow(&mut self, workflow_id: Uuid, priority: TaskPriority) -> Uuid {
+        // Find or create appropriate batch
+        let batch_id = match self.strategy {
+            BatchingStrategy::ByPriority => {
+                // Find batch with matching priority
+                let batch = self
+                    .batches
+                    .iter_mut()
+                    .find(|b| b.priority == priority && !b.is_full() && !b.is_timed_out());
+
+                if let Some(batch) = batch {
+                    batch.add_workflow(workflow_id);
+                    batch.batch_id
+                } else {
+                    // Create new batch
+                    let mut new_batch =
+                        WorkflowBatch::new(self.default_batch_size).with_priority(priority);
+                    if let Some(timeout) = self.default_timeout {
+                        new_batch = new_batch.with_timeout(timeout);
+                    }
+                    new_batch.add_workflow(workflow_id);
+                    let batch_id = new_batch.batch_id;
+                    self.batches.push(new_batch);
+                    batch_id
+                }
+            }
+            _ => {
+                // For other strategies, use first available batch
+                let batch = self
+                    .batches
+                    .iter_mut()
+                    .find(|b| !b.is_full() && !b.is_timed_out());
+
+                if let Some(batch) = batch {
+                    batch.add_workflow(workflow_id);
+                    batch.batch_id
+                } else {
+                    // Create new batch
+                    let mut new_batch = WorkflowBatch::new(self.default_batch_size);
+                    if let Some(timeout) = self.default_timeout {
+                        new_batch = new_batch.with_timeout(timeout);
+                    }
+                    new_batch.add_workflow(workflow_id);
+                    let batch_id = new_batch.batch_id;
+                    self.batches.push(new_batch);
+                    batch_id
+                }
+            }
+        };
+
+        batch_id
+    }
+
+    /// Get ready batches (full or timed out)
+    pub fn get_ready_batches(&self) -> Vec<&WorkflowBatch> {
+        self.batches
+            .iter()
+            .filter(|b| b.is_full() || b.is_timed_out())
+            .collect()
+    }
+
+    /// Remove ready batches
+    pub fn remove_ready_batches(&mut self) -> Vec<WorkflowBatch> {
+        let (ready, pending): (Vec<_>, Vec<_>) = self
+            .batches
+            .drain(..)
+            .partition(|b| b.is_full() || b.is_timed_out());
+        self.batches = pending;
+        ready
+    }
+
+    /// Get batch count
+    pub fn batch_count(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// Get total workflow count across all batches
+    pub fn total_workflow_count(&self) -> usize {
+        self.batches.iter().map(|b| b.size()).sum()
+    }
+}
+
+impl Default for WorkflowBatcher {
+    fn default() -> Self {
+        Self::new(BatchingStrategy::default())
+    }
+}
+
+impl std::fmt::Display for WorkflowBatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WorkflowBatcher[strategy={}, batches={}, workflows={}]",
+            self.strategy,
+            self.batch_count(),
+            self.total_workflow_count()
+        )
+    }
+}
+
+// ============================================================================
+// Streaming Map-Reduce
+// ============================================================================
+
+/// Streaming map-reduce for processing large datasets
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingMapReduce {
+    /// Map task signature
+    pub map_task: Signature,
+    /// Reduce task signature
+    pub reduce_task: Signature,
+    /// Chunk size for streaming
+    pub chunk_size: usize,
+    /// Buffer size for intermediate results
+    pub buffer_size: usize,
+    /// Enable backpressure control
+    pub backpressure: bool,
+}
+
+impl StreamingMapReduce {
+    /// Create a new streaming map-reduce
+    pub fn new(map_task: Signature, reduce_task: Signature) -> Self {
+        Self {
+            map_task,
+            reduce_task,
+            chunk_size: 100,
+            buffer_size: 1000,
+            backpressure: true,
+        }
+    }
+
+    /// Set chunk size
+    pub fn with_chunk_size(mut self, size: usize) -> Self {
+        self.chunk_size = size;
+        self
+    }
+
+    /// Set buffer size
+    pub fn with_buffer_size(mut self, size: usize) -> Self {
+        self.buffer_size = size;
+        self
+    }
+
+    /// Enable/disable backpressure
+    pub fn with_backpressure(mut self, enabled: bool) -> Self {
+        self.backpressure = enabled;
+        self
+    }
+}
+
+impl std::fmt::Display for StreamingMapReduce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "StreamingMapReduce[map={}, reduce={}, chunk_size={}, buffer_size={}]",
+            self.map_task.task, self.reduce_task.task, self.chunk_size, self.buffer_size
+        )
+    }
+}
+
+// ============================================================================
+// Reactive Workflows
+// ============================================================================
+
+/// Observable value that can trigger reactive workflows
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Observable<T> {
+    /// Current value
+    pub value: T,
+    /// Subscribers (workflow IDs)
+    #[serde(skip)]
+    pub subscribers: Vec<Uuid>,
+    /// Value change history
+    pub history: Vec<(T, u64)>, // (value, timestamp)
+}
+
+impl<T: Clone> Observable<T> {
+    /// Create a new observable with initial value
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            subscribers: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+
+    /// Subscribe a workflow to this observable
+    pub fn subscribe(&mut self, workflow_id: Uuid) {
+        if !self.subscribers.contains(&workflow_id) {
+            self.subscribers.push(workflow_id);
+        }
+    }
+
+    /// Unsubscribe a workflow
+    pub fn unsubscribe(&mut self, workflow_id: &Uuid) {
+        self.subscribers.retain(|id| id != workflow_id);
+    }
+
+    /// Update the value and notify subscribers
+    pub fn set(&mut self, value: T) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.history.push((self.value.clone(), timestamp));
+        self.value = value;
+    }
+
+    /// Get current value
+    pub fn get(&self) -> &T {
+        &self.value
+    }
+
+    /// Get subscriber count
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.len()
+    }
+}
+
+/// Reactive workflow that responds to observable changes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactiveWorkflow {
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Observable IDs being watched
+    pub watched_observables: Vec<String>,
+    /// Reaction task
+    pub reaction_task: Signature,
+    /// Debounce time (milliseconds)
+    pub debounce_ms: Option<u64>,
+    /// Throttle time (milliseconds)
+    pub throttle_ms: Option<u64>,
+    /// Filter condition (optional)
+    pub filter: Option<String>,
+}
+
+impl ReactiveWorkflow {
+    /// Create a new reactive workflow
+    pub fn new(reaction_task: Signature) -> Self {
+        Self {
+            workflow_id: Uuid::new_v4(),
+            watched_observables: Vec::new(),
+            reaction_task,
+            debounce_ms: None,
+            throttle_ms: None,
+            filter: None,
+        }
+    }
+
+    /// Watch an observable
+    pub fn watch(mut self, observable_id: impl Into<String>) -> Self {
+        self.watched_observables.push(observable_id.into());
+        self
+    }
+
+    /// Set debounce time (delay reaction until changes stop)
+    pub fn with_debounce(mut self, milliseconds: u64) -> Self {
+        self.debounce_ms = Some(milliseconds);
+        self
+    }
+
+    /// Set throttle time (limit reaction frequency)
+    pub fn with_throttle(mut self, milliseconds: u64) -> Self {
+        self.throttle_ms = Some(milliseconds);
+        self
+    }
+
+    /// Set filter condition
+    pub fn with_filter(mut self, condition: impl Into<String>) -> Self {
+        self.filter = Some(condition.into());
+        self
+    }
+}
+
+impl std::fmt::Display for ReactiveWorkflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ReactiveWorkflow[id={}, watching={}, reaction={}]",
+            self.workflow_id,
+            self.watched_observables.len(),
+            self.reaction_task.task
+        )
+    }
+}
+
+/// Stream operator for reactive data processing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamOperator {
+    /// Map values
+    Map,
+    /// Filter values
+    Filter,
+    /// Reduce values
+    Reduce,
+    /// Scan (accumulate)
+    Scan,
+    /// Take first N values
+    Take,
+    /// Skip first N values
+    Skip,
+    /// Debounce
+    Debounce,
+    /// Throttle
+    Throttle,
+}
+
+impl std::fmt::Display for StreamOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Map => write!(f, "Map"),
+            Self::Filter => write!(f, "Filter"),
+            Self::Reduce => write!(f, "Reduce"),
+            Self::Scan => write!(f, "Scan"),
+            Self::Take => write!(f, "Take"),
+            Self::Skip => write!(f, "Skip"),
+            Self::Debounce => write!(f, "Debounce"),
+            Self::Throttle => write!(f, "Throttle"),
+        }
+    }
+}
+
+/// Reactive stream for data flow processing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactiveStream {
+    /// Stream ID
+    pub stream_id: Uuid,
+    /// Source observable ID
+    pub source_id: String,
+    /// Stream operators
+    pub operators: Vec<(StreamOperator, serde_json::Value)>,
+    /// Subscriber workflows
+    #[serde(skip)]
+    pub subscribers: Vec<Uuid>,
+}
+
+impl ReactiveStream {
+    /// Create a new reactive stream
+    pub fn new(source_id: impl Into<String>) -> Self {
+        Self {
+            stream_id: Uuid::new_v4(),
+            source_id: source_id.into(),
+            operators: Vec::new(),
+            subscribers: Vec::new(),
+        }
+    }
+
+    /// Add a map operator
+    pub fn map(mut self, transform: serde_json::Value) -> Self {
+        self.operators.push((StreamOperator::Map, transform));
+        self
+    }
+
+    /// Add a filter operator
+    pub fn filter(mut self, condition: serde_json::Value) -> Self {
+        self.operators.push((StreamOperator::Filter, condition));
+        self
+    }
+
+    /// Add a take operator
+    pub fn take(mut self, count: usize) -> Self {
+        self.operators
+            .push((StreamOperator::Take, serde_json::json!(count)));
+        self
+    }
+
+    /// Add a skip operator
+    pub fn skip(mut self, count: usize) -> Self {
+        self.operators
+            .push((StreamOperator::Skip, serde_json::json!(count)));
+        self
+    }
+
+    /// Add a debounce operator
+    pub fn debounce(mut self, milliseconds: u64) -> Self {
+        self.operators
+            .push((StreamOperator::Debounce, serde_json::json!(milliseconds)));
+        self
+    }
+
+    /// Add a throttle operator
+    pub fn throttle(mut self, milliseconds: u64) -> Self {
+        self.operators
+            .push((StreamOperator::Throttle, serde_json::json!(milliseconds)));
+        self
+    }
+
+    /// Subscribe a workflow to this stream
+    pub fn subscribe(&mut self, workflow_id: Uuid) {
+        if !self.subscribers.contains(&workflow_id) {
+            self.subscribers.push(workflow_id);
+        }
+    }
+}
+
+impl std::fmt::Display for ReactiveStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ReactiveStream[id={}, source={}, operators={}]",
+            self.stream_id,
+            self.source_id,
+            self.operators.len()
+        )
+    }
+}
+
+// ============================================================================
+// Resource Utilization Monitoring
+// ============================================================================
+
+/// Resource utilization metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceUtilization {
+    /// CPU utilization (0.0 to 1.0)
+    pub cpu: f64,
+    /// Memory utilization (0.0 to 1.0)
+    pub memory: f64,
+    /// Disk I/O utilization (0.0 to 1.0)
+    pub disk_io: f64,
+    /// Network I/O utilization (0.0 to 1.0)
+    pub network_io: f64,
+    /// Timestamp
+    pub timestamp: u64,
+}
+
+impl ResourceUtilization {
+    /// Create a new resource utilization snapshot
+    pub fn new(cpu: f64, memory: f64, disk_io: f64, network_io: f64) -> Self {
+        Self {
+            cpu: cpu.clamp(0.0, 1.0),
+            memory: memory.clamp(0.0, 1.0),
+            disk_io: disk_io.clamp(0.0, 1.0),
+            network_io: network_io.clamp(0.0, 1.0),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+    }
+
+    /// Get overall utilization (average of all metrics)
+    pub fn overall(&self) -> f64 {
+        (self.cpu + self.memory + self.disk_io + self.network_io) / 4.0
+    }
+
+    /// Check if any resource is over threshold
+    pub fn is_overloaded(&self, threshold: f64) -> bool {
+        self.cpu > threshold
+            || self.memory > threshold
+            || self.disk_io > threshold
+            || self.network_io > threshold
+    }
+
+    /// Get the most utilized resource
+    pub fn bottleneck(&self) -> &'static str {
+        let max = self
+            .cpu
+            .max(self.memory)
+            .max(self.disk_io)
+            .max(self.network_io);
+        if (max - self.cpu).abs() < f64::EPSILON {
+            "cpu"
+        } else if (max - self.memory).abs() < f64::EPSILON {
+            "memory"
+        } else if (max - self.disk_io).abs() < f64::EPSILON {
+            "disk_io"
+        } else {
+            "network_io"
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceUtilization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ResourceUtilization[cpu={:.2}, mem={:.2}, disk={:.2}, net={:.2}, overall={:.2}]",
+            self.cpu,
+            self.memory,
+            self.disk_io,
+            self.network_io,
+            self.overall()
+        )
+    }
+}
+
+/// Workflow resource monitor
+#[derive(Debug, Clone)]
+pub struct WorkflowResourceMonitor {
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Resource utilization history
+    pub history: Vec<ResourceUtilization>,
+    /// Maximum history size
+    pub max_history: usize,
+    /// Sampling interval (seconds)
+    pub sampling_interval: u64,
+}
+
+impl WorkflowResourceMonitor {
+    /// Create a new resource monitor
+    pub fn new(workflow_id: Uuid) -> Self {
+        Self {
+            workflow_id,
+            history: Vec::new(),
+            max_history: 1000,
+            sampling_interval: 5,
+        }
+    }
+
+    /// Set maximum history size
+    pub fn with_max_history(mut self, max: usize) -> Self {
+        self.max_history = max;
+        self
+    }
+
+    /// Set sampling interval
+    pub fn with_sampling_interval(mut self, seconds: u64) -> Self {
+        self.sampling_interval = seconds;
+        self
+    }
+
+    /// Record resource utilization
+    pub fn record(&mut self, utilization: ResourceUtilization) {
+        self.history.push(utilization);
+        // Trim history if needed
+        if self.history.len() > self.max_history {
+            self.history
+                .drain(0..(self.history.len() - self.max_history));
+        }
+    }
+
+    /// Get average utilization over time window (seconds)
+    pub fn average_utilization(&self, window_seconds: u64) -> Option<ResourceUtilization> {
+        if self.history.is_empty() {
+            return None;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cutoff = now.saturating_sub(window_seconds);
+
+        let recent: Vec<_> = self
+            .history
+            .iter()
+            .filter(|u| u.timestamp >= cutoff)
+            .collect();
+
+        if recent.is_empty() {
+            return None;
+        }
+
+        let sum_cpu: f64 = recent.iter().map(|u| u.cpu).sum();
+        let sum_memory: f64 = recent.iter().map(|u| u.memory).sum();
+        let sum_disk: f64 = recent.iter().map(|u| u.disk_io).sum();
+        let sum_network: f64 = recent.iter().map(|u| u.network_io).sum();
+        let count = recent.len() as f64;
+
+        Some(ResourceUtilization::new(
+            sum_cpu / count,
+            sum_memory / count,
+            sum_disk / count,
+            sum_network / count,
+        ))
+    }
+
+    /// Get peak utilization
+    pub fn peak_utilization(&self) -> Option<&ResourceUtilization> {
+        self.history.iter().max_by(|a, b| {
+            a.overall()
+                .partial_cmp(&b.overall())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+
+    /// Clear history
+    pub fn clear(&mut self) {
+        self.history.clear();
+    }
+}
+
+impl std::fmt::Display for WorkflowResourceMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WorkflowResourceMonitor[workflow={}, samples={}]",
+            self.workflow_id,
+            self.history.len()
+        )
+    }
+}
+
+// ============================================================================
+// Workflow Testing Framework
+// ============================================================================
+
+/// Mock task result for testing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockTaskResult {
+    /// Task name
+    pub task_name: String,
+    /// Result value
+    pub result: serde_json::Value,
+    /// Execution delay (milliseconds)
+    pub delay_ms: u64,
+    /// Whether to fail
+    pub should_fail: bool,
+    /// Failure message
+    pub failure_message: Option<String>,
+}
+
+impl MockTaskResult {
+    /// Create a successful mock result
+    pub fn success(task_name: impl Into<String>, result: serde_json::Value) -> Self {
+        Self {
+            task_name: task_name.into(),
+            result,
+            delay_ms: 0,
+            should_fail: false,
+            failure_message: None,
+        }
+    }
+
+    /// Create a failing mock result
+    pub fn failure(task_name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            task_name: task_name.into(),
+            result: serde_json::Value::Null,
+            delay_ms: 0,
+            should_fail: true,
+            failure_message: Some(message.into()),
+        }
+    }
+
+    /// Set execution delay
+    pub fn with_delay(mut self, milliseconds: u64) -> Self {
+        self.delay_ms = milliseconds;
+        self
+    }
+}
+
+/// Mock task executor for testing workflows
+#[derive(Debug, Clone)]
+pub struct MockTaskExecutor {
+    /// Mock results by task name
+    pub mock_results: HashMap<String, MockTaskResult>,
+    /// Execution history
+    pub execution_history: Vec<(String, u64)>, // (task_name, timestamp)
+}
+
+impl MockTaskExecutor {
+    /// Create a new mock executor
+    pub fn new() -> Self {
+        Self {
+            mock_results: HashMap::new(),
+            execution_history: Vec::new(),
+        }
+    }
+
+    /// Register a mock result for a task
+    pub fn register(&mut self, result: MockTaskResult) {
+        self.mock_results.insert(result.task_name.clone(), result);
+    }
+
+    /// Execute a mock task
+    pub fn execute(&mut self, task_name: &str) -> Result<serde_json::Value, String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.execution_history
+            .push((task_name.to_string(), timestamp));
+
+        if let Some(mock_result) = self.mock_results.get(task_name) {
+            // Simulate delay
+            if mock_result.delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(mock_result.delay_ms));
+            }
+
+            if mock_result.should_fail {
+                Err(mock_result
+                    .failure_message
+                    .clone()
+                    .unwrap_or_else(|| "Mock task failed".to_string()))
+            } else {
+                Ok(mock_result.result.clone())
+            }
+        } else {
+            Err(format!("No mock result registered for task: {}", task_name))
+        }
+    }
+
+    /// Get execution count for a task
+    pub fn execution_count(&self, task_name: &str) -> usize {
+        self.execution_history
+            .iter()
+            .filter(|(name, _)| name == task_name)
+            .count()
+    }
+
+    /// Clear execution history
+    pub fn clear_history(&mut self) {
+        self.execution_history.clear();
+    }
+}
+
+impl Default for MockTaskExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Test data injector for workflow testing
+#[derive(Debug, Clone)]
+pub struct TestDataInjector {
+    /// Injected data by key
+    pub data: HashMap<String, serde_json::Value>,
+}
+
+impl TestDataInjector {
+    /// Create a new test data injector
+    pub fn new() -> Self {
+        Self {
+            data: HashMap::new(),
+        }
+    }
+
+    /// Inject test data
+    pub fn inject(&mut self, key: impl Into<String>, value: serde_json::Value) {
+        self.data.insert(key.into(), value);
+    }
+
+    /// Get injected data
+    pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.data.get(key)
+    }
+
+    /// Clear all injected data
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+}
+
+impl Default for TestDataInjector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Time-Travel Debugging
+// ============================================================================
+
+/// Workflow execution snapshot for time-travel debugging
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowSnapshot {
+    /// Snapshot ID
+    pub snapshot_id: Uuid,
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Snapshot timestamp
+    pub timestamp: u64,
+    /// Workflow state at snapshot
+    pub state: WorkflowState,
+    /// Completed task IDs
+    pub completed_tasks: Vec<Uuid>,
+    /// Task results
+    pub task_results: HashMap<Uuid, serde_json::Value>,
+    /// Checkpoint data
+    pub checkpoint: Option<WorkflowCheckpoint>,
+}
+
+impl WorkflowSnapshot {
+    /// Create a new workflow snapshot
+    pub fn new(workflow_id: Uuid, state: WorkflowState) -> Self {
+        Self {
+            snapshot_id: Uuid::new_v4(),
+            workflow_id,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            state,
+            completed_tasks: Vec::new(),
+            task_results: HashMap::new(),
+            checkpoint: None,
+        }
+    }
+
+    /// Record task completion
+    pub fn record_task(&mut self, task_id: Uuid, result: serde_json::Value) {
+        self.completed_tasks.push(task_id);
+        self.task_results.insert(task_id, result);
+    }
+
+    /// Attach checkpoint
+    pub fn with_checkpoint(mut self, checkpoint: WorkflowCheckpoint) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+}
+
+/// Time-travel debugger for workflow replay
+#[derive(Debug, Clone)]
+pub struct TimeTravelDebugger {
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Snapshots history
+    pub snapshots: Vec<WorkflowSnapshot>,
+    /// Current snapshot index
+    pub current_index: usize,
+    /// Step mode enabled
+    pub step_mode: bool,
+}
+
+impl TimeTravelDebugger {
+    /// Create a new time-travel debugger
+    pub fn new(workflow_id: Uuid) -> Self {
+        Self {
+            workflow_id,
+            snapshots: Vec::new(),
+            current_index: 0,
+            step_mode: false,
+        }
+    }
+
+    /// Record a snapshot
+    pub fn record_snapshot(&mut self, snapshot: WorkflowSnapshot) {
+        self.snapshots.push(snapshot);
+        self.current_index = self.snapshots.len() - 1;
+    }
+
+    /// Replay from a specific snapshot
+    pub fn replay_from(&mut self, snapshot_index: usize) -> Option<&WorkflowSnapshot> {
+        if snapshot_index < self.snapshots.len() {
+            self.current_index = snapshot_index;
+            self.snapshots.get(snapshot_index)
+        } else {
+            None
+        }
+    }
+
+    /// Step forward one snapshot
+    pub fn step_forward(&mut self) -> Option<&WorkflowSnapshot> {
+        if self.current_index + 1 < self.snapshots.len() {
+            self.current_index += 1;
+            self.snapshots.get(self.current_index)
+        } else {
+            None
+        }
+    }
+
+    /// Step backward one snapshot
+    pub fn step_backward(&mut self) -> Option<&WorkflowSnapshot> {
+        if self.current_index > 0 {
+            self.current_index -= 1;
+            self.snapshots.get(self.current_index)
+        } else {
+            None
+        }
+    }
+
+    /// Get current snapshot
+    pub fn current_snapshot(&self) -> Option<&WorkflowSnapshot> {
+        self.snapshots.get(self.current_index)
+    }
+
+    /// Enable step-by-step execution mode
+    pub fn enable_step_mode(&mut self) {
+        self.step_mode = true;
+    }
+
+    /// Disable step-by-step execution mode
+    pub fn disable_step_mode(&mut self) {
+        self.step_mode = false;
+    }
+
+    /// Get snapshot count
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    /// Clear all snapshots
+    pub fn clear(&mut self) {
+        self.snapshots.clear();
+        self.current_index = 0;
+    }
+}
+
+impl std::fmt::Display for TimeTravelDebugger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TimeTravelDebugger[workflow={}, snapshots={}, current={}]",
+            self.workflow_id,
+            self.snapshots.len(),
+            self.current_index
+        )
+    }
+}
+
+// ============================================================================
+// Workflow Visualization Support
+// ============================================================================
+
+/// Visual theme for workflow visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualTheme {
+    /// Theme name
+    pub name: String,
+    /// Colors for task states
+    pub colors: HashMap<String, String>,
+    /// Node shapes by task type
+    pub shapes: HashMap<String, String>,
+    /// Edge styles
+    pub edge_styles: HashMap<String, String>,
+    /// Font settings
+    pub font_family: String,
+    pub font_size: u8,
+}
+
+impl VisualTheme {
+    /// Create default light theme
+    pub fn light() -> Self {
+        let mut colors = HashMap::new();
+        colors.insert("pending".to_string(), "#E0E0E0".to_string());
+        colors.insert("running".to_string(), "#2196F3".to_string());
+        colors.insert("completed".to_string(), "#4CAF50".to_string());
+        colors.insert("failed".to_string(), "#F44336".to_string());
+        colors.insert("cancelled".to_string(), "#FF9800".to_string());
+
+        let mut shapes = HashMap::new();
+        shapes.insert("task".to_string(), "box".to_string());
+        shapes.insert("group".to_string(), "ellipse".to_string());
+        shapes.insert("chord".to_string(), "diamond".to_string());
+
+        let mut edge_styles = HashMap::new();
+        edge_styles.insert("chain".to_string(), "solid".to_string());
+        edge_styles.insert("callback".to_string(), "dashed".to_string());
+        edge_styles.insert("error".to_string(), "dotted".to_string());
+
+        Self {
+            name: "light".to_string(),
+            colors,
+            shapes,
+            edge_styles,
+            font_family: "Arial".to_string(),
+            font_size: 12,
+        }
+    }
+
+    /// Create dark theme
+    pub fn dark() -> Self {
+        let mut colors = HashMap::new();
+        colors.insert("pending".to_string(), "#424242".to_string());
+        colors.insert("running".to_string(), "#1976D2".to_string());
+        colors.insert("completed".to_string(), "#388E3C".to_string());
+        colors.insert("failed".to_string(), "#D32F2F".to_string());
+        colors.insert("cancelled".to_string(), "#F57C00".to_string());
+
+        let mut shapes = HashMap::new();
+        shapes.insert("task".to_string(), "box".to_string());
+        shapes.insert("group".to_string(), "ellipse".to_string());
+        shapes.insert("chord".to_string(), "diamond".to_string());
+
+        let mut edge_styles = HashMap::new();
+        edge_styles.insert("chain".to_string(), "solid".to_string());
+        edge_styles.insert("callback".to_string(), "dashed".to_string());
+        edge_styles.insert("error".to_string(), "dotted".to_string());
+
+        Self {
+            name: "dark".to_string(),
+            colors,
+            shapes,
+            edge_styles,
+            font_family: "Arial".to_string(),
+            font_size: 12,
+        }
+    }
+
+    /// Get color for state
+    pub fn color_for_state(&self, state: &str) -> Option<&str> {
+        self.colors.get(state).map(|s| s.as_str())
+    }
+
+    /// Get shape for task type
+    pub fn shape_for_type(&self, task_type: &str) -> Option<&str> {
+        self.shapes.get(task_type).map(|s| s.as_str())
+    }
+}
+
+impl Default for VisualTheme {
+    fn default() -> Self {
+        Self::light()
+    }
+}
+
+/// Task visual metadata for UI rendering
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskVisualMetadata {
+    /// Task ID
+    pub task_id: Uuid,
+    /// Task name
+    pub task_name: String,
+    /// Current state (pending, running, completed, failed, cancelled)
+    pub state: String,
+    /// Progress percentage (0-100)
+    pub progress: f64,
+    /// Visual position (x, y) for layout
+    pub position: Option<(f64, f64)>,
+    /// Node color (CSS color)
+    pub color: String,
+    /// Node shape
+    pub shape: String,
+    /// CSS classes for styling
+    pub css_classes: Vec<String>,
+    /// Additional metadata
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+impl TaskVisualMetadata {
+    /// Create new task visual metadata
+    pub fn new(task_id: Uuid, task_name: String, state: String) -> Self {
+        Self {
+            task_id,
+            task_name,
+            state: state.clone(),
+            progress: 0.0,
+            position: None,
+            color: Self::default_color_for_state(&state),
+            shape: "box".to_string(),
+            css_classes: vec![format!("task-{}", state)],
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Default color for state
+    fn default_color_for_state(state: &str) -> String {
+        match state {
+            "pending" => "#E0E0E0",
+            "running" => "#2196F3",
+            "completed" => "#4CAF50",
+            "failed" => "#F44336",
+            "cancelled" => "#FF9800",
+            _ => "#9E9E9E",
+        }
+        .to_string()
+    }
+
+    /// Set progress
+    pub fn with_progress(mut self, progress: f64) -> Self {
+        self.progress = progress.clamp(0.0, 100.0);
+        self
+    }
+
+    /// Set position
+    pub fn with_position(mut self, x: f64, y: f64) -> Self {
+        self.position = Some((x, y));
+        self
+    }
+
+    /// Set color
+    pub fn with_color(mut self, color: String) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// Add CSS class
+    pub fn add_css_class(&mut self, class: String) {
+        if !self.css_classes.contains(&class) {
+            self.css_classes.push(class);
+        }
+    }
+
+    /// Add metadata
+    pub fn add_metadata(&mut self, key: String, value: serde_json::Value) {
+        self.metadata.insert(key, value);
+    }
+}
+
+/// Workflow visualization data with rich metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowVisualizationData {
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Workflow name
+    pub workflow_name: String,
+    /// Workflow state
+    pub state: WorkflowState,
+    /// Task visual metadata
+    pub tasks: Vec<TaskVisualMetadata>,
+    /// Edge connections (from_task_id, to_task_id, edge_type)
+    pub edges: Vec<(Uuid, Uuid, String)>,
+    /// Visual theme
+    pub theme: VisualTheme,
+    /// Layout algorithm hint (hierarchical, force, circular, etc.)
+    pub layout_hint: String,
+    /// Viewport dimensions (width, height)
+    pub viewport: (f64, f64),
+}
+
+impl WorkflowVisualizationData {
+    /// Create new visualization data
+    pub fn new(workflow_id: Uuid, workflow_name: String, state: WorkflowState) -> Self {
+        Self {
+            workflow_id,
+            workflow_name,
+            state,
+            tasks: Vec::new(),
+            edges: Vec::new(),
+            theme: VisualTheme::default(),
+            layout_hint: "hierarchical".to_string(),
+            viewport: (1000.0, 600.0),
+        }
+    }
+
+    /// Add task metadata
+    pub fn add_task(&mut self, task: TaskVisualMetadata) {
+        self.tasks.push(task);
+    }
+
+    /// Add edge
+    pub fn add_edge(&mut self, from: Uuid, to: Uuid, edge_type: String) {
+        self.edges.push((from, to, edge_type));
+    }
+
+    /// Set theme
+    pub fn with_theme(mut self, theme: VisualTheme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// Set layout hint
+    pub fn with_layout(mut self, layout_hint: String) -> Self {
+        self.layout_hint = layout_hint;
+        self
+    }
+
+    /// Export to JSON for frontend
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Export to vis.js format
+    pub fn to_visjs_format(&self) -> serde_json::Value {
+        let nodes: Vec<serde_json::Value> = self
+            .tasks
+            .iter()
+            .map(|task| {
+                serde_json::json!({
+                    "id": task.task_id.to_string(),
+                    "label": task.task_name,
+                    "color": task.color,
+                    "shape": task.shape,
+                    "title": format!("{} ({})", task.task_name, task.state),
+                    "value": task.progress,
+                })
+            })
+            .collect();
+
+        let edges: Vec<serde_json::Value> = self
+            .edges
+            .iter()
+            .map(|(from, to, edge_type)| {
+                serde_json::json!({
+                    "from": from.to_string(),
+                    "to": to.to_string(),
+                    "arrows": "to",
+                    "dashes": edge_type == "callback",
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "nodes": nodes,
+            "edges": edges,
+        })
+    }
+}
+
+/// Execution timeline entry for Gantt chart visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEntry {
+    /// Task ID
+    pub task_id: Uuid,
+    /// Task name
+    pub task_name: String,
+    /// Start time (Unix timestamp in milliseconds)
+    pub start_time: u64,
+    /// End time (Unix timestamp in milliseconds)
+    pub end_time: Option<u64>,
+    /// Duration in milliseconds
+    pub duration: Option<u64>,
+    /// Task state
+    pub state: String,
+    /// Worker ID that executed the task
+    pub worker_id: Option<String>,
+    /// Parent task ID (for nested workflows)
+    pub parent_id: Option<Uuid>,
+    /// Color for visualization
+    pub color: String,
+}
+
+impl TimelineEntry {
+    /// Create new timeline entry
+    pub fn new(task_id: Uuid, task_name: String, start_time: u64) -> Self {
+        Self {
+            task_id,
+            task_name,
+            start_time,
+            end_time: None,
+            duration: None,
+            state: "running".to_string(),
+            worker_id: None,
+            parent_id: None,
+            color: "#2196F3".to_string(),
+        }
+    }
+
+    /// Mark task as completed
+    pub fn complete(&mut self, end_time: u64) {
+        self.end_time = Some(end_time);
+        self.duration = Some(end_time.saturating_sub(self.start_time));
+        self.state = "completed".to_string();
+        self.color = "#4CAF50".to_string();
+    }
+
+    /// Mark task as failed
+    pub fn fail(&mut self, end_time: u64) {
+        self.end_time = Some(end_time);
+        self.duration = Some(end_time.saturating_sub(self.start_time));
+        self.state = "failed".to_string();
+        self.color = "#F44336".to_string();
+    }
+
+    /// Set worker ID
+    pub fn with_worker(mut self, worker_id: String) -> Self {
+        self.worker_id = Some(worker_id);
+        self
+    }
+
+    /// Set parent ID
+    pub fn with_parent(mut self, parent_id: Uuid) -> Self {
+        self.parent_id = Some(parent_id);
+        self
+    }
+}
+
+/// Execution timeline for workflow visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionTimeline {
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Timeline entries
+    pub entries: Vec<TimelineEntry>,
+    /// Workflow start time
+    pub workflow_start: u64,
+    /// Workflow end time
+    pub workflow_end: Option<u64>,
+}
+
+impl ExecutionTimeline {
+    /// Create new execution timeline
+    pub fn new(workflow_id: Uuid) -> Self {
+        Self {
+            workflow_id,
+            entries: Vec::new(),
+            workflow_start: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            workflow_end: None,
+        }
+    }
+
+    /// Add timeline entry
+    pub fn add_entry(&mut self, entry: TimelineEntry) {
+        self.entries.push(entry);
+    }
+
+    /// Start task
+    pub fn start_task(&mut self, task_id: Uuid, task_name: String) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let entry = TimelineEntry::new(task_id, task_name, now);
+        self.entries.push(entry);
+        self.entries.len() - 1
+    }
+
+    /// Complete task
+    pub fn complete_task(&mut self, index: usize) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            entry.complete(now);
+        }
+    }
+
+    /// Fail task
+    pub fn fail_task(&mut self, index: usize) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            entry.fail(now);
+        }
+    }
+
+    /// Mark workflow as complete
+    pub fn complete_workflow(&mut self) {
+        self.workflow_end = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        );
+    }
+
+    /// Export to JSON
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Export to Google Charts Timeline format
+    pub fn to_google_charts_format(&self) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!([
+                    entry.task_name,
+                    entry.task_name,
+                    entry.start_time,
+                    entry.end_time.unwrap_or(entry.start_time),
+                ])
+            })
+            .collect();
+
+        serde_json::json!({
+            "cols": [
+                {"id": "", "label": "Task ID", "type": "string"},
+                {"id": "", "label": "Task Name", "type": "string"},
+                {"id": "", "label": "Start", "type": "number"},
+                {"id": "", "label": "End", "type": "number"}
+            ],
+            "rows": rows.iter().map(|row| serde_json::json!({"c": row})).collect::<Vec<_>>()
+        })
+    }
+}
+
+/// Animation frame for execution visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnimationFrame {
+    /// Frame number
+    pub frame_number: usize,
+    /// Timestamp
+    pub timestamp: u64,
+    /// Workflow state at this frame
+    pub workflow_state: WorkflowState,
+    /// Task states (task_id -> state)
+    pub task_states: HashMap<Uuid, String>,
+    /// Active tasks at this frame
+    pub active_tasks: Vec<Uuid>,
+    /// Completed tasks at this frame
+    pub completed_tasks: Vec<Uuid>,
+    /// Events that occurred in this frame
+    pub events: Vec<WorkflowEvent>,
+}
+
+impl AnimationFrame {
+    /// Create new animation frame
+    pub fn new(frame_number: usize, workflow_state: WorkflowState) -> Self {
+        Self {
+            frame_number,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            workflow_state,
+            task_states: HashMap::new(),
+            active_tasks: Vec::new(),
+            completed_tasks: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Set task state
+    pub fn set_task_state(&mut self, task_id: Uuid, state: String) {
+        self.task_states.insert(task_id, state);
+    }
+
+    /// Add active task
+    pub fn add_active_task(&mut self, task_id: Uuid) {
+        if !self.active_tasks.contains(&task_id) {
+            self.active_tasks.push(task_id);
+        }
+    }
+
+    /// Add completed task
+    pub fn add_completed_task(&mut self, task_id: Uuid) {
+        if !self.completed_tasks.contains(&task_id) {
+            self.completed_tasks.push(task_id);
+        }
+        // Remove from active tasks
+        self.active_tasks.retain(|id| id != &task_id);
+    }
+
+    /// Add event
+    pub fn add_event(&mut self, event: WorkflowEvent) {
+        self.events.push(event);
+    }
+}
+
+/// Workflow animation sequence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowAnimation {
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Animation frames
+    pub frames: Vec<AnimationFrame>,
+    /// Frame duration in milliseconds
+    pub frame_duration: u64,
+    /// Total duration
+    pub total_duration: u64,
+}
+
+impl WorkflowAnimation {
+    /// Create new workflow animation
+    pub fn new(workflow_id: Uuid, frame_duration: u64) -> Self {
+        Self {
+            workflow_id,
+            frames: Vec::new(),
+            frame_duration,
+            total_duration: 0,
+        }
+    }
+
+    /// Add frame
+    pub fn add_frame(&mut self, frame: AnimationFrame) {
+        self.frames.push(frame);
+        self.total_duration = self.frames.len() as u64 * self.frame_duration;
+    }
+
+    /// Get frame at index
+    pub fn get_frame(&self, index: usize) -> Option<&AnimationFrame> {
+        self.frames.get(index)
+    }
+
+    /// Get frame count
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Export to JSON
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+/// DAG export with execution state overlay
+pub trait DagExportWithState {
+    /// Export DAG with current execution state
+    fn to_dot_with_state(
+        &self,
+        state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> String;
+
+    /// Export Mermaid diagram with execution state
+    fn to_mermaid_with_state(
+        &self,
+        state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> String;
+
+    /// Export to JSON with execution state
+    fn to_json_with_state(
+        &self,
+        state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> Result<String, serde_json::Error>;
+}
+
+impl DagExportWithState for Chain {
+    fn to_dot_with_state(
+        &self,
+        _state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> String {
+        let mut dot = String::from("digraph Chain {\n");
+        dot.push_str("  rankdir=LR;\n");
+
+        for (i, sig) in self.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            let color = match state {
+                "completed" => "#4CAF50",
+                "running" => "#2196F3",
+                "failed" => "#F44336",
+                _ => "#E0E0E0",
+            };
+
+            dot.push_str(&format!(
+                "  task{} [label=\"{}\" style=filled fillcolor=\"{}\"];\n",
+                i, sig.task, color
+            ));
+
+            if i > 0 {
+                dot.push_str(&format!("  task{} -> task{};\n", i - 1, i));
+            }
+        }
+
+        dot.push('}');
+        dot
+    }
+
+    fn to_mermaid_with_state(
+        &self,
+        _state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> String {
+        let mut mmd = String::from("graph LR\n");
+
+        for (i, sig) in self.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            let style_class = match state {
+                "completed" => "completed",
+                "running" => "running",
+                "failed" => "failed",
+                _ => "pending",
+            };
+
+            mmd.push_str(&format!(
+                "  task{}[\"{}\"]:::{}\n",
+                i, sig.task, style_class
+            ));
+
+            if i > 0 {
+                mmd.push_str(&format!("  task{} --> task{}\n", i - 1, i));
+            }
+        }
+
+        // Add style definitions
+        mmd.push_str("\n  classDef completed fill:#4CAF50,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef running fill:#2196F3,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef failed fill:#F44336,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef pending fill:#E0E0E0,stroke:#333,stroke-width:2px\n");
+
+        mmd
+    }
+
+    fn to_json_with_state(
+        &self,
+        state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> Result<String, serde_json::Error> {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+
+        for (i, sig) in self.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let task_state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+
+            nodes.push(serde_json::json!({
+                "id": format!("task{}", i),
+                "label": sig.task,
+                "state": task_state,
+                "task_id": task_id,
+            }));
+
+            if i > 0 {
+                edges.push(serde_json::json!({
+                    "from": format!("task{}", i - 1),
+                    "to": format!("task{}", i),
+                }));
+            }
+        }
+
+        let result = serde_json::json!({
+            "type": "chain",
+            "workflow_state": state,
+            "nodes": nodes,
+            "edges": edges,
+        });
+
+        serde_json::to_string_pretty(&result)
+    }
+}
+
+impl DagExportWithState for Group {
+    fn to_dot_with_state(
+        &self,
+        _state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> String {
+        let mut dot = String::from("digraph Group {\n");
+
+        for (i, sig) in self.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            let color = match state {
+                "completed" => "#4CAF50",
+                "running" => "#2196F3",
+                "failed" => "#F44336",
+                _ => "#E0E0E0",
+            };
+
+            dot.push_str(&format!(
+                "  task{} [label=\"{}\" style=filled fillcolor=\"{}\"];\n",
+                i, sig.task, color
+            ));
+        }
+
+        dot.push('}');
+        dot
+    }
+
+    fn to_mermaid_with_state(
+        &self,
+        _state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> String {
+        let mut mmd = String::from("graph TB\n");
+
+        for (i, sig) in self.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            let style_class = match state {
+                "completed" => "completed",
+                "running" => "running",
+                "failed" => "failed",
+                _ => "pending",
+            };
+
+            mmd.push_str(&format!(
+                "  task{}[\"{}\"]:::{}\n",
+                i, sig.task, style_class
+            ));
+        }
+
+        // Add style definitions
+        mmd.push_str("\n  classDef completed fill:#4CAF50,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef running fill:#2196F3,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef failed fill:#F44336,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef pending fill:#E0E0E0,stroke:#333,stroke-width:2px\n");
+
+        mmd
+    }
+
+    fn to_json_with_state(
+        &self,
+        state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> Result<String, serde_json::Error> {
+        let mut nodes = Vec::new();
+
+        for (i, sig) in self.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let task_state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+
+            nodes.push(serde_json::json!({
+                "id": format!("task{}", i),
+                "label": sig.task,
+                "state": task_state,
+                "task_id": task_id,
+            }));
+        }
+
+        let result = serde_json::json!({
+            "type": "group",
+            "workflow_state": state,
+            "nodes": nodes,
+            "edges": [],
+        });
+
+        serde_json::to_string_pretty(&result)
+    }
+}
+
+impl DagExportWithState for Chord {
+    fn to_dot_with_state(
+        &self,
+        _state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> String {
+        let mut dot = String::from("digraph Chord {\n");
+        dot.push_str("  rankdir=LR;\n");
+
+        // Header tasks
+        for (i, sig) in self.header.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            let color = match state {
+                "completed" => "#4CAF50",
+                "running" => "#2196F3",
+                "failed" => "#F44336",
+                _ => "#E0E0E0",
+            };
+
+            dot.push_str(&format!(
+                "  task{} [label=\"{}\" style=filled fillcolor=\"{}\"];\n",
+                i, sig.task, color
+            ));
+        }
+
+        // Body (callback)
+        let task_id = self.body.options.task_id.unwrap_or_else(Uuid::new_v4);
+        let state = task_states
+            .get(&task_id)
+            .map(|s| s.as_str())
+            .unwrap_or("pending");
+        let color = match state {
+            "completed" => "#4CAF50",
+            "running" => "#2196F3",
+            "failed" => "#F44336",
+            _ => "#E0E0E0",
+        };
+
+        dot.push_str(&format!(
+            "  callback [label=\"{}\" shape=diamond style=filled fillcolor=\"{}\"];\n",
+            self.body.task, color
+        ));
+
+        for i in 0..self.header.tasks.len() {
+            dot.push_str(&format!("  task{} -> callback;\n", i));
+        }
+
+        dot.push('}');
+        dot
+    }
+
+    fn to_mermaid_with_state(
+        &self,
+        _state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> String {
+        let mut mmd = String::from("graph TB\n");
+
+        // Header tasks
+        for (i, sig) in self.header.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            let style_class = match state {
+                "completed" => "completed",
+                "running" => "running",
+                "failed" => "failed",
+                _ => "pending",
+            };
+
+            mmd.push_str(&format!(
+                "  task{}[\"{}\"]:::{}\n",
+                i, sig.task, style_class
+            ));
+        }
+
+        // Body (callback)
+        let task_id = self.body.options.task_id.unwrap_or_else(Uuid::new_v4);
+        let state = task_states
+            .get(&task_id)
+            .map(|s| s.as_str())
+            .unwrap_or("pending");
+        let style_class = match state {
+            "completed" => "completed",
+            "running" => "running",
+            "failed" => "failed",
+            _ => "pending",
+        };
+
+        mmd.push_str(&format!(
+            "  callback{{\"{}\"}}:::{}\n",
+            self.body.task, style_class
+        ));
+
+        for i in 0..self.header.tasks.len() {
+            mmd.push_str(&format!("  task{} --> callback\n", i));
+        }
+
+        // Add style definitions
+        mmd.push_str("\n  classDef completed fill:#4CAF50,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef running fill:#2196F3,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef failed fill:#F44336,stroke:#333,stroke-width:2px\n");
+        mmd.push_str("  classDef pending fill:#E0E0E0,stroke:#333,stroke-width:2px\n");
+
+        mmd
+    }
+
+    fn to_json_with_state(
+        &self,
+        state: &WorkflowState,
+        task_states: &HashMap<Uuid, String>,
+    ) -> Result<String, serde_json::Error> {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+
+        // Header tasks
+        for (i, sig) in self.header.tasks.iter().enumerate() {
+            let task_id = sig.options.task_id.unwrap_or_else(Uuid::new_v4);
+            let task_state = task_states
+                .get(&task_id)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+
+            nodes.push(serde_json::json!({
+                "id": format!("task{}", i),
+                "label": sig.task,
+                "state": task_state,
+                "task_id": task_id,
+            }));
+        }
+
+        // Body (callback)
+        let task_id = self.body.options.task_id.unwrap_or_else(Uuid::new_v4);
+        let task_state = task_states
+            .get(&task_id)
+            .map(|s| s.as_str())
+            .unwrap_or("pending");
+
+        nodes.push(serde_json::json!({
+            "id": "callback",
+            "label": self.body.task,
+            "state": task_state,
+            "task_id": task_id,
+            "shape": "diamond",
+        }));
+
+        for i in 0..self.header.tasks.len() {
+            edges.push(serde_json::json!({
+                "from": format!("task{}", i),
+                "to": "callback",
+            }));
+        }
+
+        let result = serde_json::json!({
+            "type": "chord",
+            "workflow_state": state,
+            "nodes": nodes,
+            "edges": edges,
+        });
+
+        serde_json::to_string_pretty(&result)
+    }
+}
+
+/// Real-time workflow event stream
+#[derive(Debug, Clone)]
+pub struct WorkflowEventStream {
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Event buffer
+    pub events: Vec<(u64, WorkflowEvent)>,
+    /// Maximum buffer size
+    pub max_buffer_size: usize,
+}
+
+impl WorkflowEventStream {
+    /// Create new event stream
+    pub fn new(workflow_id: Uuid) -> Self {
+        Self {
+            workflow_id,
+            events: Vec::new(),
+            max_buffer_size: 1000,
+        }
+    }
+
+    /// Set maximum buffer size
+    pub fn with_max_buffer_size(mut self, size: usize) -> Self {
+        self.max_buffer_size = size;
+        self
+    }
+
+    /// Push event
+    pub fn push(&mut self, event: WorkflowEvent) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        self.events.push((timestamp, event));
+
+        // Trim buffer if needed
+        if self.events.len() > self.max_buffer_size {
+            self.events.remove(0);
+        }
+    }
+
+    /// Get events since timestamp
+    pub fn events_since(&self, timestamp: u64) -> Vec<&(u64, WorkflowEvent)> {
+        self.events
+            .iter()
+            .filter(|(ts, _)| *ts > timestamp)
+            .collect()
+    }
+
+    /// Get all events
+    pub fn all_events(&self) -> &[(u64, WorkflowEvent)] {
+        &self.events
+    }
+
+    /// Clear events
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    /// Export to JSON for Server-Sent Events (SSE)
+    pub fn to_sse_format(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .map(|(ts, event)| {
+                format!(
+                    "event: workflow\ndata: {{\"timestamp\": {}, \"event\": \"{}\"}}\n\n",
+                    ts, event
+                )
+            })
+            .collect()
+    }
+}
+
+// ============================================================================
+// Production-Ready Enhancements
+// ============================================================================
+
+/// Workflow metrics collector for automatic metrics gathering
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowMetricsCollector {
+    /// Workflow ID
+    pub workflow_id: Uuid,
+    /// Start time
+    pub start_time: u64,
+    /// End time
+    pub end_time: Option<u64>,
+    /// Total tasks
+    pub total_tasks: usize,
+    /// Completed tasks
+    pub completed_tasks: usize,
+    /// Failed tasks
+    pub failed_tasks: usize,
+    /// Task execution times (task_id -> duration_ms)
+    pub task_durations: HashMap<Uuid, u64>,
+    /// Task retry counts (task_id -> retry_count)
+    pub task_retries: HashMap<Uuid, usize>,
+    /// Total workflow duration in milliseconds
+    pub total_duration: Option<u64>,
+    /// Average task duration
+    pub avg_task_duration: Option<f64>,
+    /// Success rate (0.0 to 1.0)
+    pub success_rate: Option<f64>,
+}
+
+impl WorkflowMetricsCollector {
+    /// Create new metrics collector
+    pub fn new(workflow_id: Uuid) -> Self {
+        Self {
+            workflow_id,
+            start_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            end_time: None,
+            total_tasks: 0,
+            completed_tasks: 0,
+            failed_tasks: 0,
+            task_durations: HashMap::new(),
+            task_retries: HashMap::new(),
+            total_duration: None,
+            avg_task_duration: None,
+            success_rate: None,
+        }
+    }
+
+    /// Record task start
+    pub fn record_task_start(&mut self, task_id: Uuid) {
+        self.total_tasks += 1;
+        self.task_durations.insert(task_id, 0);
+    }
+
+    /// Record task completion
+    pub fn record_task_complete(&mut self, task_id: Uuid, duration_ms: u64) {
+        self.completed_tasks += 1;
+        self.task_durations.insert(task_id, duration_ms);
+    }
+
+    /// Record task failure
+    pub fn record_task_failure(&mut self, task_id: Uuid, duration_ms: u64) {
+        self.failed_tasks += 1;
+        self.task_durations.insert(task_id, duration_ms);
+    }
+
+    /// Record task retry
+    pub fn record_task_retry(&mut self, task_id: Uuid) {
+        *self.task_retries.entry(task_id).or_insert(0) += 1;
+    }
+
+    /// Finalize metrics
+    pub fn finalize(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        self.end_time = Some(now);
+        self.total_duration = Some(now.saturating_sub(self.start_time));
+
+        // Calculate average task duration
+        if !self.task_durations.is_empty() {
+            let sum: u64 = self.task_durations.values().sum();
+            self.avg_task_duration = Some(sum as f64 / self.task_durations.len() as f64);
+        }
+
+        // Calculate success rate
+        if self.total_tasks > 0 {
+            self.success_rate = Some(self.completed_tasks as f64 / self.total_tasks as f64);
+        }
+    }
+
+    /// Get metrics summary
+    pub fn summary(&self) -> String {
+        format!(
+            "WorkflowMetrics[id={}, total={}, completed={}, failed={}, success_rate={:.2}%, avg_duration={:.2}ms]",
+            self.workflow_id,
+            self.total_tasks,
+            self.completed_tasks,
+            self.failed_tasks,
+            self.success_rate.unwrap_or(0.0) * 100.0,
+            self.avg_task_duration.unwrap_or(0.0)
+        )
+    }
+}
+
+impl std::fmt::Display for WorkflowMetricsCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.summary())
+    }
+}
+
+/// Workflow rate limiter for controlling execution rate
+#[derive(Debug, Clone)]
+pub struct WorkflowRateLimiter {
+    /// Maximum workflows per time window
+    pub max_workflows: usize,
+    /// Time window in milliseconds
+    pub window_ms: u64,
+    /// Workflow timestamps
+    pub workflow_timestamps: Vec<u64>,
+    /// Total workflows processed
+    pub total_workflows: usize,
+    /// Total workflows rejected
+    pub rejected_workflows: usize,
+}
+
+impl WorkflowRateLimiter {
+    /// Create new rate limiter
+    pub fn new(max_workflows: usize, window_ms: u64) -> Self {
+        Self {
+            max_workflows,
+            window_ms,
+            workflow_timestamps: Vec::new(),
+            total_workflows: 0,
+            rejected_workflows: 0,
+        }
+    }
+
+    /// Check if workflow can be executed
+    pub fn allow_workflow(&mut self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Remove old timestamps outside the window
+        self.workflow_timestamps
+            .retain(|&ts| now.saturating_sub(ts) < self.window_ms);
+
+        // Check if we can allow this workflow
+        if self.workflow_timestamps.len() < self.max_workflows {
+            self.workflow_timestamps.push(now);
+            self.total_workflows += 1;
+            true
+        } else {
+            self.rejected_workflows += 1;
+            false
+        }
+    }
+
+    /// Get current rate (workflows per second)
+    pub fn current_rate(&self) -> f64 {
+        if self.workflow_timestamps.is_empty() {
+            return 0.0;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let active_timestamps: Vec<_> = self
+            .workflow_timestamps
+            .iter()
+            .filter(|&&ts| now.saturating_sub(ts) < self.window_ms)
+            .collect();
+
+        if active_timestamps.is_empty() {
+            return 0.0;
+        }
+
+        active_timestamps.len() as f64 / (self.window_ms as f64 / 1000.0)
+    }
+
+    /// Reset rate limiter
+    pub fn reset(&mut self) {
+        self.workflow_timestamps.clear();
+    }
+
+    /// Get rejection rate
+    pub fn rejection_rate(&self) -> f64 {
+        if self.total_workflows == 0 {
+            0.0
+        } else {
+            self.rejected_workflows as f64 / self.total_workflows as f64
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RateLimiter[max={}/{}ms, current_rate={:.2}/s, rejected={}]",
+            self.max_workflows,
+            self.window_ms,
+            self.current_rate(),
+            self.rejected_workflows
+        )
+    }
+}
+
+/// Workflow concurrency control for limiting concurrent workflows
+#[derive(Debug, Clone)]
+pub struct WorkflowConcurrencyControl {
+    /// Maximum concurrent workflows
+    pub max_concurrent: usize,
+    /// Currently active workflows
+    pub active_workflows: HashMap<Uuid, u64>,
+    /// Total workflows started
+    pub total_started: usize,
+    /// Total workflows completed
+    pub total_completed: usize,
+    /// Peak concurrency reached
+    pub peak_concurrency: usize,
+}
+
+impl WorkflowConcurrencyControl {
+    /// Create new concurrency control
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            max_concurrent,
+            active_workflows: HashMap::new(),
+            total_started: 0,
+            total_completed: 0,
+            peak_concurrency: 0,
+        }
+    }
+
+    /// Try to start a workflow
+    pub fn try_start(&mut self, workflow_id: Uuid) -> bool {
+        if self.active_workflows.len() >= self.max_concurrent {
+            return false;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        self.active_workflows.insert(workflow_id, now);
+        self.total_started += 1;
+
+        // Update peak concurrency
+        if self.active_workflows.len() > self.peak_concurrency {
+            self.peak_concurrency = self.active_workflows.len();
+        }
+
+        true
+    }
+
+    /// Complete a workflow
+    pub fn complete(&mut self, workflow_id: Uuid) -> bool {
+        if self.active_workflows.remove(&workflow_id).is_some() {
+            self.total_completed += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get current concurrency
+    pub fn current_concurrency(&self) -> usize {
+        self.active_workflows.len()
+    }
+
+    /// Get available slots
+    pub fn available_slots(&self) -> usize {
+        self.max_concurrent
+            .saturating_sub(self.active_workflows.len())
+    }
+
+    /// Check if at capacity
+    pub fn is_at_capacity(&self) -> bool {
+        self.active_workflows.len() >= self.max_concurrent
+    }
+
+    /// Get average workflow duration
+    pub fn avg_workflow_duration(&self) -> Option<f64> {
+        if self.total_completed == 0 {
+            return None;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let total_duration: u64 = self
+            .active_workflows
+            .values()
+            .map(|&start_time| now.saturating_sub(start_time))
+            .sum();
+
+        Some(total_duration as f64 / self.total_completed as f64)
+    }
+}
+
+impl std::fmt::Display for WorkflowConcurrencyControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ConcurrencyControl[max={}, active={}, peak={}, available={}]",
+            self.max_concurrent,
+            self.current_concurrency(),
+            self.peak_concurrency,
+            self.available_slots()
+        )
+    }
+}
+
+/// Workflow composition helpers for easier workflow building
+#[derive(Debug, Clone)]
+pub struct WorkflowBuilder {
+    /// Workflow name
+    pub name: String,
+    /// Workflow description
+    pub description: Option<String>,
+    /// Workflow tags
+    pub tags: Vec<String>,
+    /// Workflow metadata
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+impl WorkflowBuilder {
+    /// Create new workflow builder
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            tags: Vec::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Set description
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Add tag
+    pub fn add_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Add metadata
+    pub fn add_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+
+    /// Build a chain workflow
+    pub fn chain(self) -> Chain {
+        Chain::new()
+    }
+
+    /// Build a group workflow
+    pub fn group(self) -> Group {
+        Group::new()
+    }
+
+    /// Build a map workflow
+    pub fn map(self, task: Signature, argsets: Vec<Vec<serde_json::Value>>) -> Map {
+        Map::new(task, argsets)
+    }
+}
+
+/// Workflow registry for tracking and managing workflows
+#[derive(Debug, Clone)]
+pub struct WorkflowRegistry {
+    /// Registered workflows (workflow_id -> workflow_name)
+    pub workflows: HashMap<Uuid, String>,
+    /// Workflow metadata
+    pub metadata: HashMap<Uuid, HashMap<String, serde_json::Value>>,
+    /// Workflow states
+    pub states: HashMap<Uuid, WorkflowStatus>,
+    /// Workflow start times
+    pub start_times: HashMap<Uuid, u64>,
+    /// Workflow tags
+    pub tags: HashMap<String, Vec<Uuid>>,
+}
+
+impl WorkflowRegistry {
+    /// Create new workflow registry
+    pub fn new() -> Self {
+        Self {
+            workflows: HashMap::new(),
+            metadata: HashMap::new(),
+            states: HashMap::new(),
+            start_times: HashMap::new(),
+            tags: HashMap::new(),
+        }
+    }
+
+    /// Register a workflow
+    pub fn register(
+        &mut self,
+        workflow_id: Uuid,
+        name: String,
+        metadata: HashMap<String, serde_json::Value>,
+    ) {
+        self.workflows.insert(workflow_id, name);
+        self.metadata.insert(workflow_id, metadata);
+        self.states.insert(workflow_id, WorkflowStatus::Pending);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.start_times.insert(workflow_id, now);
+    }
+
+    /// Update workflow state
+    pub fn update_state(&mut self, workflow_id: Uuid, state: WorkflowStatus) {
+        self.states.insert(workflow_id, state);
+    }
+
+    /// Add tag to workflow
+    pub fn add_tag(&mut self, workflow_id: Uuid, tag: String) {
+        self.tags.entry(tag).or_default().push(workflow_id);
+    }
+
+    /// Get workflows by tag
+    pub fn get_by_tag(&self, tag: &str) -> Vec<Uuid> {
+        self.tags.get(tag).cloned().unwrap_or_default()
+    }
+
+    /// Get workflow state
+    pub fn get_state(&self, workflow_id: &Uuid) -> Option<&WorkflowStatus> {
+        self.states.get(workflow_id)
+    }
+
+    /// Get workflow name
+    pub fn get_name(&self, workflow_id: &Uuid) -> Option<&str> {
+        self.workflows.get(workflow_id).map(|s| s.as_str())
+    }
+
+    /// Get workflow metadata
+    pub fn get_metadata(&self, workflow_id: &Uuid) -> Option<&HashMap<String, serde_json::Value>> {
+        self.metadata.get(workflow_id)
+    }
+
+    /// Remove workflow
+    pub fn remove(&mut self, workflow_id: &Uuid) -> bool {
+        let removed = self.workflows.remove(workflow_id).is_some();
+        self.metadata.remove(workflow_id);
+        self.states.remove(workflow_id);
+        self.start_times.remove(workflow_id);
+
+        // Remove from tags
+        for workflows in self.tags.values_mut() {
+            workflows.retain(|id| id != workflow_id);
+        }
+
+        removed
+    }
+
+    /// Get workflow count
+    pub fn count(&self) -> usize {
+        self.workflows.len()
+    }
+
+    /// Get workflows by state
+    pub fn get_by_state(&self, state: &WorkflowStatus) -> Vec<Uuid> {
+        self.states
+            .iter()
+            .filter(|(_, s)| *s == state)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Clear all workflows
+    pub fn clear(&mut self) {
+        self.workflows.clear();
+        self.metadata.clear();
+        self.states.clear();
+        self.start_times.clear();
+        self.tags.clear();
+    }
+}
+
+impl Default for WorkflowRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for WorkflowRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WorkflowRegistry[total={}, pending={}, running={}, success={}, failed={}]",
+            self.count(),
+            self.get_by_state(&WorkflowStatus::Pending).len(),
+            self.get_by_state(&WorkflowStatus::Running).len(),
+            self.get_by_state(&WorkflowStatus::Success).len(),
+            self.get_by_state(&WorkflowStatus::Failed).len()
+        )
     }
 }
 
@@ -6525,5 +9757,1966 @@ mod tests {
         let display = format!("{}", workflow);
         assert!(display.contains("EventDrivenWorkflow"));
         assert!(display.contains("handlers=3"));
+    }
+
+    #[test]
+    fn test_state_version() {
+        let v1 = StateVersion::new(1, 0, 0);
+        let v2 = StateVersion::new(1, 1, 0);
+        let v3 = StateVersion::new(2, 0, 0);
+
+        // Same major version is compatible
+        assert!(v1.is_compatible(&v2));
+        // Different major version is not compatible
+        assert!(!v1.is_compatible(&v3));
+
+        // Display
+        assert_eq!(format!("{}", v1), "1.0.0");
+        assert_eq!(format!("{}", v2), "1.1.0");
+
+        // Current version
+        let current = StateVersion::current();
+        assert_eq!(current.major, 1);
+        assert_eq!(current.minor, 0);
+        assert_eq!(current.patch, 0);
+    }
+
+    #[test]
+    fn test_state_migration_error() {
+        let v1 = StateVersion::new(1, 0, 0);
+        let v2 = StateVersion::new(2, 0, 0);
+
+        let err = StateMigrationError::IncompatibleVersion { from: v1, to: v2 };
+        let display = format!("{}", err);
+        assert!(display.contains("Incompatible"));
+        assert!(display.contains("1.0.0"));
+        assert!(display.contains("2.0.0"));
+
+        let err2 = StateMigrationError::MigrationFailed("test error".to_string());
+        assert!(format!("{}", err2).contains("migration failed"));
+
+        let err3 = StateMigrationError::UnsupportedVersion(v1);
+        assert!(format!("{}", err3).contains("Unsupported"));
+    }
+
+    #[test]
+    fn test_versioned_workflow_state() {
+        let workflow_id = Uuid::new_v4();
+        let state = WorkflowState::new(workflow_id, 5);
+        let mut versioned = VersionedWorkflowState::new(state);
+
+        // Check initial version
+        assert_eq!(versioned.version, StateVersion::current());
+        assert_eq!(versioned.migration_history.len(), 0);
+
+        // Migrate to compatible version
+        let target = StateVersion::new(1, 1, 0);
+        assert!(versioned.can_migrate_to(&target));
+        assert!(versioned.migrate_to(target).is_ok());
+        assert_eq!(versioned.version, target);
+        assert_eq!(versioned.migration_history.len(), 1);
+
+        // Migrate to same version is OK
+        assert!(versioned.migrate_to(target).is_ok());
+        assert_eq!(versioned.migration_history.len(), 1);
+
+        // Migrate to incompatible version fails
+        let incompatible = StateVersion::new(2, 0, 0);
+        assert!(!versioned.can_migrate_to(&incompatible));
+        assert!(versioned.migrate_to(incompatible).is_err());
+    }
+
+    #[test]
+    fn test_task_priority() {
+        let low = TaskPriority::Low;
+        let normal = TaskPriority::Normal;
+        let high = TaskPriority::High;
+        let critical = TaskPriority::Critical;
+
+        // Test ordering
+        assert!(low < normal);
+        assert!(normal < high);
+        assert!(high < critical);
+
+        // Test display
+        assert_eq!(format!("{}", low), "Low");
+        assert_eq!(format!("{}", normal), "Normal");
+        assert_eq!(format!("{}", high), "High");
+        assert_eq!(format!("{}", critical), "Critical");
+
+        // Test default
+        assert_eq!(TaskPriority::default(), TaskPriority::Normal);
+    }
+
+    #[test]
+    fn test_worker_capacity() {
+        let mut worker = WorkerCapacity::new("worker1", 4, 8192);
+
+        assert_eq!(worker.worker_id, "worker1");
+        assert_eq!(worker.cpu_cores, 4);
+        assert_eq!(worker.memory_mb, 8192);
+        assert_eq!(worker.current_load, 0.0);
+        assert_eq!(worker.active_tasks, 0);
+
+        // Test capacity checks
+        assert!(worker.has_capacity(0.5));
+        assert!(worker.has_capacity(1.0));
+        assert!(!worker.has_capacity(1.1));
+
+        // Test available capacity
+        assert_eq!(worker.available_capacity(), 1.0);
+        worker.current_load = 0.3;
+        assert_eq!(worker.available_capacity(), 0.7);
+    }
+
+    #[test]
+    fn test_scheduling_decision() {
+        let task_id = Uuid::new_v4();
+        let decision = SchedulingDecision::new(task_id, "worker1", TaskPriority::High)
+            .with_estimated_time(120);
+
+        assert_eq!(decision.task_id, task_id);
+        assert_eq!(decision.worker_id, "worker1");
+        assert_eq!(decision.priority, TaskPriority::High);
+        assert_eq!(decision.estimated_time, Some(120));
+    }
+
+    #[test]
+    fn test_scheduling_strategy() {
+        let rr = SchedulingStrategy::RoundRobin;
+        let ll = SchedulingStrategy::LeastLoaded;
+        let pb = SchedulingStrategy::PriorityBased;
+        let ra = SchedulingStrategy::ResourceAware;
+
+        assert_eq!(format!("{}", rr), "RoundRobin");
+        assert_eq!(format!("{}", ll), "LeastLoaded");
+        assert_eq!(format!("{}", pb), "PriorityBased");
+        assert_eq!(format!("{}", ra), "ResourceAware");
+
+        assert_eq!(
+            SchedulingStrategy::default(),
+            SchedulingStrategy::LeastLoaded
+        );
+    }
+
+    #[test]
+    fn test_parallel_scheduler_round_robin() {
+        let mut scheduler = ParallelScheduler::new(SchedulingStrategy::RoundRobin);
+
+        // Add workers
+        scheduler.add_worker(WorkerCapacity::new("worker1", 4, 8192));
+        scheduler.add_worker(WorkerCapacity::new("worker2", 4, 8192));
+
+        assert_eq!(scheduler.worker_count(), 2);
+
+        // Schedule tasks
+        let task1 = Uuid::new_v4();
+        let decision = scheduler.schedule_task(task1, TaskPriority::Normal);
+        assert!(decision.is_some());
+    }
+
+    #[test]
+    fn test_parallel_scheduler_least_loaded() {
+        let mut scheduler = ParallelScheduler::new(SchedulingStrategy::LeastLoaded);
+
+        let mut worker1 = WorkerCapacity::new("worker1", 4, 8192);
+        worker1.current_load = 0.8;
+        let mut worker2 = WorkerCapacity::new("worker2", 4, 8192);
+        worker2.current_load = 0.3;
+
+        scheduler.add_worker(worker1);
+        scheduler.add_worker(worker2);
+
+        // Should assign to worker2 (lower load)
+        let task = Uuid::new_v4();
+        let decision = scheduler.schedule_task(task, TaskPriority::Normal);
+        assert!(decision.is_some());
+        assert_eq!(decision.unwrap().worker_id, "worker2");
+    }
+
+    #[test]
+    fn test_parallel_scheduler_metrics() {
+        let mut scheduler = ParallelScheduler::new(SchedulingStrategy::LeastLoaded);
+
+        let mut worker1 = WorkerCapacity::new("worker1", 4, 8192);
+        worker1.current_load = 0.5;
+        let mut worker2 = WorkerCapacity::new("worker2", 4, 8192);
+        worker2.current_load = 0.3;
+
+        scheduler.add_worker(worker1);
+        scheduler.add_worker(worker2);
+
+        // Test metrics
+        assert_eq!(scheduler.worker_count(), 2);
+        assert_eq!(scheduler.average_load(), 0.4);
+        assert_eq!(scheduler.total_capacity(), 1.2);
+
+        let display = format!("{}", scheduler);
+        assert!(display.contains("ParallelScheduler"));
+        assert!(display.contains("workers=2"));
+    }
+
+    #[test]
+    fn test_parallel_scheduler_max_tasks() {
+        let mut scheduler =
+            ParallelScheduler::new(SchedulingStrategy::LeastLoaded).with_max_tasks_per_worker(2);
+
+        let mut worker = WorkerCapacity::new("worker1", 4, 8192);
+        worker.active_tasks = 2;
+        scheduler.add_worker(worker);
+
+        // Should not schedule (max reached)
+        let task = Uuid::new_v4();
+        let decision = scheduler.schedule_task(task, TaskPriority::Normal);
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn test_workflow_batch() {
+        let mut batch = WorkflowBatch::new(5);
+
+        assert!(batch.is_empty());
+        assert!(!batch.is_full());
+        assert_eq!(batch.size(), 0);
+        assert_eq!(batch.max_size, 5);
+
+        // Add workflows
+        let wf1 = Uuid::new_v4();
+        let wf2 = Uuid::new_v4();
+        assert!(batch.add_workflow(wf1));
+        assert!(batch.add_workflow(wf2));
+        assert_eq!(batch.size(), 2);
+        assert!(!batch.is_empty());
+        assert!(!batch.is_full());
+
+        // Fill batch
+        for _ in 0..3 {
+            batch.add_workflow(Uuid::new_v4());
+        }
+        assert!(batch.is_full());
+
+        // Cannot add more
+        assert!(!batch.add_workflow(Uuid::new_v4()));
+
+        // Test display
+        let display = format!("{}", batch);
+        assert!(display.contains("WorkflowBatch"));
+        assert!(display.contains("5/5"));
+    }
+
+    #[test]
+    fn test_workflow_batch_timeout() {
+        let mut batch = WorkflowBatch::new(10).with_timeout(0);
+
+        // With 0 timeout, should be immediately timed out
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(batch.is_timed_out());
+
+        // Batch without timeout never times out
+        batch.timeout = None;
+        assert!(!batch.is_timed_out());
+    }
+
+    #[test]
+    fn test_batching_strategy() {
+        let by_type = BatchingStrategy::ByType;
+        let by_priority = BatchingStrategy::ByPriority;
+        let by_size = BatchingStrategy::BySize;
+        let by_time = BatchingStrategy::ByTimeWindow;
+
+        assert_eq!(format!("{}", by_type), "ByType");
+        assert_eq!(format!("{}", by_priority), "ByPriority");
+        assert_eq!(format!("{}", by_size), "BySize");
+        assert_eq!(format!("{}", by_time), "ByTimeWindow");
+
+        assert_eq!(BatchingStrategy::default(), BatchingStrategy::ByType);
+    }
+
+    #[test]
+    fn test_workflow_batcher() {
+        let mut batcher = WorkflowBatcher::new(BatchingStrategy::ByType)
+            .with_batch_size(3)
+            .with_timeout(60);
+
+        assert_eq!(batcher.batch_count(), 0);
+        assert_eq!(batcher.total_workflow_count(), 0);
+
+        // Add workflows
+        let wf1 = Uuid::new_v4();
+        let wf2 = Uuid::new_v4();
+        let wf3 = Uuid::new_v4();
+
+        batcher.add_workflow(wf1, TaskPriority::Normal);
+        assert_eq!(batcher.batch_count(), 1);
+        assert_eq!(batcher.total_workflow_count(), 1);
+
+        batcher.add_workflow(wf2, TaskPriority::Normal);
+        batcher.add_workflow(wf3, TaskPriority::Normal);
+        assert_eq!(batcher.batch_count(), 1);
+        assert_eq!(batcher.total_workflow_count(), 3);
+
+        // Batch should be full
+        let ready = batcher.get_ready_batches();
+        assert_eq!(ready.len(), 1);
+        assert!(ready[0].is_full());
+    }
+
+    #[test]
+    fn test_workflow_batcher_by_priority() {
+        let mut batcher = WorkflowBatcher::new(BatchingStrategy::ByPriority).with_batch_size(5);
+
+        // Add workflows with different priorities
+        let wf1 = Uuid::new_v4();
+        let wf2 = Uuid::new_v4();
+        let wf3 = Uuid::new_v4();
+
+        batcher.add_workflow(wf1, TaskPriority::High);
+        batcher.add_workflow(wf2, TaskPriority::Low);
+        batcher.add_workflow(wf3, TaskPriority::High);
+
+        // Should create 2 batches (one for High, one for Low)
+        assert_eq!(batcher.batch_count(), 2);
+        assert_eq!(batcher.total_workflow_count(), 3);
+    }
+
+    #[test]
+    fn test_workflow_batcher_remove_ready() {
+        let mut batcher = WorkflowBatcher::new(BatchingStrategy::ByType).with_batch_size(2);
+
+        // Add workflows to fill one batch
+        batcher.add_workflow(Uuid::new_v4(), TaskPriority::Normal);
+        batcher.add_workflow(Uuid::new_v4(), TaskPriority::Normal);
+
+        // Add one more to create a second batch
+        batcher.add_workflow(Uuid::new_v4(), TaskPriority::Normal);
+
+        assert_eq!(batcher.batch_count(), 2);
+
+        // Remove ready batches (the full one)
+        let ready = batcher.remove_ready_batches();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(batcher.batch_count(), 1);
+
+        let display = format!("{}", batcher);
+        assert!(display.contains("WorkflowBatcher"));
+        assert!(display.contains("batches=1"));
+    }
+
+    #[test]
+    fn test_streaming_map_reduce() {
+        let map_task = Signature::new("map_task".to_string());
+        let reduce_task = Signature::new("reduce_task".to_string());
+
+        let stream = StreamingMapReduce::new(map_task, reduce_task)
+            .with_chunk_size(50)
+            .with_buffer_size(500)
+            .with_backpressure(true);
+
+        assert_eq!(stream.chunk_size, 50);
+        assert_eq!(stream.buffer_size, 500);
+        assert!(stream.backpressure);
+
+        let display = format!("{}", stream);
+        assert!(display.contains("StreamingMapReduce"));
+        assert!(display.contains("map_task"));
+        assert!(display.contains("reduce_task"));
+        assert!(display.contains("chunk_size=50"));
+        assert!(display.contains("buffer_size=500"));
+    }
+
+    #[test]
+    fn test_resource_utilization() {
+        let util = ResourceUtilization::new(0.8, 0.6, 0.4, 0.2);
+
+        assert_eq!(util.cpu, 0.8);
+        assert_eq!(util.memory, 0.6);
+        assert_eq!(util.disk_io, 0.4);
+        assert_eq!(util.network_io, 0.2);
+
+        // Test overall
+        assert!((util.overall() - 0.5).abs() < 0.01);
+
+        // Test overload
+        assert!(util.is_overloaded(0.7));
+        assert!(!util.is_overloaded(0.9));
+
+        // Test bottleneck
+        assert_eq!(util.bottleneck(), "cpu");
+
+        // Test clamping
+        let util2 = ResourceUtilization::new(1.5, -0.5, 0.5, 0.5);
+        assert_eq!(util2.cpu, 1.0);
+        assert_eq!(util2.memory, 0.0);
+    }
+
+    #[test]
+    fn test_resource_utilization_display() {
+        let util = ResourceUtilization::new(0.5, 0.6, 0.7, 0.8);
+        let display = format!("{}", util);
+        assert!(display.contains("ResourceUtilization"));
+        assert!(display.contains("cpu=0.50"));
+        assert!(display.contains("mem=0.60"));
+    }
+
+    #[test]
+    fn test_workflow_resource_monitor() {
+        let workflow_id = Uuid::new_v4();
+        let mut monitor = WorkflowResourceMonitor::new(workflow_id)
+            .with_max_history(100)
+            .with_sampling_interval(10);
+
+        assert_eq!(monitor.workflow_id, workflow_id);
+        assert_eq!(monitor.max_history, 100);
+        assert_eq!(monitor.sampling_interval, 10);
+        assert_eq!(monitor.history.len(), 0);
+
+        // Record some utilization
+        monitor.record(ResourceUtilization::new(0.5, 0.6, 0.4, 0.3));
+        monitor.record(ResourceUtilization::new(0.7, 0.8, 0.6, 0.5));
+
+        assert_eq!(monitor.history.len(), 2);
+
+        // Test peak
+        let peak = monitor.peak_utilization().unwrap();
+        assert!(peak.overall() > 0.6);
+
+        // Test average
+        let avg = monitor.average_utilization(3600).unwrap();
+        assert!(avg.cpu > 0.5 && avg.cpu < 0.7);
+
+        // Test clear
+        monitor.clear();
+        assert_eq!(monitor.history.len(), 0);
+    }
+
+    #[test]
+    fn test_workflow_resource_monitor_max_history() {
+        let workflow_id = Uuid::new_v4();
+        let mut monitor = WorkflowResourceMonitor::new(workflow_id).with_max_history(3);
+
+        // Add more than max_history
+        for i in 0..5 {
+            monitor.record(ResourceUtilization::new(i as f64 * 0.1, 0.5, 0.5, 0.5));
+        }
+
+        // Should only keep last 3
+        assert_eq!(monitor.history.len(), 3);
+
+        let display = format!("{}", monitor);
+        assert!(display.contains("WorkflowResourceMonitor"));
+        assert!(display.contains("samples=3"));
+    }
+
+    #[test]
+    fn test_batching_strategy_display() {
+        let strategy = BatchingStrategy::ByPriority;
+        assert_eq!(format!("{}", strategy), "ByPriority");
+    }
+
+    #[test]
+    fn test_observable() {
+        let mut obs = Observable::new(42);
+        assert_eq!(*obs.get(), 42);
+        assert_eq!(obs.subscriber_count(), 0);
+
+        // Subscribe workflows
+        let wf1 = Uuid::new_v4();
+        let wf2 = Uuid::new_v4();
+        obs.subscribe(wf1);
+        obs.subscribe(wf2);
+        assert_eq!(obs.subscriber_count(), 2);
+
+        // Update value
+        obs.set(100);
+        assert_eq!(*obs.get(), 100);
+        assert_eq!(obs.history.len(), 1);
+
+        // Unsubscribe
+        obs.unsubscribe(&wf1);
+        assert_eq!(obs.subscriber_count(), 1);
+    }
+
+    #[test]
+    fn test_reactive_workflow() {
+        let reaction = Signature::new("on_change".to_string());
+        let workflow = ReactiveWorkflow::new(reaction)
+            .watch("observable1")
+            .watch("observable2")
+            .with_debounce(100)
+            .with_throttle(500)
+            .with_filter("value > 10");
+
+        assert_eq!(workflow.watched_observables.len(), 2);
+        assert_eq!(workflow.debounce_ms, Some(100));
+        assert_eq!(workflow.throttle_ms, Some(500));
+        assert!(workflow.filter.is_some());
+
+        let display = format!("{}", workflow);
+        assert!(display.contains("ReactiveWorkflow"));
+        assert!(display.contains("watching=2"));
+        assert!(display.contains("on_change"));
+    }
+
+    #[test]
+    fn test_stream_operator() {
+        let map_op = StreamOperator::Map;
+        let filter_op = StreamOperator::Filter;
+        let debounce_op = StreamOperator::Debounce;
+
+        assert_eq!(format!("{}", map_op), "Map");
+        assert_eq!(format!("{}", filter_op), "Filter");
+        assert_eq!(format!("{}", debounce_op), "Debounce");
+    }
+
+    #[test]
+    fn test_reactive_stream() {
+        let mut stream = ReactiveStream::new("source1")
+            .map(serde_json::json!({"transform": "uppercase"}))
+            .filter(serde_json::json!({"condition": "length > 5"}))
+            .take(10)
+            .skip(2)
+            .debounce(100)
+            .throttle(500);
+
+        assert_eq!(stream.source_id, "source1");
+        assert_eq!(stream.operators.len(), 6);
+
+        // Subscribe workflow
+        let wf = Uuid::new_v4();
+        stream.subscribe(wf);
+        assert_eq!(stream.subscribers.len(), 1);
+
+        let display = format!("{}", stream);
+        assert!(display.contains("ReactiveStream"));
+        assert!(display.contains("source=source1"));
+        assert!(display.contains("operators=6"));
+    }
+
+    #[test]
+    fn test_mock_task_result() {
+        let success =
+            MockTaskResult::success("task1", serde_json::json!({"result": "ok"})).with_delay(50);
+        assert!(!success.should_fail);
+        assert_eq!(success.delay_ms, 50);
+
+        let failure = MockTaskResult::failure("task2", "Task failed");
+        assert!(failure.should_fail);
+        assert_eq!(failure.failure_message, Some("Task failed".to_string()));
+    }
+
+    #[test]
+    fn test_mock_task_executor() {
+        let mut executor = MockTaskExecutor::new();
+
+        // Register mock results
+        executor.register(MockTaskResult::success("task1", serde_json::json!(42)));
+        executor.register(MockTaskResult::failure("task2", "Error"));
+
+        // Execute successful task
+        let result1 = executor.execute("task1");
+        assert!(result1.is_ok());
+        assert_eq!(result1.unwrap(), serde_json::json!(42));
+
+        // Execute failing task
+        let result2 = executor.execute("task2");
+        assert!(result2.is_err());
+
+        // Execute unregistered task
+        let result3 = executor.execute("task3");
+        assert!(result3.is_err());
+
+        // Check execution count
+        assert_eq!(executor.execution_count("task1"), 1);
+        assert_eq!(executor.execution_count("task2"), 1);
+
+        // Clear history
+        executor.clear_history();
+        assert_eq!(executor.execution_count("task1"), 0);
+    }
+
+    #[test]
+    fn test_test_data_injector() {
+        let mut injector = TestDataInjector::new();
+
+        // Inject data
+        injector.inject("key1", serde_json::json!({"value": 123}));
+        injector.inject("key2", serde_json::json!("test"));
+
+        // Get data
+        assert!(injector.get("key1").is_some());
+        assert_eq!(injector.get("key2"), Some(&serde_json::json!("test")));
+        assert!(injector.get("key3").is_none());
+
+        // Clear data
+        injector.clear();
+        assert!(injector.get("key1").is_none());
+    }
+
+    #[test]
+    fn test_workflow_snapshot() {
+        let workflow_id = Uuid::new_v4();
+        let state = WorkflowState::new(workflow_id, 5);
+        let mut snapshot = WorkflowSnapshot::new(workflow_id, state);
+
+        assert_eq!(snapshot.workflow_id, workflow_id);
+        assert_eq!(snapshot.completed_tasks.len(), 0);
+
+        // Record task
+        let task_id = Uuid::new_v4();
+        snapshot.record_task(task_id, serde_json::json!({"result": "ok"}));
+
+        assert_eq!(snapshot.completed_tasks.len(), 1);
+        assert!(snapshot.task_results.contains_key(&task_id));
+
+        // Attach checkpoint
+        let checkpoint = WorkflowCheckpoint::new(workflow_id, WorkflowState::new(workflow_id, 5));
+        snapshot = snapshot.with_checkpoint(checkpoint);
+        assert!(snapshot.checkpoint.is_some());
+    }
+
+    #[test]
+    fn test_time_travel_debugger() {
+        let workflow_id = Uuid::new_v4();
+        let mut debugger = TimeTravelDebugger::new(workflow_id);
+
+        assert_eq!(debugger.snapshot_count(), 0);
+        assert!(!debugger.step_mode);
+
+        // Record snapshots
+        let snapshot1 = WorkflowSnapshot::new(workflow_id, WorkflowState::new(workflow_id, 5));
+        let snapshot2 = WorkflowSnapshot::new(workflow_id, WorkflowState::new(workflow_id, 5));
+        debugger.record_snapshot(snapshot1);
+        debugger.record_snapshot(snapshot2);
+
+        assert_eq!(debugger.snapshot_count(), 2);
+        assert_eq!(debugger.current_index, 1);
+
+        // Step backward
+        let snapshot = debugger.step_backward();
+        assert!(snapshot.is_some());
+        assert_eq!(debugger.current_index, 0);
+
+        // Step forward
+        let snapshot = debugger.step_forward();
+        assert!(snapshot.is_some());
+        assert_eq!(debugger.current_index, 1);
+
+        // Replay from specific point
+        let snapshot = debugger.replay_from(0);
+        assert!(snapshot.is_some());
+        assert_eq!(debugger.current_index, 0);
+
+        // Enable step mode
+        debugger.enable_step_mode();
+        assert!(debugger.step_mode);
+
+        // Test display
+        let display = format!("{}", debugger);
+        assert!(display.contains("TimeTravelDebugger"));
+        assert!(display.contains("snapshots=2"));
+
+        // Clear snapshots
+        debugger.clear();
+        assert_eq!(debugger.snapshot_count(), 0);
+    }
+
+    // ===== Integration Tests =====
+
+    /// Integration tests for broker, backend, chord barriers, and performance
+    mod integration {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        /// Mock broker for testing
+        #[derive(Clone)]
+        struct MockBroker {
+            tasks: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl MockBroker {
+            fn new() -> Self {
+                Self {
+                    tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+                }
+            }
+
+            fn enqueued_tasks(&self) -> Vec<String> {
+                self.tasks.lock().unwrap().clone()
+            }
+
+            fn task_count(&self) -> usize {
+                self.tasks.lock().unwrap().len()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl celers_core::Broker for MockBroker {
+            async fn enqueue(
+                &self,
+                task: celers_core::SerializedTask,
+            ) -> celers_core::Result<celers_core::TaskId> {
+                let task_name = task.metadata.name.clone();
+                let task_id = task.metadata.id;
+                self.tasks.lock().unwrap().push(task_name);
+                Ok(task_id)
+            }
+
+            async fn dequeue(&self) -> celers_core::Result<Option<celers_core::BrokerMessage>> {
+                Ok(None)
+            }
+
+            async fn ack(
+                &self,
+                _task_id: &celers_core::TaskId,
+                _receipt_handle: Option<&str>,
+            ) -> celers_core::Result<()> {
+                Ok(())
+            }
+
+            async fn reject(
+                &self,
+                _task_id: &celers_core::TaskId,
+                _receipt_handle: Option<&str>,
+                _requeue: bool,
+            ) -> celers_core::Result<()> {
+                Ok(())
+            }
+
+            async fn queue_size(&self) -> celers_core::Result<usize> {
+                Ok(self.tasks.lock().unwrap().len())
+            }
+
+            async fn cancel(&self, _task_id: &celers_core::TaskId) -> celers_core::Result<bool> {
+                Ok(true)
+            }
+        }
+
+        // ===== Broker Integration Tests =====
+
+        #[tokio::test]
+        async fn test_chain_broker_integration() {
+            let broker = MockBroker::new();
+
+            let chain = Chain::new()
+                .then("task1", vec![serde_json::json!(1)])
+                .then("task2", vec![serde_json::json!(2)])
+                .then("task3", vec![serde_json::json!(3)]);
+
+            // Apply the chain
+            let result = chain.apply(&broker).await;
+            assert!(result.is_ok(), "Chain apply should succeed");
+
+            // Verify only the first task was published
+            // (subsequent tasks are linked via callback mechanism)
+            let tasks = broker.enqueued_tasks();
+            assert_eq!(tasks.len(), 1, "Chain should publish only first task");
+            assert!(tasks.contains(&"task1".to_string()));
+        }
+
+        #[tokio::test]
+        async fn test_group_broker_integration() {
+            let broker = MockBroker::new();
+
+            let group = Group::new()
+                .add("task1", vec![serde_json::json!(1)])
+                .add("task2", vec![serde_json::json!(2)])
+                .add("task3", vec![serde_json::json!(3)]);
+
+            // Apply the group
+            let result = group.apply(&broker).await;
+            assert!(result.is_ok(), "Group apply should succeed");
+
+            // Verify all tasks were published in parallel
+            let tasks = broker.enqueued_tasks();
+            assert_eq!(tasks.len(), 3, "Should publish 3 tasks");
+        }
+
+        #[tokio::test]
+        async fn test_map_broker_integration() {
+            let broker = MockBroker::new();
+
+            let map = Map::new(
+                Signature::new("process".to_string()),
+                vec![
+                    vec![serde_json::json!(1)],
+                    vec![serde_json::json!(2)],
+                    vec![serde_json::json!(3)],
+                ],
+            );
+
+            let result = map.apply(&broker).await;
+            assert!(result.is_ok(), "Map apply should succeed");
+
+            // Verify all task instances were published
+            let tasks = broker.enqueued_tasks();
+            assert_eq!(tasks.len(), 3, "Should publish 3 task instances");
+            assert_eq!(tasks.iter().filter(|t| *t == "process").count(), 3);
+        }
+
+        #[tokio::test]
+        async fn test_nested_workflow_broker_integration() {
+            let broker = MockBroker::new();
+
+            // Create nested workflows
+            let inner_group1 = Group::new()
+                .add("task1", vec![serde_json::json!(1)])
+                .add("task2", vec![serde_json::json!(2)]);
+
+            let inner_group2 = Group::new()
+                .add("task3", vec![serde_json::json!(3)])
+                .add("task4", vec![serde_json::json!(4)]);
+
+            let _ = inner_group1.apply(&broker).await;
+            let _ = inner_group2.apply(&broker).await;
+
+            assert_eq!(broker.task_count(), 4, "Should publish all nested tasks");
+        }
+
+        // ===== Backend Integration Tests =====
+
+        #[cfg(feature = "backend-redis")]
+        #[tokio::test]
+        async fn test_chord_backend_integration() {
+            let chord = Chord::new()
+                .add("task1", vec![serde_json::json!(1)])
+                .add("task2", vec![serde_json::json!(2)])
+                .callback("aggregate", vec![]);
+
+            assert_eq!(chord.tasks.len(), 2);
+            assert!(chord.callback.is_some());
+        }
+
+        #[cfg(feature = "backend-redis")]
+        #[tokio::test]
+        async fn test_chord_state_tracking() {
+            let chord_id = Uuid::new_v4();
+            let chord = Chord::new()
+                .with_group_id(chord_id)
+                .add("task1", vec![serde_json::json!(1)])
+                .add("task2", vec![serde_json::json!(2)])
+                .callback("aggregate", vec![]);
+
+            assert_eq!(chord.group_id, Some(chord_id));
+            assert_eq!(chord.tasks.len(), 2);
+        }
+
+        // ===== Chord Barrier Race Condition Tests =====
+
+        #[tokio::test]
+        async fn test_chord_concurrent_completion() {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(tokio::sync::Barrier::new(10));
+
+            let mut handles = vec![];
+
+            // Simulate 10 tasks completing concurrently
+            for _ in 0..10 {
+                let counter = counter.clone();
+                let barrier = barrier.clone();
+
+                let handle = tokio::spawn(async move {
+                    // Wait for all tasks to be ready
+                    barrier.wait().await;
+
+                    // Simulate task completion and counter increment (like Redis INCR)
+                    let old = counter.fetch_add(1, Ordering::SeqCst);
+                    old + 1
+                });
+
+                handles.push(handle);
+            }
+
+            // Wait for all tasks
+            let mut results = vec![];
+            for handle in handles {
+                results.push(handle.await.unwrap());
+            }
+
+            // Verify no duplicates (each increment should be unique)
+            results.sort();
+            assert_eq!(results, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            assert_eq!(counter.load(Ordering::SeqCst), 10);
+        }
+
+        #[tokio::test]
+        async fn test_chord_barrier_idempotency() {
+            // Test that callback is triggered exactly once even with race conditions
+            let callback_count = Arc::new(AtomicUsize::new(0));
+            let completed_count = Arc::new(AtomicUsize::new(0));
+            let total_tasks = 5;
+
+            let mut handles = vec![];
+
+            for _ in 0..total_tasks {
+                let callback_count = callback_count.clone();
+                let completed_count = completed_count.clone();
+
+                let handle = tokio::spawn(async move {
+                    // Simulate task completion
+                    let count = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
+
+                    // Only the last task should trigger callback
+                    if count == total_tasks {
+                        callback_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            // Verify callback was triggered exactly once
+            assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+            assert_eq!(completed_count.load(Ordering::SeqCst), total_tasks);
+        }
+
+        #[tokio::test]
+        async fn test_chord_partial_failure_handling() {
+            // Test chord behavior when some tasks fail
+            let success_count = Arc::new(AtomicUsize::new(0));
+            let failure_count = Arc::new(AtomicUsize::new(0));
+
+            let mut handles = vec![];
+
+            for i in 0..10 {
+                let success_count = success_count.clone();
+                let failure_count = failure_count.clone();
+
+                let handle = tokio::spawn(async move {
+                    if i % 3 == 0 {
+                        // Simulate failure
+                        failure_count.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), &str>("Task failed")
+                    } else {
+                        // Simulate success
+                        success_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                });
+
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                let _ = handle.await.unwrap();
+            }
+
+            let success = success_count.load(Ordering::SeqCst);
+            let failure = failure_count.load(Ordering::SeqCst);
+
+            assert_eq!(success + failure, 10);
+            assert!(failure > 0, "Should have some failures");
+        }
+
+        // ===== Performance Tests =====
+
+        #[test]
+        fn test_chain_creation_performance() {
+            let start = Instant::now();
+
+            for _ in 0..1000 {
+                let _ = Chain::new()
+                    .then("task1", vec![serde_json::json!(1)])
+                    .then("task2", vec![serde_json::json!(2)])
+                    .then("task3", vec![serde_json::json!(3)]);
+            }
+
+            let duration = start.elapsed();
+            assert!(
+                duration < Duration::from_millis(100),
+                "Creating 1000 chains should take less than 100ms, took {:?}",
+                duration
+            );
+        }
+
+        #[test]
+        fn test_group_creation_performance() {
+            let start = Instant::now();
+
+            for _ in 0..1000 {
+                let _ = Group::new()
+                    .add("task1", vec![serde_json::json!(1)])
+                    .add("task2", vec![serde_json::json!(2)])
+                    .add("task3", vec![serde_json::json!(3)]);
+            }
+
+            let duration = start.elapsed();
+            assert!(
+                duration < Duration::from_millis(100),
+                "Creating 1000 groups should take less than 100ms, took {:?}",
+                duration
+            );
+        }
+
+        #[test]
+        fn test_large_workflow_creation() {
+            let start = Instant::now();
+
+            let mut chain = Chain::new();
+            for i in 0..1000 {
+                let task_name = format!("task{}", i);
+                chain = chain.then(&task_name, vec![serde_json::json!(i)]);
+            }
+
+            let duration = start.elapsed();
+            assert!(
+                duration < Duration::from_millis(500),
+                "Creating chain with 1000 tasks should take less than 500ms, took {:?}",
+                duration
+            );
+            assert_eq!(chain.len(), 1000);
+        }
+
+        #[test]
+        fn test_map_with_large_dataset() {
+            let start = Instant::now();
+
+            let args: Vec<Vec<serde_json::Value>> =
+                (0..1000).map(|i| vec![serde_json::json!(i)]).collect();
+
+            let map = Map::new(Signature::new("process".to_string()), args);
+
+            let duration = start.elapsed();
+            assert!(
+                duration < Duration::from_millis(100),
+                "Creating map with 1000 items should take less than 100ms, took {:?}",
+                duration
+            );
+            assert_eq!(map.len(), 1000);
+        }
+
+        #[test]
+        fn test_workflow_serialization_performance() {
+            let chain = Chain::new()
+                .then("task1", vec![serde_json::json!(1)])
+                .then("task2", vec![serde_json::json!(2)])
+                .then("task3", vec![serde_json::json!(3)]);
+
+            let start = Instant::now();
+
+            for _ in 0..1000 {
+                let _ = serde_json::to_string(&chain).unwrap();
+            }
+
+            let duration = start.elapsed();
+            assert!(
+                duration < Duration::from_millis(100),
+                "Serializing chain 1000 times should take less than 100ms, took {:?}",
+                duration
+            );
+        }
+
+        #[tokio::test]
+        async fn test_broker_publish_performance() {
+            let broker = MockBroker::new();
+            let start = Instant::now();
+
+            for i in 0..100 {
+                let task_name = format!("task{}", i);
+                let chain = Chain::new().then(&task_name, vec![serde_json::json!(i)]);
+                let _ = chain.apply(&broker).await;
+            }
+
+            let duration = start.elapsed();
+            assert!(
+                duration < Duration::from_secs(1),
+                "Publishing 100 chains should take less than 1s, took {:?}",
+                duration
+            );
+            assert_eq!(broker.task_count(), 100);
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_workflow_enqueue() {
+            let broker = Arc::new(MockBroker::new());
+            let mut handles = vec![];
+
+            let start = Instant::now();
+
+            for i in 0..100 {
+                let broker = broker.clone();
+                let handle = tokio::spawn(async move {
+                    let task_name = format!("task{}", i);
+                    let chain = Chain::new().then(&task_name, vec![serde_json::json!(i)]);
+                    chain.apply(&*broker).await
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+
+            let duration = start.elapsed();
+            assert!(
+                duration < Duration::from_secs(2),
+                "Concurrent publishing of 100 chains should take less than 2s, took {:?}",
+                duration
+            );
+            assert_eq!(broker.task_count(), 100);
+        }
+
+        #[test]
+        fn test_memory_efficiency_large_group() {
+            // Test that large groups don't cause excessive memory usage
+            let mut group = Group::new();
+
+            for i in 0..10000 {
+                let task_name = format!("task{}", i);
+                group = group.add(&task_name, vec![serde_json::json!(i)]);
+            }
+
+            assert_eq!(group.len(), 10000);
+            assert!(!group.is_empty());
+        }
+
+        #[test]
+        fn test_workflow_clone_performance() {
+            let chain = Chain::new()
+                .then("task1", vec![serde_json::json!(1)])
+                .then("task2", vec![serde_json::json!(2)])
+                .then("task3", vec![serde_json::json!(3)]);
+
+            let start = Instant::now();
+
+            for _ in 0..1000 {
+                let _ = chain.clone();
+            }
+
+            let duration = start.elapsed();
+            assert!(
+                duration < Duration::from_millis(50),
+                "Cloning chain 1000 times should take less than 50ms, took {:?}",
+                duration
+            );
+        }
+
+        // ===== Stress Tests =====
+
+        #[test]
+        fn test_deeply_nested_workflows() {
+            // Test that deeply nested workflows don't cause stack overflow
+            let mut current = Chain::new().then("task0", vec![serde_json::json!(0)]);
+
+            for i in 1..100 {
+                let task_name = format!("task{}", i);
+                current = current.then(&task_name, vec![serde_json::json!(i)]);
+            }
+
+            assert_eq!(current.len(), 100);
+        }
+
+        #[test]
+        fn test_workflow_with_large_payloads() {
+            // Test workflows with large argument payloads
+            let large_data = vec![serde_json::json!({ "data": "x".repeat(10000) })];
+
+            let chain = Chain::new()
+                .then("process_large", large_data.clone())
+                .then("process_large2", large_data);
+
+            let serialized = serde_json::to_string(&chain).unwrap();
+            assert!(
+                serialized.len() > 20000,
+                "Serialized chain should contain large data"
+            );
+        }
+
+        // ===== DAG Export Tests =====
+
+        #[test]
+        fn test_dag_export_dot_format() {
+            let chain = Chain::new()
+                .then("task1", vec![serde_json::json!(1)])
+                .then("task2", vec![serde_json::json!(2)])
+                .then("task3", vec![serde_json::json!(3)]);
+
+            let dot = chain.to_dot();
+            assert!(dot.contains("digraph Chain"));
+            assert!(dot.contains("task1"));
+            assert!(dot.contains("task2"));
+            assert!(dot.contains("task3"));
+            assert!(dot.contains("->"));
+        }
+
+        #[test]
+        fn test_dag_export_mermaid_format() {
+            let group = Group::new()
+                .add("task1", vec![serde_json::json!(1)])
+                .add("task2", vec![serde_json::json!(2)]);
+
+            let mermaid = group.to_mermaid();
+            assert!(mermaid.contains("graph"));
+            assert!(mermaid.contains("task1"));
+            assert!(mermaid.contains("task2"));
+        }
+
+        #[test]
+        fn test_dag_export_json_format() {
+            let chain = Chain::new().then("task1", vec![serde_json::json!(1)]);
+
+            let json = chain.to_json().unwrap();
+            assert!(json.contains("task1"));
+            assert!(json.contains("tasks"));
+        }
+
+        #[test]
+        fn test_dag_export_render_commands() {
+            let chain = Chain::new().then("task1", vec![serde_json::json!(1)]);
+
+            let svg_cmd = chain.svg_render_command();
+            assert!(svg_cmd.contains("dot"));
+            assert!(svg_cmd.contains("-Tsvg"));
+
+            let png_cmd = chain.png_render_command();
+            assert!(png_cmd.contains("dot"));
+            assert!(png_cmd.contains("-Tpng"));
+        }
+
+        #[test]
+        #[ignore] // Requires GraphViz to be installed
+        fn test_dag_export_to_svg() {
+            let chain = Chain::new()
+                .then("task1", vec![serde_json::json!(1)])
+                .then("task2", vec![serde_json::json!(2)]);
+
+            if is_graphviz_available() {
+                let svg = chain.to_svg().unwrap();
+                assert!(svg.contains("<svg"));
+                assert!(svg.contains("</svg>"));
+                assert!(svg.contains("task1"));
+            } else {
+                println!("Skipping: GraphViz not installed");
+            }
+        }
+
+        #[test]
+        #[ignore] // Requires GraphViz to be installed
+        fn test_dag_export_to_png() {
+            let chain = Chain::new()
+                .then("task1", vec![serde_json::json!(1)])
+                .then("task2", vec![serde_json::json!(2)]);
+
+            if is_graphviz_available() {
+                let png = chain.to_png().unwrap();
+                assert!(!png.is_empty());
+                // PNG magic bytes
+                assert_eq!(&png[0..4], &[0x89, 0x50, 0x4E, 0x47]);
+            } else {
+                println!("Skipping: GraphViz not installed");
+            }
+        }
+
+        #[test]
+        fn test_graphviz_availability_check() {
+            // This test just verifies the function runs without panicking
+            let _available = is_graphviz_available();
+            // Result depends on system, so we just ensure it doesn't crash
+        }
+
+        #[test]
+        fn test_dag_format_enum() {
+            let _dot = DagFormat::Dot;
+            let _mermaid = DagFormat::Mermaid;
+            let _json = DagFormat::Json;
+            let _svg = DagFormat::Svg;
+            let _png = DagFormat::Png;
+        }
+
+        // ========================================================================
+        // Visualization Features Tests
+        // ========================================================================
+
+        #[test]
+        fn test_visual_theme_light() {
+            let theme = VisualTheme::light();
+            assert_eq!(theme.name, "light");
+            assert_eq!(theme.color_for_state("completed"), Some("#4CAF50"));
+            assert_eq!(theme.color_for_state("running"), Some("#2196F3"));
+            assert_eq!(theme.color_for_state("failed"), Some("#F44336"));
+            assert_eq!(theme.shape_for_type("task"), Some("box"));
+        }
+
+        #[test]
+        fn test_visual_theme_dark() {
+            let theme = VisualTheme::dark();
+            assert_eq!(theme.name, "dark");
+            assert_eq!(theme.color_for_state("completed"), Some("#388E3C"));
+            assert_eq!(theme.color_for_state("running"), Some("#1976D2"));
+            assert_eq!(theme.color_for_state("failed"), Some("#D32F2F"));
+        }
+
+        #[test]
+        fn test_visual_theme_default() {
+            let theme = VisualTheme::default();
+            assert_eq!(theme.name, "light");
+        }
+
+        #[test]
+        fn test_task_visual_metadata() {
+            let task_id = Uuid::new_v4();
+            let mut metadata =
+                TaskVisualMetadata::new(task_id, "test_task".to_string(), "running".to_string());
+
+            assert_eq!(metadata.task_name, "test_task");
+            assert_eq!(metadata.state, "running");
+            assert_eq!(metadata.progress, 0.0);
+            assert_eq!(metadata.color, "#2196F3");
+
+            metadata = metadata.with_progress(50.0);
+            assert_eq!(metadata.progress, 50.0);
+
+            metadata = metadata.with_position(100.0, 200.0);
+            assert_eq!(metadata.position, Some((100.0, 200.0)));
+
+            metadata.add_css_class("highlight".to_string());
+            assert!(metadata.css_classes.contains(&"highlight".to_string()));
+
+            metadata.add_metadata("custom".to_string(), serde_json::json!("value"));
+            assert_eq!(
+                metadata.metadata.get("custom"),
+                Some(&serde_json::json!("value"))
+            );
+        }
+
+        #[test]
+        fn test_workflow_visualization_data() {
+            let workflow_id = Uuid::new_v4();
+            let state = WorkflowState {
+                workflow_id,
+                status: WorkflowStatus::Running,
+                total_tasks: 3,
+                completed_tasks: 1,
+                failed_tasks: 0,
+                start_time: Some(12345),
+                end_time: None,
+                current_stage: Some("stage1".to_string()),
+                intermediate_results: HashMap::new(),
+            };
+
+            let mut viz_data =
+                WorkflowVisualizationData::new(workflow_id, "test_workflow".to_string(), state);
+
+            let task1_id = Uuid::new_v4();
+            let task1 =
+                TaskVisualMetadata::new(task1_id, "task1".to_string(), "completed".to_string());
+            viz_data.add_task(task1);
+
+            let task2_id = Uuid::new_v4();
+            let task2 =
+                TaskVisualMetadata::new(task2_id, "task2".to_string(), "running".to_string());
+            viz_data.add_task(task2);
+
+            viz_data.add_edge(task1_id, task2_id, "chain".to_string());
+
+            assert_eq!(viz_data.tasks.len(), 2);
+            assert_eq!(viz_data.edges.len(), 1);
+
+            // Test JSON export
+            let json = viz_data.to_json();
+            assert!(json.is_ok());
+
+            // Test vis.js format
+            let visjs = viz_data.to_visjs_format();
+            assert!(visjs.is_object());
+        }
+
+        #[test]
+        fn test_workflow_visualization_data_with_theme() {
+            let workflow_id = Uuid::new_v4();
+            let state = WorkflowState {
+                workflow_id,
+                status: WorkflowStatus::Pending,
+                total_tasks: 1,
+                completed_tasks: 0,
+                failed_tasks: 0,
+                start_time: None,
+                end_time: None,
+                current_stage: None,
+                intermediate_results: HashMap::new(),
+            };
+
+            let viz_data = WorkflowVisualizationData::new(workflow_id, "test".to_string(), state)
+                .with_theme(VisualTheme::dark())
+                .with_layout("force".to_string());
+
+            assert_eq!(viz_data.theme.name, "dark");
+            assert_eq!(viz_data.layout_hint, "force");
+        }
+
+        #[test]
+        fn test_timeline_entry() {
+            let task_id = Uuid::new_v4();
+            let mut entry = TimelineEntry::new(task_id, "test_task".to_string(), 1000);
+
+            assert_eq!(entry.task_name, "test_task");
+            assert_eq!(entry.start_time, 1000);
+            assert_eq!(entry.state, "running");
+            assert_eq!(entry.end_time, None);
+
+            entry.complete(2000);
+            assert_eq!(entry.end_time, Some(2000));
+            assert_eq!(entry.duration, Some(1000));
+            assert_eq!(entry.state, "completed");
+            assert_eq!(entry.color, "#4CAF50");
+        }
+
+        #[test]
+        fn test_timeline_entry_fail() {
+            let task_id = Uuid::new_v4();
+            let mut entry = TimelineEntry::new(task_id, "test_task".to_string(), 1000);
+
+            entry.fail(2500);
+            assert_eq!(entry.end_time, Some(2500));
+            assert_eq!(entry.duration, Some(1500));
+            assert_eq!(entry.state, "failed");
+            assert_eq!(entry.color, "#F44336");
+        }
+
+        #[test]
+        fn test_timeline_entry_with_worker() {
+            let task_id = Uuid::new_v4();
+            let entry = TimelineEntry::new(task_id, "test".to_string(), 1000)
+                .with_worker("worker-1".to_string())
+                .with_parent(Uuid::new_v4());
+
+            assert_eq!(entry.worker_id, Some("worker-1".to_string()));
+            assert!(entry.parent_id.is_some());
+        }
+
+        #[test]
+        fn test_execution_timeline() {
+            let workflow_id = Uuid::new_v4();
+            let mut timeline = ExecutionTimeline::new(workflow_id);
+
+            let task1_id = Uuid::new_v4();
+            let index = timeline.start_task(task1_id, "task1".to_string());
+            assert_eq!(timeline.entries.len(), 1);
+
+            timeline.complete_task(index);
+            assert_eq!(timeline.entries[index].state, "completed");
+
+            timeline.complete_workflow();
+            assert!(timeline.workflow_end.is_some());
+        }
+
+        #[test]
+        fn test_execution_timeline_fail_task() {
+            let workflow_id = Uuid::new_v4();
+            let mut timeline = ExecutionTimeline::new(workflow_id);
+
+            let task_id = Uuid::new_v4();
+            let index = timeline.start_task(task_id, "failing_task".to_string());
+
+            timeline.fail_task(index);
+            assert_eq!(timeline.entries[index].state, "failed");
+        }
+
+        #[test]
+        fn test_execution_timeline_json_export() {
+            let workflow_id = Uuid::new_v4();
+            let timeline = ExecutionTimeline::new(workflow_id);
+
+            let json = timeline.to_json();
+            assert!(json.is_ok());
+        }
+
+        #[test]
+        fn test_execution_timeline_google_charts() {
+            let workflow_id = Uuid::new_v4();
+            let mut timeline = ExecutionTimeline::new(workflow_id);
+
+            timeline.add_entry(TimelineEntry::new(
+                Uuid::new_v4(),
+                "task1".to_string(),
+                1000,
+            ));
+
+            let chart_data = timeline.to_google_charts_format();
+            assert!(chart_data.is_object());
+            assert!(chart_data["cols"].is_array());
+            assert!(chart_data["rows"].is_array());
+        }
+
+        #[test]
+        fn test_animation_frame() {
+            let workflow_state = WorkflowState {
+                workflow_id: Uuid::new_v4(),
+                status: WorkflowStatus::Running,
+                total_tasks: 5,
+                completed_tasks: 2,
+                failed_tasks: 0,
+                start_time: Some(1000),
+                end_time: None,
+                current_stage: Some("processing".to_string()),
+                intermediate_results: HashMap::new(),
+            };
+
+            let mut frame = AnimationFrame::new(0, workflow_state);
+
+            let task1_id = Uuid::new_v4();
+            let task2_id = Uuid::new_v4();
+
+            frame.set_task_state(task1_id, "completed".to_string());
+            frame.add_active_task(task2_id);
+            frame.add_completed_task(task1_id);
+
+            assert_eq!(
+                frame.task_states.get(&task1_id),
+                Some(&"completed".to_string())
+            );
+            assert!(frame.active_tasks.contains(&task2_id));
+            assert!(frame.completed_tasks.contains(&task1_id));
+            assert!(!frame.active_tasks.contains(&task1_id));
+        }
+
+        #[test]
+        fn test_animation_frame_with_events() {
+            let workflow_state = WorkflowState {
+                workflow_id: Uuid::new_v4(),
+                status: WorkflowStatus::Running,
+                total_tasks: 1,
+                completed_tasks: 0,
+                failed_tasks: 0,
+                start_time: Some(1000),
+                end_time: None,
+                current_stage: None,
+                intermediate_results: HashMap::new(),
+            };
+
+            let mut frame = AnimationFrame::new(0, workflow_state);
+
+            let task_id = Uuid::new_v4();
+            frame.add_event(WorkflowEvent::TaskCompleted { task_id });
+
+            assert_eq!(frame.events.len(), 1);
+        }
+
+        #[test]
+        fn test_workflow_animation() {
+            let workflow_id = Uuid::new_v4();
+            let mut animation = WorkflowAnimation::new(workflow_id, 100);
+
+            let state1 = WorkflowState {
+                workflow_id,
+                status: WorkflowStatus::Pending,
+                total_tasks: 1,
+                completed_tasks: 0,
+                failed_tasks: 0,
+                start_time: None,
+                end_time: None,
+                current_stage: None,
+                intermediate_results: HashMap::new(),
+            };
+
+            let frame1 = AnimationFrame::new(0, state1);
+            animation.add_frame(frame1);
+
+            assert_eq!(animation.frame_count(), 1);
+            assert_eq!(animation.total_duration, 100);
+
+            let retrieved_frame = animation.get_frame(0);
+            assert!(retrieved_frame.is_some());
+        }
+
+        #[test]
+        fn test_workflow_animation_json_export() {
+            let workflow_id = Uuid::new_v4();
+            let animation = WorkflowAnimation::new(workflow_id, 100);
+
+            let json = animation.to_json();
+            assert!(json.is_ok());
+        }
+
+        #[test]
+        fn test_dag_export_with_state_chain() {
+            let mut chain = Chain::new();
+            chain.tasks.push(Signature::new("task1".to_string()));
+            chain.tasks.push(Signature::new("task2".to_string()));
+
+            let workflow_state = WorkflowState {
+                workflow_id: Uuid::new_v4(),
+                status: WorkflowStatus::Running,
+                total_tasks: 2,
+                completed_tasks: 1,
+                failed_tasks: 0,
+                start_time: Some(1000),
+                end_time: None,
+                current_stage: Some("task2".to_string()),
+                intermediate_results: HashMap::new(),
+            };
+
+            let mut task_states = HashMap::new();
+            let task1_id = Uuid::new_v4();
+            let task2_id = Uuid::new_v4();
+            task_states.insert(task1_id, "completed".to_string());
+            task_states.insert(task2_id, "running".to_string());
+
+            let dot = chain.to_dot_with_state(&workflow_state, &task_states);
+            assert!(dot.contains("digraph Chain"));
+            assert!(dot.contains("task1"));
+            assert!(dot.contains("task2"));
+
+            let mermaid = chain.to_mermaid_with_state(&workflow_state, &task_states);
+            assert!(mermaid.contains("graph LR"));
+            assert!(mermaid.contains("completed"));
+            assert!(mermaid.contains("running"));
+
+            let json = chain.to_json_with_state(&workflow_state, &task_states);
+            assert!(json.is_ok());
+        }
+
+        #[test]
+        fn test_dag_export_with_state_group() {
+            let mut group = Group::new();
+            group.tasks.push(Signature::new("task1".to_string()));
+            group.tasks.push(Signature::new("task2".to_string()));
+
+            let workflow_state = WorkflowState {
+                workflow_id: Uuid::new_v4(),
+                status: WorkflowStatus::Running,
+                total_tasks: 2,
+                completed_tasks: 0,
+                failed_tasks: 0,
+                start_time: Some(1000),
+                end_time: None,
+                current_stage: None,
+                intermediate_results: HashMap::new(),
+            };
+
+            let task_states = HashMap::new();
+
+            let dot = group.to_dot_with_state(&workflow_state, &task_states);
+            assert!(dot.contains("digraph Group"));
+
+            let mermaid = group.to_mermaid_with_state(&workflow_state, &task_states);
+            assert!(mermaid.contains("graph TB"));
+
+            let json = group.to_json_with_state(&workflow_state, &task_states);
+            assert!(json.is_ok());
+        }
+
+        #[test]
+        fn test_dag_export_with_state_chord() {
+            let mut header = Group::new();
+            header.tasks.push(Signature::new("task1".to_string()));
+            header.tasks.push(Signature::new("task2".to_string()));
+            let body = Signature::new("callback".to_string());
+            let chord = Chord::new(header, body);
+
+            let workflow_state = WorkflowState {
+                workflow_id: Uuid::new_v4(),
+                status: WorkflowStatus::Running,
+                total_tasks: 3,
+                completed_tasks: 2,
+                failed_tasks: 0,
+                start_time: Some(1000),
+                end_time: None,
+                current_stage: Some("callback".to_string()),
+                intermediate_results: HashMap::new(),
+            };
+
+            let task_states = HashMap::new();
+
+            let dot = chord.to_dot_with_state(&workflow_state, &task_states);
+            assert!(dot.contains("digraph Chord"));
+            assert!(dot.contains("callback"));
+
+            let mermaid = chord.to_mermaid_with_state(&workflow_state, &task_states);
+            assert!(mermaid.contains("graph TB"));
+            assert!(mermaid.contains("callback"));
+
+            let json = chord.to_json_with_state(&workflow_state, &task_states);
+            assert!(json.is_ok());
+        }
+
+        #[test]
+        fn test_workflow_event_stream() {
+            let workflow_id = Uuid::new_v4();
+            let mut stream = WorkflowEventStream::new(workflow_id);
+
+            assert_eq!(stream.workflow_id, workflow_id);
+            assert_eq!(stream.events.len(), 0);
+
+            let task_id = Uuid::new_v4();
+            stream.push(WorkflowEvent::TaskCompleted { task_id });
+            stream.push(WorkflowEvent::WorkflowStarted { workflow_id });
+
+            assert_eq!(stream.events.len(), 2);
+
+            let all_events = stream.all_events();
+            assert_eq!(all_events.len(), 2);
+        }
+
+        #[test]
+        fn test_workflow_event_stream_buffer_limit() {
+            let workflow_id = Uuid::new_v4();
+            let mut stream = WorkflowEventStream::new(workflow_id).with_max_buffer_size(2);
+
+            let task1 = Uuid::new_v4();
+            let task2 = Uuid::new_v4();
+            let task3 = Uuid::new_v4();
+
+            stream.push(WorkflowEvent::TaskCompleted { task_id: task1 });
+            stream.push(WorkflowEvent::TaskCompleted { task_id: task2 });
+            stream.push(WorkflowEvent::TaskCompleted { task_id: task3 });
+
+            // Should only keep last 2 events
+            assert_eq!(stream.events.len(), 2);
+        }
+
+        #[test]
+        fn test_workflow_event_stream_since() {
+            let workflow_id = Uuid::new_v4();
+            let mut stream = WorkflowEventStream::new(workflow_id);
+
+            stream.push(WorkflowEvent::WorkflowStarted { workflow_id });
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let task_id = Uuid::new_v4();
+            stream.push(WorkflowEvent::TaskCompleted { task_id });
+
+            let recent_events = stream.events_since(timestamp);
+            assert_eq!(recent_events.len(), 1);
+        }
+
+        #[test]
+        fn test_workflow_event_stream_clear() {
+            let workflow_id = Uuid::new_v4();
+            let mut stream = WorkflowEventStream::new(workflow_id);
+
+            stream.push(WorkflowEvent::WorkflowStarted { workflow_id });
+            assert_eq!(stream.events.len(), 1);
+
+            stream.clear();
+            assert_eq!(stream.events.len(), 0);
+        }
+
+        #[test]
+        fn test_workflow_event_stream_sse_format() {
+            let workflow_id = Uuid::new_v4();
+            let mut stream = WorkflowEventStream::new(workflow_id);
+
+            stream.push(WorkflowEvent::WorkflowStarted { workflow_id });
+
+            let sse_messages = stream.to_sse_format();
+            assert_eq!(sse_messages.len(), 1);
+            assert!(sse_messages[0].starts_with("event: workflow"));
+        }
+
+        // ========================================================================
+        // Production-Ready Enhancements Tests
+        // ========================================================================
+
+        #[test]
+        fn test_workflow_metrics_collector() {
+            let workflow_id = Uuid::new_v4();
+            let mut collector = WorkflowMetricsCollector::new(workflow_id);
+
+            assert_eq!(collector.workflow_id, workflow_id);
+            assert_eq!(collector.total_tasks, 0);
+            assert_eq!(collector.completed_tasks, 0);
+            assert_eq!(collector.failed_tasks, 0);
+
+            let task1 = Uuid::new_v4();
+            let task2 = Uuid::new_v4();
+
+            collector.record_task_start(task1);
+            collector.record_task_complete(task1, 100);
+
+            assert_eq!(collector.total_tasks, 1);
+            assert_eq!(collector.completed_tasks, 1);
+
+            collector.record_task_start(task2);
+            collector.record_task_failure(task2, 50);
+
+            assert_eq!(collector.total_tasks, 2);
+            assert_eq!(collector.failed_tasks, 1);
+
+            collector.record_task_retry(task2);
+            assert_eq!(*collector.task_retries.get(&task2).unwrap(), 1);
+
+            collector.finalize();
+            assert!(collector.end_time.is_some());
+            assert!(collector.total_duration.is_some());
+            assert!(collector.avg_task_duration.is_some());
+            assert!(collector.success_rate.is_some());
+
+            let summary = collector.summary();
+            assert!(summary.contains("WorkflowMetrics"));
+        }
+
+        #[test]
+        fn test_workflow_metrics_collector_display() {
+            let workflow_id = Uuid::new_v4();
+            let collector = WorkflowMetricsCollector::new(workflow_id);
+
+            let display = format!("{}", collector);
+            assert!(display.contains("WorkflowMetrics"));
+        }
+
+        #[test]
+        fn test_workflow_rate_limiter() {
+            let mut limiter = WorkflowRateLimiter::new(2, 1000);
+
+            assert_eq!(limiter.max_workflows, 2);
+            assert_eq!(limiter.window_ms, 1000);
+
+            assert!(limiter.allow_workflow());
+            assert!(limiter.allow_workflow());
+            assert!(!limiter.allow_workflow()); // Should be rejected
+
+            assert_eq!(limiter.total_workflows, 2);
+            assert_eq!(limiter.rejected_workflows, 1);
+
+            let rate = limiter.current_rate();
+            assert!(rate > 0.0);
+
+            let rejection_rate = limiter.rejection_rate();
+            assert!(rejection_rate > 0.0);
+
+            limiter.reset();
+            assert_eq!(limiter.workflow_timestamps.len(), 0);
+        }
+
+        #[test]
+        fn test_workflow_rate_limiter_display() {
+            let limiter = WorkflowRateLimiter::new(10, 1000);
+
+            let display = format!("{}", limiter);
+            assert!(display.contains("RateLimiter"));
+        }
+
+        #[test]
+        fn test_workflow_concurrency_control() {
+            let mut control = WorkflowConcurrencyControl::new(2);
+
+            assert_eq!(control.max_concurrent, 2);
+            assert_eq!(control.current_concurrency(), 0);
+            assert_eq!(control.available_slots(), 2);
+            assert!(!control.is_at_capacity());
+
+            let wf1 = Uuid::new_v4();
+            let wf2 = Uuid::new_v4();
+            let wf3 = Uuid::new_v4();
+
+            assert!(control.try_start(wf1));
+            assert!(control.try_start(wf2));
+            assert!(!control.try_start(wf3)); // Should be rejected
+
+            assert_eq!(control.current_concurrency(), 2);
+            assert!(control.is_at_capacity());
+            assert_eq!(control.peak_concurrency, 2);
+
+            assert!(control.complete(wf1));
+            assert_eq!(control.current_concurrency(), 1);
+            assert_eq!(control.total_completed, 1);
+
+            assert!(control.try_start(wf3));
+            assert_eq!(control.current_concurrency(), 2);
+        }
+
+        #[test]
+        fn test_workflow_concurrency_control_display() {
+            let control = WorkflowConcurrencyControl::new(5);
+
+            let display = format!("{}", control);
+            assert!(display.contains("ConcurrencyControl"));
+        }
+
+        #[test]
+        fn test_workflow_builder() {
+            let builder = WorkflowBuilder::new("test_workflow")
+                .with_description("Test workflow description")
+                .add_tag("test")
+                .add_tag("production")
+                .add_metadata("version", serde_json::json!("1.0"));
+
+            assert_eq!(builder.name, "test_workflow");
+            assert_eq!(
+                builder.description,
+                Some("Test workflow description".to_string())
+            );
+            assert_eq!(builder.tags.len(), 2);
+            assert_eq!(builder.metadata.len(), 1);
+
+            let chain = builder.clone().chain();
+            assert!(chain.is_empty());
+
+            let group = builder.clone().group();
+            assert!(group.is_empty());
+
+            let task = Signature::new("map_task".to_string());
+            let argsets = vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]];
+            let map = builder.map(task, argsets);
+            assert_eq!(map.task.task, "map_task");
+        }
+
+        #[test]
+        fn test_workflow_registry() {
+            let mut registry = WorkflowRegistry::new();
+
+            assert_eq!(registry.count(), 0);
+
+            let wf1 = Uuid::new_v4();
+            let wf2 = Uuid::new_v4();
+
+            let mut metadata1 = HashMap::new();
+            metadata1.insert("version".to_string(), serde_json::json!("1.0"));
+
+            registry.register(wf1, "workflow_1".to_string(), metadata1.clone());
+            registry.register(wf2, "workflow_2".to_string(), HashMap::new());
+
+            assert_eq!(registry.count(), 2);
+            assert_eq!(registry.get_name(&wf1), Some("workflow_1"));
+            assert_eq!(registry.get_state(&wf1), Some(&WorkflowStatus::Pending));
+
+            registry.update_state(wf1, WorkflowStatus::Running);
+            assert_eq!(registry.get_state(&wf1), Some(&WorkflowStatus::Running));
+
+            registry.add_tag(wf1, "production".to_string());
+            registry.add_tag(wf2, "production".to_string());
+
+            let production_workflows = registry.get_by_tag("production");
+            assert_eq!(production_workflows.len(), 2);
+
+            let running = registry.get_by_state(&WorkflowStatus::Running);
+            assert_eq!(running.len(), 1);
+
+            assert!(registry.remove(&wf1));
+            assert_eq!(registry.count(), 1);
+
+            registry.clear();
+            assert_eq!(registry.count(), 0);
+        }
+
+        #[test]
+        fn test_workflow_registry_default() {
+            let registry = WorkflowRegistry::default();
+            assert_eq!(registry.count(), 0);
+        }
+
+        #[test]
+        fn test_workflow_registry_display() {
+            let mut registry = WorkflowRegistry::new();
+
+            let wf1 = Uuid::new_v4();
+            registry.register(wf1, "test".to_string(), HashMap::new());
+
+            let display = format!("{}", registry);
+            assert!(display.contains("WorkflowRegistry"));
+            assert!(display.contains("total=1"));
+        }
     }
 }

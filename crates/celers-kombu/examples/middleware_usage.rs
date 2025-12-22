@@ -85,7 +85,7 @@ async fn main() -> celers_kombu::Result<()> {
 
     // 2. Retry Limit Middleware
     println!("\n2️⃣  Retry Limit Middleware");
-    let retry_limiter = RetryLimitMiddleware::new(3);
+    let _retry_limiter = RetryLimitMiddleware::new(3);
 
     println!("   Max retries configured: 3");
     println!("   Middleware will reject messages that exceed retry limit");

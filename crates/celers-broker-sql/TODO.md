@@ -165,6 +165,10 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 - [x] **UUID Optimization Guide** - CHAR(36) vs BINARY(16) analysis and migration guide (migrations/005_uuid_optimization.sql)
 - [x] **Worker Pool Example** - Production-ready worker pool implementation with health monitoring and graceful shutdown (examples/worker_pool.rs)
 - [x] **Task Producer Example** - Comprehensive task enqueueing examples with different patterns (examples/task_producer.rs)
+- [x] **Circuit Breaker Example** - Demonstrates circuit breaker pattern for resilient database operations (examples/circuit_breaker.rs) (2025-12-20)
+- [x] **Bulk Import/Export Example** - Data migration and backup utilities using JSON format (examples/bulk_import_export.rs) (2025-12-20)
+- [x] **Recurring Tasks Example** - Scheduled periodic task execution with multiple schedule types (examples/recurring_tasks.rs) (2025-12-20)
+- [x] **Advanced Retry Policies Example** - Sophisticated retry strategies including exponential backoff with jitter (examples/advanced_retry.rs) (2025-12-20)
 - [x] **Examples Documentation** - Complete guide for using the examples with troubleshooting and best practices (examples/README.md)
 - [x] **Enhanced Batch Operations** - `cancel_batch()` for bulk task cancellation (2025-12-04)
 - [x] **Worker Statistics** - `get_worker_statistics()` and `get_all_worker_statistics()` for per-worker monitoring (2025-12-04)
@@ -198,6 +202,30 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 - [x] **Time-Windowed Deduplication** - `enqueue_deduplicated_window()` for preventing duplicates within time windows (2025-12-07)
 - [x] **Cascade Cancellation** - `cancel_cascade()` for cancelling tasks and all their dependents (2025-12-07)
 - [x] **Circuit Breaker Support** - Data structures for circuit breaker pattern (CircuitBreakerState, CircuitBreakerStats) (2025-12-07)
+- [x] **Circuit Breaker Implementation** - Full circuit breaker pattern with automatic state transitions, failure tracking, and recovery (2025-12-13)
+  - `get_circuit_breaker_stats()` - Get current circuit breaker state and statistics
+  - `reset_circuit_breaker()` - Manually reset circuit breaker to closed state
+  - `with_circuit_breaker()` - Execute operations with circuit breaker protection
+  - `with_circuit_breaker_config()` - Create broker with custom circuit breaker configuration
+  - Automatic state transitions: Closed -> Open -> HalfOpen -> Closed
+  - Configurable failure threshold, timeout, and success threshold
+- [x] **Bulk Import/Export** - Data migration and backup utilities (2025-12-13)
+  - `export_tasks()` - Export tasks to JSON format for backup or migration
+  - `import_tasks()` - Import tasks from JSON format with duplicate handling
+  - `export_dlq()` - Export dead letter queue entries for analysis
+- [x] **Recurring/Cron Tasks** - Scheduled periodic task execution (2025-12-13)
+  - `register_recurring_task()` - Register tasks to run on recurring schedules
+  - `process_recurring_tasks()` - Process and enqueue due recurring tasks
+  - `list_recurring_tasks()` - List all recurring task configurations
+  - `delete_recurring_task()` - Remove recurring task configurations
+  - Support for multiple schedule types: EverySeconds, EveryMinutes, EveryHours, EveryDays, Weekly, Monthly
+  - Automatic next-run calculation with timezone support
+- [x] **Advanced Retry Policies** - Sophisticated retry strategies (2025-12-13)
+  - `enqueue_with_retry_policy()` - Enqueue tasks with custom retry behavior
+  - `reject_with_retry_policy()` - Reject with policy-based retry scheduling
+  - Multiple retry strategies: Fixed, Linear, Exponential, ExponentialWithJitter
+  - Configurable base delay, multiplier, and maximum delay
+  - Jitter support to prevent thundering herd problem
 
 ## Future Enhancements
 
@@ -514,6 +542,77 @@ enqueue_deduplicated_window(task: SerializedTask, dedup_key: &str, window_secs: 
 
 cancel_cascade(task_id: &TaskId) -> u64
 // Cancel a task and all its dependent tasks (identified by parent_task_id in metadata)
+```
+
+### NEW: Circuit Breaker (2025-12-13)
+```rust
+with_circuit_breaker_config(url, queue_name, pool_config, circuit_breaker_config) -> MysqlBroker
+// Create broker with custom circuit breaker configuration
+
+get_circuit_breaker_stats() -> CircuitBreakerStats
+// Get current circuit breaker state, failure/success counts, and timestamps
+
+reset_circuit_breaker()
+// Manually reset circuit breaker to Closed state
+
+with_circuit_breaker<F, T>(operation: F) -> Result<T>
+// Execute a database operation with circuit breaker protection
+// Tracks failures and automatically opens/closes circuit based on thresholds
+```
+
+### NEW: Bulk Import/Export (2025-12-13)
+```rust
+export_tasks(state: Option<DbTaskState>, limit: Option<i64>) -> String
+// Export tasks to JSON format for backup or migration
+// Returns JSON string with task data
+
+import_tasks(json_data: &str, skip_existing: bool) -> u64
+// Import tasks from JSON format (from export_tasks)
+// Returns number of tasks successfully imported
+
+export_dlq(limit: Option<i64>) -> String
+// Export dead letter queue entries to JSON format for analysis
+```
+
+### NEW: Recurring/Cron Tasks (2025-12-13)
+```rust
+register_recurring_task(config: RecurringTaskConfig) -> String
+// Register a task to run on a recurring schedule
+// Returns configuration ID
+
+process_recurring_tasks() -> u64
+// Check for due recurring tasks and enqueue them
+// Should be called periodically by a scheduler
+// Returns number of tasks enqueued
+
+list_recurring_tasks() -> Vec<(String, RecurringTaskConfig)>
+// List all recurring task configurations
+
+delete_recurring_task(config_id: &str) -> bool
+// Delete a recurring task configuration
+
+// RecurringSchedule types:
+// - EverySeconds(u64)
+// - EveryMinutes(u64)
+// - EveryHours(u64)
+// - EveryDays(u64, hour, minute)
+// - Weekly(day_of_week, hour, minute)  // 0=Sunday
+// - Monthly(day, hour, minute)
+```
+
+### NEW: Advanced Retry Policies (2025-12-13)
+```rust
+enqueue_with_retry_policy(task: SerializedTask, retry_policy: RetryPolicy) -> TaskId
+// Enqueue task with custom retry behavior
+
+reject_with_retry_policy(task_id: &TaskId, error: Option<String>, requeue: bool) -> bool
+// Reject task with policy-based retry scheduling
+
+// RetryStrategy types:
+// - Fixed(delay_secs)
+// - Linear { base_delay_secs }
+// - Exponential { base_delay_secs, multiplier, max_delay_secs }
+// - ExponentialWithJitter { base_delay_secs, multiplier, max_delay_secs }
 ```
 
 ## Schema Design
