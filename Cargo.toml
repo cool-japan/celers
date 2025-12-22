@@ -43,14 +43,14 @@ tokio = { version = "1.48.0", features = ["full"] }
 async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-bincode = "2.0.1"
+bincode = "3.0.0"
 thiserror = "2.0.17"
 anyhow = "1.0.100"
 tracing = "0.1.43"
 tracing-subscriber = "0.3.22"
 
 # Broker implementations
-redis = { version = "0.32.7", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.0.1", features = ["tokio-comp", "connection-manager"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
 
 # CLI and utilities
