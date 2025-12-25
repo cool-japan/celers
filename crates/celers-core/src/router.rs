@@ -951,6 +951,320 @@ impl Default for RoutingConfig {
     }
 }
 
+// ============================================================================
+// Topic-Based Routing (AMQP Topic Exchange Pattern)
+// ============================================================================
+
+/// Topic pattern matcher for AMQP-style topic routing
+///
+/// Supports wildcards:
+/// - `*` (star) matches exactly one word
+/// - `#` (hash) matches zero or more words
+/// - Words are separated by dots (`.`)
+///
+/// # Examples
+///
+/// ```rust
+/// use celers_core::router::TopicPattern;
+///
+/// let pattern = TopicPattern::new("user.*.created");
+/// assert!(pattern.matches("user.email.created"));
+/// assert!(pattern.matches("user.profile.created"));
+/// assert!(!pattern.matches("user.created"));  // No middle word
+/// assert!(!pattern.matches("user.email.verified.created"));  // Too many words
+///
+/// let pattern = TopicPattern::new("user.#");
+/// assert!(pattern.matches("user.email"));
+/// assert!(pattern.matches("user.email.created"));
+/// assert!(pattern.matches("user.email.verified.sent"));
+/// assert!(!pattern.matches("admin.email"));  // Doesn't start with "user"
+/// ```
+#[derive(Debug, Clone)]
+pub struct TopicPattern {
+    pattern: String,
+    segments: Vec<TopicSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TopicSegment {
+    /// Exact word match
+    Literal(String),
+    /// Wildcard: matches exactly one word (*)
+    Star,
+    /// Wildcard: matches zero or more words (#)
+    Hash,
+}
+
+impl TopicPattern {
+    /// Create a new topic pattern
+    pub fn new(pattern: impl Into<String>) -> Self {
+        let pattern = pattern.into();
+        let segments = Self::parse(&pattern);
+        Self { pattern, segments }
+    }
+
+    fn parse(pattern: &str) -> Vec<TopicSegment> {
+        pattern
+            .split('.')
+            .map(|s| match s {
+                "*" => TopicSegment::Star,
+                "#" => TopicSegment::Hash,
+                literal => TopicSegment::Literal(literal.to_string()),
+            })
+            .collect()
+    }
+
+    /// Check if a routing key matches this topic pattern
+    pub fn matches(&self, routing_key: &str) -> bool {
+        let key_parts: Vec<&str> = routing_key.split('.').collect();
+        self.matches_parts(&key_parts, 0, 0)
+    }
+
+    fn matches_parts(&self, key_parts: &[&str], key_idx: usize, pattern_idx: usize) -> bool {
+        // Base cases
+        if pattern_idx >= self.segments.len() {
+            return key_idx >= key_parts.len();
+        }
+
+        if key_idx >= key_parts.len() {
+            // Check if remaining segments are all # (which match zero words)
+            return self.segments[pattern_idx..]
+                .iter()
+                .all(|seg| matches!(seg, TopicSegment::Hash));
+        }
+
+        match &self.segments[pattern_idx] {
+            TopicSegment::Literal(literal) => {
+                if key_parts[key_idx] == literal {
+                    self.matches_parts(key_parts, key_idx + 1, pattern_idx + 1)
+                } else {
+                    false
+                }
+            }
+            TopicSegment::Star => {
+                // * matches exactly one word
+                self.matches_parts(key_parts, key_idx + 1, pattern_idx + 1)
+            }
+            TopicSegment::Hash => {
+                // # matches zero or more words
+                // Try matching zero words (skip this segment)
+                if self.matches_parts(key_parts, key_idx, pattern_idx + 1) {
+                    return true;
+                }
+                // Try matching one or more words
+                for i in key_idx..key_parts.len() {
+                    if self.matches_parts(key_parts, i + 1, pattern_idx + 1) {
+                        return true;
+                    }
+                }
+                // Also check if # can match all remaining words
+                pattern_idx + 1 >= self.segments.len()
+            }
+        }
+    }
+
+    /// Get the original pattern string
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    /// Get pattern complexity (number of segments)
+    pub fn complexity(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Check if pattern contains wildcards
+    pub fn has_wildcards(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| matches!(s, TopicSegment::Star | TopicSegment::Hash))
+    }
+
+    /// Check if pattern is exact (no wildcards)
+    pub fn is_exact(&self) -> bool {
+        !self.has_wildcards()
+    }
+}
+
+/// Topic exchange router for AMQP-style topic routing
+///
+/// Routes messages based on topic patterns with wildcards.
+#[derive(Debug, Clone)]
+pub struct TopicRouter {
+    /// Topic bindings: (pattern, queue)
+    bindings: Vec<(TopicPattern, String)>,
+
+    /// Default queue for unmatched topics
+    default_queue: Option<String>,
+}
+
+impl TopicRouter {
+    /// Create a new topic router
+    pub fn new() -> Self {
+        Self {
+            bindings: Vec::new(),
+            default_queue: None,
+        }
+    }
+
+    /// Bind a topic pattern to a queue
+    pub fn bind(&mut self, pattern: impl Into<String>, queue: impl Into<String>) {
+        let pattern = TopicPattern::new(pattern);
+        self.bindings.push((pattern, queue.into()));
+    }
+
+    /// Bind multiple patterns to a queue
+    pub fn bind_many(&mut self, patterns: Vec<String>, queue: impl Into<String>) {
+        let queue = queue.into();
+        for pattern in patterns {
+            self.bind(pattern, queue.clone());
+        }
+    }
+
+    /// Set default queue for unmatched routing keys
+    pub fn set_default_queue(&mut self, queue: impl Into<String>) {
+        self.default_queue = Some(queue.into());
+    }
+
+    /// Route a message based on routing key
+    ///
+    /// Returns the first matching queue, or the default queue if no match.
+    pub fn route(&self, routing_key: &str) -> Option<String> {
+        for (pattern, queue) in &self.bindings {
+            if pattern.matches(routing_key) {
+                return Some(queue.clone());
+            }
+        }
+
+        self.default_queue.clone()
+    }
+
+    /// Get all queues that match a routing key
+    pub fn route_all(&self, routing_key: &str) -> Vec<String> {
+        self.bindings
+            .iter()
+            .filter(|(pattern, _)| pattern.matches(routing_key))
+            .map(|(_, queue)| queue.clone())
+            .collect()
+    }
+
+    /// Remove all bindings for a queue
+    pub fn unbind_queue(&mut self, queue: &str) -> usize {
+        let original_len = self.bindings.len();
+        self.bindings.retain(|(_, q)| q != queue);
+        original_len - self.bindings.len()
+    }
+
+    /// Remove a specific binding
+    pub fn unbind_pattern(&mut self, pattern: &str) -> bool {
+        let original_len = self.bindings.len();
+        self.bindings.retain(|(p, _)| p.pattern() != pattern);
+        self.bindings.len() < original_len
+    }
+
+    /// Get all bindings
+    pub fn bindings(&self) -> Vec<(String, String)> {
+        self.bindings
+            .iter()
+            .map(|(pattern, queue)| (pattern.pattern().to_string(), queue.clone()))
+            .collect()
+    }
+
+    /// Clear all bindings
+    pub fn clear(&mut self) {
+        self.bindings.clear();
+        self.default_queue = None;
+    }
+
+    /// Get number of bindings
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Check if a routing key has any matches
+    pub fn has_match(&self, routing_key: &str) -> bool {
+        self.bindings.iter().any(|(p, _)| p.matches(routing_key)) || self.default_queue.is_some()
+    }
+}
+
+impl Default for TopicRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Topic exchange configuration for declarative setup
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicExchangeConfig {
+    /// Exchange name
+    pub name: String,
+
+    /// Topic bindings: pattern -> queue
+    pub bindings: HashMap<String, String>,
+
+    /// Default queue for unmatched topics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_queue: Option<String>,
+
+    /// Whether the exchange is durable
+    #[serde(default = "default_true")]
+    pub durable: bool,
+
+    /// Whether to auto-delete when unused
+    #[serde(default)]
+    pub auto_delete: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl TopicExchangeConfig {
+    /// Create a new topic exchange configuration
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            bindings: HashMap::new(),
+            default_queue: None,
+            durable: true,
+            auto_delete: false,
+        }
+    }
+
+    /// Add a topic binding
+    pub fn with_binding(mut self, pattern: impl Into<String>, queue: impl Into<String>) -> Self {
+        self.bindings.insert(pattern.into(), queue.into());
+        self
+    }
+
+    /// Set default queue
+    pub fn with_default_queue(mut self, queue: impl Into<String>) -> Self {
+        self.default_queue = Some(queue.into());
+        self
+    }
+
+    /// Set durable flag
+    pub fn with_durable(mut self, durable: bool) -> Self {
+        self.durable = durable;
+        self
+    }
+
+    /// Build a topic router from this configuration
+    pub fn build_router(&self) -> TopicRouter {
+        let mut router = TopicRouter::new();
+
+        for (pattern, queue) in &self.bindings {
+            router.bind(pattern.clone(), queue.clone());
+        }
+
+        if let Some(ref default_queue) = self.default_queue {
+            router.set_default_queue(default_queue.clone());
+        }
+
+        router
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

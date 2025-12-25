@@ -12,14 +12,14 @@ use std::time::Duration;
 
 // Define task argument types
 #[allow(dead_code)]
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct AddArgs {
     x: i32,
     y: i32,
 }
 
 #[allow(dead_code)]
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct ProcessDataArgs {
     data: Vec<String>,
     filter: Option<String>,

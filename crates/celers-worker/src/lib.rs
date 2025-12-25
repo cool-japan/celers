@@ -413,7 +413,8 @@ impl WorkerConfig {
         match env.as_str() {
             "production" | "prod" => Self::for_production(),
             "staging" | "stage" => Self::for_staging(),
-            "development" | "dev" | _ => Self::for_development(),
+            "development" | "dev" => Self::for_development(),
+            _ => Self::for_development(),
         }
     }
 

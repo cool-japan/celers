@@ -109,6 +109,7 @@
 //! - **Rate Limiting**: Token bucket and sliding window algorithms
 
 pub mod broker;
+pub mod config;
 pub mod control;
 pub mod dag;
 pub mod error;
@@ -125,6 +126,10 @@ pub mod task;
 pub mod time_limit;
 
 pub use broker::{Broker, BrokerMessage};
+pub use config::{
+    BackendTransport, BeatSchedule, BrokerTransport, CeleryConfig, ScheduleDefinition, TaskConfig,
+    TaskRoute,
+};
 pub use control::{
     ActiveTaskInfo, BrokerStats, ControlCommand, ControlResponse, DeliveryInfo, InspectCommand,
     InspectResponse, PoolStats, QueueCommand, QueueResponse, QueueStats, RequestInfo,
@@ -133,9 +138,11 @@ pub use control::{
 pub use dag::{DagNode, TaskDag};
 pub use error::{CelersError, Result};
 pub use event::{
-    CompositeEventEmitter, Event, EventEmitter, InMemoryEventEmitter, LogLevel,
-    LoggingEventEmitter, NoOpEventEmitter, TaskEvent, TaskEventBuilder, WorkerEvent,
-    WorkerEventBuilder,
+    Alert, AlertCondition, AlertContext, AlertHandler, AlertManager, AlertSeverity,
+    CompositeEventEmitter, Event, EventDispatcher, EventEmitter, EventFilter, EventMonitor,
+    EventReceiver, EventStats, EventStorage, EventStream, FileEventStorage, InMemoryEventEmitter,
+    InMemoryEventStorage, LogLevel, LoggingAlertHandler, LoggingEventEmitter, NoOpEventEmitter,
+    TaskEvent, TaskEventBuilder, WorkerEvent, WorkerEventBuilder,
 };
 pub use exception::{
     ExceptionAction, ExceptionCategory, ExceptionHandler, ExceptionHandlerChain, ExceptionPolicy,
@@ -143,10 +150,14 @@ pub use exception::{
 };
 pub use executor::TaskRegistry;
 pub use rate_limit::{
-    create_rate_limiter, RateLimitConfig, RateLimiter, SlidingWindow, TaskRateLimiter, TokenBucket,
-    WorkerRateLimiter,
+    create_rate_limiter, DistributedRateLimiter, DistributedRateLimiterCoordinator,
+    DistributedRateLimiterState, DistributedSlidingWindowSpec, DistributedTokenBucketSpec,
+    RateLimitConfig, RateLimiter, SlidingWindow, TaskRateLimiter, TokenBucket, WorkerRateLimiter,
 };
-pub use result::{AsyncResult, ResultStore, TaskResultValue};
+pub use result::{
+    AsyncResult, ExtendedResultStore, ResultChunk, ResultChunker, ResultCompressor, ResultMetadata,
+    ResultStore, ResultTombstone, TaskResultValue,
+};
 pub use retry::{RetryPolicy, RetryStrategy};
 pub use revocation::{
     PatternRevocation, RevocationManager, RevocationMode, RevocationRequest, RevocationResult,

@@ -2588,11 +2588,7 @@ impl ScheduledTask {
     /// Get the latest version before current
     pub fn get_previous_version(&self) -> Option<&ScheduleVersion> {
         if self.current_version > 1 {
-            self.version_history
-                .iter()
-                .rev()
-                .skip(1) // Skip current version
-                .next()
+            self.version_history.iter().rev().nth(1) // Skip current version
         } else {
             None
         }
@@ -4095,9 +4091,9 @@ impl BeatScheduler {
                             next2.format("%Y-%m-%d %H:%M:%S")
                         );
 
-                        let resolution = Some(format!(
+                        let resolution =
                             "Consider adjusting schedules or using jitter to avoid overlap"
-                        ));
+                                .to_string();
 
                         conflicts.push(
                             ScheduleConflict::new(
@@ -4107,7 +4103,7 @@ impl BeatScheduler {
                                 overlap_seconds,
                                 description,
                             )
-                            .with_resolution(resolution.unwrap()),
+                            .with_resolution(resolution),
                         );
                     }
                 }

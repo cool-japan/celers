@@ -406,6 +406,386 @@ impl<S: ResultStore + Clone> std::fmt::Display for AsyncResult<S> {
     }
 }
 
+// ============================================================================
+// Advanced Result Features
+// ============================================================================
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Result metadata for storing additional information with task results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultMetadata {
+    /// Custom tags for categorization
+    pub tags: Vec<String>,
+
+    /// Custom key-value fields
+    pub custom_fields: HashMap<String, Value>,
+
+    /// Result creation timestamp
+    pub created_at: DateTime<Utc>,
+
+    /// Result expiration timestamp (TTL)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+
+    /// Whether the result is compressed
+    pub compressed: bool,
+
+    /// Compression algorithm used (if compressed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_algorithm: Option<String>,
+
+    /// Whether the result is chunked
+    pub chunked: bool,
+
+    /// Total number of chunks (if chunked)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_chunks: Option<usize>,
+
+    /// Original size in bytes (before compression/chunking)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_size: Option<usize>,
+
+    /// Compressed size in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compressed_size: Option<usize>,
+}
+
+impl ResultMetadata {
+    /// Create new result metadata
+    pub fn new() -> Self {
+        Self {
+            tags: Vec::new(),
+            custom_fields: HashMap::new(),
+            created_at: Utc::now(),
+            expires_at: None,
+            compressed: false,
+            compression_algorithm: None,
+            chunked: false,
+            total_chunks: None,
+            original_size: None,
+            compressed_size: None,
+        }
+    }
+
+    /// Add a tag
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Add multiple tags
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags.extend(tags);
+        self
+    }
+
+    /// Add a custom field
+    pub fn with_field(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.custom_fields.insert(key.into(), value);
+        self
+    }
+
+    /// Set TTL (time to live)
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.expires_at = Some(Utc::now() + chrono::Duration::from_std(ttl).unwrap());
+        self
+    }
+
+    /// Set expiration timestamp
+    pub fn with_expires_at(mut self, expires_at: DateTime<Utc>) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Check if the result has expired
+    pub fn is_expired(&self) -> bool {
+        self.expires_at.is_some_and(|exp| Utc::now() > exp)
+    }
+
+    /// Get time until expiration
+    pub fn time_until_expiration(&self) -> Option<Duration> {
+        self.expires_at.and_then(|exp| {
+            let diff = exp - Utc::now();
+            diff.to_std().ok()
+        })
+    }
+
+    /// Mark as compressed
+    pub fn with_compression(
+        mut self,
+        algorithm: impl Into<String>,
+        original_size: usize,
+        compressed_size: usize,
+    ) -> Self {
+        self.compressed = true;
+        self.compression_algorithm = Some(algorithm.into());
+        self.original_size = Some(original_size);
+        self.compressed_size = Some(compressed_size);
+        self
+    }
+
+    /// Mark as chunked
+    pub fn with_chunking(mut self, total_chunks: usize) -> Self {
+        self.chunked = true;
+        self.total_chunks = Some(total_chunks);
+        self
+    }
+
+    /// Get compression ratio
+    pub fn compression_ratio(&self) -> Option<f64> {
+        if let (Some(orig), Some(comp)) = (self.original_size, self.compressed_size) {
+            if orig > 0 {
+                return Some(comp as f64 / orig as f64);
+            }
+        }
+        None
+    }
+}
+
+impl Default for ResultMetadata {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result chunk for large results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultChunk {
+    /// Chunk index (0-based)
+    pub index: usize,
+
+    /// Total number of chunks
+    pub total: usize,
+
+    /// Chunk data
+    pub data: Vec<u8>,
+
+    /// Checksum for integrity verification
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+}
+
+impl ResultChunk {
+    /// Create a new result chunk
+    pub fn new(index: usize, total: usize, data: Vec<u8>) -> Self {
+        Self {
+            index,
+            total,
+            data,
+            checksum: None,
+        }
+    }
+
+    /// Add checksum
+    pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
+        self.checksum = Some(checksum.into());
+        self
+    }
+
+    /// Check if this is the last chunk
+    pub fn is_last(&self) -> bool {
+        self.index == self.total - 1
+    }
+}
+
+/// Result tombstone marker for deleted tasks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultTombstone {
+    /// Task ID
+    pub task_id: TaskId,
+
+    /// Deletion timestamp
+    pub deleted_at: DateTime<Utc>,
+
+    /// Reason for deletion
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+
+    /// Who deleted it (user, system, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_by: Option<String>,
+
+    /// TTL for the tombstone itself
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone_ttl: Option<Duration>,
+}
+
+impl ResultTombstone {
+    /// Create a new tombstone
+    pub fn new(task_id: TaskId) -> Self {
+        Self {
+            task_id,
+            deleted_at: Utc::now(),
+            reason: None,
+            deleted_by: None,
+            tombstone_ttl: None,
+        }
+    }
+
+    /// Set deletion reason
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Set who deleted it
+    pub fn with_deleted_by(mut self, deleted_by: impl Into<String>) -> Self {
+        self.deleted_by = Some(deleted_by.into());
+        self
+    }
+
+    /// Set tombstone TTL
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.tombstone_ttl = Some(ttl);
+        self
+    }
+}
+
+/// Extended result store with advanced features
+#[async_trait]
+pub trait ExtendedResultStore: ResultStore {
+    /// Store result with metadata
+    async fn store_result_with_metadata(
+        &self,
+        task_id: TaskId,
+        result: TaskResultValue,
+        metadata: ResultMetadata,
+    ) -> crate::Result<()>;
+
+    /// Get result metadata
+    async fn get_metadata(&self, task_id: TaskId) -> crate::Result<Option<ResultMetadata>>;
+
+    /// Store a result chunk
+    async fn store_chunk(&self, task_id: TaskId, chunk: ResultChunk) -> crate::Result<()>;
+
+    /// Get a result chunk
+    async fn get_chunk(&self, task_id: TaskId, index: usize) -> crate::Result<Option<ResultChunk>>;
+
+    /// Get all chunks for a task
+    async fn get_all_chunks(&self, task_id: TaskId) -> crate::Result<Vec<ResultChunk>>;
+
+    /// Store a tombstone
+    async fn store_tombstone(&self, tombstone: ResultTombstone) -> crate::Result<()>;
+
+    /// Get a tombstone
+    async fn get_tombstone(&self, task_id: TaskId) -> crate::Result<Option<ResultTombstone>>;
+
+    /// Check if a task has a tombstone
+    async fn has_tombstone(&self, task_id: TaskId) -> crate::Result<bool> {
+        Ok(self.get_tombstone(task_id).await?.is_some())
+    }
+
+    /// Cleanup expired results
+    async fn cleanup_expired(&self) -> crate::Result<usize>;
+
+    /// Query results by tags
+    async fn query_by_tags(&self, tags: &[String]) -> crate::Result<Vec<TaskId>>;
+}
+
+/// Compression helper for result values
+pub struct ResultCompressor {
+    threshold_bytes: usize,
+}
+
+impl ResultCompressor {
+    /// Create a new compressor with threshold
+    pub fn new(threshold_bytes: usize) -> Self {
+        Self { threshold_bytes }
+    }
+
+    /// Check if value should be compressed
+    pub fn should_compress(&self, data: &[u8]) -> bool {
+        data.len() >= self.threshold_bytes
+    }
+
+    /// Compress data (to be implemented by backend-specific compressors)
+    ///
+    /// Note: Actual compression implementations are provided by backend crates
+    /// (e.g., celers-backend-redis) which have the compression dependencies.
+    pub fn compress(&self, _data: &[u8], _algorithm: &str) -> crate::Result<Vec<u8>> {
+        Err(crate::CelersError::Other(
+            "Compression not available - use backend-specific implementation".to_string(),
+        ))
+    }
+
+    /// Decompress data (to be implemented by backend-specific compressors)
+    ///
+    /// Note: Actual decompression implementations are provided by backend crates
+    /// (e.g., celers-backend-redis) which have the compression dependencies.
+    pub fn decompress(&self, _data: &[u8], _algorithm: &str) -> crate::Result<Vec<u8>> {
+        Err(crate::CelersError::Other(
+            "Decompression not available - use backend-specific implementation".to_string(),
+        ))
+    }
+}
+
+impl Default for ResultCompressor {
+    fn default() -> Self {
+        Self::new(1024 * 1024) // 1MB threshold
+    }
+}
+
+/// Chunker for large results
+pub struct ResultChunker {
+    chunk_size: usize,
+}
+
+impl ResultChunker {
+    /// Create a new chunker
+    pub fn new(chunk_size: usize) -> Self {
+        Self { chunk_size }
+    }
+
+    /// Split data into chunks
+    pub fn chunk(&self, data: &[u8]) -> Vec<ResultChunk> {
+        let total = data.len().div_ceil(self.chunk_size);
+
+        data.chunks(self.chunk_size)
+            .enumerate()
+            .map(|(index, chunk)| ResultChunk::new(index, total, chunk.to_vec()))
+            .collect()
+    }
+
+    /// Reassemble chunks into original data
+    pub fn reassemble(&self, chunks: &[ResultChunk]) -> crate::Result<Vec<u8>> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Verify chunks are complete and in order
+        let total = chunks[0].total;
+        if chunks.len() != total {
+            return Err(crate::CelersError::Other(format!(
+                "Incomplete chunks: expected {}, got {}",
+                total,
+                chunks.len()
+            )));
+        }
+
+        let mut result = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            if chunk.index != i {
+                return Err(crate::CelersError::Other(format!(
+                    "Chunk out of order: expected index {}, got {}",
+                    i, chunk.index
+                )));
+            }
+            result.extend_from_slice(&chunk.data);
+        }
+
+        Ok(result)
+    }
+}
+
+impl Default for ResultChunker {
+    fn default() -> Self {
+        Self::new(256 * 1024) // 256KB chunks
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

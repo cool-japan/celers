@@ -740,6 +740,930 @@ impl std::fmt::Debug for CompositeEventEmitter {
     }
 }
 
+// ============================================================================
+// Event Consumer Infrastructure
+// ============================================================================
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::sync::RwLock;
+
+/// Event filter for selecting which events to process
+#[derive(Clone)]
+pub enum EventFilter {
+    /// Accept all events
+    All,
+    /// Accept only task events
+    TaskOnly,
+    /// Accept only worker events
+    WorkerOnly,
+    /// Accept specific event types (e.g., "task-started", "worker-online")
+    EventTypes(Vec<String>),
+    /// Accept events matching task name pattern
+    TaskName(String),
+    /// Accept events from specific hostname
+    Hostname(String),
+    /// Accept events matching custom predicate
+    Custom(Arc<dyn Fn(&Event) -> bool + Send + Sync>),
+    /// Combine multiple filters with AND logic
+    And(Vec<EventFilter>),
+    /// Combine multiple filters with OR logic
+    Or(Vec<EventFilter>),
+}
+
+impl EventFilter {
+    /// Check if an event matches this filter
+    pub fn matches(&self, event: &Event) -> bool {
+        match self {
+            EventFilter::All => true,
+            EventFilter::TaskOnly => matches!(event, Event::Task(_)),
+            EventFilter::WorkerOnly => matches!(event, Event::Worker(_)),
+            EventFilter::EventTypes(types) => types.contains(&event.event_type().to_string()),
+            EventFilter::TaskName(name) => {
+                if let Event::Task(task_event) = event {
+                    match task_event {
+                        TaskEvent::Sent { task_name, .. }
+                        | TaskEvent::Received { task_name, .. }
+                        | TaskEvent::Started { task_name, .. }
+                        | TaskEvent::Succeeded { task_name, .. }
+                        | TaskEvent::Failed { task_name, .. }
+                        | TaskEvent::Retried { task_name, .. } => task_name == name,
+                        TaskEvent::Revoked { task_name, .. }
+                        | TaskEvent::Rejected { task_name, .. } => {
+                            matches!(task_name.as_ref(), Some(tn) if tn == name)
+                        }
+                    }
+                } else {
+                    false
+                }
+            }
+            EventFilter::Hostname(hostname) => {
+                let event_hostname = match event {
+                    Event::Task(task_event) => match task_event {
+                        TaskEvent::Received { hostname, .. }
+                        | TaskEvent::Started { hostname, .. }
+                        | TaskEvent::Succeeded { hostname, .. }
+                        | TaskEvent::Failed { hostname, .. }
+                        | TaskEvent::Retried { hostname, .. }
+                        | TaskEvent::Rejected { hostname, .. } => Some(hostname),
+                        _ => None,
+                    },
+                    Event::Worker(worker_event) => match worker_event {
+                        WorkerEvent::Online { hostname, .. }
+                        | WorkerEvent::Offline { hostname, .. }
+                        | WorkerEvent::Heartbeat { hostname, .. } => Some(hostname),
+                    },
+                };
+                matches!(event_hostname, Some(h) if h == hostname)
+            }
+            EventFilter::Custom(predicate) => predicate(event),
+            EventFilter::And(filters) => filters.iter().all(|f| f.matches(event)),
+            EventFilter::Or(filters) => filters.iter().any(|f| f.matches(event)),
+        }
+    }
+
+    /// Create a filter that accepts events from a list of task names
+    pub fn task_names(names: Vec<String>) -> Self {
+        EventFilter::Or(names.into_iter().map(EventFilter::TaskName).collect())
+    }
+
+    /// Create a filter that accepts events from a list of hostnames
+    pub fn hostnames(names: Vec<String>) -> Self {
+        EventFilter::Or(names.into_iter().map(EventFilter::Hostname).collect())
+    }
+}
+
+impl std::fmt::Debug for EventFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventFilter::All => write!(f, "EventFilter::All"),
+            EventFilter::TaskOnly => write!(f, "EventFilter::TaskOnly"),
+            EventFilter::WorkerOnly => write!(f, "EventFilter::WorkerOnly"),
+            EventFilter::EventTypes(types) => f
+                .debug_tuple("EventFilter::EventTypes")
+                .field(types)
+                .finish(),
+            EventFilter::TaskName(name) => {
+                f.debug_tuple("EventFilter::TaskName").field(name).finish()
+            }
+            EventFilter::Hostname(hostname) => f
+                .debug_tuple("EventFilter::Hostname")
+                .field(hostname)
+                .finish(),
+            EventFilter::Custom(_) => write!(f, "EventFilter::Custom(<closure>)"),
+            EventFilter::And(filters) => f.debug_tuple("EventFilter::And").field(filters).finish(),
+            EventFilter::Or(filters) => f.debug_tuple("EventFilter::Or").field(filters).finish(),
+        }
+    }
+}
+
+/// Event handler function type
+pub type EventHandler = Arc<
+    dyn Fn(Event) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Event receiver trait for consuming events
+#[async_trait]
+pub trait EventReceiver: Send + Sync {
+    /// Receive the next event
+    async fn receive(&mut self) -> crate::Result<Option<Event>>;
+
+    /// Receive events with a timeout
+    async fn receive_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> crate::Result<Option<Event>> {
+        tokio::time::timeout(timeout, self.receive())
+            .await
+            .map_err(|_| crate::CelersError::Broker("Receive timeout".to_string()))?
+    }
+
+    /// Check if the receiver is still active
+    fn is_active(&self) -> bool {
+        true
+    }
+}
+
+/// Event dispatcher for routing events to handlers based on filters
+#[derive(Clone)]
+pub struct EventDispatcher {
+    handlers: Arc<RwLock<Vec<(EventFilter, EventHandler)>>>,
+}
+
+impl EventDispatcher {
+    /// Create a new event dispatcher
+    pub fn new() -> Self {
+        Self {
+            handlers: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Register a handler with a filter
+    pub async fn register<F, Fut>(&self, filter: EventFilter, handler: F)
+    where
+        F: Fn(Event) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::Result<()>> + Send + 'static,
+    {
+        let handler_arc = Arc::new(move |event: Event| {
+            Box::pin(handler(event))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send>>
+        });
+
+        let mut handlers = self.handlers.write().await;
+        handlers.push((filter, handler_arc));
+    }
+
+    /// Dispatch an event to all matching handlers
+    pub async fn dispatch(&self, event: Event) -> crate::Result<()> {
+        let handlers = self.handlers.read().await;
+
+        for (filter, handler) in handlers.iter() {
+            if filter.matches(&event) {
+                handler(event.clone()).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch events in batch
+    pub async fn dispatch_batch(&self, events: Vec<Event>) -> crate::Result<()> {
+        for event in events {
+            self.dispatch(event).await?;
+        }
+        Ok(())
+    }
+
+    /// Get the number of registered handlers
+    pub async fn handler_count(&self) -> usize {
+        self.handlers.read().await.len()
+    }
+
+    /// Clear all handlers
+    pub async fn clear(&self) {
+        self.handlers.write().await.clear();
+    }
+}
+
+impl Default for EventDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for EventDispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventDispatcher")
+            .field("handlers", &"Arc<RwLock<Vec<...>>>")
+            .finish()
+    }
+}
+
+/// Event persistence storage backend
+#[async_trait]
+pub trait EventStorage: Send + Sync {
+    /// Store an event
+    async fn store(&self, event: &Event) -> crate::Result<()>;
+
+    /// Store multiple events
+    async fn store_batch(&self, events: &[Event]) -> crate::Result<()> {
+        for event in events {
+            self.store(event).await?;
+        }
+        Ok(())
+    }
+
+    /// Query events by filter
+    async fn query(&self, filter: &EventFilter, limit: Option<usize>) -> crate::Result<Vec<Event>>;
+
+    /// Query events in a time range
+    async fn query_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> crate::Result<Vec<Event>>;
+
+    /// Delete old events
+    async fn cleanup(&self, before: DateTime<Utc>) -> crate::Result<usize>;
+}
+
+/// File-based event storage (append-only JSON lines)
+pub struct FileEventStorage {
+    path: PathBuf,
+    file_handle: Arc<RwLock<Option<tokio::fs::File>>>,
+}
+
+impl FileEventStorage {
+    /// Create a new file-based event storage
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            file_handle: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Initialize the storage file
+    pub async fn init(&self) -> crate::Result<()> {
+        let mut handle = self.file_handle.write().await;
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to open event file: {}", e)))?;
+
+        *handle = Some(file);
+        Ok(())
+    }
+
+    /// Read all events from the file
+    async fn read_all(&self) -> crate::Result<Vec<Event>> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let file = tokio::fs::File::open(&self.path)
+            .await
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to open event file: {}", e)))?;
+
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut events = Vec::new();
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to read line: {}", e)))?
+        {
+            if let Ok(event) = serde_json::from_str::<Event>(&line) {
+                events.push(event);
+            }
+        }
+
+        Ok(events)
+    }
+}
+
+#[async_trait]
+impl EventStorage for FileEventStorage {
+    async fn store(&self, event: &Event) -> crate::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut handle = self.file_handle.write().await;
+        if handle.is_none() {
+            drop(handle);
+            self.init().await?;
+            handle = self.file_handle.write().await;
+        }
+
+        if let Some(file) = handle.as_mut() {
+            let json = serde_json::to_string(event)
+                .map_err(|e| crate::CelersError::Serialization(e.to_string()))?;
+
+            file.write_all(json.as_bytes())
+                .await
+                .map_err(|e| crate::CelersError::Broker(format!("Failed to write event: {}", e)))?;
+            file.write_all(b"\n").await.map_err(|e| {
+                crate::CelersError::Broker(format!("Failed to write newline: {}", e))
+            })?;
+            file.flush()
+                .await
+                .map_err(|e| crate::CelersError::Broker(format!("Failed to flush: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    async fn query(&self, filter: &EventFilter, limit: Option<usize>) -> crate::Result<Vec<Event>> {
+        let all_events = self.read_all().await?;
+        let mut filtered: Vec<Event> = all_events
+            .into_iter()
+            .filter(|e| filter.matches(e))
+            .collect();
+
+        if let Some(limit) = limit {
+            filtered.truncate(limit);
+        }
+
+        Ok(filtered)
+    }
+
+    async fn query_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> crate::Result<Vec<Event>> {
+        let all_events = self.read_all().await?;
+        let mut filtered: Vec<Event> = all_events
+            .into_iter()
+            .filter(|e| {
+                let timestamp = e.timestamp();
+                timestamp >= start && timestamp <= end
+            })
+            .collect();
+
+        if let Some(limit) = limit {
+            filtered.truncate(limit);
+        }
+
+        Ok(filtered)
+    }
+
+    async fn cleanup(&self, before: DateTime<Utc>) -> crate::Result<usize> {
+        let all_events = self.read_all().await?;
+        let (keep, remove): (Vec<_>, Vec<_>) = all_events
+            .into_iter()
+            .partition(|e| e.timestamp() >= before);
+
+        let removed_count = remove.len();
+
+        // Rewrite file with only kept events
+        use tokio::io::AsyncWriteExt;
+        let temp_path = self.path.with_extension("tmp");
+        let mut temp_file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
+            crate::CelersError::Broker(format!("Failed to create temp file: {}", e))
+        })?;
+
+        for event in keep {
+            let json = serde_json::to_string(&event)
+                .map_err(|e| crate::CelersError::Serialization(e.to_string()))?;
+            temp_file
+                .write_all(json.as_bytes())
+                .await
+                .map_err(|e| crate::CelersError::Broker(format!("Failed to write: {}", e)))?;
+            temp_file.write_all(b"\n").await.map_err(|e| {
+                crate::CelersError::Broker(format!("Failed to write newline: {}", e))
+            })?;
+        }
+
+        temp_file
+            .flush()
+            .await
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to flush: {}", e)))?;
+        drop(temp_file);
+
+        // Replace original file with temp file
+        tokio::fs::rename(&temp_path, &self.path)
+            .await
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to rename file: {}", e)))?;
+
+        // Reinitialize file handle
+        let mut handle = self.file_handle.write().await;
+        *handle = None;
+        drop(handle);
+        self.init().await?;
+
+        Ok(removed_count)
+    }
+}
+
+/// In-memory event storage (for testing and development)
+#[derive(Clone)]
+pub struct InMemoryEventStorage {
+    events: Arc<RwLock<Vec<Event>>>,
+    max_size: usize,
+}
+
+impl InMemoryEventStorage {
+    /// Create a new in-memory event storage
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            events: Arc::new(RwLock::new(Vec::new())),
+            max_size,
+        }
+    }
+
+    /// Get the number of stored events
+    pub async fn len(&self) -> usize {
+        self.events.read().await.len()
+    }
+
+    /// Check if storage is empty
+    pub async fn is_empty(&self) -> bool {
+        self.events.read().await.is_empty()
+    }
+
+    /// Clear all events
+    pub async fn clear(&self) {
+        self.events.write().await.clear();
+    }
+}
+
+#[async_trait]
+impl EventStorage for InMemoryEventStorage {
+    async fn store(&self, event: &Event) -> crate::Result<()> {
+        let mut events = self.events.write().await;
+        events.push(event.clone());
+
+        // Trim to max size (FIFO)
+        if events.len() > self.max_size {
+            let excess = events.len() - self.max_size;
+            events.drain(0..excess);
+        }
+
+        Ok(())
+    }
+
+    async fn query(&self, filter: &EventFilter, limit: Option<usize>) -> crate::Result<Vec<Event>> {
+        let events = self.events.read().await;
+        let mut filtered: Vec<Event> = events
+            .iter()
+            .filter(|e| filter.matches(e))
+            .cloned()
+            .collect();
+
+        if let Some(limit) = limit {
+            filtered.truncate(limit);
+        }
+
+        Ok(filtered)
+    }
+
+    async fn query_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> crate::Result<Vec<Event>> {
+        let events = self.events.read().await;
+        let mut filtered: Vec<Event> = events
+            .iter()
+            .filter(|e| {
+                let timestamp = e.timestamp();
+                timestamp >= start && timestamp <= end
+            })
+            .cloned()
+            .collect();
+
+        if let Some(limit) = limit {
+            filtered.truncate(limit);
+        }
+
+        Ok(filtered)
+    }
+
+    async fn cleanup(&self, before: DateTime<Utc>) -> crate::Result<usize> {
+        let mut events = self.events.write().await;
+        let original_len = events.len();
+        events.retain(|e| e.timestamp() >= before);
+        let removed = original_len - events.len();
+        Ok(removed)
+    }
+}
+
+/// Event stream for real-time event delivery
+pub struct EventStream {
+    receiver: broadcast::Receiver<Event>,
+    filter: EventFilter,
+}
+
+impl EventStream {
+    /// Create a new event stream with a filter
+    pub fn new(receiver: broadcast::Receiver<Event>, filter: EventFilter) -> Self {
+        Self { receiver, filter }
+    }
+
+    /// Receive the next matching event
+    pub async fn recv(&mut self) -> Result<Event, broadcast::error::RecvError> {
+        loop {
+            let event = self.receiver.recv().await?;
+            if self.filter.matches(&event) {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// Try to receive an event without blocking
+    pub fn try_recv(&mut self) -> Result<Event, broadcast::error::TryRecvError> {
+        loop {
+            let event = self.receiver.try_recv()?;
+            if self.filter.matches(&event) {
+                return Ok(event);
+            }
+        }
+    }
+}
+
+// Note: Database-backed event storage is available in celers-backend-db crate
+// to avoid adding database dependencies to celers-core
+
+/// Event alert condition for triggering notifications
+#[derive(Clone)]
+pub enum AlertCondition {
+    /// Alert on specific event type
+    EventType(String),
+    /// Alert when task fails
+    TaskFailed,
+    /// Alert when task exceeds retry count
+    TaskRetryExceeded(u32),
+    /// Alert when worker goes offline
+    WorkerOffline,
+    /// Alert when event rate exceeds threshold (events per second)
+    RateExceeds { threshold: f64, window_secs: u64 },
+    /// Alert on custom condition
+    Custom(Arc<dyn Fn(&Event) -> bool + Send + Sync>),
+}
+
+impl std::fmt::Debug for AlertCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AlertCondition::EventType(event_type) => {
+                f.debug_tuple("EventType").field(event_type).finish()
+            }
+            AlertCondition::TaskFailed => write!(f, "TaskFailed"),
+            AlertCondition::TaskRetryExceeded(max) => {
+                f.debug_tuple("TaskRetryExceeded").field(max).finish()
+            }
+            AlertCondition::WorkerOffline => write!(f, "WorkerOffline"),
+            AlertCondition::RateExceeds {
+                threshold,
+                window_secs,
+            } => f
+                .debug_struct("RateExceeds")
+                .field("threshold", threshold)
+                .field("window_secs", window_secs)
+                .finish(),
+            AlertCondition::Custom(_) => write!(f, "Custom(<closure>)"),
+        }
+    }
+}
+
+impl AlertCondition {
+    /// Check if an event triggers this alert condition
+    pub fn check(&self, event: &Event, context: &AlertContext) -> bool {
+        match self {
+            AlertCondition::EventType(event_type) => event.event_type() == event_type,
+            AlertCondition::TaskFailed => matches!(event, Event::Task(TaskEvent::Failed { .. })),
+            AlertCondition::TaskRetryExceeded(max) => {
+                if let Event::Task(TaskEvent::Retried { retries, .. }) = event {
+                    retries >= max
+                } else {
+                    false
+                }
+            }
+            AlertCondition::WorkerOffline => {
+                matches!(event, Event::Worker(WorkerEvent::Offline { .. }))
+            }
+            AlertCondition::RateExceeds {
+                threshold,
+                window_secs,
+            } => {
+                let rate = context.get_event_rate(*window_secs);
+                rate > *threshold
+            }
+            AlertCondition::Custom(predicate) => predicate(event),
+        }
+    }
+}
+
+/// Context information for alert conditions
+#[derive(Debug, Clone, Default)]
+pub struct AlertContext {
+    /// Recent event timestamps for rate calculation
+    recent_events: Arc<RwLock<Vec<DateTime<Utc>>>>,
+}
+
+impl AlertContext {
+    /// Create a new alert context
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an event timestamp
+    pub async fn record_event(&self, timestamp: DateTime<Utc>) {
+        let mut events = self.recent_events.write().await;
+        events.push(timestamp);
+
+        // Keep only last 1000 events to prevent unbounded growth
+        if events.len() > 1000 {
+            let excess = events.len() - 1000;
+            events.drain(0..excess);
+        }
+    }
+
+    /// Get event rate (events per second) over a time window
+    fn get_event_rate(&self, _window_secs: u64) -> f64 {
+        // This is a synchronous approximation for rate calculation
+        // In practice, you'd use the async version with proper locking
+        0.0 // Placeholder - actual implementation would need async context
+    }
+
+    /// Get event rate (async version)
+    pub async fn get_event_rate_async(&self, window_secs: u64) -> f64 {
+        let events = self.recent_events.read().await;
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::seconds(window_secs as i64);
+
+        let count = events.iter().filter(|&&ts| ts >= cutoff).count();
+        count as f64 / window_secs as f64
+    }
+}
+
+/// Alert severity level
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AlertSeverity {
+    /// Informational alert
+    Info,
+    /// Warning alert
+    Warning,
+    /// Error alert
+    Error,
+    /// Critical alert requiring immediate attention
+    Critical,
+}
+
+/// Alert triggered by an event
+#[derive(Debug, Clone)]
+pub struct Alert {
+    /// Alert severity
+    pub severity: AlertSeverity,
+    /// Alert title/summary
+    pub title: String,
+    /// Alert description
+    pub message: String,
+    /// Event that triggered the alert
+    pub event: Event,
+    /// Timestamp when alert was triggered
+    pub timestamp: DateTime<Utc>,
+    /// Additional metadata
+    pub metadata: HashMap<String, String>,
+}
+
+impl Alert {
+    /// Create a new alert
+    pub fn new(
+        severity: AlertSeverity,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        event: Event,
+    ) -> Self {
+        Self {
+            severity,
+            title: title.into(),
+            message: message.into(),
+            event,
+            timestamp: Utc::now(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Add metadata to the alert
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+}
+
+/// Alert handler trait
+#[async_trait]
+pub trait AlertHandler: Send + Sync {
+    /// Handle an alert
+    async fn handle(&self, alert: &Alert) -> crate::Result<()>;
+}
+
+/// Logging alert handler that logs alerts using tracing
+#[derive(Debug, Clone, Default)]
+pub struct LoggingAlertHandler;
+
+impl LoggingAlertHandler {
+    /// Create a new logging alert handler
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl AlertHandler for LoggingAlertHandler {
+    async fn handle(&self, alert: &Alert) -> crate::Result<()> {
+        let task_id = alert.event.task_id();
+        let hostname = alert.event.hostname();
+
+        match alert.severity {
+            AlertSeverity::Info => {
+                tracing::info!(
+                    severity = "info",
+                    title = %alert.title,
+                    message = %alert.message,
+                    event_type = alert.event.event_type(),
+                    task_id = ?task_id,
+                    hostname = ?hostname,
+                    "Alert triggered"
+                );
+            }
+            AlertSeverity::Warning => {
+                tracing::warn!(
+                    severity = "warning",
+                    title = %alert.title,
+                    message = %alert.message,
+                    event_type = alert.event.event_type(),
+                    task_id = ?task_id,
+                    hostname = ?hostname,
+                    "Alert triggered"
+                );
+            }
+            AlertSeverity::Error => {
+                tracing::error!(
+                    severity = "error",
+                    title = %alert.title,
+                    message = %alert.message,
+                    event_type = alert.event.event_type(),
+                    task_id = ?task_id,
+                    hostname = ?hostname,
+                    "Alert triggered"
+                );
+            }
+            AlertSeverity::Critical => {
+                tracing::error!(
+                    severity = "critical",
+                    title = %alert.title,
+                    message = %alert.message,
+                    event_type = alert.event.event_type(),
+                    task_id = ?task_id,
+                    hostname = ?hostname,
+                    "CRITICAL ALERT"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Type alias for alert handler registry entries
+type AlertHandlerEntry = (AlertCondition, AlertSeverity, String, Arc<dyn AlertHandler>);
+
+/// Alert manager for monitoring events and triggering alerts
+pub struct AlertManager {
+    handlers: Arc<RwLock<Vec<AlertHandlerEntry>>>,
+    context: AlertContext,
+}
+
+impl AlertManager {
+    /// Create a new alert manager
+    pub fn new() -> Self {
+        Self {
+            handlers: Arc::new(RwLock::new(Vec::new())),
+            context: AlertContext::new(),
+        }
+    }
+
+    /// Register an alert handler
+    pub async fn register<H: AlertHandler + 'static>(
+        &self,
+        condition: AlertCondition,
+        severity: AlertSeverity,
+        title: impl Into<String>,
+        handler: H,
+    ) {
+        let mut handlers = self.handlers.write().await;
+        handlers.push((condition, severity, title.into(), Arc::new(handler)));
+    }
+
+    /// Process an event and trigger alerts if conditions match
+    pub async fn process_event(&self, event: Event) -> crate::Result<()> {
+        // Record event for rate tracking
+        self.context.record_event(event.timestamp()).await;
+
+        let handlers = self.handlers.read().await;
+
+        for (condition, severity, title, handler) in handlers.iter() {
+            if condition.check(&event, &self.context) {
+                let message = format!("Event {} triggered alert condition", event.event_type());
+                let alert = Alert::new(*severity, title.clone(), message, event.clone());
+                handler.handle(&alert).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the number of registered alert handlers
+    pub async fn handler_count(&self) -> usize {
+        self.handlers.read().await.len()
+    }
+
+    /// Clear all alert handlers
+    pub async fn clear(&self) {
+        self.handlers.write().await.clear();
+    }
+}
+
+impl Default for AlertManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Event monitor for collecting statistics
+#[derive(Debug, Clone, Default)]
+pub struct EventMonitor {
+    stats: Arc<RwLock<EventStats>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EventStats {
+    pub total_events: u64,
+    pub task_events: u64,
+    pub worker_events: u64,
+    pub events_by_type: HashMap<String, u64>,
+    pub events_by_hostname: HashMap<String, u64>,
+    pub last_event_time: Option<DateTime<Utc>>,
+}
+
+impl EventMonitor {
+    /// Create a new event monitor
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an event
+    pub async fn record(&self, event: &Event) {
+        let mut stats = self.stats.write().await;
+
+        stats.total_events += 1;
+        stats.last_event_time = Some(event.timestamp());
+
+        match event {
+            Event::Task(_) => stats.task_events += 1,
+            Event::Worker(_) => stats.worker_events += 1,
+        }
+
+        let event_type = event.event_type().to_string();
+        *stats.events_by_type.entry(event_type).or_insert(0) += 1;
+
+        if let Some(hostname) = match event {
+            Event::Task(task_event) => match task_event {
+                TaskEvent::Received { hostname, .. }
+                | TaskEvent::Started { hostname, .. }
+                | TaskEvent::Succeeded { hostname, .. }
+                | TaskEvent::Failed { hostname, .. }
+                | TaskEvent::Retried { hostname, .. }
+                | TaskEvent::Rejected { hostname, .. } => Some(hostname.clone()),
+                _ => None,
+            },
+            Event::Worker(worker_event) => match worker_event {
+                WorkerEvent::Online { hostname, .. }
+                | WorkerEvent::Offline { hostname, .. }
+                | WorkerEvent::Heartbeat { hostname, .. } => Some(hostname.clone()),
+            },
+        } {
+            *stats.events_by_hostname.entry(hostname).or_insert(0) += 1;
+        }
+    }
+
+    /// Get current statistics
+    pub async fn get_stats(&self) -> EventStats {
+        self.stats.read().await.clone()
+    }
+
+    /// Reset statistics
+    pub async fn reset(&self) {
+        let mut stats = self.stats.write().await;
+        *stats = EventStats::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
