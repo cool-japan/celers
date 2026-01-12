@@ -16,16 +16,16 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.11", features = ["v4"] }
 tracing = "0.1"
-rand = "0.8"
+rand = "0.9"
 flate2 = "1.0"
 zstd = "0.13"
 
 # AMQP client
-lapin = "2.5"
+lapin = "3.7"
 tokio = { version = "1.42", features = ["full"] }
 
 # HTTP client for RabbitMQ Management API
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 urlencoding = "2.1"
 
 # Core dependencies
@@ -36,7 +36,7 @@ celers-kombu = { path = "../celers-kombu" }
 tokio-test = "0.4"
 tracing-subscriber = "0.3"
 futures = "0.3"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [[bench]]
 name = "amqp_benchmarks"

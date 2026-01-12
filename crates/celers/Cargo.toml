@@ -48,15 +48,15 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 thiserror = "2.0"
 
 # Optional tracing dependencies
-opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", optional = true }
-tracing-opentelemetry = { version = "0.28", optional = true }
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
 
 # Helper dependencies
 num_cpus = "1.16"
-rand = "0.8"
+rand = "0.9"
 
 [features]
 default = ["redis", "json"]

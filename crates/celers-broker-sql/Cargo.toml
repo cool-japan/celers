@@ -25,7 +25,7 @@ chrono = "0.4"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "chrono", "uuid", "rust_decimal"] }
 rust_decimal = "1.36"
 flate2 = "1.0"
-rand = "0.8"
+rand = "0.9"
 
 [features]
 default = []
@@ -34,7 +34,7 @@ metrics = ["celers-metrics"]
 [dev-dependencies]
 tokio-test = "0.4"
 futures = "0.3"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 tracing-subscriber = "0.3"
 
 [[bench]]
