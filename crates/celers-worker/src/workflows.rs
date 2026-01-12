@@ -3,7 +3,7 @@
 //! This module provides worker integration for Chain and Chord workflows.
 
 use celers_core::{Broker, SerializedTask};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "workflows")]
 use celers_backend_redis::ResultBackend;

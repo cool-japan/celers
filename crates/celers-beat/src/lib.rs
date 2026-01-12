@@ -38,7 +38,7 @@
 //! ```
 
 use chrono::Datelike;
-use chrono::{DateTime, Duration, Offset, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 #[cfg(feature = "cron")]
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -7135,8 +7135,11 @@ pub struct ScheduleBuilder {
     interval_seconds: Option<u64>,
     #[cfg(feature = "cron")]
     timezone: Option<String>,
+    #[cfg(feature = "cron")]
     business_hours: bool,
+    #[cfg(feature = "cron")]
     weekends: bool,
+    #[cfg(feature = "cron")]
     weekdays: bool,
 }
 
@@ -7147,8 +7150,11 @@ impl ScheduleBuilder {
             interval_seconds: None,
             #[cfg(feature = "cron")]
             timezone: None,
+            #[cfg(feature = "cron")]
             business_hours: false,
+            #[cfg(feature = "cron")]
             weekends: false,
+            #[cfg(feature = "cron")]
             weekdays: false,
         }
     }
