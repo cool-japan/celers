@@ -6960,8 +6960,6 @@ mod tests {
     #[test]
     fn test_health_check_worker_health_checker() {
         use crate::health_check::{HealthStatus, WorkerHealthChecker};
-        use std::thread;
-        use std::time::Duration;
 
         let checker = WorkerHealthChecker::default();
 
@@ -9413,7 +9411,6 @@ pub mod task_dependencies {
                 }
             }
 
-            result.reverse();
             Ok(result)
         }
 
@@ -9537,7 +9534,8 @@ pub mod performance_profiling {
 
         /// Ends the current profiling span
         pub fn end_span(&self) {
-            if let Some((name, start_time)) = self.active_spans.lock().unwrap().pop() {
+            let span_data = self.active_spans.lock().unwrap().pop();
+            if let Some((name, start_time)) = span_data {
                 let duration = start_time.elapsed();
                 let mut profiles = self.profiles.lock().unwrap();
 
@@ -9553,13 +9551,6 @@ pub mod performance_profiling {
 
                 profile.total_duration += duration;
                 profile.invocation_count += 1;
-
-                // Update parent's children duration
-                if let Some((_, _parent_start)) = self.active_spans.lock().unwrap().last() {
-                    // Parent is still active, update its children time
-                    // (This is simplified - in practice would need more sophisticated tracking)
-                }
-
                 profile.self_duration = profile.total_duration - profile.children_duration;
             }
         }

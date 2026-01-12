@@ -34,3 +34,11 @@ solar = ["dep:sunrise"]
 
 [dev-dependencies]
 tokio = { version = "1.42", features = ["full"] }
+
+[[example]]
+name = "schedule_builders"
+required-features = ["cron"]
+
+[[example]]
+name = "timezone_utilities"
+required-features = ["cron"]
