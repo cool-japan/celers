@@ -74,5 +74,3 @@ wheels/
 
 
 # SQL
-crates/**/migrations/+.sql
-**/*.sql
