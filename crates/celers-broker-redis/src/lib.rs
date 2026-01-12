@@ -27,29 +27,45 @@ pub mod advanced_queue;
 pub mod authorization;
 pub mod backup_restore;
 pub mod batch_ext;
+pub mod bulkhead;
 pub mod circuit_breaker;
 pub mod cluster;
 pub mod compression;
 pub mod connection;
+pub mod cron_scheduler;
 pub mod dedup;
 pub mod degradation;
+pub mod dlq_analytics;
+pub mod dlq_archival;
+pub mod dlq_replay;
+pub mod encryption;
 pub mod geo;
 pub mod health;
+pub mod hooks;
+pub mod hooks_advanced;
 pub mod integrity;
 pub mod locks;
 pub mod lua_scripts;
 pub mod metrics_ext;
+pub mod monitoring;
+pub mod otel_integration;
 pub mod partitioning;
+pub mod pipeline_advanced;
 pub mod pool;
+pub mod pool_advanced;
 pub mod priority_mgmt;
 pub mod queue_control;
+pub mod quota_mgmt;
 pub mod rate_limit;
 pub mod result_backend;
 pub mod retry;
 pub mod sentinel;
 pub mod streams;
+pub mod structured_logging;
 pub mod task_groups;
 pub mod task_query;
+pub mod telemetry;
+pub mod utilities;
 pub mod visibility;
 
 pub use advanced_queue::{
@@ -59,6 +75,7 @@ pub use advanced_queue::{
 pub use authorization::{AuthorizationPolicy, UserPermissions};
 pub use backup_restore::{BackupManager, QueueSnapshot, SnapshotComparison};
 pub use batch_ext::{BatchOperations, TaskFilter};
+pub use bulkhead::{Bulkhead, BulkheadConfig, BulkheadManager, BulkheadPermit, BulkheadStats};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
 };
@@ -68,13 +85,36 @@ pub use cluster::{
 };
 pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionStats, Compressor};
 pub use connection::{ConnectionStats, RedisConfig, TlsConfig};
+pub use cron_scheduler::{CronExpression, CronScheduler, ScheduledTask};
 pub use dedup::{DedupResult, DedupStrategy, Deduplicator};
 pub use degradation::{DegradationManager, DegradationMode, DegradationStats, QueuedOperation};
+pub use dlq_analytics::{
+    DLQAnalyzer, ErrorCategory, ErrorCluster, FailurePattern, FailureTrend, RootCause,
+    TemporalAnalysis,
+};
+pub use dlq_archival::{
+    ArchivalConfig, ArchiveSearchCriteria, ArchiveStats, ArchivedTask, DLQArchivalManager,
+    RetentionPolicy, StorageBackend,
+};
+pub use dlq_replay::{
+    ReplayCondition, ReplayPolicy, ReplayPolicyType, ReplayResult, ReplayScheduler, ReplayStats,
+};
+pub use encryption::{
+    EncryptedData, EncryptionAlgorithm, EncryptionConfig, EncryptionManager, EncryptionStats,
+};
 pub use geo::{
     ConflictResolution, GeoReplicationManager, Region, RegionId, RegionStats, RegionStatsSnapshot,
     RegionalReadRouter, ReplicationConfig, ReplicationConfigBuilder, RoutingStrategy, SyncMode,
 };
 pub use health::{HealthChecker, KeyspaceStats, QueueStats, RedisHealthStatus, ReplicationInfo};
+pub use hooks::{
+    CompletionHook, CompletionStatus, DequeueHook, EnqueueHook, HookContext, HookResult, LogLevel,
+    LoggingHook, MetricsHook, PayloadSizeValidator, TaskHookRegistry, TimestampEnrichmentHook,
+};
+pub use hooks_advanced::{
+    ConditionalHook, HookCondition, HookErrorStrategy, ParallelHookExecutor, PrioritizedHook,
+    RetryableHook, SequentialHooks,
+};
 pub use integrity::{ChecksumAlgorithm, IntegrityStats, IntegrityValidator, IntegrityWrappedTask};
 pub use locks::{DistributedLock, LockConfig, LockGuard, LockToken};
 pub use lua_scripts::{ScriptId, ScriptManager, ScriptPerformance, ScriptStats, SCRIPT_VERSION};
@@ -82,12 +122,36 @@ pub use metrics_ext::{
     HistogramSnapshot, LatencyStats, MetricsSnapshot, MetricsTracker, SlowOperation,
     SlowOperationLogger, TaskAgeHistogram,
 };
+pub use monitoring::{
+    analyze_performance_trend, analyze_redis_broker_performance, analyze_redis_consumer_lag,
+    analyze_redis_dlq_health, analyze_redis_fragmentation, analyze_redis_memory_efficiency,
+    analyze_redis_slowlog, analyze_task_completion_patterns,
+    calculate_redis_message_age_distribution, calculate_redis_message_velocity,
+    calculate_redis_queue_health_score, detect_performance_regression, detect_queue_burst,
+    detect_redis_queue_anomaly, detect_redis_queue_saturation, estimate_redis_monthly_cost,
+    estimate_redis_processing_capacity, generate_queue_health_report, predict_redis_queue_size,
+    recommend_alert_thresholds, recommend_redis_scaling_strategy, suggest_redis_worker_scaling,
+    AlertThresholds, AnomalyDetection, BurstDetection, ConsumerLagAnalysis, DLQAnalysis,
+    FragmentationAnalysis, MemoryEfficiencyAnalysis, MessageAgeDistribution, MessageVelocity,
+    PerformanceTrend, ProcessingCapacity, QueueHealthReport, QueueSaturationAnalysis,
+    QueueSizePrediction, QueueTrend, RedisCostEstimate, RegressionDetection, SaturationLevel,
+    ScalingRecommendation, ScalingStrategy, SlowlogAnalysis, TaskCompletionAnalysis,
+    WorkerScalingSuggestion,
+};
+pub use otel_integration::{
+    OtelBrokerInstrumentation, OtelConfig, SpanInfo, TracingBackend, W3CTraceContext,
+};
 pub use partitioning::{
     ConsistentHashRing, HashAlgorithm, PartitionManager, PartitionStats, PartitionStrategy,
 };
+pub use pipeline_advanced::{
+    AdvancedPipeline, PipelineConfig, PipelineExecutionResult, PipelineOperation, PipelineStats,
+};
 pub use pool::{ConnectionPool, PoolConfig, PoolStats};
+pub use pool_advanced::{AdaptiveConnectionPool, AdaptivePoolConfig, AdaptivePoolStats};
 pub use priority_mgmt::{PriorityAdjustment, PriorityManager};
 pub use queue_control::{QueueController, QueueState};
+pub use quota_mgmt::{QuotaConfig, QuotaManager, QuotaPeriod, QuotaUsage};
 pub use rate_limit::{
     DistributedRateLimiter, QueueRateLimitConfig, QueueRateLimiter, TokenBucketLimiter,
     TrackedRateLimiter,
@@ -100,8 +164,27 @@ pub use sentinel::{
 pub use streams::{
     StreamConfig, StreamConfigBuilder, StreamEntry, StreamMessageId, StreamStats, StreamsClient,
 };
+pub use structured_logging::{
+    CorrelationAnalysis, LogConfig, LogContext, LogEntry, PerformanceAnalysis, StructuredLogLevel,
+    StructuredLogger,
+};
 pub use task_groups::{GroupConfig, GroupMetadata, GroupStatus, TaskGroup};
 pub use task_query::{TaskQuery, TaskSearchCriteria, TaskStats};
+pub use telemetry::{SpanBuilder, SpanEvent, TracingContext};
+pub use utilities::{
+    analyze_redis_command_performance, analyze_redis_queue_balance,
+    calculate_optimal_redis_batch_size, calculate_optimal_redis_pool_size,
+    calculate_redis_capacity_headroom, calculate_redis_key_ttl_by_priority,
+    calculate_redis_migration_batch_size, calculate_redis_optimal_shard_count,
+    calculate_redis_pipeline_size, calculate_redis_queue_efficiency,
+    calculate_redis_sla_compliance, calculate_redis_timeout_values, calculate_worker_distribution,
+    estimate_redis_migration_time, estimate_redis_queue_drain_time, estimate_redis_queue_memory,
+    estimate_redis_scaling_time, optimize_task_priority, recommend_queue_rebalancing,
+    suggest_redis_data_retention, suggest_redis_persistence_strategy,
+    suggest_redis_pipeline_strategy, CapacityHeadroom, MigrationStrategy, PriorityOptimization,
+    QueueEfficiency, RebalancingRecommendation, SLACompliance, ScalingTimeEstimate,
+    WorkerDistribution,
+};
 use visibility::VisibilityManager;
 
 /// Queue mode for Redis broker

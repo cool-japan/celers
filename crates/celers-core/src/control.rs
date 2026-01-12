@@ -507,6 +507,7 @@ pub struct WorkerConf {
 
 impl ControlCommand {
     /// Create a ping command
+    #[inline]
     pub fn ping(reply_to: impl Into<String>) -> Self {
         Self::Ping {
             reply_to: reply_to.into(),
@@ -514,46 +515,64 @@ impl ControlCommand {
     }
 
     /// Create an inspect active command
+    #[inline]
+    #[must_use]
     pub fn inspect_active() -> Self {
         Self::Inspect(InspectCommand::Active)
     }
 
     /// Create an inspect scheduled command
+    #[inline]
+    #[must_use]
     pub fn inspect_scheduled() -> Self {
         Self::Inspect(InspectCommand::Scheduled)
     }
 
     /// Create an inspect reserved command
+    #[inline]
+    #[must_use]
     pub fn inspect_reserved() -> Self {
         Self::Inspect(InspectCommand::Reserved)
     }
 
     /// Create an inspect revoked command
+    #[inline]
+    #[must_use]
     pub fn inspect_revoked() -> Self {
         Self::Inspect(InspectCommand::Revoked)
     }
 
     /// Create an inspect registered command
+    #[inline]
+    #[must_use]
     pub fn inspect_registered() -> Self {
         Self::Inspect(InspectCommand::Registered)
     }
 
     /// Create an inspect stats command
+    #[inline]
+    #[must_use]
     pub fn inspect_stats() -> Self {
         Self::Inspect(InspectCommand::Stats)
     }
 
     /// Create an inspect queue info command
+    #[inline]
+    #[must_use]
     pub fn inspect_queue_info() -> Self {
         Self::Inspect(InspectCommand::QueueInfo)
     }
 
     /// Create a shutdown command
+    #[inline]
+    #[must_use]
     pub fn shutdown(timeout: Option<u64>) -> Self {
         Self::Shutdown { timeout }
     }
 
     /// Create a revoke command
+    #[inline]
+    #[must_use]
     pub fn revoke(task_id: Uuid, terminate: bool) -> Self {
         Self::Revoke {
             task_id,
@@ -563,6 +582,8 @@ impl ControlCommand {
     }
 
     /// Create a bulk revoke command
+    #[inline]
+    #[must_use]
     pub fn bulk_revoke(task_ids: Vec<Uuid>, terminate: bool) -> Self {
         Self::BulkRevoke {
             task_ids,
@@ -571,6 +592,7 @@ impl ControlCommand {
     }
 
     /// Create a revoke by pattern command
+    #[inline]
     pub fn revoke_by_pattern(pattern: impl Into<String>, terminate: bool) -> Self {
         Self::RevokeByPattern {
             pattern: pattern.into(),
@@ -579,6 +601,7 @@ impl ControlCommand {
     }
 
     /// Create a queue purge command
+    #[inline]
     pub fn queue_purge(queue: impl Into<String>) -> Self {
         Self::Queue(QueueCommand::Purge {
             queue: queue.into(),
@@ -586,6 +609,7 @@ impl ControlCommand {
     }
 
     /// Create a queue length command
+    #[inline]
     pub fn queue_length(queue: impl Into<String>) -> Self {
         Self::Queue(QueueCommand::Length {
             queue: queue.into(),
@@ -593,6 +617,7 @@ impl ControlCommand {
     }
 
     /// Create a queue delete command
+    #[inline]
     pub fn queue_delete(queue: impl Into<String>, if_empty: bool, if_unused: bool) -> Self {
         Self::Queue(QueueCommand::Delete {
             queue: queue.into(),
@@ -602,6 +627,7 @@ impl ControlCommand {
     }
 
     /// Create a queue bind command
+    #[inline]
     pub fn queue_bind(
         queue: impl Into<String>,
         exchange: impl Into<String>,
@@ -615,6 +641,7 @@ impl ControlCommand {
     }
 
     /// Create a queue unbind command
+    #[inline]
     pub fn queue_unbind(
         queue: impl Into<String>,
         exchange: impl Into<String>,
@@ -628,6 +655,7 @@ impl ControlCommand {
     }
 
     /// Create a queue declare command
+    #[inline]
     pub fn queue_declare(
         queue: impl Into<String>,
         durable: bool,
@@ -645,20 +673,23 @@ impl ControlCommand {
 
 impl QueueCommand {
     /// Get the queue name this command operates on
+    #[inline]
+    #[must_use]
     pub fn queue_name(&self) -> &str {
         match self {
-            Self::Purge { queue } => queue,
-            Self::Length { queue } => queue,
-            Self::Delete { queue, .. } => queue,
-            Self::Bind { queue, .. } => queue,
-            Self::Unbind { queue, .. } => queue,
-            Self::Declare { queue, .. } => queue,
+            Self::Purge { queue }
+            | Self::Length { queue }
+            | Self::Delete { queue, .. }
+            | Self::Bind { queue, .. }
+            | Self::Unbind { queue, .. }
+            | Self::Declare { queue, .. } => queue,
         }
     }
 }
 
 impl ControlResponse {
     /// Create a pong response
+    #[inline]
     pub fn pong(hostname: impl Into<String>) -> Self {
         Self::Pong {
             hostname: hostname.into(),
@@ -670,11 +701,14 @@ impl ControlResponse {
     }
 
     /// Create an ack response
+    #[inline]
+    #[must_use]
     pub fn ack(ok: bool, message: Option<String>) -> Self {
         Self::Ack { ok, message }
     }
 
     /// Create an error response
+    #[inline]
     pub fn error(error: impl Into<String>) -> Self {
         Self::Error {
             error: error.into(),
@@ -741,13 +775,13 @@ mod tests {
             name: "tasks.add".to_string(),
             args: "[1, 2]".to_string(),
             kwargs: "{}".to_string(),
-            started: 1234567890.0,
+            started: 1_234_567_890.0,
             hostname: "worker-1".to_string(),
             worker_pid: Some(12345),
             delivery_info: Some(DeliveryInfo {
                 queue: "celery".to_string(),
                 routing_key: Some("tasks.add".to_string()),
-                exchange: Some("".to_string()),
+                exchange: Some(String::new()),
                 delivery_tag: Some("1".to_string()),
                 redelivered: false,
             }),

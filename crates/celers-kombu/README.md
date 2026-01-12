@@ -14,9 +14,17 @@ Production-ready broker abstraction with:
 - ✅ **Requeue Support**: Retry failed messages
 - ✅ **Message Envelope**: Delivery metadata tracking
 - ✅ **Error Handling**: Comprehensive error types
-- ✅ **Middleware System**: Message transformation pipeline
-  - **Built-in**: Validation, Logging, Metrics, Retry Limit, Rate Limiting, Deduplication
-  - **Feature-gated**: Compression (Gzip), Signing (HMAC), Encryption (AES-256-GCM)
+- ✅ **Dead Letter Queue (DLQ)**: Failed message handling with retry tracking
+- ✅ **Message Transactions**: ACID guarantees with isolation levels
+- ✅ **Message Scheduling**: Delayed delivery with absolute/relative timing
+- ✅ **Consumer Groups**: Load-balanced distributed consumption
+- ✅ **Message Replay**: Debugging and recovery with progress tracking
+- ✅ **Quota Management**: Resource limits with enforcement policies
+- ✅ **Flow Control**: Backpressure detection and poison message handling
+- ✅ **Middleware System**: 21 middleware types for transformation, validation, security, and reliability
+  - **Built-in** (18): Validation, Logging, Metrics, Retry Limit, Rate Limiting, Deduplication, Timeout, Filter, Sampling, Transformation, Tracing, Batching, Audit, Deadline, ContentType, RoutingKey, Idempotency, Backoff
+  - **Feature-gated** (3): Compression (Gzip), Signing (HMAC), Encryption (AES-256-GCM)
+- ✅ **Utilities Module**: 47 helper functions for optimization, monitoring, and operational excellence
 
 ## Architecture
 
@@ -727,6 +735,210 @@ let chain = MiddlewareChain::new()
 consumer.consume_with_middleware("celery", timeout, &chain).await?;
 ```
 
+#### TimeoutMiddleware
+
+Enforces message processing timeouts:
+
+```rust
+use celers_kombu::TimeoutMiddleware;
+use std::time::Duration;
+
+let timeout = TimeoutMiddleware::new(Duration::from_secs(30));
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(timeout));
+
+// Timeout metadata injected into message headers
+```
+
+#### FilterMiddleware
+
+Selectively processes messages based on custom predicates:
+
+```rust
+use celers_kombu::FilterMiddleware;
+
+let filter = FilterMiddleware::new(|msg| {
+    msg.headers.task.starts_with("high_priority")
+});
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(filter));
+
+// Only processes messages matching the predicate
+```
+
+#### SamplingMiddleware
+
+Statistical message sampling for monitoring/testing:
+
+```rust
+use celers_kombu::SamplingMiddleware;
+
+let sampler = SamplingMiddleware::new(0.1);  // Sample 10% of messages
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(sampler));
+```
+
+#### TransformationMiddleware
+
+Custom message content transformation:
+
+```rust
+use celers_kombu::TransformationMiddleware;
+
+let transformer = TransformationMiddleware::new(|msg| {
+    // Transform message body
+    msg.body = transform_body(&msg.body);
+    Ok(())
+});
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(transformer));
+```
+
+#### TracingMiddleware
+
+Distributed tracing support with automatic trace ID propagation:
+
+```rust
+use celers_kombu::TracingMiddleware;
+
+let tracer = TracingMiddleware::new("my-service");
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(tracer));
+
+// Injects trace IDs, span IDs, and timestamps for latency analysis
+```
+
+#### BatchingMiddleware
+
+Automatic message batching hints for batch-aware consumers:
+
+```rust
+use celers_kombu::BatchingMiddleware;
+use std::time::Duration;
+
+let batcher = BatchingMiddleware::new(100, Duration::from_secs(5));
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(batcher));
+
+// Suggests batching metadata (size: 100, timeout: 5s)
+```
+
+#### AuditMiddleware
+
+Comprehensive audit logging for compliance:
+
+```rust
+use celers_kombu::AuditMiddleware;
+
+let auditor = AuditMiddleware::new("audit-system")
+    .with_body_logging();  // Include message body in audit trail
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(auditor));
+
+// Generates unique audit IDs and tracks all operations
+```
+
+#### DeadlineMiddleware
+
+Hard deadline enforcement (absolute time-based):
+
+```rust
+use celers_kombu::DeadlineMiddleware;
+use std::time::Duration;
+
+let deadline = DeadlineMiddleware::new(Duration::from_secs(300));  // 5 min deadline
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(deadline));
+
+// Rejects messages that exceed their absolute deadline
+```
+
+#### ContentTypeMiddleware
+
+Content type validation and conversion:
+
+```rust
+use celers_kombu::ContentTypeMiddleware;
+
+let validator = ContentTypeMiddleware::new()
+    .with_allowed_types(vec!["application/json", "application/msgpack"])
+    .with_default_type("application/json");
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(validator));
+
+// Validates and enforces content types
+```
+
+#### RoutingKeyMiddleware
+
+Dynamic routing key assignment:
+
+```rust
+use celers_kombu::RoutingKeyMiddleware;
+
+// From task name
+let router = RoutingKeyMiddleware::from_task_name();
+
+// From task and priority
+let router = RoutingKeyMiddleware::from_task_and_priority();
+
+// Custom routing logic
+let router = RoutingKeyMiddleware::new(|msg| {
+    format!("tasks.{}.{}", msg.headers.task, msg.headers.priority)
+});
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(router));
+```
+
+#### IdempotencyMiddleware (NEW - v0.4.7)
+
+Exactly-once message processing guarantee:
+
+```rust
+use celers_kombu::IdempotencyMiddleware;
+
+let idempotency = IdempotencyMiddleware::new(10_000);  // Track 10K message IDs
+// Or use default: IdempotencyMiddleware::with_default_cache();
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(idempotency));
+
+// Tracks processed messages to prevent duplicate processing on retries
+// Sets x-already-processed header to true for duplicates
+```
+
+#### BackoffMiddleware (NEW - v0.4.7)
+
+Automatic retry backoff calculation with jitter:
+
+```rust
+use celers_kombu::BackoffMiddleware;
+use std::time::Duration;
+
+let backoff = BackoffMiddleware::new(
+    Duration::from_secs(1),   // Initial delay
+    Duration::from_secs(300), // Max delay (5 min)
+    2.0,                      // Multiplier
+);
+// Or use defaults: BackoffMiddleware::with_defaults();
+
+let chain = MiddlewareChain::new()
+    .with_middleware(Box::new(backoff));
+
+// Calculates exponential backoff with 0-25% jitter
+// Injects x-backoff-delay and x-next-retry headers
+```
+
 ### Feature-Gated Middleware
 
 The following middleware require enabling feature flags in `Cargo.toml`:
@@ -850,6 +1062,380 @@ let chain = chain.with_middleware(Box::new(
     EncryptionMiddleware::new(b"32-byte-encryption-key-here!!!!!")?
 ));
 ```
+
+## Dead Letter Queue (DLQ)
+
+Handle failed messages with automatic retry tracking:
+
+```rust
+use celers_kombu::{DlqConfig, DeadLetterQueue};
+
+// Configure DLQ
+let dlq_config = DlqConfig::new("my-queue-dlq")
+    .with_max_retries(3)
+    .with_ttl(Duration::from_secs(86400))  // 24 hours
+    .with_metadata("reason", "processing_failed");
+
+// Send to DLQ
+broker.send_to_dlq(&message, &dlq_config).await?;
+
+// Retrieve from DLQ
+if let Some(msg) = broker.get_from_dlq("my-queue-dlq", None).await? {
+    println!("Found failed message: {:?}", msg);
+}
+
+// Retry from DLQ
+broker.retry_from_dlq("my-queue-dlq", &message_id, "my-queue").await?;
+
+// Get DLQ statistics
+let stats = broker.dlq_stats("my-queue-dlq").await?;
+println!("DLQ has {} messages, oldest: {}s",
+    stats.message_count,
+    stats.oldest_message_age_secs().unwrap_or(0));
+
+// Purge DLQ
+broker.purge_dlq("my-queue-dlq").await?;
+```
+
+## Message Transactions
+
+ACID guarantees for message operations:
+
+```rust
+use celers_kombu::{MessageTransaction, IsolationLevel};
+
+// Begin transaction with isolation level
+let tx_id = broker.begin_transaction(IsolationLevel::ReadCommitted).await?;
+
+// Publish within transaction
+broker.publish_transactional(&tx_id, "queue", message1).await?;
+broker.publish_transactional(&tx_id, "queue", message2).await?;
+
+// Consume within transaction
+if let Some(env) = broker.consume_transactional(&tx_id, "queue", timeout).await? {
+    // Process message
+}
+
+// Commit or rollback
+if success {
+    broker.commit_transaction(&tx_id).await?;
+} else {
+    broker.rollback_transaction(&tx_id).await?;
+}
+
+// Check transaction state
+let state = broker.transaction_state(&tx_id).await?;
+```
+
+**Isolation Levels:**
+- `ReadUncommitted`: Dirty reads allowed
+- `ReadCommitted`: Only committed data visible
+- `RepeatableRead`: Consistent snapshot
+- `Serializable`: Full isolation
+
+## Message Scheduling
+
+Delay message delivery with flexible timing:
+
+```rust
+use celers_kombu::{ScheduleConfig, MessageScheduler};
+
+// Schedule with delay
+let schedule = ScheduleConfig::delay(Duration::from_secs(3600));  // 1 hour delay
+
+// Schedule at absolute time
+let schedule = ScheduleConfig::at(SystemTime::now() + Duration::from_secs(7200));
+
+// Schedule with execution window
+let schedule = ScheduleConfig::delay(Duration::from_secs(60))
+    .with_window(Duration::from_secs(30));  // Allow ±30s variance
+
+// Schedule message
+let scheduled_id = broker.schedule_message("queue", message, &schedule).await?;
+
+// Cancel scheduled message
+broker.cancel_scheduled(&scheduled_id).await?;
+
+// List scheduled messages
+let scheduled = broker.list_scheduled("queue").await?;
+for msg in scheduled {
+    println!("Message {} scheduled for {:?}", msg.message_id, msg.scheduled_time);
+}
+
+// Check if ready for delivery
+if schedule.is_ready() {
+    println!("Message is ready for delivery");
+}
+```
+
+## Consumer Groups
+
+Load-balanced distributed consumption:
+
+```rust
+use celers_kombu::{ConsumerGroup, ConsumerGroupConfig};
+
+// Configure consumer group
+let config = ConsumerGroupConfig::new("my-group")
+    .with_max_consumers(10)
+    .with_heartbeat_interval(Duration::from_secs(30))
+    .with_rebalance_timeout(Duration::from_secs(60));
+
+// Join group
+let consumer_id = broker.join_group(&config).await?;
+println!("Joined group as: {}", consumer_id);
+
+// Send heartbeat (keep membership alive)
+broker.heartbeat(&consumer_id).await?;
+
+// Consume with automatic load balancing
+if let Some(envelope) = broker.consume_from_group("queue", &consumer_id, timeout).await? {
+    println!("Received: {:?}", envelope);
+}
+
+// Get group members
+let members = broker.group_members("my-group").await?;
+println!("Group has {} consumers", members.len());
+
+// Leave group
+broker.leave_group(&consumer_id).await?;
+```
+
+## Message Replay
+
+Debug and recover with historical message replay:
+
+```rust
+use celers_kombu::{ReplayConfig, MessageReplay};
+
+// Replay last hour
+let config = ReplayConfig::from_duration(Duration::from_secs(3600));
+
+// Replay from specific timestamp
+let config = ReplayConfig::from_timestamp(SystemTime::now() - Duration::from_secs(7200));
+
+// Replay with limits
+let config = ReplayConfig::from_duration(Duration::from_secs(3600))
+    .with_max_messages(1000)
+    .with_speed(2.0);  // 2x speed
+
+// Begin replay session
+let session_id = broker.begin_replay("queue", &config).await?;
+
+// Replay messages
+loop {
+    match broker.replay_next(&session_id).await? {
+        Some(envelope) => {
+            println!("Replaying: {:?}", envelope);
+        }
+        None => break,
+    }
+}
+
+// Track progress
+let progress = broker.replay_progress(&session_id).await?;
+println!("Replay {}% complete", progress.completion_percent());
+
+// Stop replay
+broker.stop_replay(&session_id).await?;
+```
+
+## Quota Management
+
+Resource limits with flexible enforcement:
+
+```rust
+use celers_kombu::{QuotaConfig, QuotaManager, QuotaEnforcement};
+
+// Configure quotas
+let quota = QuotaConfig::new()
+    .with_max_messages(10_000)
+    .with_max_bytes(100 * 1024 * 1024)  // 100 MB
+    .with_max_rate(100.0)  // 100 messages/sec
+    .with_max_per_consumer(50)
+    .with_enforcement(QuotaEnforcement::Throttle);
+
+// Set quota
+broker.set_quota("queue", quota).await?;
+
+// Check quota before operation
+match broker.check_quota("queue", message_size).await? {
+    Ok(_) => {
+        broker.publish("queue", message).await?;
+    }
+    Err(e) => println!("Quota exceeded: {}", e),
+}
+
+// Get quota usage
+let usage = broker.quota_usage("queue").await?;
+println!("Message quota: {}%", usage.message_usage_percent());
+println!("Byte quota: {}%", usage.byte_usage_percent());
+println!("Rate quota: {}%", usage.rate_usage_percent());
+
+if usage.is_message_quota_exceeded() {
+    println!("WARNING: Message quota exceeded!");
+}
+
+// Reset quota
+broker.reset_quota("queue").await?;
+```
+
+**Enforcement Policies:**
+- `Reject`: Reject operations exceeding quota
+- `Throttle`: Slow down operations
+- `Warn`: Log warnings but allow
+
+## Flow Control
+
+### Backpressure Detection
+
+Automatic flow control based on queue metrics:
+
+```rust
+use celers_kombu::BackpressureConfig;
+
+let backpressure = BackpressureConfig::new()
+    .with_max_pending(1000)
+    .with_max_queue_size(10_000)
+    .with_high_watermark(0.8)  // 80%
+    .with_low_watermark(0.2);  // 20%
+
+// Check if backpressure should be applied
+if backpressure.should_apply_backpressure(pending, queue_size) {
+    println!("Applying backpressure - queue is full");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+// Check if backpressure can be released
+if backpressure.should_release_backpressure(pending, queue_size) {
+    println!("Releasing backpressure - queue drained");
+}
+```
+
+### Poison Message Detection
+
+Prevent infinite retry loops:
+
+```rust
+use celers_kombu::PoisonMessageDetector;
+
+let detector = PoisonMessageDetector::new()
+    .with_max_failures(5)
+    .with_failure_window(Duration::from_secs(300));  // 5 min window
+
+// Record failure
+detector.record_failure(&message_id);
+
+// Check if poison
+if detector.is_poison(&message_id) {
+    println!("Poison message detected! Sending to DLQ...");
+    broker.send_to_dlq(&message, &dlq_config).await?;
+    detector.clear_failures(&message_id);
+} else {
+    let failures = detector.failure_count(&message_id);
+    println!("Message has {} failures", failures);
+}
+
+// Clear all tracking
+detector.clear_all();
+```
+
+## Utilities Module
+
+47 helper functions for broker operations, optimization, and monitoring:
+
+### Batch Optimization
+
+```rust
+use celers_kombu::utils;
+
+// Calculate optimal batch size
+let batch_size = utils::calculate_optimal_batch_size(
+    1024,      // avg_message_size
+    10_000,    // target_throughput
+    100,       // processing_time_ms
+);
+
+// Calculate optimal workers
+let workers = utils::calculate_optimal_workers(
+    10_000,    // queue_size
+    100,       // processing_rate per worker
+    3600,      // target_drain_time_secs
+);
+```
+
+### Performance Analysis
+
+```rust
+// Analyze broker performance
+let (success_rate, error_rate, ack_rate) = utils::analyze_broker_performance(&metrics);
+println!("Success: {:.1}%, Errors: {:.1}%", success_rate, error_rate);
+
+// Calculate throughput
+let throughput = utils::calculate_throughput(messages_count, duration_secs);
+println!("Throughput: {:.1} msgs/sec", throughput);
+
+// Analyze circuit breaker
+let action = utils::analyze_circuit_breaker(&stats, &config);
+println!("Recommended action: {:?}", action);
+```
+
+### Queue Health Monitoring
+
+```rust
+// Analyze queue health
+let health = utils::analyze_queue_health(queue_size, high_watermark, low_watermark);
+println!("Queue health: {:?}", health);  // Healthy, Warning, Critical
+
+// Estimate drain time
+let drain_time = utils::estimate_drain_time(queue_size, consumption_rate);
+println!("Queue will drain in {:.1} seconds", drain_time);
+
+// Estimate memory usage
+let memory_mb = utils::estimate_queue_memory(queue_size, avg_message_size);
+println!("Queue using ~{:.1} MB", memory_mb);
+```
+
+### Operational Excellence (NEW - v0.4.7)
+
+```rust
+// Anomaly detection
+let (is_anomaly, severity, description) = utils::detect_anomalies(
+    &current_rates,
+    &baseline_rates,
+    2.0,  // threshold_multiplier
+);
+
+// SLA compliance
+let (compliance_pct, violations, avg_time) = utils::calculate_sla_compliance(
+    &processing_times,
+    target_ms,
+);
+
+// Error budget tracking
+let (budget_remaining, errors_allowed, hours_to_exhaustion) = utils::calculate_error_budget(
+    99.9,              // sla_target
+    total_requests,
+    failed_requests,
+    requests_per_hour,
+);
+
+// Cost estimation
+let monthly_cost = utils::estimate_infrastructure_cost(
+    messages_per_day,
+    cost_per_million,
+    30,
+);
+
+// Queue saturation prediction
+let (hours_to_saturation, growth_rate) = utils::predict_queue_saturation(
+    &queue_sizes,
+    max_capacity,
+    hours_per_sample,
+);
+```
+
+See examples for comprehensive usage: `cargo run --example monitoring` and `cargo run --example operational_excellence`.
 
 ## Best Practices
 
@@ -986,6 +1572,57 @@ mod tests {
     }
 }
 ```
+
+## Examples
+
+The crate includes 11 comprehensive examples demonstrating all features:
+
+### Basic Usage
+```bash
+# Complete broker implementation
+cargo run --example basic_broker
+
+# Middleware usage patterns
+cargo run --example middleware_usage
+
+# Batch operations
+cargo run --example batch_operations
+```
+
+### Advanced Features
+```bash
+# Dead Letter Queue (DLQ)
+cargo run --example dlq_usage
+
+# Message transactions with ACID guarantees
+cargo run --example transactions
+
+# Scheduling, consumer groups, replay, quotas
+cargo run --example advanced_features
+```
+
+### Flow Control & Resilience
+```bash
+# Backpressure, poison detection, timeout, filter
+cargo run --example flow_control
+
+# Circuit breaker, connection pooling, health checks
+cargo run --example circuit_breaker
+```
+
+### Monitoring & Operational Excellence
+```bash
+# 47 utility functions showcase
+cargo run --example utilities_showcase
+
+# Production monitoring and observability
+cargo run --example monitoring
+
+# Idempotency, backoff, anomaly detection, SLA tracking, error budgets
+cargo run --example operational_excellence
+```
+
+Each example includes detailed comments and demonstrates best practices for production use.
 
 ## See Also
 

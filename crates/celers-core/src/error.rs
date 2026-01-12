@@ -42,70 +42,70 @@ impl CelersError {
     /// Check if the error is serialization-related
     #[inline]
     #[must_use]
-    pub fn is_serialization(&self) -> bool {
+    pub const fn is_serialization(&self) -> bool {
         matches!(self, CelersError::Serialization(_))
     }
 
     /// Check if the error is deserialization-related
     #[inline]
     #[must_use]
-    pub fn is_deserialization(&self) -> bool {
+    pub const fn is_deserialization(&self) -> bool {
         matches!(self, CelersError::Deserialization(_))
     }
 
     /// Check if the error is broker-related
     #[inline]
     #[must_use]
-    pub fn is_broker(&self) -> bool {
+    pub const fn is_broker(&self) -> bool {
         matches!(self, CelersError::Broker(_))
     }
 
     /// Check if the error is task-not-found
     #[inline]
     #[must_use]
-    pub fn is_task_not_found(&self) -> bool {
+    pub const fn is_task_not_found(&self) -> bool {
         matches!(self, CelersError::TaskNotFound(_))
     }
 
     /// Check if the error is task-execution-related
     #[inline]
     #[must_use]
-    pub fn is_task_execution(&self) -> bool {
+    pub const fn is_task_execution(&self) -> bool {
         matches!(self, CelersError::TaskExecution(_))
     }
 
     /// Check if the error is task-revoked
     #[inline]
     #[must_use]
-    pub fn is_task_revoked(&self) -> bool {
+    pub const fn is_task_revoked(&self) -> bool {
         matches!(self, CelersError::TaskRevoked(_))
     }
 
     /// Check if the error is timeout-related
     #[inline]
     #[must_use]
-    pub fn is_timeout(&self) -> bool {
+    pub const fn is_timeout(&self) -> bool {
         matches!(self, CelersError::Timeout(_))
     }
 
     /// Check if the error is configuration-related
     #[inline]
     #[must_use]
-    pub fn is_configuration(&self) -> bool {
+    pub const fn is_configuration(&self) -> bool {
         matches!(self, CelersError::Configuration(_))
     }
 
     /// Check if the error is IO-related
     #[inline]
     #[must_use]
-    pub fn is_io(&self) -> bool {
+    pub const fn is_io(&self) -> bool {
         matches!(self, CelersError::Io(_))
     }
 
     /// Check if the error is an invalid state transition
     #[inline]
     #[must_use]
-    pub fn is_invalid_state_transition(&self) -> bool {
+    pub const fn is_invalid_state_transition(&self) -> bool {
         matches!(self, CelersError::InvalidStateTransition { .. })
     }
 
@@ -115,7 +115,7 @@ impl CelersError {
     /// Returns false for serialization, configuration, and state transition errors.
     #[inline]
     #[must_use]
-    pub fn is_retryable(&self) -> bool {
+    pub const fn is_retryable(&self) -> bool {
         matches!(
             self,
             CelersError::Broker(_) | CelersError::Io(_) | CelersError::TaskExecution(_)
@@ -125,7 +125,7 @@ impl CelersError {
     /// Get the error category as a string
     #[inline]
     #[must_use]
-    pub fn category(&self) -> &'static str {
+    pub const fn category(&self) -> &'static str {
         match self {
             CelersError::Serialization(_) => "serialization",
             CelersError::Deserialization(_) => "deserialization",

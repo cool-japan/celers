@@ -10,7 +10,7 @@ pub type TaskId = Uuid;
 
 /// Batch utility functions for working with multiple tasks
 pub mod batch {
-    use super::*;
+    use super::{SerializedTask, TaskState, Uuid};
 
     /// Validate a collection of tasks, returning all errors
     ///
@@ -146,9 +146,10 @@ pub mod batch {
     /// // Fresh tasks shouldn't be expired
     /// assert!(!batch::has_expired_tasks(&tasks));
     /// ```
+    #[inline]
     #[must_use]
     pub fn has_expired_tasks(tasks: &[SerializedTask]) -> bool {
-        tasks.iter().any(|task| task.is_expired())
+        tasks.iter().any(super::SerializedTask::is_expired)
     }
 
     /// Get tasks that have expired
@@ -166,6 +167,7 @@ pub mod batch {
     /// // Fresh tasks shouldn't be expired
     /// assert_eq!(expired.len(), 0);
     /// ```
+    #[inline]
     #[must_use]
     pub fn get_expired_tasks(tasks: &[SerializedTask]) -> Vec<&SerializedTask> {
         tasks.iter().filter(|task| task.is_expired()).collect()
@@ -187,7 +189,7 @@ pub mod batch {
     /// ```
     #[must_use]
     pub fn total_payload_size(tasks: &[SerializedTask]) -> usize {
-        tasks.iter().map(|task| task.payload_size()).sum()
+        tasks.iter().map(super::SerializedTask::payload_size).sum()
     }
 
     /// Find tasks with dependencies
@@ -494,13 +496,16 @@ impl TaskMetadata {
     }
 
     /// Get the age of the task (time since creation)
+    #[inline]
     #[must_use]
     pub fn age(&self) -> chrono::Duration {
         Utc::now() - self.created_at
     }
 
     /// Check if the task has expired based on its timeout
+    #[inline]
     #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
     pub fn is_expired(&self) -> bool {
         if let Some(timeout_secs) = self.timeout_secs {
             let elapsed = (Utc::now() - self.created_at).num_seconds();
@@ -511,12 +516,14 @@ impl TaskMetadata {
     }
 
     /// Check if the task is in a terminal state (Succeeded or Failed)
+    #[inline]
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.state.is_terminal()
     }
 
     /// Check if the task is in a running or active state
+    #[inline]
     #[must_use]
     pub fn is_active(&self) -> bool {
         matches!(
@@ -532,6 +539,10 @@ impl TaskMetadata {
     /// - Max retries must be reasonable (< 1000)
     /// - Timeout must be at least 1 second if set
     /// - Priority must be in valid range (-2147483648 to 2147483647)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails.
     pub fn validate(&self) -> Result<(), String> {
         if self.name.is_empty() {
             return Err("Task name cannot be empty".to_string());
@@ -554,38 +565,44 @@ impl TaskMetadata {
     }
 
     /// Check if task has a timeout configured
+    #[inline]
     #[must_use]
     pub fn has_timeout(&self) -> bool {
         self.timeout_secs.is_some()
     }
 
     /// Check if task is part of a group
+    #[inline]
     #[must_use]
     pub fn has_group_id(&self) -> bool {
         self.group_id.is_some()
     }
 
     /// Check if task is part of a chord
+    #[inline]
     #[must_use]
     pub fn has_chord_id(&self) -> bool {
         self.chord_id.is_some()
     }
 
     /// Check if task has custom priority (non-zero)
+    #[inline]
     #[must_use]
-    pub fn has_priority(&self) -> bool {
+    pub const fn has_priority(&self) -> bool {
         self.priority != 0
     }
 
     /// Check if task has high priority (priority > 0)
+    #[inline]
     #[must_use]
-    pub fn is_high_priority(&self) -> bool {
+    pub const fn is_high_priority(&self) -> bool {
         self.priority > 0
     }
 
     /// Check if task has low priority (priority < 0)
+    #[inline]
     #[must_use]
-    pub fn is_low_priority(&self) -> bool {
+    pub const fn is_low_priority(&self) -> bool {
         self.priority < 0
     }
 
@@ -598,6 +615,7 @@ impl TaskMetadata {
     }
 
     /// Add multiple task dependencies
+    #[inline]
     #[must_use]
     pub fn with_dependencies(mut self, dependencies: impl IntoIterator<Item = TaskId>) -> Self {
         self.dependencies.extend(dependencies);
@@ -626,11 +644,13 @@ impl TaskMetadata {
     }
 
     /// Remove a dependency
+    #[inline]
     pub fn remove_dependency(&mut self, task_id: &TaskId) -> bool {
         self.dependencies.remove(task_id)
     }
 
     /// Clear all dependencies
+    #[inline]
     pub fn clear_dependencies(&mut self) {
         self.dependencies.clear();
     }
@@ -692,7 +712,9 @@ impl TaskMetadata {
     ///     println!("Task has {} seconds remaining", remaining.num_seconds());
     /// }
     /// ```
+    #[inline]
     #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
     pub fn time_remaining(&self) -> Option<chrono::Duration> {
         self.timeout_secs.and_then(|timeout| {
             let elapsed = Utc::now() - self.created_at;
@@ -716,6 +738,7 @@ impl TaskMetadata {
     /// let elapsed = task.time_elapsed();
     /// assert!(elapsed.num_seconds() >= 0);
     /// ```
+    #[inline]
     #[must_use]
     pub fn time_elapsed(&self) -> chrono::Duration {
         Utc::now() - self.created_at
@@ -736,6 +759,7 @@ impl TaskMetadata {
     /// task.state = TaskState::Retrying(3);
     /// assert!(!task.can_retry());
     /// ```
+    #[inline]
     #[must_use]
     pub fn can_retry(&self) -> bool {
         self.state.can_retry(self.max_retries)
@@ -753,7 +777,7 @@ impl TaskMetadata {
     /// ```
     #[inline]
     #[must_use]
-    pub fn retry_count(&self) -> u32 {
+    pub const fn retry_count(&self) -> u32 {
         self.state.retry_count()
     }
 
@@ -767,8 +791,9 @@ impl TaskMetadata {
     /// task.state = TaskState::Retrying(2);
     /// assert_eq!(task.retries_remaining(), 3);
     /// ```
+    #[inline]
     #[must_use]
-    pub fn retries_remaining(&self) -> u32 {
+    pub const fn retries_remaining(&self) -> u32 {
         let current = self.retry_count();
         self.max_retries.saturating_sub(current)
     }
@@ -818,6 +843,7 @@ impl TaskMetadata {
     /// task.mark_as_running();
     /// assert!(task.is_running());
     /// ```
+    #[inline]
     pub fn mark_as_running(&mut self) {
         self.state = TaskState::Running;
         self.updated_at = Utc::now();
@@ -833,6 +859,7 @@ impl TaskMetadata {
     /// task.mark_as_succeeded(vec![1, 2, 3]);
     /// assert!(task.is_succeeded());
     /// ```
+    #[inline]
     pub fn mark_as_succeeded(&mut self, result: Vec<u8>) {
         self.state = TaskState::Succeeded(result);
         self.updated_at = Utc::now();
@@ -848,6 +875,7 @@ impl TaskMetadata {
     /// task.mark_as_failed("Connection timeout");
     /// assert!(task.is_failed());
     /// ```
+    #[inline]
     pub fn mark_as_failed(&mut self, error: impl Into<String>) {
         self.state = TaskState::Failed(error.into());
         self.updated_at = Utc::now();
@@ -865,6 +893,7 @@ impl TaskMetadata {
     /// assert_eq!(task.name, cloned.name);
     /// assert_eq!(task.priority, cloned.priority);
     /// ```
+    #[inline]
     #[must_use]
     pub fn with_new_id(&self) -> Self {
         let now = Utc::now();
@@ -898,7 +927,7 @@ impl fmt::Display for TaskMetadata {
         )?;
 
         if let Some(timeout) = self.timeout_secs {
-            write!(f, " timeout={}s", timeout)?;
+            write!(f, " timeout={timeout}s")?;
         }
 
         if let Some(chord_id) = self.chord_id {
@@ -1050,8 +1079,12 @@ impl SerializedTask {
     /// Validate the serialized task
     ///
     /// Validates both metadata and payload constraints:
-    /// - Delegates metadata validation to TaskMetadata::validate()
+    /// - Delegates metadata validation to `TaskMetadata::validate()`
     /// - Checks payload size (must be < 1MB by default)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails.
     pub fn validate(&self) -> Result<(), String> {
         self.metadata.validate()?;
 
@@ -1070,6 +1103,10 @@ impl SerializedTask {
     }
 
     /// Validate with custom payload size limit
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails.
     pub fn validate_with_limit(&self, max_payload_bytes: usize) -> Result<(), String> {
         self.metadata.validate()?;
 
@@ -1119,7 +1156,7 @@ impl SerializedTask {
     /// Get payload size in bytes
     #[inline]
     #[must_use]
-    pub fn payload_size(&self) -> usize {
+    pub const fn payload_size(&self) -> usize {
         self.payload.len()
     }
 
@@ -1139,6 +1176,7 @@ impl SerializedTask {
     }
 
     /// Add multiple task dependencies
+    #[inline]
     #[must_use]
     pub fn with_dependencies(mut self, dependencies: impl IntoIterator<Item = TaskId>) -> Self {
         self.metadata.dependencies.extend(dependencies);
@@ -1252,14 +1290,14 @@ impl SerializedTask {
     /// Get current retry count
     #[inline]
     #[must_use]
-    pub fn retry_count(&self) -> u32 {
+    pub const fn retry_count(&self) -> u32 {
         self.metadata.retry_count()
     }
 
     /// Get remaining retry attempts
     #[inline]
     #[must_use]
-    pub fn retries_remaining(&self) -> u32 {
+    pub const fn retries_remaining(&self) -> u32 {
         self.metadata.retries_remaining()
     }
 

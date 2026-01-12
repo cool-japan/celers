@@ -51,6 +51,7 @@ pub enum EventType {
 
 impl EventType {
     /// Get the event type string
+    #[inline]
     pub fn as_str(&self) -> &str {
         match self {
             EventType::TaskSent => "task-sent",
@@ -69,6 +70,7 @@ impl EventType {
     }
 
     /// Check if this is a task event
+    #[inline]
     pub fn is_task_event(&self) -> bool {
         matches!(
             self,
@@ -84,6 +86,7 @@ impl EventType {
     }
 
     /// Check if this is a worker event
+    #[inline]
     pub fn is_worker_event(&self) -> bool {
         matches!(
             self,
@@ -98,8 +101,29 @@ impl std::fmt::Display for EventType {
     }
 }
 
+impl std::str::FromStr for EventType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "task-sent" => Ok(EventType::TaskSent),
+            "task-received" => Ok(EventType::TaskReceived),
+            "task-started" => Ok(EventType::TaskStarted),
+            "task-succeeded" => Ok(EventType::TaskSucceeded),
+            "task-failed" => Ok(EventType::TaskFailed),
+            "task-rejected" => Ok(EventType::TaskRejected),
+            "task-revoked" => Ok(EventType::TaskRevoked),
+            "task-retried" => Ok(EventType::TaskRetried),
+            "worker-online" => Ok(EventType::WorkerOnline),
+            "worker-offline" => Ok(EventType::WorkerOffline),
+            "worker-heartbeat" => Ok(EventType::WorkerHeartbeat),
+            other => Ok(EventType::Custom(other.to_string())),
+        }
+    }
+}
+
 /// Base event message structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventMessage {
     /// Event type
     #[serde(rename = "type")]
@@ -200,8 +224,14 @@ impl EventMessage {
     }
 }
 
+impl From<EventType> for EventMessage {
+    fn from(event_type: EventType) -> Self {
+        Self::new(event_type)
+    }
+}
+
 /// Task-specific event data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskEvent {
     /// Base event
     #[serde(flatten)]
@@ -426,7 +456,7 @@ impl TaskEvent {
 }
 
 /// Worker-specific event data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerEvent {
     /// Base event
     #[serde(flatten)]
@@ -565,6 +595,62 @@ mod tests {
     }
 
     #[test]
+    fn test_event_type_from_str() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            EventType::from_str("task-sent").unwrap(),
+            EventType::TaskSent
+        );
+        assert_eq!(
+            EventType::from_str("task-received").unwrap(),
+            EventType::TaskReceived
+        );
+        assert_eq!(
+            EventType::from_str("task-started").unwrap(),
+            EventType::TaskStarted
+        );
+        assert_eq!(
+            EventType::from_str("task-succeeded").unwrap(),
+            EventType::TaskSucceeded
+        );
+        assert_eq!(
+            EventType::from_str("task-failed").unwrap(),
+            EventType::TaskFailed
+        );
+        assert_eq!(
+            EventType::from_str("task-rejected").unwrap(),
+            EventType::TaskRejected
+        );
+        assert_eq!(
+            EventType::from_str("task-revoked").unwrap(),
+            EventType::TaskRevoked
+        );
+        assert_eq!(
+            EventType::from_str("task-retried").unwrap(),
+            EventType::TaskRetried
+        );
+        assert_eq!(
+            EventType::from_str("worker-online").unwrap(),
+            EventType::WorkerOnline
+        );
+        assert_eq!(
+            EventType::from_str("worker-offline").unwrap(),
+            EventType::WorkerOffline
+        );
+        assert_eq!(
+            EventType::from_str("worker-heartbeat").unwrap(),
+            EventType::WorkerHeartbeat
+        );
+
+        // Test custom event type
+        match EventType::from_str("custom-event").unwrap() {
+            EventType::Custom(s) => assert_eq!(s, "custom-event"),
+            _ => panic!("Expected Custom variant"),
+        }
+    }
+
+    #[test]
     fn test_event_message_creation() {
         let event = EventMessage::new(EventType::TaskSent).with_hostname("worker-1");
 
@@ -698,5 +784,53 @@ mod tests {
         assert_eq!(decoded.base.event_type, "worker-heartbeat");
         assert_eq!(decoded.active, Some(3));
         assert_eq!(decoded.processed, Some(500));
+    }
+
+    #[test]
+    fn test_event_message_from_event_type() {
+        let event: EventMessage = EventType::TaskSent.into();
+        assert_eq!(event.event_type, "task-sent");
+        assert!(event.timestamp > 0.0);
+
+        let event2: EventMessage = EventType::WorkerOnline.into();
+        assert_eq!(event2.event_type, "worker-online");
+    }
+
+    #[test]
+    fn test_event_message_equality() {
+        let event1 = EventMessage::new(EventType::TaskSent)
+            .with_hostname("host-1")
+            .with_pid(123);
+        let event3 = EventMessage::new(EventType::TaskSent)
+            .with_hostname("host-2")
+            .with_pid(123);
+
+        // Test that the same event equals itself (cloning preserves all fields including timestamp)
+        assert_eq!(event1, event1.clone());
+
+        // Verify different hostnames result in different events
+        assert_ne!(event1.hostname, event3.hostname);
+    }
+
+    #[test]
+    fn test_task_event_equality() {
+        let task_id = Uuid::new_v4();
+        let event1 = TaskEvent::sent(task_id, "tasks.add")
+            .with_hostname("worker-1")
+            .with_queue("celery");
+        let event2 = event1.clone();
+
+        assert_eq!(event1, event2);
+        assert_eq!(event1.uuid, event2.uuid);
+    }
+
+    #[test]
+    fn test_worker_event_equality() {
+        let event1 =
+            WorkerEvent::online("worker@host").with_software("celers-worker", "0.1.0", "Linux");
+        let event2 = event1.clone();
+
+        assert_eq!(event1, event2);
+        assert_eq!(event1.software_identity, event2.software_identity);
     }
 }

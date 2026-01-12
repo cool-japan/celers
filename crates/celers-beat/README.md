@@ -4,15 +4,38 @@ Periodic task scheduler for CeleRS, equivalent to Celery Beat. Schedule tasks to
 
 ## Overview
 
-Production-ready task scheduler with:
+Production-ready task scheduler with comprehensive features:
 
+**Core Scheduling:**
 - ✅ **Interval Schedules**: Execute every N seconds
-- ✅ **Crontab Schedules**: Unix cron-style scheduling (optional feature: "cron")
-- ✅ **Solar Schedules**: Sunrise/sunset events (optional feature: "solar")
-- ✅ **Persistent State**: Track last run times
-- ✅ **Enable/Disable**: Control task execution
-- ✅ **Priority Support**: Schedule high-priority tasks
-- ✅ **Timezone Support**: UTC-based scheduling
+- ✅ **Crontab Schedules**: Unix cron-style scheduling with timezone support
+- ✅ **Solar Schedules**: Sunrise/sunset/twilight/golden hour events
+- ✅ **One-Time Schedules**: Run once at specific time (auto-cleanup)
+- ✅ **Custom Schedules**: User-defined scheduling logic via closures
+- ✅ **Composite Schedules**: Combine schedules with AND/OR logic
+
+**Task Management:**
+- ✅ **Persistent State**: Track execution history across restarts
+- ✅ **Schedule Versioning**: Track and rollback schedule modifications
+- ✅ **Task Dependencies**: Define execution order with dependency chains
+- ✅ **Groups & Tags**: Organize tasks with hierarchical groups and tags
+- ✅ **Batch Operations**: Efficient bulk add/remove operations
+- ✅ **Priority Support**: High-priority task scheduling
+- ✅ **Retry Policies**: Exponential backoff and fixed delay strategies
+
+**Reliability & Monitoring:**
+- ✅ **Crash Recovery**: Automatic recovery from scheduler crashes
+- ✅ **Schedule Locking**: Prevent duplicate execution across instances
+- ✅ **Alerting System**: Configurable alerts for failures and performance issues
+- ✅ **Health Checks**: Task health validation and stuck detection
+- ✅ **Conflict Detection**: Analyze overlapping schedules
+- ✅ **Execution History**: Track success/failure/duration statistics
+
+**Advanced Features:**
+- ✅ **Calendar Integration**: Business hours, holidays, blackout periods
+- ✅ **Webhook Alerts**: Send alerts to external systems
+- ✅ **Jitter & Catch-up**: Avoid thundering herd, handle missed schedules
+- ✅ **Schedule Indexing**: Fast O(log n) due task lookup
 
 ## Quick Start
 
@@ -356,7 +379,336 @@ let check_alerts = ScheduledTask::new(
 );
 ```
 
+## Schedule Builders and Templates
+
+### Schedule Builder - Fluent API
+
+Create schedules with a chainable, intuitive API:
+
+```rust
+use celers_beat::ScheduleBuilder;
+
+// Simple intervals
+let schedule = ScheduleBuilder::new()
+    .every_n_minutes(30)
+    .build();
+
+// Business hours only (Mon-Fri, 9 AM - 5 PM)
+let schedule = ScheduleBuilder::new()
+    .every_n_minutes(15)
+    .business_hours_only()
+    .build();
+
+// Weekends only
+let schedule = ScheduleBuilder::new()
+    .every_n_hours(2)
+    .weekends_only()
+    .build();
+
+// Weekdays with timezone
+let schedule = ScheduleBuilder::new()
+    .every_n_hours(1)
+    .weekdays_only()
+    .in_timezone("America/New_York")
+    .build();
+
+// Business hours in Tokyo
+let schedule = ScheduleBuilder::new()
+    .every_n_minutes(30)
+    .business_hours_only()
+    .in_timezone("Asia/Tokyo")
+    .build();
+```
+
+**Builder Methods:**
+- `every_n_seconds(n)` - Every N seconds
+- `every_n_minutes(n)` - Every N minutes
+- `every_n_hours(n)` - Every N hours
+- `every_n_days(n)` - Every N days
+- `business_hours_only()` - Mon-Fri, 9 AM - 5 PM
+- `weekdays_only()` - Mon-Fri
+- `weekends_only()` - Sat-Sun
+- `in_timezone(tz)` - Set timezone
+- `build()` - Create the schedule
+
+### Schedule Templates
+
+Pre-built schedules for common patterns:
+
+```rust
+use celers_beat::ScheduleTemplates;
+
+// Common intervals
+ScheduleTemplates::every_minute();
+ScheduleTemplates::every_5_minutes();
+ScheduleTemplates::every_15_minutes();
+ScheduleTemplates::every_30_minutes();
+ScheduleTemplates::hourly();
+ScheduleTemplates::every_2_hours();
+ScheduleTemplates::every_6_hours();
+ScheduleTemplates::every_12_hours();
+
+// Daily schedules
+ScheduleTemplates::daily_at_midnight();
+ScheduleTemplates::daily_at_hour(3); // 3 AM
+
+// Weekly schedules
+ScheduleTemplates::weekdays_at(9, 0); // Weekdays at 9:00 AM
+ScheduleTemplates::weekly_on_monday(9, 0); // Monday at 9:00 AM
+ScheduleTemplates::weekend_mornings(); // Sat/Sun at 8 AM
+
+// Monthly schedules
+ScheduleTemplates::monthly_first_day(); // 1st of month
+ScheduleTemplates::monthly_last_day(); // 28-31st of month
+
+// Business hours
+ScheduleTemplates::business_hours_hourly();
+ScheduleTemplates::business_hours_every_15_minutes();
+
+// Quarterly
+ScheduleTemplates::quarterly(); // Jan/Apr/Jul/Oct 1st
+```
+
+**Practical Examples:**
+
+```rust
+// Health check monitoring
+let task = ScheduledTask::new(
+    "health_check".to_string(),
+    ScheduleTemplates::every_minute()
+);
+
+// Daily report at 3 AM
+let task = ScheduledTask::new(
+    "daily_report".to_string(),
+    ScheduleTemplates::daily_at_hour(3)
+);
+
+// Business hours API sync
+let task = ScheduledTask::new(
+    "api_sync".to_string(),
+    ScheduleTemplates::business_hours_every_15_minutes()
+);
+
+// Weekend batch processing
+let task = ScheduledTask::new(
+    "weekend_batch".to_string(),
+    ScheduleBuilder::new()
+        .every_n_hours(2)
+        .weekends_only()
+        .build()
+);
+```
+
+See `examples/schedule_builders.rs` for comprehensive demonstrations.
+
 ## Advanced Features
+
+### Schedule Versioning
+
+Track and rollback schedule modifications:
+
+```rust
+use celers_beat::ScheduledTask;
+
+let mut task = ScheduledTask::new("my_task".to_string(), Schedule::interval(60));
+
+// Update schedule (creates version 2)
+task.update_schedule(Schedule::interval(120));
+
+// Update again (creates version 3)
+task.update_schedule(Schedule::interval(180));
+
+// Rollback to version 2
+task.rollback_to_version(1)?;
+
+// View version history
+for version in task.get_version_history() {
+    println!("Version {} at {}", version.version, version.timestamp);
+}
+```
+
+### Task Dependencies
+
+Define task execution order with dependency chains:
+
+```rust
+let extract = ScheduledTask::new("extract_data".to_string(), Schedule::interval(3600))
+    .with_group("etl");
+
+let transform = ScheduledTask::new("transform_data".to_string(), Schedule::interval(3600))
+    .with_dependencies(vec!["extract_data".to_string()])
+    .with_group("etl");
+
+let load = ScheduledTask::new("load_data".to_string(), Schedule::interval(3600))
+    .with_dependencies(vec!["transform_data".to_string()])
+    .with_group("etl");
+
+scheduler.add_task(extract)?;
+scheduler.add_task(transform)?;
+scheduler.add_task(load)?;
+
+// Validate dependencies (detects circular dependencies)
+scheduler.validate_dependencies()?;
+
+// Get dependency chain
+let chain = scheduler.resolve_dependency_chain("load_data")?;
+```
+
+### Schedule Locking
+
+Prevent duplicate task execution across multiple scheduler instances:
+
+```rust
+// Set unique instance ID
+scheduler.set_instance_id("scheduler-001");
+
+// Try to acquire lock
+if scheduler.try_acquire_lock("my_task", 300)? {
+    // Lock acquired, safe to execute
+
+    // Renew lock if task runs longer
+    scheduler.renew_lock("my_task", 300)?;
+
+    // Release when done
+    scheduler.release_lock("my_task")?;
+}
+```
+
+### Alerting System
+
+Configure alerts for task failures and performance issues:
+
+```rust
+use celers_beat::AlertConfig;
+
+let alert_config = AlertConfig {
+    enabled: true,
+    consecutive_failures_threshold: 3,
+    failure_rate_threshold: 0.5,  // 50%
+    slow_execution_threshold_ms: Some(5000),
+    alert_on_missed_schedule: true,
+    alert_on_stuck_task: true,
+};
+
+let task = ScheduledTask::new("critical_task".to_string(), Schedule::interval(60))
+    .with_alert_config(alert_config);
+
+// Register alert callback
+scheduler.on_alert(Arc::new(|alert| {
+    eprintln!("[{}] {} - {}", alert.level, alert.task_name, alert.message);
+}));
+
+// Check alerts
+scheduler.check_all_alerts();
+let critical = scheduler.get_critical_alerts();
+```
+
+### Crash Recovery
+
+Automatic recovery from scheduler crashes:
+
+```rust
+// On restart, detect interrupted tasks
+let crashed_tasks = scheduler.detect_crashed_tasks();
+
+// Recover from crash
+scheduler.recover_from_crash()?;
+
+// Get tasks ready for retry
+let retry_tasks = scheduler.get_tasks_ready_for_crash_retry();
+```
+
+### Conflict Detection
+
+Detect and analyze overlapping schedules:
+
+```rust
+// Detect conflicts (tasks scheduled too close together)
+let conflicts = scheduler.detect_conflicts(60)?; // 60 second window
+
+// Get high-severity conflicts only
+let high_severity = scheduler.get_high_severity_conflicts(&conflicts);
+
+for conflict in high_severity {
+    println!("Conflict: {} and {} overlap by {}s",
+        conflict.task1_name, conflict.task2_name, conflict.overlap_seconds);
+}
+```
+
+### Groups and Tags
+
+Organize tasks with groups and tags:
+
+```rust
+let task = ScheduledTask::new("report".to_string(), Schedule::interval(3600))
+    .with_group("reports")
+    .with_tags(vec!["daily".to_string(), "email".to_string()]);
+
+// Query by group
+let reports = scheduler.get_tasks_by_group("reports");
+
+// Query by tag
+let daily = scheduler.get_tasks_by_tag("daily");
+
+// Bulk operations
+scheduler.enable_group("reports");
+scheduler.disable_tag("cleanup");
+```
+
+### Batch Operations
+
+Efficient bulk task management:
+
+```rust
+// Add multiple tasks in one operation
+let tasks = vec![
+    ScheduledTask::new("task1".to_string(), Schedule::interval(60)),
+    ScheduledTask::new("task2".to_string(), Schedule::interval(120)),
+];
+scheduler.add_tasks_batch(tasks)?;
+
+// Remove multiple tasks
+scheduler.remove_tasks_batch(&["task1", "task2"])?;
+```
+
+### Schedule Composition
+
+Combine multiple schedules with AND/OR logic:
+
+```rust
+use celers_beat::CompositeSchedule;
+
+// OR: Run when ANY schedule is due (earliest)
+let composite_or = CompositeSchedule::or(vec![
+    Schedule::interval(60),
+    Schedule::interval(120),
+]);
+
+// AND: Run when ALL schedules are due (latest)
+let composite_and = CompositeSchedule::and(vec![
+    Schedule::interval(60),
+    Schedule::interval(120),
+]);
+```
+
+### Custom Schedules
+
+Define custom scheduling logic:
+
+```rust
+use celers_beat::CustomSchedule;
+
+let custom = CustomSchedule::new(
+    "business_hours",
+    |last_run| {
+        let mut next = last_run.unwrap_or_else(Utc::now);
+        // Custom logic to find next business hour
+        // ...
+        Ok(next)
+    }
+);
+```
 
 ### Priority Scheduling
 
@@ -530,6 +882,54 @@ let local = next_run.with_timezone(&New_York);
 println!("Next run: {}", local);
 ```
 
+#### Comprehensive Timezone Utilities
+
+The crate provides comprehensive timezone utilities for working with schedules across different timezones:
+
+```rust
+use celers_beat::TimezoneUtils;
+
+// Automatic system timezone detection
+let system_tz = TimezoneUtils::detect_system_timezone();
+
+// Validate timezone names
+assert!(TimezoneUtils::is_valid_timezone("America/New_York"));
+
+// List and search timezones
+let all_timezones = TimezoneUtils::list_all_timezones(); // 600+ timezones
+let us_zones = TimezoneUtils::search_timezones("america");
+
+// Get current time in multiple timezones
+let zones = vec!["America/New_York", "Europe/London", "Asia/Tokyo"];
+let times = TimezoneUtils::current_time_in_zones(&zones);
+
+// Check DST status
+let is_dst = TimezoneUtils::is_dst_active("America/New_York", None)?;
+
+// Get UTC offset
+let offset = TimezoneUtils::get_utc_offset("Asia/Tokyo", None)?;
+
+// Get detailed timezone info
+let info = TimezoneUtils::get_timezone_info("Europe/London", None)?;
+println!("{}", info); // Europe/London (UTC+0.0h, GMT, DST: No): ...
+
+// Convert between timezones
+let tokyo_time = TimezoneUtils::convert_between_timezones(
+    Utc::now(),
+    "America/New_York",
+    "Asia/Tokyo"
+)?;
+
+// Get common timezone abbreviations
+let abbrevs = TimezoneUtils::get_common_timezone_abbreviations();
+let ny_tz = abbrevs.get("EST"); // Returns "America/New_York"
+
+// Calculate time until next occurrence in timezone
+let duration = TimezoneUtils::time_until_next_occurrence(9, 0, "America/New_York")?;
+```
+
+See `examples/timezone_utilities.rs` for a comprehensive demonstration.
+
 ### 4. Error Handling
 
 ```rust
@@ -613,11 +1013,20 @@ registry.register("generate_report", |args| async move {
 | Feature | Celery Beat | CeleRS Beat |
 |---------|-------------|-------------|
 | Interval schedules | ✅ | ✅ |
-| Crontab schedules | ✅ | ✅ |
-| Solar schedules | ✅ | 🔄 Planned |
-| Persistent state | File/DB | JSON/DB |
+| Crontab schedules | ✅ | ✅ (with timezone support) |
+| Solar schedules | ✅ | ✅ (with twilight & golden hour) |
+| One-time schedules | ❌ | ✅ |
+| Custom schedules | ❌ | ✅ |
+| Schedule versioning | ❌ | ✅ |
+| Task dependencies | ❌ | ✅ |
+| Crash recovery | ❌ | ✅ |
+| Alerting system | ❌ | ✅ |
+| Schedule locking | ❌ | ✅ |
+| Conflict detection | ❌ | ✅ |
+| Business calendars | ❌ | ✅ |
+| Persistent state | File/DB | JSON (auto-save) |
 | Performance | ~100 tasks/sec | ~1000 tasks/sec |
-| Memory | 50MB+ | 10MB |
+| Memory | 50MB+ | <10MB |
 
 ## See Also
 

@@ -524,6 +524,106 @@ fn bench_batch_operations(c: &mut Criterion) {
     rt.block_on(broker.purge_all_queues()).ok();
 }
 
+fn bench_monitoring_utilities(c: &mut Criterion) {
+    use celers_broker_redis::monitoring::*;
+
+    let mut group = c.benchmark_group("monitoring_utilities");
+
+    group.bench_function("analyze_consumer_lag", |b| {
+        b.iter(|| analyze_redis_consumer_lag(black_box(1000), black_box(50.0), black_box(100)));
+    });
+
+    group.bench_function("calculate_message_velocity", |b| {
+        b.iter(|| {
+            calculate_redis_message_velocity(black_box(1000), black_box(1500), black_box(60.0))
+        });
+    });
+
+    group.bench_function("suggest_worker_scaling", |b| {
+        b.iter(|| {
+            suggest_redis_worker_scaling(
+                black_box(2000),
+                black_box(5),
+                black_box(40.0),
+                black_box(100),
+            )
+        });
+    });
+
+    group.bench_function("calculate_message_age_distribution", |b| {
+        let ages: Vec<f64> = (1..=100).map(|i| i as f64 * 10.0).collect();
+        b.iter(|| calculate_redis_message_age_distribution(black_box(&ages), black_box(500.0)));
+    });
+
+    group.bench_function("estimate_processing_capacity", |b| {
+        b.iter(|| {
+            estimate_redis_processing_capacity(black_box(10), black_box(50.0), black_box(5000))
+        });
+    });
+
+    group.bench_function("calculate_queue_health_score", |b| {
+        b.iter(|| {
+            calculate_redis_queue_health_score(
+                black_box(500),
+                black_box(50.0),
+                black_box(1000),
+                black_box(40.0),
+            )
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_utility_functions(c: &mut Criterion) {
+    use celers_broker_redis::utilities::*;
+    use celers_broker_redis::QueueMode;
+
+    let mut group = c.benchmark_group("utility_functions");
+
+    group.bench_function("calculate_optimal_batch_size", |b| {
+        b.iter(|| {
+            calculate_optimal_redis_batch_size(black_box(1000), black_box(1024), black_box(100))
+        });
+    });
+
+    group.bench_function("estimate_queue_memory", |b| {
+        b.iter(|| {
+            estimate_redis_queue_memory(
+                black_box(1000),
+                black_box(1024),
+                black_box(QueueMode::Fifo),
+            )
+        });
+    });
+
+    group.bench_function("calculate_optimal_pool_size", |b| {
+        b.iter(|| calculate_optimal_redis_pool_size(black_box(100), black_box(50)));
+    });
+
+    group.bench_function("calculate_pipeline_size", |b| {
+        b.iter(|| calculate_redis_pipeline_size(black_box(100), black_box(10)));
+    });
+
+    group.bench_function("estimate_drain_time", |b| {
+        b.iter(|| estimate_redis_queue_drain_time(black_box(1000), black_box(50.0)));
+    });
+
+    group.bench_function("suggest_pipeline_strategy", |b| {
+        b.iter(|| suggest_redis_pipeline_strategy(black_box(500), black_box("write")));
+    });
+
+    group.bench_function("calculate_key_ttl_by_priority", |b| {
+        b.iter(|| calculate_redis_key_ttl_by_priority(black_box(150), black_box(3600)));
+    });
+
+    group.bench_function("calculate_timeout_values", |b| {
+        b.iter(|| calculate_redis_timeout_values(black_box(50.0), black_box(200.0)));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_enqueue_single,
@@ -539,6 +639,8 @@ criterion_group!(
     bench_priority_management,
     bench_task_query,
     bench_batch_operations,
+    bench_monitoring_utilities,
+    bench_utility_functions,
 );
 
 criterion_main!(benches);

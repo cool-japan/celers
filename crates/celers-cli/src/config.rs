@@ -1,10 +1,67 @@
-//! Configuration file support for CeleRS CLI
+//! Configuration file support for `CeleRS` CLI.
+//!
+//! This module provides configuration management for the `CeleRS` CLI tool, including:
+//! - TOML file parsing and validation
+//! - Environment variable expansion
+//! - Configuration profiles (dev, staging, prod)
+//! - Broker and worker settings
+//! - Auto-scaling and alerting configuration
+//!
+//! # Configuration File Format
+//!
+//! The configuration file uses TOML format and supports the following sections:
+//! - `[broker]`: Broker connection settings (Redis, `PostgreSQL`, etc.)
+//! - `[worker]`: Worker runtime settings (concurrency, retries, timeouts)
+//! - `[autoscale]`: Auto-scaling configuration
+//! - `[alerts]`: Alert and notification settings
+//!
+//! # Environment Variables
+//!
+//! Configuration values can reference environment variables using the syntax:
+//! - `${VAR_NAME}` - Required environment variable
+//! - `${VAR_NAME:default}` - Optional with default value
+//!
+//! # Examples
+//!
+//! ```toml
+//! [broker]
+//! type = "redis"
+//! url = "${REDIS_URL:redis://localhost:6379}"
+//! queue = "my_queue"
+//!
+//! [worker]
+//! concurrency = 4
+//! max_retries = 3
+//! ```
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use celers_cli::config::Config;
+//! use std::path::PathBuf;
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! // Load from file
+//! let config = Config::from_file(PathBuf::from("celers.toml"))?;
+//!
+//! // Get default configuration
+//! let default_config = Config::default_config();
+//!
+//! // Save to file
+//! default_config.to_file("celers.toml")?;
+//! # Ok(())
+//! # }
+//! ```
 
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::Path;
 
-/// CLI configuration
+/// Main CLI configuration structure.
+///
+/// Contains all settings for broker connection, worker configuration,
+/// auto-scaling, and alerting. Can be loaded from TOML files with
+/// environment variable support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Configuration profile name (dev, staging, prod, etc.)
@@ -209,7 +266,7 @@ fn default_alert_check_interval() -> u64 {
 }
 
 /// Expand environment variables in a string
-/// Supports ${VAR} and ${VAR:default_value} syntax
+/// Supports ${VAR} and ${`VAR:default_value`} syntax
 fn expand_env_vars(s: &str) -> String {
     let mut result = s.to_string();
     let mut start_idx = 0;
@@ -295,7 +352,7 @@ impl Config {
             .as_ref()
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(format!("celers.{}.toml", profile));
+            .join(format!("celers.{profile}.toml"));
 
         if profile_path.exists() {
             let profile_config = Self::from_file(profile_path)?;

@@ -316,6 +316,11 @@ Full-featured CLI for worker management, queue inspection, and DLQ operations.
   - [x] Shutdown channel naming
   - [x] Timestamp formatting
   - [x] Password masking in URLs ✅
+- [x] Unit tests for enhanced utilities (v1.1) ✅
+  - [x] String truncation with edge cases
+  - [x] Relative time formatting (seconds, minutes, hours, days)
+  - [x] Broker URL validation (all schemes)
+  - [x] Number formatting with thousands separators
 - [x] Integration tests with real brokers ✅
   - [x] Test framework created in /tmp/celers_integration_tests.rs ✅
   - [x] Redis broker integration tests ✅
@@ -432,6 +437,75 @@ default_timeout_secs = 300
 queues = ["celers", "high_priority", "low_priority"]
 ```
 
+## Code Organization ✅
+
+- [x] Utility functions extracted to separate module ✅
+  - [x] `command_utils` module with helper functions ✅
+  - [x] Comprehensive documentation and examples ✅
+  - [x] Full test coverage (100%) ✅
+  - [x] Zero warnings from clippy ✅
+  - [x] Enhanced utility functions (v1.1) ✅
+    - [x] `truncate_string` - Smart string truncation with ellipsis
+    - [x] `format_relative_time` - Human-readable relative timestamps
+    - [x] `validate_broker_url` - Comprehensive URL validation
+    - [x] `format_count` - Thousands separator formatting
+    - [x] `print_progress` - Progress bar for long operations
+- [x] Database commands extracted to separate module ✅
+  - [x] `database` module with db operations ✅
+  - [x] Connection testing and benchmarking ✅
+  - [x] Health checks and diagnostics ✅
+  - [x] Pool statistics and monitoring ✅
+  - [x] Migration management ✅
+  - [x] Comprehensive documentation with examples ✅
+  - [x] Full test coverage (3 unit tests) ✅
+  - [x] 5 doc tests for all public functions ✅
+  - [x] Zero warnings from clippy ✅
+
+## Library Support ✅
+
+- [x] Hybrid crate (binary + library) ✅
+  - [x] `src/lib.rs` exposes commands module ✅
+  - [x] `src/lib.rs` exposes command_utils module ✅
+  - [x] `src/lib.rs` exposes database module ✅
+  - [x] Examples can import `celers_cli::commands` ✅
+  - [x] Examples can import `celers_cli::command_utils` ✅
+  - [x] Examples can import `celers_cli::database` ✅
+  - [x] Programmatic usage supported ✅
+
+### Examples ✅
+
+- [x] `basic_workflow.rs` - Common operational workflows ✅
+  - [x] Queue status checking
+  - [x] Listing queues
+  - [x] Metrics display
+  - [x] Health checks
+- [x] `monitoring_and_diagnostics.rs` - Production monitoring ✅
+  - [x] Doctor diagnostics
+  - [x] Bottleneck analysis
+  - [x] Failure pattern analysis
+  - [x] Daily/weekly reports
+  - [x] Worker and queue statistics
+- [x] `queue_management.rs` - Queue operations ✅
+  - [x] Queue listing and statistics
+  - [x] Pause/resume operations
+  - [x] Export/import workflows
+  - [x] Task migration between queues
+  - [x] Backup and restore procedures
+- [x] `worker_management.rs` - Worker lifecycle ✅
+  - [x] Worker listing and statistics
+  - [x] Pause/resume/drain operations
+  - [x] Graceful shutdown procedures
+  - [x] Scaling strategies
+  - [x] Rolling deployment patterns
+  - [x] Auto-scaling configuration
+- [x] `task_and_dlq_management.rs` - Task operations ✅
+  - [x] Task inspection and debugging
+  - [x] Cancel/retry operations
+  - [x] Task log viewing
+  - [x] DLQ inspection and management
+  - [x] Task reprioritization
+  - [x] Failure handling workflows
+
 ## Notes
 
 - CLI is designed for operational tasks, not development
@@ -439,3 +513,123 @@ queues = ["celers", "high_priority", "low_priority"]
 - Config file is optional (CLI args work standalone)
 - Supports both Redis and PostgreSQL brokers
 - Colored output automatically disabled in CI/pipes
+- Library mode enables programmatic usage and examples
+
+## 🚀 Enhancement Roadmap (v0.2.0)
+
+### Interactive Mode ✅
+- [x] `interactive` - Launch REPL mode for running multiple commands ✅
+  - [x] Command history with arrow keys ✅
+  - [x] Tab completion for commands and arguments ✅
+  - [x] Multi-line editing support ✅
+  - [x] Session state persistence ✅
+  - [x] Configurable prompt with queue/broker info ✅
+
+### Configuration Wizard
+- [ ] `init --wizard` - Interactive configuration setup
+  - [ ] Step-by-step broker selection
+  - [ ] Connection testing during setup
+  - [ ] Queue configuration with validation
+  - [ ] Worker settings with recommendations
+  - [ ] Auto-scaling and alert setup
+  - [ ] Profile selection (dev/staging/prod)
+
+### Backup & Restore ✅
+- [x] `backup` - Full broker state backup ✅
+  - [x] Export all queues to single archive ✅
+  - [x] Include scheduled tasks ✅
+  - [x] Include worker configurations ✅
+  - [x] Include metrics and statistics ✅
+  - [x] Compressed backup format (.tar.gz) ✅
+  - [ ] Incremental backup support
+- [x] `restore` - Restore from backup ✅
+  - [x] Validate backup before restore ✅
+  - [x] Selective restore (specific queues) ✅
+  - [x] Dry-run mode ✅
+  - [ ] Conflict resolution options
+
+### Enhanced Reporting
+- [x] CSV export format for reports ✅
+  - [x] CSV helper functions ✅
+  - [x] Task statistics formatting ✅
+  - [ ] Daily/weekly reports to CSV (helper functions ready)
+  - [ ] Task execution history export
+  - [ ] Worker statistics export
+  - [ ] Queue metrics export
+- [ ] HTML report generation
+  - [ ] Interactive charts and graphs
+  - [ ] Shareable reports
+  - [ ] Custom report templates
+
+### Performance Enhancements
+- [ ] Connection pooling optimization
+  - [ ] Configurable pool size
+  - [ ] Connection reuse tracking
+  - [ ] Pool statistics monitoring
+- [ ] Caching for frequently accessed data
+  - [ ] Queue statistics cache
+  - [ ] Worker list cache with TTL
+  - [ ] Configurable cache settings
+- [ ] Parallel operations
+  - [ ] Batch queue operations
+  - [ ] Parallel task inspection
+  - [ ] Concurrent worker commands
+
+### Advanced Features
+- [ ] Multi-broker management
+  - [ ] Manage multiple brokers from single CLI
+  - [ ] Cross-broker task migration
+  - [ ] Federated queue view
+  - [ ] Aggregated metrics
+- [ ] Task dependency visualization
+  - [ ] ASCII art dependency graph
+  - [ ] GraphViz export
+  - [ ] Interactive graph navigation
+- [ ] Performance profiling
+  - [ ] Task execution profiling
+  - [ ] Worker performance analysis
+  - [ ] Bottleneck detection
+  - [ ] Resource usage tracking
+
+### User Experience
+- [ ] Enhanced error messages
+  - [ ] Actionable suggestions
+  - [ ] Common fixes documentation
+  - [ ] Error code reference
+  - [ ] Debug hints
+- [ ] Smart defaults
+  - [ ] Auto-detect broker from environment
+  - [ ] Intelligent queue selection
+  - [ ] Context-aware suggestions
+- [ ] Command aliases
+  - [ ] Short aliases for common commands
+  - [ ] User-defined aliases
+  - [ ] Alias management
+
+### Testing & Quality
+- [ ] Property-based tests
+  - [ ] Command argument validation
+  - [ ] Configuration parsing
+  - [ ] Data serialization
+- [ ] Integration tests with real brokers
+  - [ ] Redis integration suite
+  - [ ] PostgreSQL integration suite
+  - [ ] AMQP integration suite
+- [ ] Benchmarks
+  - [ ] Command execution benchmarks
+  - [ ] Connection pool benchmarks
+  - [ ] Serialization benchmarks
+
+### Observability
+- [ ] Grafana dashboard templates
+  - [ ] Pre-built dashboards
+  - [ ] Dashboard export/import
+- [ ] Extended alerting integrations
+  - [ ] Slack notifications
+  - [ ] PagerDuty integration
+  - [ ] Email alerts
+  - [ ] Custom webhook templates
+- [ ] Structured logging
+  - [ ] JSON log output option
+  - [ ] Log level filtering
+  - [ ] Log streaming to external systems

@@ -2,9 +2,9 @@
 
 > Prometheus metrics integration for CeleRS monitoring
 
-## Status: ✅ FEATURE COMPLETE + ENHANCED WITH ADVANCED ANALYTICS
+## Status: ✅ FEATURE COMPLETE + ENHANCED WITH ADVANCED ANALYTICS & PRODUCTION-READY TOOLS + VALIDATION & REGISTRY + EXPORT UTILITIES + SLA & HEALTH MANAGEMENT + CAPACITY PLANNING + ALERT HISTORY + QUERY BUILDER
 
-Complete Prometheus metrics implementation with comprehensive task queue monitoring, multi-backend export support, and advanced analytics capabilities including time-series analysis, auto-scaling recommendations, forecasting, and cost estimation.
+Complete Prometheus metrics implementation with comprehensive task queue monitoring, multi-backend export support, and advanced analytics capabilities including time-series analysis, auto-scaling recommendations, forecasting (linear & exponential), cost estimation with optimization recommendations, cardinality protection, trend-based alerting, correlation analysis, windowed statistics, adaptive sampling, metric export batching, label sanitization and validation, histogram heatmap generation, dynamic metric registry, resource usage tracking, **JSON/CSV export utilities**, **performance profiling utilities**, **SLA reporting**, **alert debouncing**, **health scoring**, **metric retention management**, **capacity planning and resource exhaustion prediction**, **alert history tracking**, **Prometheus query builder**, and **metric collection scheduler**.
 
 ## Completed Features
 
@@ -166,6 +166,171 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
   - [x] Compute cost tracking (worker-hours)
   - [x] Task execution cost tracking
   - [x] Cost breakdown (compute, tasks, data)
+- [x] **Cardinality protection** ✅
+  - [x] `CardinalityLimiter` - Prevent label explosion in production
+  - [x] Track unique label combinations
+  - [x] Configurable maximum cardinality
+  - [x] Check and record labels within limits
+  - [x] Reset functionality for testing
+- [x] **Trend-based alerting** ✅
+  - [x] `TrendAlertCondition` - Alert based on metric trends
+  - [x] `TrendDirection` - Increasing, Decreasing, Stable trends
+  - [x] Configurable trend thresholds
+  - [x] Minimum sample requirements
+  - [x] Integration with MetricHistory
+- [x] **Correlation analysis** ✅
+  - [x] `CorrelationResult` - Pearson correlation coefficient
+  - [x] `calculate_correlation()` - Compute correlation between metrics
+  - [x] `are_metrics_correlated()` - Quick correlation check
+  - [x] Statistical significance approximation
+  - [x] Time-aligned sample pairing
+- [x] **Windowed statistics** ✅
+  - [x] `TimeWindow` - Predefined time windows (1m, 5m, 15m, 1h, 1d)
+  - [x] `WindowedStats` - Statistics within time windows
+  - [x] `calculate_windowed_stats()` - Compute stats for windows
+  - [x] Mean, min, max, std dev calculations
+  - [x] **Percentile tracking** (p50, p95, p99) ✅
+  - [x] Sample count tracking
+- [x] **AlertManager integration with trend alerts** ✅
+  - [x] `TrendAlertRule` - Trend-based alert rules
+  - [x] `add_trend_rule()` - Add trend alerts to AlertManager
+  - [x] `check_trend_alerts()` - Check trend-based alerts
+  - [x] `critical_trend_alerts()` - Get critical trend alerts
+  - [x] Unified alert management for static and trend-based alerts
+- [x] **Exponential Smoothing Forecasting (Holt's Method)** ✅
+  - [x] `ExponentialForecast` - Forecast result with level, trend, confidence
+  - [x] `ExponentialSmoothingConfig` - Alpha/beta parameters for smoothing
+  - [x] `forecast_exponential()` - Double exponential smoothing forecast
+  - [x] More accurate than linear regression for trending data
+  - [x] Confidence calculation based on recent forecast accuracy
+  - [x] Handles stable and trending metrics
+- [x] **Cost Optimization Recommendations** ✅
+  - [x] `CostOptimization` - Enum of optimization recommendations
+  - [x] `CostOptimizationConfig` - Configuration for cost analysis
+  - [x] `recommend_cost_optimizations()` - Analyze and recommend optimizations
+  - [x] Scale down recommendations for low utilization
+  - [x] Batch size optimization for overhead reduction
+  - [x] Spot instance recommendations for stable workloads
+  - [x] Polling frequency optimization for idle systems
+- [x] **Adaptive Sampling with Load Monitoring** ✅
+  - [x] `AdaptiveSampler` - Adjusts sampling rate based on system load
+  - [x] `update_based_on_load()` - Dynamic rate adjustment
+  - [x] `should_sample()` - Check if observation should be sampled
+  - [x] `current_rate()` - Get current sampling rate
+  - [x] Automatic reduction during high load
+  - [x] Automatic increase during low load
+  - [x] Minimum 1% sampling rate guarantee
+- [x] **Metric Export Batching** ✅
+  - [x] `MetricBatch` - Batch container for efficient exports
+  - [x] `MetricBatcher` - Thread-safe batching with size and age limits
+  - [x] `add()` - Add metrics with auto-flush detection
+  - [x] `flush()` - Manual batch export
+  - [x] Size-based and time-based flush triggers
+  - [x] Zero-copy batch operations
+- [x] **Label Sanitization and Validation** ✅
+  - [x] `sanitize_label_name()` - Sanitize labels to Prometheus standards
+  - [x] `sanitize_label_value()` - Clean control characters from values
+  - [x] `is_valid_metric_name()` - Validate metric names
+  - [x] `is_valid_label_name()` - Validate label names
+  - [x] Automatic name normalization (replace invalid chars)
+  - [x] Whitespace normalization
+- [x] **Histogram Heatmap Generation** ✅
+  - [x] `HistogramHeatmap` - Time-series histogram visualization
+  - [x] `HeatmapBucket` - Bucket data structure
+  - [x] Snapshot recording with timestamps
+  - [x] Configurable retention limits
+  - [x] Historical data retrieval
+- [x] **Dynamic Metric Registry** ✅
+  - [x] `MetricRegistry` - Runtime metric management
+  - [x] `MetricMetadata` - Metric information tracking
+  - [x] `MetricType` - Counter, Gauge, Histogram, Summary
+  - [x] Dynamic counter and gauge registration
+  - [x] Metric listing and querying
+  - [x] Unregister and clear operations
+  - [x] Automatic validation during registration
+- [x] **Resource Usage Tracking** ✅
+  - [x] `ResourceTracker` - Track metrics collection overhead
+  - [x] Collection time tracking (microsecond precision)
+  - [x] Peak memory usage monitoring
+  - [x] Average collection time calculation
+  - [x] Operation wrapper for automatic tracking
+  - [x] Reset functionality
+- [x] **Metric Export Utilities** ✅
+  - [x] `export_metrics_json()` - Export metrics in JSON format
+  - [x] `export_metrics_csv()` - Export metrics in CSV format
+  - [x] `export_history_csv()` - Export metric history to CSV
+  - [x] `MetricExportBatch` - Batch export in multiple formats
+  - [x] Timestamp support for all exports
+  - [x] Structured JSON output with nested objects
+- [x] **Performance Profiling Utilities** ✅
+  - [x] `MetricsProfiler` - Profile metric collection operations
+  - [x] `profile_operation()` - Profile specific operations
+  - [x] `get_operation_stats()` - Get operation statistics
+  - [x] `all_stats()` - Get all profiled operations
+  - [x] `generate_report()` - Generate profiling report
+  - [x] `OperationStats` - Statistics per operation
+  - [x] Mean, min, max, std dev tracking
+  - [x] Call count tracking
+- [x] **SLA Report Generator** ✅ (NEW)
+  - [x] `SlaReport` - Automated SLA compliance reports
+  - [x] `generate()` - Generate report from SLO target
+  - [x] `format_text()` - Human-readable report formatting
+  - [x] Error budget calculation
+  - [x] Compliance status tracking
+  - [x] Automated recommendations
+  - [x] Success rate and throughput analysis
+- [x] **Alert Debouncer** ✅ (NEW)
+  - [x] `AlertDebouncer` - Prevent alert fatigue
+  - [x] `should_fire()` - Check if alert should fire
+  - [x] `reset()` - Reset specific alert debounce
+  - [x] `reset_all()` - Reset all alerts
+  - [x] `time_until_next()` - Time until alert can fire again
+  - [x] Configurable debounce periods
+  - [x] Per-alert state tracking
+- [x] **Health Score Calculator** ✅ (NEW)
+  - [x] `HealthScore` - Composite system health scoring
+  - [x] `calculate()` - Calculate overall health score
+  - [x] `format_report()` - Human-readable health report
+  - [x] Component-based scoring (success rate, queue, workers, DLQ)
+  - [x] Weighted health calculation
+  - [x] Letter grade system (A-F)
+  - [x] Issue detection and reporting
+- [x] **Metric Retention Manager** ✅
+  - [x] `MetricRetentionManager` - Manage metric history retention
+  - [x] `RetentionPolicy` - Configurable retention policies
+  - [x] `set_policy()` / `get_policy()` - Policy management
+  - [x] `apply_retention()` - Apply retention to history
+  - [x] Pre-defined policies (default, high-frequency, long-term)
+  - [x] Per-metric retention configuration
+- [x] **Capacity Planning** ✅ (NEW)
+  - [x] `CapacityPrediction` - Predict resource exhaustion
+  - [x] `predict_capacity_exhaustion()` - Predict when resources will be exhausted
+  - [x] `CapacityRecommendation` - Action recommendations (Healthy, Monitor, ActionNeeded, Critical, Decreasing)
+  - [x] Growth rate calculation
+  - [x] Utilization tracking
+  - [x] Time-until-exhaustion prediction
+- [x] **Alert History Tracking** ✅ (NEW)
+  - [x] `AlertHistory` - Track alert firing events
+  - [x] `AlertEvent` - Alert event with timestamp, severity, and trigger value
+  - [x] `record_alert()` - Record when alerts fire
+  - [x] `events_for_alert()` - Get history for specific alert
+  - [x] `alert_fire_count()` - Count how many times alert fired
+  - [x] `time_since_last_alert()` - Time since alert last fired
+  - [x] Automatic retention management
+- [x] **Prometheus Query Builder** ✅ (NEW)
+  - [x] `PrometheusQueryBuilder` - Fluent API for building Prometheus queries
+  - [x] Label filtering support
+  - [x] Rate/increase aggregations
+  - [x] Sum/avg aggregations
+  - [x] Histogram quantile support
+  - [x] Builder pattern for complex queries
+- [x] **Metric Collection Scheduler** ✅ (NEW)
+  - [x] `CollectionTask` - Scheduled metric collection tasks
+  - [x] `MetricCollectionScheduler` - Manage collection tasks
+  - [x] `should_collect()` - Check if it's time to collect
+  - [x] `mark_collected()` - Mark task as collected
+  - [x] Interval-based scheduling
+  - [x] Task registration and management
 
 ### Alternative Backends
 - [x] StatsD backend ✅
@@ -229,6 +394,119 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
   - [x] Linear trend prediction
   - [x] Stable values
   - [x] Result field validation
+- [x] **Unit tests for cardinality protection** (3 tests) ✅
+  - [x] Basic limiter functionality
+  - [x] Reset functionality
+  - [x] Duplicate label handling
+- [x] **Unit tests for trend-based alerting** (3 tests) ✅
+  - [x] Increasing trend detection
+  - [x] Insufficient samples handling
+  - [x] Stable trend detection
+- [x] **Unit tests for correlation analysis** (4 tests) ✅
+  - [x] Perfect positive correlation
+  - [x] Perfect negative correlation
+  - [x] Insufficient samples handling
+  - [x] Correlation detection helper
+- [x] **Unit tests for windowed statistics** (5 tests) ✅
+  - [x] Basic windowed stats (with percentile validation)
+  - [x] Empty history handling
+  - [x] All time window variants
+  - [x] Time window duration conversion
+  - [x] Statistics accuracy validation (including p50, p95, p99)
+- [x] **Unit tests for AlertManager integration** (2 tests) ✅
+  - [x] Trend alert manager functionality
+  - [x] Trend alert rule API
+- [x] **Unit tests for exponential forecasting** (4 tests) ✅
+  - [x] Basic forecast with increasing trend
+  - [x] Config creation and defaults
+  - [x] Insufficient samples handling
+  - [x] Stable values forecasting
+- [x] **Unit tests for cost optimization** (6 tests) ✅
+  - [x] Scale down recommendation
+  - [x] Increase batching recommendation
+  - [x] Spot instances recommendation
+  - [x] Polling optimization recommendation
+  - [x] No optimization needed scenario
+  - [x] Config defaults
+- [x] **Unit tests for adaptive sampling** (5 tests) ✅
+  - [x] Basic sampling behavior
+  - [x] High load rate reduction
+  - [x] Low load rate increase
+  - [x] Base rate adjustment
+  - [x] Minimum rate guarantee
+- [x] **Unit tests for metric batching** (6 tests) ✅
+  - [x] Basic batch operations
+  - [x] Batch clear functionality
+  - [x] Batcher basic operations
+  - [x] Size-based flush trigger
+  - [x] Manual flush
+  - [x] Default batch creation
+- [x] **Unit tests for label sanitization** (4 tests) ✅
+  - [x] Label name sanitization
+  - [x] Label value sanitization
+  - [x] Metric name validation
+  - [x] Label name validation
+- [x] **Unit tests for histogram heatmap** (3 tests) ✅
+  - [x] Basic heatmap operations
+  - [x] Retention limit enforcement
+  - [x] Clear functionality
+- [x] **Unit tests for metric registry** (6 tests) ✅
+  - [x] Counter registration and increment
+  - [x] Gauge registration and set
+  - [x] Metadata retrieval
+  - [x] Name validation during registration
+  - [x] Unregister functionality
+  - [x] Clear all metrics
+- [x] **Unit tests for resource tracker** (4 tests) ✅
+  - [x] Basic operation tracking
+  - [x] Multiple operations
+  - [x] Memory usage tracking
+  - [x] Reset functionality
+- [x] **Unit tests for metric export utilities** (4 tests) ✅
+  - [x] JSON export
+  - [x] CSV export
+  - [x] History CSV export
+  - [x] Batch export (all formats)
+- [x] **Unit tests for performance profiling** (4 tests) ✅
+  - [x] Basic profiler operations
+  - [x] Multiple operation tracking
+  - [x] Report generation
+  - [x] Reset functionality
+- [x] **Unit tests for SLA reporting** (3 tests) ✅ (NEW)
+  - [x] SLA report generation (compliant)
+  - [x] SLA report non-compliant scenario
+  - [x] Report text formatting
+- [x] **Unit tests for alert debouncer** (4 tests) ✅ (NEW)
+  - [x] Basic debounce functionality
+  - [x] Different alert handling
+  - [x] Reset functionality
+  - [x] Time until next alert
+- [x] **Unit tests for health score** (3 tests) ✅ (NEW)
+  - [x] Perfect health score
+  - [x] Degraded health score
+  - [x] Health report formatting
+- [x] **Unit tests for retention manager** (3 tests) ✅
+  - [x] Retention policy defaults
+  - [x] Set/get policy
+  - [x] Default policy fallback
+- [x] **Unit tests for capacity planning** (3 tests) ✅ (NEW)
+  - [x] Growing capacity prediction
+  - [x] Critical capacity scenarios
+  - [x] Decreasing usage scenarios
+- [x] **Unit tests for alert history** (3 tests) ✅ (NEW)
+  - [x] Basic alert recording
+  - [x] Retention limits
+  - [x] Clear functionality
+- [x] **Unit tests for Prometheus query builder** (5 tests) ✅ (NEW)
+  - [x] Basic query generation
+  - [x] Label filtering
+  - [x] Rate aggregation
+  - [x] Sum aggregation
+  - [x] Avg aggregation
+- [x] **Unit tests for collection scheduler** (3 tests) ✅ (NEW)
+  - [x] Collection task basics
+  - [x] Scheduler registration
+  - [x] Should collect timing
 - [x] Integration-style tests (7 tests) ✅
   - [x] Complete worker lifecycle simulation
   - [x] Broker operations simulation
@@ -239,15 +517,20 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
   - [x] Delayed task scheduling
 - [x] Performance impact testing ✅
 
-**Total: 89 tests (82 unit + 7 integration-style) - All passing ✅**
-**Benchmarks: 19 performance benchmarks - All working ✅**
+**Total: 183 tests (172 unit + 4 profiling + 14 new features + 7 integration-style) - All passing ✅**
+**Doc tests: 31 tests (29 original + 2 new features) - All passing ✅**
+**Benchmarks: 33 performance benchmarks - All working ✅** (includes benchmarks for all features)
 **Clippy warnings: 0 ✅**
 
 ## Documentation
 
 - [x] Module-level documentation
 - [x] Metric descriptions
-- [x] Integration example (prometheus_metrics.rs)
+- [x] Integration examples ✅
+  - [x] basic_prometheus_endpoint.rs - Basic HTTP endpoint
+  - [x] simple_metrics.rs - Simple metrics tracking
+  - [x] health_and_alerts.rs - Health checks and alerting
+  - [x] **production_monitoring.rs** - **Comprehensive production monitoring** (NEW)
 - [x] Grafana dashboard documentation ✅
 - [x] Alerting rules examples ✅
 - [x] Recording rules examples ✅
@@ -932,6 +1215,134 @@ println!("{}", summary);
 
 // Use for logging, dashboards, or debugging
 eprintln!("{}", summary);
+```
+
+### Cardinality Protection
+
+```rust
+use celers_metrics::CardinalityLimiter;
+
+// Create a limiter with max 1000 unique label combinations
+let limiter = CardinalityLimiter::new(1000);
+
+// Check if label is within limit before recording metric
+let task_label = format!("task_type:{}", task_name);
+if limiter.check_and_record(&task_label) {
+    // Safe to record metric
+    TASKS_ENQUEUED_BY_TYPE
+        .with_label_values(&[&task_name])
+        .inc();
+} else {
+    // Use fallback label to prevent cardinality explosion
+    TASKS_ENQUEUED_BY_TYPE
+        .with_label_values(&["other"])
+        .inc();
+}
+
+// Monitor cardinality
+println!("Current cardinality: {}", limiter.current_cardinality());
+if limiter.is_at_limit() {
+    eprintln!("⚠ Cardinality limit reached!");
+}
+```
+
+### Trend-Based Alerting
+
+```rust
+use celers_metrics::{TrendAlertCondition, TrendDirection, MetricHistory};
+
+// Track queue size over time
+let queue_history = MetricHistory::new(100);
+
+// Periodically record metrics
+loop {
+    let queue_size = get_current_queue_size();
+    queue_history.record(queue_size as f64);
+
+    // Check for concerning trends
+    let growing_alert = TrendAlertCondition::new(
+        10.0, // Alert if growing by 10+ items/second
+        TrendDirection::Increasing
+    );
+
+    if growing_alert.should_alert(&queue_history) {
+        eprintln!("⚠ Queue is growing rapidly!");
+        // Trigger auto-scaling, send alerts, etc.
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(10));
+}
+```
+
+### Correlation Analysis
+
+```rust
+use celers_metrics::{MetricHistory, calculate_correlation, are_metrics_correlated};
+
+// Track two metrics over time
+let error_rate_history = MetricHistory::new(100);
+let latency_history = MetricHistory::new(100);
+
+// Record metrics...
+error_rate_history.record(0.05);
+latency_history.record(150.0);
+
+// Check for correlation
+if let Some(corr) = calculate_correlation(&error_rate_history, &latency_history) {
+    println!("Correlation coefficient: {:.3}", corr.coefficient);
+    println!("Significance: {:.3}", corr.significance);
+
+    if corr.coefficient > 0.7 {
+        println!("✓ Strong positive correlation detected");
+        println!("  → High latency may be causing errors");
+    } else if corr.coefficient < -0.7 {
+        println!("✓ Strong negative correlation detected");
+    }
+}
+
+// Quick correlation check
+if are_metrics_correlated(&error_rate_history, &latency_history, 0.8) {
+    println!("⚠ These metrics are strongly correlated!");
+}
+```
+
+### Windowed Statistics
+
+```rust
+use celers_metrics::{MetricHistory, TimeWindow, calculate_windowed_stats};
+
+// Track latency over time
+let latency_history = MetricHistory::new(1000);
+
+// Record measurements...
+latency_history.record(50.0);
+latency_history.record(75.0);
+latency_history.record(60.0);
+
+// Analyze last 5 minutes
+if let Some(stats) = calculate_windowed_stats(&latency_history, TimeWindow::FiveMinutes) {
+    println!("Last 5 minutes:");
+    println!("  Mean latency: {:.2}ms", stats.mean);
+    println!("  Min: {:.2}ms", stats.min);
+    println!("  Max: {:.2}ms", stats.max);
+    println!("  Std Dev: {:.2}ms", stats.std_dev);
+    println!("  Sample count: {}", stats.sample_count);
+
+    // Check SLO compliance
+    if stats.mean > 100.0 {
+        eprintln!("⚠ Average latency exceeds SLO!");
+    }
+}
+
+// Compare different time windows
+let last_minute = calculate_windowed_stats(&latency_history, TimeWindow::OneMinute);
+let last_hour = calculate_windowed_stats(&latency_history, TimeWindow::OneHour);
+
+if let (Some(recent), Some(hourly)) = (last_minute, last_hour) {
+    if recent.mean > hourly.mean * 1.5 {
+        eprintln!("⚠ Recent latency is 50% higher than hourly average!");
+    }
+}
 ```
 
 ## Prometheus Configuration

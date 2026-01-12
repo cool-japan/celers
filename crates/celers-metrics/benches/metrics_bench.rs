@@ -319,6 +319,239 @@ fn bench_generate_summary(c: &mut Criterion) {
     });
 }
 
+fn bench_cardinality_limiter(c: &mut Criterion) {
+    c.bench_function("cardinality_limiter_check_new", |b| {
+        let limiter = CardinalityLimiter::new(1000);
+        let mut counter = 0u64;
+        b.iter(|| {
+            counter += 1;
+            let label = format!("label_{}", counter);
+            black_box(limiter.check_and_record(&label))
+        })
+    });
+
+    c.bench_function("cardinality_limiter_check_existing", |b| {
+        let limiter = CardinalityLimiter::new(1000);
+        limiter.check_and_record("label_1");
+        b.iter(|| black_box(limiter.check_and_record("label_1")))
+    });
+
+    c.bench_function("cardinality_limiter_at_limit", |b| {
+        let limiter = CardinalityLimiter::new(100);
+        for i in 0..100 {
+            limiter.check_and_record(&format!("label_{}", i));
+        }
+        b.iter(|| black_box(limiter.check_and_record("label_new")))
+    });
+}
+
+fn bench_trend_alerting(c: &mut Criterion) {
+    c.bench_function("trend_alert_check", |b| {
+        let history = MetricHistory::new(100);
+        for i in 0..20 {
+            history.record((i * 10) as f64);
+        }
+        let alert = TrendAlertCondition::new(5.0, TrendDirection::Increasing);
+        b.iter(|| black_box(alert.should_alert(&history)))
+    });
+
+    c.bench_function("trend_alert_insufficient_samples", |b| {
+        let history = MetricHistory::new(100);
+        history.record(10.0);
+        history.record(20.0);
+        let alert = TrendAlertCondition::new(5.0, TrendDirection::Increasing);
+        b.iter(|| black_box(alert.should_alert(&history)))
+    });
+}
+
+fn bench_correlation_analysis(c: &mut Criterion) {
+    c.bench_function("calculate_correlation", |b| {
+        let history_a = MetricHistory::new(100);
+        let history_b = MetricHistory::new(100);
+        for i in 0..50 {
+            history_a.record((i * 10) as f64);
+            history_b.record((i * 10 + 5) as f64);
+        }
+        b.iter(|| black_box(calculate_correlation(&history_a, &history_b)))
+    });
+
+    c.bench_function("are_metrics_correlated", |b| {
+        let history_a = MetricHistory::new(100);
+        let history_b = MetricHistory::new(100);
+        for i in 0..50 {
+            history_a.record((i * 10) as f64);
+            history_b.record((i * 10 + 5) as f64);
+        }
+        b.iter(|| black_box(are_metrics_correlated(&history_a, &history_b, 0.8)))
+    });
+}
+
+fn bench_windowed_statistics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("windowed_statistics");
+
+    let history = MetricHistory::new(1000);
+    for i in 0..500 {
+        history.record((i * 10) as f64);
+    }
+
+    for window in [
+        ("1m", TimeWindow::OneMinute),
+        ("5m", TimeWindow::FiveMinutes),
+        ("15m", TimeWindow::FifteenMinutes),
+        ("1h", TimeWindow::OneHour),
+        ("1d", TimeWindow::OneDay),
+    ]
+    .iter()
+    {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(window.0),
+            &window.1,
+            |b, &time_window| b.iter(|| black_box(calculate_windowed_stats(&history, time_window))),
+        );
+    }
+    group.finish();
+}
+
+fn bench_metric_history_operations(c: &mut Criterion) {
+    c.bench_function("metric_history_record", |b| {
+        let history = MetricHistory::new(100);
+        let mut counter = 0.0;
+        b.iter(|| {
+            counter += 1.0;
+            history.record(black_box(counter))
+        })
+    });
+
+    c.bench_function("metric_history_trend", |b| {
+        let history = MetricHistory::new(100);
+        for i in 0..100 {
+            history.record((i * 10) as f64);
+        }
+        b.iter(|| black_box(history.trend()))
+    });
+
+    c.bench_function("metric_history_moving_average", |b| {
+        let history = MetricHistory::new(100);
+        for i in 0..100 {
+            history.record((i * 10) as f64);
+        }
+        b.iter(|| black_box(history.moving_average()))
+    });
+}
+
+fn bench_label_validation(c: &mut Criterion) {
+    c.bench_function("is_valid_metric_name", |b| {
+        b.iter(|| is_valid_metric_name(black_box("http_requests_total")))
+    });
+
+    c.bench_function("is_valid_label_name", |b| {
+        b.iter(|| is_valid_label_name(black_box("status_code")))
+    });
+
+    c.bench_function("sanitize_label_name", |b| {
+        b.iter(|| sanitize_label_name(black_box("invalid-label-name")))
+    });
+
+    c.bench_function("sanitize_label_value", |b| {
+        b.iter(|| sanitize_label_value(black_box("hello\nworld\ttab")))
+    });
+}
+
+fn bench_histogram_heatmap(c: &mut Criterion) {
+    let heatmap = HistogramHeatmap::new(100);
+
+    c.bench_function("heatmap_record_snapshot", |b| {
+        let buckets = vec![
+            HeatmapBucket {
+                upper_bound: 0.1,
+                count: 10,
+                timestamp: 0,
+            },
+            HeatmapBucket {
+                upper_bound: 1.0,
+                count: 50,
+                timestamp: 0,
+            },
+            HeatmapBucket {
+                upper_bound: 10.0,
+                count: 100,
+                timestamp: 0,
+            },
+        ];
+        b.iter(|| {
+            heatmap.record_snapshot(black_box(buckets.clone()));
+        })
+    });
+
+    // Pre-populate for get_snapshots benchmark
+    for i in 0..10 {
+        let buckets = vec![HeatmapBucket {
+            upper_bound: 1.0,
+            count: i * 10,
+            timestamp: i,
+        }];
+        heatmap.record_snapshot(buckets);
+    }
+
+    c.bench_function("heatmap_get_snapshots", |b| {
+        b.iter(|| black_box(heatmap.get_snapshots()))
+    });
+}
+
+fn bench_metric_registry(c: &mut Criterion) {
+    let registry = MetricRegistry::new();
+
+    // Pre-register some metrics
+    for i in 0..10 {
+        registry.register_counter(&format!("counter_{}", i), "Test counter");
+        registry.register_gauge(&format!("gauge_{}", i), "Test gauge");
+    }
+
+    c.bench_function("registry_increment_counter", |b| {
+        b.iter(|| registry.increment_counter(black_box("counter_0"), black_box(1)))
+    });
+
+    c.bench_function("registry_set_gauge", |b| {
+        b.iter(|| registry.set_gauge(black_box("gauge_0"), black_box(100)))
+    });
+
+    c.bench_function("registry_get_counter", |b| {
+        b.iter(|| black_box(registry.get_counter("counter_0")))
+    });
+
+    c.bench_function("registry_list_metrics", |b| {
+        b.iter(|| black_box(registry.list_metrics()))
+    });
+
+    c.bench_function("registry_register_counter", |b| {
+        let mut counter = 0;
+        b.iter(|| {
+            counter += 1;
+            registry.register_counter(&format!("new_counter_{}", counter), "Test")
+        })
+    });
+}
+
+fn bench_resource_tracker(c: &mut Criterion) {
+    let tracker = ResourceTracker::new();
+
+    c.bench_function("resource_tracker_track_operation", |b| {
+        b.iter(|| tracker.track_operation(|| black_box(42)))
+    });
+
+    c.bench_function("resource_tracker_record_memory", |b| {
+        b.iter(|| tracker.record_memory_usage(black_box(1000)))
+    });
+
+    c.bench_function("resource_tracker_get_stats", |b| {
+        b.iter(|| {
+            black_box(tracker.collection_count());
+            black_box(tracker.avg_collection_time_micros());
+            black_box(tracker.peak_memory_bytes());
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_counter_increment,
@@ -339,6 +572,15 @@ criterion_group!(
     bench_gather_metrics,
     bench_current_metrics_capture,
     bench_generate_summary,
+    bench_cardinality_limiter,
+    bench_trend_alerting,
+    bench_correlation_analysis,
+    bench_windowed_statistics,
+    bench_metric_history_operations,
+    bench_label_validation,
+    bench_histogram_heatmap,
+    bench_metric_registry,
+    bench_resource_tracker,
 );
 
 criterion_main!(benches);

@@ -12,7 +12,7 @@
 //!
 //! Messages consist of:
 //! - **Headers**: Task metadata (task name, ID, parent/root IDs, etc.)
-//! - **Properties**: AMQP properties (correlation_id, reply_to, delivery_mode)
+//! - **Properties**: AMQP properties (`correlation_id`, `reply_to`, `delivery_mode`)
 //! - **Body**: Serialized task arguments
 //! - **Content-Type**: Serialization format ("application/json", "application/x-msgpack")
 //! - **Content-Encoding**: Encoding format ("utf-8", "binary")
@@ -77,6 +77,20 @@ use std::collections::HashMap;
 use std::fmt;
 use uuid::Uuid;
 
+/// Common content type constants
+pub(crate) const CONTENT_TYPE_JSON: &str = "application/json";
+#[cfg(feature = "msgpack")]
+pub(crate) const CONTENT_TYPE_MSGPACK: &str = "application/x-msgpack";
+#[cfg(feature = "binary")]
+pub(crate) const CONTENT_TYPE_BINARY: &str = "application/octet-stream";
+
+/// Common encoding constants
+pub(crate) const ENCODING_UTF8: &str = "utf-8";
+pub(crate) const ENCODING_BINARY: &str = "binary";
+
+/// Default language
+pub(crate) const DEFAULT_LANG: &str = "rust";
+
 /// Validation errors for Celery protocol messages
 ///
 /// # Examples
@@ -97,7 +111,7 @@ use uuid::Uuid;
 ///     Err(e) => panic!("Unexpected error: {}", e),
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValidationError {
     /// Task name is empty
     EmptyTaskName,
@@ -157,7 +171,7 @@ impl fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 /// Protocol version
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ProtocolVersion {
     /// Protocol version 2 (Celery 4.x+)
     V2,
@@ -180,8 +194,52 @@ impl std::fmt::Display for ProtocolVersion {
     }
 }
 
+impl std::str::FromStr for ProtocolVersion {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "v2" | "2" => Ok(ProtocolVersion::V2),
+            "v5" | "5" => Ok(ProtocolVersion::V5),
+            _ => Err(format!("Invalid protocol version: {}", s)),
+        }
+    }
+}
+
+impl ProtocolVersion {
+    /// Check if this is protocol version 2
+    #[inline]
+    pub const fn is_v2(self) -> bool {
+        matches!(self, ProtocolVersion::V2)
+    }
+
+    /// Check if this is protocol version 5
+    #[inline]
+    pub const fn is_v5(self) -> bool {
+        matches!(self, ProtocolVersion::V5)
+    }
+
+    /// Get the version number as u8
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            ProtocolVersion::V2 => 2,
+            ProtocolVersion::V5 => 5,
+        }
+    }
+
+    /// Get the version number as a static string
+    #[inline]
+    pub const fn as_number_str(self) -> &'static str {
+        match self {
+            ProtocolVersion::V2 => "2",
+            ProtocolVersion::V5 => "5",
+        }
+    }
+}
+
 /// Content type for serialization
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContentType {
     /// JSON serialization
     Json,
@@ -199,11 +257,11 @@ impl ContentType {
     #[inline]
     pub fn as_str(&self) -> &str {
         match self {
-            ContentType::Json => "application/json",
+            ContentType::Json => CONTENT_TYPE_JSON,
             #[cfg(feature = "msgpack")]
-            ContentType::MessagePack => "application/x-msgpack",
+            ContentType::MessagePack => CONTENT_TYPE_MSGPACK,
             #[cfg(feature = "binary")]
-            ContentType::Binary => "application/octet-stream",
+            ContentType::Binary => CONTENT_TYPE_BINARY,
             ContentType::Custom(s) => s,
         }
     }
@@ -221,8 +279,42 @@ impl std::fmt::Display for ContentType {
     }
 }
 
+impl std::str::FromStr for ContentType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            CONTENT_TYPE_JSON => Ok(ContentType::Json),
+            #[cfg(feature = "msgpack")]
+            CONTENT_TYPE_MSGPACK => Ok(ContentType::MessagePack),
+            #[cfg(feature = "binary")]
+            CONTENT_TYPE_BINARY => Ok(ContentType::Binary),
+            other => Ok(ContentType::Custom(other.to_string())),
+        }
+    }
+}
+
+impl From<&str> for ContentType {
+    fn from(s: &str) -> Self {
+        match s {
+            CONTENT_TYPE_JSON => ContentType::Json,
+            #[cfg(feature = "msgpack")]
+            CONTENT_TYPE_MSGPACK => ContentType::MessagePack,
+            #[cfg(feature = "binary")]
+            CONTENT_TYPE_BINARY => ContentType::Binary,
+            other => ContentType::Custom(other.to_string()),
+        }
+    }
+}
+
+impl AsRef<str> for ContentType {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// Content encoding
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContentEncoding {
     /// UTF-8 encoding
     Utf8,
@@ -236,8 +328,8 @@ impl ContentEncoding {
     #[inline]
     pub fn as_str(&self) -> &str {
         match self {
-            ContentEncoding::Utf8 => "utf-8",
-            ContentEncoding::Binary => "binary",
+            ContentEncoding::Utf8 => ENCODING_UTF8,
+            ContentEncoding::Binary => ENCODING_BINARY,
             ContentEncoding::Custom(s) => s,
         }
     }
@@ -255,8 +347,36 @@ impl std::fmt::Display for ContentEncoding {
     }
 }
 
+impl std::str::FromStr for ContentEncoding {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            ENCODING_UTF8 => Ok(ContentEncoding::Utf8),
+            ENCODING_BINARY => Ok(ContentEncoding::Binary),
+            other => Ok(ContentEncoding::Custom(other.to_string())),
+        }
+    }
+}
+
+impl From<&str> for ContentEncoding {
+    fn from(s: &str) -> Self {
+        match s {
+            ENCODING_UTF8 => ContentEncoding::Utf8,
+            ENCODING_BINARY => ContentEncoding::Binary,
+            other => ContentEncoding::Custom(other.to_string()),
+        }
+    }
+}
+
+impl AsRef<str> for ContentEncoding {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// Message headers (Celery protocol)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageHeaders {
     /// Task name (e.g., "tasks.add")
     pub task: String,
@@ -298,7 +418,7 @@ pub struct MessageHeaders {
 }
 
 fn default_lang() -> String {
-    "rust".to_string()
+    DEFAULT_LANG.to_string()
 }
 
 impl MessageHeaders {
@@ -315,6 +435,55 @@ impl MessageHeaders {
             expires: None,
             extra: HashMap::new(),
         }
+    }
+
+    /// Set the language field (builder pattern)
+    #[must_use]
+    pub fn with_lang(mut self, lang: String) -> Self {
+        self.lang = lang;
+        self
+    }
+
+    /// Set the root ID field (builder pattern)
+    #[must_use]
+    pub fn with_root_id(mut self, root_id: Uuid) -> Self {
+        self.root_id = Some(root_id);
+        self
+    }
+
+    /// Set the parent ID field (builder pattern)
+    #[must_use]
+    pub fn with_parent_id(mut self, parent_id: Uuid) -> Self {
+        self.parent_id = Some(parent_id);
+        self
+    }
+
+    /// Set the group field (builder pattern)
+    #[must_use]
+    pub fn with_group(mut self, group: Uuid) -> Self {
+        self.group = Some(group);
+        self
+    }
+
+    /// Set the retries field (builder pattern)
+    #[must_use]
+    pub fn with_retries(mut self, retries: u32) -> Self {
+        self.retries = Some(retries);
+        self
+    }
+
+    /// Set the ETA field (builder pattern)
+    #[must_use]
+    pub fn with_eta(mut self, eta: DateTime<Utc>) -> Self {
+        self.eta = Some(eta);
+        self
+    }
+
+    /// Set the expires field (builder pattern)
+    #[must_use]
+    pub fn with_expires(mut self, expires: DateTime<Utc>) -> Self {
+        self.expires = Some(expires);
+        self
     }
 
     /// Validate message headers
@@ -341,7 +510,7 @@ impl MessageHeaders {
 }
 
 /// Message properties (AMQP-like)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageProperties {
     /// Correlation ID for RPC-style calls
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,7 +529,7 @@ pub struct MessageProperties {
     pub priority: Option<u8>,
 }
 
-fn default_delivery_mode() -> u8 {
+const fn default_delivery_mode() -> u8 {
     2 // Persistent by default
 }
 
@@ -376,6 +545,39 @@ impl Default for MessageProperties {
 }
 
 impl MessageProperties {
+    /// Create new MessageProperties with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set correlation ID (builder pattern)
+    #[must_use]
+    pub fn with_correlation_id(mut self, correlation_id: String) -> Self {
+        self.correlation_id = Some(correlation_id);
+        self
+    }
+
+    /// Set reply-to queue (builder pattern)
+    #[must_use]
+    pub fn with_reply_to(mut self, reply_to: String) -> Self {
+        self.reply_to = Some(reply_to);
+        self
+    }
+
+    /// Set delivery mode (builder pattern)
+    #[must_use]
+    pub fn with_delivery_mode(mut self, delivery_mode: u8) -> Self {
+        self.delivery_mode = delivery_mode;
+        self
+    }
+
+    /// Set priority (builder pattern)
+    #[must_use]
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
     /// Validate message properties
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.delivery_mode != 1 && self.delivery_mode != 2 {
@@ -395,7 +597,7 @@ impl MessageProperties {
 }
 
 /// Complete Celery message
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     /// Message headers
     pub headers: MessageHeaders,
@@ -449,8 +651,8 @@ impl Message {
             headers: MessageHeaders::new(task, id),
             properties: MessageProperties::default(),
             body,
-            content_type: ContentType::default().as_str().to_string(),
-            content_encoding: ContentEncoding::default().as_str().to_string(),
+            content_type: CONTENT_TYPE_JSON.to_string(),
+            content_encoding: ENCODING_UTF8.to_string(),
         }
     }
 
@@ -493,6 +695,34 @@ impl Message {
     #[must_use]
     pub fn with_expires(mut self, expires: DateTime<Utc>) -> Self {
         self.headers.expires = Some(expires);
+        self
+    }
+
+    /// Set retry count
+    #[must_use]
+    pub fn with_retries(mut self, retries: u32) -> Self {
+        self.headers.retries = Some(retries);
+        self
+    }
+
+    /// Set correlation ID (for RPC-style calls)
+    #[must_use]
+    pub fn with_correlation_id(mut self, correlation_id: String) -> Self {
+        self.properties.correlation_id = Some(correlation_id);
+        self
+    }
+
+    /// Set reply-to queue (for results)
+    #[must_use]
+    pub fn with_reply_to(mut self, reply_to: String) -> Self {
+        self.properties.reply_to = Some(reply_to);
+        self
+    }
+
+    /// Set delivery mode (1 = non-persistent, 2 = persistent)
+    #[must_use]
+    pub fn with_delivery_mode(mut self, mode: u8) -> Self {
+        self.properties.delivery_mode = mode;
         self
     }
 
@@ -555,91 +785,91 @@ impl Message {
     }
 
     /// Check if the message has an ETA (delayed execution)
-    #[inline]
+    #[inline(always)]
     pub fn has_eta(&self) -> bool {
         self.headers.eta.is_some()
     }
 
     /// Check if the message has an expiration time
-    #[inline]
+    #[inline(always)]
     pub fn has_expires(&self) -> bool {
         self.headers.expires.is_some()
     }
 
     /// Check if the message is part of a group
-    #[inline]
+    #[inline(always)]
     pub fn has_group(&self) -> bool {
         self.headers.group.is_some()
     }
 
     /// Check if the message has a parent task
-    #[inline]
+    #[inline(always)]
     pub fn has_parent(&self) -> bool {
         self.headers.parent_id.is_some()
     }
 
     /// Check if the message has a root task
-    #[inline]
+    #[inline(always)]
     pub fn has_root(&self) -> bool {
         self.headers.root_id.is_some()
     }
 
     /// Check if the message is persistent
-    #[inline]
+    #[inline(always)]
     pub fn is_persistent(&self) -> bool {
         self.properties.delivery_mode == 2
     }
 
     /// Get the task ID
-    #[inline]
+    #[inline(always)]
     pub fn task_id(&self) -> uuid::Uuid {
         self.headers.id
     }
 
     /// Get the task name
-    #[inline]
+    #[inline(always)]
     pub fn task_name(&self) -> &str {
         &self.headers.task
     }
 
     /// Get the content type as a string slice
-    #[inline]
+    #[inline(always)]
     pub fn content_type_str(&self) -> &str {
         &self.content_type
     }
 
     /// Get the content encoding as a string slice
-    #[inline]
+    #[inline(always)]
     pub fn content_encoding_str(&self) -> &str {
         &self.content_encoding
     }
 
     /// Get the message body size in bytes
-    #[inline]
+    #[inline(always)]
     pub fn body_size(&self) -> usize {
         self.body.len()
     }
 
     /// Check if the message body is empty
-    #[inline]
+    #[inline(always)]
     pub fn has_empty_body(&self) -> bool {
         self.body.is_empty()
     }
 
     /// Get the retry count (0 if not set)
-    #[inline]
+    #[inline(always)]
     pub fn retry_count(&self) -> u32 {
         self.headers.retries.unwrap_or(0)
     }
 
     /// Get the priority (None if not set)
-    #[inline]
+    #[inline(always)]
     pub fn priority(&self) -> Option<u8> {
         self.properties.priority
     }
 
     /// Check if message has a correlation ID
-    #[inline]
+    #[inline(always)]
     pub fn has_correlation_id(&self) -> bool {
         self.properties.correlation_id.is_some()
     }
@@ -657,7 +887,7 @@ impl Message {
     }
 
     /// Check if this is a workflow message (has parent, root, or group)
-    #[inline]
+    #[inline(always)]
     pub fn is_workflow_message(&self) -> bool {
         self.has_parent() || self.has_root() || self.has_group()
     }
@@ -702,10 +932,105 @@ impl Message {
 
         builder
     }
+
+    /// Check if the message is ready for immediate execution (not delayed)
+    #[inline]
+    pub fn is_ready_for_execution(&self) -> bool {
+        match self.headers.eta {
+            None => true,
+            Some(eta) => chrono::Utc::now() >= eta,
+        }
+    }
+
+    /// Check if the message has not expired yet
+    #[inline]
+    pub fn is_not_expired(&self) -> bool {
+        match self.headers.expires {
+            None => true,
+            Some(expires) => chrono::Utc::now() < expires,
+        }
+    }
+
+    /// Check if the message should be processed (not expired and ready for execution)
+    #[inline]
+    pub fn should_process(&self) -> bool {
+        self.is_ready_for_execution() && self.is_not_expired()
+    }
+
+    /// Set ETA to now + duration (builder pattern)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_protocol::Message;
+    /// use uuid::Uuid;
+    /// use chrono::Duration;
+    ///
+    /// let msg = Message::new("task".to_string(), Uuid::new_v4(), vec![])
+    ///     .with_eta_delay(Duration::minutes(5));
+    /// assert!(msg.has_eta());
+    /// ```
+    #[must_use]
+    pub fn with_eta_delay(mut self, delay: chrono::Duration) -> Self {
+        self.headers.eta = Some(chrono::Utc::now() + delay);
+        self
+    }
+
+    /// Set expiration to now + duration (builder pattern)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_protocol::Message;
+    /// use uuid::Uuid;
+    /// use chrono::Duration;
+    ///
+    /// let msg = Message::new("task".to_string(), Uuid::new_v4(), vec![])
+    ///     .with_expires_in(Duration::hours(1));
+    /// assert!(msg.has_expires());
+    /// ```
+    #[must_use]
+    pub fn with_expires_in(mut self, duration: chrono::Duration) -> Self {
+        self.headers.expires = Some(chrono::Utc::now() + duration);
+        self
+    }
+
+    /// Get the time remaining until ETA (None if no ETA or already past)
+    #[inline]
+    pub fn time_until_eta(&self) -> Option<chrono::Duration> {
+        self.headers.eta.and_then(|eta| {
+            let now = chrono::Utc::now();
+            if eta > now {
+                Some(eta - now)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Get the time remaining until expiration (None if no expiration or already expired)
+    #[inline]
+    pub fn time_until_expiration(&self) -> Option<chrono::Duration> {
+        self.headers.expires.and_then(|expires| {
+            let now = chrono::Utc::now();
+            if expires > now {
+                Some(expires - now)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Increment the retry count (returns new count)
+    pub fn increment_retry(&mut self) -> u32 {
+        let new_count = self.headers.retries.unwrap_or(0) + 1;
+        self.headers.retries = Some(new_count);
+        new_count
+    }
 }
 
 /// Task arguments (args, kwargs)
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TaskArgs {
     /// Positional arguments
     #[serde(default)]
@@ -747,25 +1072,25 @@ impl TaskArgs {
     }
 
     /// Check if both args and kwargs are empty
-    #[inline]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.args.is_empty() && self.kwargs.is_empty()
     }
 
     /// Get the total number of arguments (positional + keyword)
-    #[inline]
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.args.len() + self.kwargs.len()
     }
 
     /// Check if there are any positional arguments
-    #[inline]
+    #[inline(always)]
     pub fn has_args(&self) -> bool {
         !self.args.is_empty()
     }
 
     /// Check if there are any keyword arguments
-    #[inline]
+    #[inline(always)]
     pub fn has_kwargs(&self) -> bool {
         !self.kwargs.is_empty()
     }
@@ -786,6 +1111,93 @@ impl TaskArgs {
     #[inline]
     pub fn get_kwarg(&self, key: &str) -> Option<&serde_json::Value> {
         self.kwargs.get(key)
+    }
+
+    /// Create TaskArgs from a JSON string
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// Convert TaskArgs to a JSON string
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Convert TaskArgs to pretty-printed JSON
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+// Index trait for accessing positional arguments by index
+impl std::ops::Index<usize> for TaskArgs {
+    type Output = serde_json::Value;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.args[index]
+    }
+}
+
+// IndexMut trait for mutating positional arguments by index
+impl std::ops::IndexMut<usize> for TaskArgs {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.args[index]
+    }
+}
+
+// Index trait for accessing keyword arguments by string key
+impl std::ops::Index<&str> for TaskArgs {
+    type Output = serde_json::Value;
+
+    #[inline]
+    fn index(&self, key: &str) -> &Self::Output {
+        &self.kwargs[key]
+    }
+}
+
+// IntoIterator for TaskArgs - iterates over positional args
+impl IntoIterator for TaskArgs {
+    type Item = serde_json::Value;
+    type IntoIter = std::vec::IntoIter<serde_json::Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.args.into_iter()
+    }
+}
+
+// IntoIterator for &TaskArgs - iterates over positional args by reference
+impl<'a> IntoIterator for &'a TaskArgs {
+    type Item = &'a serde_json::Value;
+    type IntoIter = std::slice::Iter<'a, serde_json::Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.args.iter()
+    }
+}
+
+// Extend trait for TaskArgs - extend with more positional arguments
+impl Extend<serde_json::Value> for TaskArgs {
+    fn extend<T: IntoIterator<Item = serde_json::Value>>(&mut self, iter: T) {
+        self.args.extend(iter);
+    }
+}
+
+// Extend trait for TaskArgs with key-value pairs for kwargs
+impl Extend<(String, serde_json::Value)> for TaskArgs {
+    fn extend<T: IntoIterator<Item = (String, serde_json::Value)>>(&mut self, iter: T) {
+        self.kwargs.extend(iter);
+    }
+}
+
+// FromIterator for TaskArgs - build from iterator of positional args
+impl FromIterator<serde_json::Value> for TaskArgs {
+    fn from_iter<T: IntoIterator<Item = serde_json::Value>>(iter: T) -> Self {
+        Self {
+            args: iter.into_iter().collect(),
+            kwargs: HashMap::new(),
+        }
     }
 }
 
@@ -912,8 +1324,10 @@ mod tests {
 
     #[test]
     fn test_message_properties_validate_delivery_mode() {
-        let mut props = MessageProperties::default();
-        props.delivery_mode = 3;
+        let props = MessageProperties {
+            delivery_mode: 3,
+            ..MessageProperties::default()
+        };
         let result = props.validate();
         assert!(result.is_err());
         assert_eq!(
@@ -924,9 +1338,11 @@ mod tests {
 
     #[test]
     fn test_message_properties_validate_priority() {
-        let mut props = MessageProperties::default();
-        props.delivery_mode = 2; // Set valid delivery mode
-        props.priority = Some(10);
+        let props = MessageProperties {
+            delivery_mode: 2, // Set valid delivery mode
+            priority: Some(10),
+            ..MessageProperties::default()
+        };
         let result = props.validate();
         assert!(result.is_err());
         assert_eq!(
@@ -1103,5 +1519,670 @@ mod tests {
         assert_eq!(rebuilt.task_name(), msg.task_name());
         assert_eq!(rebuilt.priority(), msg.priority());
         assert_eq!(rebuilt.headers.parent_id, msg.headers.parent_id);
+    }
+
+    #[test]
+    fn test_protocol_version_from_str() {
+        use std::str::FromStr;
+        assert_eq!(
+            ProtocolVersion::from_str("v2").unwrap(),
+            ProtocolVersion::V2
+        );
+        assert_eq!(
+            ProtocolVersion::from_str("V2").unwrap(),
+            ProtocolVersion::V2
+        );
+        assert_eq!(ProtocolVersion::from_str("2").unwrap(), ProtocolVersion::V2);
+        assert_eq!(
+            ProtocolVersion::from_str("v5").unwrap(),
+            ProtocolVersion::V5
+        );
+        assert_eq!(
+            ProtocolVersion::from_str("V5").unwrap(),
+            ProtocolVersion::V5
+        );
+        assert_eq!(ProtocolVersion::from_str("5").unwrap(), ProtocolVersion::V5);
+        assert!(ProtocolVersion::from_str("v3").is_err());
+        assert!(ProtocolVersion::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_protocol_version_ordering() {
+        assert!(ProtocolVersion::V2 < ProtocolVersion::V5);
+        assert!(ProtocolVersion::V5 > ProtocolVersion::V2);
+        assert_eq!(ProtocolVersion::V2, ProtocolVersion::V2);
+    }
+
+    #[test]
+    fn test_content_type_from_str() {
+        use std::str::FromStr;
+        assert_eq!(
+            ContentType::from_str("application/json").unwrap(),
+            ContentType::Json
+        );
+        assert_eq!(
+            ContentType::from_str("text/plain").unwrap(),
+            ContentType::Custom("text/plain".to_string())
+        );
+    }
+
+    #[test]
+    fn test_content_encoding_from_str() {
+        use std::str::FromStr;
+        assert_eq!(
+            ContentEncoding::from_str("utf-8").unwrap(),
+            ContentEncoding::Utf8
+        );
+        assert_eq!(
+            ContentEncoding::from_str("binary").unwrap(),
+            ContentEncoding::Binary
+        );
+        assert_eq!(
+            ContentEncoding::from_str("gzip").unwrap(),
+            ContentEncoding::Custom("gzip".to_string())
+        );
+    }
+
+    #[test]
+    fn test_message_headers_equality() {
+        let id = Uuid::new_v4();
+        let headers1 = MessageHeaders::new("tasks.add".to_string(), id);
+        let headers2 = MessageHeaders::new("tasks.add".to_string(), id);
+        let headers3 = MessageHeaders::new("tasks.sub".to_string(), id);
+
+        assert_eq!(headers1, headers2);
+        assert_ne!(headers1, headers3);
+    }
+
+    #[test]
+    fn test_message_properties_equality() {
+        let props1 = MessageProperties::default();
+        let props2 = MessageProperties::default();
+        let props3 = MessageProperties {
+            priority: Some(5),
+            ..Default::default()
+        };
+
+        assert_eq!(props1, props2);
+        assert_ne!(props1, props3);
+    }
+
+    #[test]
+    fn test_message_equality() {
+        let id = Uuid::new_v4();
+        let body = vec![1, 2, 3];
+        let msg1 = Message::new("tasks.add".to_string(), id, body.clone());
+        let msg2 = Message::new("tasks.add".to_string(), id, body.clone());
+        let msg3 = Message::new("tasks.add".to_string(), id, vec![4, 5, 6]);
+
+        assert_eq!(msg1, msg2);
+        assert_ne!(msg1, msg3);
+    }
+
+    #[test]
+    fn test_message_equality_with_options() {
+        let id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let body = vec![1, 2, 3];
+
+        let msg1 = Message::new("tasks.add".to_string(), id, body.clone())
+            .with_priority(5)
+            .with_parent(parent_id);
+        let msg2 = Message::new("tasks.add".to_string(), id, body.clone())
+            .with_priority(5)
+            .with_parent(parent_id);
+        let msg3 = Message::new("tasks.add".to_string(), id, body.clone())
+            .with_priority(3)
+            .with_parent(parent_id);
+
+        assert_eq!(msg1, msg2);
+        assert_ne!(msg1, msg3);
+    }
+
+    #[test]
+    fn test_task_args_equality() {
+        let args1 = TaskArgs::new().with_args(vec![serde_json::json!(1), serde_json::json!(2)]);
+        let args2 = TaskArgs::new().with_args(vec![serde_json::json!(1), serde_json::json!(2)]);
+        let args3 = TaskArgs::new().with_args(vec![serde_json::json!(3), serde_json::json!(4)]);
+
+        assert_eq!(args1, args2);
+        assert_ne!(args1, args3);
+    }
+
+    #[test]
+    fn test_task_args_equality_with_kwargs() {
+        let mut kwargs1 = std::collections::HashMap::new();
+        kwargs1.insert("key".to_string(), serde_json::json!("value"));
+
+        let mut kwargs2 = std::collections::HashMap::new();
+        kwargs2.insert("key".to_string(), serde_json::json!("value"));
+
+        let args1 = TaskArgs::new().with_kwargs(kwargs1);
+        let args2 = TaskArgs::new().with_kwargs(kwargs2);
+        let args3 = TaskArgs::new();
+
+        assert_eq!(args1, args2);
+        assert_ne!(args1, args3);
+    }
+
+    #[test]
+    fn test_content_type_from_str_trait() {
+        let ct1: ContentType = "application/json".into();
+        let ct2: ContentType = "text/plain".into();
+
+        assert_eq!(ct1, ContentType::Json);
+        assert_eq!(ct2, ContentType::Custom("text/plain".to_string()));
+    }
+
+    #[test]
+    fn test_content_encoding_from_str_trait() {
+        let ce1: ContentEncoding = "utf-8".into();
+        let ce2: ContentEncoding = "binary".into();
+        let ce3: ContentEncoding = "gzip".into();
+
+        assert_eq!(ce1, ContentEncoding::Utf8);
+        assert_eq!(ce2, ContentEncoding::Binary);
+        assert_eq!(ce3, ContentEncoding::Custom("gzip".to_string()));
+    }
+
+    #[test]
+    fn test_content_type_as_ref() {
+        let ct = ContentType::Json;
+        let s: &str = ct.as_ref();
+        assert_eq!(s, "application/json");
+
+        let ct_custom = ContentType::Custom("text/plain".to_string());
+        let s_custom: &str = ct_custom.as_ref();
+        assert_eq!(s_custom, "text/plain");
+    }
+
+    #[test]
+    fn test_content_encoding_as_ref() {
+        let ce = ContentEncoding::Utf8;
+        let s: &str = ce.as_ref();
+        assert_eq!(s, "utf-8");
+
+        let ce_binary = ContentEncoding::Binary;
+        let s_binary: &str = ce_binary.as_ref();
+        assert_eq!(s_binary, "binary");
+    }
+
+    #[test]
+    fn test_content_type_hash() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(ContentType::Json);
+        set.insert(ContentType::Json); // Duplicate
+        #[cfg(feature = "msgpack")]
+        set.insert(ContentType::MessagePack);
+        set.insert(ContentType::Custom("text/plain".to_string()));
+
+        #[cfg(feature = "msgpack")]
+        assert_eq!(set.len(), 3);
+        #[cfg(not(feature = "msgpack"))]
+        assert_eq!(set.len(), 2);
+
+        assert!(set.contains(&ContentType::Json));
+    }
+
+    #[test]
+    fn test_content_encoding_hash() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(ContentEncoding::Utf8);
+        set.insert(ContentEncoding::Utf8); // Duplicate
+        set.insert(ContentEncoding::Binary);
+        set.insert(ContentEncoding::Custom("base64".to_string()));
+
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&ContentEncoding::Utf8));
+        assert!(set.contains(&ContentEncoding::Binary));
+    }
+
+    #[test]
+    fn test_message_with_retries() {
+        let msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1]).with_retries(5);
+
+        assert_eq!(msg.headers.retries, Some(5));
+        assert_eq!(msg.retry_count(), 5);
+    }
+
+    #[test]
+    fn test_message_with_correlation_id() {
+        let msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1])
+            .with_correlation_id("corr-123".to_string());
+
+        assert_eq!(msg.properties.correlation_id, Some("corr-123".to_string()));
+        assert_eq!(msg.correlation_id(), Some("corr-123"));
+    }
+
+    #[test]
+    fn test_message_with_reply_to() {
+        let msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1])
+            .with_reply_to("reply-queue".to_string());
+
+        assert_eq!(msg.properties.reply_to, Some("reply-queue".to_string()));
+        assert_eq!(msg.reply_to(), Some("reply-queue"));
+    }
+
+    #[test]
+    fn test_message_with_delivery_mode() {
+        let msg = Message::new("test".to_string(), Uuid::new_v4(), vec![1]).with_delivery_mode(1);
+
+        assert_eq!(msg.properties.delivery_mode, 1);
+        assert!(!msg.is_persistent());
+
+        let persistent_msg =
+            Message::new("test".to_string(), Uuid::new_v4(), vec![1]).with_delivery_mode(2);
+
+        assert_eq!(persistent_msg.properties.delivery_mode, 2);
+        assert!(persistent_msg.is_persistent());
+    }
+
+    #[test]
+    fn test_message_builder_chaining() {
+        let parent_id = Uuid::new_v4();
+        let msg = Message::new("test.task".to_string(), Uuid::new_v4(), vec![1, 2, 3])
+            .with_priority(7)
+            .with_retries(3)
+            .with_correlation_id("corr-456".to_string())
+            .with_reply_to("result-queue".to_string())
+            .with_parent(parent_id)
+            .with_delivery_mode(1);
+
+        assert_eq!(msg.priority(), Some(7));
+        assert_eq!(msg.retry_count(), 3);
+        assert_eq!(msg.correlation_id(), Some("corr-456"));
+        assert_eq!(msg.reply_to(), Some("result-queue"));
+        assert_eq!(msg.headers.parent_id, Some(parent_id));
+        assert_eq!(msg.properties.delivery_mode, 1);
+        assert!(!msg.is_persistent());
+    }
+
+    #[test]
+    fn test_protocol_version_is_v2() {
+        assert!(ProtocolVersion::V2.is_v2());
+        assert!(!ProtocolVersion::V5.is_v2());
+    }
+
+    #[test]
+    fn test_protocol_version_is_v5() {
+        assert!(ProtocolVersion::V5.is_v5());
+        assert!(!ProtocolVersion::V2.is_v5());
+    }
+
+    #[test]
+    fn test_protocol_version_as_u8() {
+        assert_eq!(ProtocolVersion::V2.as_u8(), 2);
+        assert_eq!(ProtocolVersion::V5.as_u8(), 5);
+    }
+
+    #[test]
+    fn test_protocol_version_as_number_str() {
+        assert_eq!(ProtocolVersion::V2.as_number_str(), "2");
+        assert_eq!(ProtocolVersion::V5.as_number_str(), "5");
+    }
+
+    #[test]
+    fn test_task_args_from_json() {
+        let json = r#"{"args":[1,2,3],"kwargs":{"key":"value"}}"#;
+        let args = TaskArgs::from_json(json).unwrap();
+
+        assert_eq!(args.args.len(), 3);
+        assert_eq!(args.kwargs.len(), 1);
+        assert_eq!(args.get_kwarg("key"), Some(&serde_json::json!("value")));
+    }
+
+    #[test]
+    fn test_task_args_to_json() {
+        let mut args = TaskArgs::new();
+        args.add_arg(serde_json::json!(1));
+        args.add_arg(serde_json::json!(2));
+        args.add_kwarg("key".to_string(), serde_json::json!("value"));
+
+        let json = args.to_json().unwrap();
+        assert!(json.contains("\"args\""));
+        assert!(json.contains("\"kwargs\""));
+        assert!(json.contains("\"key\""));
+    }
+
+    #[test]
+    fn test_task_args_to_json_pretty() {
+        let args = TaskArgs::new()
+            .with_args(vec![serde_json::json!(1)])
+            .with_kwargs({
+                let mut map = std::collections::HashMap::new();
+                map.insert("test".to_string(), serde_json::json!("value"));
+                map
+            });
+
+        let json_pretty = args.to_json_pretty().unwrap();
+        assert!(json_pretty.contains('\n')); // Should have newlines
+    }
+
+    #[test]
+    fn test_message_is_ready_for_execution() {
+        let msg1 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3]);
+        assert!(msg1.is_ready_for_execution()); // No ETA
+
+        let msg2 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3])
+            .with_eta(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(msg2.is_ready_for_execution()); // Past ETA
+
+        let msg3 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3])
+            .with_eta(chrono::Utc::now() + chrono::Duration::hours(1));
+        assert!(!msg3.is_ready_for_execution()); // Future ETA
+    }
+
+    #[test]
+    fn test_message_is_not_expired() {
+        let msg1 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3]);
+        assert!(msg1.is_not_expired()); // No expiration
+
+        let msg2 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3])
+            .with_expires(chrono::Utc::now() + chrono::Duration::hours(1));
+        assert!(msg2.is_not_expired()); // Future expiration
+
+        let msg3 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3])
+            .with_expires(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(!msg3.is_not_expired()); // Past expiration
+    }
+
+    #[test]
+    fn test_message_should_process() {
+        // Ready and not expired
+        let msg1 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3]);
+        assert!(msg1.should_process());
+
+        // Not ready (future ETA)
+        let msg2 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3])
+            .with_eta(chrono::Utc::now() + chrono::Duration::hours(1));
+        assert!(!msg2.should_process());
+
+        // Expired
+        let msg3 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3])
+            .with_expires(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(!msg3.should_process());
+
+        // Ready but expired
+        let msg4 = Message::new("test".to_string(), Uuid::new_v4(), vec![1, 2, 3])
+            .with_eta(chrono::Utc::now() - chrono::Duration::hours(2))
+            .with_expires(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(!msg4.should_process());
+    }
+
+    #[test]
+    fn test_message_headers_builder() {
+        let task_id = Uuid::new_v4();
+        let root_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+
+        let headers = MessageHeaders::new("task".to_string(), task_id)
+            .with_lang("python".to_string())
+            .with_root_id(root_id)
+            .with_parent_id(parent_id)
+            .with_group(group_id)
+            .with_retries(3)
+            .with_eta(chrono::Utc::now() + chrono::Duration::minutes(5))
+            .with_expires(chrono::Utc::now() + chrono::Duration::hours(1));
+
+        assert_eq!(headers.lang, "python");
+        assert_eq!(headers.root_id, Some(root_id));
+        assert_eq!(headers.parent_id, Some(parent_id));
+        assert_eq!(headers.group, Some(group_id));
+        assert_eq!(headers.retries, Some(3));
+        assert!(headers.eta.is_some());
+        assert!(headers.expires.is_some());
+    }
+
+    #[test]
+    fn test_message_properties_builder() {
+        let props = MessageProperties::new()
+            .with_correlation_id("corr-123".to_string())
+            .with_reply_to("reply.queue".to_string())
+            .with_delivery_mode(1)
+            .with_priority(5);
+
+        assert_eq!(props.correlation_id, Some("corr-123".to_string()));
+        assert_eq!(props.reply_to, Some("reply.queue".to_string()));
+        assert_eq!(props.delivery_mode, 1);
+        assert_eq!(props.priority, Some(5));
+    }
+
+    #[test]
+    fn test_message_with_eta_delay() {
+        let before = chrono::Utc::now();
+        let msg = Message::new("task".to_string(), Uuid::new_v4(), vec![])
+            .with_eta_delay(chrono::Duration::minutes(10));
+        let after = chrono::Utc::now();
+
+        assert!(msg.has_eta());
+        let eta = msg.headers.eta.unwrap();
+        // ETA should be roughly 10 minutes from now
+        assert!(eta > before + chrono::Duration::minutes(9));
+        assert!(eta < after + chrono::Duration::minutes(11));
+    }
+
+    #[test]
+    fn test_message_with_expires_in() {
+        let before = chrono::Utc::now();
+        let msg = Message::new("task".to_string(), Uuid::new_v4(), vec![])
+            .with_expires_in(chrono::Duration::hours(2));
+        let after = chrono::Utc::now();
+
+        assert!(msg.has_expires());
+        let expires = msg.headers.expires.unwrap();
+        // Expiration should be roughly 2 hours from now
+        assert!(expires > before + chrono::Duration::hours(2) - chrono::Duration::seconds(1));
+        assert!(expires < after + chrono::Duration::hours(2) + chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn test_message_time_until_eta() {
+        // No ETA
+        let msg1 = Message::new("task".to_string(), Uuid::new_v4(), vec![]);
+        assert!(msg1.time_until_eta().is_none());
+
+        // Future ETA
+        let msg2 = Message::new("task".to_string(), Uuid::new_v4(), vec![])
+            .with_eta(chrono::Utc::now() + chrono::Duration::minutes(30));
+        let time_left = msg2.time_until_eta();
+        assert!(time_left.is_some());
+        assert!(time_left.unwrap() > chrono::Duration::minutes(29));
+        assert!(time_left.unwrap() < chrono::Duration::minutes(31));
+
+        // Past ETA
+        let msg3 = Message::new("task".to_string(), Uuid::new_v4(), vec![])
+            .with_eta(chrono::Utc::now() - chrono::Duration::minutes(30));
+        assert!(msg3.time_until_eta().is_none());
+    }
+
+    #[test]
+    fn test_message_time_until_expiration() {
+        // No expiration
+        let msg1 = Message::new("task".to_string(), Uuid::new_v4(), vec![]);
+        assert!(msg1.time_until_expiration().is_none());
+
+        // Future expiration
+        let msg2 = Message::new("task".to_string(), Uuid::new_v4(), vec![])
+            .with_expires(chrono::Utc::now() + chrono::Duration::hours(1));
+        let time_left = msg2.time_until_expiration();
+        assert!(time_left.is_some());
+        assert!(time_left.unwrap() > chrono::Duration::minutes(59));
+        assert!(time_left.unwrap() < chrono::Duration::minutes(61));
+
+        // Past expiration
+        let msg3 = Message::new("task".to_string(), Uuid::new_v4(), vec![])
+            .with_expires(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(msg3.time_until_expiration().is_none());
+    }
+
+    #[test]
+    fn test_message_increment_retry() {
+        let mut msg = Message::new("task".to_string(), Uuid::new_v4(), vec![]);
+
+        // Initial retry count is 0
+        assert_eq!(msg.retry_count(), 0);
+
+        // Increment to 1
+        let count1 = msg.increment_retry();
+        assert_eq!(count1, 1);
+        assert_eq!(msg.retry_count(), 1);
+
+        // Increment to 2
+        let count2 = msg.increment_retry();
+        assert_eq!(count2, 2);
+        assert_eq!(msg.retry_count(), 2);
+    }
+
+    #[test]
+    fn test_task_args_index_usize() {
+        let args = TaskArgs::new().with_args(vec![
+            serde_json::json!(1),
+            serde_json::json!("hello"),
+            serde_json::json!(true),
+        ]);
+
+        // Test Index trait
+        assert_eq!(args[0], serde_json::json!(1));
+        assert_eq!(args[1], serde_json::json!("hello"));
+        assert_eq!(args[2], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_task_args_index_mut_usize() {
+        let mut args = TaskArgs::new().with_args(vec![serde_json::json!(1), serde_json::json!(2)]);
+
+        // Test IndexMut trait
+        args[0] = serde_json::json!(100);
+        args[1] = serde_json::json!(200);
+
+        assert_eq!(args[0], serde_json::json!(100));
+        assert_eq!(args[1], serde_json::json!(200));
+    }
+
+    #[test]
+    fn test_task_args_index_str() {
+        let mut kwargs = HashMap::new();
+        kwargs.insert("name".to_string(), serde_json::json!("Alice"));
+        kwargs.insert("age".to_string(), serde_json::json!(30));
+
+        let args = TaskArgs::new().with_kwargs(kwargs);
+
+        // Test Index trait with string keys
+        assert_eq!(args["name"], serde_json::json!("Alice"));
+        assert_eq!(args["age"], serde_json::json!(30));
+    }
+
+    #[test]
+    #[should_panic(expected = "no entry found for key")]
+    fn test_task_args_index_str_panic() {
+        let args = TaskArgs::new();
+        let _ = &args["nonexistent"]; // Should panic
+    }
+
+    #[test]
+    fn test_task_args_into_iterator() {
+        let args = TaskArgs::new().with_args(vec![
+            serde_json::json!(1),
+            serde_json::json!(2),
+            serde_json::json!(3),
+        ]);
+
+        // Test IntoIterator
+        let values: Vec<_> = args.into_iter().collect();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0], serde_json::json!(1));
+        assert_eq!(values[1], serde_json::json!(2));
+        assert_eq!(values[2], serde_json::json!(3));
+    }
+
+    #[test]
+    fn test_task_args_into_iterator_ref() {
+        let args = TaskArgs::new().with_args(vec![serde_json::json!(10), serde_json::json!(20)]);
+
+        // Test IntoIterator for &TaskArgs
+        let sum: i64 = (&args).into_iter().filter_map(|v| v.as_i64()).sum();
+
+        assert_eq!(sum, 30);
+        // args is still usable
+        assert_eq!(args.args.len(), 2);
+    }
+
+    #[test]
+    fn test_task_args_extend() {
+        let mut args = TaskArgs::new().with_args(vec![serde_json::json!(1)]);
+
+        // Test Extend trait with positional args
+        args.extend(vec![serde_json::json!(2), serde_json::json!(3)]);
+
+        assert_eq!(args.args.len(), 3);
+        assert_eq!(args[0], serde_json::json!(1));
+        assert_eq!(args[1], serde_json::json!(2));
+        assert_eq!(args[2], serde_json::json!(3));
+    }
+
+    #[test]
+    fn test_task_args_extend_kwargs() {
+        let mut args = TaskArgs::new();
+
+        // Test Extend trait with key-value pairs
+        args.extend(vec![
+            ("key1".to_string(), serde_json::json!("value1")),
+            ("key2".to_string(), serde_json::json!(42)),
+        ]);
+
+        assert_eq!(args.kwargs.len(), 2);
+        assert_eq!(args["key1"], serde_json::json!("value1"));
+        assert_eq!(args["key2"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_task_args_from_iterator() {
+        // Test FromIterator trait
+        let args: TaskArgs = vec![
+            serde_json::json!(1),
+            serde_json::json!("hello"),
+            serde_json::json!(true),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(args.args.len(), 3);
+        assert_eq!(args.kwargs.len(), 0);
+        assert_eq!(args[0], serde_json::json!(1));
+        assert_eq!(args[1], serde_json::json!("hello"));
+        assert_eq!(args[2], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_task_args_from_iterator_range() {
+        // Build TaskArgs from range using FromIterator
+        let args: TaskArgs = (1..=5).map(|i| serde_json::json!(i)).collect();
+
+        assert_eq!(args.args.len(), 5);
+        assert_eq!(args[0], serde_json::json!(1));
+        assert_eq!(args[4], serde_json::json!(5));
+    }
+
+    #[test]
+    fn test_task_args_iterator_chain() {
+        // Test combining traits: FromIterator, IntoIterator, Extend
+        let args1: TaskArgs = vec![serde_json::json!(1), serde_json::json!(2)]
+            .into_iter()
+            .collect();
+
+        let mut args2 = TaskArgs::new();
+        args2.extend(vec![serde_json::json!(3), serde_json::json!(4)]);
+
+        // Extend args2 with args1's values
+        args2.extend(args1);
+
+        assert_eq!(args2.args.len(), 4);
+        assert_eq!(args2[0], serde_json::json!(3));
+        assert_eq!(args2[3], serde_json::json!(2));
     }
 }

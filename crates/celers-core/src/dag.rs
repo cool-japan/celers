@@ -117,18 +117,20 @@ impl TaskDag {
     /// Add a dependency relationship: `task_id` depends on `depends_on`
     ///
     /// This means `depends_on` must complete before `task_id` can execute.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either task is not found in the DAG or if adding this dependency would create a cycle.
     pub fn add_dependency(&mut self, task_id: TaskId, depends_on: TaskId) -> Result<()> {
         // Ensure both nodes exist
         if !self.nodes.contains_key(&task_id) {
             return Err(CelersError::Configuration(format!(
-                "Task {} not found in DAG",
-                task_id
+                "Task {task_id} not found in DAG"
             )));
         }
         if !self.nodes.contains_key(&depends_on) {
             return Err(CelersError::Configuration(format!(
-                "Dependency task {} not found in DAG",
-                depends_on
+                "Dependency task {depends_on} not found in DAG"
             )));
         }
 
@@ -159,12 +161,14 @@ impl TaskDag {
     }
 
     /// Get a node by task ID
+    #[inline]
     #[must_use]
     pub fn get_node(&self, task_id: &TaskId) -> Option<&DagNode> {
         self.nodes.get(task_id)
     }
 
     /// Get all root nodes (nodes with no dependencies)
+    #[inline]
     #[must_use]
     pub fn get_roots(&self) -> Vec<TaskId> {
         self.nodes
@@ -175,6 +179,7 @@ impl TaskDag {
     }
 
     /// Get all leaf nodes (nodes with no dependents)
+    #[inline]
     #[must_use]
     pub fn get_leaves(&self) -> Vec<TaskId> {
         self.nodes
@@ -185,6 +190,7 @@ impl TaskDag {
     }
 
     /// Get the dependencies of a task
+    #[inline]
     #[must_use]
     pub fn get_dependencies(&self, task_id: &TaskId) -> Option<Vec<TaskId>> {
         self.nodes
@@ -193,6 +199,7 @@ impl TaskDag {
     }
 
     /// Get the dependents of a task
+    #[inline]
     #[must_use]
     pub fn get_dependents(&self, task_id: &TaskId) -> Option<Vec<TaskId>> {
         self.nodes
@@ -245,6 +252,10 @@ impl TaskDag {
     }
 
     /// Validate the DAG structure (check for cycles)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DAG contains a cycle.
     pub fn validate(&self) -> Result<()> {
         if self.has_cycle() {
             return Err(CelersError::Configuration(
@@ -257,6 +268,9 @@ impl TaskDag {
     /// Perform topological sort on the DAG
     ///
     /// Returns tasks in execution order (dependencies before dependents).
+    ///
+    /// # Errors
+    ///
     /// Returns an error if the DAG contains a cycle.
     pub fn topological_sort(&self) -> Result<Vec<TaskId>> {
         self.validate()?;
@@ -502,7 +516,7 @@ mod tests {
                 let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{i}"));
                 }
 
                 prop_assert_eq!(dag.node_count(), count);
@@ -515,7 +529,7 @@ mod tests {
 
                 // Create linear chain: ids[0] -> ids[1] -> ids[2] -> ...
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{i}"));
                 }
 
                 for i in 1..ids.len() {
@@ -539,7 +553,7 @@ mod tests {
                 let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{i}"));
                 }
 
                 // Create valid DAG structure
@@ -556,7 +570,7 @@ mod tests {
                 let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{i}"));
                 }
 
                 // Create linear chain
@@ -579,7 +593,7 @@ mod tests {
                 let ids: Vec<_> = (0..count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{i}"));
                 }
 
                 // Create linear chain
@@ -602,7 +616,7 @@ mod tests {
                 let ids: Vec<_> = (0..node_count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{i}"));
                 }
 
                 // Add edges in a linear chain
@@ -620,7 +634,7 @@ mod tests {
                 let ids: Vec<_> = (0..node_count).map(|_| TaskId::new_v4()).collect();
 
                 for (i, id) in ids.iter().enumerate() {
-                    dag.add_node(*id, format!("task_{}", i));
+                    dag.add_node(*id, format!("task_{i}"));
                 }
 
                 // Add all edges

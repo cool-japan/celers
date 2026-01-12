@@ -1,4 +1,4 @@
-//! CeleRS Core - Type-safe distributed task queue library
+//! `CeleRS` Core - Type-safe distributed task queue library
 //!
 //! This crate provides the core abstractions and types for building
 //! distributed task processing systems in Rust.

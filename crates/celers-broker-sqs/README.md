@@ -14,6 +14,19 @@ Cloud-native message broker using AWS SQS with:
 - ✅ **Server-Side Encryption**: SSE-SQS and KMS encryption support
 - ✅ **Parallel Processing**: Concurrent message processing with tokio
 - ✅ **Cost Optimization**: 90%+ cost reduction with best practices
+- ✅ **Circuit Breaker**: Resilience pattern for AWS API failures
+- ✅ **Cost Tracking**: Real-time cost monitoring and budgets
+- ✅ **Batch Optimizer**: Dynamic batch size optimization
+- ✅ **Distributed Tracing**: Correlation IDs and trace context
+- ✅ **Quota Management**: API usage limits and cost budgets
+- ✅ **Multi-Queue Router**: Message routing and prioritization
+- ✅ **Performance Profiler**: Latency tracking and bottleneck detection
+- ✅ **Backpressure Management**: Automatic throttling to prevent overload ✨ NEW
+- ✅ **Poison Message Detection**: Isolate repeatedly failing messages ✨ NEW
+- ✅ **Cost Alert System**: Real-time budget monitoring with alerts ✨ NEW
+- ✅ **Lambda Integration**: Helpers for AWS Lambda SQS event processing ✨ NEW
+- ✅ **Message Replay**: DLQ replay with selective filtering and rate limiting ✨ NEW
+- ✅ **SLA Monitoring**: Real-time SLA compliance tracking and reporting ✨ NEW
 
 ## Features
 
@@ -430,6 +443,336 @@ The broker uses AWS SDK's credential chain:
 
 **Recommendation**: Use IAM roles in production for enhanced security.
 
+## Production Features
+
+### Circuit Breaker
+
+Protect against cascading AWS API failures:
+
+```rust
+use celers_broker_sqs::circuit_breaker::CircuitBreaker;
+
+let circuit_breaker = CircuitBreaker::new(5, Duration::from_secs(30));
+
+// Execute operations with circuit breaker protection
+let result = circuit_breaker.call(|| async {
+    broker.publish("my-queue", message).await
+}).await;
+
+// Check circuit state
+let stats = circuit_breaker.stats();
+println!("Circuit state: {:?}", stats.state);
+```
+
+### Real-Time Cost Tracking
+
+Monitor and control AWS SQS costs:
+
+```rust
+use celers_broker_sqs::cost_tracker::CostTracker;
+
+let mut tracker = CostTracker::new();
+
+// Track operations
+tracker.track_publish(false, 1);  // Standard queue, 1 message
+tracker.track_consume(10);         // 10 messages consumed
+
+// Get cost summary
+let summary = tracker.summary();
+println!("Total cost: ${:.4}", summary.total_cost_usd);
+println!("Monthly projection: ${:.2}", summary.monthly_projection_usd);
+
+// Check batch savings
+println!("Batch savings: ${:.4}", summary.batch_savings_usd);
+```
+
+### Batch Optimizer
+
+Dynamically optimize batch sizes:
+
+```rust
+use celers_broker_sqs::batch_optimizer::{BatchOptimizer, OptimizerGoal};
+
+let optimizer = BatchOptimizer::new(OptimizerGoal::MinimizeCost);
+
+// Get recommendation based on queue metrics
+let recommendation = optimizer.recommend(
+    1000,    // Queue depth
+    50,      // Avg message size (KB)
+    100,     // Avg processing time (ms)
+    4        // Number of workers
+);
+
+println!("Recommended batch size: {}", recommendation.recommended_batch_size);
+println!("Reason: {}", recommendation.reasoning);
+```
+
+### Distributed Tracing
+
+Track messages across services:
+
+```rust
+use celers_broker_sqs::tracing_util::{TraceContext, generate_correlation_id};
+
+// Create trace context
+let trace_ctx = TraceContext::new()
+    .with_correlation_id(generate_correlation_id())
+    .with_xray_trace_id()
+    .with_parent_span_id("parent-123");
+
+// Attach to message attributes
+let attrs = trace_ctx.to_message_attributes();
+
+// Track message flow
+let mut flow_tracker = MessageFlowTracker::new();
+flow_tracker.record_publish(&trace_ctx, "queue-1");
+flow_tracker.record_consume(&trace_ctx, "queue-1");
+```
+
+### Quota Management
+
+Control API usage and budgets:
+
+```rust
+use celers_broker_sqs::quota_manager::{QuotaManager, QuotaConfig};
+
+let config = QuotaConfig::new()
+    .with_daily_budget(10.0)      // $10/day max
+    .with_monthly_budget(200.0)   // $200/month max
+    .with_per_second_limit(100);  // 100 requests/sec max
+
+let mut quota = QuotaManager::new(config);
+
+// Check before operations
+if quota.check_request(0.0004).await? {
+    broker.publish("my-queue", message).await?;
+} else {
+    println!("Quota exceeded!");
+}
+
+// Get quota status
+let status = quota.status();
+println!("Daily spend: ${:.2}", status.daily_spend_usd);
+```
+
+### Multi-Queue Router
+
+Route messages to multiple queues:
+
+```rust
+use celers_broker_sqs::router::{MessageRouter, RoutingRule, RoutingStrategy};
+
+let mut router = MessageRouter::new();
+
+// Priority-based routing
+router.add_rule(RoutingRule::priority_based(
+    "high-priority-queue",
+    RoutingStrategy::PriorityThreshold(8)
+));
+
+// Pattern-based routing
+router.add_rule(RoutingRule::task_pattern(
+    "analytics-queue",
+    "tasks.analytics.*"
+));
+
+// Route message
+let queue = router.route(&message)?;
+broker.publish(queue, message).await?;
+```
+
+### Performance Profiler
+
+Track and analyze operation latencies:
+
+```rust
+use celers_broker_sqs::profiler::PerformanceProfiler;
+
+let mut profiler = PerformanceProfiler::new();
+
+// Record operations
+let start = Instant::now();
+broker.publish("my-queue", message).await?;
+profiler.record_publish(start.elapsed());
+
+// Get statistics
+let stats = profiler.summary();
+for (op, stat) in stats {
+    println!("{}: P50={:.2}ms, P95={:.2}ms, P99={:.2}ms",
+        op, stat.p50_ms, stat.p95_ms, stat.p99_ms);
+}
+
+// Detect bottlenecks
+let bottlenecks = profiler.detect_bottlenecks(100); // 100ms threshold
+if !bottlenecks.is_empty() {
+    println!("Bottlenecks: {}", bottlenecks.join(", "));
+}
+```
+
+### Backpressure Management
+
+Prevent system overload with automatic throttling:
+
+```rust
+use celers_broker_sqs::backpressure::{BackpressureManager, BackpressureConfig};
+use std::time::Duration;
+
+let config = BackpressureConfig::new()
+    .with_max_in_flight_messages(100)
+    .with_max_processing_time(Duration::from_secs(30))
+    .with_throttle_threshold(0.8)  // Start throttling at 80%
+    .with_stop_threshold(0.95);     // Stop at 95%
+
+let mut manager = BackpressureManager::new(config);
+
+// Check before consuming
+if manager.should_consume() {
+    // Safe to process more messages
+    manager.track_message_start("msg-1");
+    // ... process message ...
+    manager.track_message_complete("msg-1");
+}
+
+// Get metrics
+let metrics = manager.metrics();
+println!("Utilization: {:.1}%", metrics.utilization * 100.0);
+```
+
+### Poison Message Detection
+
+Automatically detect and isolate repeatedly failing messages:
+
+```rust
+use celers_broker_sqs::poison_detector::{PoisonDetector, PoisonConfig};
+use std::time::Duration;
+
+let config = PoisonConfig::new()
+    .with_max_failures(3)
+    .with_failure_window(Duration::from_secs(300))  // 5 minutes
+    .with_auto_isolate(true);
+
+let mut detector = PoisonDetector::new(config);
+
+// Track failures
+if detector.track_failure("msg-123", "Database timeout") {
+    println!("Poison message detected!");
+}
+
+// Get statistics
+let stats = detector.statistics();
+println!("Poison messages: {}", stats.poison_message_count);
+
+// Analyze error patterns
+for pattern in detector.analyze_error_patterns() {
+    println!("{}: {} occurrences", pattern.pattern, pattern.count);
+}
+```
+
+### Cost Alert System
+
+Monitor costs with automatic alerts:
+
+```rust
+use celers_broker_sqs::cost_alerts::{CostAlertSystem, CostAlertConfig};
+use std::sync::Arc;
+
+let config = CostAlertConfig::new()
+    .with_daily_warning_threshold(5.0)
+    .with_daily_critical_threshold(10.0)
+    .with_monthly_warning_threshold(100.0);
+
+let mut alert_system = CostAlertSystem::new(config);
+
+// Register callback
+alert_system.register_callback(Arc::new(|alert| {
+    println!("COST ALERT: {} - ${:.2}", alert.level, alert.amount_usd);
+}));
+
+// Track costs
+alert_system.track_cost(0.0004);  // Per-request cost
+
+// Check budget
+if !alert_system.is_within_budget() {
+    println!("Budget exceeded!");
+}
+```
+
+### Message Replay
+
+Replay messages from DLQ with selective filtering:
+
+```rust
+use celers_broker_sqs::replay::{ReplayManager, ReplayConfig, ReplayFilter};
+use std::time::Duration;
+
+// Configure replay
+let config = ReplayConfig::new()
+    .with_batch_size(10)
+    .with_rate_limit(100)  // 100 messages/sec max
+    .with_retry_failed(true);
+
+let manager = ReplayManager::new(config);
+
+// Create selective filter
+let filter = ReplayFilter::new()
+    .with_time_range_hours(1)
+    .with_task_pattern("tasks.payment.*")
+    .with_min_failure_count(3);
+
+// Messages matching the filter can be replayed
+```
+
+### SLA Monitoring
+
+Track SLA compliance in real-time:
+
+```rust
+use celers_broker_sqs::sla_monitor::{SlaMonitor, SlaTarget};
+use std::time::Duration;
+
+// Define SLA targets
+let targets = SlaTarget::production(); // or SlaTarget::critical()
+
+let mut monitor = SlaMonitor::new(targets);
+
+// Record message processing
+monitor.record_message(Duration::from_millis(150), true);
+
+// Generate compliance report
+let report = monitor.generate_report();
+println!("SLA Compliance: {:.2}%", report.overall_compliance * 100.0);
+println!("P99 Latency: {:?}", report.current_p99);
+
+// Check for violations
+for violation in report.violations {
+    println!("Violation: {:?}", violation.violation_type);
+}
+```
+
+### Lambda Integration Helpers
+
+Process SQS events in AWS Lambda functions:
+
+```rust
+use celers_broker_sqs::lambda_helpers::LambdaEventProcessor;
+
+let processor = LambdaEventProcessor::new()
+    .with_max_retries(2);
+
+// Process Lambda SQS event
+let results = processor.process_event(event_json, |record| {
+    // Your message processing logic
+    println!("Processing: {}", record.message_id);
+    Ok(())
+})?;
+
+// Return partial batch response for failed messages
+if results.has_failures() {
+    let response = results.to_batch_item_failures();
+    return serde_json::to_string(&response);
+}
+```
+
 ## AWS SQS Limits
 
 - **Message size**: 256 KB maximum
@@ -445,17 +788,41 @@ The broker uses AWS SDK's credential chain:
 
 See the `examples/` directory for comprehensive examples:
 
+### Core Features
 - **`basic_usage.rs`** - Basic operations (publish, consume, batch, queue management)
 - **`advanced_features.rs`** - FIFO, DLQ, SSE, CloudWatch, adaptive polling, parallel processing
 - **`cost_optimization.rs`** - Cost reduction strategies and comparisons
 - **`monitoring_alarms.rs`** - CloudWatch metrics and alarms setup
 
+### Production Features
+- **`monitoring_utilities.rs`** - Monitoring utilities (lag analysis, velocity, health assessment)
+- **`production_optimization.rs`** - Auto-tuning and optimization for different workloads
+- **`production_suite.rs`** - Complete production setup with all features
+- **`quota_management.rs`** - API quota and budget management
+- **`routing_patterns.rs`** - Multi-queue routing and message distribution
+- **`distributed_tracing.rs`** - Distributed tracing with correlation IDs
+- **`advanced_production_features.rs`** - Backpressure, poison detection, cost alerts integration ✨ NEW
+- **`lambda_sqs_handler.rs`** - AWS Lambda SQS event processing example ✨ NEW
+- **`replay_and_sla.rs`** - Message replay and SLA monitoring examples ✨ NEW
+
 Run examples:
 ```bash
+# Core features
 cargo run --example basic_usage
 cargo run --example advanced_features
 cargo run --example cost_optimization
 cargo run --example monitoring_alarms
+
+# Production features
+cargo run --example monitoring_utilities
+cargo run --example production_optimization
+cargo run --example production_suite
+cargo run --example quota_management
+cargo run --example routing_patterns
+cargo run --example distributed_tracing
+cargo run --example advanced_production_features  # NEW
+cargo run --example lambda_sqs_handler  # NEW
+cargo run --example replay_and_sla  # NEW
 ```
 
 ## Benchmarks

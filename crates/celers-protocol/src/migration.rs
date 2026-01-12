@@ -32,6 +32,12 @@ pub enum MigrationStrategy {
     Strict,
 }
 
+impl Default for MigrationStrategy {
+    fn default() -> Self {
+        Self::Conservative
+    }
+}
+
 /// Migration compatibility information
 #[derive(Debug, Clone)]
 pub struct CompatibilityInfo {
@@ -365,6 +371,14 @@ mod tests {
         assert_ne!(
             MigrationStrategy::Conservative,
             MigrationStrategy::Permissive
+        );
+    }
+
+    #[test]
+    fn test_migration_strategy_default() {
+        assert_eq!(
+            MigrationStrategy::default(),
+            MigrationStrategy::Conservative
         );
     }
 }

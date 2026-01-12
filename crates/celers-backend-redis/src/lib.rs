@@ -55,12 +55,19 @@
 //! # }
 //! ```
 
+pub mod batch_stream;
 pub mod cache;
 pub mod compression;
 pub mod encryption;
 pub mod event_transport;
 pub mod metrics;
+pub mod monitoring;
+pub mod pipeline;
+pub mod profiler;
 pub mod result_store;
+pub mod retry;
+pub mod telemetry;
+pub mod utilities;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -194,6 +201,22 @@ impl TaskResult {
     /// Check if the task is in an active (non-terminal) state
     pub fn is_active(&self) -> bool {
         !self.is_terminal()
+    }
+
+    /// Check if two TaskResult values are of the same variant type
+    ///
+    /// This compares only the variant, ignoring inner values.
+    /// For example, `Success(1)` and `Success(2)` are considered the same.
+    pub fn same_variant(&self, other: &TaskResult) -> bool {
+        matches!(
+            (self, other),
+            (TaskResult::Pending, TaskResult::Pending)
+                | (TaskResult::Started, TaskResult::Started)
+                | (TaskResult::Success(_), TaskResult::Success(_))
+                | (TaskResult::Failure(_), TaskResult::Failure(_))
+                | (TaskResult::Revoked, TaskResult::Revoked)
+                | (TaskResult::Retry(_), TaskResult::Retry(_))
+        )
     }
 
     /// Get the success result value if the task succeeded
@@ -339,6 +362,14 @@ pub struct TaskMeta {
     /// Version number for result versioning
     #[serde(default)]
     pub version: u32,
+
+    /// Tags for categorizing and filtering tasks
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
+    /// Custom metadata for flexible key-value storage
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl TaskMeta {
@@ -353,6 +384,8 @@ impl TaskMeta {
             worker: None,
             progress: None,
             version: 0,
+            tags: Vec::new(),
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -397,6 +430,54 @@ impl TaskMeta {
     /// Check if the task is in an active state
     pub fn is_active(&self) -> bool {
         self.result.is_active()
+    }
+
+    /// Add a tag to this task
+    pub fn add_tag(&mut self, tag: impl Into<String>) {
+        let tag = tag.into();
+        if !self.tags.contains(&tag) {
+            self.tags.push(tag);
+        }
+    }
+
+    /// Remove a tag from this task
+    pub fn remove_tag(&mut self, tag: &str) {
+        self.tags.retain(|t| t != tag);
+    }
+
+    /// Check if this task has a specific tag
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|t| t == tag)
+    }
+
+    /// Check if this task has any of the specified tags
+    pub fn has_any_tag(&self, tags: &[String]) -> bool {
+        tags.iter().any(|tag| self.has_tag(tag))
+    }
+
+    /// Check if this task has all of the specified tags
+    pub fn has_all_tags(&self, tags: &[String]) -> bool {
+        tags.iter().all(|tag| self.has_tag(tag))
+    }
+
+    /// Set a custom metadata field
+    pub fn set_metadata(&mut self, key: impl Into<String>, value: serde_json::Value) {
+        self.metadata.insert(key.into(), value);
+    }
+
+    /// Get a custom metadata field
+    pub fn get_metadata(&self, key: &str) -> Option<&serde_json::Value> {
+        self.metadata.get(key)
+    }
+
+    /// Remove a custom metadata field
+    pub fn remove_metadata(&mut self, key: &str) -> Option<serde_json::Value> {
+        self.metadata.remove(key)
+    }
+
+    /// Check if a custom metadata field exists
+    pub fn has_metadata(&self, key: &str) -> bool {
+        self.metadata.contains_key(key)
     }
 }
 
@@ -1333,6 +1414,1795 @@ impl RedisResultBackend {
         }
 
         Ok(deleted)
+    }
+
+    /// Store a result and set its expiration atomically
+    ///
+    /// This is a convenience method that combines `store_result()` and `set_expiration()`
+    /// into a single operation, ensuring the TTL is always set.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, ResultBackend, TaskMeta, ttl};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    /// let meta = TaskMeta::new(task_id, "my_task".to_string());
+    ///
+    /// // Store with automatic expiration
+    /// backend.store_result_with_ttl(task_id, &meta, ttl::LONG).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn store_result_with_ttl(
+        &mut self,
+        task_id: Uuid,
+        meta: &TaskMeta,
+        ttl: Duration,
+    ) -> Result<()> {
+        self.store_result(task_id, meta).await?;
+        self.set_expiration(task_id, ttl).await?;
+        Ok(())
+    }
+
+    /// Store multiple results with the same TTL
+    ///
+    /// This is a convenience method that combines batch store with TTL setting.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, ResultBackend, TaskMeta, ttl};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let results = vec![
+    ///     (Uuid::new_v4(), TaskMeta::new(Uuid::new_v4(), "task1".to_string())),
+    ///     (Uuid::new_v4(), TaskMeta::new(Uuid::new_v4(), "task2".to_string())),
+    /// ];
+    ///
+    /// // Store all with same TTL
+    /// backend.store_results_with_ttl(&results, ttl::LONG).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn store_results_with_ttl(
+        &mut self,
+        results: &[(Uuid, TaskMeta)],
+        ttl: Duration,
+    ) -> Result<()> {
+        self.store_results_batch(results).await?;
+        self.set_multiple_expirations(&results.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ttl)
+            .await?;
+        Ok(())
+    }
+
+    /// Set expiration for multiple tasks at once
+    ///
+    /// This uses pipelining for efficient bulk TTL updates.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, ttl};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    ///
+    /// // Set TTL for all tasks
+    /// backend.set_multiple_expirations(&task_ids, ttl::LONG).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_multiple_expirations(
+        &mut self,
+        task_ids: &[Uuid],
+        ttl: Duration,
+    ) -> Result<()> {
+        if task_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut pipe = redis::pipe();
+
+        let ttl_secs = ttl.as_secs() as i64;
+        for task_id in task_ids {
+            let key = self.task_key(*task_id);
+            pipe.expire(&key, ttl_secs);
+        }
+
+        pipe.query_async::<()>(&mut conn).await?;
+        Ok(())
+    }
+
+    /// Wait for a task result with timeout and polling
+    ///
+    /// Polls the backend until the task reaches a terminal state or timeout is reached.
+    ///
+    /// # Arguments
+    /// * `task_id` - Task to wait for
+    /// * `timeout` - Maximum time to wait
+    /// * `poll_interval` - Time between polls (default: 500ms)
+    ///
+    /// # Returns
+    /// * `Ok(Some(meta))` - Task completed (terminal state)
+    /// * `Ok(None)` - Timeout reached before completion
+    /// * `Err(...)` - Backend error
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    /// use uuid::Uuid;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// // Wait up to 30 seconds for result
+    /// match backend.wait_for_result(
+    ///     task_id,
+    ///     Duration::from_secs(30),
+    ///     Duration::from_millis(500)
+    /// ).await? {
+    ///     Some(meta) => println!("Task completed: {:?}", meta.result),
+    ///     None => println!("Task timed out"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn wait_for_result(
+        &mut self,
+        task_id: Uuid,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<Option<TaskMeta>> {
+        let start = std::time::Instant::now();
+
+        loop {
+            if let Some(meta) = self.get_result(task_id).await? {
+                if meta.is_terminal() {
+                    return Ok(Some(meta));
+                }
+            }
+
+            if start.elapsed() >= timeout {
+                return Ok(None);
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Check if a task is in a terminal state without fetching full metadata
+    ///
+    /// This is more efficient than fetching the full result when you only need to check completion.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// if backend.is_task_complete(task_id).await? {
+    ///     println!("Task is done!");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn is_task_complete(&mut self, task_id: Uuid) -> Result<bool> {
+        if let Some(meta) = self.get_result(task_id).await? {
+            Ok(meta.is_terminal())
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Get the age of a task result (time since creation)
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// if let Some(age) = backend.get_task_age(task_id).await? {
+    ///     println!("Task created {} seconds ago", age.num_seconds());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_task_age(&mut self, task_id: Uuid) -> Result<Option<chrono::Duration>> {
+        if let Some(meta) = self.get_result(task_id).await? {
+            Ok(Some(meta.age()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get or create a task result
+    ///
+    /// If the task exists, returns the existing metadata.
+    /// If not, creates it with the provided metadata.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, ResultBackend, TaskMeta, TaskResult};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// // Get existing or create new
+    /// let meta = backend.get_or_create(
+    ///     task_id,
+    ///     TaskMeta::new(task_id, "my_task".to_string())
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_or_create(&mut self, task_id: Uuid, default: TaskMeta) -> Result<TaskMeta> {
+        if let Some(existing) = self.get_result(task_id).await? {
+            Ok(existing)
+        } else {
+            self.store_result(task_id, &default).await?;
+            Ok(default)
+        }
+    }
+
+    /// Mark a task as failed with an error message and timestamp
+    ///
+    /// Convenience method that sets the task result to Failure and updates completion time.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, ResultBackend};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// backend.mark_failed(task_id, "Connection timeout".to_string()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn mark_failed(&mut self, task_id: Uuid, error: String) -> Result<()> {
+        self.mark_completed(task_id, TaskResult::Failure(error))
+            .await
+    }
+
+    /// Mark a task as successful with a result value and timestamp
+    ///
+    /// Convenience method that sets the task result to Success and updates completion time.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, ResultBackend};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// backend.mark_success(task_id, serde_json::json!({"result": 42})).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn mark_success(&mut self, task_id: Uuid, value: serde_json::Value) -> Result<()> {
+        self.mark_completed(task_id, TaskResult::Success(value))
+            .await
+    }
+
+    /// Mark a task as revoked (cancelled)
+    ///
+    /// Convenience method that sets the task result to Revoked and updates completion time.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, ResultBackend};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// backend.mark_revoked(task_id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn mark_revoked(&mut self, task_id: Uuid) -> Result<()> {
+        self.mark_completed(task_id, TaskResult::Revoked).await
+    }
+
+    /// Get ages for multiple tasks in a single batch operation
+    ///
+    /// This is more efficient than calling `get_task_age` multiple times.
+    ///
+    /// # Returns
+    /// A vector of `Option<chrono::Duration>` corresponding to each task ID.
+    /// Returns `None` for tasks that don't exist.
+    pub async fn get_task_ages_batch(
+        &mut self,
+        task_ids: &[Uuid],
+    ) -> Result<Vec<Option<chrono::Duration>>> {
+        let results = self.get_results_batch(task_ids).await?;
+        let now = Utc::now();
+
+        Ok(results
+            .into_iter()
+            .map(|meta_opt| meta_opt.map(|meta| now.signed_duration_since(meta.created_at)))
+            .collect())
+    }
+
+    /// Get a summary of task states for a list of tasks
+    ///
+    /// Returns statistics about task completion, failures, etc.
+    pub async fn get_task_summary(&mut self, task_ids: &[Uuid]) -> Result<TaskSummary> {
+        let results = self.get_results_batch(task_ids).await?;
+
+        let mut summary = TaskSummary {
+            total: task_ids.len(),
+            found: 0,
+            not_found: 0,
+            pending: 0,
+            started: 0,
+            success: 0,
+            failure: 0,
+            retry: 0,
+            revoked: 0,
+        };
+
+        for result in results {
+            match result {
+                Some(meta) => {
+                    summary.found += 1;
+                    match meta.result {
+                        TaskResult::Pending => summary.pending += 1,
+                        TaskResult::Started => summary.started += 1,
+                        TaskResult::Success(_) => summary.success += 1,
+                        TaskResult::Failure(_) => summary.failure += 1,
+                        TaskResult::Retry(_) => summary.retry += 1,
+                        TaskResult::Revoked => summary.revoked += 1,
+                    }
+                }
+                None => summary.not_found += 1,
+            }
+        }
+
+        Ok(summary)
+    }
+
+    /// Check if a task exists in the backend
+    ///
+    /// This is more efficient than calling `get_result` if you only need to check existence.
+    pub async fn task_exists(&mut self, task_id: Uuid) -> Result<bool> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let key = self.task_key(task_id);
+        let exists: bool = conn.exists(&key).await?;
+        Ok(exists)
+    }
+
+    /// Check existence for multiple tasks in a batch
+    ///
+    /// Returns a vector of booleans indicating whether each task exists.
+    pub async fn tasks_exist_batch(&mut self, task_ids: &[Uuid]) -> Result<Vec<bool>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut pipe = redis::pipe();
+
+        for task_id in task_ids {
+            let key = self.task_key(*task_id);
+            pipe.exists(&key);
+        }
+
+        let results: Vec<bool> = pipe.query_async(&mut conn).await?;
+        Ok(results)
+    }
+
+    /// Get failed tasks from a list of task IDs
+    ///
+    /// Returns task IDs and their error messages for all failed tasks.
+    pub async fn get_failed_tasks(&mut self, task_ids: &[Uuid]) -> Result<Vec<(Uuid, String)>> {
+        let results = self.get_results_batch(task_ids).await?;
+        let mut failed = Vec::new();
+
+        for (task_id, meta_opt) in task_ids.iter().zip(results.iter()) {
+            if let Some(meta) = meta_opt {
+                if let TaskResult::Failure(error) = &meta.result {
+                    failed.push((*task_id, error.clone()));
+                }
+            }
+        }
+
+        Ok(failed)
+    }
+
+    /// Get successful tasks from a list of task IDs
+    ///
+    /// Returns task IDs and their result values for all successful tasks.
+    pub async fn get_successful_tasks(
+        &mut self,
+        task_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, serde_json::Value)>> {
+        let results = self.get_results_batch(task_ids).await?;
+        let mut successful = Vec::new();
+
+        for (task_id, meta_opt) in task_ids.iter().zip(results.iter()) {
+            if let Some(meta) = meta_opt {
+                if let TaskResult::Success(value) = &meta.result {
+                    successful.push((*task_id, value.clone()));
+                }
+            }
+        }
+
+        Ok(successful)
+    }
+
+    /// Cleanup tasks by state
+    ///
+    /// Removes all tasks matching the specified state from a list of task IDs.
+    /// Returns the number of tasks deleted.
+    pub async fn cleanup_by_state(
+        &mut self,
+        task_ids: &[Uuid],
+        target_state: TaskResult,
+    ) -> Result<usize> {
+        let results = self.get_results_batch(task_ids).await?;
+        let mut to_delete = Vec::new();
+
+        for (task_id, meta_opt) in task_ids.iter().zip(results.iter()) {
+            if let Some(meta) = meta_opt {
+                // Compare discriminants (state type) only
+                if std::mem::discriminant(&meta.result) == std::mem::discriminant(&target_state) {
+                    to_delete.push(*task_id);
+                }
+            }
+        }
+
+        if !to_delete.is_empty() {
+            self.delete_results_batch(&to_delete).await?;
+        }
+
+        Ok(to_delete.len())
+    }
+
+    /// Get TTL (time to live) for a task result
+    ///
+    /// Returns the remaining time before the task expires, or None if no TTL is set.
+    pub async fn get_ttl(&mut self, task_id: Uuid) -> Result<Option<Duration>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let key = self.task_key(task_id);
+
+        let ttl_secs: i64 = conn.ttl(&key).await?;
+
+        // Redis returns -1 if key exists but has no TTL, -2 if key doesn't exist
+        if ttl_secs > 0 {
+            Ok(Some(Duration::from_secs(ttl_secs as u64)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Refresh TTL for a task (reset expiration timer)
+    ///
+    /// Extends the TTL of a task by the specified duration from now.
+    pub async fn refresh_ttl(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let key = self.task_key(task_id);
+        let _: bool = conn.expire(&key, ttl.as_secs() as i64).await?;
+        Ok(())
+    }
+
+    /// Refresh TTL for multiple tasks at once
+    ///
+    /// Efficiently updates TTL for multiple tasks using pipelining.
+    /// Returns the number of tasks that had their TTL updated.
+    pub async fn refresh_ttl_batch(&mut self, task_ids: &[Uuid], ttl: Duration) -> Result<usize> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut pipe = redis::pipe();
+
+        for task_id in task_ids {
+            let key = self.task_key(*task_id);
+            pipe.expire(&key, ttl.as_secs() as i64);
+        }
+
+        let results: Vec<bool> = pipe.query_async(&mut conn).await?;
+        Ok(results.iter().filter(|&&r| r).count())
+    }
+
+    /// Remove TTL from a task (make it persistent)
+    ///
+    /// The task will no longer expire automatically.
+    pub async fn persist_task(&mut self, task_id: Uuid) -> Result<()> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let key = self.task_key(task_id);
+        let _: bool = conn.persist(&key).await?;
+        Ok(())
+    }
+
+    /// Count tasks by state in a list of task IDs
+    ///
+    /// Returns a count of how many tasks are in each state.
+    pub async fn count_by_state(&mut self, task_ids: &[Uuid]) -> Result<StateCount> {
+        let results = self.get_results_batch(task_ids).await?;
+
+        let mut counts = StateCount {
+            total: task_ids.len(),
+            pending: 0,
+            started: 0,
+            success: 0,
+            failure: 0,
+            retry: 0,
+            revoked: 0,
+            not_found: 0,
+        };
+
+        for meta_opt in results {
+            match meta_opt {
+                Some(meta) => match meta.result {
+                    TaskResult::Pending => counts.pending += 1,
+                    TaskResult::Started => counts.started += 1,
+                    TaskResult::Success(_) => counts.success += 1,
+                    TaskResult::Failure(_) => counts.failure += 1,
+                    TaskResult::Retry(_) => counts.retry += 1,
+                    TaskResult::Revoked => counts.revoked += 1,
+                },
+                None => counts.not_found += 1,
+            }
+        }
+
+        Ok(counts)
+    }
+
+    // === Transaction Support ===
+
+    /// Atomically store multiple results with optional TTL
+    ///
+    /// Uses Redis MULTI/EXEC transaction to ensure all operations succeed or fail together.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, TaskMeta, ttl};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let results = vec![
+    ///     (Uuid::new_v4(), TaskMeta::new(Uuid::new_v4(), "task1".to_string())),
+    ///     (Uuid::new_v4(), TaskMeta::new(Uuid::new_v4(), "task2".to_string())),
+    /// ];
+    ///
+    /// // Atomically store all results with TTL
+    /// backend.atomic_store_multiple(&results, Some(ttl::LONG)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn atomic_store_multiple(
+        &mut self,
+        results: &[(Uuid, TaskMeta)],
+        ttl: Option<Duration>,
+    ) -> Result<()> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        for (task_id, meta) in results {
+            let key = self.task_key(*task_id);
+            let json = serde_json::to_string(meta)
+                .map_err(|e| BackendError::Serialization(e.to_string()))?;
+            pipe.set(&key, json);
+
+            if let Some(ttl_duration) = ttl {
+                pipe.expire(&key, ttl_duration.as_secs() as i64);
+            }
+        }
+
+        let _: () = pipe.query_async(&mut conn).await?;
+        Ok(())
+    }
+
+    /// Atomically delete multiple task results
+    ///
+    /// Uses Redis transaction to ensure all deletions succeed or fail together.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+    ///
+    /// let deleted = backend.atomic_delete_multiple(&task_ids).await?;
+    /// println!("Deleted {} tasks", deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn atomic_delete_multiple(&mut self, task_ids: &[Uuid]) -> Result<usize> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        for task_id in task_ids {
+            let key = self.task_key(*task_id);
+            pipe.del(&key);
+        }
+
+        let results: Vec<i32> = pipe.query_async(&mut conn).await?;
+        Ok(results.iter().sum::<i32>() as usize)
+    }
+
+    // === Lua Script Support ===
+
+    /// Execute a Lua script for atomic operations
+    ///
+    /// Lua scripts are executed atomically on the Redis server, ensuring thread-safe
+    /// operations without race conditions.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    ///
+    /// // Lua script to increment a counter with max value
+    /// let script = r#"
+    ///     local current = redis.call('GET', KEYS[1])
+    ///     if not current then current = 0 else current = tonumber(current) end
+    ///     local max = tonumber(ARGV[1])
+    ///     if current < max then
+    ///         redis.call('INCR', KEYS[1])
+    ///         return current + 1
+    ///     else
+    ///         return current
+    ///     end
+    /// "#;
+    ///
+    /// let result: i64 = backend.eval_script(
+    ///     script,
+    ///     &["counter_key"],
+    ///     &["100"]
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn eval_script<T: redis::FromRedisValue>(
+        &mut self,
+        script: &str,
+        keys: &[&str],
+        args: &[&str],
+    ) -> Result<T> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let result = redis::Script::new(script)
+            .key(keys)
+            .arg(args)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(result)
+    }
+
+    /// Compare-and-swap operation using Lua script
+    ///
+    /// Atomically updates a task result only if the current state matches the expected state.
+    ///
+    /// # Returns
+    /// - `Ok(true)` if the swap was successful
+    /// - `Ok(false)` if the current state didn't match
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, TaskMeta, TaskResult};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// let mut expected = TaskMeta::new(task_id, "task".to_string());
+    /// expected.result = TaskResult::Started;
+    ///
+    /// let mut new = expected.clone();
+    /// new.result = TaskResult::Success(serde_json::json!({"result": 42}));
+    ///
+    /// // Only updates if task is currently Started
+    /// let swapped = backend.compare_and_swap(task_id, &expected, &new).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn compare_and_swap(
+        &mut self,
+        task_id: Uuid,
+        expected: &TaskMeta,
+        new_value: &TaskMeta,
+    ) -> Result<bool> {
+        let key = self.task_key(task_id);
+        let expected_json = serde_json::to_string(expected)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let new_json = serde_json::to_string(new_value)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+
+        // Lua script for atomic compare-and-swap
+        let script = r#"
+            local current = redis.call('GET', KEYS[1])
+            if current == ARGV[1] then
+                redis.call('SET', KEYS[1], ARGV[2])
+                return 1
+            else
+                return 0
+            end
+        "#;
+
+        let result: i32 = self
+            .eval_script(script, &[&key], &[&expected_json, &new_json])
+            .await?;
+
+        Ok(result == 1)
+    }
+
+    // === Pattern-Based Operations ===
+
+    /// Find all task IDs matching a pattern
+    ///
+    /// Uses SCAN for production-safe iteration without blocking.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    ///
+    /// // Find all tasks (using wildcard pattern)
+    /// let task_ids = backend.find_tasks_by_pattern("*").await?;
+    /// println!("Found {} tasks", task_ids.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn find_tasks_by_pattern(&mut self, pattern: &str) -> Result<Vec<Uuid>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let full_pattern = format!("{}{}", self.key_prefix, pattern);
+
+        let mut task_ids = Vec::new();
+        let mut cursor = 0u64;
+
+        loop {
+            let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&full_pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await?;
+
+            for key in keys {
+                // Extract task ID from key
+                if let Some(id_str) = key.strip_prefix(&self.key_prefix) {
+                    if let Ok(task_id) = Uuid::parse_str(id_str) {
+                        task_ids.push(task_id);
+                    }
+                }
+            }
+
+            cursor = new_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        Ok(task_ids)
+    }
+
+    /// Delete all tasks matching a pattern
+    ///
+    /// Uses SCAN to find matching keys, then deletes them in batches.
+    ///
+    /// # Returns
+    /// Number of tasks deleted
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    ///
+    /// // Delete tasks (example pattern - be careful!)
+    /// // let deleted = backend.delete_tasks_by_pattern("test-*").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn delete_tasks_by_pattern(&mut self, pattern: &str) -> Result<usize> {
+        let task_ids = self.find_tasks_by_pattern(pattern).await?;
+        let count = task_ids.len();
+
+        if count == 0 {
+            return Ok(0);
+        }
+
+        self.delete_results_batch(&task_ids).await?;
+        Ok(count)
+    }
+
+    // === Task Dependencies ===
+
+    /// Store task dependencies (parent-child relationships)
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    ///
+    /// let parent = Uuid::new_v4();
+    /// let children = vec![Uuid::new_v4(), Uuid::new_v4()];
+    ///
+    /// backend.store_task_dependencies(parent, &children).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn store_task_dependencies(
+        &mut self,
+        parent_id: Uuid,
+        child_ids: &[Uuid],
+    ) -> Result<()> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let key = format!("{}deps:{}", self.key_prefix, parent_id);
+
+        let child_strings: Vec<String> = child_ids.iter().map(|id| id.to_string()).collect();
+
+        if !child_strings.is_empty() {
+            let _: () = conn.sadd(&key, child_strings).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get all tasks that depend on a given task
+    ///
+    /// # Returns
+    /// Vector of task IDs that are children of the given parent task
+    pub async fn get_task_dependencies(&mut self, parent_id: Uuid) -> Result<Vec<Uuid>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let key = format!("{}deps:{}", self.key_prefix, parent_id);
+
+        let child_strings: Vec<String> = conn.smembers(&key).await?;
+
+        let child_ids: Vec<Uuid> = child_strings
+            .iter()
+            .filter_map(|s| Uuid::parse_str(s).ok())
+            .collect();
+
+        Ok(child_ids)
+    }
+
+    /// Remove task dependencies
+    pub async fn remove_task_dependencies(&mut self, parent_id: Uuid) -> Result<()> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let key = format!("{}deps:{}", self.key_prefix, parent_id);
+        let _: () = conn.del(&key).await?;
+        Ok(())
+    }
+
+    /// Check if all dependencies of a task are complete
+    ///
+    /// # Returns
+    /// - `Ok(true)` if all dependencies are in terminal state
+    /// - `Ok(false)` if any dependency is still running
+    pub async fn are_dependencies_complete(&mut self, parent_id: Uuid) -> Result<bool> {
+        let child_ids = self.get_task_dependencies(parent_id).await?;
+
+        if child_ids.is_empty() {
+            return Ok(true);
+        }
+
+        let results = self.get_results_batch(&child_ids).await?;
+
+        for meta_opt in results {
+            if let Some(meta) = meta_opt {
+                if !meta.result.is_terminal() {
+                    return Ok(false);
+                }
+            } else {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    // === Connection Monitoring ===
+
+    /// Get detailed Redis connection information
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    ///
+    /// let info = backend.get_connection_info().await?;
+    /// println!("Redis info:\n{}", info);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_connection_info(&mut self) -> Result<String> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let info: String = redis::cmd("INFO").query_async(&mut conn).await?;
+        Ok(info)
+    }
+
+    /// Get Redis server memory statistics
+    ///
+    /// # Returns
+    /// Memory statistics as a map
+    pub async fn get_memory_stats(&mut self) -> Result<std::collections::HashMap<String, String>> {
+        let info = self.get_connection_info().await?;
+        let mut stats = std::collections::HashMap::new();
+
+        for line in info.lines() {
+            if line.starts_with("used_memory") || line.starts_with("maxmemory") {
+                if let Some((key, value)) = line.split_once(':') {
+                    stats.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Test connection latency (ping round-trip time)
+    ///
+    /// # Returns
+    /// Round-trip time in microseconds
+    pub async fn ping_latency(&mut self) -> Result<Duration> {
+        let start = std::time::Instant::now();
+        self.health_check().await?;
+        Ok(start.elapsed())
+    }
+
+    // === Task Querying ===
+
+    /// Query tasks by state
+    ///
+    /// Returns task IDs that match the specified state.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, TaskResult};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    ///
+    /// // Find all failed tasks
+    /// let failed_ids = backend.query_tasks_by_state(TaskResult::Failure("".to_string())).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn query_tasks_by_state(&mut self, target_state: TaskResult) -> Result<Vec<Uuid>> {
+        // Get all task keys
+        let pattern = format!("{}task-meta-*", self.key_prefix);
+        let task_ids = self.find_tasks_by_pattern(&pattern).await?;
+
+        let mut matching_ids = Vec::new();
+
+        // Filter by state
+        for task_id in task_ids {
+            if let Some(meta) = self.get_result(task_id).await? {
+                if meta.result.same_variant(&target_state) {
+                    matching_ids.push(task_id);
+                }
+            }
+        }
+
+        Ok(matching_ids)
+    }
+
+    /// Query tasks by worker name
+    ///
+    /// Returns task IDs that were executed by the specified worker.
+    pub async fn query_tasks_by_worker(&mut self, worker_name: &str) -> Result<Vec<Uuid>> {
+        let pattern = format!("{}task-meta-*", self.key_prefix);
+        let task_ids = self.find_tasks_by_pattern(&pattern).await?;
+
+        let mut matching_ids = Vec::new();
+
+        for task_id in task_ids {
+            if let Some(meta) = self.get_result(task_id).await? {
+                if let Some(ref worker) = meta.worker {
+                    if worker == worker_name {
+                        matching_ids.push(task_id);
+                    }
+                }
+            }
+        }
+
+        Ok(matching_ids)
+    }
+
+    /// Query tasks created within a time range
+    ///
+    /// # Arguments
+    /// * `start` - Start time (inclusive)
+    /// * `end` - End time (inclusive)
+    ///
+    /// # Returns
+    /// Vector of task IDs created within the specified time range
+    pub async fn query_tasks_by_time_range(
+        &mut self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<Uuid>> {
+        let pattern = format!("{}task-meta-*", self.key_prefix);
+        let task_ids = self.find_tasks_by_pattern(&pattern).await?;
+
+        let mut matching_ids = Vec::new();
+
+        for task_id in task_ids {
+            if let Some(meta) = self.get_result(task_id).await? {
+                if meta.created_at >= start && meta.created_at <= end {
+                    matching_ids.push(task_id);
+                }
+            }
+        }
+
+        Ok(matching_ids)
+    }
+
+    /// Query tasks by multiple criteria
+    ///
+    /// # Arguments
+    /// * `criteria` - Query criteria to filter tasks
+    ///
+    /// # Returns
+    /// Vector of task IDs that match all specified criteria
+    pub async fn query_tasks(&mut self, criteria: TaskQuery) -> Result<Vec<Uuid>> {
+        let pattern = format!("{}task-meta-*", self.key_prefix);
+        let task_ids = self.find_tasks_by_pattern(&pattern).await?;
+
+        let mut matching_ids = Vec::new();
+
+        for task_id in task_ids {
+            if let Some(meta) = self.get_result(task_id).await? {
+                if criteria.matches(&meta) {
+                    matching_ids.push(task_id);
+                }
+            }
+        }
+
+        Ok(matching_ids)
+    }
+
+    /// Query tasks by tags (task must have all specified tags)
+    ///
+    /// This is a convenience method that wraps `query_tasks` with a tag filter.
+    pub async fn query_tasks_by_tags(&mut self, tags: Vec<String>) -> Result<Vec<Uuid>> {
+        let criteria = TaskQuery::new().with_tags(tags);
+        self.query_tasks(criteria).await
+    }
+
+    /// Count tasks with specific tags
+    ///
+    /// Returns the number of tasks that have all specified tags.
+    pub async fn count_tasks_by_tags(&mut self, tags: Vec<String>) -> Result<usize> {
+        let task_ids = self.query_tasks_by_tags(tags).await?;
+        Ok(task_ids.len())
+    }
+
+    /// Bulk delete tasks with specific tags
+    ///
+    /// Deletes all tasks that have all specified tags.
+    /// Returns the number of tasks deleted.
+    pub async fn bulk_delete_by_tags(&mut self, tags: Vec<String>) -> Result<usize> {
+        let task_ids = self.query_tasks_by_tags(tags).await?;
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+        self.delete_results_batch(&task_ids).await?;
+        Ok(task_ids.len())
+    }
+
+    /// Bulk revoke tasks with specific tags
+    ///
+    /// Revokes all tasks that have all specified tags.
+    /// Returns the number of tasks revoked.
+    pub async fn bulk_revoke_by_tags(&mut self, tags: Vec<String>) -> Result<usize> {
+        let task_ids = self.query_tasks_by_tags(tags).await?;
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+        self.bulk_transition_state(&task_ids, TaskResult::Revoked)
+            .await
+    }
+
+    /// Bulk set TTL for tasks with specific tags
+    ///
+    /// Sets expiration time for all tasks that have all specified tags.
+    /// Returns the number of tasks updated.
+    pub async fn bulk_set_ttl_by_tags(
+        &mut self,
+        tags: Vec<String>,
+        ttl: Duration,
+    ) -> Result<usize> {
+        let task_ids = self.query_tasks_by_tags(tags).await?;
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+        self.set_multiple_expirations(&task_ids, ttl).await?;
+        Ok(task_ids.len())
+    }
+
+    /// Store multiple results with detailed error tracking
+    ///
+    /// Attempts to store all results and returns detailed information about
+    /// successes and failures. Unlike `store_results_batch`, this method
+    /// continues on errors and reports which specific tasks failed.
+    pub async fn store_results_with_details(
+        &mut self,
+        results: &[(Uuid, TaskMeta)],
+    ) -> BatchOperationResult {
+        let mut batch_result = BatchOperationResult::new();
+
+        for (task_id, meta) in results {
+            match self.store_result(*task_id, meta).await {
+                Ok(()) => batch_result.record_success(*task_id),
+                Err(e) => batch_result.record_failure(*task_id, e.to_string()),
+            }
+        }
+
+        batch_result
+    }
+
+    /// Delete multiple results with detailed error tracking
+    ///
+    /// Attempts to delete all results and returns detailed information about
+    /// successes and failures.
+    pub async fn delete_results_with_details(&mut self, task_ids: &[Uuid]) -> BatchOperationResult {
+        let mut batch_result = BatchOperationResult::new();
+
+        for task_id in task_ids {
+            match self.delete_result(*task_id).await {
+                Ok(()) => batch_result.record_success(*task_id),
+                Err(e) => batch_result.record_failure(*task_id, e.to_string()),
+            }
+        }
+
+        batch_result
+    }
+
+    // === Bulk State Transitions ===
+
+    /// Transition multiple tasks to a new state atomically
+    ///
+    /// This is useful for operational tasks like bulk revocation.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::{RedisResultBackend, TaskResult};
+    /// use uuid::Uuid;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+    ///
+    /// // Revoke all tasks
+    /// let count = backend.bulk_transition_state(&task_ids, TaskResult::Revoked).await?;
+    /// println!("Transitioned {} tasks", count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn bulk_transition_state(
+        &mut self,
+        task_ids: &[Uuid],
+        new_state: TaskResult,
+    ) -> Result<usize> {
+        let mut count = 0;
+
+        for &task_id in task_ids {
+            if let Some(mut meta) = self.get_result(task_id).await? {
+                meta.result = new_state.clone();
+
+                // Update completion timestamp for terminal states
+                if new_state.is_terminal() && meta.completed_at.is_none() {
+                    meta.completed_at = Some(Utc::now());
+                }
+
+                self.store_result(task_id, &meta).await?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Bulk revoke tasks by pattern
+    ///
+    /// Finds all tasks matching the pattern and transitions them to Revoked state.
+    ///
+    /// # Returns
+    /// Number of tasks revoked
+    pub async fn bulk_revoke_by_pattern(&mut self, pattern: &str) -> Result<usize> {
+        let task_ids = self.find_tasks_by_pattern(pattern).await?;
+        self.bulk_transition_state(&task_ids, TaskResult::Revoked)
+            .await
+    }
+
+    // === Metadata Partial Updates ===
+
+    /// Update only the worker field of task metadata
+    ///
+    /// This is more efficient than fetching and storing the entire metadata.
+    pub async fn update_worker(&mut self, task_id: Uuid, worker: String) -> Result<()> {
+        if let Some(mut meta) = self.get_result(task_id).await? {
+            meta.worker = Some(worker);
+            self.store_result(task_id, &meta).await?;
+        }
+        Ok(())
+    }
+
+    /// Update only the progress field of task metadata
+    pub async fn update_progress_field(
+        &mut self,
+        task_id: Uuid,
+        progress: ProgressInfo,
+    ) -> Result<()> {
+        if let Some(mut meta) = self.get_result(task_id).await? {
+            meta.progress = Some(progress);
+            self.store_result(task_id, &meta).await?;
+        }
+        Ok(())
+    }
+
+    /// Increment version number of a task
+    ///
+    /// This is useful for optimistic locking or tracking how many times
+    /// a task result has been updated.
+    pub async fn increment_version(&mut self, task_id: Uuid) -> Result<u32> {
+        if let Some(mut meta) = self.get_result(task_id).await? {
+            meta.version += 1;
+            let new_version = meta.version;
+            self.store_result(task_id, &meta).await?;
+            Ok(new_version)
+        } else {
+            Err(BackendError::NotFound(task_id))
+        }
+    }
+
+    // === Result Archival ===
+
+    /// Copy task results to an archive key with a longer TTL
+    ///
+    /// This is useful for preserving important results before they expire.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use celers_backend_redis::RedisResultBackend;
+    /// use uuid::Uuid;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
+    /// let task_id = Uuid::new_v4();
+    ///
+    /// // Archive with 90-day retention
+    /// backend.archive_result(task_id, Duration::from_secs(90 * 86400)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn archive_result(&mut self, task_id: Uuid, archive_ttl: Duration) -> Result<()> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+
+        let source_key = format!("{}task-meta-{}", self.key_prefix, task_id);
+        let archive_key = format!("{}archive:task-meta-{}", self.key_prefix, task_id);
+
+        // Copy to archive key
+        let _: () = redis::cmd("COPY")
+            .arg(&source_key)
+            .arg(&archive_key)
+            .arg("REPLACE")
+            .query_async(&mut conn)
+            .await?;
+
+        // Set TTL on archive
+        let ttl_secs = archive_ttl.as_secs() as i64;
+        let _: () = conn.expire(&archive_key, ttl_secs).await?;
+
+        Ok(())
+    }
+
+    /// Retrieve an archived task result
+    pub async fn get_archived_result(&mut self, task_id: Uuid) -> Result<Option<TaskMeta>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let archive_key = format!("{}archive:task-meta-{}", self.key_prefix, task_id);
+
+        let data: Option<String> = conn.get(&archive_key).await?;
+
+        match data {
+            Some(json_str) => {
+                let meta: TaskMeta = serde_json::from_str(&json_str)
+                    .map_err(|e| BackendError::Serialization(e.to_string()))?;
+                Ok(Some(meta))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Bulk archive multiple task results
+    pub async fn archive_results_batch(
+        &mut self,
+        task_ids: &[Uuid],
+        archive_ttl: Duration,
+    ) -> Result<usize> {
+        let mut count = 0;
+
+        for &task_id in task_ids {
+            if self.archive_result(task_id, archive_ttl).await.is_ok() {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    // === Connection Pool Statistics ===
+
+    /// Get connection pool statistics
+    ///
+    /// Returns statistics about the Redis connection pool,
+    /// including active connections and pool capacity.
+    ///
+    /// # Returns
+    /// Connection pool statistics
+    pub async fn get_pool_stats(&self) -> PoolStats {
+        // Note: redis-rs multiplexed connections don't expose pool stats directly
+        // This is a placeholder that returns basic info
+        PoolStats {
+            backend_type: "redis".to_string(),
+            connection_mode: "multiplexed".to_string(),
+            is_connected: true,
+        }
+    }
+}
+
+/// Query criteria for filtering tasks
+#[derive(Debug, Clone, Default)]
+pub struct TaskQuery {
+    /// Filter by task state
+    pub state: Option<TaskResult>,
+    /// Filter by worker name
+    pub worker: Option<String>,
+    /// Filter by creation time (start of range)
+    pub created_after: Option<DateTime<Utc>>,
+    /// Filter by creation time (end of range)
+    pub created_before: Option<DateTime<Utc>>,
+    /// Filter by task name pattern
+    pub task_name_pattern: Option<String>,
+    /// Filter by tags (task must have all specified tags)
+    pub tags: Vec<String>,
+    /// Filter by metadata key-value pairs (task must have all specified key-value pairs)
+    pub metadata: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl TaskQuery {
+    /// Create a new empty query
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Filter by state
+    pub fn with_state(mut self, state: TaskResult) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// Filter by worker
+    pub fn with_worker(mut self, worker: impl Into<String>) -> Self {
+        self.worker = Some(worker.into());
+        self
+    }
+
+    /// Filter by creation time range
+    pub fn with_time_range(mut self, start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
+        self.created_after = Some(start);
+        self.created_before = Some(end);
+        self
+    }
+
+    /// Filter by task name pattern (simple substring match)
+    pub fn with_task_name_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.task_name_pattern = Some(pattern.into());
+        self
+    }
+
+    /// Filter by tag (task must have this tag)
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Filter by multiple tags (task must have all specified tags)
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags.extend(tags);
+        self
+    }
+
+    /// Filter by metadata field (task must have this exact key-value pair)
+    pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+
+    /// Check if a task matches all criteria
+    pub fn matches(&self, meta: &TaskMeta) -> bool {
+        // Check state
+        if let Some(ref target_state) = self.state {
+            if !meta.result.same_variant(target_state) {
+                return false;
+            }
+        }
+
+        // Check worker
+        if let Some(ref target_worker) = self.worker {
+            if meta.worker.as_ref() != Some(target_worker) {
+                return false;
+            }
+        }
+
+        // Check creation time range
+        if let Some(start) = self.created_after {
+            if meta.created_at < start {
+                return false;
+            }
+        }
+        if let Some(end) = self.created_before {
+            if meta.created_at > end {
+                return false;
+            }
+        }
+
+        // Check task name pattern
+        if let Some(ref pattern) = self.task_name_pattern {
+            if !meta.task_name.contains(pattern) {
+                return false;
+            }
+        }
+
+        // Check tags (task must have all specified tags)
+        if !self.tags.is_empty() && !meta.has_all_tags(&self.tags) {
+            return false;
+        }
+
+        // Check metadata (task must have all specified key-value pairs)
+        for (key, value) in &self.metadata {
+            match meta.get_metadata(key) {
+                Some(meta_value) if meta_value == value => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+}
+
+/// Batch operation result with detailed success/failure tracking
+#[derive(Debug, Clone)]
+pub struct BatchOperationResult {
+    /// Total number of operations attempted
+    pub total: usize,
+    /// Number of successful operations
+    pub successful: usize,
+    /// Number of failed operations
+    pub failed: usize,
+    /// Task IDs that succeeded
+    pub succeeded_ids: Vec<Uuid>,
+    /// Task IDs that failed with error messages
+    pub failed_ids: Vec<(Uuid, String)>,
+}
+
+impl BatchOperationResult {
+    /// Create a new empty batch result
+    pub fn new() -> Self {
+        Self {
+            total: 0,
+            successful: 0,
+            failed: 0,
+            succeeded_ids: Vec::new(),
+            failed_ids: Vec::new(),
+        }
+    }
+
+    /// Record a successful operation
+    pub fn record_success(&mut self, task_id: Uuid) {
+        self.total += 1;
+        self.successful += 1;
+        self.succeeded_ids.push(task_id);
+    }
+
+    /// Record a failed operation
+    pub fn record_failure(&mut self, task_id: Uuid, error: String) {
+        self.total += 1;
+        self.failed += 1;
+        self.failed_ids.push((task_id, error));
+    }
+
+    /// Check if all operations succeeded
+    pub fn all_succeeded(&self) -> bool {
+        self.failed == 0 && self.total > 0
+    }
+
+    /// Check if any operations failed
+    pub fn has_failures(&self) -> bool {
+        self.failed > 0
+    }
+
+    /// Get success rate (0.0 to 1.0)
+    pub fn success_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.successful as f64 / self.total as f64
+        }
+    }
+
+    /// Get failure rate (0.0 to 1.0)
+    pub fn failure_rate(&self) -> f64 {
+        1.0 - self.success_rate()
+    }
+}
+
+impl Default for BatchOperationResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for BatchOperationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Batch Operation Result:")?;
+        writeln!(f, "  Total: {}", self.total)?;
+        writeln!(
+            f,
+            "  Successful: {} ({:.1}%)",
+            self.successful,
+            self.success_rate() * 100.0
+        )?;
+        writeln!(
+            f,
+            "  Failed: {} ({:.1}%)",
+            self.failed,
+            self.failure_rate() * 100.0
+        )?;
+        if !self.failed_ids.is_empty() {
+            writeln!(f, "  Failed IDs:")?;
+            for (id, error) in self.failed_ids.iter().take(5) {
+                writeln!(f, "    {} - {}", &id.to_string()[..8], error)?;
+            }
+            if self.failed_ids.len() > 5 {
+                writeln!(f, "    ... and {} more", self.failed_ids.len() - 5)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Connection pool statistics
+#[derive(Debug, Clone)]
+pub struct PoolStats {
+    /// Backend type
+    pub backend_type: String,
+    /// Connection mode (multiplexed, pooled, etc.)
+    pub connection_mode: String,
+    /// Whether connected to Redis
+    pub is_connected: bool,
+}
+
+impl std::fmt::Display for PoolStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PoolStats: type={}, mode={}, connected={}",
+            self.backend_type, self.connection_mode, self.is_connected
+        )
+    }
+}
+
+/// Count of tasks by state
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateCount {
+    /// Total number of tasks queried
+    pub total: usize,
+    /// Number of pending tasks
+    pub pending: usize,
+    /// Number of started tasks
+    pub started: usize,
+    /// Number of successful tasks
+    pub success: usize,
+    /// Number of failed tasks
+    pub failure: usize,
+    /// Number of tasks being retried
+    pub retry: usize,
+    /// Number of revoked tasks
+    pub revoked: usize,
+    /// Number of tasks not found
+    pub not_found: usize,
+}
+
+impl StateCount {
+    /// Get the percentage of tasks in each state
+    pub fn percentages(&self) -> StatePercentages {
+        let total = self.total as f64;
+        if total == 0.0 {
+            return StatePercentages::default();
+        }
+
+        StatePercentages {
+            pending: (self.pending as f64 / total) * 100.0,
+            started: (self.started as f64 / total) * 100.0,
+            success: (self.success as f64 / total) * 100.0,
+            failure: (self.failure as f64 / total) * 100.0,
+            retry: (self.retry as f64 / total) * 100.0,
+            revoked: (self.revoked as f64 / total) * 100.0,
+            not_found: (self.not_found as f64 / total) * 100.0,
+        }
+    }
+}
+
+impl std::fmt::Display for StateCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "StateCount (Total: {}):", self.total)?;
+        writeln!(f, "  Pending: {}", self.pending)?;
+        writeln!(f, "  Started: {}", self.started)?;
+        writeln!(f, "  Success: {}", self.success)?;
+        writeln!(f, "  Failure: {}", self.failure)?;
+        writeln!(f, "  Retry: {}", self.retry)?;
+        writeln!(f, "  Revoked: {}", self.revoked)?;
+        write!(f, "  Not Found: {}", self.not_found)?;
+        Ok(())
+    }
+}
+
+/// Percentage breakdown of task states
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatePercentages {
+    pub pending: f64,
+    pub started: f64,
+    pub success: f64,
+    pub failure: f64,
+    pub retry: f64,
+    pub revoked: f64,
+    pub not_found: f64,
+}
+
+impl Default for StatePercentages {
+    fn default() -> Self {
+        Self {
+            pending: 0.0,
+            started: 0.0,
+            success: 0.0,
+            failure: 0.0,
+            retry: 0.0,
+            revoked: 0.0,
+            not_found: 0.0,
+        }
+    }
+}
+
+impl std::fmt::Display for StatePercentages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "State Percentages:")?;
+        writeln!(f, "  Pending: {:.1}%", self.pending)?;
+        writeln!(f, "  Started: {:.1}%", self.started)?;
+        writeln!(f, "  Success: {:.1}%", self.success)?;
+        writeln!(f, "  Failure: {:.1}%", self.failure)?;
+        writeln!(f, "  Retry: {:.1}%", self.retry)?;
+        writeln!(f, "  Revoked: {:.1}%", self.revoked)?;
+        write!(f, "  Not Found: {:.1}%", self.not_found)?;
+        Ok(())
+    }
+}
+
+/// Summary statistics for a collection of tasks
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSummary {
+    /// Total number of tasks queried
+    pub total: usize,
+    /// Number of tasks found in backend
+    pub found: usize,
+    /// Number of tasks not found
+    pub not_found: usize,
+    /// Number of pending tasks
+    pub pending: usize,
+    /// Number of started tasks
+    pub started: usize,
+    /// Number of successful tasks
+    pub success: usize,
+    /// Number of failed tasks
+    pub failure: usize,
+    /// Number of tasks being retried
+    pub retry: usize,
+    /// Number of revoked tasks
+    pub revoked: usize,
+}
+
+impl TaskSummary {
+    /// Get the completion rate (0.0 to 1.0)
+    pub fn completion_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.success + self.failure + self.revoked) as f64 / self.total as f64
+        }
+    }
+
+    /// Get the success rate (0.0 to 1.0)
+    pub fn success_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.success as f64 / self.total as f64
+        }
+    }
+
+    /// Get the failure rate (0.0 to 1.0)
+    pub fn failure_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.failure as f64 / self.total as f64
+        }
+    }
+
+    /// Check if all tasks are complete
+    pub fn all_complete(&self) -> bool {
+        self.pending == 0 && self.started == 0 && self.retry == 0
+    }
+
+    /// Check if any tasks have failed
+    pub fn has_failures(&self) -> bool {
+        self.failure > 0
+    }
+}
+
+impl std::fmt::Display for TaskSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "TaskSummary:")?;
+        writeln!(f, "  Total: {}", self.total)?;
+        writeln!(f, "  Found: {} | Not Found: {}", self.found, self.not_found)?;
+        writeln!(
+            f,
+            "  Pending: {} | Started: {} | Retry: {}",
+            self.pending, self.started, self.retry
+        )?;
+        writeln!(
+            f,
+            "  Success: {} | Failure: {} | Revoked: {}",
+            self.success, self.failure, self.revoked
+        )?;
+        writeln!(
+            f,
+            "  Completion Rate: {:.1}%",
+            self.completion_rate() * 100.0
+        )?;
+        writeln!(f, "  Success Rate: {:.1}%", self.success_rate() * 100.0)?;
+        write!(f, "  Failure Rate: {:.1}%", self.failure_rate() * 100.0)?;
+        Ok(())
     }
 }
 
@@ -2836,5 +4706,427 @@ mod tests {
         // Verify chord is gone
         let result = backend.chord_get_state(chord_id).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_task_summary_creation() {
+        let summary = TaskSummary {
+            total: 10,
+            found: 8,
+            not_found: 2,
+            pending: 2,
+            started: 1,
+            success: 4,
+            failure: 1,
+            retry: 0,
+            revoked: 0,
+        };
+
+        assert_eq!(summary.total, 10);
+        assert_eq!(summary.success, 4);
+        assert_eq!(summary.failure, 1);
+    }
+
+    #[test]
+    fn test_task_summary_rates() {
+        let summary = TaskSummary {
+            total: 10,
+            found: 10,
+            not_found: 0,
+            pending: 0,
+            started: 0,
+            success: 7,
+            failure: 2,
+            retry: 0,
+            revoked: 1,
+        };
+
+        assert_eq!(summary.completion_rate(), 1.0);
+        assert_eq!(summary.success_rate(), 0.7);
+        assert_eq!(summary.failure_rate(), 0.2);
+        assert!(summary.all_complete());
+        assert!(summary.has_failures());
+    }
+
+    #[test]
+    fn test_task_summary_edge_cases() {
+        let empty = TaskSummary {
+            total: 0,
+            found: 0,
+            not_found: 0,
+            pending: 0,
+            started: 0,
+            success: 0,
+            failure: 0,
+            retry: 0,
+            revoked: 0,
+        };
+
+        assert_eq!(empty.completion_rate(), 0.0);
+        assert_eq!(empty.success_rate(), 0.0);
+        assert_eq!(empty.failure_rate(), 0.0);
+        assert!(empty.all_complete());
+        assert!(!empty.has_failures());
+    }
+
+    #[test]
+    fn test_task_summary_display() {
+        let summary = TaskSummary {
+            total: 5,
+            found: 5,
+            not_found: 0,
+            pending: 1,
+            started: 0,
+            success: 3,
+            failure: 1,
+            retry: 0,
+            revoked: 0,
+        };
+
+        let display = format!("{}", summary);
+        assert!(display.contains("Total: 5"));
+        assert!(display.contains("Success: 3"));
+        assert!(display.contains("Failure: 1"));
+    }
+
+    #[test]
+    fn test_state_count_creation() {
+        let counts = StateCount {
+            total: 20,
+            pending: 3,
+            started: 2,
+            success: 10,
+            failure: 3,
+            retry: 1,
+            revoked: 1,
+            not_found: 0,
+        };
+
+        assert_eq!(counts.total, 20);
+        assert_eq!(counts.success, 10);
+        assert_eq!(counts.failure, 3);
+    }
+
+    #[test]
+    fn test_state_count_percentages() {
+        let counts = StateCount {
+            total: 10,
+            pending: 1,
+            started: 1,
+            success: 5,
+            failure: 2,
+            retry: 1,
+            revoked: 0,
+            not_found: 0,
+        };
+
+        let percentages = counts.percentages();
+        assert_eq!(percentages.success, 50.0);
+        assert_eq!(percentages.failure, 20.0);
+        assert_eq!(percentages.pending, 10.0);
+    }
+
+    #[test]
+    fn test_state_count_percentages_zero_total() {
+        let counts = StateCount {
+            total: 0,
+            pending: 0,
+            started: 0,
+            success: 0,
+            failure: 0,
+            retry: 0,
+            revoked: 0,
+            not_found: 0,
+        };
+
+        let percentages = counts.percentages();
+        assert_eq!(percentages.success, 0.0);
+        assert_eq!(percentages.failure, 0.0);
+    }
+
+    #[test]
+    fn test_state_count_display() {
+        let counts = StateCount {
+            total: 10,
+            pending: 2,
+            started: 1,
+            success: 5,
+            failure: 1,
+            retry: 1,
+            revoked: 0,
+            not_found: 0,
+        };
+
+        let display = format!("{}", counts);
+        assert!(display.contains("Total: 10"));
+        assert!(display.contains("Success: 5"));
+        assert!(display.contains("Pending: 2"));
+    }
+
+    #[test]
+    fn test_state_percentages_display() {
+        let percentages = StatePercentages {
+            pending: 10.0,
+            started: 10.0,
+            success: 50.0,
+            failure: 20.0,
+            retry: 10.0,
+            revoked: 0.0,
+            not_found: 0.0,
+        };
+
+        let display = format!("{}", percentages);
+        assert!(display.contains("Success: 50.0%"));
+        assert!(display.contains("Failure: 20.0%"));
+    }
+
+    #[test]
+    fn test_state_percentages_default() {
+        let percentages = StatePercentages::default();
+        assert_eq!(percentages.pending, 0.0);
+        assert_eq!(percentages.success, 0.0);
+        assert_eq!(percentages.failure, 0.0);
+    }
+
+    #[test]
+    fn test_task_meta_tags() {
+        let mut meta = TaskMeta::new(Uuid::new_v4(), "test_task".to_string());
+
+        // Initially no tags
+        assert!(meta.tags.is_empty());
+        assert!(!meta.has_tag("tag1"));
+
+        // Add tags
+        meta.add_tag("tag1");
+        meta.add_tag("tag2");
+        assert_eq!(meta.tags.len(), 2);
+        assert!(meta.has_tag("tag1"));
+        assert!(meta.has_tag("tag2"));
+
+        // Duplicate tags should not be added
+        meta.add_tag("tag1");
+        assert_eq!(meta.tags.len(), 2);
+
+        // Check any/all tags
+        assert!(meta.has_any_tag(&["tag1".to_string()]));
+        assert!(meta.has_any_tag(&["tag3".to_string(), "tag1".to_string()]));
+        assert!(!meta.has_any_tag(&["tag3".to_string(), "tag4".to_string()]));
+
+        assert!(meta.has_all_tags(&["tag1".to_string(), "tag2".to_string()]));
+        assert!(!meta.has_all_tags(&["tag1".to_string(), "tag3".to_string()]));
+
+        // Remove tags
+        meta.remove_tag("tag1");
+        assert_eq!(meta.tags.len(), 1);
+        assert!(!meta.has_tag("tag1"));
+        assert!(meta.has_tag("tag2"));
+    }
+
+    #[test]
+    fn test_task_meta_metadata() {
+        let mut meta = TaskMeta::new(Uuid::new_v4(), "test_task".to_string());
+
+        // Initially no metadata
+        assert!(meta.metadata.is_empty());
+        assert!(!meta.has_metadata("key1"));
+
+        // Set metadata
+        meta.set_metadata("key1", serde_json::json!("value1"));
+        meta.set_metadata("key2", serde_json::json!(42));
+        assert_eq!(meta.metadata.len(), 2);
+        assert!(meta.has_metadata("key1"));
+        assert!(meta.has_metadata("key2"));
+
+        // Get metadata
+        assert_eq!(
+            meta.get_metadata("key1"),
+            Some(&serde_json::json!("value1"))
+        );
+        assert_eq!(meta.get_metadata("key2"), Some(&serde_json::json!(42)));
+        assert_eq!(meta.get_metadata("key3"), None);
+
+        // Remove metadata
+        let removed = meta.remove_metadata("key1");
+        assert_eq!(removed, Some(serde_json::json!("value1")));
+        assert_eq!(meta.metadata.len(), 1);
+        assert!(!meta.has_metadata("key1"));
+        assert!(meta.has_metadata("key2"));
+    }
+
+    #[test]
+    fn test_task_query_with_tags() {
+        let mut meta = TaskMeta::new(Uuid::new_v4(), "test_task".to_string());
+        meta.add_tag("production");
+        meta.add_tag("high-priority");
+
+        // Query with matching tags
+        let query = TaskQuery::new().with_tag("production");
+        assert!(query.matches(&meta));
+
+        // Query with multiple matching tags
+        let query =
+            TaskQuery::new().with_tags(vec!["production".to_string(), "high-priority".to_string()]);
+        assert!(query.matches(&meta));
+
+        // Query with non-matching tag
+        let query = TaskQuery::new().with_tag("low-priority");
+        assert!(!query.matches(&meta));
+
+        // Query with partial match (should fail as it requires all tags)
+        let query =
+            TaskQuery::new().with_tags(vec!["production".to_string(), "experimental".to_string()]);
+        assert!(!query.matches(&meta));
+    }
+
+    #[test]
+    fn test_task_query_with_metadata() {
+        let mut meta = TaskMeta::new(Uuid::new_v4(), "test_task".to_string());
+        meta.set_metadata("environment", serde_json::json!("production"));
+        meta.set_metadata("priority", serde_json::json!(5));
+
+        // Query with matching metadata
+        let query = TaskQuery::new().with_metadata("environment", serde_json::json!("production"));
+        assert!(query.matches(&meta));
+
+        // Query with multiple matching metadata fields
+        let mut query = TaskQuery::new();
+        query = query.with_metadata("environment", serde_json::json!("production"));
+        query = query.with_metadata("priority", serde_json::json!(5));
+        assert!(query.matches(&meta));
+
+        // Query with non-matching metadata value
+        let query = TaskQuery::new().with_metadata("environment", serde_json::json!("development"));
+        assert!(!query.matches(&meta));
+
+        // Query with non-existent metadata key
+        let query = TaskQuery::new().with_metadata("nonexistent", serde_json::json!("value"));
+        assert!(!query.matches(&meta));
+    }
+
+    #[test]
+    fn test_task_query_combined_criteria() {
+        let mut meta = TaskMeta::new(Uuid::new_v4(), "test_task".to_string());
+        meta.result = TaskResult::Success(serde_json::json!({"result": "ok"}));
+        meta.worker = Some("worker-1".to_string());
+        meta.add_tag("production");
+        meta.set_metadata("environment", serde_json::json!("prod"));
+
+        // Query with all matching criteria
+        let query = TaskQuery::new()
+            .with_state(TaskResult::Success(serde_json::json!(null)))
+            .with_worker("worker-1")
+            .with_tag("production")
+            .with_metadata("environment", serde_json::json!("prod"));
+        assert!(query.matches(&meta));
+
+        // Query with one non-matching criterion
+        let query = TaskQuery::new()
+            .with_state(TaskResult::Success(serde_json::json!(null)))
+            .with_worker("worker-2") // Different worker
+            .with_tag("production")
+            .with_metadata("environment", serde_json::json!("prod"));
+        assert!(!query.matches(&meta));
+    }
+
+    #[test]
+    fn test_task_meta_serialization_with_tags_and_metadata() {
+        let mut meta = TaskMeta::new(Uuid::new_v4(), "test_task".to_string());
+        meta.add_tag("tag1");
+        meta.add_tag("tag2");
+        meta.set_metadata("key1", serde_json::json!("value1"));
+        meta.set_metadata("key2", serde_json::json!(42));
+
+        // Serialize
+        let json = serde_json::to_string(&meta).unwrap();
+
+        // Deserialize
+        let deserialized: TaskMeta = serde_json::from_str(&json).unwrap();
+
+        // Verify tags
+        assert_eq!(deserialized.tags.len(), 2);
+        assert!(deserialized.has_tag("tag1"));
+        assert!(deserialized.has_tag("tag2"));
+
+        // Verify metadata
+        assert_eq!(deserialized.metadata.len(), 2);
+        assert_eq!(
+            deserialized.get_metadata("key1"),
+            Some(&serde_json::json!("value1"))
+        );
+        assert_eq!(
+            deserialized.get_metadata("key2"),
+            Some(&serde_json::json!(42))
+        );
+    }
+
+    #[test]
+    fn test_batch_operation_result() {
+        let mut result = BatchOperationResult::new();
+
+        // Initially empty
+        assert_eq!(result.total, 0);
+        assert_eq!(result.successful, 0);
+        assert_eq!(result.failed, 0);
+        assert!(!result.all_succeeded());
+        assert!(!result.has_failures());
+
+        // Record successes
+        result.record_success(Uuid::new_v4());
+        result.record_success(Uuid::new_v4());
+        assert_eq!(result.total, 2);
+        assert_eq!(result.successful, 2);
+        assert_eq!(result.failed, 0);
+        assert!(result.all_succeeded());
+        assert!(!result.has_failures());
+
+        // Record failure
+        result.record_failure(Uuid::new_v4(), "Connection error".to_string());
+        assert_eq!(result.total, 3);
+        assert_eq!(result.successful, 2);
+        assert_eq!(result.failed, 1);
+        assert!(!result.all_succeeded());
+        assert!(result.has_failures());
+
+        // Check rates
+        assert!((result.success_rate() - 2.0 / 3.0).abs() < 1e-10);
+        assert!((result.failure_rate() - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_batch_operation_result_default() {
+        let result = BatchOperationResult::default();
+        assert_eq!(result.total, 0);
+        assert_eq!(result.successful, 0);
+        assert_eq!(result.failed, 0);
+    }
+
+    #[test]
+    fn test_batch_operation_result_display() {
+        let mut result = BatchOperationResult::new();
+        result.record_success(Uuid::new_v4());
+        result.record_success(Uuid::new_v4());
+        result.record_failure(Uuid::new_v4(), "Error 1".to_string());
+
+        let display = format!("{}", result);
+        assert!(display.contains("Total: 3"));
+        assert!(display.contains("Successful: 2"));
+        assert!(display.contains("Failed: 1"));
+        assert!(display.contains("66.7%")); // Success rate
+    }
+
+    #[test]
+    fn test_batch_operation_result_edge_cases() {
+        let mut result = BatchOperationResult::new();
+
+        // Empty result
+        assert_eq!(result.success_rate(), 0.0);
+        assert_eq!(result.failure_rate(), 1.0);
+        assert!(!result.all_succeeded()); // Empty batch is not considered successful
+
+        // All failed
+        result.record_failure(Uuid::new_v4(), "Error".to_string());
+        assert_eq!(result.success_rate(), 0.0);
+        assert_eq!(result.failure_rate(), 1.0);
+        assert!(result.has_failures());
     }
 }

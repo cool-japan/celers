@@ -18,6 +18,32 @@ RabbitMQ/AMQP broker implementation for CeleRS, providing a full-featured messag
 - **Message Deduplication** - Prevent duplicate message processing
 - **Connection & Channel Pooling** - Efficient resource management
 
+### Production Features (v7)
+- **Rate Limiting** - Token bucket and leaky bucket algorithms for controlling message rates
+- **Bulkhead Pattern** - Resource isolation to prevent cascading failures
+- **Message Scheduling** - Delayed message delivery for scheduled tasks and retries
+- **Metrics Export** - Export metrics to Prometheus, StatsD, and JSON formats
+
+### Enterprise Production Features (v9) NEW
+- **Backpressure Management** - Intelligent flow control to prevent overwhelming the broker or consumers
+- **Poison Message Detection** - Identify and handle messages that repeatedly fail processing
+- **Advanced Routing** - Sophisticated routing strategies beyond basic AMQP exchange types
+- **Performance Optimization** - Advanced optimization strategies for connection tuning and resource management
+
+### Advanced Production Features (v8)
+- **Lifecycle Hooks** - Extensible hooks for message interception and validation
+- **DLX Analytics** - Comprehensive Dead Letter Exchange analytics and insights
+- **Adaptive Batching** - Dynamic batch size optimization based on system load
+- **Performance Profiling** - Detailed performance profiling with percentile analysis
+
+### Enhanced Features (v6)
+- **Circuit Breaker Pattern** - Prevent cascading failures with automatic recovery
+- **Advanced Retry Strategies** - Exponential backoff with jitter (Full, Equal, Decorrelated)
+- **Message Compression** - Reduce network overhead with Gzip/Zstd compression
+- **Topology Validation** - Validate AMQP topology before deployment
+- **Message Tracing** - Track message lifecycle and analyze flow patterns
+- **Consumer Groups** - Load balancing with RoundRobin, LeastConnections, Priority, and Random strategies
+
 ## Installation
 
 Add to your `Cargo.toml`:
@@ -59,6 +85,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Examples
+
+The `examples/` directory contains 16 comprehensive examples demonstrating various features:
+
+### Basic Examples
+
+```bash
+# Basic publish/consume workflow
+cargo run --example basic_publish_consume
+
+# High-throughput batch operations
+cargo run --example batch_publish
+
+# Priority-based message processing
+cargo run --example priority_queue
+
+# Dead Letter Exchange configuration
+cargo run --example dead_letter_exchange
+
+# AMQP transaction support
+cargo run --example transaction
+
+# Async streaming consumer pattern
+cargo run --example streaming_consumer
+```
+
+### Advanced Examples
+
+```bash
+# RabbitMQ Management API usage
+cargo run --example management_api
+
+# Modern queue features (quorum, stream, lazy mode)
+cargo run --example modern_queue_features
+
+# Advanced monitoring & batch consumption (v4)
+cargo run --example advanced_monitoring
+
+# Monitoring & utility functions demo (v5)
+cargo run --example monitoring_utilities
+
+# v6 features: circuit breaker, retry, compression, topology, tracing, consumer groups
+cargo run --example v6_features_demo
+
+# Production patterns: complete integration of all v6 features
+cargo run --example production_patterns
+
+# v7 features: rate limiting, bulkhead, scheduling, metrics export
+cargo run --example v7_features_demo
+
+# v8 features: hooks, DLX analytics, adaptive batching, profiling
+cargo run --example v8_features_demo
+
+# v9 features: backpressure, poison detection, routing, optimization
+cargo run --example v9_features_demo
+
+# v9 production integration: complete production-ready integration of all v9 features (RECOMMENDED)
+cargo run --example v9_production_integration
+```
+
+**Note**: Most examples require a running RabbitMQ instance. See the setup guide below.
 
 ## RabbitMQ Setup Guide
 
@@ -457,6 +545,263 @@ let mut broker = AmqpBroker::with_config(
 
 // Duplicate messages with same ID will be automatically skipped
 ```
+
+## Enhanced Features (v6)
+
+### Circuit Breaker Pattern
+
+Protect your system from cascading failures with automatic circuit breaking:
+
+```rust
+use celers_broker_amqp::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use std::time::Duration;
+
+async fn with_circuit_breaker() -> Result<(), Box<dyn std::error::Error>> {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 5,      // Open after 5 failures
+        success_threshold: 2,      // Close after 2 successes
+        timeout: Duration::from_secs(60),  // Try again after 60s
+        half_open_max_calls: 3,    // Test with 3 calls in half-open state
+    };
+
+    let mut circuit = CircuitBreaker::new(config);
+
+    // Execute operation with circuit breaker protection
+    match circuit.call(|| async {
+        // Your operation here
+        Ok(())
+    }).await {
+        Ok(result) => println!("Success: {:?}", result),
+        Err(e) => println!("Circuit open or operation failed: {:?}", e),
+    }
+
+    // Monitor circuit state
+    let metrics = circuit.metrics();
+    println!("State: {:?}", metrics.state);
+    println!("Failures: {}", metrics.failure_count);
+
+    Ok(())
+}
+```
+
+### Advanced Retry Strategies
+
+Implement sophisticated retry logic with exponential backoff and jitter:
+
+```rust
+use celers_broker_amqp::retry::{
+    ExponentialBackoff, Jitter, RetryStrategy, RetryExecutor
+};
+use std::time::Duration;
+
+async fn with_retry() -> Result<(), Box<dyn std::error::Error>> {
+    // Create exponential backoff strategy
+    let strategy = ExponentialBackoff::new(Duration::from_millis(100))
+        .with_max_delay(Duration::from_secs(30))
+        .with_max_retries(5)
+        .with_jitter(Jitter::Full);  // Full jitter to prevent thundering herd
+
+    // Execute with retry
+    let executor = RetryExecutor::new(strategy);
+    let result = executor.execute(|| async {
+        // Your operation that might fail
+        publish_message().await
+    }).await?;
+
+    Ok(())
+}
+
+async fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
+    // Simulated operation
+    Ok(())
+}
+```
+
+Available jitter strategies:
+- `Jitter::None` - No randomization
+- `Jitter::Full` - Randomize between 0 and calculated delay
+- `Jitter::Equal` - Half deterministic, half random
+- `Jitter::Decorrelated` - Based on previous delay
+
+### Message Compression
+
+Reduce network overhead with built-in compression:
+
+```rust
+use celers_broker_amqp::compression::{
+    compress_message, decompress_message, CompressionCodec,
+    should_compress_message, CompressionStats
+};
+
+fn compression_example() -> Result<(), Box<dyn std::error::Error>> {
+    let data = b"Your message data here...".repeat(100);
+
+    // Check if compression is beneficial
+    if should_compress_message(&data, 1024) {
+        // Compress with gzip
+        let compressed = compress_message(&data, CompressionCodec::Gzip)?;
+        println!("Original: {} bytes", data.len());
+        println!("Compressed: {} bytes", compressed.len());
+
+        // Or use zstd for better compression ratios
+        let zstd_compressed = compress_message(&data, CompressionCodec::Zstd)?;
+        println!("Zstd compressed: {} bytes", zstd_compressed.len());
+
+        // Decompress
+        let decompressed = decompress_message(&compressed, CompressionCodec::Gzip)?;
+        assert_eq!(data, decompressed.as_slice());
+    }
+
+    Ok(())
+}
+```
+
+### Topology Validation
+
+Validate your AMQP topology before deployment:
+
+```rust
+use celers_broker_amqp::topology::{
+    TopologyValidator, ExchangeDefinition, QueueDefinition, BindingDefinition,
+    validate_queue_naming, calculate_topology_complexity, analyze_topology_issues
+};
+use celers_broker_amqp::AmqpExchangeType;
+
+fn validate_topology() -> Result<(), Box<dyn std::error::Error>> {
+    let mut validator = TopologyValidator::new();
+
+    // Define exchanges
+    let exchange = ExchangeDefinition {
+        name: "tasks".to_string(),
+        exchange_type: AmqpExchangeType::Topic,
+        durable: true,
+        auto_delete: false,
+    };
+    validator.add_exchange(exchange)?;
+
+    // Define queues
+    let queue = QueueDefinition {
+        name: "tasks.high".to_string(),
+        durable: true,
+        auto_delete: false,
+        arguments: Default::default(),
+    };
+    validator.add_queue(queue)?;
+
+    // Define bindings
+    let binding = BindingDefinition {
+        source: "tasks".to_string(),
+        destination: "tasks.high".to_string(),
+        routing_key: "tasks.high.*".to_string(),
+        arguments: Default::default(),
+    };
+    validator.add_binding(binding)?;
+
+    // Validate topology
+    let issues = validator.validate()?;
+    if !issues.is_empty() {
+        println!("Topology issues found:");
+        for issue in issues {
+            println!("  - {}", issue);
+        }
+    }
+
+    // Analyze complexity
+    let summary = validator.summary();
+    let complexity = calculate_topology_complexity(
+        summary.exchanges,
+        summary.queues,
+        summary.bindings
+    );
+    println!("Topology complexity score: {:.1}", complexity);
+
+    Ok(())
+}
+```
+
+### Message Tracing & Observability
+
+Track message flow and analyze patterns:
+
+```rust
+use celers_broker_amqp::tracing_util::{
+    TraceRecorder, MessageTrace, TraceEvent, MessageFlowAnalyzer
+};
+use uuid::Uuid;
+
+async fn message_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    let mut recorder = TraceRecorder::new(10000);  // Track up to 10k messages
+
+    // Record message lifecycle
+    let msg_id = Uuid::new_v4().to_string();
+    recorder.record_event(&msg_id, TraceEvent::Published);
+    recorder.record_event(&msg_id, TraceEvent::Consumed);
+    recorder.record_event(&msg_id, TraceEvent::Acknowledged);
+
+    // Analyze message flow
+    let analyzer = MessageFlowAnalyzer::new(recorder);
+    let insights = analyzer.analyze();
+
+    println!("Total messages: {}", insights.total_messages);
+    println!("Success rate: {:.2}%", insights.success_rate * 100.0);
+    println!("Rejection rate: {:.2}%", insights.rejection_rate * 100.0);
+    println!("Avg processing time: {:.2}ms", insights.avg_processing_time_ms);
+    println!("Health status: {:?}", insights.health_status);
+
+    Ok(())
+}
+```
+
+### Consumer Group Management
+
+Coordinate multiple consumers with load balancing:
+
+```rust
+use celers_broker_amqp::consumer_groups::{
+    ConsumerGroup, ConsumerInfo, LoadBalancingStrategy
+};
+
+fn consumer_groups_example() -> Result<(), Box<dyn std::error::Error>> {
+    // Create consumer group with round-robin strategy
+    let mut group = ConsumerGroup::new(
+        "my-consumer-group".to_string(),
+        LoadBalancingStrategy::RoundRobin
+    );
+
+    // Add consumers
+    for i in 0..5 {
+        let consumer = ConsumerInfo::new(
+            format!("consumer-{}", i),
+            "my_queue".to_string()
+        );
+        group.add_consumer(consumer);
+    }
+
+    // Select next consumer for message delivery
+    if let Some(consumer_id) = group.next_consumer() {
+        println!("Routing to consumer: {}", consumer_id);
+
+        // Track message processing
+        group.mark_processing_started(&consumer_id);
+        // ... process message ...
+        group.mark_processing_completed(&consumer_id, true);
+    }
+
+    // Get group statistics
+    let stats = group.get_statistics();
+    println!("Active consumers: {}", stats.active_consumers);
+    println!("Total processed: {}", stats.total_messages_processed);
+    println!("Avg utilization: {:.2}%", stats.avg_utilization * 100.0);
+
+    Ok(())
+}
+```
+
+Available load balancing strategies:
+- `LoadBalancingStrategy::RoundRobin` - Distribute evenly across consumers
+- `LoadBalancingStrategy::LeastConnections` - Route to least busy consumer
+- `LoadBalancingStrategy::Priority` - Route to highest priority available consumer
+- `LoadBalancingStrategy::Random` - Random consumer selection
 
 ## Troubleshooting Guide
 

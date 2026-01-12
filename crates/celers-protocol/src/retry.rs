@@ -332,7 +332,7 @@ mod tests {
         let now = Utc::now();
         let eta_time = eta.unwrap();
         let diff = (eta_time - now).num_seconds();
-        assert!(diff >= 9 && diff <= 11); // ~10 seconds
+        assert!((9..=11).contains(&diff)); // ~10 seconds
     }
 
     #[test]

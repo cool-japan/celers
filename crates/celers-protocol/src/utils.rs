@@ -15,6 +15,7 @@ use uuid::Uuid;
 /// # Returns
 ///
 /// `true` if the message has an expiration time that has passed, `false` otherwise
+#[inline]
 pub fn is_message_expired(message: &Message) -> bool {
     message
         .headers
@@ -32,6 +33,7 @@ pub fn is_message_expired(message: &Message) -> bool {
 /// # Returns
 ///
 /// `true` if the message has no ETA or the ETA has passed, `false` otherwise
+#[inline]
 pub fn is_ready_to_execute(message: &Message) -> bool {
     message
         .headers
@@ -113,10 +115,9 @@ pub fn message_age(message: &Message) -> Duration {
             let time_to_expire = expires - now;
             let estimated_ttl = time_to_expire + Duration::hours(1);
             return Duration::hours(1).min(estimated_ttl / 4);
-        } else {
-            // Message is expired, estimate it was created 1 hour before expiration
-            return now - (expires - Duration::hours(1));
         }
+        // Message is expired, estimate it was created 1 hour before expiration
+        return now - (expires - Duration::hours(1));
     }
 
     Duration::zero()
@@ -132,6 +133,7 @@ pub fn message_age(message: &Message) -> Duration {
 /// # Returns
 ///
 /// `true` if the message can be retried, `false` otherwise
+#[inline]
 pub fn can_retry(message: &Message, max_retries: u32) -> bool {
     message.headers.retries.unwrap_or(0) < max_retries
 }

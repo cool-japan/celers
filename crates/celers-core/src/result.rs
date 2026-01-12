@@ -1,4 +1,10 @@
-//! AsyncResult API for querying task results
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::missing_fields_in_debug
+)]
+#![allow(clippy::cast_precision_loss)]
+//! `AsyncResult` API for querying task results
 //!
 //! This module provides a Celery-compatible interface for retrieving task results,
 //! checking task state, and waiting for task completion.
@@ -48,9 +54,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
 
-/// Result store trait for AsyncResult API
+/// Result store trait for `AsyncResult` API
 ///
-/// This trait provides the storage interface needed by AsyncResult for querying
+/// This trait provides the storage interface needed by `AsyncResult` for querying
 /// task results in a Celery-compatible way. Implementations should provide
 /// lightweight result storage focused on result state and values.
 #[async_trait]
@@ -104,7 +110,9 @@ pub enum TaskResultValue {
 
 impl TaskResultValue {
     /// Check if the result is in a terminal state
-    pub fn is_terminal(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
             TaskResultValue::Success(_)
@@ -115,22 +123,30 @@ impl TaskResultValue {
     }
 
     /// Check if the task is pending
-    pub fn is_pending(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_pending(&self) -> bool {
         matches!(self, TaskResultValue::Pending)
     }
 
     /// Check if the task is ready (in terminal state)
-    pub fn is_ready(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
         self.is_terminal()
     }
 
     /// Check if the task succeeded
-    pub fn is_successful(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_successful(&self) -> bool {
         matches!(self, TaskResultValue::Success(_))
     }
 
     /// Check if the task failed
-    pub fn is_failed(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
         matches!(
             self,
             TaskResultValue::Failure { .. } | TaskResultValue::Rejected { .. }
@@ -138,6 +154,8 @@ impl TaskResultValue {
     }
 
     /// Get the success value if available
+    #[inline]
+    #[must_use]
     pub fn success_value(&self) -> Option<&Value> {
         match self {
             TaskResultValue::Success(v) => Some(v),
@@ -146,6 +164,8 @@ impl TaskResultValue {
     }
 
     /// Get the error message if failed
+    #[inline]
+    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         match self {
             TaskResultValue::Failure { error, .. } => Some(error),
@@ -155,6 +175,8 @@ impl TaskResultValue {
     }
 
     /// Get the traceback if available
+    #[inline]
+    #[must_use]
     pub fn traceback(&self) -> Option<&str> {
         match self {
             TaskResultValue::Failure { traceback, .. } => traceback.as_deref(),
@@ -163,7 +185,7 @@ impl TaskResultValue {
     }
 }
 
-/// AsyncResult handle for querying task results (Celery-compatible API)
+/// `AsyncResult` handle for querying task results (Celery-compatible API)
 #[derive(Clone)]
 pub struct AsyncResult<S: ResultStore> {
     /// Task ID
@@ -180,7 +202,7 @@ pub struct AsyncResult<S: ResultStore> {
 }
 
 impl<S: ResultStore + Clone> AsyncResult<S> {
-    /// Create a new AsyncResult for a task
+    /// Create a new `AsyncResult` for a task
     pub fn new(task_id: TaskId, store: S) -> Self {
         Self {
             task_id,
@@ -190,7 +212,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
         }
     }
 
-    /// Create an AsyncResult with a parent
+    /// Create an `AsyncResult` with a parent
     pub fn with_parent(task_id: TaskId, store: S, parent: AsyncResult<S>) -> Self {
         Self {
             task_id,
@@ -200,7 +222,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
         }
     }
 
-    /// Create an AsyncResult with children (for group/chord results)
+    /// Create an `AsyncResult` with children (for group/chord results)
     pub fn with_children(task_id: TaskId, store: S, children: Vec<AsyncResult<S>>) -> Self {
         Self {
             task_id,
@@ -211,16 +233,22 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
     }
 
     /// Get the task ID
+    #[inline]
+    #[must_use]
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
 
     /// Get the parent result if this is a linked task
+    #[inline]
+    #[must_use]
     pub fn parent(&self) -> Option<&AsyncResult<S>> {
         self.parent.as_deref()
     }
 
     /// Get child results (for group/chord tasks)
+    #[inline]
+    #[must_use]
     pub fn children(&self) -> &[AsyncResult<S>] {
         &self.children
     }
@@ -312,34 +340,30 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
             }
 
             // Get current result
-            match self.store.get_result(self.task_id).await? {
-                Some(result) => {
-                    match result {
-                        TaskResultValue::Success(value) => return Ok(Some(value)),
-                        TaskResultValue::Failure { error, traceback } => {
-                            let msg = if let Some(tb) = traceback {
-                                format!("{}\n{}", error, tb)
-                            } else {
-                                error
-                            };
-                            return Err(crate::CelersError::TaskExecution(msg));
-                        }
-                        TaskResultValue::Revoked => {
-                            return Err(crate::CelersError::TaskRevoked(self.task_id));
-                        }
-                        TaskResultValue::Rejected { reason } => {
-                            return Err(crate::CelersError::TaskExecution(format!(
-                                "Task rejected: {}",
-                                reason
-                            )));
-                        }
-                        // Task not ready yet, continue polling
-                        _ => {}
+            if let Some(result) = self.store.get_result(self.task_id).await? {
+                match result {
+                    TaskResultValue::Success(value) => return Ok(Some(value)),
+                    TaskResultValue::Failure { error, traceback } => {
+                        let msg = if let Some(tb) = traceback {
+                            format!("{error}\n{tb}")
+                        } else {
+                            error
+                        };
+                        return Err(crate::CelersError::TaskExecution(msg));
                     }
+                    TaskResultValue::Revoked => {
+                        return Err(crate::CelersError::TaskRevoked(self.task_id));
+                    }
+                    TaskResultValue::Rejected { reason } => {
+                        return Err(crate::CelersError::TaskExecution(format!(
+                            "Task rejected: {reason}"
+                        )));
+                    }
+                    // Task not ready yet, continue polling
+                    _ => {}
                 }
-                None => {
-                    // Result not yet available
-                }
+            } else {
+                // Result not yet available
             }
 
             // Wait before next poll
@@ -379,7 +403,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
 
     /// Wait for the task to complete and return the result
     ///
-    /// This is a convenience method that combines ready() and get()
+    /// This is a convenience method that combines `ready()` and `get()`
     pub async fn wait(&self, timeout: Option<Duration>) -> crate::Result<Value> {
         match self.get(timeout).await? {
             Some(value) => Ok(value),
@@ -393,6 +417,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
 impl<S: ResultStore + Clone> std::fmt::Debug for AsyncResult<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncResult")
+            .field("store", &"<ResultStore>")
             .field("task_id", &self.task_id)
             .field("has_parent", &self.parent.is_some())
             .field("num_children", &self.children.len())
@@ -455,6 +480,7 @@ pub struct ResultMetadata {
 
 impl ResultMetadata {
     /// Create new result metadata
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tags: Vec::new(),
@@ -471,41 +497,54 @@ impl ResultMetadata {
     }
 
     /// Add a tag
+    #[must_use]
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tags.push(tag.into());
         self
     }
 
     /// Add multiple tags
+    #[must_use]
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tags.extend(tags);
         self
     }
 
     /// Add a custom field
+    #[must_use]
     pub fn with_field(mut self, key: impl Into<String>, value: Value) -> Self {
         self.custom_fields.insert(key.into(), value);
         self
     }
 
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TTL duration cannot be converted to a chrono duration.
     /// Set TTL (time to live)
+    #[must_use]
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.expires_at = Some(Utc::now() + chrono::Duration::from_std(ttl).unwrap());
         self
     }
 
     /// Set expiration timestamp
+    #[must_use]
     pub fn with_expires_at(mut self, expires_at: DateTime<Utc>) -> Self {
         self.expires_at = Some(expires_at);
         self
     }
 
     /// Check if the result has expired
+    #[inline]
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         self.expires_at.is_some_and(|exp| Utc::now() > exp)
     }
 
     /// Get time until expiration
+    #[inline]
+    #[must_use]
     pub fn time_until_expiration(&self) -> Option<Duration> {
         self.expires_at.and_then(|exp| {
             let diff = exp - Utc::now();
@@ -514,6 +553,7 @@ impl ResultMetadata {
     }
 
     /// Mark as compressed
+    #[must_use]
     pub fn with_compression(
         mut self,
         algorithm: impl Into<String>,
@@ -528,6 +568,7 @@ impl ResultMetadata {
     }
 
     /// Mark as chunked
+    #[must_use]
     pub fn with_chunking(mut self, total_chunks: usize) -> Self {
         self.chunked = true;
         self.total_chunks = Some(total_chunks);
@@ -535,6 +576,8 @@ impl ResultMetadata {
     }
 
     /// Get compression ratio
+    #[allow(clippy::cast_precision_loss)]
+    #[must_use]
     pub fn compression_ratio(&self) -> Option<f64> {
         if let (Some(orig), Some(comp)) = (self.original_size, self.compressed_size) {
             if orig > 0 {
@@ -570,6 +613,7 @@ pub struct ResultChunk {
 
 impl ResultChunk {
     /// Create a new result chunk
+    #[must_use]
     pub fn new(index: usize, total: usize, data: Vec<u8>) -> Self {
         Self {
             index,
@@ -580,13 +624,16 @@ impl ResultChunk {
     }
 
     /// Add checksum
+    #[must_use]
     pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
         self
     }
 
     /// Check if this is the last chunk
-    pub fn is_last(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_last(&self) -> bool {
         self.index == self.total - 1
     }
 }
@@ -615,6 +662,7 @@ pub struct ResultTombstone {
 
 impl ResultTombstone {
     /// Create a new tombstone
+    #[must_use]
     pub fn new(task_id: TaskId) -> Self {
         Self {
             task_id,
@@ -626,18 +674,21 @@ impl ResultTombstone {
     }
 
     /// Set deletion reason
+    #[must_use]
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
     }
 
     /// Set who deleted it
+    #[must_use]
     pub fn with_deleted_by(mut self, deleted_by: impl Into<String>) -> Self {
         self.deleted_by = Some(deleted_by.into());
         self
     }
 
     /// Set tombstone TTL
+    #[must_use]
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.tombstone_ttl = Some(ttl);
         self
@@ -692,12 +743,14 @@ pub struct ResultCompressor {
 
 impl ResultCompressor {
     /// Create a new compressor with threshold
+    #[must_use]
     pub fn new(threshold_bytes: usize) -> Self {
         Self { threshold_bytes }
     }
 
     /// Check if value should be compressed
-    pub fn should_compress(&self, data: &[u8]) -> bool {
+    #[must_use]
+    pub const fn should_compress(&self, data: &[u8]) -> bool {
         data.len() >= self.threshold_bytes
     }
 
@@ -735,11 +788,13 @@ pub struct ResultChunker {
 
 impl ResultChunker {
     /// Create a new chunker
+    #[must_use]
     pub fn new(chunk_size: usize) -> Self {
         Self { chunk_size }
     }
 
     /// Split data into chunks
+    #[must_use]
     pub fn chunk(&self, data: &[u8]) -> Vec<ResultChunk> {
         let total = data.len().div_ceil(self.chunk_size);
 

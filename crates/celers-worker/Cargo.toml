@@ -26,9 +26,16 @@ uuid = { workspace = true }
 hostname = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
+crossbeam-deque = { workspace = true }
+num_cpus = { workspace = true }
+libc = { workspace = true }
+redis = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true, features = ["runtime-tokio", "postgres", "json", "uuid"] }
 
 [features]
 default = []
 metrics = ["celers-metrics"]
 canvas = ["celers-canvas"]
 workflows = ["canvas", "celers-backend-redis"]
+redis = ["dep:redis"]
+postgres = ["dep:sqlx"]

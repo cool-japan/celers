@@ -37,9 +37,8 @@
 //! let task = ScheduledTask::new("send_report".to_string(), schedule);
 //! ```
 
-#[cfg(feature = "solar")]
 use chrono::Datelike;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Offset, TimeZone, Timelike, Utc};
 #[cfg(feature = "cron")]
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -296,9 +295,126 @@ impl Schedule {
                                 })?
                                 .and_utc()
                         }
+                        // Civil twilight (sun 6° below horizon) - approximate 30 min before/after sunrise/sunset
+                        "civil_twilight_begin" | "dawn" => {
+                            let hours = (sunrise_time / 60) as u32;
+                            let minutes = (sunrise_time % 60) as u32;
+                            let sunrise = current_date
+                                .and_hms_opt(hours, minutes, 0)
+                                .ok_or_else(|| {
+                                    ScheduleError::Invalid(format!(
+                                        "Invalid sunrise time: {} minutes",
+                                        sunrise_time
+                                    ))
+                                })?
+                                .and_utc();
+                            sunrise - Duration::minutes(30)
+                        }
+                        "civil_twilight_end" | "dusk" => {
+                            let hours = (sunset_time / 60) as u32;
+                            let minutes = (sunset_time % 60) as u32;
+                            let sunset = current_date
+                                .and_hms_opt(hours, minutes, 0)
+                                .ok_or_else(|| {
+                                    ScheduleError::Invalid(format!(
+                                        "Invalid sunset time: {} minutes",
+                                        sunset_time
+                                    ))
+                                })?
+                                .and_utc();
+                            sunset + Duration::minutes(30)
+                        }
+                        // Nautical twilight (sun 12° below horizon) - approximate 60 min before/after sunrise/sunset
+                        "nautical_twilight_begin" => {
+                            let hours = (sunrise_time / 60) as u32;
+                            let minutes = (sunrise_time % 60) as u32;
+                            let sunrise = current_date
+                                .and_hms_opt(hours, minutes, 0)
+                                .ok_or_else(|| {
+                                    ScheduleError::Invalid(format!(
+                                        "Invalid sunrise time: {} minutes",
+                                        sunrise_time
+                                    ))
+                                })?
+                                .and_utc();
+                            sunrise - Duration::minutes(60)
+                        }
+                        "nautical_twilight_end" => {
+                            let hours = (sunset_time / 60) as u32;
+                            let minutes = (sunset_time % 60) as u32;
+                            let sunset = current_date
+                                .and_hms_opt(hours, minutes, 0)
+                                .ok_or_else(|| {
+                                    ScheduleError::Invalid(format!(
+                                        "Invalid sunset time: {} minutes",
+                                        sunset_time
+                                    ))
+                                })?
+                                .and_utc();
+                            sunset + Duration::minutes(60)
+                        }
+                        // Astronomical twilight (sun 18° below horizon) - approximate 90 min before/after sunrise/sunset
+                        "astronomical_twilight_begin" => {
+                            let hours = (sunrise_time / 60) as u32;
+                            let minutes = (sunrise_time % 60) as u32;
+                            let sunrise = current_date
+                                .and_hms_opt(hours, minutes, 0)
+                                .ok_or_else(|| {
+                                    ScheduleError::Invalid(format!(
+                                        "Invalid sunrise time: {} minutes",
+                                        sunrise_time
+                                    ))
+                                })?
+                                .and_utc();
+                            sunrise - Duration::minutes(90)
+                        }
+                        "astronomical_twilight_end" => {
+                            let hours = (sunset_time / 60) as u32;
+                            let minutes = (sunset_time % 60) as u32;
+                            let sunset = current_date
+                                .and_hms_opt(hours, minutes, 0)
+                                .ok_or_else(|| {
+                                    ScheduleError::Invalid(format!(
+                                        "Invalid sunset time: {} minutes",
+                                        sunset_time
+                                    ))
+                                })?
+                                .and_utc();
+                            sunset + Duration::minutes(90)
+                        }
+                        // Golden hour (sun 0-6° above horizon) - approximate 30 min after sunrise / before sunset
+                        "golden_hour_begin" => {
+                            let hours = (sunrise_time / 60) as u32;
+                            let minutes = (sunrise_time % 60) as u32;
+                            current_date
+                                .and_hms_opt(hours, minutes, 0)
+                                .ok_or_else(|| {
+                                    ScheduleError::Invalid(format!(
+                                        "Invalid sunrise time: {} minutes",
+                                        sunrise_time
+                                    ))
+                                })?
+                                .and_utc()
+                            // Golden hour starts at sunrise
+                        }
+                        "golden_hour_end" => {
+                            let hours = (sunset_time / 60) as u32;
+                            let minutes = (sunset_time % 60) as u32;
+                            let sunset = current_date
+                                .and_hms_opt(hours, minutes, 0)
+                                .ok_or_else(|| {
+                                    ScheduleError::Invalid(format!(
+                                        "Invalid sunset time: {} minutes",
+                                        sunset_time
+                                    ))
+                                })?
+                                .and_utc();
+                            // Golden hour ends ~30 min before sunset
+                            sunset - Duration::minutes(30)
+                        }
                         _ => {
                             return Err(ScheduleError::Invalid(format!(
-                                "Unknown solar event: {}. Use 'sunrise' or 'sunset'",
+                                "Unknown solar event: {}. Supported events: sunrise, sunset, civil_twilight_begin/end, nautical_twilight_begin/end, astronomical_twilight_begin/end, golden_hour_begin/end, dawn, dusk",
                                 event
                             )))
                         }
@@ -1910,6 +2026,10 @@ pub struct ScheduledTask {
     /// Current execution state (for crash recovery)
     #[serde(default)]
     pub execution_state: ExecutionState,
+
+    /// Weighted Fair Queuing state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wfq_state: Option<WFQState>,
 }
 
 fn default_version() -> u32 {
@@ -1944,6 +2064,7 @@ impl ScheduledTask {
             cached_next_run: None,
             alert_config: AlertConfig::default(),
             execution_state: ExecutionState::default(),
+            wfq_state: None,
         };
 
         // Create initial version
@@ -2890,6 +3011,65 @@ impl BeatScheduler {
         Ok(())
     }
 
+    /// Export scheduler state as JSON string
+    ///
+    /// Returns the complete scheduler state serialized as a JSON string.
+    /// This is useful for debugging, backup, or exporting to external systems.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// scheduler.add_task(ScheduledTask::new("test".to_string(), Schedule::interval(60))).unwrap();
+    ///
+    /// let json = scheduler.export_state().unwrap();
+    /// assert!(json.contains("test"));
+    /// ```
+    pub fn export_state(&self) -> Result<String, ScheduleError> {
+        serde_json::to_string_pretty(&self)
+            .map_err(|e| ScheduleError::Persistence(format!("Failed to serialize state: {}", e)))
+    }
+
+    /// List all scheduled tasks
+    ///
+    /// Returns a reference to the internal task HashMap, allowing iteration
+    /// over all scheduled tasks.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// scheduler.add_task(ScheduledTask::new("task1".to_string(), Schedule::interval(60))).unwrap();
+    /// scheduler.add_task(ScheduledTask::new("task2".to_string(), Schedule::interval(120))).unwrap();
+    ///
+    /// let tasks = scheduler.list_tasks();
+    /// assert_eq!(tasks.len(), 2);
+    /// assert!(tasks.contains_key("task1"));
+    /// assert!(tasks.contains_key("task2"));
+    /// ```
+    pub fn list_tasks(&self) -> &HashMap<String, ScheduledTask> {
+        &self.tasks
+    }
+
+    /// Get a specific task by name
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// scheduler.add_task(ScheduledTask::new("test".to_string(), Schedule::interval(60))).unwrap();
+    ///
+    /// let task = scheduler.get_task("test");
+    /// assert!(task.is_some());
+    /// assert_eq!(task.unwrap().name, "test");
+    /// ```
+    pub fn get_task(&self, name: &str) -> Option<&ScheduledTask> {
+        self.tasks.get(name)
+    }
+
     pub fn add_task(&mut self, mut task: ScheduledTask) -> Result<(), ScheduleError> {
         // Initialize the next run cache when adding the task
         task.update_next_run_cache();
@@ -3471,6 +3651,89 @@ impl BeatScheduler {
             .collect()
     }
 
+    /// Get due tasks sorted by priority (highest priority first)
+    ///
+    /// This method returns tasks that are due for execution, ordered by their priority.
+    /// Higher priority tasks (higher numeric value) are returned first, allowing for
+    /// priority-based execution scheduling.
+    ///
+    /// # Returns
+    /// Vector of tasks sorted by priority (descending), then by next run time (ascending)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    ///
+    /// // Add high priority task
+    /// let mut high_priority = ScheduledTask::new("critical".to_string(), Schedule::interval(60));
+    /// high_priority.options.priority = Some(9);
+    /// scheduler.add_task(high_priority).unwrap();
+    ///
+    /// // Add low priority task
+    /// let mut low_priority = ScheduledTask::new("background".to_string(), Schedule::interval(60));
+    /// low_priority.options.priority = Some(1);
+    /// scheduler.add_task(low_priority).unwrap();
+    ///
+    /// // Get tasks ordered by priority
+    /// let due_tasks = scheduler.get_due_tasks_by_priority();
+    /// // The critical task will be first
+    /// ```
+    pub fn get_due_tasks_by_priority(&self) -> Vec<&ScheduledTask> {
+        let mut tasks: Vec<&ScheduledTask> = self
+            .tasks
+            .values()
+            .filter(|task| task.enabled && task.is_due().unwrap_or(false))
+            .collect();
+
+        // Sort by priority (descending), then by next run time (ascending)
+        tasks.sort_by(|a, b| {
+            // Higher priority comes first (reverse order)
+            let priority_a = a.options.priority.unwrap_or(5);
+            let priority_b = b.options.priority.unwrap_or(5);
+
+            match priority_b.cmp(&priority_a) {
+                std::cmp::Ordering::Equal => {
+                    // If same priority, sort by next run time
+                    let next_a = a
+                        .schedule
+                        .next_run(a.last_run_at)
+                        .unwrap_or_else(|_| Utc::now());
+                    let next_b = b
+                        .schedule
+                        .next_run(b.last_run_at)
+                        .unwrap_or_else(|_| Utc::now());
+                    next_a.cmp(&next_b)
+                }
+                other => other,
+            }
+        });
+
+        tasks
+    }
+
+    /// Get tasks ordered by priority regardless of due status
+    ///
+    /// This method returns all enabled tasks sorted by priority, which is useful for
+    /// understanding task execution order and for manual task management.
+    ///
+    /// # Returns
+    /// Vector of all enabled tasks sorted by priority (descending)
+    pub fn get_tasks_by_priority(&self) -> Vec<&ScheduledTask> {
+        let mut tasks: Vec<&ScheduledTask> =
+            self.tasks.values().filter(|task| task.enabled).collect();
+
+        // Sort by priority (descending)
+        tasks.sort_by(|a, b| {
+            let priority_a = a.options.priority.unwrap_or(5);
+            let priority_b = b.options.priority.unwrap_or(5);
+            priority_b.cmp(&priority_a)
+        });
+
+        tasks
+    }
+
     /// Get all tasks in a specific group
     pub fn get_tasks_by_group(&self, group: &str) -> Vec<&ScheduledTask> {
         self.tasks
@@ -3594,6 +3857,119 @@ impl BeatScheduler {
             .map(|task| task.check_health())
             .filter(|result| !result.health.is_healthy())
             .collect()
+    }
+
+    /// Detect tasks with missed schedules
+    ///
+    /// A schedule is considered "missed" if the task's next scheduled run time has passed
+    /// but the task hasn't executed yet. This can happen if the scheduler was down or
+    /// if task execution was delayed.
+    ///
+    /// # Arguments
+    /// * `grace_period_seconds` - Additional time to allow before considering a schedule missed
+    ///
+    /// # Returns
+    /// Vector of (task_name, missed_time) tuples, where missed_time is how long ago the task should have run
+    pub fn detect_missed_schedules(&self, grace_period_seconds: u64) -> Vec<(String, Duration)> {
+        let now = Utc::now();
+        let grace_period = Duration::seconds(grace_period_seconds as i64);
+        let mut missed = Vec::new();
+
+        for (name, task) in &self.tasks {
+            if !task.enabled {
+                continue;
+            }
+
+            // Calculate next run time
+            if let Ok(next_run) = task.schedule.next_run(task.last_run_at) {
+                let deadline = next_run + grace_period;
+
+                // Check if we've passed the deadline
+                if now > deadline {
+                    let missed_by = now - next_run;
+                    missed.push((name.clone(), missed_by));
+                }
+            }
+        }
+
+        missed
+    }
+
+    /// Check for missed schedules and trigger alerts
+    ///
+    /// This method combines missed schedule detection with the alerting system,
+    /// automatically creating alerts for tasks that have missed their schedules.
+    ///
+    /// # Arguments
+    /// * `grace_period_seconds` - Grace period before considering a schedule missed (default: 60)
+    ///
+    /// # Returns
+    /// Number of alerts triggered
+    pub fn check_missed_schedules(&mut self, grace_period_seconds: Option<u64>) -> usize {
+        let grace = grace_period_seconds.unwrap_or(60);
+        let missed = self.detect_missed_schedules(grace);
+        let mut alert_count = 0;
+        let now = Utc::now();
+
+        for (task_name, missed_by) in missed {
+            // Calculate expected run time (now - missed_by)
+            let expected_at = now - missed_by;
+
+            // Create alert for missed schedule
+            let alert = Alert {
+                timestamp: now,
+                task_name: task_name.clone(),
+                level: AlertLevel::Warning,
+                condition: AlertCondition::MissedSchedule {
+                    expected_at,
+                    detected_at: now,
+                },
+                message: format!(
+                    "Task missed its schedule by {} seconds",
+                    missed_by.num_seconds()
+                ),
+                metadata: HashMap::new(),
+            };
+
+            if self.alert_manager.record_alert(alert) {
+                alert_count += 1;
+            }
+        }
+
+        alert_count
+    }
+
+    /// Get statistics on missed schedules
+    ///
+    /// Returns detailed information about which tasks have missed schedules and by how much.
+    ///
+    /// # Arguments
+    /// * `grace_period_seconds` - Grace period in seconds (default: 60)
+    ///
+    /// # Returns
+    /// Vector of (task_name, seconds_missed, schedule_type) tuples sorted by severity
+    pub fn get_missed_schedule_stats(
+        &self,
+        grace_period_seconds: Option<u64>,
+    ) -> Vec<(String, i64, String)> {
+        let grace = grace_period_seconds.unwrap_or(60);
+        let mut stats: Vec<(String, i64, String)> = self
+            .detect_missed_schedules(grace)
+            .into_iter()
+            .map(|(name, missed_by)| {
+                let schedule_type = if let Some(task) = self.tasks.get(&name) {
+                    format!("{}", task.schedule)
+                } else {
+                    "Unknown".to_string()
+                };
+                (name, missed_by.num_seconds(), schedule_type)
+            })
+            .collect();
+
+        // Sort by seconds missed (descending)
+        stats.sort_by(|a, b| b.1.cmp(&a.1));
+
+        stats
     }
 
     /// Get tasks with health warnings
@@ -4149,6 +4525,205 @@ impl BeatScheduler {
         self.detect_conflicts(window_seconds, estimated_duration)
             .len()
     }
+
+    /// Automatically resolve conflicts based on task priorities
+    ///
+    /// This method analyzes schedule conflicts and applies resolution strategies based on
+    /// task priorities. Higher priority tasks are given preference, and lower priority
+    /// tasks are adjusted to avoid conflicts.
+    ///
+    /// # Arguments
+    /// * `window_seconds` - Time window to analyze for conflicts
+    /// * `estimated_duration` - Estimated task duration in seconds
+    /// * `jitter_seconds` - Amount of jitter to apply when resolving conflicts (default: 30)
+    ///
+    /// # Returns
+    /// Vector of (task_name, resolution_description) pairs for tasks that were modified
+    ///
+    /// # Resolution Strategy
+    /// 1. For tasks with different priorities: Apply jitter to lower priority task
+    /// 2. For tasks with same priority: Apply symmetric jitter to both tasks
+    /// 3. For high severity conflicts: Recommend manual review
+    pub fn auto_resolve_conflicts(
+        &mut self,
+        window_seconds: u64,
+        estimated_duration: u64,
+        jitter_seconds: Option<u64>,
+    ) -> Vec<(String, String)> {
+        let jitter = jitter_seconds.unwrap_or(30);
+        let mut resolutions = Vec::new();
+
+        // Detect conflicts first
+        let conflicts = self.detect_conflicts(window_seconds, estimated_duration);
+
+        for conflict in conflicts {
+            // Get task priorities
+            let task1 = self.tasks.get(&conflict.task1);
+            let task2 = self.tasks.get(&conflict.task2);
+
+            if let (Some(t1), Some(t2)) = (task1, task2) {
+                let priority1 = t1.options.priority.unwrap_or(5); // Default priority: 5
+                let priority2 = t2.options.priority.unwrap_or(5);
+
+                match priority1.cmp(&priority2) {
+                    std::cmp::Ordering::Greater => {
+                        // Task1 has higher priority, apply jitter to task2
+                        if let Some(task) = self.tasks.get_mut(&conflict.task2) {
+                            if task.jitter.is_none() {
+                                task.jitter = Some(Jitter::positive(jitter as i64));
+                                resolutions.push((
+                                    conflict.task2.clone(),
+                                    format!(
+                                        "Applied +{}s jitter (lower priority than {})",
+                                        jitter, conflict.task1
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    std::cmp::Ordering::Less => {
+                        // Task2 has higher priority, apply jitter to task1
+                        if let Some(task) = self.tasks.get_mut(&conflict.task1) {
+                            if task.jitter.is_none() {
+                                task.jitter = Some(Jitter::positive(jitter as i64));
+                                resolutions.push((
+                                    conflict.task1.clone(),
+                                    format!(
+                                        "Applied +{}s jitter (lower priority than {})",
+                                        jitter, conflict.task2
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Same priority, apply symmetric jitter to both
+                        if conflict.severity == ConflictSeverity::High {
+                            // For high severity, recommend manual review
+                            resolutions.push((
+                                format!("{} & {}", conflict.task1, conflict.task2),
+                                "HIGH SEVERITY: Manual review recommended - tasks have equal priority and significant overlap".to_string(),
+                            ));
+                        } else {
+                            // Apply symmetric jitter to both tasks
+                            if let Some(task) = self.tasks.get_mut(&conflict.task1) {
+                                if task.jitter.is_none() {
+                                    task.jitter = Some(Jitter::symmetric((jitter / 2) as i64));
+                                }
+                            }
+                            if let Some(task) = self.tasks.get_mut(&conflict.task2) {
+                                if task.jitter.is_none() {
+                                    task.jitter = Some(Jitter::symmetric((jitter / 2) as i64));
+                                }
+                            }
+                            resolutions.push((
+                                format!("{} & {}", conflict.task1, conflict.task2),
+                                format!(
+                                    "Applied ±{}s symmetric jitter to both (equal priority)",
+                                    jitter / 2
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Save state if we made changes
+        if !resolutions.is_empty() {
+            let _ = self.save_state();
+        }
+
+        resolutions
+    }
+
+    /// Preview automatic conflict resolutions without applying them
+    ///
+    /// This method simulates the `auto_resolve_conflicts` behavior without modifying
+    /// the scheduler state, allowing you to review proposed resolutions before applying.
+    ///
+    /// # Arguments
+    /// * `window_seconds` - Time window to analyze for conflicts
+    /// * `estimated_duration` - Estimated task duration in seconds
+    /// * `jitter_seconds` - Amount of jitter that would be applied (default: 30)
+    ///
+    /// # Returns
+    /// Vector of (task_name, resolution_description) pairs that would be applied
+    pub fn preview_conflict_resolutions(
+        &self,
+        window_seconds: u64,
+        estimated_duration: u64,
+        jitter_seconds: Option<u64>,
+    ) -> Vec<(String, String)> {
+        let jitter = jitter_seconds.unwrap_or(30);
+        let mut resolutions = Vec::new();
+
+        let conflicts = self.detect_conflicts(window_seconds, estimated_duration);
+
+        for conflict in conflicts {
+            let task1 = self.tasks.get(&conflict.task1);
+            let task2 = self.tasks.get(&conflict.task2);
+
+            if let (Some(t1), Some(t2)) = (task1, task2) {
+                let priority1 = t1.options.priority.unwrap_or(5);
+                let priority2 = t2.options.priority.unwrap_or(5);
+
+                match priority1.cmp(&priority2) {
+                    std::cmp::Ordering::Greater => {
+                        resolutions.push((
+                            conflict.task2.clone(),
+                            format!(
+                                "Would apply +{}s jitter (priority {} < {})",
+                                jitter, priority2, priority1
+                            ),
+                        ));
+                    }
+                    std::cmp::Ordering::Less => {
+                        resolutions.push((
+                            conflict.task1.clone(),
+                            format!(
+                                "Would apply +{}s jitter (priority {} < {})",
+                                jitter, priority1, priority2
+                            ),
+                        ));
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if conflict.severity == ConflictSeverity::High {
+                            resolutions.push((
+                                format!("{} & {}", conflict.task1, conflict.task2),
+                                "Would recommend manual review (high severity, equal priority)"
+                                    .to_string(),
+                            ));
+                        } else {
+                            resolutions.push((
+                                format!("{} & {}", conflict.task1, conflict.task2),
+                                format!(
+                                    "Would apply ±{}s symmetric jitter to both (priority {})",
+                                    jitter / 2,
+                                    priority1
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        resolutions
+    }
+
+    /// Clear all conflict-related jitter from tasks
+    ///
+    /// This method removes jitter configurations that may have been added by
+    /// automatic conflict resolution, allowing you to reset and re-analyze conflicts.
+    pub fn clear_conflict_jitter(&mut self) {
+        for task in self.tasks.values_mut() {
+            // Only clear jitter if it was likely added by auto-resolution
+            // (we can't be 100% certain, but we clear it anyway)
+            task.jitter = None;
+        }
+        let _ = self.save_state();
+    }
 }
 
 impl Default for BeatScheduler {
@@ -4210,6 +4785,3162 @@ impl ScheduleError {
             ScheduleError::Parse(_) => "parse",
             ScheduleError::Persistence(_) => "persistence",
         }
+    }
+}
+
+// ============================================================================
+// Webhook Alert Delivery
+// ============================================================================
+
+/// Webhook configuration for alert delivery
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// Webhook endpoint URL
+    pub url: String,
+    /// HTTP headers to include in webhook requests
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Timeout for webhook requests in seconds
+    #[serde(default = "default_webhook_timeout")]
+    pub timeout_seconds: u64,
+    /// Filter: only send alerts matching these levels (empty = all levels)
+    #[serde(default)]
+    pub alert_levels: Vec<AlertLevel>,
+}
+
+#[allow(dead_code)]
+fn default_webhook_timeout() -> u64 {
+    30
+}
+
+impl WebhookConfig {
+    /// Create a new webhook configuration
+    ///
+    /// # Arguments
+    /// * `url` - Webhook endpoint URL
+    ///
+    /// # Examples
+    /// ```
+    /// use celers_beat::WebhookConfig;
+    ///
+    /// let webhook = WebhookConfig::new("https://example.com/alerts");
+    /// ```
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            headers: HashMap::new(),
+            timeout_seconds: default_webhook_timeout(),
+            alert_levels: Vec::new(),
+        }
+    }
+
+    /// Add a custom HTTP header
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set the timeout for webhook requests
+    pub fn with_timeout(mut self, timeout_seconds: u64) -> Self {
+        self.timeout_seconds = timeout_seconds;
+        self
+    }
+
+    /// Filter alerts by level (empty = send all alerts)
+    pub fn with_alert_levels(mut self, levels: Vec<AlertLevel>) -> Self {
+        self.alert_levels = levels;
+        self
+    }
+
+    /// Check if this webhook should receive the given alert
+    pub fn should_send(&self, alert: &Alert) -> bool {
+        if self.alert_levels.is_empty() {
+            return true;
+        }
+        self.alert_levels.contains(&alert.level)
+    }
+
+    /// Create a JSON payload for the webhook
+    pub fn create_payload(&self, alert: &Alert) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": alert.timestamp.to_rfc3339(),
+            "task_name": alert.task_name,
+            "level": format!("{:?}", alert.level),
+            "condition": format!("{:?}", alert.condition),
+            "message": alert.message,
+            "metadata": alert.metadata,
+        })
+    }
+}
+
+// ============================================================================
+// Business Day Calendar
+// ============================================================================
+
+/// Day of week
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DayOfWeek {
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+impl DayOfWeek {
+    /// Check if this is a weekend day (Saturday or Sunday)
+    pub fn is_weekend(&self) -> bool {
+        matches!(self, DayOfWeek::Saturday | DayOfWeek::Sunday)
+    }
+
+    /// Check if this is a weekday (Monday-Friday)
+    pub fn is_weekday(&self) -> bool {
+        !self.is_weekend()
+    }
+
+    /// Convert from chrono Weekday
+    pub fn from_chrono(weekday: chrono::Weekday) -> Self {
+        match weekday {
+            chrono::Weekday::Mon => DayOfWeek::Monday,
+            chrono::Weekday::Tue => DayOfWeek::Tuesday,
+            chrono::Weekday::Wed => DayOfWeek::Wednesday,
+            chrono::Weekday::Thu => DayOfWeek::Thursday,
+            chrono::Weekday::Fri => DayOfWeek::Friday,
+            chrono::Weekday::Sat => DayOfWeek::Saturday,
+            chrono::Weekday::Sun => DayOfWeek::Sunday,
+        }
+    }
+}
+
+/// Business hours configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessHours {
+    /// Start hour (0-23)
+    pub start_hour: u32,
+    /// End hour (0-23)
+    pub end_hour: u32,
+}
+
+impl BusinessHours {
+    /// Create a new business hours configuration
+    ///
+    /// # Arguments
+    /// * `start_hour` - Start hour (0-23)
+    /// * `end_hour` - End hour (0-23)
+    pub fn new(start_hour: u32, end_hour: u32) -> Self {
+        Self {
+            start_hour,
+            end_hour,
+        }
+    }
+
+    /// Standard business hours (9 AM - 5 PM)
+    pub fn standard() -> Self {
+        Self {
+            start_hour: 9,
+            end_hour: 17,
+        }
+    }
+
+    /// Check if a given hour is within business hours
+    pub fn is_business_hour(&self, hour: u32) -> bool {
+        hour >= self.start_hour && hour < self.end_hour
+    }
+
+    /// Check if a given time is within business hours
+    pub fn is_within(&self, time: &DateTime<Utc>) -> bool {
+        self.is_business_hour(time.hour())
+    }
+}
+
+/// Business day calendar configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessCalendar {
+    /// Business hours configuration
+    pub business_hours: BusinessHours,
+    /// Working days (defaults to Monday-Friday)
+    #[serde(default = "default_working_days")]
+    pub working_days: Vec<DayOfWeek>,
+}
+
+#[allow(dead_code)]
+fn default_working_days() -> Vec<DayOfWeek> {
+    vec![
+        DayOfWeek::Monday,
+        DayOfWeek::Tuesday,
+        DayOfWeek::Wednesday,
+        DayOfWeek::Thursday,
+        DayOfWeek::Friday,
+    ]
+}
+
+impl BusinessCalendar {
+    /// Create a new business calendar with standard hours (9 AM - 5 PM, Mon-Fri)
+    pub fn standard() -> Self {
+        Self {
+            business_hours: BusinessHours::standard(),
+            working_days: default_working_days(),
+        }
+    }
+
+    /// Create a custom business calendar
+    pub fn new(business_hours: BusinessHours, working_days: Vec<DayOfWeek>) -> Self {
+        Self {
+            business_hours,
+            working_days,
+        }
+    }
+
+    /// Check if a given day of week is a working day
+    pub fn is_working_day(&self, day: DayOfWeek) -> bool {
+        self.working_days.contains(&day)
+    }
+
+    /// Check if a given date/time is within business hours
+    pub fn is_business_time(&self, time: &DateTime<Utc>) -> bool {
+        let day = DayOfWeek::from_chrono(time.weekday());
+        self.is_working_day(day) && self.business_hours.is_within(time)
+    }
+
+    /// Find the next business time after the given time
+    ///
+    /// This will advance to the next business day/hour if necessary.
+    pub fn next_business_time(&self, time: DateTime<Utc>) -> DateTime<Utc> {
+        let mut current = time;
+
+        // Try up to 14 days (2 weeks) to find next business time
+        for _ in 0..14 {
+            let day = DayOfWeek::from_chrono(current.weekday());
+
+            if self.is_working_day(day) {
+                // Check if we're in business hours
+                let hour = current.hour();
+                if hour < self.business_hours.start_hour {
+                    // Before business hours - move to start of business hours today
+                    current = current
+                        .with_hour(self.business_hours.start_hour)
+                        .unwrap()
+                        .with_minute(0)
+                        .unwrap()
+                        .with_second(0)
+                        .unwrap();
+                    return current;
+                } else if hour < self.business_hours.end_hour {
+                    // Within business hours - this is valid
+                    return current;
+                }
+                // After business hours - fall through to next day
+            }
+
+            // Move to start of next day
+            current = (current + Duration::days(1))
+                .with_hour(self.business_hours.start_hour)
+                .unwrap()
+                .with_minute(0)
+                .unwrap()
+                .with_second(0)
+                .unwrap();
+        }
+
+        current
+    }
+}
+
+// ============================================================================
+// Holiday Calendar
+// ============================================================================
+
+/// Holiday definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Holiday {
+    /// Holiday name
+    pub name: String,
+    /// Date (year, month, day)
+    pub date: (i32, u32, u32),
+}
+
+impl Holiday {
+    /// Create a new holiday
+    pub fn new(name: impl Into<String>, year: i32, month: u32, day: u32) -> Self {
+        Self {
+            name: name.into(),
+            date: (year, month, day),
+        }
+    }
+
+    /// Check if this holiday matches the given date
+    pub fn matches(&self, date: &DateTime<Utc>) -> bool {
+        let (year, month, day) = self.date;
+        date.year() == year && date.month() == month && date.day() == day
+    }
+}
+
+/// Holiday calendar
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HolidayCalendar {
+    /// List of holidays
+    holidays: Vec<Holiday>,
+}
+
+impl HolidayCalendar {
+    /// Create a new empty holiday calendar
+    pub fn new() -> Self {
+        Self {
+            holidays: Vec::new(),
+        }
+    }
+
+    /// Add a holiday to the calendar
+    pub fn add_holiday(&mut self, holiday: Holiday) {
+        self.holidays.push(holiday);
+    }
+
+    /// Add a holiday by date components
+    pub fn add(&mut self, name: impl Into<String>, year: i32, month: u32, day: u32) {
+        self.holidays.push(Holiday::new(name, year, month, day));
+    }
+
+    /// Check if a given date is a holiday
+    pub fn is_holiday(&self, date: &DateTime<Utc>) -> bool {
+        self.holidays.iter().any(|h| h.matches(date))
+    }
+
+    /// Get the holiday for a given date, if any
+    pub fn get_holiday(&self, date: &DateTime<Utc>) -> Option<&Holiday> {
+        self.holidays.iter().find(|h| h.matches(date))
+    }
+
+    /// Get the number of holidays in this calendar
+    pub fn len(&self) -> usize {
+        self.holidays.len()
+    }
+
+    /// Check if the calendar is empty
+    pub fn is_empty(&self) -> bool {
+        self.holidays.is_empty()
+    }
+
+    /// Find the next non-holiday date after the given time
+    pub fn next_non_holiday(&self, time: DateTime<Utc>) -> DateTime<Utc> {
+        let mut current = time;
+
+        // Try up to 365 days to find a non-holiday
+        for _ in 0..365 {
+            if !self.is_holiday(&current) {
+                return current;
+            }
+            current += Duration::days(1);
+        }
+
+        current
+    }
+
+    /// Create a US federal holidays calendar for a given year
+    ///
+    /// Includes all 11 US federal holidays:
+    /// - New Year's Day (January 1)
+    /// - Martin Luther King Jr Day (3rd Monday in January)
+    /// - Presidents Day (3rd Monday in February)
+    /// - Memorial Day (Last Monday in May)
+    /// - Juneteenth (June 19)
+    /// - Independence Day (July 4)
+    /// - Labor Day (1st Monday in September)
+    /// - Columbus Day (2nd Monday in October)
+    /// - Veterans Day (November 11)
+    /// - Thanksgiving Day (4th Thursday in November)
+    /// - Christmas Day (December 25)
+    pub fn us_federal(year: i32) -> Self {
+        let mut calendar = Self::new();
+
+        // New Year's Day (January 1)
+        calendar.add("New Year's Day", year, 1, 1);
+
+        // Martin Luther King Jr Day (3rd Monday in January)
+        if let Some((_, day)) = Self::nth_weekday(year, 1, 1, 3) {
+            calendar.add("Martin Luther King Jr Day", year, 1, day);
+        }
+
+        // Presidents Day (3rd Monday in February)
+        if let Some((_, day)) = Self::nth_weekday(year, 2, 1, 3) {
+            calendar.add("Presidents Day", year, 2, day);
+        }
+
+        // Memorial Day (Last Monday in May)
+        if let Some((_, day)) = Self::last_weekday(year, 5, 1) {
+            calendar.add("Memorial Day", year, 5, day);
+        }
+
+        // Juneteenth (June 19)
+        calendar.add("Juneteenth", year, 6, 19);
+
+        // Independence Day (July 4)
+        calendar.add("Independence Day", year, 7, 4);
+
+        // Labor Day (1st Monday in September)
+        if let Some((_, day)) = Self::nth_weekday(year, 9, 1, 1) {
+            calendar.add("Labor Day", year, 9, day);
+        }
+
+        // Columbus Day (2nd Monday in October)
+        if let Some((_, day)) = Self::nth_weekday(year, 10, 1, 2) {
+            calendar.add("Columbus Day", year, 10, day);
+        }
+
+        // Veterans Day (November 11)
+        calendar.add("Veterans Day", year, 11, 11);
+
+        // Thanksgiving Day (4th Thursday in November)
+        if let Some((_, day)) = Self::nth_weekday(year, 11, 4, 4) {
+            calendar.add("Thanksgiving Day", year, 11, day);
+        }
+
+        // Christmas Day (December 25)
+        calendar.add("Christmas Day", year, 12, 25);
+
+        calendar
+    }
+
+    /// Calculate the Nth occurrence of a weekday in a given month
+    ///
+    /// # Arguments
+    /// * `year` - Year
+    /// * `month` - Month (1-12)
+    /// * `weekday` - Day of week (0=Sunday, 1=Monday, ..., 6=Saturday)
+    /// * `nth` - Which occurrence (1=first, 2=second, etc.)
+    ///
+    /// # Returns
+    /// `Some((month, day))` if found, `None` otherwise
+    fn nth_weekday(year: i32, month: u32, weekday: u32, nth: u32) -> Option<(u32, u32)> {
+        use chrono::NaiveDate;
+
+        let first_day = NaiveDate::from_ymd_opt(year, month, 1)?;
+        let first_weekday = first_day.weekday().num_days_from_sunday();
+
+        // Calculate days until first occurrence of target weekday
+        let days_until_first = if weekday >= first_weekday {
+            weekday - first_weekday
+        } else {
+            7 - (first_weekday - weekday)
+        };
+
+        // Calculate the date of the nth occurrence
+        let target_day = 1 + days_until_first + (nth - 1) * 7;
+
+        // Validate the day exists in the month
+        if NaiveDate::from_ymd_opt(year, month, target_day).is_some() {
+            Some((month, target_day))
+        } else {
+            None
+        }
+    }
+
+    /// Find the last occurrence of a weekday in a given month
+    ///
+    /// # Arguments
+    /// * `year` - Year
+    /// * `month` - Month (1-12)
+    /// * `weekday` - Day of week (0=Sunday, 1=Monday, ..., 6=Saturday)
+    ///
+    /// # Returns
+    /// `Some((month, day))` if found, `None` otherwise
+    fn last_weekday(year: i32, month: u32, weekday: u32) -> Option<(u32, u32)> {
+        use chrono::NaiveDate;
+
+        // Start from the last day of the month and work backwards
+        let next_month = if month == 12 { 1 } else { month + 1 };
+        let next_year = if month == 12 { year + 1 } else { year };
+        let last_day = NaiveDate::from_ymd_opt(next_year, next_month, 1)?.pred_opt()?;
+
+        // Search backwards for the target weekday
+        for days_back in 0..7 {
+            if let Some(date) = last_day.checked_sub_signed(Duration::days(days_back)) {
+                if date.weekday().num_days_from_sunday() == weekday {
+                    return Some((month, date.day()));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Create a Japan national holidays calendar for a given year
+    ///
+    /// Includes all 16 Japanese national holidays:
+    /// - New Year's Day (January 1)
+    /// - Coming of Age Day (2nd Monday in January)
+    /// - National Foundation Day (February 11)
+    /// - Emperor's Birthday (February 23)
+    /// - Vernal Equinox Day (March 20 - approximate)
+    /// - Showa Day (April 29)
+    /// - Constitution Memorial Day (May 3)
+    /// - Greenery Day (May 4)
+    /// - Children's Day (May 5)
+    /// - Marine Day (3rd Monday in July)
+    /// - Mountain Day (August 11)
+    /// - Respect for the Aged Day (3rd Monday in September)
+    /// - Autumnal Equinox Day (September 23 - approximate)
+    /// - Sports Day (2nd Monday in October)
+    /// - Culture Day (November 3)
+    /// - Labor Thanksgiving Day (November 23)
+    pub fn japan(year: i32) -> Self {
+        let mut calendar = Self::new();
+
+        // New Year's Day (January 1)
+        calendar.add("New Year's Day", year, 1, 1);
+
+        // Coming of Age Day (2nd Monday in January)
+        if let Some((_, day)) = Self::nth_weekday(year, 1, 1, 2) {
+            calendar.add("Coming of Age Day", year, 1, day);
+        }
+
+        // National Foundation Day (February 11)
+        calendar.add("National Foundation Day", year, 2, 11);
+
+        // Emperor's Birthday (February 23)
+        calendar.add("Emperor's Birthday", year, 2, 23);
+
+        // Vernal Equinox Day (around March 20-21, using March 20 as approximation)
+        calendar.add("Vernal Equinox Day", year, 3, 20);
+
+        // Showa Day (April 29)
+        calendar.add("Showa Day", year, 4, 29);
+
+        // Constitution Memorial Day (May 3)
+        calendar.add("Constitution Memorial Day", year, 5, 3);
+
+        // Greenery Day (May 4)
+        calendar.add("Greenery Day", year, 5, 4);
+
+        // Children's Day (May 5)
+        calendar.add("Children's Day", year, 5, 5);
+
+        // Marine Day (3rd Monday in July)
+        if let Some((_, day)) = Self::nth_weekday(year, 7, 1, 3) {
+            calendar.add("Marine Day", year, 7, day);
+        }
+
+        // Mountain Day (August 11)
+        calendar.add("Mountain Day", year, 8, 11);
+
+        // Respect for the Aged Day (3rd Monday in September)
+        if let Some((_, day)) = Self::nth_weekday(year, 9, 1, 3) {
+            calendar.add("Respect for the Aged Day", year, 9, day);
+        }
+
+        // Autumnal Equinox Day (around September 22-23, using September 23 as approximation)
+        calendar.add("Autumnal Equinox Day", year, 9, 23);
+
+        // Sports Day (2nd Monday in October)
+        if let Some((_, day)) = Self::nth_weekday(year, 10, 1, 2) {
+            calendar.add("Sports Day", year, 10, day);
+        }
+
+        // Culture Day (November 3)
+        calendar.add("Culture Day", year, 11, 3);
+
+        // Labor Thanksgiving Day (November 23)
+        calendar.add("Labor Thanksgiving Day", year, 11, 23);
+
+        calendar
+    }
+
+    /// Create a UK public holidays calendar for a given year (England and Wales)
+    ///
+    /// Includes the standard UK bank holidays:
+    /// - New Year's Day (January 1)
+    /// - Good Friday (calculated based on Easter)
+    /// - Easter Monday (calculated based on Easter)
+    /// - Early May Bank Holiday (1st Monday in May)
+    /// - Spring Bank Holiday (Last Monday in May)
+    /// - Summer Bank Holiday (Last Monday in August)
+    /// - Christmas Day (December 25)
+    /// - Boxing Day (December 26)
+    ///
+    /// Note: Easter-dependent holidays use a simplified approximation.
+    /// For exact dates, use a proper Easter calculation algorithm.
+    pub fn uk(year: i32) -> Self {
+        let mut calendar = Self::new();
+
+        // New Year's Day (January 1)
+        calendar.add("New Year's Day", year, 1, 1);
+
+        // Easter calculation (simplified - using a fixed date approximation)
+        // In a production system, you would use a proper Easter algorithm
+        // For now, we'll use common approximate dates
+
+        // Good Friday (approximate - varies between March 20 and April 23)
+        // Using April 15 as a typical date
+        calendar.add("Good Friday", year, 4, 15);
+
+        // Easter Monday (Good Friday + 3 days)
+        calendar.add("Easter Monday", year, 4, 18);
+
+        // Early May Bank Holiday (1st Monday in May)
+        if let Some((_, day)) = Self::nth_weekday(year, 5, 1, 1) {
+            calendar.add("Early May Bank Holiday", year, 5, day);
+        }
+
+        // Spring Bank Holiday (Last Monday in May)
+        if let Some((_, day)) = Self::last_weekday(year, 5, 1) {
+            calendar.add("Spring Bank Holiday", year, 5, day);
+        }
+
+        // Summer Bank Holiday (Last Monday in August)
+        if let Some((_, day)) = Self::last_weekday(year, 8, 1) {
+            calendar.add("Summer Bank Holiday", year, 8, day);
+        }
+
+        // Christmas Day (December 25)
+        calendar.add("Christmas Day", year, 12, 25);
+
+        // Boxing Day (December 26)
+        calendar.add("Boxing Day", year, 12, 26);
+
+        calendar
+    }
+
+    /// Create a Canada statutory holidays calendar for a given year
+    ///
+    /// Includes federal statutory holidays observed across Canada:
+    /// - New Year's Day (January 1)
+    /// - Good Friday (calculated based on Easter)
+    /// - Victoria Day (Monday before May 25)
+    /// - Canada Day (July 1)
+    /// - Labour Day (1st Monday in September)
+    /// - Thanksgiving (2nd Monday in October)
+    /// - Remembrance Day (November 11) - observed federally
+    /// - Christmas Day (December 25)
+    /// - Boxing Day (December 26)
+    ///
+    /// Note: Provincial holidays may vary and are not included.
+    pub fn canada(year: i32) -> Self {
+        let mut calendar = Self::new();
+
+        // New Year's Day (January 1)
+        calendar.add("New Year's Day", year, 1, 1);
+
+        // Good Friday (approximate - using April 15 as typical date)
+        calendar.add("Good Friday", year, 4, 15);
+
+        // Victoria Day (Monday before May 25)
+        // This is the last Monday on or before May 24
+        if let Some((_, day)) = Self::monday_on_or_before(year, 5, 24) {
+            calendar.add("Victoria Day", year, 5, day);
+        }
+
+        // Canada Day (July 1)
+        calendar.add("Canada Day", year, 7, 1);
+
+        // Labour Day (1st Monday in September)
+        if let Some((_, day)) = Self::nth_weekday(year, 9, 1, 1) {
+            calendar.add("Labour Day", year, 9, day);
+        }
+
+        // Thanksgiving (2nd Monday in October)
+        if let Some((_, day)) = Self::nth_weekday(year, 10, 1, 2) {
+            calendar.add("Thanksgiving", year, 10, day);
+        }
+
+        // Remembrance Day (November 11)
+        calendar.add("Remembrance Day", year, 11, 11);
+
+        // Christmas Day (December 25)
+        calendar.add("Christmas Day", year, 12, 25);
+
+        // Boxing Day (December 26)
+        calendar.add("Boxing Day", year, 12, 26);
+
+        calendar
+    }
+
+    /// Find the Monday on or before a specific date
+    ///
+    /// # Arguments
+    /// * `year` - Year
+    /// * `month` - Month (1-12)
+    /// * `day` - Day of month
+    ///
+    /// # Returns
+    /// `Some((month, day))` if found, `None` otherwise
+    fn monday_on_or_before(year: i32, month: u32, day: u32) -> Option<(u32, u32)> {
+        use chrono::NaiveDate;
+
+        let date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let weekday = date.weekday().num_days_from_sunday();
+
+        // If it's already Monday (1), return it
+        // Otherwise, go back to the previous Monday
+        let days_back = if weekday >= 1 {
+            weekday - 1
+        } else {
+            6 // Sunday, so go back 6 days to Monday
+        };
+
+        let target = date.checked_sub_signed(Duration::days(days_back as i64))?;
+        Some((target.month(), target.day()))
+    }
+}
+
+// ============================================================================
+// Calendar-Aware Schedule Extensions
+// ============================================================================
+
+impl ScheduledTask {
+    /// Set business calendar for this task
+    ///
+    /// This doesn't currently enforce business hours (requires more extensive changes),
+    /// but provides the configuration for future use.
+    pub fn with_business_calendar(self, _calendar: BusinessCalendar) -> Self {
+        // Store for future use - currently just validation
+        self
+    }
+
+    /// Set holiday calendar for this task
+    ///
+    /// This doesn't currently enforce holidays (requires more extensive changes),
+    /// but provides the configuration for future use.
+    pub fn with_holiday_calendar(self, _calendar: HolidayCalendar) -> Self {
+        // Store for future use - currently just validation
+        self
+    }
+}
+
+impl BeatScheduler {
+    /// Register a webhook for alert delivery
+    ///
+    /// # Arguments
+    /// * `webhook` - Webhook configuration
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use celers_beat::{BeatScheduler, WebhookConfig};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// let webhook = WebhookConfig::new("https://example.com/alerts")
+    ///     .with_header("Authorization", "Bearer token123");
+    /// scheduler.register_webhook(webhook);
+    /// ```
+    pub fn register_webhook(&mut self, webhook: WebhookConfig) {
+        let webhook = Arc::new(webhook);
+        self.alert_manager
+            .add_callback(Arc::new(move |alert: &Alert| {
+                if webhook.should_send(alert) {
+                    let payload = webhook.create_payload(alert);
+                    // In a real implementation, this would send an async HTTP request
+                    // For now, we just log it (webhook delivery requires async runtime)
+                    eprintln!("Webhook alert to {}: {}", webhook.url, payload);
+                }
+            }));
+    }
+}
+
+// ============================================================================
+// Efficient Schedule Indexing
+// ============================================================================
+
+/// Schedule index for fast task lookup
+///
+/// This structure maintains indexes on tasks for efficient queries:
+/// - By schedule type (Interval, Crontab, Solar, OneTime)
+/// - By next run time (priority queue ordering)
+#[derive(Debug, Clone, Default)]
+pub struct ScheduleIndex {
+    /// Tasks indexed by schedule type
+    by_type: HashMap<String, HashSet<String>>,
+    /// Tasks sorted by next run time (task_name, next_run_time)
+    by_next_run: Vec<(String, DateTime<Utc>)>,
+    /// Flag to track if index needs rebuilding
+    dirty: bool,
+}
+
+impl ScheduleIndex {
+    /// Create a new empty schedule index
+    pub fn new() -> Self {
+        Self {
+            by_type: HashMap::new(),
+            by_next_run: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    /// Add a task to the index
+    pub fn add_task(&mut self, task: &ScheduledTask) {
+        let type_key = Self::schedule_type_key(&task.schedule);
+        self.by_type
+            .entry(type_key)
+            .or_default()
+            .insert(task.name.clone());
+
+        if let Ok(next_run) = task.next_run_time() {
+            self.by_next_run.push((task.name.clone(), next_run));
+            self.dirty = true;
+        }
+    }
+
+    /// Remove a task from the index
+    pub fn remove_task(&mut self, task: &ScheduledTask) {
+        let type_key = Self::schedule_type_key(&task.schedule);
+        if let Some(set) = self.by_type.get_mut(&type_key) {
+            set.remove(&task.name);
+        }
+
+        self.by_next_run.retain(|(name, _)| name != &task.name);
+        self.dirty = true;
+    }
+
+    /// Update a task in the index (when schedule changes)
+    pub fn update_task(&mut self, old_task: &ScheduledTask, new_task: &ScheduledTask) {
+        self.remove_task(old_task);
+        self.add_task(new_task);
+    }
+
+    /// Rebuild the index from a task map
+    pub fn rebuild(&mut self, tasks: &HashMap<String, ScheduledTask>) {
+        self.by_type.clear();
+        self.by_next_run.clear();
+
+        for task in tasks.values() {
+            if task.enabled {
+                self.add_task(task);
+            }
+        }
+
+        self.sort_by_next_run();
+        self.dirty = false;
+    }
+
+    /// Sort tasks by next run time (for priority queue behavior)
+    fn sort_by_next_run(&mut self) {
+        if self.dirty {
+            self.by_next_run.sort_by_key(|(_, time)| *time);
+            self.dirty = false;
+        }
+    }
+
+    /// Get tasks of a specific schedule type
+    pub fn get_by_type(&self, schedule_type: &str) -> Option<&HashSet<String>> {
+        self.by_type.get(schedule_type)
+    }
+
+    /// Get tasks that should run next (up to N tasks)
+    pub fn get_next_due(&mut self, limit: usize, now: DateTime<Utc>) -> Vec<String> {
+        self.sort_by_next_run();
+
+        self.by_next_run
+            .iter()
+            .filter(|(_, time)| *time <= now)
+            .take(limit)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Get the earliest next run time
+    pub fn earliest_next_run(&mut self) -> Option<DateTime<Utc>> {
+        self.sort_by_next_run();
+        self.by_next_run.first().map(|(_, time)| *time)
+    }
+
+    /// Get schedule type key for indexing
+    fn schedule_type_key(schedule: &Schedule) -> String {
+        match schedule {
+            Schedule::Interval { .. } => "interval".to_string(),
+            #[cfg(feature = "cron")]
+            Schedule::Crontab { .. } => "crontab".to_string(),
+            #[cfg(feature = "solar")]
+            Schedule::Solar { .. } => "solar".to_string(),
+            Schedule::OneTime { .. } => "onetime".to_string(),
+        }
+    }
+
+    /// Check if index needs rebuilding
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Mark index as dirty (needs sorting)
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Get count of tasks by type
+    pub fn count_by_type(&self, schedule_type: &str) -> usize {
+        self.by_type
+            .get(schedule_type)
+            .map(|set| set.len())
+            .unwrap_or(0)
+    }
+
+    /// Get total count of indexed tasks
+    pub fn total_count(&self) -> usize {
+        self.by_next_run.len()
+    }
+}
+
+// ============================================================================
+// Advanced Calendar Features
+// ============================================================================
+
+/// Blackout period - time range when tasks should not execute
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlackoutPeriod {
+    /// Blackout period name
+    pub name: String,
+    /// Start time (UTC)
+    pub start: DateTime<Utc>,
+    /// End time (UTC)
+    pub end: DateTime<Utc>,
+    /// Optional recurring pattern
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurring: Option<BlackoutRecurrence>,
+}
+
+/// Blackout recurrence pattern
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BlackoutRecurrence {
+    /// Recur daily at the same time
+    Daily,
+    /// Recur weekly on the same day and time
+    Weekly,
+    /// Recur monthly on the same date and time
+    Monthly,
+}
+
+impl BlackoutPeriod {
+    /// Create a new blackout period
+    pub fn new(name: impl Into<String>, start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
+        Self {
+            name: name.into(),
+            start,
+            end,
+            recurring: None,
+        }
+    }
+
+    /// Make this blackout period recurring
+    pub fn with_recurrence(mut self, recurrence: BlackoutRecurrence) -> Self {
+        self.recurring = Some(recurrence);
+        self
+    }
+
+    /// Check if the given time is within this blackout period
+    pub fn is_blackout(&self, time: DateTime<Utc>) -> bool {
+        if time >= self.start && time <= self.end {
+            return true;
+        }
+
+        // Check recurring patterns
+        if let Some(ref recurrence) = self.recurring {
+            match recurrence {
+                BlackoutRecurrence::Daily => {
+                    let start_time = (self.start.hour(), self.start.minute());
+                    let end_time = (self.end.hour(), self.end.minute());
+                    let current_time = (time.hour(), time.minute());
+                    current_time >= start_time && current_time <= end_time
+                }
+                BlackoutRecurrence::Weekly => {
+                    if time.weekday() == self.start.weekday() {
+                        let start_time = (self.start.hour(), self.start.minute());
+                        let end_time = (self.end.hour(), self.end.minute());
+                        let current_time = (time.hour(), time.minute());
+                        current_time >= start_time && current_time <= end_time
+                    } else {
+                        false
+                    }
+                }
+                BlackoutRecurrence::Monthly => {
+                    if time.day() == self.start.day() {
+                        let start_time = (self.start.hour(), self.start.minute());
+                        let end_time = (self.end.hour(), self.end.minute());
+                        let current_time = (time.hour(), time.minute());
+                        current_time >= start_time && current_time <= end_time
+                    } else {
+                        false
+                    }
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Find the next time after the blackout period
+    pub fn next_available_time(&self, time: DateTime<Utc>) -> DateTime<Utc> {
+        if !self.is_blackout(time) {
+            return time;
+        }
+
+        // If in blackout, move to end of blackout
+        let mut current = self.end;
+
+        // For recurring blackouts, may need to advance further
+        if let Some(ref recurrence) = self.recurring {
+            while self.is_blackout(current) {
+                current = match recurrence {
+                    BlackoutRecurrence::Daily => current + Duration::days(1),
+                    BlackoutRecurrence::Weekly => current + Duration::weeks(1),
+                    BlackoutRecurrence::Monthly => {
+                        // Move to next month
+                        if current.month() == 12 {
+                            current
+                                .with_year(current.year() + 1)
+                                .unwrap()
+                                .with_month(1)
+                                .unwrap()
+                        } else {
+                            current.with_month(current.month() + 1).unwrap()
+                        }
+                    }
+                };
+            }
+        }
+
+        current
+    }
+}
+
+/// Calendar with blackout periods
+#[derive(Debug, Clone, Default)]
+pub struct CalendarWithBlackout {
+    /// Base holiday calendar
+    pub holiday_calendar: HolidayCalendar,
+    /// Base business calendar
+    pub business_calendar: Option<BusinessCalendar>,
+    /// Blackout periods
+    pub blackout_periods: Vec<BlackoutPeriod>,
+    /// Execute only on holidays flag
+    pub holidays_only: bool,
+}
+
+impl CalendarWithBlackout {
+    /// Create a new calendar with blackout support
+    pub fn new() -> Self {
+        Self {
+            holiday_calendar: HolidayCalendar::new(),
+            business_calendar: None,
+            blackout_periods: Vec::new(),
+            holidays_only: false,
+        }
+    }
+
+    /// Add a blackout period
+    pub fn add_blackout(&mut self, blackout: BlackoutPeriod) {
+        self.blackout_periods.push(blackout);
+    }
+
+    /// Set to execute only on holidays
+    pub fn set_holidays_only(&mut self, enabled: bool) {
+        self.holidays_only = enabled;
+    }
+
+    /// Set business calendar
+    pub fn set_business_calendar(&mut self, calendar: BusinessCalendar) {
+        self.business_calendar = Some(calendar);
+    }
+
+    /// Check if a time is valid for execution
+    pub fn is_valid_time(&self, time: DateTime<Utc>) -> bool {
+        // Check blackout periods
+        for blackout in &self.blackout_periods {
+            if blackout.is_blackout(time) {
+                return false;
+            }
+        }
+
+        // Check holidays-only mode
+        if self.holidays_only && !self.holiday_calendar.is_holiday(&time) {
+            return false;
+        }
+
+        // Check business calendar if set
+        if let Some(ref business) = self.business_calendar {
+            if !business.is_business_time(&time) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Find the next valid execution time
+    pub fn next_valid_time(&self, mut time: DateTime<Utc>) -> DateTime<Utc> {
+        // Try up to 365 days
+        for _ in 0..365 {
+            // Check blackout periods first
+            let mut in_blackout = false;
+            for blackout in &self.blackout_periods {
+                if blackout.is_blackout(time) {
+                    time = blackout.next_available_time(time);
+                    in_blackout = true;
+                    break;
+                }
+            }
+
+            if in_blackout {
+                continue;
+            }
+
+            // Check holidays-only mode
+            if self.holidays_only && !self.holiday_calendar.is_holiday(&time) {
+                time += Duration::days(1);
+                continue;
+            }
+
+            // Check business calendar
+            if let Some(ref business) = self.business_calendar {
+                if !business.is_business_time(&time) {
+                    time = business.next_business_time(time);
+                    continue;
+                }
+            }
+
+            // All checks passed
+            return time;
+        }
+
+        time
+    }
+}
+
+// ============================================================================
+// Schedule Composition
+// ============================================================================
+
+/// Composite schedule combining multiple schedules with logical operations
+///
+/// Allows creating complex schedules by combining simple ones with AND/OR logic.
+#[derive(Debug, Clone)]
+pub struct CompositeSchedule {
+    /// List of schedules to combine
+    schedules: Vec<Schedule>,
+    /// Combination mode (AND = all must match, OR = any must match)
+    mode: CompositeMode,
+}
+
+/// Mode for combining schedules
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompositeMode {
+    /// All schedules must be due (intersection)
+    And,
+    /// Any schedule must be due (union)
+    Or,
+}
+
+impl CompositeSchedule {
+    /// Create a new composite schedule with AND logic
+    ///
+    /// # Examples
+    /// ```
+    /// use celers_beat::{Schedule, CompositeSchedule};
+    ///
+    /// let schedule = CompositeSchedule::and(vec![
+    ///     Schedule::interval(60),
+    ///     Schedule::interval(120),
+    /// ]);
+    /// ```
+    pub fn and(schedules: Vec<Schedule>) -> Self {
+        Self {
+            schedules,
+            mode: CompositeMode::And,
+        }
+    }
+
+    /// Create a new composite schedule with OR logic
+    ///
+    /// # Examples
+    /// ```
+    /// use celers_beat::{Schedule, CompositeSchedule};
+    ///
+    /// let schedule = CompositeSchedule::or(vec![
+    ///     Schedule::interval(60),
+    ///     Schedule::interval(120),
+    /// ]);
+    /// ```
+    pub fn or(schedules: Vec<Schedule>) -> Self {
+        Self {
+            schedules,
+            mode: CompositeMode::Or,
+        }
+    }
+
+    /// Calculate next run time based on composite logic
+    ///
+    /// - AND mode: Returns the latest next run time among all schedules (all must be due)
+    /// - OR mode: Returns the earliest next run time among all schedules (any can be due)
+    pub fn next_run(
+        &self,
+        last_run: Option<DateTime<Utc>>,
+    ) -> Result<DateTime<Utc>, ScheduleError> {
+        if self.schedules.is_empty() {
+            return Err(ScheduleError::Invalid(
+                "Composite schedule has no sub-schedules".to_string(),
+            ));
+        }
+
+        let mut next_runs = Vec::new();
+        for schedule in &self.schedules {
+            match schedule.next_run(last_run) {
+                Ok(next) => next_runs.push(next),
+                Err(e) => {
+                    // If any schedule fails in AND mode, the whole composite fails
+                    if self.mode == CompositeMode::And {
+                        return Err(e);
+                    }
+                    // In OR mode, skip failed schedules
+                }
+            }
+        }
+
+        if next_runs.is_empty() {
+            return Err(ScheduleError::Invalid(
+                "No valid next run time from any sub-schedule".to_string(),
+            ));
+        }
+
+        match self.mode {
+            CompositeMode::And => {
+                // AND: all must be due, so take the latest (slowest) time
+                Ok(*next_runs.iter().max().unwrap())
+            }
+            CompositeMode::Or => {
+                // OR: any can be due, so take the earliest (fastest) time
+                Ok(*next_runs.iter().min().unwrap())
+            }
+        }
+    }
+
+    /// Check if this composite schedule is due
+    pub fn is_due(&self, last_run: Option<DateTime<Utc>>) -> Result<bool, ScheduleError> {
+        let next_run = self.next_run(last_run)?;
+        Ok(Utc::now() >= next_run)
+    }
+
+    /// Get the number of sub-schedules
+    pub fn schedule_count(&self) -> usize {
+        self.schedules.len()
+    }
+
+    /// Get the composition mode
+    pub fn mode(&self) -> CompositeMode {
+        self.mode
+    }
+
+    /// Get reference to sub-schedules
+    pub fn schedules(&self) -> &[Schedule] {
+        &self.schedules
+    }
+}
+
+impl std::fmt::Display for CompositeSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode_str = match self.mode {
+            CompositeMode::And => "AND",
+            CompositeMode::Or => "OR",
+        };
+
+        write!(f, "Composite[{}](", mode_str)?;
+        for (i, schedule) in self.schedules.iter().enumerate() {
+            if i > 0 {
+                write!(f, " {} ", mode_str)?;
+            }
+            write!(f, "{}", schedule)?;
+        }
+        write!(f, ")")
+    }
+}
+
+/// Type alias for custom schedule function
+type CustomScheduleFn =
+    Arc<dyn Fn(Option<DateTime<Utc>>) -> Result<DateTime<Utc>, ScheduleError> + Send + Sync>;
+
+/// Custom schedule with user-defined logic
+///
+/// Allows users to define custom scheduling logic via a closure.
+pub struct CustomSchedule {
+    /// Schedule name/description
+    pub name: String,
+    /// Custom next_run logic
+    next_run_fn: CustomScheduleFn,
+}
+
+impl CustomSchedule {
+    /// Create a new custom schedule
+    ///
+    /// # Arguments
+    /// * `name` - Descriptive name for this schedule
+    /// * `next_run_fn` - Function that calculates next run time
+    ///
+    /// # Examples
+    /// ```
+    /// use celers_beat::CustomSchedule;
+    /// use chrono::{Utc, Duration};
+    ///
+    /// let schedule = CustomSchedule::new(
+    ///     "every_fibonacci_seconds",
+    ///     |last_run| {
+    ///         let base = last_run.unwrap_or_else(Utc::now);
+    ///         Ok(base + Duration::seconds(13)) // 13th Fibonacci number
+    ///     }
+    /// );
+    /// ```
+    pub fn new<F>(name: impl Into<String>, next_run_fn: F) -> Self
+    where
+        F: Fn(Option<DateTime<Utc>>) -> Result<DateTime<Utc>, ScheduleError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            name: name.into(),
+            next_run_fn: Arc::new(next_run_fn),
+        }
+    }
+
+    /// Calculate next run time using custom logic
+    pub fn next_run(
+        &self,
+        last_run: Option<DateTime<Utc>>,
+    ) -> Result<DateTime<Utc>, ScheduleError> {
+        (self.next_run_fn)(last_run)
+    }
+
+    /// Check if this custom schedule is due
+    pub fn is_due(&self, last_run: Option<DateTime<Utc>>) -> Result<bool, ScheduleError> {
+        let next_run = self.next_run(last_run)?;
+        Ok(Utc::now() >= next_run)
+    }
+}
+
+impl std::fmt::Debug for CustomSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomSchedule")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for CustomSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Custom[{}]", self.name)
+    }
+}
+
+// ============================================================================
+// Advanced Scheduler Features: Starvation Prevention & Schedule Preview
+// ============================================================================
+
+/// Task waiting time information for starvation prevention
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskWaitingInfo {
+    /// Task name
+    pub task_name: String,
+    /// Original priority (None = default 5)
+    pub original_priority: Option<u8>,
+    /// Effective priority (may be boosted to prevent starvation)
+    pub effective_priority: u8,
+    /// Time since last execution (or since created if never run)
+    pub waiting_duration: chrono::Duration,
+    /// Whether priority was boosted
+    pub priority_boosted: bool,
+    /// Boost reason if applicable
+    pub boost_reason: Option<String>,
+}
+
+impl BeatScheduler {
+    /// Get tasks with starvation prevention priority boosting
+    ///
+    /// This method identifies low-priority tasks that have been waiting too long
+    /// and temporarily boosts their effective priority to prevent starvation.
+    ///
+    /// # Arguments
+    /// * `starvation_threshold_minutes` - Minutes waited before boosting priority (default: 60)
+    /// * `boost_amount` - How much to boost priority (default: 2 levels)
+    ///
+    /// # Returns
+    /// Vector of waiting information for all tasks, with boosted priorities where applicable
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    ///
+    /// let mut low_priority_task = ScheduledTask::new(
+    ///     "cleanup".to_string(),
+    ///     Schedule::interval(300)
+    /// );
+    /// low_priority_task.options.priority = Some(2); // Low priority
+    /// scheduler.add_task(low_priority_task).unwrap();
+    ///
+    /// // Check for starvation (60 minute threshold)
+    /// let waiting_info = scheduler.get_tasks_with_starvation_prevention(Some(60), Some(2));
+    /// for info in waiting_info {
+    ///     if info.priority_boosted {
+    ///         println!("{} priority boosted to {} (waited {} minutes)",
+    ///             info.task_name, info.effective_priority,
+    ///             info.waiting_duration.num_minutes());
+    ///     }
+    /// }
+    /// ```
+    pub fn get_tasks_with_starvation_prevention(
+        &self,
+        starvation_threshold_minutes: Option<i64>,
+        boost_amount: Option<u8>,
+    ) -> Vec<TaskWaitingInfo> {
+        let threshold_minutes = starvation_threshold_minutes.unwrap_or(60);
+        let boost = boost_amount.unwrap_or(2);
+        let now = Utc::now();
+
+        self.tasks
+            .values()
+            .filter(|task| task.enabled)
+            .map(|task| {
+                let original_priority = task.options.priority;
+                let base_priority = original_priority.unwrap_or(5);
+
+                // Calculate waiting duration
+                let waiting_duration = if let Some(last_run) = task.last_run_at {
+                    now - last_run
+                } else {
+                    // Never run - use a very large duration to ensure it gets scheduled
+                    Duration::hours(24 * 365)
+                };
+
+                // Determine if priority should be boosted
+                let waiting_minutes = waiting_duration.num_minutes();
+                let should_boost = waiting_minutes >= threshold_minutes && base_priority < 7;
+
+                let (effective_priority, priority_boosted, boost_reason) = if should_boost {
+                    let boosted = (base_priority + boost).min(9);
+                    (
+                        boosted,
+                        true,
+                        Some(format!(
+                            "Waited {} minutes (threshold: {} min)",
+                            waiting_minutes, threshold_minutes
+                        )),
+                    )
+                } else {
+                    (base_priority, false, None)
+                };
+
+                TaskWaitingInfo {
+                    task_name: task.name.clone(),
+                    original_priority,
+                    effective_priority,
+                    waiting_duration,
+                    priority_boosted,
+                    boost_reason,
+                }
+            })
+            .collect()
+    }
+
+    /// Get due tasks with starvation prevention
+    ///
+    /// Like `get_due_tasks_by_priority()` but applies starvation prevention
+    /// to ensure low-priority tasks eventually run.
+    ///
+    /// # Arguments
+    /// * `starvation_threshold_minutes` - Minutes waited before boosting (default: 60)
+    ///
+    /// # Returns
+    /// Due tasks ordered by effective priority (with starvation prevention)
+    pub fn get_due_tasks_with_starvation_prevention(
+        &self,
+        starvation_threshold_minutes: Option<i64>,
+    ) -> Vec<&ScheduledTask> {
+        let waiting_info =
+            self.get_tasks_with_starvation_prevention(starvation_threshold_minutes, Some(2));
+
+        // Create a map of task name to effective priority
+        let effective_priorities: HashMap<String, u8> = waiting_info
+            .into_iter()
+            .map(|info| (info.task_name, info.effective_priority))
+            .collect();
+
+        let mut due_tasks: Vec<&ScheduledTask> = self
+            .tasks
+            .values()
+            .filter(|task| task.enabled && task.is_due().unwrap_or(false))
+            .collect();
+
+        // Sort by effective priority (descending), then by next run time (ascending)
+        due_tasks.sort_by(|a, b| {
+            let a_priority = effective_priorities.get(&a.name).copied().unwrap_or(5);
+            let b_priority = effective_priorities.get(&b.name).copied().unwrap_or(5);
+
+            match b_priority.cmp(&a_priority) {
+                std::cmp::Ordering::Equal => {
+                    // Same priority - sort by next run time
+                    match (a.next_run_time(), b.next_run_time()) {
+                        (Ok(a_time), Ok(b_time)) => a_time.cmp(&b_time),
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                }
+                other => other,
+            }
+        });
+
+        due_tasks
+    }
+
+    /// Preview upcoming task executions
+    ///
+    /// Calculate and preview the next N execution times for each task.
+    /// Useful for debugging schedules and planning capacity.
+    ///
+    /// # Arguments
+    /// * `count` - Number of upcoming executions to preview (default: 10)
+    /// * `task_name` - Optional specific task to preview (None = all tasks)
+    ///
+    /// # Returns
+    /// Map of task name to vector of upcoming execution times
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// let task = ScheduledTask::new("report".to_string(), Schedule::interval(3600));
+    /// scheduler.add_task(task).unwrap();
+    ///
+    /// // Preview next 5 executions
+    /// let preview = scheduler.preview_upcoming_executions(Some(5), None);
+    /// for (task_name, times) in preview {
+    ///     println!("{}: {} upcoming executions", task_name, times.len());
+    ///     for (i, time) in times.iter().enumerate() {
+    ///         println!("  {}. {}", i + 1, time);
+    ///     }
+    /// }
+    /// ```
+    pub fn preview_upcoming_executions(
+        &self,
+        count: Option<usize>,
+        task_name: Option<&str>,
+    ) -> HashMap<String, Vec<DateTime<Utc>>> {
+        let preview_count = count.unwrap_or(10);
+        let mut preview = HashMap::new();
+
+        let tasks: Vec<&ScheduledTask> = if let Some(name) = task_name {
+            self.tasks.get(name).into_iter().collect()
+        } else {
+            self.tasks.values().collect()
+        };
+
+        for task in tasks {
+            let mut upcoming = Vec::new();
+            let mut last_run = task.last_run_at;
+
+            for _ in 0..preview_count {
+                match task.schedule.next_run(last_run) {
+                    Ok(next_time) => {
+                        upcoming.push(next_time);
+                        last_run = Some(next_time);
+                    }
+                    Err(_) => break, // Can't calculate more (e.g., one-time schedule)
+                }
+            }
+
+            if !upcoming.is_empty() {
+                preview.insert(task.name.clone(), upcoming);
+            }
+        }
+
+        preview
+    }
+
+    /// Simulate task execution without actually running tasks
+    ///
+    /// Dry-run mode for testing scheduler behavior. This method simulates
+    /// the scheduler loop and returns what would have been executed.
+    ///
+    /// # Arguments
+    /// * `duration_seconds` - How long to simulate (in seconds)
+    /// * `tick_interval_seconds` - Scheduler tick interval (default: 1 second)
+    ///
+    /// # Returns
+    /// Vector of (timestamp, task_name) tuples showing when each task would execute
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    ///
+    /// let task1 = ScheduledTask::new("task_60s".to_string(), Schedule::interval(60));
+    /// let task2 = ScheduledTask::new("task_120s".to_string(), Schedule::interval(120));
+    /// scheduler.add_task(task1).unwrap();
+    /// scheduler.add_task(task2).unwrap();
+    ///
+    /// // Simulate 5 minutes of execution
+    /// let simulation = scheduler.dry_run(300, Some(1));
+    /// println!("Would execute {} tasks in 5 minutes", simulation.len());
+    /// for (time, task_name) in simulation {
+    ///     println!("  {} at {}", task_name, time);
+    /// }
+    /// ```
+    pub fn dry_run(
+        &self,
+        duration_seconds: i64,
+        tick_interval_seconds: Option<i64>,
+    ) -> Vec<(DateTime<Utc>, String)> {
+        let tick_interval = Duration::seconds(tick_interval_seconds.unwrap_or(1));
+        let end_time = Utc::now() + Duration::seconds(duration_seconds);
+        let mut current_time = Utc::now();
+        let mut executions = Vec::new();
+
+        // Clone task state for simulation
+        let mut task_state: HashMap<String, Option<DateTime<Utc>>> = self
+            .tasks
+            .iter()
+            .map(|(name, task)| (name.clone(), task.last_run_at))
+            .collect();
+
+        while current_time < end_time {
+            // Check each task
+            for (name, task) in &self.tasks {
+                if !task.enabled {
+                    continue;
+                }
+
+                let last_run = task_state.get(name).and_then(|t| *t);
+
+                // Calculate next run based on simulated last run
+                if let Ok(next_run) = task.schedule.next_run(last_run) {
+                    // Check if task should execute at current simulation time
+                    if next_run <= current_time && last_run.is_none_or(|lr| lr < next_run) {
+                        executions.push((current_time, name.clone()));
+                        // Update simulated last run
+                        task_state.insert(name.clone(), Some(current_time));
+                    }
+                }
+            }
+
+            // Advance simulation time
+            current_time += tick_interval;
+        }
+
+        // Sort by execution time
+        executions.sort_by_key(|(time, _)| *time);
+        executions
+    }
+
+    /// Get comprehensive scheduler statistics
+    ///
+    /// Returns detailed statistics about scheduler performance and task execution.
+    ///
+    /// # Returns
+    /// Detailed scheduler statistics including execution counts, rates, and health metrics
+    pub fn get_comprehensive_stats(&self) -> SchedulerStatistics {
+        let total_tasks = self.tasks.len();
+        let enabled_tasks = self.tasks.values().filter(|t| t.enabled).count();
+        let disabled_tasks = total_tasks - enabled_tasks;
+
+        let mut total_executions = 0u64;
+        let mut total_failures = 0u64;
+        let mut total_timeouts = 0u64;
+        let mut total_duration_ms = 0u64;
+        let mut execution_count = 0u64;
+
+        let mut tasks_in_retry = 0;
+        let mut tasks_with_failures = 0;
+        let mut healthy_tasks = 0;
+        let mut warning_tasks = 0;
+        let mut unhealthy_tasks = 0;
+
+        let now = Utc::now();
+        let mut oldest_execution: Option<DateTime<Utc>> = None;
+        let mut newest_execution: Option<DateTime<Utc>> = None;
+
+        for task in self.tasks.values() {
+            total_executions += task.total_run_count;
+            total_failures += task.total_failure_count;
+
+            // Aggregate from history
+            for record in &task.execution_history {
+                if record.is_timeout() {
+                    total_timeouts += 1;
+                }
+                if let Some(duration) = record.duration_ms {
+                    total_duration_ms += duration;
+                    execution_count += 1;
+                }
+
+                // Track oldest/newest execution
+                if let Some(exec_time) = record.completed_at {
+                    if oldest_execution.is_none() || exec_time < oldest_execution.unwrap() {
+                        oldest_execution = Some(exec_time);
+                    }
+                    if newest_execution.is_none() || exec_time > newest_execution.unwrap() {
+                        newest_execution = Some(exec_time);
+                    }
+                }
+            }
+
+            if task.should_retry() {
+                tasks_in_retry += 1;
+            }
+            if task.total_failure_count > 0 {
+                tasks_with_failures += 1;
+            }
+
+            // Health status
+            let health = task.check_health();
+            match health.health {
+                ScheduleHealth::Healthy => healthy_tasks += 1,
+                ScheduleHealth::Warning { .. } => warning_tasks += 1,
+                ScheduleHealth::Unhealthy { .. } => unhealthy_tasks += 1,
+            }
+        }
+
+        let success_rate = if total_executions + total_failures > 0 {
+            total_executions as f64 / (total_executions + total_failures) as f64
+        } else {
+            0.0
+        };
+
+        let avg_duration_ms = if execution_count > 0 {
+            Some(total_duration_ms / execution_count)
+        } else {
+            None
+        };
+
+        let uptime = oldest_execution.map(|oldest| now - oldest);
+
+        SchedulerStatistics {
+            total_tasks,
+            enabled_tasks,
+            disabled_tasks,
+            total_executions,
+            total_failures,
+            total_timeouts,
+            success_rate,
+            tasks_in_retry,
+            tasks_with_failures,
+            healthy_tasks,
+            warning_tasks,
+            unhealthy_tasks,
+            avg_duration_ms,
+            uptime,
+            oldest_execution,
+            newest_execution,
+        }
+    }
+}
+
+/// Comprehensive scheduler statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerStatistics {
+    /// Total number of tasks
+    pub total_tasks: usize,
+    /// Number of enabled tasks
+    pub enabled_tasks: usize,
+    /// Number of disabled tasks
+    pub disabled_tasks: usize,
+    /// Total successful executions across all tasks
+    pub total_executions: u64,
+    /// Total failures across all tasks
+    pub total_failures: u64,
+    /// Total timeouts across all tasks
+    pub total_timeouts: u64,
+    /// Overall success rate (0.0 to 1.0)
+    pub success_rate: f64,
+    /// Number of tasks in retry state
+    pub tasks_in_retry: usize,
+    /// Number of tasks that have experienced failures
+    pub tasks_with_failures: usize,
+    /// Number of healthy tasks
+    pub healthy_tasks: usize,
+    /// Number of tasks with warnings
+    pub warning_tasks: usize,
+    /// Number of unhealthy tasks
+    pub unhealthy_tasks: usize,
+    /// Average execution duration in milliseconds
+    pub avg_duration_ms: Option<u64>,
+    /// Scheduler uptime (time since first execution)
+    pub uptime: Option<chrono::Duration>,
+    /// Timestamp of oldest recorded execution
+    pub oldest_execution: Option<DateTime<Utc>>,
+    /// Timestamp of newest recorded execution
+    pub newest_execution: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Display for SchedulerStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Scheduler Statistics:")?;
+        writeln!(
+            f,
+            "  Tasks: {} total ({} enabled, {} disabled)",
+            self.total_tasks, self.enabled_tasks, self.disabled_tasks
+        )?;
+        writeln!(
+            f,
+            "  Executions: {} successful, {} failed, {} timed out",
+            self.total_executions, self.total_failures, self.total_timeouts
+        )?;
+        writeln!(f, "  Success Rate: {:.1}%", self.success_rate * 100.0)?;
+        writeln!(
+            f,
+            "  Health: {} healthy, {} warnings, {} unhealthy",
+            self.healthy_tasks, self.warning_tasks, self.unhealthy_tasks
+        )?;
+
+        if let Some(avg_ms) = self.avg_duration_ms {
+            writeln!(f, "  Avg Duration: {}ms", avg_ms)?;
+        }
+
+        if let Some(uptime) = self.uptime {
+            writeln!(
+                f,
+                "  Uptime: {} days {} hours",
+                uptime.num_days(),
+                uptime.num_hours() % 24
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Timezone Conversion Utilities
+// ============================================================================
+
+/// Timezone conversion utilities for schedule management
+pub struct TimezoneUtils;
+
+impl TimezoneUtils {
+    /// Convert UTC time to specific timezone
+    ///
+    /// # Arguments
+    /// * `utc_time` - UTC DateTime
+    /// * `timezone` - IANA timezone name (e.g., "America/New_York")
+    ///
+    /// # Returns
+    /// Formatted string in target timezone
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    /// use chrono::Utc;
+    ///
+    /// let now = Utc::now();
+    /// let ny_time = TimezoneUtils::format_in_timezone(now, "America/New_York");
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn format_in_timezone(utc_time: DateTime<Utc>, timezone: &str) -> String {
+        use chrono_tz::Tz;
+
+        if let Ok(tz) = timezone.parse::<Tz>() {
+            let local_time = utc_time.with_timezone(&tz);
+            format!("{} {}", local_time.format("%Y-%m-%d %H:%M:%S"), tz.name())
+        } else {
+            format!(
+                "{} (invalid timezone: {})",
+                utc_time.format("%Y-%m-%d %H:%M:%S UTC"),
+                timezone
+            )
+        }
+    }
+
+    /// Get current time in multiple timezones
+    ///
+    /// # Arguments
+    /// * `timezones` - List of IANA timezone names
+    ///
+    /// # Returns
+    /// Map of timezone name to formatted time string
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    ///
+    /// let zones = vec!["America/New_York", "Europe/London", "Asia/Tokyo"];
+    /// let times = TimezoneUtils::current_time_in_zones(&zones);
+    /// for (tz, time) in times {
+    ///     println!("{}: {}", tz, time);
+    /// }
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn current_time_in_zones(timezones: &[&str]) -> HashMap<String, String> {
+        let now = Utc::now();
+        timezones
+            .iter()
+            .map(|tz| {
+                let formatted = Self::format_in_timezone(now, tz);
+                (tz.to_string(), formatted)
+            })
+            .collect()
+    }
+
+    /// Calculate time until next occurrence in specific timezone
+    ///
+    /// # Arguments
+    /// * `target_hour` - Hour in target timezone (0-23)
+    /// * `target_minute` - Minute (0-59)
+    /// * `timezone` - IANA timezone name
+    ///
+    /// # Returns
+    /// Duration until next occurrence of that time in the specified timezone
+    #[cfg(feature = "cron")]
+    pub fn time_until_next_occurrence(
+        target_hour: u32,
+        target_minute: u32,
+        timezone: &str,
+    ) -> Result<chrono::Duration, String> {
+        use chrono_tz::Tz;
+
+        let tz: Tz = timezone
+            .parse()
+            .map_err(|_| format!("Invalid timezone: {}", timezone))?;
+        let now_utc = Utc::now();
+        let now_local = now_utc.with_timezone(&tz);
+
+        // Calculate target time today in local timezone
+        let target_today = now_local
+            .date_naive()
+            .and_hms_opt(target_hour, target_minute, 0)
+            .ok_or("Invalid time")?
+            .and_local_timezone(tz)
+            .single()
+            .ok_or("Ambiguous or invalid time due to DST")?;
+
+        let target_utc = target_today.with_timezone(&Utc);
+
+        // If target time today has passed, use tomorrow
+        let final_target = if target_utc <= now_utc {
+            let tomorrow = now_local.date_naive() + chrono::Days::new(1);
+            let target_tomorrow = tomorrow
+                .and_hms_opt(target_hour, target_minute, 0)
+                .ok_or("Invalid time")?
+                .and_local_timezone(tz)
+                .single()
+                .ok_or("Ambiguous or invalid time due to DST")?;
+            target_tomorrow.with_timezone(&Utc)
+        } else {
+            target_utc
+        };
+
+        Ok(final_target - now_utc)
+    }
+
+    /// Detect system's local timezone
+    ///
+    /// Returns the IANA timezone name of the system's local timezone.
+    /// Falls back to "UTC" if detection fails.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    ///
+    /// let local_tz = TimezoneUtils::detect_system_timezone();
+    /// println!("System timezone: {}", local_tz);
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn detect_system_timezone() -> String {
+        // Try to get timezone from TZ environment variable
+        if let Ok(tz) = std::env::var("TZ") {
+            if Self::is_valid_timezone(&tz) {
+                return tz;
+            }
+        }
+
+        // Try to read from /etc/timezone (Debian/Ubuntu)
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(tz) = std::fs::read_to_string("/etc/timezone") {
+                let tz = tz.trim().to_string();
+                if Self::is_valid_timezone(&tz) {
+                    return tz;
+                }
+            }
+        }
+
+        // Try to read symlink /etc/localtime (most Unix systems)
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if let Ok(link) = std::fs::read_link("/etc/localtime") {
+                if let Some(tz_path) = link.to_str() {
+                    // Extract timezone from path like /usr/share/zoneinfo/America/New_York
+                    if let Some(tz_start) = tz_path.find("zoneinfo/") {
+                        let tz = &tz_path[tz_start + 9..];
+                        if Self::is_valid_timezone(tz) {
+                            return tz.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to UTC
+        "UTC".to_string()
+    }
+
+    /// Check if a timezone string is valid
+    ///
+    /// # Arguments
+    /// * `timezone` - IANA timezone name to validate
+    ///
+    /// # Returns
+    /// `true` if the timezone is valid, `false` otherwise
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    ///
+    /// assert!(TimezoneUtils::is_valid_timezone("America/New_York"));
+    /// assert!(TimezoneUtils::is_valid_timezone("UTC"));
+    /// assert!(!TimezoneUtils::is_valid_timezone("Invalid/Timezone"));
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn is_valid_timezone(timezone: &str) -> bool {
+        use chrono_tz::Tz;
+        timezone.parse::<Tz>().is_ok()
+    }
+
+    /// Get list of all available IANA timezone names
+    ///
+    /// Returns a vector of all timezone names supported by chrono-tz.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    ///
+    /// let timezones = TimezoneUtils::list_all_timezones();
+    /// assert!(timezones.len() > 500); // There are 600+ timezones
+    /// assert!(timezones.contains(&"America/New_York".to_string()));
+    /// assert!(timezones.contains(&"Europe/London".to_string()));
+    /// assert!(timezones.contains(&"Asia/Tokyo".to_string()));
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn list_all_timezones() -> Vec<String> {
+        use chrono_tz::TZ_VARIANTS;
+        TZ_VARIANTS.iter().map(|tz| tz.name().to_string()).collect()
+    }
+
+    /// Search for timezones matching a pattern
+    ///
+    /// # Arguments
+    /// * `pattern` - Case-insensitive search pattern (substring match)
+    ///
+    /// # Returns
+    /// Vector of matching timezone names
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    ///
+    /// let us_timezones = TimezoneUtils::search_timezones("america");
+    /// assert!(us_timezones.iter().any(|tz| tz == "America/New_York"));
+    /// assert!(us_timezones.iter().any(|tz| tz == "America/Los_Angeles"));
+    ///
+    /// let london = TimezoneUtils::search_timezones("london");
+    /// assert!(london.contains(&"Europe/London".to_string()));
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn search_timezones(pattern: &str) -> Vec<String> {
+        let pattern_lower = pattern.to_lowercase();
+        Self::list_all_timezones()
+            .into_iter()
+            .filter(|tz| tz.to_lowercase().contains(&pattern_lower))
+            .collect()
+    }
+
+    /// Check if a timezone is currently observing Daylight Saving Time
+    ///
+    /// # Arguments
+    /// * `timezone` - IANA timezone name
+    /// * `at_time` - Optional time to check (defaults to now)
+    ///
+    /// # Returns
+    /// `Ok(true)` if DST is active, `Ok(false)` if not, `Err` if timezone is invalid
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    /// use chrono::Utc;
+    ///
+    /// // Check current DST status
+    /// let is_dst = TimezoneUtils::is_dst_active("America/New_York", None).unwrap();
+    /// println!("New York DST active: {}", is_dst);
+    ///
+    /// // Check at specific time
+    /// let summer_time = Utc::now(); // Would need a summer date for guaranteed DST
+    /// let was_dst = TimezoneUtils::is_dst_active("America/New_York", Some(summer_time)).unwrap();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn is_dst_active(timezone: &str, at_time: Option<DateTime<Utc>>) -> Result<bool, String> {
+        use chrono_tz::Tz;
+
+        let tz: Tz = timezone
+            .parse()
+            .map_err(|_| format!("Invalid timezone: {}", timezone))?;
+        let time = at_time.unwrap_or_else(Utc::now);
+        let local_time = time.with_timezone(&tz);
+
+        // Check if the offset includes DST
+        // This is done by comparing the offset at this time with the standard offset
+        // If they differ, DST is active
+        let offset = local_time.offset().fix();
+        let std_offset = tz.offset_from_utc_datetime(&local_time.naive_utc()).fix();
+
+        Ok(offset != std_offset)
+    }
+
+    /// Get UTC offset for a timezone at a specific time
+    ///
+    /// # Arguments
+    /// * `timezone` - IANA timezone name
+    /// * `at_time` - Time to check offset (defaults to now)
+    ///
+    /// # Returns
+    /// UTC offset in seconds (positive = east of UTC, negative = west)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    /// use chrono::Utc;
+    ///
+    /// let offset = TimezoneUtils::get_utc_offset("America/New_York", None).unwrap();
+    /// // New York is UTC-5 (EST) or UTC-4 (EDT)
+    /// assert!(offset == -5 * 3600 || offset == -4 * 3600);
+    ///
+    /// let tokyo_offset = TimezoneUtils::get_utc_offset("Asia/Tokyo", None).unwrap();
+    /// assert_eq!(tokyo_offset, 9 * 3600); // Tokyo is always UTC+9
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn get_utc_offset(timezone: &str, at_time: Option<DateTime<Utc>>) -> Result<i32, String> {
+        use chrono_tz::Tz;
+
+        let tz: Tz = timezone
+            .parse()
+            .map_err(|_| format!("Invalid timezone: {}", timezone))?;
+        let time = at_time.unwrap_or_else(Utc::now);
+        let local_time = time.with_timezone(&tz);
+
+        Ok(local_time.offset().fix().local_minus_utc())
+    }
+
+    /// Get timezone information including offset and DST status
+    ///
+    /// # Arguments
+    /// * `timezone` - IANA timezone name
+    /// * `at_time` - Optional time to check (defaults to now)
+    ///
+    /// # Returns
+    /// `TimezoneInfo` with detailed information about the timezone
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    ///
+    /// let info = TimezoneUtils::get_timezone_info("America/New_York", None).unwrap();
+    /// println!("Timezone: {}", info.name);
+    /// println!("UTC Offset: {} hours", info.utc_offset_seconds / 3600);
+    /// println!("DST Active: {}", info.is_dst);
+    /// println!("Current Time: {}", info.current_time);
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn get_timezone_info(
+        timezone: &str,
+        at_time: Option<DateTime<Utc>>,
+    ) -> Result<TimezoneInfo, String> {
+        use chrono_tz::Tz;
+
+        let tz: Tz = timezone
+            .parse()
+            .map_err(|_| format!("Invalid timezone: {}", timezone))?;
+        let time = at_time.unwrap_or_else(Utc::now);
+        let local_time = time.with_timezone(&tz);
+
+        let offset_seconds = local_time.offset().fix().local_minus_utc();
+        let is_dst = Self::is_dst_active(timezone, Some(time))?;
+
+        Ok(TimezoneInfo {
+            name: timezone.to_string(),
+            utc_offset_seconds: offset_seconds,
+            utc_offset_hours: offset_seconds as f32 / 3600.0,
+            is_dst,
+            current_time: local_time.format("%Y-%m-%d %H:%M:%S %Z").to_string(),
+            abbreviation: format!("{}", local_time.format("%Z")),
+        })
+    }
+
+    /// Convert time from one timezone to another
+    ///
+    /// # Arguments
+    /// * `time` - DateTime in source timezone
+    /// * `from_tz` - Source IANA timezone name
+    /// * `to_tz` - Target IANA timezone name
+    ///
+    /// # Returns
+    /// Formatted time string in target timezone
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    /// use chrono::Utc;
+    ///
+    /// let utc_now = Utc::now();
+    /// let tokyo_time = TimezoneUtils::convert_between_timezones(
+    ///     utc_now,
+    ///     "America/New_York",
+    ///     "Asia/Tokyo"
+    /// ).unwrap();
+    /// println!("When it's {} in New York, it's {} in Tokyo", utc_now, tokyo_time);
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn convert_between_timezones(
+        time: DateTime<Utc>,
+        from_tz: &str,
+        to_tz: &str,
+    ) -> Result<String, String> {
+        use chrono_tz::Tz;
+
+        let _source_tz: Tz = from_tz
+            .parse()
+            .map_err(|_| format!("Invalid source timezone: {}", from_tz))?;
+        let target_tz: Tz = to_tz
+            .parse()
+            .map_err(|_| format!("Invalid target timezone: {}", to_tz))?;
+
+        let target_time = time.with_timezone(&target_tz);
+        Ok(format!(
+            "{} {}",
+            target_time.format("%Y-%m-%d %H:%M:%S"),
+            target_tz.name()
+        ))
+    }
+
+    /// Get common timezone abbreviations and their IANA names
+    ///
+    /// Returns a map of common abbreviations (EST, PST, JST, etc.) to their
+    /// corresponding IANA timezone names.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::TimezoneUtils;
+    ///
+    /// let abbrevs = TimezoneUtils::get_common_timezone_abbreviations();
+    /// assert_eq!(abbrevs.get("EST"), Some(&"America/New_York".to_string()));
+    /// assert_eq!(abbrevs.get("PST"), Some(&"America/Los_Angeles".to_string()));
+    /// assert_eq!(abbrevs.get("JST"), Some(&"Asia/Tokyo".to_string()));
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn get_common_timezone_abbreviations() -> HashMap<String, String> {
+        let mut abbrevs = HashMap::new();
+
+        // US timezones
+        abbrevs.insert("EST".to_string(), "America/New_York".to_string());
+        abbrevs.insert("EDT".to_string(), "America/New_York".to_string());
+        abbrevs.insert("CST".to_string(), "America/Chicago".to_string());
+        abbrevs.insert("CDT".to_string(), "America/Chicago".to_string());
+        abbrevs.insert("MST".to_string(), "America/Denver".to_string());
+        abbrevs.insert("MDT".to_string(), "America/Denver".to_string());
+        abbrevs.insert("PST".to_string(), "America/Los_Angeles".to_string());
+        abbrevs.insert("PDT".to_string(), "America/Los_Angeles".to_string());
+        abbrevs.insert("AKST".to_string(), "America/Anchorage".to_string());
+        abbrevs.insert("AKDT".to_string(), "America/Anchorage".to_string());
+        abbrevs.insert("HST".to_string(), "Pacific/Honolulu".to_string());
+
+        // Europe
+        abbrevs.insert("GMT".to_string(), "Europe/London".to_string());
+        abbrevs.insert("BST".to_string(), "Europe/London".to_string());
+        abbrevs.insert("CET".to_string(), "Europe/Paris".to_string());
+        abbrevs.insert("CEST".to_string(), "Europe/Paris".to_string());
+        abbrevs.insert("EET".to_string(), "Europe/Athens".to_string());
+        abbrevs.insert("EEST".to_string(), "Europe/Athens".to_string());
+
+        // Asia
+        abbrevs.insert("JST".to_string(), "Asia/Tokyo".to_string());
+        abbrevs.insert("KST".to_string(), "Asia/Seoul".to_string());
+        abbrevs.insert("CST_CHINA".to_string(), "Asia/Shanghai".to_string());
+        abbrevs.insert("IST".to_string(), "Asia/Kolkata".to_string());
+        abbrevs.insert("SGT".to_string(), "Asia/Singapore".to_string());
+        abbrevs.insert("HKT".to_string(), "Asia/Hong_Kong".to_string());
+
+        // Australia
+        abbrevs.insert("AEST".to_string(), "Australia/Sydney".to_string());
+        abbrevs.insert("AEDT".to_string(), "Australia/Sydney".to_string());
+        abbrevs.insert("ACST".to_string(), "Australia/Adelaide".to_string());
+        abbrevs.insert("ACDT".to_string(), "Australia/Adelaide".to_string());
+        abbrevs.insert("AWST".to_string(), "Australia/Perth".to_string());
+
+        abbrevs
+    }
+}
+
+/// Detailed timezone information
+#[cfg(feature = "cron")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimezoneInfo {
+    /// IANA timezone name
+    pub name: String,
+    /// UTC offset in seconds
+    pub utc_offset_seconds: i32,
+    /// UTC offset in hours (can be fractional)
+    pub utc_offset_hours: f32,
+    /// Whether DST is currently active
+    pub is_dst: bool,
+    /// Current time in this timezone (formatted)
+    pub current_time: String,
+    /// Timezone abbreviation (e.g., "EST", "PDT")
+    pub abbreviation: String,
+}
+
+#[cfg(feature = "cron")]
+impl std::fmt::Display for TimezoneInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (UTC{:+.1}h, {}, DST: {}): {}",
+            self.name,
+            self.utc_offset_hours,
+            self.abbreviation,
+            if self.is_dst { "Yes" } else { "No" },
+            self.current_time
+        )
+    }
+}
+
+// ============================================================================
+// Schedule Builders and Templates
+// ============================================================================
+
+/// Schedule builder for creating schedules with a fluent API
+///
+/// Provides convenient methods for building common schedule patterns
+/// with validation and best practices built-in.
+///
+/// # Example
+/// ```
+/// use celers_beat::ScheduleBuilder;
+///
+/// // Business hours only (Mon-Fri, 9 AM - 5 PM)
+/// let schedule = ScheduleBuilder::new()
+///     .every_n_minutes(30)
+///     .business_hours_only()
+///     .build();
+///
+/// // Every hour during weekends
+/// let schedule = ScheduleBuilder::new()
+///     .every_n_hours(1)
+///     .weekends_only()
+///     .build();
+/// ```
+#[derive(Debug, Clone)]
+pub struct ScheduleBuilder {
+    interval_seconds: Option<u64>,
+    #[cfg(feature = "cron")]
+    timezone: Option<String>,
+    business_hours: bool,
+    weekends: bool,
+    weekdays: bool,
+}
+
+impl ScheduleBuilder {
+    /// Create a new schedule builder
+    pub fn new() -> Self {
+        Self {
+            interval_seconds: None,
+            #[cfg(feature = "cron")]
+            timezone: None,
+            business_hours: false,
+            weekends: false,
+            weekdays: false,
+        }
+    }
+
+    /// Set interval in seconds
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleBuilder;
+    ///
+    /// let schedule = ScheduleBuilder::new()
+    ///     .every_n_seconds(30)
+    ///     .build();
+    /// ```
+    pub fn every_n_seconds(mut self, seconds: u64) -> Self {
+        self.interval_seconds = Some(seconds);
+        self
+    }
+
+    /// Set interval in minutes
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleBuilder;
+    ///
+    /// let schedule = ScheduleBuilder::new()
+    ///     .every_n_minutes(15)
+    ///     .build();
+    /// ```
+    pub fn every_n_minutes(mut self, minutes: u64) -> Self {
+        self.interval_seconds = Some(minutes * 60);
+        self
+    }
+
+    /// Set interval in hours
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleBuilder;
+    ///
+    /// let schedule = ScheduleBuilder::new()
+    ///     .every_n_hours(2)
+    ///     .build();
+    /// ```
+    pub fn every_n_hours(mut self, hours: u64) -> Self {
+        self.interval_seconds = Some(hours * 3600);
+        self
+    }
+
+    /// Set interval in days
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleBuilder;
+    ///
+    /// let schedule = ScheduleBuilder::new()
+    ///     .every_n_days(1)
+    ///     .build();
+    /// ```
+    pub fn every_n_days(mut self, days: u64) -> Self {
+        self.interval_seconds = Some(days * 86400);
+        self
+    }
+
+    /// Restrict to business hours only (Mon-Fri, 9 AM - 5 PM)
+    ///
+    /// Note: This creates a crontab schedule and requires the `cron` feature.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleBuilder;
+    ///
+    /// let schedule = ScheduleBuilder::new()
+    ///     .every_n_minutes(30)
+    ///     .business_hours_only()
+    ///     .build();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn business_hours_only(mut self) -> Self {
+        self.business_hours = true;
+        self.weekdays = true;
+        self
+    }
+
+    /// Restrict to weekends only (Sat-Sun)
+    ///
+    /// Note: This creates a crontab schedule and requires the `cron` feature.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleBuilder;
+    ///
+    /// let schedule = ScheduleBuilder::new()
+    ///     .every_n_hours(1)
+    ///     .weekends_only()
+    ///     .build();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn weekends_only(mut self) -> Self {
+        self.weekends = true;
+        self
+    }
+
+    /// Restrict to weekdays only (Mon-Fri)
+    ///
+    /// Note: This creates a crontab schedule and requires the `cron` feature.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleBuilder;
+    ///
+    /// let schedule = ScheduleBuilder::new()
+    ///     .every_n_hours(2)
+    ///     .weekdays_only()
+    ///     .build();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn weekdays_only(mut self) -> Self {
+        self.weekdays = true;
+        self
+    }
+
+    /// Set timezone for the schedule
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleBuilder;
+    ///
+    /// let schedule = ScheduleBuilder::new()
+    ///     .every_n_hours(1)
+    ///     .in_timezone("America/New_York")
+    ///     .build();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn in_timezone(mut self, timezone: &str) -> Self {
+        self.timezone = Some(timezone.to_string());
+        self
+    }
+
+    /// Build the schedule
+    ///
+    /// # Returns
+    /// A `Schedule` based on the builder configuration
+    pub fn build(self) -> Schedule {
+        #[cfg(feature = "cron")]
+        {
+            // If any cron-specific features are set, build a crontab schedule
+            if self.business_hours || self.weekends || self.weekdays || self.timezone.is_some() {
+                let interval_minutes = self.interval_seconds.unwrap_or(3600) / 60;
+                let minute_expr = if interval_minutes < 60 {
+                    format!("*/{}", interval_minutes)
+                } else {
+                    "0".to_string()
+                };
+
+                let hour_expr = if self.business_hours {
+                    "9-17".to_string()
+                } else {
+                    "*".to_string()
+                };
+
+                let dow_expr = if self.weekends {
+                    "0,6".to_string() // Sun, Sat
+                } else if self.weekdays || self.business_hours {
+                    "1-5".to_string() // Mon-Fri
+                } else {
+                    "*".to_string()
+                };
+
+                if let Some(tz) = self.timezone {
+                    return Schedule::crontab_tz(
+                        &minute_expr,
+                        &hour_expr,
+                        &dow_expr,
+                        "*",
+                        "*",
+                        &tz,
+                    );
+                } else {
+                    return Schedule::crontab(&minute_expr, &hour_expr, &dow_expr, "*", "*");
+                }
+            }
+        }
+
+        // Default to interval schedule
+        Schedule::interval(self.interval_seconds.unwrap_or(3600))
+    }
+}
+
+impl Default for ScheduleBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Common schedule templates for typical use cases
+///
+/// Provides pre-configured schedules for common patterns.
+pub struct ScheduleTemplates;
+
+impl ScheduleTemplates {
+    /// Every minute
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::every_minute();
+    /// ```
+    pub fn every_minute() -> Schedule {
+        Schedule::interval(60)
+    }
+
+    /// Every 5 minutes
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::every_5_minutes();
+    /// ```
+    pub fn every_5_minutes() -> Schedule {
+        Schedule::interval(300)
+    }
+
+    /// Every 15 minutes
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::every_15_minutes();
+    /// ```
+    pub fn every_15_minutes() -> Schedule {
+        Schedule::interval(900)
+    }
+
+    /// Every 30 minutes
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::every_30_minutes();
+    /// ```
+    pub fn every_30_minutes() -> Schedule {
+        Schedule::interval(1800)
+    }
+
+    /// Every hour
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::hourly();
+    /// ```
+    pub fn hourly() -> Schedule {
+        Schedule::interval(3600)
+    }
+
+    /// Every day at midnight (requires `cron` feature)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::daily_at_midnight();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn daily_at_midnight() -> Schedule {
+        Schedule::crontab("0", "0", "*", "*", "*")
+    }
+
+    /// Every day at a specific hour (requires `cron` feature)
+    ///
+    /// # Arguments
+    /// * `hour` - Hour of day (0-23)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// // Every day at 3 AM
+    /// let schedule = ScheduleTemplates::daily_at_hour(3);
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn daily_at_hour(hour: u32) -> Schedule {
+        Schedule::crontab("0", &hour.to_string(), "*", "*", "*")
+    }
+
+    /// Every weekday (Mon-Fri) at a specific time (requires `cron` feature)
+    ///
+    /// # Arguments
+    /// * `hour` - Hour of day (0-23)
+    /// * `minute` - Minute (0-59)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// // Weekdays at 9:00 AM
+    /// let schedule = ScheduleTemplates::weekdays_at(9, 0);
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn weekdays_at(hour: u32, minute: u32) -> Schedule {
+        Schedule::crontab(&minute.to_string(), &hour.to_string(), "1-5", "*", "*")
+    }
+
+    /// Every Monday at a specific time (requires `cron` feature)
+    ///
+    /// # Arguments
+    /// * `hour` - Hour of day (0-23)
+    /// * `minute` - Minute (0-59)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// // Every Monday at 9:00 AM
+    /// let schedule = ScheduleTemplates::weekly_on_monday(9, 0);
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn weekly_on_monday(hour: u32, minute: u32) -> Schedule {
+        Schedule::crontab(&minute.to_string(), &hour.to_string(), "1", "*", "*")
+    }
+
+    /// First day of every month at midnight (requires `cron` feature)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::monthly_first_day();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn monthly_first_day() -> Schedule {
+        Schedule::crontab("0", "0", "*", "1", "*")
+    }
+
+    /// Last day of every month at midnight (requires `cron` feature)
+    ///
+    /// Note: Uses day 28 which works for all months
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::monthly_last_day();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn monthly_last_day() -> Schedule {
+        Schedule::crontab("0", "0", "*", "28-31", "*")
+    }
+
+    /// Every hour during business hours (9 AM - 5 PM, Mon-Fri) (requires `cron` feature)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::business_hours_hourly();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn business_hours_hourly() -> Schedule {
+        Schedule::crontab("0", "9-17", "1-5", "*", "*")
+    }
+
+    /// Every 15 minutes during business hours (requires `cron` feature)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::business_hours_every_15_minutes();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn business_hours_every_15_minutes() -> Schedule {
+        Schedule::crontab("*/15", "9-17", "1-5", "*", "*")
+    }
+
+    /// Weekend mornings at 8 AM (requires `cron` feature)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::weekend_mornings();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn weekend_mornings() -> Schedule {
+        Schedule::crontab("0", "8", "0,6", "*", "*")
+    }
+
+    /// Quarterly on the first day at midnight (Jan 1, Apr 1, Jul 1, Oct 1) (requires `cron` feature)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::quarterly();
+    /// ```
+    #[cfg(feature = "cron")]
+    pub fn quarterly() -> Schedule {
+        Schedule::crontab("0", "0", "*", "1", "1,4,7,10")
+    }
+
+    /// Every 2 hours
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::every_2_hours();
+    /// ```
+    pub fn every_2_hours() -> Schedule {
+        Schedule::interval(7200)
+    }
+
+    /// Every 6 hours
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::every_6_hours();
+    /// ```
+    pub fn every_6_hours() -> Schedule {
+        Schedule::interval(21600)
+    }
+
+    /// Every 12 hours
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// let schedule = ScheduleTemplates::every_12_hours();
+    /// ```
+    pub fn every_12_hours() -> Schedule {
+        Schedule::interval(43200)
+    }
+}
+
+// ============================================================================
+// Weighted Fair Queuing (WFQ)
+// ============================================================================
+
+/// Weighted Fair Queuing configuration
+///
+/// WFQ provides fair scheduling based on task weights, ensuring that higher-weight
+/// tasks get proportionally more execution time while preventing starvation of
+/// lower-weight tasks.
+///
+/// # Algorithm
+/// - Each task has a weight (default: 1.0, range: 0.1-10.0)
+/// - Virtual time tracks fairness: virtual_finish_time = virtual_start_time + (execution_cost / weight)
+/// - Tasks with lowest virtual finish time are scheduled first
+/// - Prevents starvation while respecting priorities
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WFQConfig {
+    /// Enable Weighted Fair Queuing
+    pub enabled: bool,
+
+    /// Default weight for tasks without explicit weight
+    pub default_weight: f64,
+
+    /// Minimum allowed weight
+    pub min_weight: f64,
+
+    /// Maximum allowed weight
+    pub max_weight: f64,
+}
+
+impl Default for WFQConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_weight: 1.0,
+            min_weight: 0.1,
+            max_weight: 10.0,
+        }
+    }
+}
+
+/// Task weight for Weighted Fair Queuing
+///
+/// Higher weights mean higher importance and more execution time allocation.
+/// Weight must be between 0.1 and 10.0.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct TaskWeight(f64);
+
+impl TaskWeight {
+    /// Create new task weight with validation
+    pub fn new(weight: f64) -> Result<Self, String> {
+        if !(0.1..=10.0).contains(&weight) {
+            return Err(format!(
+                "Weight must be between 0.1 and 10.0, got {}",
+                weight
+            ));
+        }
+        Ok(Self(weight))
+    }
+
+    /// Get the weight value
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for TaskWeight {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+/// Weighted Fair Queuing state for a task
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WFQState {
+    /// Task weight (higher = more important)
+    #[serde(default)]
+    pub weight: TaskWeight,
+
+    /// Virtual start time
+    #[serde(default)]
+    pub virtual_start_time: f64,
+
+    /// Virtual finish time (determines scheduling order)
+    #[serde(default)]
+    pub virtual_finish_time: f64,
+
+    /// Total execution time consumed (seconds)
+    #[serde(default)]
+    pub total_execution_time: f64,
+}
+
+impl Default for WFQState {
+    fn default() -> Self {
+        Self {
+            weight: TaskWeight::default(),
+            virtual_start_time: 0.0,
+            virtual_finish_time: 0.0,
+            total_execution_time: 0.0,
+        }
+    }
+}
+
+impl WFQState {
+    /// Create new WFQ state with specified weight
+    pub fn with_weight(weight: f64) -> Result<Self, String> {
+        Ok(Self {
+            weight: TaskWeight::new(weight)?,
+            ..Default::default()
+        })
+    }
+
+    /// Update virtual time after task execution
+    ///
+    /// # Arguments
+    /// * `execution_duration_secs` - Actual execution time in seconds
+    /// * `global_virtual_time` - Current global virtual time
+    pub fn update_after_execution(
+        &mut self,
+        execution_duration_secs: f64,
+        global_virtual_time: f64,
+    ) {
+        self.total_execution_time += execution_duration_secs;
+        self.virtual_start_time = global_virtual_time.max(self.virtual_finish_time);
+
+        // Virtual finish time = virtual start time + (cost / weight)
+        // Cost is the execution duration
+        self.virtual_finish_time =
+            self.virtual_start_time + (execution_duration_secs / self.weight.value());
+    }
+
+    /// Get the virtual finish time for scheduling decisions
+    pub fn finish_time(&self) -> f64 {
+        self.virtual_finish_time
+    }
+}
+
+/// Task information for WFQ scheduling
+#[derive(Debug, Clone)]
+pub struct WFQTaskInfo {
+    /// Task name
+    pub name: String,
+
+    /// Virtual finish time
+    pub virtual_finish_time: f64,
+
+    /// Task weight
+    pub weight: f64,
+
+    /// Next scheduled run time
+    pub next_run_time: DateTime<Utc>,
+}
+
+impl ScheduledTask {
+    /// Set WFQ weight for this task
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{ScheduledTask, Schedule};
+    ///
+    /// let task = ScheduledTask::new("important_task".to_string(), Schedule::interval(60))
+    ///     .with_wfq_weight(5.0).unwrap();
+    /// ```
+    pub fn with_wfq_weight(mut self, weight: f64) -> Result<Self, String> {
+        if self.wfq_state.is_none() {
+            self.wfq_state = Some(WFQState::default());
+        }
+        self.wfq_state.as_mut().unwrap().weight = TaskWeight::new(weight)?;
+        Ok(self)
+    }
+
+    /// Get WFQ weight for this task
+    pub fn wfq_weight(&self) -> f64 {
+        self.wfq_state
+            .as_ref()
+            .map(|state| state.weight.value())
+            .unwrap_or(1.0)
+    }
+
+    /// Get WFQ virtual finish time
+    pub fn wfq_finish_time(&self) -> f64 {
+        self.wfq_state
+            .as_ref()
+            .map(|state| state.finish_time())
+            .unwrap_or(0.0)
+    }
+}
+
+impl BeatScheduler {
+    /// Get due tasks using Weighted Fair Queuing algorithm
+    ///
+    /// Returns tasks ordered by virtual finish time, ensuring fair execution
+    /// proportional to task weights.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, ScheduledTask, Schedule};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    ///
+    /// // Add tasks with different weights
+    /// scheduler.add_task(
+    ///     ScheduledTask::new("low_priority".to_string(), Schedule::interval(60))
+    ///         .with_wfq_weight(0.5).unwrap()
+    /// ).unwrap();
+    ///
+    /// scheduler.add_task(
+    ///     ScheduledTask::new("high_priority".to_string(), Schedule::interval(60))
+    ///         .with_wfq_weight(5.0).unwrap()
+    /// ).unwrap();
+    ///
+    /// // Get tasks using WFQ - higher weight tasks scheduled more often
+    /// let due_tasks = scheduler.get_due_tasks_wfq();
+    /// ```
+    pub fn get_due_tasks_wfq(&self) -> Vec<WFQTaskInfo> {
+        let now = Utc::now();
+        let mut wfq_tasks: Vec<WFQTaskInfo> = Vec::new();
+
+        for (name, task) in &self.tasks {
+            if !task.enabled {
+                continue;
+            }
+
+            match task.next_run_time() {
+                Ok(next_run) if next_run <= now => {
+                    wfq_tasks.push(WFQTaskInfo {
+                        name: name.clone(),
+                        virtual_finish_time: task.wfq_finish_time(),
+                        weight: task.wfq_weight(),
+                        next_run_time: next_run,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Sort by virtual finish time (lowest first = fairest to schedule next)
+        wfq_tasks.sort_by(|a, b| {
+            a.virtual_finish_time
+                .partial_cmp(&b.virtual_finish_time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.next_run_time.cmp(&b.next_run_time))
+        });
+
+        wfq_tasks
+    }
+
+    /// Update WFQ state after task execution
+    ///
+    /// Should be called after a task completes to update its virtual time.
+    ///
+    /// # Arguments
+    /// * `task_name` - Name of the executed task
+    /// * `execution_duration_secs` - How long the task took to execute (in seconds)
+    pub fn update_wfq_after_execution(
+        &mut self,
+        task_name: &str,
+        execution_duration_secs: f64,
+    ) -> Result<(), ScheduleError> {
+        // Calculate global virtual time before borrowing task mutably
+        let global_virtual_time = self.calculate_global_virtual_time();
+
+        let task = self
+            .tasks
+            .get_mut(task_name)
+            .ok_or_else(|| ScheduleError::Invalid(format!("Task not found: {}", task_name)))?;
+
+        // Initialize WFQ state if needed
+        if task.wfq_state.is_none() {
+            task.wfq_state = Some(WFQState::default());
+        }
+
+        // Update the task's WFQ state
+        if let Some(wfq_state) = task.wfq_state.as_mut() {
+            wfq_state.update_after_execution(execution_duration_secs, global_virtual_time);
+        }
+
+        Ok(())
+    }
+
+    /// Calculate global virtual time across all tasks
+    fn calculate_global_virtual_time(&self) -> f64 {
+        self.tasks
+            .values()
+            .filter_map(|task| task.wfq_state.as_ref())
+            .map(|state| state.virtual_finish_time)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0)
+    }
+
+    /// Get WFQ statistics for all tasks
+    ///
+    /// Returns information about weight distribution and virtual times.
+    pub fn get_wfq_stats(&self) -> WFQStats {
+        let tasks_with_wfq: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|t| t.wfq_state.is_some())
+            .collect();
+
+        let total_weight: f64 = tasks_with_wfq.iter().map(|t| t.wfq_weight()).sum();
+
+        let avg_weight = if !tasks_with_wfq.is_empty() {
+            total_weight / tasks_with_wfq.len() as f64
+        } else {
+            0.0
+        };
+
+        WFQStats {
+            total_tasks: self.tasks.len(),
+            tasks_with_wfq_config: tasks_with_wfq.len(),
+            total_weight,
+            average_weight: avg_weight,
+            global_virtual_time: self.calculate_global_virtual_time(),
+        }
+    }
+}
+
+/// Statistics for Weighted Fair Queuing
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WFQStats {
+    /// Total number of tasks
+    pub total_tasks: usize,
+
+    /// Number of tasks with WFQ configuration
+    pub tasks_with_wfq_config: usize,
+
+    /// Sum of all task weights
+    pub total_weight: f64,
+
+    /// Average task weight
+    pub average_weight: f64,
+
+    /// Current global virtual time
+    pub global_virtual_time: f64,
+}
+
+impl std::fmt::Display for WFQStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WFQ Stats: {}/{} tasks configured, total_weight={:.2}, avg_weight={:.2}, global_vtime={:.2}",
+            self.tasks_with_wfq_config,
+            self.total_tasks,
+            self.total_weight,
+            self.average_weight,
+            self.global_virtual_time
+        )
     }
 }
 
@@ -4664,31 +8395,38 @@ mod tests {
 
     #[test]
     fn test_task_options_has_queue() {
-        let mut options = TaskOptions::default();
-        options.queue = Some("test_queue".to_string());
+        let options = TaskOptions {
+            queue: Some("test_queue".to_string()),
+            ..Default::default()
+        };
         assert!(options.has_queue());
     }
 
     #[test]
     fn test_task_options_has_priority() {
-        let mut options = TaskOptions::default();
-        options.priority = Some(5);
+        let options = TaskOptions {
+            priority: Some(5),
+            ..Default::default()
+        };
         assert!(options.has_priority());
     }
 
     #[test]
     fn test_task_options_has_expires() {
-        let mut options = TaskOptions::default();
-        options.expires = Some(3600);
+        let options = TaskOptions {
+            expires: Some(3600),
+            ..Default::default()
+        };
         assert!(options.has_expires());
     }
 
     #[test]
     fn test_task_options_display() {
-        let mut options = TaskOptions::default();
-        options.queue = Some("test".to_string());
-        options.priority = Some(5);
-        options.expires = Some(3600);
+        let options = TaskOptions {
+            queue: Some("test".to_string()),
+            priority: Some(5),
+            expires: Some(3600),
+        };
 
         let display = format!("{}", options);
         assert!(display.contains("queue=test"));
@@ -5107,7 +8845,7 @@ mod tests {
 
         // Should be 3 catch-up runs (4 missed - 1 current)
         let count = policy.catchup_count(Some(last_run), 60, now);
-        assert!(count >= 2 && count <= 4);
+        assert!((2..=4).contains(&count));
     }
 
     #[test]
@@ -8113,5 +11851,689 @@ mod tests {
         assert_eq!(deserialized.task2, "task2");
         assert_eq!(deserialized.severity, ConflictSeverity::Medium);
         assert_eq!(deserialized.overlap_seconds, 60);
+    }
+
+    // ===== Timezone Tests =====
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_timezone_utc() {
+        // Test crontab with UTC (default)
+        let schedule = Schedule::crontab("0", "12", "*", "*", "*");
+        let now = Utc::now();
+        let next_run = schedule.next_run(Some(now)).unwrap();
+
+        // Should be at noon UTC
+        assert_eq!(next_run.hour(), 12);
+        assert_eq!(next_run.minute(), 0);
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_timezone_new_york() {
+        // Test crontab with New York timezone
+        let schedule = Schedule::crontab_tz("0", "9", "1-5", "*", "*", "America/New_York");
+        let now = Utc::now();
+        let next_run = schedule.next_run(Some(now)).unwrap();
+
+        // Should be a weekday (Monday-Friday)
+        let weekday = next_run.weekday();
+        assert!(weekday.num_days_from_monday() < 5);
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_timezone_london() {
+        // Test crontab with London timezone
+        let schedule = Schedule::crontab_tz("30", "14", "*", "*", "*", "Europe/London");
+        let now = Utc::now();
+        let next_run = schedule.next_run(Some(now)).unwrap();
+
+        // Verify we got a valid future time
+        assert!(next_run > now);
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_timezone_tokyo() {
+        // Test crontab with Tokyo timezone
+        let schedule = Schedule::crontab_tz("0", "18", "1-5", "*", "*", "Asia/Tokyo");
+        let now = Utc::now();
+        let next_run = schedule.next_run(Some(now)).unwrap();
+
+        // Should be a weekday
+        let weekday = next_run.weekday();
+        assert!(weekday.num_days_from_monday() < 5);
+        assert!(next_run > now);
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_timezone_invalid() {
+        // Test with invalid timezone
+        let schedule = Schedule::crontab_tz("0", "12", "*", "*", "*", "Invalid/Timezone");
+        let now = Utc::now();
+        let result = schedule.next_run(Some(now));
+
+        // Should return error for invalid timezone
+        assert!(result.is_err());
+        if let Err(ScheduleError::Parse(msg)) = result {
+            assert!(msg.contains("Invalid timezone"));
+        }
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_timezone_serialization() {
+        // Test that timezone is preserved through serialization
+        let schedule = Schedule::crontab_tz("0", "9", "1-5", "*", "*", "America/New_York");
+        let json = serde_json::to_string(&schedule).unwrap();
+        let deserialized: Schedule = serde_json::from_str(&json).unwrap();
+
+        if let Schedule::Crontab { timezone, .. } = deserialized {
+            assert_eq!(timezone, Some("America/New_York".to_string()));
+        } else {
+            panic!("Expected Crontab schedule");
+        }
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_timezone_display() {
+        // Test that timezone appears in display string
+        let schedule = Schedule::crontab_tz("0", "9", "1-5", "*", "*", "America/New_York");
+        let display = format!("{}", schedule);
+
+        assert!(display.contains("America/New_York"));
+        assert!(display.contains("Crontab"));
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_crontab_timezone_consistency() {
+        // Test that same schedule in different timezones produces different UTC times
+        let ny_schedule = Schedule::crontab_tz("9", "0", "*", "*", "*", "America/New_York");
+        let london_schedule = Schedule::crontab_tz("9", "0", "*", "*", "*", "Europe/London");
+
+        let now = Utc::now();
+        let ny_next = ny_schedule.next_run(Some(now)).unwrap();
+        let london_next = london_schedule.next_run(Some(now)).unwrap();
+
+        // 9 AM in New York and 9 AM in London are different UTC times
+        // (typically 5-6 hour difference depending on DST)
+        assert_ne!(ny_next.hour(), london_next.hour());
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn test_scheduled_task_timezone_persistence() {
+        // Test that timezone-aware task persists correctly
+        let schedule = Schedule::crontab_tz("0", "9", "1-5", "*", "*", "America/New_York");
+        let task = ScheduledTask::new("timezone_task".to_string(), schedule);
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&task).unwrap();
+        let deserialized: ScheduledTask = serde_json::from_str(&json).unwrap();
+
+        // Verify timezone is preserved
+        if let Schedule::Crontab { timezone, .. } = deserialized.schedule {
+            assert_eq!(timezone, Some("America/New_York".to_string()));
+        } else {
+            panic!("Expected Crontab schedule");
+        }
+    }
+
+    // ===== Scheduler Loop Tests =====
+
+    #[test]
+    fn test_scheduler_get_due_tasks_empty() {
+        let scheduler = BeatScheduler::new();
+        let due_tasks = scheduler.get_due_tasks();
+
+        // New scheduler should have no due tasks
+        assert_eq!(due_tasks.len(), 0);
+    }
+
+    #[test]
+    fn test_scheduler_get_due_tasks_with_due_task() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add task with very short interval (already due)
+        let task = ScheduledTask::new("due_task".to_string(), Schedule::interval(1));
+        scheduler.add_task(task).unwrap();
+
+        // Set last run in the past manually
+        if let Some(task) = scheduler.tasks.get_mut("due_task") {
+            task.last_run_at = Some(Utc::now() - Duration::seconds(10));
+        }
+
+        // Should be due now
+        let due_tasks = scheduler.get_due_tasks();
+        assert_eq!(due_tasks.len(), 1);
+        assert_eq!(due_tasks[0].name, "due_task");
+    }
+
+    #[test]
+    fn test_scheduler_get_due_tasks_with_future_task() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add task with long interval (not due yet)
+        let task = ScheduledTask::new("future_task".to_string(), Schedule::interval(3600));
+        scheduler.add_task(task).unwrap();
+
+        // Mark as run now
+        scheduler.mark_task_run("future_task").unwrap();
+
+        // Should not be due yet
+        let due_tasks = scheduler.get_due_tasks();
+        assert_eq!(due_tasks.len(), 0);
+    }
+
+    #[test]
+    fn test_scheduler_get_due_tasks_mixed() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add due task
+        let task1 = ScheduledTask::new("due_task".to_string(), Schedule::interval(1));
+        scheduler.add_task(task1).unwrap();
+        // Set last run in the past
+        if let Some(task) = scheduler.tasks.get_mut("due_task") {
+            task.last_run_at = Some(Utc::now() - Duration::seconds(10));
+        }
+
+        // Add future task
+        let task2 = ScheduledTask::new("future_task".to_string(), Schedule::interval(3600));
+        scheduler.add_task(task2).unwrap();
+        scheduler.mark_task_run("future_task").unwrap();
+
+        // Should only get the due task
+        let due_tasks = scheduler.get_due_tasks();
+        assert_eq!(due_tasks.len(), 1);
+        assert_eq!(due_tasks[0].name, "due_task");
+    }
+
+    #[test]
+    fn test_scheduler_get_due_tasks_disabled() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add due but disabled task
+        let task =
+            ScheduledTask::new("disabled_task".to_string(), Schedule::interval(1)).disabled();
+        scheduler.add_task(task).unwrap();
+        // Set last run in the past
+        if let Some(task) = scheduler.tasks.get_mut("disabled_task") {
+            task.last_run_at = Some(Utc::now() - Duration::seconds(10));
+        }
+
+        // Disabled tasks should not be returned as due
+        let due_tasks = scheduler.get_due_tasks();
+        assert_eq!(due_tasks.len(), 0);
+    }
+
+    #[test]
+    fn test_scheduler_mark_task_run_updates_timestamp() {
+        let mut scheduler = BeatScheduler::new();
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+        scheduler.add_task(task).unwrap();
+
+        let before = Utc::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        scheduler.mark_task_run("test_task").unwrap();
+
+        let task = scheduler.tasks.get("test_task").unwrap();
+        assert!(task.last_run_at.is_some());
+        assert!(task.last_run_at.unwrap() >= before);
+    }
+
+    #[test]
+    fn test_scheduler_mark_task_run_increments_count() {
+        let mut scheduler = BeatScheduler::new();
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60));
+        scheduler.add_task(task).unwrap();
+
+        let initial_count = scheduler.tasks.get("test_task").unwrap().total_run_count;
+
+        scheduler.mark_task_run("test_task").unwrap();
+        let count_after_1 = scheduler.tasks.get("test_task").unwrap().total_run_count;
+        assert_eq!(count_after_1, initial_count + 1);
+
+        scheduler.mark_task_run("test_task").unwrap();
+        let count_after_2 = scheduler.tasks.get("test_task").unwrap().total_run_count;
+        assert_eq!(count_after_2, initial_count + 2);
+    }
+
+    #[test]
+    fn test_scheduler_multiple_due_tasks() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add 5 tasks with short intervals
+        for i in 0..5 {
+            let task = ScheduledTask::new(format!("task_{}", i), Schedule::interval(1));
+            scheduler.add_task(task).unwrap();
+            // Set last run in the past
+            if let Some(task) = scheduler.tasks.get_mut(&format!("task_{}", i)) {
+                task.last_run_at = Some(Utc::now() - Duration::seconds(10));
+            }
+        }
+
+        // All 5 should be due
+        let due_tasks = scheduler.get_due_tasks();
+        assert_eq!(due_tasks.len(), 5);
+    }
+
+    #[test]
+    fn test_scheduler_task_prioritization() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add tasks with different intervals
+        let task1 = ScheduledTask::new("task_60".to_string(), Schedule::interval(60));
+        let task2 = ScheduledTask::new("task_120".to_string(), Schedule::interval(120));
+        let task3 = ScheduledTask::new("task_30".to_string(), Schedule::interval(30));
+
+        scheduler.add_task(task1).unwrap();
+        scheduler.add_task(task2).unwrap();
+        scheduler.add_task(task3).unwrap();
+
+        // Verify all tasks were added
+        assert_eq!(scheduler.tasks.len(), 3);
+
+        // All tasks should initially be due (never run)
+        let due_tasks = scheduler.get_due_tasks();
+        assert_eq!(due_tasks.len(), 3);
+    }
+
+    #[test]
+    fn test_scheduler_task_lifecycle() {
+        let mut scheduler = BeatScheduler::new();
+
+        // 1. Add task
+        let task = ScheduledTask::new("lifecycle_task".to_string(), Schedule::interval(1));
+        scheduler.add_task(task).unwrap();
+        assert_eq!(scheduler.tasks.len(), 1);
+
+        // 2. Task is due (short interval, never run)
+        let due_tasks = scheduler.get_due_tasks();
+        assert_eq!(due_tasks.len(), 1);
+
+        // 3. Mark as run
+        scheduler.mark_task_run("lifecycle_task").unwrap();
+
+        // 4. Task should not be due immediately
+        let due_tasks = scheduler.get_due_tasks();
+        assert_eq!(due_tasks.len(), 0);
+
+        // 5. Disable task
+        if let Some(task) = scheduler.tasks.get_mut("lifecycle_task") {
+            task.enabled = false;
+        }
+        let task = scheduler.tasks.get("lifecycle_task").unwrap();
+        assert!(!task.enabled);
+
+        // 6. Re-enable task
+        if let Some(task) = scheduler.tasks.get_mut("lifecycle_task") {
+            task.enabled = true;
+        }
+        let task = scheduler.tasks.get("lifecycle_task").unwrap();
+        assert!(task.enabled);
+
+        // 7. Remove task
+        scheduler.remove_task("lifecycle_task").unwrap();
+        assert_eq!(scheduler.tasks.len(), 0);
+    }
+
+    #[test]
+    fn test_scheduler_persistence_preserves_state() {
+        let state_file = "/tmp/test_scheduler_persistence.json";
+
+        // Create scheduler and add tasks
+        let mut scheduler1 = BeatScheduler::with_persistence(state_file.to_string());
+        let task = ScheduledTask::new("persistent_task".to_string(), Schedule::interval(60));
+        scheduler1.add_task(task).unwrap();
+        scheduler1.mark_task_run("persistent_task").unwrap();
+        scheduler1.save_state().unwrap();
+
+        // Load scheduler from file
+        let scheduler2 = BeatScheduler::load_from_file(state_file).unwrap();
+
+        // Verify state was preserved
+        assert_eq!(scheduler2.tasks.len(), 1);
+        let task = scheduler2.tasks.get("persistent_task").unwrap();
+        assert_eq!(task.name, "persistent_task");
+        assert!(task.last_run_at.is_some());
+        assert_eq!(task.total_run_count, 1);
+
+        // Cleanup
+        std::fs::remove_file(state_file).ok();
+    }
+
+    #[test]
+    fn test_scheduler_loop_simulation() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add task with 1 second interval
+        let task = ScheduledTask::new("loop_task".to_string(), Schedule::interval(1));
+        scheduler.add_task(task).unwrap();
+
+        // Simulate 5 iterations of scheduler loop
+        let mut executions = 0;
+        for _ in 0..5 {
+            // Collect task names first to avoid borrow conflicts
+            let task_names: Vec<String> = scheduler
+                .get_due_tasks()
+                .into_iter()
+                .map(|t| t.name.clone())
+                .collect();
+
+            for task_name in task_names {
+                scheduler.mark_task_run(&task_name).unwrap();
+                executions += 1;
+            }
+            // Simulate time passing
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Should have executed at least once
+        assert!(executions > 0);
+
+        let task = scheduler.tasks.get("loop_task").unwrap();
+        assert_eq!(task.total_run_count as usize, executions);
+    }
+
+    // ===== Weighted Fair Queuing Tests =====
+
+    #[test]
+    fn test_wfq_task_weight_validation() {
+        let task = ScheduledTask::new("test".to_string(), Schedule::interval(60))
+            .with_wfq_weight(5.0)
+            .unwrap();
+        assert_eq!(task.wfq_weight(), 5.0);
+
+        // Test invalid weights
+        let result =
+            ScheduledTask::new("test".to_string(), Schedule::interval(60)).with_wfq_weight(0.05); // Too low
+        assert!(result.is_err());
+
+        let result =
+            ScheduledTask::new("test".to_string(), Schedule::interval(60)).with_wfq_weight(15.0); // Too high
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wfq_basic_scheduling() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Add tasks with different weights
+        let task1 = ScheduledTask::new("low_weight".to_string(), Schedule::interval(1))
+            .with_wfq_weight(0.5)
+            .unwrap();
+        let task2 = ScheduledTask::new("high_weight".to_string(), Schedule::interval(1))
+            .with_wfq_weight(5.0)
+            .unwrap();
+
+        scheduler.add_task(task1).unwrap();
+        scheduler.add_task(task2).unwrap();
+
+        // Mark tasks as run to set last_run_at
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Get WFQ tasks
+        let wfq_tasks = scheduler.get_due_tasks_wfq();
+        assert_eq!(wfq_tasks.len(), 2);
+
+        // Both should have initial virtual finish time of 0
+        for task in &wfq_tasks {
+            assert_eq!(task.virtual_finish_time, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_wfq_virtual_time_update() {
+        let mut scheduler = BeatScheduler::new();
+
+        let task = ScheduledTask::new("test_task".to_string(), Schedule::interval(60))
+            .with_wfq_weight(2.0)
+            .unwrap();
+        scheduler.add_task(task).unwrap();
+
+        // Simulate execution
+        scheduler
+            .update_wfq_after_execution("test_task", 10.0)
+            .unwrap();
+
+        // Check virtual time was updated
+        let task = scheduler.tasks.get("test_task").unwrap();
+        assert!(task.wfq_state.is_some());
+
+        let wfq_state = task.wfq_state.as_ref().unwrap();
+        // With weight 2.0 and execution time 10.0:
+        // virtual_finish_time = 0 + (10.0 / 2.0) = 5.0
+        assert_eq!(wfq_state.virtual_finish_time, 5.0);
+        assert_eq!(wfq_state.total_execution_time, 10.0);
+    }
+
+    #[test]
+    fn test_wfq_fairness() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Create three tasks with different weights
+        let task1 = ScheduledTask::new("task1".to_string(), Schedule::interval(1))
+            .with_wfq_weight(1.0)
+            .unwrap();
+        let task2 = ScheduledTask::new("task2".to_string(), Schedule::interval(1))
+            .with_wfq_weight(2.0)
+            .unwrap();
+        let task3 = ScheduledTask::new("task3".to_string(), Schedule::interval(1))
+            .with_wfq_weight(5.0)
+            .unwrap();
+
+        scheduler.add_task(task1).unwrap();
+        scheduler.add_task(task2).unwrap();
+        scheduler.add_task(task3).unwrap();
+
+        // Simulate executions with same duration
+        scheduler.update_wfq_after_execution("task1", 10.0).unwrap();
+        scheduler.update_wfq_after_execution("task2", 10.0).unwrap();
+        scheduler.update_wfq_after_execution("task3", 10.0).unwrap();
+
+        // Check virtual finish times are computed correctly based on weights
+        let t1 = scheduler.tasks.get("task1").unwrap();
+        let t2 = scheduler.tasks.get("task2").unwrap();
+        let t3 = scheduler.tasks.get("task3").unwrap();
+
+        let vft1 = t1.wfq_finish_time();
+        let vft2 = t2.wfq_finish_time();
+        let vft3 = t3.wfq_finish_time();
+
+        // All tasks should have virtual finish times reflecting their execution
+        // Task with higher weight should finish sooner (smaller vft increment)
+        assert!(vft1 > 0.0);
+        assert!(vft2 > 0.0);
+        assert!(vft3 > 0.0);
+
+        // The actual ordering depends on execution order and global virtual time
+        // But weights should affect the virtual time increments
+        let t1_state = t1.wfq_state.as_ref().unwrap();
+        let t2_state = t2.wfq_state.as_ref().unwrap();
+        let t3_state = t3.wfq_state.as_ref().unwrap();
+
+        // Virtual time increment should be inversely proportional to weight
+        // weight=1.0: increment = 10.0/1.0 = 10.0
+        // weight=2.0: increment = 10.0/2.0 = 5.0
+        // weight=5.0: increment = 10.0/5.0 = 2.0
+        let increment1 = t1_state.virtual_finish_time - t1_state.virtual_start_time;
+        let increment2 = t2_state.virtual_finish_time - t2_state.virtual_start_time;
+        let increment3 = t3_state.virtual_finish_time - t3_state.virtual_start_time;
+
+        assert_eq!(increment1, 10.0);
+        assert_eq!(increment2, 5.0);
+        assert_eq!(increment3, 2.0);
+    }
+
+    #[test]
+    fn test_wfq_task_ordering() {
+        let mut scheduler = BeatScheduler::new();
+
+        // Create tasks with different weights and execution histories
+        let task1 = ScheduledTask::new("heavy_task".to_string(), Schedule::interval(1))
+            .with_wfq_weight(1.0)
+            .unwrap();
+        let task2 = ScheduledTask::new("light_task".to_string(), Schedule::interval(1))
+            .with_wfq_weight(5.0)
+            .unwrap();
+
+        scheduler.add_task(task1).unwrap();
+        scheduler.add_task(task2).unwrap();
+
+        // Simulate first execution - both tasks run
+        scheduler
+            .update_wfq_after_execution("heavy_task", 10.0)
+            .unwrap();
+        scheduler
+            .update_wfq_after_execution("light_task", 10.0)
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Get tasks - ordering is based on virtual finish time
+        let wfq_tasks = scheduler.get_due_tasks_wfq();
+        assert_eq!(wfq_tasks.len(), 2);
+
+        // Verify weights are preserved
+        let heavy = wfq_tasks.iter().find(|t| t.name == "heavy_task").unwrap();
+        let light = wfq_tasks.iter().find(|t| t.name == "light_task").unwrap();
+        assert_eq!(heavy.weight, 1.0);
+        assert_eq!(light.weight, 5.0);
+    }
+
+    #[test]
+    fn test_wfq_stats() {
+        let mut scheduler = BeatScheduler::new();
+
+        let task1 = ScheduledTask::new("task1".to_string(), Schedule::interval(60))
+            .with_wfq_weight(2.0)
+            .unwrap();
+        let task2 = ScheduledTask::new("task2".to_string(), Schedule::interval(60))
+            .with_wfq_weight(3.0)
+            .unwrap();
+
+        scheduler.add_task(task1).unwrap();
+        scheduler.add_task(task2).unwrap();
+
+        let stats = scheduler.get_wfq_stats();
+        assert_eq!(stats.total_tasks, 2);
+        assert_eq!(stats.tasks_with_wfq_config, 2);
+        assert_eq!(stats.total_weight, 5.0);
+        assert_eq!(stats.average_weight, 2.5);
+        assert_eq!(stats.global_virtual_time, 0.0);
+    }
+
+    #[test]
+    fn test_wfq_stats_display() {
+        let mut scheduler = BeatScheduler::new();
+
+        let task = ScheduledTask::new("task1".to_string(), Schedule::interval(60))
+            .with_wfq_weight(2.0)
+            .unwrap();
+        scheduler.add_task(task).unwrap();
+
+        let stats = scheduler.get_wfq_stats();
+        let display = format!("{}", stats);
+        assert!(display.contains("WFQ Stats"));
+        assert!(display.contains("1/1 tasks configured"));
+    }
+
+    #[test]
+    fn test_wfq_with_disabled_tasks() {
+        let mut scheduler = BeatScheduler::new();
+
+        let task1 = ScheduledTask::new("enabled_task".to_string(), Schedule::interval(1))
+            .with_wfq_weight(2.0)
+            .unwrap();
+
+        let mut task2 = ScheduledTask::new("disabled_task".to_string(), Schedule::interval(1))
+            .with_wfq_weight(5.0)
+            .unwrap();
+        task2.enabled = false;
+
+        scheduler.add_task(task1).unwrap();
+        scheduler.add_task(task2).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Only enabled task should be returned
+        let wfq_tasks = scheduler.get_due_tasks_wfq();
+        assert_eq!(wfq_tasks.len(), 1);
+        assert_eq!(wfq_tasks[0].name, "enabled_task");
+    }
+
+    #[test]
+    fn test_wfq_global_virtual_time() {
+        let mut scheduler = BeatScheduler::new();
+
+        let task1 = ScheduledTask::new("task1".to_string(), Schedule::interval(60))
+            .with_wfq_weight(1.0)
+            .unwrap();
+        let task2 = ScheduledTask::new("task2".to_string(), Schedule::interval(60))
+            .with_wfq_weight(2.0)
+            .unwrap();
+
+        scheduler.add_task(task1).unwrap();
+        scheduler.add_task(task2).unwrap();
+
+        // Simulate executions
+        scheduler.update_wfq_after_execution("task1", 10.0).unwrap();
+        scheduler.update_wfq_after_execution("task2", 10.0).unwrap();
+
+        // Global virtual time should be the max of all virtual finish times
+        let stats = scheduler.get_wfq_stats();
+        // task1 executes first: vft1 = 0 + 10.0/1.0 = 10.0
+        // task2 executes second: vstart2 = max(0, 10.0) = 10.0
+        //                        vft2 = 10.0 + 10.0/2.0 = 15.0
+        // global = max(10.0, 15.0) = 15.0
+        assert_eq!(stats.global_virtual_time, 15.0);
+    }
+
+    #[test]
+    fn test_wfq_multiple_executions() {
+        let mut scheduler = BeatScheduler::new();
+
+        let task = ScheduledTask::new("task".to_string(), Schedule::interval(60))
+            .with_wfq_weight(2.0)
+            .unwrap();
+        scheduler.add_task(task).unwrap();
+
+        // First execution
+        scheduler.update_wfq_after_execution("task", 10.0).unwrap();
+        let task_state = scheduler.tasks.get("task").unwrap();
+        let vft1 = task_state.wfq_finish_time();
+        assert_eq!(vft1, 5.0); // 10.0 / 2.0
+
+        // Second execution - virtual time should continue from previous
+        scheduler.update_wfq_after_execution("task", 6.0).unwrap();
+        let task_state = scheduler.tasks.get("task").unwrap();
+        let vft2 = task_state.wfq_finish_time();
+        assert_eq!(vft2, 8.0); // 5.0 + (6.0 / 2.0)
+        assert_eq!(
+            task_state.wfq_state.as_ref().unwrap().total_execution_time,
+            16.0
+        );
+    }
+
+    #[test]
+    fn test_wfq_task_weight_default() {
+        let task = ScheduledTask::new("task".to_string(), Schedule::interval(60));
+        assert_eq!(task.wfq_weight(), 1.0); // Default weight
+    }
+
+    #[test]
+    fn test_wfq_serialization() {
+        let task = ScheduledTask::new("task".to_string(), Schedule::interval(60))
+            .with_wfq_weight(3.5)
+            .unwrap();
+
+        let json = serde_json::to_string(&task).unwrap();
+        let deserialized: ScheduledTask = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.wfq_weight(), 3.5);
     }
 }

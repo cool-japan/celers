@@ -1108,3 +1108,1931 @@ async fn test_validate_combined_predefined_quantity_failure() {
     let error = result.unwrap_err();
     assert_eq!(error.0, "Quantity must be greater than zero");
 }
+
+// Test: numeric validator
+#[task]
+async fn validate_numeric(#[validate(numeric)] pin: String) -> celers_core::Result<String> {
+    Ok(format!("PIN: {}", pin))
+}
+
+#[tokio::test]
+async fn test_validate_numeric_success() {
+    let task = ValidateNumericTask;
+    let input = ValidateNumericTaskInput {
+        pin: "123456".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_numeric_failure() {
+    let task = ValidateNumericTask;
+    let input = ValidateNumericTaskInput {
+        pin: "12a456".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(error.0.contains("only numeric characters"));
+}
+
+// Test: uuid validator
+#[task]
+async fn validate_uuid(#[validate(uuid)] id: String) -> celers_core::Result<String> {
+    Ok(format!("ID: {}", id))
+}
+
+#[tokio::test]
+async fn test_validate_uuid_success() {
+    let task = ValidateUuidTask;
+    let input = ValidateUuidTaskInput {
+        id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_uuid_failure() {
+    let task = ValidateUuidTask;
+    let input = ValidateUuidTaskInput {
+        id: "not-a-uuid".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(error.0.contains("valid UUID"));
+}
+
+#[tokio::test]
+async fn test_validate_uuid_failure_wrong_format() {
+    let task = ValidateUuidTask;
+    let input = ValidateUuidTaskInput {
+        id: "550e8400e29b41d4a716446655440000".to_string(), // Missing hyphens
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test: ipv4 validator
+#[task]
+async fn validate_ipv4(#[validate(ipv4)] address: String) -> celers_core::Result<String> {
+    Ok(format!("IP: {}", address))
+}
+
+#[tokio::test]
+async fn test_validate_ipv4_success() {
+    let task = ValidateIpv4Task;
+    let input = ValidateIpv4TaskInput {
+        address: "192.168.1.1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ipv4_success_edge_cases() {
+    let task = ValidateIpv4Task;
+
+    // Test 0.0.0.0
+    let input = ValidateIpv4TaskInput {
+        address: "0.0.0.0".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+
+    // Test 255.255.255.255
+    let input = ValidateIpv4TaskInput {
+        address: "255.255.255.255".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ipv4_failure() {
+    let task = ValidateIpv4Task;
+    let input = ValidateIpv4TaskInput {
+        address: "not-an-ip".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(error.0.contains("valid IPv4 address"));
+}
+
+#[tokio::test]
+async fn test_validate_ipv4_failure_out_of_range() {
+    let task = ValidateIpv4Task;
+    let input = ValidateIpv4TaskInput {
+        address: "256.1.1.1".to_string(), // 256 is out of range
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test: hexadecimal validator
+#[task]
+async fn validate_hexadecimal(
+    #[validate(hexadecimal)] hash: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Hash: {}", hash))
+}
+
+#[tokio::test]
+async fn test_validate_hexadecimal_success() {
+    let task = ValidateHexadecimalTask;
+    let input = ValidateHexadecimalTaskInput {
+        hash: "1a2b3c4d5e6f".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_hexadecimal_success_uppercase() {
+    let task = ValidateHexadecimalTask;
+    let input = ValidateHexadecimalTaskInput {
+        hash: "1A2B3C4D5E6F".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_hexadecimal_success_mixed_case() {
+    let task = ValidateHexadecimalTask;
+    let input = ValidateHexadecimalTaskInput {
+        hash: "1a2B3c4D5e6F".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_hexadecimal_failure() {
+    let task = ValidateHexadecimalTask;
+    let input = ValidateHexadecimalTaskInput {
+        hash: "not-hex-123g".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(error.0.contains("only hexadecimal characters"));
+}
+
+// Test: Combined new validators with custom messages
+#[task]
+async fn validate_new_validators_combined(
+    #[validate(numeric, message = "PIN must contain only digits")] pin: String,
+    #[validate(uuid, message = "Invalid transaction ID format")] transaction_id: String,
+    #[validate(ipv4, message = "Invalid server IP address")] server_ip: String,
+) -> celers_core::Result<String> {
+    Ok(format!(
+        "Transaction {} from {} with PIN {}",
+        transaction_id, server_ip, pin
+    ))
+}
+
+#[tokio::test]
+async fn test_validate_new_validators_combined_success() {
+    let task = ValidateNewValidatorsCombinedTask;
+    let input = ValidateNewValidatorsCombinedTaskInput {
+        pin: "123456".to_string(),
+        transaction_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        server_ip: "192.168.1.100".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_new_validators_combined_pin_failure() {
+    let task = ValidateNewValidatorsCombinedTask;
+    let input = ValidateNewValidatorsCombinedTaskInput {
+        pin: "12a456".to_string(),
+        transaction_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        server_ip: "192.168.1.100".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "PIN must contain only digits");
+}
+
+#[tokio::test]
+async fn test_validate_new_validators_combined_uuid_failure() {
+    let task = ValidateNewValidatorsCombinedTask;
+    let input = ValidateNewValidatorsCombinedTaskInput {
+        pin: "123456".to_string(),
+        transaction_id: "invalid-uuid".to_string(),
+        server_ip: "192.168.1.100".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid transaction ID format");
+}
+
+#[tokio::test]
+async fn test_validate_new_validators_combined_ipv4_failure() {
+    let task = ValidateNewValidatorsCombinedTask;
+    let input = ValidateNewValidatorsCombinedTaskInput {
+        pin: "123456".to_string(),
+        transaction_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        server_ip: "256.256.256.256".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid server IP address");
+}
+
+// Test IPv6 validation
+#[task]
+async fn validate_ipv6(#[validate(ipv6)] address: String) -> celers_core::Result<String> {
+    Ok(format!("Valid IPv6: {}", address))
+}
+
+#[tokio::test]
+async fn test_validate_ipv6_success() {
+    let task = ValidateIpv6Task;
+    let input = ValidateIpv6TaskInput {
+        address: "2001:0db8:85a3:0000:0000:8a2e:0370:7334".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ipv6_success_compressed() {
+    let task = ValidateIpv6Task;
+    let input = ValidateIpv6TaskInput {
+        address: "2001:db8::1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ipv6_failure() {
+    let task = ValidateIpv6Task;
+    let input = ValidateIpv6TaskInput {
+        address: "not-an-ipv6".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Field 'address' must be a valid IPv6 address");
+}
+
+// Test slug validation
+#[task]
+async fn validate_slug(#[validate(slug)] slug: String) -> celers_core::Result<String> {
+    Ok(format!("Valid slug: {}", slug))
+}
+
+#[tokio::test]
+async fn test_validate_slug_success() {
+    let task = ValidateSlugTask;
+    let input = ValidateSlugTaskInput {
+        slug: "hello-world".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_slug_success_numbers() {
+    let task = ValidateSlugTask;
+    let input = ValidateSlugTaskInput {
+        slug: "article-123".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_slug_failure_uppercase() {
+    let task = ValidateSlugTask;
+    let input = ValidateSlugTaskInput {
+        slug: "Hello-World".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(
+        error.0,
+        "Field 'slug' must be a valid URL slug (lowercase letters, numbers, and hyphens only)"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_slug_failure_underscore() {
+    let task = ValidateSlugTask;
+    let input = ValidateSlugTaskInput {
+        slug: "hello_world".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test MAC address validation
+#[task]
+async fn validate_mac(#[validate(mac_address)] mac: String) -> celers_core::Result<String> {
+    Ok(format!("Valid MAC: {}", mac))
+}
+
+#[tokio::test]
+async fn test_validate_mac_success_colon() {
+    let task = ValidateMacTask;
+    let input = ValidateMacTaskInput {
+        mac: "00:1A:2B:3C:4D:5E".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_mac_success_hyphen() {
+    let task = ValidateMacTask;
+    let input = ValidateMacTaskInput {
+        mac: "00-1A-2B-3C-4D-5E".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_mac_failure() {
+    let task = ValidateMacTask;
+    let input = ValidateMacTaskInput {
+        mac: "not-a-mac".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Field 'mac' must be a valid MAC address");
+}
+
+#[tokio::test]
+async fn test_validate_mac_failure_wrong_format() {
+    let task = ValidateMacTask;
+    let input = ValidateMacTaskInput {
+        mac: "00:1A:2B:3C:4D".to_string(), // Too short
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test combined new validators with custom messages
+#[task]
+async fn validate_network_config(
+    #[validate(ipv6, message = "Invalid IPv6 address")] ipv6_addr: String,
+    #[validate(mac_address, message = "Invalid MAC address")] mac_addr: String,
+    #[validate(slug, message = "Invalid hostname slug")] hostname: String,
+) -> celers_core::Result<String> {
+    Ok(format!(
+        "Network configured: {} - {} - {}",
+        ipv6_addr, mac_addr, hostname
+    ))
+}
+
+#[tokio::test]
+async fn test_validate_network_config_success() {
+    let task = ValidateNetworkConfigTask;
+    let input = ValidateNetworkConfigTaskInput {
+        ipv6_addr: "2001:db8::1".to_string(),
+        mac_addr: "00:1A:2B:3C:4D:5E".to_string(),
+        hostname: "server-01".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_network_config_ipv6_failure() {
+    let task = ValidateNetworkConfigTask;
+    let input = ValidateNetworkConfigTaskInput {
+        ipv6_addr: "invalid".to_string(),
+        mac_addr: "00:1A:2B:3C:4D:5E".to_string(),
+        hostname: "server-01".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid IPv6 address");
+}
+
+#[tokio::test]
+async fn test_validate_network_config_mac_failure() {
+    let task = ValidateNetworkConfigTask;
+    let input = ValidateNetworkConfigTaskInput {
+        ipv6_addr: "2001:db8::1".to_string(),
+        mac_addr: "invalid".to_string(),
+        hostname: "server-01".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid MAC address");
+}
+
+#[tokio::test]
+async fn test_validate_network_config_slug_failure() {
+    let task = ValidateNetworkConfigTask;
+    let input = ValidateNetworkConfigTaskInput {
+        ipv6_addr: "2001:db8::1".to_string(),
+        mac_addr: "00:1A:2B:3C:4D:5E".to_string(),
+        hostname: "Server_01".to_string(), // Invalid: contains uppercase and underscore
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid hostname slug");
+}
+
+// Test JSON validation
+#[task]
+async fn validate_json(#[validate(json)] data: String) -> celers_core::Result<String> {
+    Ok(format!("Valid JSON: {}", data))
+}
+
+#[tokio::test]
+async fn test_validate_json_success_object() {
+    let task = ValidateJsonTask;
+    let input = ValidateJsonTaskInput {
+        data: r#"{"name": "test", "value": 123}"#.to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_json_success_array() {
+    let task = ValidateJsonTask;
+    let input = ValidateJsonTaskInput {
+        data: r#"[1, 2, 3, "test"]"#.to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_json_failure() {
+    let task = ValidateJsonTask;
+    let input = ValidateJsonTaskInput {
+        data: "not-valid-json".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Field 'data' must be valid JSON");
+}
+
+// Test base64 validation
+#[task]
+async fn validate_base64(#[validate(base64)] data: String) -> celers_core::Result<String> {
+    Ok(format!("Valid base64: {}", data))
+}
+
+#[tokio::test]
+async fn test_validate_base64_success() {
+    let task = ValidateBase64Task;
+    let input = ValidateBase64TaskInput {
+        data: "SGVsbG8gV29ybGQ=".to_string(), // "Hello World" in base64
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_base64_success_no_padding() {
+    let task = ValidateBase64Task;
+    let input = ValidateBase64TaskInput {
+        data: "SGVsbG8=".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_base64_failure_invalid_chars() {
+    let task = ValidateBase64Task;
+    let input = ValidateBase64TaskInput {
+        data: "Invalid@#$".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Field 'data' must be valid base64");
+}
+
+#[tokio::test]
+async fn test_validate_base64_failure_wrong_length() {
+    let task = ValidateBase64Task;
+    let input = ValidateBase64TaskInput {
+        data: "SGVs".to_string(), // Length not divisible by 4
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok()); // This should pass as it's divisible by 4
+}
+
+// Test color hex validation
+#[task]
+async fn validate_color(#[validate(color_hex)] color: String) -> celers_core::Result<String> {
+    Ok(format!("Valid color: {}", color))
+}
+
+#[tokio::test]
+async fn test_validate_color_hex_success_six_digit() {
+    let task = ValidateColorTask;
+    let input = ValidateColorTaskInput {
+        color: "#FF5733".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_color_hex_success_three_digit() {
+    let task = ValidateColorTask;
+    let input = ValidateColorTaskInput {
+        color: "#F53".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_color_hex_failure_no_hash() {
+    let task = ValidateColorTask;
+    let input = ValidateColorTaskInput {
+        color: "FF5733".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(
+        error.0,
+        "Field 'color' must be a valid hex color code (#RGB or #RRGGBB)"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_color_hex_failure_wrong_length() {
+    let task = ValidateColorTask;
+    let input = ValidateColorTaskInput {
+        color: "#FF57".to_string(), // 4 digits, should be 3 or 6
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test combined new validators with custom messages
+#[task]
+async fn validate_web_data(
+    #[validate(json, message = "Invalid JSON configuration")] config: String,
+    #[validate(base64, message = "Invalid base64 encoded data")] encoded: String,
+    #[validate(color_hex, message = "Invalid color code")] primary_color: String,
+) -> celers_core::Result<String> {
+    Ok(format!(
+        "Web data validated: config, encoded, color={}",
+        primary_color
+    ))
+}
+
+#[tokio::test]
+async fn test_validate_web_data_success() {
+    let task = ValidateWebDataTask;
+    let input = ValidateWebDataTaskInput {
+        config: r#"{"theme": "dark"}"#.to_string(),
+        encoded: "SGVsbG8=".to_string(),
+        primary_color: "#007BFF".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_web_data_json_failure() {
+    let task = ValidateWebDataTask;
+    let input = ValidateWebDataTaskInput {
+        config: "invalid-json".to_string(),
+        encoded: "SGVsbG8=".to_string(),
+        primary_color: "#007BFF".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid JSON configuration");
+}
+
+#[tokio::test]
+async fn test_validate_web_data_base64_failure() {
+    let task = ValidateWebDataTask;
+    let input = ValidateWebDataTaskInput {
+        config: r#"{"theme": "dark"}"#.to_string(),
+        encoded: "Invalid@Data".to_string(),
+        primary_color: "#007BFF".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid base64 encoded data");
+}
+
+#[tokio::test]
+async fn test_validate_web_data_color_failure() {
+    let task = ValidateWebDataTask;
+    let input = ValidateWebDataTaskInput {
+        config: r#"{"theme": "dark"}"#.to_string(),
+        encoded: "SGVsbG8=".to_string(),
+        primary_color: "blue".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid color code");
+}
+
+// ============================================================================
+// Additional Practical Validators Tests (December 30, 2025)
+// ============================================================================
+
+// Semver validator tests
+#[task]
+async fn validate_semver(
+    #[validate(semver, message = "Invalid version format")] version: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Version: {}", version))
+}
+
+#[tokio::test]
+async fn test_validate_semver_success() {
+    let task = ValidateSemverTask;
+    let input = ValidateSemverTaskInput {
+        version: "1.2.3".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_semver_success_prerelease() {
+    let task = ValidateSemverTask;
+    let input = ValidateSemverTaskInput {
+        version: "2.0.0-alpha.1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_semver_failure() {
+    let task = ValidateSemverTask;
+    let input = ValidateSemverTaskInput {
+        version: "1.2".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid version format");
+}
+
+// Domain validator tests
+#[task]
+async fn validate_domain(
+    #[validate(domain, message = "Invalid domain name")] domain: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Domain: {}", domain))
+}
+
+#[tokio::test]
+async fn test_validate_domain_success() {
+    let task = ValidateDomainTask;
+    let input = ValidateDomainTaskInput {
+        domain: "example.com".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_domain_success_subdomain() {
+    let task = ValidateDomainTask;
+    let input = ValidateDomainTaskInput {
+        domain: "subdomain.example.co.uk".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_domain_failure() {
+    let task = ValidateDomainTask;
+    let input = ValidateDomainTaskInput {
+        domain: "not_a_domain".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid domain name");
+}
+
+// ASCII validator tests
+#[task]
+async fn validate_ascii(
+    #[validate(ascii, message = "Must be ASCII only")] text: String,
+) -> celers_core::Result<String> {
+    Ok(format!("ASCII: {}", text))
+}
+
+#[tokio::test]
+async fn test_validate_ascii_success() {
+    let task = ValidateAsciiTask;
+    let input = ValidateAsciiTaskInput {
+        text: "Hello World 123!".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ascii_failure() {
+    let task = ValidateAsciiTask;
+    let input = ValidateAsciiTaskInput {
+        text: "Hello 世界".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Must be ASCII only");
+}
+
+#[tokio::test]
+async fn test_validate_ascii_success_empty() {
+    let task = ValidateAsciiTask;
+    let input = ValidateAsciiTaskInput {
+        text: "".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+// Lowercase validator tests
+#[task]
+async fn validate_lowercase(
+    #[validate(lowercase, message = "Must be lowercase")] tag: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Tag: {}", tag))
+}
+
+#[tokio::test]
+async fn test_validate_lowercase_success() {
+    let task = ValidateLowercaseTask;
+    let input = ValidateLowercaseTaskInput {
+        tag: "hello123".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_lowercase_failure() {
+    let task = ValidateLowercaseTask;
+    let input = ValidateLowercaseTaskInput {
+        tag: "Hello".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Must be lowercase");
+}
+
+#[tokio::test]
+async fn test_validate_lowercase_success_with_numbers() {
+    let task = ValidateLowercaseTask;
+    let input = ValidateLowercaseTaskInput {
+        tag: "tag-123".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+// Uppercase validator tests
+#[task]
+async fn validate_uppercase(
+    #[validate(uppercase, message = "Must be uppercase")] code: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Code: {}", code))
+}
+
+#[tokio::test]
+async fn test_validate_uppercase_success() {
+    let task = ValidateUppercaseTask;
+    let input = ValidateUppercaseTaskInput {
+        code: "HELLO123".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_uppercase_failure() {
+    let task = ValidateUppercaseTask;
+    let input = ValidateUppercaseTaskInput {
+        code: "Hello".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Must be uppercase");
+}
+
+#[tokio::test]
+async fn test_validate_uppercase_success_with_numbers() {
+    let task = ValidateUppercaseTask;
+    let input = ValidateUppercaseTaskInput {
+        code: "CODE-456".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+// Time 24h validator tests
+#[task]
+async fn validate_time(
+    #[validate(time_24h, message = "Invalid time format")] time: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Time: {}", time))
+}
+
+#[tokio::test]
+async fn test_validate_time_success() {
+    let task = ValidateTimeTask;
+    let input = ValidateTimeTaskInput {
+        time: "14:30".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_time_success_with_seconds() {
+    let task = ValidateTimeTask;
+    let input = ValidateTimeTaskInput {
+        time: "23:59:59".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_time_failure() {
+    let task = ValidateTimeTask;
+    let input = ValidateTimeTaskInput {
+        time: "25:00".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid time format");
+}
+
+// Date ISO 8601 validator tests
+#[task]
+async fn validate_date(
+    #[validate(date_iso8601, message = "Invalid date format")] date: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Date: {}", date))
+}
+
+#[tokio::test]
+async fn test_validate_date_success() {
+    let task = ValidateDateTask;
+    let input = ValidateDateTaskInput {
+        date: "2025-12-30".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_date_failure_invalid_month() {
+    let task = ValidateDateTask;
+    let input = ValidateDateTaskInput {
+        date: "2025-13-01".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid date format");
+}
+
+#[tokio::test]
+async fn test_validate_date_failure_wrong_format() {
+    let task = ValidateDateTask;
+    let input = ValidateDateTaskInput {
+        date: "12/30/2025".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid date format");
+}
+
+// Credit card validator tests
+#[task]
+async fn validate_credit_card(
+    #[validate(credit_card, message = "Invalid credit card number")] card: String,
+) -> celers_core::Result<String> {
+    Ok("Card validated".to_string())
+}
+
+#[tokio::test]
+async fn test_validate_credit_card_success() {
+    let task = ValidateCreditCardTask;
+    // Valid Visa test card number
+    let input = ValidateCreditCardTaskInput {
+        card: "4532015112830366".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_credit_card_success_with_spaces() {
+    let task = ValidateCreditCardTask;
+    // Valid Visa test card with spaces
+    let input = ValidateCreditCardTaskInput {
+        card: "4532 0151 1283 0366".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_credit_card_failure() {
+    let task = ValidateCreditCardTask;
+    let input = ValidateCreditCardTaskInput {
+        card: "1234567890123456".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid credit card number");
+}
+
+// Combined test with all new validators
+#[task]
+async fn validate_all_new(
+    #[validate(semver, message = "Invalid version")] version: String,
+    #[validate(domain, message = "Invalid domain")] domain: String,
+    #[validate(ascii, message = "Must be ASCII")] description: String,
+    #[validate(lowercase, message = "Must be lowercase")] tag: String,
+    #[validate(uppercase, message = "Must be uppercase")] code: String,
+    #[validate(time_24h, message = "Invalid time")] time: String,
+    #[validate(date_iso8601, message = "Invalid date")] date: String,
+    #[validate(credit_card, message = "Invalid card")] card: String,
+) -> celers_core::Result<String> {
+    Ok("All validated".to_string())
+}
+
+#[tokio::test]
+async fn test_validate_all_new_success() {
+    let task = ValidateAllNewTask;
+    let input = ValidateAllNewTaskInput {
+        version: "1.0.0".to_string(),
+        domain: "example.com".to_string(),
+        description: "ASCII text".to_string(),
+        tag: "tag123".to_string(),
+        code: "CODE456".to_string(),
+        time: "14:30:00".to_string(),
+        date: "2025-12-30".to_string(),
+        card: "4532015112830366".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_all_new_version_failure() {
+    let task = ValidateAllNewTask;
+    let input = ValidateAllNewTaskInput {
+        version: "1.0".to_string(),
+        domain: "example.com".to_string(),
+        description: "ASCII text".to_string(),
+        tag: "tag123".to_string(),
+        code: "CODE456".to_string(),
+        time: "14:30:00".to_string(),
+        date: "2025-12-30".to_string(),
+        card: "4532015112830366".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid version");
+}
+
+#[tokio::test]
+async fn test_validate_all_new_card_failure() {
+    let task = ValidateAllNewTask;
+    let input = ValidateAllNewTaskInput {
+        version: "1.0.0".to_string(),
+        domain: "example.com".to_string(),
+        description: "ASCII text".to_string(),
+        tag: "tag123".to_string(),
+        code: "CODE456".to_string(),
+        time: "14:30:00".to_string(),
+        date: "2025-12-30".to_string(),
+        card: "1234567890123456".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid card");
+}
+
+// ============================================================================
+// NEW GEOGRAPHIC AND LOCALE VALIDATORS (ADDED 2025-12-30)
+// ============================================================================
+
+// Test: Latitude validator - success
+#[task]
+async fn validate_latitude_task(#[validate(latitude)] lat: String) -> celers_core::Result<String> {
+    Ok(format!("Latitude: {}", lat))
+}
+
+#[tokio::test]
+async fn test_validate_latitude_success() {
+    let task = ValidateLatitudeTaskTask;
+    let input = ValidateLatitudeTaskTaskInput {
+        lat: "45.5".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_latitude_edge_cases() {
+    let task = ValidateLatitudeTaskTask;
+
+    // Test -90 (valid)
+    let input = ValidateLatitudeTaskTaskInput {
+        lat: "-90".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+
+    // Test 90 (valid)
+    let input = ValidateLatitudeTaskTaskInput {
+        lat: "90".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_latitude_failure() {
+    let task = ValidateLatitudeTaskTask;
+
+    // Test > 90
+    let input = ValidateLatitudeTaskTaskInput {
+        lat: "91".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+
+    // Test < -90
+    let input = ValidateLatitudeTaskTaskInput {
+        lat: "-91".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test: Longitude validator - success
+#[task]
+async fn validate_longitude_task(
+    #[validate(longitude)] lon: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Longitude: {}", lon))
+}
+
+#[tokio::test]
+async fn test_validate_longitude_success() {
+    let task = ValidateLongitudeTaskTask;
+    let input = ValidateLongitudeTaskTaskInput {
+        lon: "122.4".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_longitude_edge_cases() {
+    let task = ValidateLongitudeTaskTask;
+
+    // Test -180 (valid)
+    let input = ValidateLongitudeTaskTaskInput {
+        lon: "-180".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+
+    // Test 180 (valid)
+    let input = ValidateLongitudeTaskTaskInput {
+        lon: "180".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_longitude_failure() {
+    let task = ValidateLongitudeTaskTask;
+
+    // Test > 180
+    let input = ValidateLongitudeTaskTaskInput {
+        lon: "181".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+
+    // Test < -180
+    let input = ValidateLongitudeTaskTaskInput {
+        lon: "-181".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test: ISO country code validator
+#[task]
+async fn validate_iso_country_task(
+    #[validate(iso_country)] country: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Country: {}", country))
+}
+
+#[tokio::test]
+async fn test_validate_iso_country_success() {
+    let task = ValidateIsoCountryTaskTask;
+
+    // Test US
+    let input = ValidateIsoCountryTaskTaskInput {
+        country: "US".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+
+    // Test CA
+    let input = ValidateIsoCountryTaskTaskInput {
+        country: "CA".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+
+    // Test GB
+    let input = ValidateIsoCountryTaskTaskInput {
+        country: "GB".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_iso_country_failure() {
+    let task = ValidateIsoCountryTaskTask;
+
+    // Test lowercase (invalid)
+    let input = ValidateIsoCountryTaskTaskInput {
+        country: "us".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+
+    // Test 3 letters (invalid)
+    let input = ValidateIsoCountryTaskTaskInput {
+        country: "USA".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test: ISO language code validator
+#[task]
+async fn validate_iso_language_task(
+    #[validate(iso_language)] lang: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Language: {}", lang))
+}
+
+#[tokio::test]
+async fn test_validate_iso_language_success() {
+    let task = ValidateIsoLanguageTaskTask;
+
+    // Test en
+    let input = ValidateIsoLanguageTaskTaskInput {
+        lang: "en".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+
+    // Test es
+    let input = ValidateIsoLanguageTaskTaskInput {
+        lang: "es".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+
+    // Test fr
+    let input = ValidateIsoLanguageTaskTaskInput {
+        lang: "fr".to_string(),
+    };
+    assert!(task.execute(input).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_iso_language_failure() {
+    let task = ValidateIsoLanguageTaskTask;
+
+    // Test uppercase (invalid)
+    let input = ValidateIsoLanguageTaskTaskInput {
+        lang: "EN".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+
+    // Test 3 letters (invalid)
+    let input = ValidateIsoLanguageTaskTaskInput {
+        lang: "eng".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test: US ZIP code validator
+#[task]
+async fn validate_us_zip_task(#[validate(us_zip)] zip: String) -> celers_core::Result<String> {
+    Ok(format!("ZIP: {}", zip))
+}
+
+#[tokio::test]
+async fn test_validate_us_zip_success_5_digit() {
+    let task = ValidateUsZipTaskTask;
+    let input = ValidateUsZipTaskTaskInput {
+        zip: "12345".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_us_zip_success_9_digit() {
+    let task = ValidateUsZipTaskTask;
+    let input = ValidateUsZipTaskTaskInput {
+        zip: "12345-6789".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_us_zip_failure() {
+    let task = ValidateUsZipTaskTask;
+
+    // Test 4 digits (invalid)
+    let input = ValidateUsZipTaskTaskInput {
+        zip: "1234".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+
+    // Test with letters (invalid)
+    let input = ValidateUsZipTaskTaskInput {
+        zip: "12A45".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test: Canadian postal code validator
+#[task]
+async fn validate_ca_postal_task(
+    #[validate(ca_postal)] postal: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Postal: {}", postal))
+}
+
+#[tokio::test]
+async fn test_validate_ca_postal_success_with_space() {
+    let task = ValidateCaPostalTaskTask;
+    let input = ValidateCaPostalTaskTaskInput {
+        postal: "K1A 0B1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ca_postal_success_without_space() {
+    let task = ValidateCaPostalTaskTask;
+    let input = ValidateCaPostalTaskTaskInput {
+        postal: "K1A0B1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ca_postal_failure() {
+    let task = ValidateCaPostalTaskTask;
+
+    // Test lowercase (invalid)
+    let input = ValidateCaPostalTaskTaskInput {
+        postal: "k1a 0b1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+
+    // Test all digits (invalid)
+    let input = ValidateCaPostalTaskTaskInput {
+        postal: "123 456".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Test: Combined new validators with custom messages
+#[task]
+async fn validate_location_data(
+    #[validate(latitude, message = "Invalid latitude")] lat: String,
+    #[validate(longitude, message = "Invalid longitude")] lon: String,
+    #[validate(iso_country, message = "Invalid country code")] country: String,
+    #[validate(iso_language, message = "Invalid language code")] lang: String,
+    #[validate(us_zip, message = "Invalid ZIP code")] zip: String,
+    #[validate(ca_postal, message = "Invalid postal code")] postal: String,
+) -> celers_core::Result<String> {
+    Ok("Location data validated".to_string())
+}
+
+#[tokio::test]
+async fn test_validate_location_data_success() {
+    let task = ValidateLocationDataTask;
+    let input = ValidateLocationDataTaskInput {
+        lat: "40.7128".to_string(),
+        lon: "-74.0060".to_string(),
+        country: "US".to_string(),
+        lang: "en".to_string(),
+        zip: "10001".to_string(),
+        postal: "K1A 0B1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_location_data_lat_failure() {
+    let task = ValidateLocationDataTask;
+    let input = ValidateLocationDataTaskInput {
+        lat: "91".to_string(), // Invalid
+        lon: "-74.0060".to_string(),
+        country: "US".to_string(),
+        lang: "en".to_string(),
+        zip: "10001".to_string(),
+        postal: "K1A 0B1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid latitude");
+}
+
+#[tokio::test]
+async fn test_validate_location_data_country_failure() {
+    let task = ValidateLocationDataTask;
+    let input = ValidateLocationDataTaskInput {
+        lat: "40.7128".to_string(),
+        lon: "-74.0060".to_string(),
+        country: "USA".to_string(), // Invalid (3 letters)
+        lang: "en".to_string(),
+        zip: "10001".to_string(),
+        postal: "K1A 0B1".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid country code");
+}
+
+// ============================================================================
+// New Validators Tests (IBAN, Bitcoin, Ethereum, ISBN, Password Strength)
+// ============================================================================
+
+// IBAN Validator Tests
+#[task]
+async fn validate_iban(#[validate(iban)] account: String) -> celers_core::Result<String> {
+    Ok(format!("IBAN validated: {}", account))
+}
+
+#[tokio::test]
+async fn test_validate_iban_success() {
+    let task = ValidateIbanTask;
+    let input = ValidateIbanTaskInput {
+        account: "GB82WEST12345698765432".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_iban_failure() {
+    let task = ValidateIbanTask;
+    let input = ValidateIbanTaskInput {
+        account: "invalid-iban".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_validate_iban_failure_too_short() {
+    let task = ValidateIbanTask;
+    let input = ValidateIbanTaskInput {
+        account: "GB82".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Bitcoin Address Validator Tests
+#[task]
+async fn validate_bitcoin(
+    #[validate(bitcoin_address, message = "Invalid Bitcoin address")] address: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Bitcoin address validated: {}", address))
+}
+
+#[tokio::test]
+async fn test_validate_bitcoin_success_p2pkh() {
+    let task = ValidateBitcoinTask;
+    let input = ValidateBitcoinTaskInput {
+        address: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_bitcoin_success_p2sh() {
+    let task = ValidateBitcoinTask;
+    let input = ValidateBitcoinTaskInput {
+        address: "3J98t1WpEZ73CNmYviecrnyiWrnqRhWNLy".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_bitcoin_success_bech32() {
+    let task = ValidateBitcoinTask;
+    let input = ValidateBitcoinTaskInput {
+        address: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_bitcoin_failure() {
+    let task = ValidateBitcoinTask;
+    let input = ValidateBitcoinTaskInput {
+        address: "not-a-bitcoin-address".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid Bitcoin address");
+}
+
+// Ethereum Address Validator Tests
+#[task]
+async fn validate_ethereum(
+    #[validate(ethereum_address, message = "Invalid Ethereum address")] address: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Ethereum address validated: {}", address))
+}
+
+#[tokio::test]
+async fn test_validate_ethereum_success() {
+    let task = ValidateEthereumTask;
+    let input = ValidateEthereumTaskInput {
+        address: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ethereum_success_lowercase() {
+    let task = ValidateEthereumTask;
+    let input = ValidateEthereumTaskInput {
+        address: "0x742d35cc6634c0532925a3b844bc454e4438f44e".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_ethereum_failure_no_prefix() {
+    let task = ValidateEthereumTask;
+    let input = ValidateEthereumTaskInput {
+        address: "742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid Ethereum address");
+}
+
+#[tokio::test]
+async fn test_validate_ethereum_failure_too_short() {
+    let task = ValidateEthereumTask;
+    let input = ValidateEthereumTaskInput {
+        address: "0x742d35Cc".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// ISBN Validator Tests
+#[task]
+async fn validate_isbn(
+    #[validate(isbn, message = "Invalid ISBN")] book_id: String,
+) -> celers_core::Result<String> {
+    Ok(format!("ISBN validated: {}", book_id))
+}
+
+#[tokio::test]
+async fn test_validate_isbn_10_success() {
+    let task = ValidateIsbnTask;
+    let input = ValidateIsbnTaskInput {
+        book_id: "0306406152".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_isbn_10_with_x() {
+    let task = ValidateIsbnTask;
+    let input = ValidateIsbnTaskInput {
+        book_id: "043942089X".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_isbn_13_success() {
+    let task = ValidateIsbnTask;
+    let input = ValidateIsbnTaskInput {
+        book_id: "9780306406157".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_isbn_13_with_hyphens() {
+    let task = ValidateIsbnTask;
+    let input = ValidateIsbnTaskInput {
+        book_id: "978-0-306-40615-7".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_isbn_failure_invalid_checksum() {
+    let task = ValidateIsbnTask;
+    let input = ValidateIsbnTaskInput {
+        book_id: "9780306406150".to_string(), // Invalid checksum
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid ISBN");
+}
+
+#[tokio::test]
+async fn test_validate_isbn_failure_wrong_length() {
+    let task = ValidateIsbnTask;
+    let input = ValidateIsbnTaskInput {
+        book_id: "12345".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Password Strength Validator Tests
+#[task]
+async fn validate_password(
+    #[validate(password_strength, message = "Weak password")] password: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Password validated: {}", password.len()))
+}
+
+#[tokio::test]
+async fn test_validate_password_success() {
+    let task = ValidatePasswordTask;
+    let input = ValidatePasswordTaskInput {
+        password: "Str0ng!Pass".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_password_failure_too_short() {
+    let task = ValidatePasswordTask;
+    let input = ValidatePasswordTaskInput {
+        password: "Str0!".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Weak password");
+}
+
+#[tokio::test]
+async fn test_validate_password_failure_no_uppercase() {
+    let task = ValidatePasswordTask;
+    let input = ValidatePasswordTaskInput {
+        password: "str0ng!pass".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Weak password");
+}
+
+#[tokio::test]
+async fn test_validate_password_failure_no_lowercase() {
+    let task = ValidatePasswordTask;
+    let input = ValidatePasswordTaskInput {
+        password: "STR0NG!PASS".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_validate_password_failure_no_digit() {
+    let task = ValidatePasswordTask;
+    let input = ValidatePasswordTaskInput {
+        password: "Strong!Pass".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_validate_password_failure_no_special() {
+    let task = ValidatePasswordTask;
+    let input = ValidatePasswordTaskInput {
+        password: "Str0ngPass".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+}
+
+// Combined Test with Financial and Crypto Validators
+#[task]
+async fn validate_financial_crypto(
+    #[validate(iban, message = "Invalid bank account")] iban: String,
+    #[validate(bitcoin_address, message = "Invalid BTC address")] btc: String,
+    #[validate(ethereum_address, message = "Invalid ETH address")] eth: String,
+    #[validate(isbn, message = "Invalid book ID")] isbn: String,
+    #[validate(password_strength, message = "Password too weak")] password: String,
+) -> celers_core::Result<String> {
+    Ok(format!(
+        "All validated: {} {} {} {} {}",
+        iban.len(),
+        btc.len(),
+        eth.len(),
+        isbn.len(),
+        password.len()
+    ))
+}
+
+#[tokio::test]
+async fn test_validate_financial_crypto_success() {
+    let task = ValidateFinancialCryptoTask;
+    let input = ValidateFinancialCryptoTaskInput {
+        iban: "GB82WEST12345698765432".to_string(),
+        btc: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string(),
+        eth: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+        isbn: "9780306406157".to_string(),
+        password: "Str0ng!Pass".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_validate_financial_crypto_iban_failure() {
+    let task = ValidateFinancialCryptoTask;
+    let input = ValidateFinancialCryptoTaskInput {
+        iban: "invalid".to_string(),
+        btc: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string(),
+        eth: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+        isbn: "9780306406157".to_string(),
+        password: "Str0ng!Pass".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Invalid bank account");
+}
+
+#[tokio::test]
+async fn test_validate_financial_crypto_password_failure() {
+    let task = ValidateFinancialCryptoTask;
+    let input = ValidateFinancialCryptoTaskInput {
+        iban: "GB82WEST12345698765432".to_string(),
+        btc: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string(),
+        eth: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+        isbn: "9780306406157".to_string(),
+        password: "weak".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Password too weak");
+}
+
+// Test: Custom validator function support
+fn validate_even_number(value: &i32) -> Result<(), String> {
+    if value % 2 == 0 {
+        Ok(())
+    } else {
+        Err("Value must be an even number".to_string())
+    }
+}
+
+fn validate_username_format(value: &str) -> Result<(), String> {
+    if value.starts_with('@') {
+        Err("Username cannot start with @".to_string())
+    } else if value.len() < 3 {
+        Err("Username must be at least 3 characters".to_string())
+    } else if value.contains(' ') {
+        Err("Username cannot contain spaces".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_percentage(value: &i32) -> Result<(), String> {
+    if *value >= 0 && *value <= 100 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Percentage must be between 0 and 100, got {}",
+            value
+        ))
+    }
+}
+
+#[task]
+async fn custom_validator_even(
+    #[validate(custom = "validate_even_number")] number: i32,
+) -> celers_core::Result<String> {
+    Ok(format!("Even number: {}", number))
+}
+
+#[tokio::test]
+async fn test_custom_validator_success() {
+    let task = CustomValidatorEvenTask;
+    let input = CustomValidatorEvenTaskInput { number: 42 };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), "Even number: 42");
+}
+
+#[tokio::test]
+async fn test_custom_validator_failure() {
+    let task = CustomValidatorEvenTask;
+    let input = CustomValidatorEvenTaskInput { number: 43 };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Value must be an even number");
+}
+
+#[task]
+async fn custom_validator_username(
+    #[validate(custom = "validate_username_format")] username: String,
+) -> celers_core::Result<String> {
+    Ok(format!("Username: {}", username))
+}
+
+#[tokio::test]
+async fn test_custom_validator_username_success() {
+    let task = CustomValidatorUsernameTask;
+    let input = CustomValidatorUsernameTaskInput {
+        username: "alice123".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), "Username: alice123");
+}
+
+#[tokio::test]
+async fn test_custom_validator_username_at_sign() {
+    let task = CustomValidatorUsernameTask;
+    let input = CustomValidatorUsernameTaskInput {
+        username: "@alice".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Username cannot start with @");
+}
+
+#[tokio::test]
+async fn test_custom_validator_username_too_short() {
+    let task = CustomValidatorUsernameTask;
+    let input = CustomValidatorUsernameTaskInput {
+        username: "al".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Username must be at least 3 characters");
+}
+
+#[tokio::test]
+async fn test_custom_validator_username_with_space() {
+    let task = CustomValidatorUsernameTask;
+    let input = CustomValidatorUsernameTaskInput {
+        username: "alice bob".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Username cannot contain spaces");
+}
+
+#[task]
+async fn combined_custom_and_predefined(
+    #[validate(custom = "validate_percentage", min = 0, max = 100)] completion: i32,
+    #[validate(custom = "validate_username_format", min_length = 3)] user: String,
+) -> celers_core::Result<String> {
+    Ok(format!("User {} is {}% complete", user, completion))
+}
+
+#[tokio::test]
+async fn test_combined_custom_predefined_success() {
+    let task = CombinedCustomAndPredefinedTask;
+    let input = CombinedCustomAndPredefinedTaskInput {
+        completion: 75,
+        user: "alice".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), "User alice is 75% complete");
+}
+
+#[tokio::test]
+async fn test_combined_max_validator_failure() {
+    let task = CombinedCustomAndPredefinedTask;
+    let input = CombinedCustomAndPredefinedTaskInput {
+        completion: 150,
+        user: "alice".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    // The max validator runs before custom validator
+    assert_eq!(error.0, "Field 'completion' value 150 exceeds maximum 100");
+}
+
+#[tokio::test]
+async fn test_combined_username_validator_failure() {
+    let task = CombinedCustomAndPredefinedTask;
+    let input = CombinedCustomAndPredefinedTaskInput {
+        completion: 75,
+        user: "@alice".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.0, "Username cannot start with @");
+}
+
+#[tokio::test]
+async fn test_combined_min_validator_failure() {
+    let task = CombinedCustomAndPredefinedTask;
+    let input = CombinedCustomAndPredefinedTaskInput {
+        completion: -10,
+        user: "alice".to_string(),
+    };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    // The min validator runs before custom validator
+    assert!(error.0.contains("below minimum"));
+}

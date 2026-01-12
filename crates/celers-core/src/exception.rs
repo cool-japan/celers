@@ -128,12 +128,14 @@ impl TracebackFrame {
     }
 
     /// Add column information
+    #[must_use]
     pub fn with_column(mut self, column: u32) -> Self {
         self.column = Some(column);
         self
     }
 
     /// Add a local variable
+    #[must_use]
     pub fn with_local(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.locals.insert(name.into(), value.into());
         self
@@ -144,7 +146,7 @@ impl fmt::Display for TracebackFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "  File \"{}\", line {}", self.file, self.line)?;
         if let Some(col) = self.column {
-            write!(f, ", column {}", col)?;
+            write!(f, ", column {col}")?;
         }
         write!(f, ", in {}", self.function)?;
         Ok(())
@@ -154,7 +156,7 @@ impl fmt::Display for TracebackFrame {
 /// A structured exception from task execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskException {
-    /// Exception type name (e.g., "ValueError", "TimeoutError")
+    /// Exception type name (e.g., "`ValueError`", "`TimeoutError`")
     pub exc_type: String,
     /// Exception message
     pub exc_message: String,
@@ -236,6 +238,7 @@ impl TaskException {
     }
 
     /// Add structured traceback frames
+    #[must_use]
     pub fn with_traceback(mut self, frames: Vec<(String, String, u32)>) -> Self {
         self.traceback = frames
             .into_iter()
@@ -245,48 +248,56 @@ impl TaskException {
     }
 
     /// Add traceback frames
+    #[must_use]
     pub fn with_traceback_frames(mut self, frames: Vec<TracebackFrame>) -> Self {
         self.traceback = frames;
         self
     }
 
     /// Add raw traceback string
+    #[must_use]
     pub fn with_traceback_str(mut self, traceback: impl Into<String>) -> Self {
         self.traceback_str = Some(traceback.into());
         self
     }
 
     /// Set exception category
+    #[must_use]
     pub fn with_category(mut self, category: ExceptionCategory) -> Self {
         self.category = category;
         self
     }
 
     /// Set cause exception
+    #[must_use]
     pub fn with_cause(mut self, cause: TaskException) -> Self {
         self.cause = Some(Box::new(cause));
         self
     }
 
     /// Set context exception
+    #[must_use]
     pub fn with_context(mut self, context: TaskException) -> Self {
         self.context = Some(Box::new(context));
         self
     }
 
     /// Add metadata
+    #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.metadata.insert(key.into(), value);
         self
     }
 
     /// Set timestamp
+    #[must_use]
     pub fn with_timestamp(mut self, timestamp: f64) -> Self {
         self.timestamp = Some(timestamp);
         self
     }
 
     /// Set timestamp to now
+    #[must_use]
     pub fn with_timestamp_now(mut self) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
         self.timestamp = Some(
@@ -299,33 +310,42 @@ impl TaskException {
     }
 
     /// Set hostname
+    #[must_use]
     pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
         self.hostname = Some(hostname.into());
         self
     }
 
     /// Set task ID
+    #[must_use]
     pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
         self.task_id = Some(task_id.into());
         self
     }
 
     /// Check if this exception is retryable
-    pub fn is_retryable(&self) -> bool {
-        self.category == ExceptionCategory::Retryable
+    #[inline]
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        self.category as u8 == ExceptionCategory::Retryable as u8
     }
 
     /// Check if this exception is fatal
-    pub fn is_fatal(&self) -> bool {
-        self.category == ExceptionCategory::Fatal
+    #[inline]
+    #[must_use]
+    pub const fn is_fatal(&self) -> bool {
+        self.category as u8 == ExceptionCategory::Fatal as u8
     }
 
     /// Check if this exception should be ignored
-    pub fn is_ignorable(&self) -> bool {
-        self.category == ExceptionCategory::Ignorable
+    #[inline]
+    #[must_use]
+    pub const fn is_ignorable(&self) -> bool {
+        self.category as u8 == ExceptionCategory::Ignorable as u8
     }
 
     /// Get the full exception chain as a vector
+    #[must_use]
     pub fn exception_chain(&self) -> Vec<&TaskException> {
         let mut chain = vec![self];
         let mut current = self;
@@ -339,7 +359,10 @@ impl TaskException {
     }
 
     /// Format the traceback as a string
+    #[must_use]
     pub fn format_traceback(&self) -> String {
+        use std::fmt::Write;
+
         if let Some(ref tb_str) = self.traceback_str {
             return tb_str.clone();
         }
@@ -350,23 +373,32 @@ impl TaskException {
 
         let mut result = String::from("Traceback (most recent call last):\n");
         for frame in &self.traceback {
-            result.push_str(&format!("{}\n", frame));
+            let _ = writeln!(result, "{frame}");
         }
-        result.push_str(&format!("{}: {}", self.exc_type, self.exc_message));
+        let _ = write!(result, "{}: {}", self.exc_type, self.exc_message);
         result
     }
 
     /// Serialize to JSON for cross-language compatibility
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
     /// Deserialize from JSON
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
 
     /// Convert to Celery-compatible format
+    #[must_use]
     pub fn to_celery_format(&self) -> serde_json::Value {
         serde_json::json!({
             "exc_type": self.exc_type,
@@ -441,77 +473,90 @@ impl Default for ExceptionPolicy {
 
 impl ExceptionPolicy {
     /// Create a new exception policy with defaults
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set exception types to retry on
+    #[must_use]
     pub fn retry_on(mut self, types: &[&str]) -> Self {
-        self.retry_on = types.iter().map(|s| s.to_string()).collect();
+        self.retry_on = types.iter().map(std::string::ToString::to_string).collect();
         self
     }
 
     /// Add exception type to retry on
+    #[must_use]
     pub fn add_retry_on(mut self, exc_type: impl Into<String>) -> Self {
         self.retry_on.push(exc_type.into());
         self
     }
 
     /// Set exception types to ignore
+    #[must_use]
     pub fn ignore_on(mut self, types: &[&str]) -> Self {
-        self.ignore_on = types.iter().map(|s| s.to_string()).collect();
+        self.ignore_on = types.iter().map(std::string::ToString::to_string).collect();
         self
     }
 
     /// Add exception type to ignore
+    #[must_use]
     pub fn add_ignore_on(mut self, exc_type: impl Into<String>) -> Self {
         self.ignore_on.push(exc_type.into());
         self
     }
 
     /// Set exception types to fail on
+    #[must_use]
     pub fn fail_on(mut self, types: &[&str]) -> Self {
-        self.fail_on = types.iter().map(|s| s.to_string()).collect();
+        self.fail_on = types.iter().map(std::string::ToString::to_string).collect();
         self
     }
 
     /// Add exception type to fail on
+    #[must_use]
     pub fn add_fail_on(mut self, exc_type: impl Into<String>) -> Self {
         self.fail_on.push(exc_type.into());
         self
     }
 
     /// Set exception types to reject
+    #[must_use]
     pub fn reject_on(mut self, types: &[&str]) -> Self {
-        self.reject_on = types.iter().map(|s| s.to_string()).collect();
+        self.reject_on = types.iter().map(std::string::ToString::to_string).collect();
         self
     }
 
     /// Add exception type to reject
+    #[must_use]
     pub fn add_reject_on(mut self, exc_type: impl Into<String>) -> Self {
         self.reject_on.push(exc_type.into());
         self
     }
 
     /// Set default action
+    #[must_use]
     pub fn with_default_action(mut self, action: ExceptionAction) -> Self {
         self.default_action = action;
         self
     }
 
     /// Set traceback preservation
+    #[must_use]
     pub fn with_traceback(mut self, preserve: bool) -> Self {
         self.preserve_traceback = preserve;
         self
     }
 
     /// Set maximum traceback depth
+    #[must_use]
     pub fn with_max_traceback_depth(mut self, depth: usize) -> Self {
         self.max_traceback_depth = Some(depth);
         self
     }
 
     /// Get the action to take for an exception
+    #[must_use]
     pub fn get_action(&self, exception: &TaskException) -> ExceptionAction {
         let exc_type = &exception.exc_type;
 
@@ -534,18 +579,19 @@ impl ExceptionPolicy {
         if self.matches_pattern(exc_type, &self.retry_on) {
             return ExceptionAction::Retry;
         }
-
         // Use category-based decision if available
         match exception.category {
             ExceptionCategory::Retryable => ExceptionAction::Retry,
-            ExceptionCategory::Fatal => ExceptionAction::Fail,
+            ExceptionCategory::Fatal | ExceptionCategory::RequiresIntervention => {
+                ExceptionAction::Fail
+            }
             ExceptionCategory::Ignorable => ExceptionAction::Ignore,
-            ExceptionCategory::RequiresIntervention => ExceptionAction::Fail,
             ExceptionCategory::Unknown => self.default_action,
         }
     }
 
     /// Check if exception type matches any pattern
+    #[allow(clippy::unused_self)]
     fn matches_pattern(&self, exc_type: &str, patterns: &[String]) -> bool {
         for pattern in patterns {
             if pattern == exc_type {
@@ -575,6 +621,7 @@ impl ExceptionPolicy {
     }
 
     /// Process an exception according to policy
+    #[must_use]
     pub fn process_exception(&self, mut exception: TaskException) -> TaskException {
         // Truncate traceback if needed
         if let Some(max_depth) = self.max_traceback_depth {
@@ -607,7 +654,7 @@ pub trait ExceptionHandler: Send + Sync {
     fn on_exception(&self, _exception: &TaskException) {}
 
     /// Get handler name for logging
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ExceptionHandler"
     }
 }
@@ -620,11 +667,13 @@ pub struct ExceptionHandlerChain {
 
 impl ExceptionHandlerChain {
     /// Create a new handler chain
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add a handler to the chain
+    #[must_use]
     pub fn add_handler<H: ExceptionHandler + 'static>(mut self, handler: H) -> Self {
         self.handlers.push(Box::new(handler));
         self
@@ -633,6 +682,7 @@ impl ExceptionHandlerChain {
     /// Handle an exception through the chain
     ///
     /// Returns the first non-Default action, or Default if all handlers return Default
+    #[must_use]
     pub fn handle(&self, exception: &TaskException) -> ExceptionAction {
         for handler in &self.handlers {
             handler.on_exception(exception);
@@ -645,6 +695,7 @@ impl ExceptionHandlerChain {
     }
 
     /// Transform an exception through all handlers
+    #[must_use]
     pub fn transform(&self, mut exception: TaskException) -> TaskException {
         for handler in &self.handlers {
             exception = handler.transform(exception);
@@ -669,11 +720,13 @@ impl Default for LoggingExceptionHandler {
 
 impl LoggingExceptionHandler {
     /// Create a new logging handler
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set log level
+    #[must_use]
     pub fn with_level(mut self, level: tracing::Level) -> Self {
         self.log_level = level;
         self
@@ -714,7 +767,7 @@ impl ExceptionHandler for LoggingExceptionHandler {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LoggingExceptionHandler"
     }
 }
@@ -726,6 +779,7 @@ pub struct PolicyExceptionHandler {
 
 impl PolicyExceptionHandler {
     /// Create a handler from a policy
+    #[must_use]
     pub fn new(policy: ExceptionPolicy) -> Self {
         Self { policy }
     }
@@ -740,7 +794,7 @@ impl ExceptionHandler for PolicyExceptionHandler {
         self.policy.process_exception(exception)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "PolicyExceptionHandler"
     }
 }
@@ -951,7 +1005,7 @@ mod tests {
     fn test_traceback_frame_display() {
         let frame = TracebackFrame::new("process_data", "tasks.py", 42).with_column(10);
 
-        let display = format!("{}", frame);
+        let display = format!("{frame}");
         assert!(display.contains("tasks.py"));
         assert!(display.contains("42"));
         assert!(display.contains("process_data"));
@@ -986,7 +1040,7 @@ mod tests {
     #[test]
     fn test_exception_display() {
         let exc = TaskException::new("ValueError", "Invalid input");
-        assert_eq!(format!("{}", exc), "ValueError: Invalid input");
+        assert_eq!(format!("{exc}"), "ValueError: Invalid input");
     }
 
     #[test]
@@ -1000,7 +1054,7 @@ mod tests {
                     ExceptionAction::Default
                 }
             }
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "RetryHandler"
             }
         }
@@ -1014,7 +1068,7 @@ mod tests {
                     ExceptionAction::Default
                 }
             }
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "FailHandler"
             }
         }

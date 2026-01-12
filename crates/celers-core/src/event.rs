@@ -243,7 +243,7 @@ pub enum WorkerEvent {
     },
 }
 
-/// Combined event type for all CeleRS events
+/// Combined event type for all `CeleRS` events
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum Event {
@@ -255,6 +255,8 @@ pub enum Event {
 
 impl Event {
     /// Get the event type as a string
+    #[inline]
+    #[must_use]
     pub fn event_type(&self) -> &'static str {
         match self {
             Event::Task(TaskEvent::Sent { .. }) => "task-sent",
@@ -272,71 +274,80 @@ impl Event {
     }
 
     /// Get the timestamp of the event
+    #[inline]
+    #[must_use]
     pub fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Event::Task(e) => match e {
-                TaskEvent::Sent { timestamp, .. } => *timestamp,
-                TaskEvent::Received { timestamp, .. } => *timestamp,
-                TaskEvent::Started { timestamp, .. } => *timestamp,
-                TaskEvent::Succeeded { timestamp, .. } => *timestamp,
-                TaskEvent::Failed { timestamp, .. } => *timestamp,
-                TaskEvent::Retried { timestamp, .. } => *timestamp,
-                TaskEvent::Revoked { timestamp, .. } => *timestamp,
-                TaskEvent::Rejected { timestamp, .. } => *timestamp,
+                TaskEvent::Sent { timestamp, .. }
+                | TaskEvent::Received { timestamp, .. }
+                | TaskEvent::Started { timestamp, .. }
+                | TaskEvent::Succeeded { timestamp, .. }
+                | TaskEvent::Failed { timestamp, .. }
+                | TaskEvent::Retried { timestamp, .. }
+                | TaskEvent::Revoked { timestamp, .. }
+                | TaskEvent::Rejected { timestamp, .. } => *timestamp,
             },
             Event::Worker(e) => match e {
-                WorkerEvent::Online { timestamp, .. } => *timestamp,
-                WorkerEvent::Offline { timestamp, .. } => *timestamp,
-                WorkerEvent::Heartbeat { timestamp, .. } => *timestamp,
+                WorkerEvent::Online { timestamp, .. }
+                | WorkerEvent::Offline { timestamp, .. }
+                | WorkerEvent::Heartbeat { timestamp, .. } => *timestamp,
             },
         }
     }
 
     /// Get the task ID if this is a task event
+    #[inline]
+    #[must_use]
     pub fn task_id(&self) -> Option<Uuid> {
         match self {
             Event::Task(e) => Some(match e {
-                TaskEvent::Sent { task_id, .. } => *task_id,
-                TaskEvent::Received { task_id, .. } => *task_id,
-                TaskEvent::Started { task_id, .. } => *task_id,
-                TaskEvent::Succeeded { task_id, .. } => *task_id,
-                TaskEvent::Failed { task_id, .. } => *task_id,
-                TaskEvent::Retried { task_id, .. } => *task_id,
-                TaskEvent::Revoked { task_id, .. } => *task_id,
-                TaskEvent::Rejected { task_id, .. } => *task_id,
+                TaskEvent::Sent { task_id, .. }
+                | TaskEvent::Received { task_id, .. }
+                | TaskEvent::Started { task_id, .. }
+                | TaskEvent::Succeeded { task_id, .. }
+                | TaskEvent::Failed { task_id, .. }
+                | TaskEvent::Retried { task_id, .. }
+                | TaskEvent::Revoked { task_id, .. }
+                | TaskEvent::Rejected { task_id, .. } => *task_id,
             }),
             Event::Worker(_) => None,
         }
     }
 
     /// Get the hostname if available
+    #[inline]
+    #[must_use]
     pub fn hostname(&self) -> Option<&str> {
         match self {
             Event::Task(e) => match e {
-                TaskEvent::Sent { .. } => None,
-                TaskEvent::Received { hostname, .. } => Some(hostname),
-                TaskEvent::Started { hostname, .. } => Some(hostname),
-                TaskEvent::Succeeded { hostname, .. } => Some(hostname),
-                TaskEvent::Failed { hostname, .. } => Some(hostname),
-                TaskEvent::Retried { hostname, .. } => Some(hostname),
-                TaskEvent::Revoked { .. } => None,
-                TaskEvent::Rejected { hostname, .. } => Some(hostname),
+                TaskEvent::Received { hostname, .. }
+                | TaskEvent::Started { hostname, .. }
+                | TaskEvent::Succeeded { hostname, .. }
+                | TaskEvent::Failed { hostname, .. }
+                | TaskEvent::Retried { hostname, .. }
+                | TaskEvent::Rejected { hostname, .. } => Some(hostname),
+                TaskEvent::Sent { .. } | TaskEvent::Revoked { .. } => None,
             },
             Event::Worker(e) => match e {
-                WorkerEvent::Online { hostname, .. } => Some(hostname),
-                WorkerEvent::Offline { hostname, .. } => Some(hostname),
-                WorkerEvent::Heartbeat { hostname, .. } => Some(hostname),
+                WorkerEvent::Online { hostname, .. }
+                | WorkerEvent::Offline { hostname, .. }
+                | WorkerEvent::Heartbeat { hostname, .. } => Some(hostname),
             },
         }
     }
 
     /// Check if this is a task event
-    pub fn is_task_event(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_task_event(&self) -> bool {
         matches!(self, Event::Task(_))
     }
 
     /// Check if this is a worker event
-    pub fn is_worker_event(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn is_worker_event(&self) -> bool {
         matches!(self, Event::Worker(_))
     }
 }
@@ -362,12 +373,14 @@ impl TaskEventBuilder {
     }
 
     /// Set the worker hostname
+    #[must_use]
     pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
         self.hostname = Some(hostname.into());
         self
     }
 
     /// Set the worker process ID
+    #[must_use]
     pub fn pid(mut self, pid: u32) -> Self {
         self.pid = Some(pid);
         self
@@ -389,6 +402,7 @@ impl TaskEventBuilder {
     }
 
     /// Build a task-received event
+    #[must_use]
     pub fn received(self) -> Event {
         Event::Task(TaskEvent::Received {
             task_id: self.task_id,
@@ -400,6 +414,7 @@ impl TaskEventBuilder {
     }
 
     /// Build a task-started event
+    #[must_use]
     pub fn started(self) -> Event {
         Event::Task(TaskEvent::Started {
             task_id: self.task_id,
@@ -411,6 +426,7 @@ impl TaskEventBuilder {
     }
 
     /// Build a task-succeeded event
+    #[must_use]
     pub fn succeeded(self, runtime: f64) -> Event {
         Event::Task(TaskEvent::Succeeded {
             task_id: self.task_id,
@@ -462,6 +478,7 @@ impl WorkerEventBuilder {
     }
 
     /// Build a worker-online event
+    #[must_use]
     pub fn online(self) -> Event {
         Event::Worker(WorkerEvent::Online {
             hostname: self.hostname,
@@ -473,6 +490,7 @@ impl WorkerEventBuilder {
     }
 
     /// Build a worker-offline event
+    #[must_use]
     pub fn offline(self) -> Event {
         Event::Worker(WorkerEvent::Offline {
             hostname: self.hostname,
@@ -481,6 +499,7 @@ impl WorkerEventBuilder {
     }
 
     /// Build a worker-heartbeat event
+    #[must_use]
     pub fn heartbeat(self, active: u32, processed: u64, loadavg: [f64; 3], freq: f64) -> Event {
         // Only include loadavg if non-zero (indicating it was actually measured)
         let loadavg_opt = if loadavg == [0.0, 0.0, 0.0] {
@@ -560,6 +579,7 @@ pub struct NoOpEventEmitter;
 
 impl NoOpEventEmitter {
     /// Create a new no-op event emitter
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -586,17 +606,21 @@ pub struct InMemoryEventEmitter {
 
 impl InMemoryEventEmitter {
     /// Create a new in-memory event emitter with the specified buffer capacity
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         Self { sender }
     }
 
     /// Subscribe to events
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.sender.subscribe()
     }
 
     /// Get the number of active subscribers
+    #[inline]
+    #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }
@@ -634,11 +658,13 @@ pub enum LogLevel {
 
 impl LoggingEventEmitter {
     /// Create a new logging event emitter with default (debug) level
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create a logging event emitter with specified level
+    #[must_use]
     pub fn with_level(level: LogLevel) -> Self {
         Self { level }
     }
@@ -691,6 +717,7 @@ pub struct CompositeEventEmitter {
 
 impl CompositeEventEmitter {
     /// Create a new composite emitter
+    #[must_use]
     pub fn new() -> Self {
         Self {
             emitters: Vec::new(),
@@ -698,12 +725,14 @@ impl CompositeEventEmitter {
     }
 
     /// Add an emitter to the composite
+    #[must_use]
     pub fn with_emitter<E: EventEmitter + 'static>(mut self, emitter: E) -> Self {
         self.emitters.push(Arc::new(emitter));
         self
     }
 
     /// Add an Arc-wrapped emitter
+    #[must_use]
     pub fn add_arc(mut self, emitter: Arc<dyn EventEmitter>) -> Self {
         self.emitters.push(emitter);
         self
@@ -773,6 +802,7 @@ pub enum EventFilter {
 
 impl EventFilter {
     /// Check if an event matches this filter
+    #[must_use]
     pub fn matches(&self, event: &Event) -> bool {
         match self {
             EventFilter::All => true,
@@ -894,6 +924,7 @@ pub struct EventDispatcher {
 
 impl EventDispatcher {
     /// Create a new event dispatcher
+    #[must_use]
     pub fn new() -> Self {
         Self {
             handlers: Arc::new(RwLock::new(Vec::new())),
@@ -916,6 +947,10 @@ impl EventDispatcher {
     }
 
     /// Dispatch an event to all matching handlers
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any handler fails to process the event.
     pub async fn dispatch(&self, event: Event) -> crate::Result<()> {
         let handlers = self.handlers.read().await;
 
@@ -929,6 +964,10 @@ impl EventDispatcher {
     }
 
     /// Dispatch events in batch
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any handler fails to process any event.
     pub async fn dispatch_batch(&self, events: Vec<Event>) -> crate::Result<()> {
         for event in events {
             self.dispatch(event).await?;
@@ -1006,6 +1045,10 @@ impl FileEventStorage {
     }
 
     /// Initialize the storage file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened or created.
     pub async fn init(&self) -> crate::Result<()> {
         let mut handle = self.file_handle.write().await;
         let file = tokio::fs::OpenOptions::new()
@@ -1013,7 +1056,7 @@ impl FileEventStorage {
             .append(true)
             .open(&self.path)
             .await
-            .map_err(|e| crate::CelersError::Broker(format!("Failed to open event file: {}", e)))?;
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to open event file: {e}")))?;
 
         *handle = Some(file);
         Ok(())
@@ -1025,7 +1068,7 @@ impl FileEventStorage {
 
         let file = tokio::fs::File::open(&self.path)
             .await
-            .map_err(|e| crate::CelersError::Broker(format!("Failed to open event file: {}", e)))?;
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to open event file: {e}")))?;
 
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
@@ -1034,7 +1077,7 @@ impl FileEventStorage {
         while let Some(line) = lines
             .next_line()
             .await
-            .map_err(|e| crate::CelersError::Broker(format!("Failed to read line: {}", e)))?
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to read line: {e}")))?
         {
             if let Ok(event) = serde_json::from_str::<Event>(&line) {
                 events.push(event);
@@ -1063,13 +1106,13 @@ impl EventStorage for FileEventStorage {
 
             file.write_all(json.as_bytes())
                 .await
-                .map_err(|e| crate::CelersError::Broker(format!("Failed to write event: {}", e)))?;
-            file.write_all(b"\n").await.map_err(|e| {
-                crate::CelersError::Broker(format!("Failed to write newline: {}", e))
-            })?;
+                .map_err(|e| crate::CelersError::Broker(format!("Failed to write event: {e}")))?;
+            file.write_all(b"\n")
+                .await
+                .map_err(|e| crate::CelersError::Broker(format!("Failed to write newline: {e}")))?;
             file.flush()
                 .await
-                .map_err(|e| crate::CelersError::Broker(format!("Failed to flush: {}", e)))?;
+                .map_err(|e| crate::CelersError::Broker(format!("Failed to flush: {e}")))?;
         }
 
         Ok(())
@@ -1112,6 +1155,8 @@ impl EventStorage for FileEventStorage {
     }
 
     async fn cleanup(&self, before: DateTime<Utc>) -> crate::Result<usize> {
+        use tokio::io::AsyncWriteExt;
+
         let all_events = self.read_all().await?;
         let (keep, remove): (Vec<_>, Vec<_>) = all_events
             .into_iter()
@@ -1120,11 +1165,10 @@ impl EventStorage for FileEventStorage {
         let removed_count = remove.len();
 
         // Rewrite file with only kept events
-        use tokio::io::AsyncWriteExt;
         let temp_path = self.path.with_extension("tmp");
-        let mut temp_file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
-            crate::CelersError::Broker(format!("Failed to create temp file: {}", e))
-        })?;
+        let mut temp_file = tokio::fs::File::create(&temp_path)
+            .await
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to create temp file: {e}")))?;
 
         for event in keep {
             let json = serde_json::to_string(&event)
@@ -1132,22 +1176,23 @@ impl EventStorage for FileEventStorage {
             temp_file
                 .write_all(json.as_bytes())
                 .await
-                .map_err(|e| crate::CelersError::Broker(format!("Failed to write: {}", e)))?;
-            temp_file.write_all(b"\n").await.map_err(|e| {
-                crate::CelersError::Broker(format!("Failed to write newline: {}", e))
-            })?;
+                .map_err(|e| crate::CelersError::Broker(format!("Failed to write: {e}")))?;
+            temp_file
+                .write_all(b"\n")
+                .await
+                .map_err(|e| crate::CelersError::Broker(format!("Failed to write newline: {e}")))?;
         }
 
         temp_file
             .flush()
             .await
-            .map_err(|e| crate::CelersError::Broker(format!("Failed to flush: {}", e)))?;
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to flush: {e}")))?;
         drop(temp_file);
 
         // Replace original file with temp file
         tokio::fs::rename(&temp_path, &self.path)
             .await
-            .map_err(|e| crate::CelersError::Broker(format!("Failed to rename file: {}", e)))?;
+            .map_err(|e| crate::CelersError::Broker(format!("Failed to rename file: {e}")))?;
 
         // Reinitialize file handle
         let mut handle = self.file_handle.write().await;
@@ -1168,6 +1213,7 @@ pub struct InMemoryEventStorage {
 
 impl InMemoryEventStorage {
     /// Create a new in-memory event storage
+    #[must_use]
     pub fn new(max_size: usize) -> Self {
         Self {
             events: Arc::new(RwLock::new(Vec::new())),
@@ -1261,11 +1307,16 @@ pub struct EventStream {
 
 impl EventStream {
     /// Create a new event stream with a filter
+    #[must_use]
     pub fn new(receiver: broadcast::Receiver<Event>, filter: EventFilter) -> Self {
         Self { receiver, filter }
     }
 
     /// Receive the next matching event
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receiver is closed or lagged behind.
     pub async fn recv(&mut self) -> Result<Event, broadcast::error::RecvError> {
         loop {
             let event = self.receiver.recv().await?;
@@ -1276,6 +1327,10 @@ impl EventStream {
     }
 
     /// Try to receive an event without blocking
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no event is available, the receiver is closed, or lagged behind.
     pub fn try_recv(&mut self) -> Result<Event, broadcast::error::TryRecvError> {
         loop {
             let event = self.receiver.try_recv()?;
@@ -1332,6 +1387,7 @@ impl std::fmt::Debug for AlertCondition {
 
 impl AlertCondition {
     /// Check if an event triggers this alert condition
+    #[must_use]
     pub fn check(&self, event: &Event, context: &AlertContext) -> bool {
         match self {
             AlertCondition::EventType(event_type) => event.event_type() == event_type,
@@ -1367,6 +1423,7 @@ pub struct AlertContext {
 
 impl AlertContext {
     /// Create a new alert context
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -1384,12 +1441,14 @@ impl AlertContext {
     }
 
     /// Get event rate (events per second) over a time window
+    #[allow(clippy::unused_self)]
     fn get_event_rate(&self, _window_secs: u64) -> f64 {
         // This is a synchronous approximation for rate calculation
         // In practice, you'd use the async version with proper locking
         0.0 // Placeholder - actual implementation would need async context
     }
 
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
     /// Get event rate (async version)
     pub async fn get_event_rate_async(&self, window_secs: u64) -> f64 {
         let events = self.recent_events.read().await;
@@ -1450,6 +1509,7 @@ impl Alert {
     }
 
     /// Add metadata to the alert
+    #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
@@ -1469,6 +1529,7 @@ pub struct LoggingAlertHandler;
 
 impl LoggingAlertHandler {
     /// Create a new logging alert handler
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -1541,6 +1602,7 @@ pub struct AlertManager {
 
 impl AlertManager {
     /// Create a new alert manager
+    #[must_use]
     pub fn new() -> Self {
         Self {
             handlers: Arc::new(RwLock::new(Vec::new())),
@@ -1561,6 +1623,10 @@ impl AlertManager {
     }
 
     /// Process an event and trigger alerts if conditions match
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any alert handler fails to process the alert.
     pub async fn process_event(&self, event: Event) -> crate::Result<()> {
         // Record event for rate tracking
         self.context.record_event(event.timestamp()).await;
@@ -1613,6 +1679,7 @@ pub struct EventStats {
 
 impl EventMonitor {
     /// Create a new event monitor
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

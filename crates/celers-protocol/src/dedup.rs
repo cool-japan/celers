@@ -155,11 +155,13 @@ impl DedupCache {
     }
 
     /// Get the number of entries in the cache
+    #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Check if the cache is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -212,11 +214,13 @@ impl SimpleDedupSet {
     }
 
     /// Get the number of seen IDs
+    #[inline]
     pub fn len(&self) -> usize {
         self.seen_ids.len()
     }
 
     /// Check if the set is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.seen_ids.is_empty()
     }

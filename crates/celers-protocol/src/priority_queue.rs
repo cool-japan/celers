@@ -102,16 +102,19 @@ impl MessagePriorityQueue {
     }
 
     /// Get the number of messages in the queue
+    #[inline]
     pub fn len(&self) -> usize {
         self.heap.len()
     }
 
     /// Check if the queue is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
 
     /// Check if the queue is full (if max_size is set)
+    #[inline]
     pub fn is_full(&self) -> bool {
         if let Some(max) = self.max_size {
             self.heap.len() >= max
@@ -169,6 +172,49 @@ impl FromIterator<Message> for MessagePriorityQueue {
             queue.push(message);
         }
         queue
+    }
+}
+
+impl Extend<Message> for MessagePriorityQueue {
+    fn extend<T: IntoIterator<Item = Message>>(&mut self, iter: T) {
+        for message in iter {
+            if !self.push(message) {
+                break; // Stop if queue is full
+            }
+        }
+    }
+}
+
+impl IntoIterator for MessagePriorityQueue {
+    type Item = Message;
+    type IntoIter = PriorityQueueIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        PriorityQueueIter { queue: self }
+    }
+}
+
+/// Iterator that drains messages from a priority queue in priority order
+pub struct PriorityQueueIter {
+    queue: MessagePriorityQueue,
+}
+
+impl Iterator for PriorityQueueIter {
+    type Item = Message;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.queue.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.queue.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for PriorityQueueIter {
+    fn len(&self) -> usize {
+        self.queue.len()
     }
 }
 
@@ -240,16 +286,19 @@ impl MultiLevelQueue {
     }
 
     /// Get the total number of messages across all queues
+    #[inline]
     pub fn len(&self) -> usize {
         self.total_size
     }
 
     /// Check if all queues are empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.total_size == 0
     }
 
     /// Get the number of messages at a specific priority level
+    #[inline]
     pub fn len_at_priority(&self, priority: u8) -> usize {
         if (priority as usize) < 10 {
             self.queues[priority as usize].len()
@@ -279,6 +328,59 @@ impl MultiLevelQueue {
 impl Default for MultiLevelQueue {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl FromIterator<Message> for MultiLevelQueue {
+    fn from_iter<T: IntoIterator<Item = Message>>(iter: T) -> Self {
+        let mut queue = Self::new();
+        for message in iter {
+            queue.push(message);
+        }
+        queue
+    }
+}
+
+impl Extend<Message> for MultiLevelQueue {
+    fn extend<T: IntoIterator<Item = Message>>(&mut self, iter: T) {
+        for message in iter {
+            if !self.push(message) {
+                break; // Stop if queue is full
+            }
+        }
+    }
+}
+
+impl IntoIterator for MultiLevelQueue {
+    type Item = Message;
+    type IntoIter = MultiLevelQueueIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        MultiLevelQueueIter { queue: self }
+    }
+}
+
+/// Iterator that drains messages from a multi-level queue in priority order
+pub struct MultiLevelQueueIter {
+    queue: MultiLevelQueue,
+}
+
+impl Iterator for MultiLevelQueueIter {
+    type Item = Message;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.queue.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.queue.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for MultiLevelQueueIter {
+    fn len(&self) -> usize {
+        self.queue.len()
     }
 }
 
@@ -494,6 +596,181 @@ mod tests {
         ];
 
         let queue: MessagePriorityQueue = messages.into_iter().collect();
+        assert_eq!(queue.len(), 3);
+    }
+
+    #[test]
+    fn test_priority_queue_extend() {
+        let mut queue = MessagePriorityQueue::new();
+        queue.push(create_message_with_priority("task1", 5));
+
+        let new_messages = vec![
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 1),
+        ];
+
+        queue.extend(new_messages);
+        assert_eq!(queue.len(), 3);
+
+        // Check priority order
+        assert_eq!(queue.pop().unwrap().properties.priority, Some(9));
+        assert_eq!(queue.pop().unwrap().properties.priority, Some(5));
+        assert_eq!(queue.pop().unwrap().properties.priority, Some(1));
+    }
+
+    #[test]
+    fn test_priority_queue_extend_with_capacity() {
+        let mut queue = MessagePriorityQueue::with_capacity(3);
+        queue.push(create_message_with_priority("task1", 5));
+
+        let new_messages = vec![
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 1),
+            create_message_with_priority("task4", 7), // Should not be added (over capacity)
+        ];
+
+        queue.extend(new_messages);
+        assert_eq!(queue.len(), 3);
+        assert!(queue.is_full());
+    }
+
+    #[test]
+    fn test_priority_queue_into_iterator() {
+        let messages = vec![
+            create_message_with_priority("task1", 5),
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 1),
+        ];
+
+        let queue: MessagePriorityQueue = messages.into_iter().collect();
+        let mut count = 0;
+        let mut priorities = Vec::new();
+
+        for msg in queue {
+            priorities.push(msg.properties.priority.unwrap());
+            count += 1;
+        }
+
+        assert_eq!(count, 3);
+        assert_eq!(priorities, vec![9, 5, 1]); // Should be in priority order
+    }
+
+    #[test]
+    fn test_priority_queue_iter_exact_size() {
+        let messages = vec![
+            create_message_with_priority("task1", 5),
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 1),
+        ];
+
+        let queue: MessagePriorityQueue = messages.into_iter().collect();
+        let iter = queue.into_iter();
+
+        assert_eq!(iter.len(), 3);
+
+        let collected: Vec<_> = iter.collect();
+        assert_eq!(collected.len(), 3);
+    }
+
+    #[test]
+    fn test_priority_queue_iterator_chain() {
+        let messages = vec![
+            create_message_with_priority("task1", 5),
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 1),
+            create_message_with_priority("task4", 7),
+        ];
+
+        let queue: MessagePriorityQueue = messages.into_iter().collect();
+
+        let task_names: Vec<String> = queue
+            .into_iter()
+            .map(|msg| msg.headers.task.clone())
+            .collect();
+
+        assert_eq!(task_names, vec!["task2", "task4", "task1", "task3"]);
+    }
+
+    #[test]
+    fn test_multi_level_queue_from_iterator() {
+        let messages = vec![
+            create_message_with_priority("task1", 5),
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 1),
+        ];
+
+        let queue: MultiLevelQueue = messages.into_iter().collect();
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.len_at_priority(5), 1);
+        assert_eq!(queue.len_at_priority(9), 1);
+        assert_eq!(queue.len_at_priority(1), 1);
+    }
+
+    #[test]
+    fn test_multi_level_queue_extend() {
+        let mut queue = MultiLevelQueue::new();
+        queue.push(create_message_with_priority("task1", 5));
+
+        let new_messages = vec![
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 5),
+        ];
+
+        queue.extend(new_messages);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.len_at_priority(5), 2);
+        assert_eq!(queue.len_at_priority(9), 1);
+    }
+
+    #[test]
+    fn test_multi_level_queue_into_iterator() {
+        let messages = vec![
+            create_message_with_priority("task1", 5),
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 1),
+        ];
+
+        let queue: MultiLevelQueue = messages.into_iter().collect();
+        let mut count = 0;
+        let mut priorities = Vec::new();
+
+        for msg in queue {
+            priorities.push(msg.properties.priority.unwrap());
+            count += 1;
+        }
+
+        assert_eq!(count, 3);
+        assert_eq!(priorities, vec![9, 5, 1]); // Should be in priority order
+    }
+
+    #[test]
+    fn test_multi_level_queue_iter_exact_size() {
+        let messages = vec![
+            create_message_with_priority("task1", 5),
+            create_message_with_priority("task2", 9),
+        ];
+
+        let queue: MultiLevelQueue = messages.into_iter().collect();
+        let iter = queue.into_iter();
+
+        assert_eq!(iter.len(), 2);
+
+        let collected: Vec<_> = iter.collect();
+        assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_level_queue_extend_with_capacity() {
+        let mut queue = MultiLevelQueue::with_capacity(3);
+        queue.push(create_message_with_priority("task1", 5));
+
+        let new_messages = vec![
+            create_message_with_priority("task2", 9),
+            create_message_with_priority("task3", 1),
+            create_message_with_priority("task4", 7), // Should not be added
+        ];
+
+        queue.extend(new_messages);
         assert_eq!(queue.len(), 3);
     }
 }

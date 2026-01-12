@@ -42,16 +42,19 @@ impl MessageBatch {
     }
 
     /// Get the number of messages in the batch
+    #[inline]
     pub fn len(&self) -> usize {
         self.messages.len()
     }
 
     /// Check if the batch is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
 
     /// Check if the batch is full
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.messages.len() >= self.max_size
     }
@@ -113,6 +116,76 @@ impl FromIterator<Message> for MessageBatch {
         let messages: Vec<_> = iter.into_iter().collect();
         let max_size = messages.len().max(100);
         Self { messages, max_size }
+    }
+}
+
+impl IntoIterator for MessageBatch {
+    type Item = Message;
+    type IntoIter = std::vec::IntoIter<Message>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.messages.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a MessageBatch {
+    type Item = &'a Message;
+    type IntoIter = std::slice::Iter<'a, Message>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.messages.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut MessageBatch {
+    type Item = &'a mut Message;
+    type IntoIter = std::slice::IterMut<'a, Message>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.messages.iter_mut()
+    }
+}
+
+impl std::ops::Index<usize> for MessageBatch {
+    type Output = Message;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.messages[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for MessageBatch {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.messages[index]
+    }
+}
+
+impl Extend<Message> for MessageBatch {
+    fn extend<T: IntoIterator<Item = Message>>(&mut self, iter: T) {
+        for msg in iter {
+            if !self.push(msg) {
+                break; // Stop if batch is full
+            }
+        }
+    }
+}
+
+impl AsRef<[Message]> for MessageBatch {
+    #[inline]
+    fn as_ref(&self) -> &[Message] {
+        &self.messages
+    }
+}
+
+impl AsMut<[Message]> for MessageBatch {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [Message] {
+        &mut self.messages
     }
 }
 
@@ -413,5 +486,145 @@ mod tests {
 
         assert_eq!(task_messages.len(), 2);
         assert_eq!(other_messages.len(), 1);
+    }
+
+    #[test]
+    fn test_message_batch_into_iterator() {
+        let mut batch = MessageBatch::new();
+        batch.push(create_test_message("task1"));
+        batch.push(create_test_message("task2"));
+        batch.push(create_test_message("task3"));
+
+        let mut count = 0;
+        for msg in batch {
+            assert!(!msg.headers.task.is_empty());
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_message_batch_into_iterator_ref() {
+        let mut batch = MessageBatch::new();
+        batch.push(create_test_message("task1"));
+        batch.push(create_test_message("task2"));
+
+        let mut count = 0;
+        for msg in &batch {
+            assert!(!msg.headers.task.is_empty());
+            count += 1;
+        }
+        assert_eq!(count, 2);
+        assert_eq!(batch.len(), 2); // Batch still exists
+    }
+
+    #[test]
+    fn test_message_batch_into_iterator_mut() {
+        let mut batch = MessageBatch::new();
+        batch.push(create_test_message("task1"));
+        batch.push(create_test_message("task2"));
+
+        for msg in &mut batch {
+            msg.headers.retries = Some(1);
+        }
+
+        for msg in &batch {
+            assert_eq!(msg.headers.retries, Some(1));
+        }
+    }
+
+    #[test]
+    fn test_message_batch_index() {
+        let mut batch = MessageBatch::new();
+        batch.push(create_test_message("task1"));
+        batch.push(create_test_message("task2"));
+        batch.push(create_test_message("task3"));
+
+        assert_eq!(batch[0].headers.task, "task1");
+        assert_eq!(batch[1].headers.task, "task2");
+        assert_eq!(batch[2].headers.task, "task3");
+    }
+
+    #[test]
+    fn test_message_batch_index_mut() {
+        let mut batch = MessageBatch::new();
+        batch.push(create_test_message("task1"));
+        batch.push(create_test_message("task2"));
+
+        batch[0].headers.retries = Some(5);
+        batch[1].headers.retries = Some(10);
+
+        assert_eq!(batch[0].headers.retries, Some(5));
+        assert_eq!(batch[1].headers.retries, Some(10));
+    }
+
+    #[test]
+    fn test_message_batch_extend() {
+        let mut batch = MessageBatch::with_capacity(5);
+        batch.push(create_test_message("task1"));
+
+        let new_messages = vec![create_test_message("task2"), create_test_message("task3")];
+
+        batch.extend(new_messages);
+        assert_eq!(batch.len(), 3);
+    }
+
+    #[test]
+    fn test_message_batch_extend_with_capacity_limit() {
+        let mut batch = MessageBatch::with_capacity(3);
+        batch.push(create_test_message("task1"));
+
+        let new_messages = vec![
+            create_test_message("task2"),
+            create_test_message("task3"),
+            create_test_message("task4"), // This should not be added (over capacity)
+        ];
+
+        batch.extend(new_messages);
+        assert_eq!(batch.len(), 3);
+        assert!(batch.is_full());
+    }
+
+    #[test]
+    fn test_message_batch_as_ref() {
+        let mut batch = MessageBatch::new();
+        batch.push(create_test_message("task1"));
+        batch.push(create_test_message("task2"));
+
+        let slice: &[Message] = batch.as_ref();
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice[0].headers.task, "task1");
+    }
+
+    #[test]
+    fn test_message_batch_as_mut() {
+        let mut batch = MessageBatch::new();
+        batch.push(create_test_message("task1"));
+        batch.push(create_test_message("task2"));
+
+        let slice: &mut [Message] = batch.as_mut();
+        slice[0].headers.retries = Some(99);
+
+        assert_eq!(batch[0].headers.retries, Some(99));
+    }
+
+    #[test]
+    fn test_message_batch_iterator_chain() {
+        let messages = vec![
+            create_test_message("task1"),
+            create_test_message("task2"),
+            create_test_message("task3"),
+            create_test_message("task4"),
+        ];
+
+        let batch: MessageBatch = messages.into_iter().collect();
+        assert_eq!(batch.len(), 4);
+
+        let task_names: Vec<String> = batch
+            .into_iter()
+            .map(|msg| msg.headers.task.clone())
+            .collect();
+
+        assert_eq!(task_names, vec!["task1", "task2", "task3", "task4"]);
     }
 }

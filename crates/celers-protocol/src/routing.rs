@@ -43,6 +43,7 @@ impl RoutingRule {
     }
 
     /// Check if this rule matches a task name
+    #[inline]
     pub fn matches(&self, task_name: &str) -> bool {
         if self.pattern.ends_with('*') {
             let prefix = &self.pattern[..self.pattern.len() - 1];
@@ -80,11 +81,13 @@ impl MessageRouter {
     }
 
     /// Get the queue name for a message
+    #[inline]
     pub fn get_queue(&self, message: &Message) -> &str {
         self.get_queue_for_task(&message.headers.task)
     }
 
     /// Get the queue name for a task name
+    #[inline]
     pub fn get_queue_for_task(&self, task_name: &str) -> &str {
         for rule in &self.rules {
             if rule.matches(task_name) {
@@ -95,6 +98,7 @@ impl MessageRouter {
     }
 
     /// Get the routing key for a message
+    #[inline]
     pub fn get_routing_key(&self, message: &Message) -> Option<&str> {
         for rule in &self.rules {
             if rule.matches(&message.headers.task) {
@@ -105,6 +109,7 @@ impl MessageRouter {
     }
 
     /// Get the exchange for a message
+    #[inline]
     pub fn get_exchange(&self, message: &Message) -> Option<&str> {
         for rule in &self.rules {
             if rule.matches(&message.headers.task) {
@@ -158,6 +163,7 @@ impl PriorityRouter {
     }
 
     /// Get the queue for a message based on priority
+    #[inline]
     pub fn get_queue(&self, message: &Message) -> &str {
         let priority = message.properties.priority.unwrap_or(5);
 
@@ -197,6 +203,7 @@ impl RoundRobinRouter {
     }
 
     /// Get the next queue in round-robin order
+    #[inline]
     pub fn next_queue(&self) -> &str {
         if self.queues.is_empty() {
             return "default";

@@ -218,6 +218,63 @@ impl HealthChecker {
     pub fn is_ready(&self) -> bool {
         !matches!(self.get_health().status, HealthStatus::Unhealthy)
     }
+
+    /// Get health status as JSON string
+    pub fn get_health_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.get_health())
+    }
+
+    /// Get health status as pretty JSON string
+    pub fn get_health_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.get_health())
+    }
+
+    /// Get success rate (0.0 - 1.0)
+    pub fn get_success_rate(&self) -> f64 {
+        let processed = self.tasks_processed.load(Ordering::Relaxed);
+        let failures = self.consecutive_failures.load(Ordering::Relaxed);
+
+        if processed > 0 {
+            let successes = processed.saturating_sub(failures);
+            successes as f64 / processed as f64
+        } else {
+            1.0
+        }
+    }
+
+    /// Get failure rate (0.0 - 1.0)
+    pub fn get_failure_rate(&self) -> f64 {
+        1.0 - self.get_success_rate()
+    }
+
+    /// Reset all counters (useful for testing)
+    pub fn reset(&self) {
+        self.tasks_processed.store(0, Ordering::Relaxed);
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.last_success_timestamp.store(0, Ordering::Relaxed);
+        self.is_processing.store(false, Ordering::Relaxed);
+    }
+
+    /// Get time since last success in seconds
+    pub fn time_since_last_success_seconds(&self) -> u64 {
+        let last_success = self.last_success_timestamp.load(Ordering::Relaxed);
+        if last_success == 0 {
+            return u64::MAX; // Never succeeded
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        now.saturating_sub(last_success)
+    }
+
+    /// Check if worker has been idle for more than the specified duration
+    pub fn is_idle(&self, idle_threshold_seconds: u64) -> bool {
+        !self.is_processing.load(Ordering::Relaxed)
+            && self.time_since_last_success_seconds() > idle_threshold_seconds
+    }
 }
 
 impl Default for HealthChecker {

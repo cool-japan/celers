@@ -263,16 +263,19 @@ impl Workflow {
     }
 
     /// Get the workflow name
+    #[inline]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Get the number of tasks in the workflow
+    #[inline]
     pub fn len(&self) -> usize {
         self.tasks.len()
     }
 
     /// Check if the workflow is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
@@ -380,16 +383,19 @@ impl Group {
     }
 
     /// Get the group ID
+    #[inline]
     pub fn id(&self) -> Uuid {
         self.group_id
     }
 
     /// Get the number of tasks in the group
+    #[inline]
     pub fn len(&self) -> usize {
         self.tasks.len()
     }
 
     /// Check if the group is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }

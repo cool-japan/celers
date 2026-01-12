@@ -52,6 +52,7 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     /// Check if this is a terminal state (no more transitions)
+    #[inline]
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -60,21 +61,25 @@ impl TaskStatus {
     }
 
     /// Check if this is a successful state
+    #[inline]
     pub fn is_success(&self) -> bool {
         matches!(self, TaskStatus::Success)
     }
 
     /// Check if this is a failure state
+    #[inline]
     pub fn is_failure(&self) -> bool {
         matches!(self, TaskStatus::Failure)
     }
 
     /// Check if this is a ready state (has a result)
+    #[inline]
     pub fn is_ready(&self) -> bool {
         self.is_terminal()
     }
 
     /// Get the string representation
+    #[inline]
     pub fn as_str(&self) -> &'static str {
         match self {
             TaskStatus::Pending => "PENDING",
@@ -100,8 +105,25 @@ impl Default for TaskStatus {
     }
 }
 
+impl std::str::FromStr for TaskStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "PENDING" => Ok(TaskStatus::Pending),
+            "RECEIVED" => Ok(TaskStatus::Received),
+            "STARTED" => Ok(TaskStatus::Started),
+            "SUCCESS" => Ok(TaskStatus::Success),
+            "FAILURE" => Ok(TaskStatus::Failure),
+            "RETRY" => Ok(TaskStatus::Retry),
+            "REVOKED" => Ok(TaskStatus::Revoked),
+            _ => Err(format!("Invalid task status: {}", s)),
+        }
+    }
+}
+
 /// Exception information for failed tasks
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ExceptionInfo {
     /// Exception type name
     #[serde(rename = "exc_type")]
@@ -127,6 +149,7 @@ impl ExceptionInfo {
     }
 
     /// Set the traceback
+    #[must_use]
     pub fn with_traceback(mut self, traceback: impl Into<String>) -> Self {
         self.traceback = Some(traceback.into());
         self
@@ -134,7 +157,7 @@ impl ExceptionInfo {
 }
 
 /// Task result message (Celery-compatible format)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResultMessage {
     /// Task ID
     pub task_id: Uuid,
@@ -277,69 +300,124 @@ impl ResultMessage {
     }
 
     /// Set the task name
+    #[must_use]
     pub fn with_task(mut self, task: impl Into<String>) -> Self {
         self.task = Some(task.into());
         self
     }
 
     /// Set the worker name
+    #[must_use]
     pub fn with_worker(mut self, worker: impl Into<String>) -> Self {
         self.worker = Some(worker.into());
         self
     }
 
     /// Set the parent task ID
+    #[must_use]
     pub fn with_parent(mut self, parent_id: Uuid) -> Self {
         self.parent_id = Some(parent_id);
         self
     }
 
     /// Set the root task ID
+    #[must_use]
     pub fn with_root(mut self, root_id: Uuid) -> Self {
         self.root_id = Some(root_id);
         self
     }
 
     /// Set the group ID
+    #[must_use]
     pub fn with_group(mut self, group_id: Uuid) -> Self {
         self.group_id = Some(group_id);
         self
     }
 
     /// Add a child task ID
+    #[must_use]
     pub fn with_child(mut self, child_id: Uuid) -> Self {
         self.children.push(child_id);
         self
     }
 
     /// Set children task IDs
+    #[must_use]
     pub fn with_children(mut self, children: Vec<Uuid>) -> Self {
         self.children = children;
         self
     }
 
     /// Add metadata
+    #[must_use]
     pub fn with_meta(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.meta.insert(key.into(), value);
         self
     }
 
+    /// Set retry count
+    #[must_use]
+    pub fn with_retries(mut self, retries: u32) -> Self {
+        self.retries = Some(retries);
+        self
+    }
+
+    /// Set completion timestamp
+    #[must_use]
+    pub fn with_date_done(mut self, date_done: DateTime<Utc>) -> Self {
+        self.date_done = Some(date_done);
+        self
+    }
+
+    /// Add a single metadata entry (mutable)
+    pub fn add_meta(&mut self, key: impl Into<String>, value: serde_json::Value) {
+        self.meta.insert(key.into(), value);
+    }
+
+    /// Get a metadata value by key
+    #[inline]
+    pub fn get_meta(&self, key: &str) -> Option<&serde_json::Value> {
+        self.meta.get(key)
+    }
+
+    /// Check if metadata key exists
+    #[inline]
+    pub fn has_meta(&self, key: &str) -> bool {
+        self.meta.contains_key(key)
+    }
+
+    /// Get the number of metadata entries
+    #[inline]
+    pub fn meta_len(&self) -> usize {
+        self.meta.len()
+    }
+
+    /// Get the retry count (defaults to 0 if not set)
+    #[inline]
+    pub fn retry_count(&self) -> u32 {
+        self.retries.unwrap_or(0)
+    }
+
     /// Check if the result is ready
+    #[inline]
     pub fn is_ready(&self) -> bool {
         self.status.is_ready()
     }
 
     /// Check if the task succeeded
+    #[inline]
     pub fn is_success(&self) -> bool {
         self.status.is_success()
     }
 
     /// Check if the task failed
+    #[inline]
     pub fn is_failure(&self) -> bool {
         self.status.is_failure()
     }
 
     /// Get the result value (if success)
+    #[inline]
     pub fn get_result(&self) -> Option<&serde_json::Value> {
         if self.is_success() {
             self.result.as_ref()
@@ -349,6 +427,7 @@ impl ResultMessage {
     }
 
     /// Get the exception info (if failure)
+    #[inline]
     pub fn get_exception(&self) -> Option<&ExceptionInfo> {
         if self.is_failure() {
             self.exception.as_ref()
@@ -400,6 +479,48 @@ mod tests {
     #[test]
     fn test_task_status_default() {
         assert_eq!(TaskStatus::default(), TaskStatus::Pending);
+    }
+
+    #[test]
+    fn test_task_status_from_str() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            TaskStatus::from_str("PENDING").unwrap(),
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            TaskStatus::from_str("pending").unwrap(),
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            TaskStatus::from_str("RECEIVED").unwrap(),
+            TaskStatus::Received
+        );
+        assert_eq!(
+            TaskStatus::from_str("STARTED").unwrap(),
+            TaskStatus::Started
+        );
+        assert_eq!(
+            TaskStatus::from_str("SUCCESS").unwrap(),
+            TaskStatus::Success
+        );
+        assert_eq!(
+            TaskStatus::from_str("success").unwrap(),
+            TaskStatus::Success
+        );
+        assert_eq!(
+            TaskStatus::from_str("FAILURE").unwrap(),
+            TaskStatus::Failure
+        );
+        assert_eq!(TaskStatus::from_str("RETRY").unwrap(), TaskStatus::Retry);
+        assert_eq!(
+            TaskStatus::from_str("REVOKED").unwrap(),
+            TaskStatus::Revoked
+        );
+
+        assert!(TaskStatus::from_str("INVALID").is_err());
+        assert!(TaskStatus::from_str("").is_err());
     }
 
     #[test]
@@ -547,6 +668,20 @@ mod tests {
     }
 
     #[test]
+    fn test_exception_info_default() {
+        let exc = ExceptionInfo::default();
+
+        assert_eq!(exc.exc_type, "");
+        assert_eq!(exc.exc_message, "");
+        assert_eq!(exc.traceback, None);
+
+        // Test that default can be used in builder patterns
+        let exc_builder = ExceptionInfo::default().with_traceback("some traceback");
+
+        assert_eq!(exc_builder.traceback, Some("some traceback".to_string()));
+    }
+
+    #[test]
     fn test_with_children() {
         let task_id = Uuid::new_v4();
         let children = vec![Uuid::new_v4(), Uuid::new_v4()];
@@ -554,5 +689,85 @@ mod tests {
         let result = ResultMessage::success(task_id, json!(null)).with_children(children.clone());
 
         assert_eq!(result.children, children);
+    }
+
+    #[test]
+    fn test_result_message_with_retries() {
+        let result = ResultMessage::new(Uuid::new_v4(), TaskStatus::Retry).with_retries(5);
+
+        assert_eq!(result.retries, Some(5));
+        assert_eq!(result.retry_count(), 5);
+    }
+
+    #[test]
+    fn test_result_message_retry_count_default() {
+        let result = ResultMessage::new(Uuid::new_v4(), TaskStatus::Success);
+
+        assert_eq!(result.retries, None);
+        assert_eq!(result.retry_count(), 0); // Defaults to 0
+    }
+
+    #[test]
+    fn test_result_message_with_date_done() {
+        let now = chrono::Utc::now();
+        let result = ResultMessage::new(Uuid::new_v4(), TaskStatus::Success).with_date_done(now);
+
+        assert_eq!(result.date_done, Some(now));
+    }
+
+    #[test]
+    fn test_result_message_metadata() {
+        let mut result = ResultMessage::new(Uuid::new_v4(), TaskStatus::Success);
+
+        // Test add_meta (mutable)
+        result.add_meta("key1", json!("value1"));
+        result.add_meta("key2", json!(42));
+
+        assert_eq!(result.meta_len(), 2);
+        assert!(result.has_meta("key1"));
+        assert!(result.has_meta("key2"));
+        assert!(!result.has_meta("key3"));
+
+        assert_eq!(result.get_meta("key1"), Some(&json!("value1")));
+        assert_eq!(result.get_meta("key2"), Some(&json!(42)));
+        assert_eq!(result.get_meta("key3"), None);
+    }
+
+    #[test]
+    fn test_result_message_with_meta_builder() {
+        let result = ResultMessage::new(Uuid::new_v4(), TaskStatus::Success)
+            .with_meta("version", json!("1.0.0"))
+            .with_meta("region", json!("us-west-2"));
+
+        assert_eq!(result.meta_len(), 2);
+        assert_eq!(result.get_meta("version"), Some(&json!("1.0.0")));
+        assert_eq!(result.get_meta("region"), Some(&json!("us-west-2")));
+    }
+
+    #[test]
+    fn test_result_message_builder_chaining() {
+        let task_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let root_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        let result = ResultMessage::success(task_id, json!({"data": 42}))
+            .with_task("my.task")
+            .with_worker("worker-1")
+            .with_parent(parent_id)
+            .with_root(root_id)
+            .with_retries(3)
+            .with_date_done(now)
+            .with_meta("source", json!("api"));
+
+        assert_eq!(result.task_id, task_id);
+        assert_eq!(result.status, TaskStatus::Success);
+        assert_eq!(result.task, Some("my.task".to_string()));
+        assert_eq!(result.worker, Some("worker-1".to_string()));
+        assert_eq!(result.parent_id, Some(parent_id));
+        assert_eq!(result.root_id, Some(root_id));
+        assert_eq!(result.retry_count(), 3);
+        assert_eq!(result.date_done, Some(now));
+        assert_eq!(result.get_meta("source"), Some(&json!("api")));
     }
 }

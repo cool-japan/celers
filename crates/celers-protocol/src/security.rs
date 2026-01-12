@@ -86,6 +86,7 @@ impl ContentTypeWhitelist {
     }
 
     /// Allow a content type
+    #[must_use]
     pub fn allow(mut self, content_type: impl Into<String>) -> Self {
         let ct = content_type.into();
         self.allowed.insert(ct.clone());
@@ -94,6 +95,7 @@ impl ContentTypeWhitelist {
     }
 
     /// Block a content type
+    #[must_use]
     pub fn block(mut self, content_type: impl Into<String>) -> Self {
         let ct = content_type.into();
         self.blocked.insert(ct.clone());
@@ -121,11 +123,13 @@ impl ContentTypeWhitelist {
     }
 
     /// Get all allowed content types
+    #[inline]
     pub fn allowed_types(&self) -> Vec<&str> {
         self.allowed.iter().map(|s| s.as_str()).collect()
     }
 
     /// Get all blocked content types
+    #[inline]
     pub fn blocked_types(&self) -> Vec<&str> {
         self.blocked.iter().map(|s| s.as_str()).collect()
     }

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap
+)]
 //! Rate Limiting for Task Execution
 //!
 //! This module provides rate limiting capabilities for controlling task execution rates.
@@ -49,6 +55,7 @@ impl RateLimitConfig {
     /// # Arguments
     ///
     /// * `rate` - Maximum tasks per second
+    #[must_use]
     pub fn new(rate: f64) -> Self {
         Self {
             rate,
@@ -59,12 +66,14 @@ impl RateLimitConfig {
     }
 
     /// Set the burst capacity (max tokens in bucket)
+    #[must_use]
     pub fn with_burst(mut self, burst: u32) -> Self {
         self.burst = Some(burst);
         self
     }
 
     /// Use sliding window algorithm instead of token bucket
+    #[must_use]
     pub fn with_sliding_window(mut self, window_size: u64) -> Self {
         self.sliding_window = true;
         self.window_size = window_size;
@@ -72,6 +81,8 @@ impl RateLimitConfig {
     }
 
     /// Get the effective burst capacity
+    #[must_use]
+    #[inline]
     pub fn effective_burst(&self) -> u32 {
         self.burst.unwrap_or(self.rate.ceil() as u32)
     }
@@ -135,8 +146,9 @@ pub struct TokenBucket {
 
 impl TokenBucket {
     /// Create a new token bucket rate limiter
+    #[must_use]
     pub fn new(config: RateLimitConfig) -> Self {
-        let tokens = config.effective_burst() as f64;
+        let tokens = f64::from(config.effective_burst());
         Self {
             config,
             tokens,
@@ -145,16 +157,18 @@ impl TokenBucket {
     }
 
     /// Create a token bucket with default configuration
+    #[must_use]
     pub fn with_rate(rate: f64) -> Self {
         Self::new(RateLimitConfig::new(rate))
     }
 
     /// Refill tokens based on elapsed time
+    #[inline]
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill);
         let new_tokens = elapsed.as_secs_f64() * self.config.rate;
-        let max_tokens = self.config.effective_burst() as f64;
+        let max_tokens = f64::from(self.config.effective_burst());
         self.tokens = (self.tokens + new_tokens).min(max_tokens);
         self.last_refill = now;
     }
@@ -197,7 +211,7 @@ impl RateLimiter for TokenBucket {
     }
 
     fn reset(&mut self) {
-        self.tokens = self.config.effective_burst() as f64;
+        self.tokens = f64::from(self.config.effective_burst());
         self.last_refill = Instant::now();
     }
 
@@ -223,6 +237,7 @@ pub struct SlidingWindow {
 
 impl SlidingWindow {
     /// Create a new sliding window rate limiter
+    #[must_use]
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
             config,
@@ -231,19 +246,22 @@ impl SlidingWindow {
     }
 
     /// Create a sliding window limiter with default configuration
+    #[must_use]
     pub fn with_rate(rate: f64, window_size: u64) -> Self {
         let config = RateLimitConfig::new(rate).with_sliding_window(window_size);
         Self::new(config)
     }
 
     /// Clean up old timestamps outside the window
+    #[inline]
     fn cleanup(&mut self) {
         let window = Duration::from_secs(self.config.window_size);
-        let cutoff = Instant::now() - window;
+        let cutoff = Instant::now().checked_sub(window).unwrap();
         self.timestamps.retain(|&t| t > cutoff);
     }
 
     /// Get the maximum allowed executions in the window
+    #[inline]
     fn max_executions(&self) -> usize {
         (self.config.rate * self.config.window_size as f64).ceil() as usize
     }
@@ -313,7 +331,7 @@ impl RateLimiter for SlidingWindow {
 /// rate limits per task name.
 #[derive(Debug)]
 pub struct TaskRateLimiter {
-    /// Per-task rate limiters (task_name -> limiter)
+    /// Per-task rate limiters (`task_name` -> limiter)
     limiters: HashMap<String, TokenBucket>,
     /// Default rate limit for tasks without specific configuration
     default_config: Option<RateLimitConfig>,
@@ -321,6 +339,7 @@ pub struct TaskRateLimiter {
 
 impl TaskRateLimiter {
     /// Create a new task rate limiter manager
+    #[must_use]
     pub fn new() -> Self {
         Self {
             limiters: HashMap::new(),
@@ -329,6 +348,7 @@ impl TaskRateLimiter {
     }
 
     /// Create with a default rate limit for all tasks
+    #[must_use]
     pub fn with_default(config: RateLimitConfig) -> Self {
         Self {
             limiters: HashMap::new(),
@@ -366,6 +386,7 @@ impl TaskRateLimiter {
     }
 
     /// Get time until a task can be executed
+    #[must_use]
     pub fn time_until_available(&self, task_name: &str) -> Duration {
         if let Some(limiter) = self.limiters.get(task_name) {
             limiter.time_until_available()
@@ -375,15 +396,18 @@ impl TaskRateLimiter {
     }
 
     /// Check if a task type has a rate limit configured
+    #[inline]
+    #[must_use]
     pub fn has_rate_limit(&self, task_name: &str) -> bool {
         self.limiters.contains_key(task_name) || self.default_config.is_some()
     }
 
     /// Get the rate limit configuration for a task
+    #[inline]
     pub fn get_rate_limit(&self, task_name: &str) -> Option<&RateLimitConfig> {
         self.limiters
             .get(task_name)
-            .map(|l| l.config())
+            .map(RateLimiter::config)
             .or(self.default_config.as_ref())
     }
 
@@ -411,6 +435,7 @@ pub struct WorkerRateLimiter {
 
 impl WorkerRateLimiter {
     /// Create a new worker rate limiter
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(TaskRateLimiter::new())),
@@ -418,6 +443,7 @@ impl WorkerRateLimiter {
     }
 
     /// Create with a default rate limit
+    #[must_use]
     pub fn with_default(config: RateLimitConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(TaskRateLimiter::with_default(config))),
@@ -439,6 +465,7 @@ impl WorkerRateLimiter {
     }
 
     /// Try to acquire a permit for a specific task
+    #[must_use]
     pub fn try_acquire(&self, task_name: &str) -> bool {
         if let Ok(mut guard) = self.inner.write() {
             guard.try_acquire(task_name)
@@ -449,6 +476,7 @@ impl WorkerRateLimiter {
     }
 
     /// Get time until a task can be executed
+    #[must_use]
     pub fn time_until_available(&self, task_name: &str) -> Duration {
         if let Ok(guard) = self.inner.read() {
             guard.time_until_available(task_name)
@@ -458,6 +486,8 @@ impl WorkerRateLimiter {
     }
 
     /// Check if a task type has a rate limit configured
+    #[inline]
+    #[must_use]
     pub fn has_rate_limit(&self, task_name: &str) -> bool {
         if let Ok(guard) = self.inner.read() {
             guard.has_rate_limit(task_name)
@@ -481,6 +511,7 @@ impl Default for WorkerRateLimiter {
 }
 
 /// Create a rate limiter from configuration
+#[must_use]
 pub fn create_rate_limiter(config: RateLimitConfig) -> Box<dyn RateLimiter> {
     if config.sliding_window {
         Box::new(SlidingWindow::new(config))
@@ -586,6 +617,7 @@ impl DistributedRateLimiterState {
     ///
     /// * `key` - Redis key for storing rate limit state
     /// * `config` - Rate limit configuration
+    #[must_use]
     pub fn new(key: String, config: RateLimitConfig) -> Self {
         let fallback = Arc::new(RwLock::new(TokenBucket::new(config.clone())));
         Self {
@@ -598,6 +630,8 @@ impl DistributedRateLimiterState {
     /// Get the Redis key for token count
     ///
     /// Used by backend implementations to store token count.
+    #[inline]
+    #[must_use]
     pub fn token_key(&self) -> String {
         format!("{}:tokens", self.key)
     }
@@ -605,6 +639,8 @@ impl DistributedRateLimiterState {
     /// Get the Redis key for last refill timestamp
     ///
     /// Used by backend implementations to store last refill time.
+    #[inline]
+    #[must_use]
     pub fn refill_key(&self) -> String {
         format!("{}:refill", self.key)
     }
@@ -612,6 +648,8 @@ impl DistributedRateLimiterState {
     /// Get the Redis key for sliding window
     ///
     /// Used by backend implementations to store sliding window data.
+    #[inline]
+    #[must_use]
     pub fn window_key(&self) -> String {
         format!("{}:window", self.key)
     }
@@ -689,6 +727,7 @@ impl DistributedTokenBucketSpec {
     ///
     /// This creates the specification for a distributed token bucket.
     /// Actual implementation requires a backend (e.g., Redis client).
+    #[must_use]
     pub fn new(key: String, config: RateLimitConfig) -> Self {
         Self {
             state: DistributedRateLimiterState::new(key, config),
@@ -699,8 +738,9 @@ impl DistributedTokenBucketSpec {
     ///
     /// This script should be loaded into Redis using SCRIPT LOAD
     /// and executed with EVALSHA for better performance.
+    #[must_use]
     pub fn lua_acquire_script() -> &'static str {
-        r#"
+        r"
         local tokens_key = KEYS[1]
         local refill_key = KEYS[2]
         local rate = tonumber(ARGV[1])
@@ -732,12 +772,13 @@ impl DistributedTokenBucketSpec {
             redis.call('SET', refill_key, tostring(now), 'EX', ttl)
             return {0, tokens}
         end
-        "#
+        "
     }
 
     /// Get the Lua script for querying available permits
+    #[must_use]
     pub fn lua_available_script() -> &'static str {
-        r#"
+        r"
         local tokens_key = KEYS[1]
         local refill_key = KEYS[2]
         local rate = tonumber(ARGV[1])
@@ -759,15 +800,18 @@ impl DistributedTokenBucketSpec {
         end
 
         return math.floor(tokens)
-        "#
+        "
     }
 
     /// Get the state for implementing the distributed backend
+    #[inline]
+    #[must_use]
     pub fn state(&self) -> &DistributedRateLimiterState {
         &self.state
     }
 
     /// Try to acquire using local fallback
+    #[must_use]
     pub fn try_acquire_fallback(&self) -> bool {
         self.state.try_acquire_fallback()
     }
@@ -816,6 +860,7 @@ pub struct DistributedSlidingWindowSpec {
 
 impl DistributedSlidingWindowSpec {
     /// Create a new distributed sliding window specification
+    #[must_use]
     pub fn new(key: String, config: RateLimitConfig) -> Self {
         Self {
             state: DistributedRateLimiterState::new(key, config),
@@ -823,8 +868,9 @@ impl DistributedSlidingWindowSpec {
     }
 
     /// Get the Lua script for atomic window acquisition
+    #[must_use]
     pub fn lua_acquire_script() -> &'static str {
-        r#"
+        r"
         local window_key = KEYS[1]
         local now = tonumber(ARGV[1])
         local window_size = tonumber(ARGV[2])
@@ -842,12 +888,13 @@ impl DistributedSlidingWindowSpec {
         else
             return {0, 0}
         end
-        "#
+        "
     }
 
     /// Get the Lua script for querying available permits
+    #[must_use]
     pub fn lua_available_script() -> &'static str {
-        r#"
+        r"
         local window_key = KEYS[1]
         local now = tonumber(ARGV[1])
         local window_size = tonumber(ARGV[2])
@@ -858,12 +905,13 @@ impl DistributedSlidingWindowSpec {
 
         local count = redis.call('ZCARD', window_key)
         return math.max(0, max_count - count)
-        "#
+        "
     }
 
     /// Get the Lua script for querying time until available
+    #[must_use]
     pub fn lua_time_until_script() -> &'static str {
-        r#"
+        r"
         local window_key = KEYS[1]
         local now = tonumber(ARGV[1])
         local window_size = tonumber(ARGV[2])
@@ -884,21 +932,26 @@ impl DistributedSlidingWindowSpec {
             else
                 return 0
             end
-        end
-        "#
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        "
     }
 
     /// Get the maximum number of executions allowed in the window
+    #[must_use]
+    #[inline]
     pub fn max_executions(&self) -> usize {
         (self.state.config.rate * self.state.config.window_size as f64).ceil() as usize
     }
 
     /// Get the state for implementing the distributed backend
+    #[inline]
+    #[must_use]
     pub fn state(&self) -> &DistributedRateLimiterState {
         &self.state
     }
 
     /// Try to acquire using local fallback
+    #[must_use]
     pub fn try_acquire_fallback(&self) -> bool {
         self.state.try_acquire_fallback()
     }
@@ -999,6 +1052,8 @@ impl DistributedRateLimiterCoordinator {
     }
 
     /// Get the token bucket spec for a task (if using token bucket)
+    #[inline]
+    #[must_use]
     pub fn get_token_bucket_spec(&self, task_name: &str) -> Option<DistributedTokenBucketSpec> {
         if let Ok(guard) = self.token_buckets.read() {
             guard.get(task_name).cloned()
@@ -1008,6 +1063,8 @@ impl DistributedRateLimiterCoordinator {
     }
 
     /// Get the sliding window spec for a task (if using sliding window)
+    #[inline]
+    #[must_use]
     pub fn get_sliding_window_spec(&self, task_name: &str) -> Option<DistributedSlidingWindowSpec> {
         if let Ok(guard) = self.sliding_windows.read() {
             guard.get(task_name).cloned()
@@ -1017,6 +1074,8 @@ impl DistributedRateLimiterCoordinator {
     }
 
     /// Check if a task has a distributed rate limit configured
+    #[inline]
+    #[must_use]
     pub fn has_rate_limit(&self, task_name: &str) -> bool {
         let has_bucket = if let Ok(guard) = self.token_buckets.read() {
             guard.contains_key(task_name)
@@ -1036,6 +1095,7 @@ impl DistributedRateLimiterCoordinator {
     /// Try to acquire using local fallback for a task
     ///
     /// This method is useful when the distributed backend is unavailable.
+    #[must_use]
     pub fn try_acquire_fallback(&self, task_name: &str) -> bool {
         // Try token bucket first
         if let Some(spec) = self.get_token_bucket_spec(task_name) {
@@ -1059,6 +1119,7 @@ impl DistributedRateLimiterCoordinator {
     }
 
     /// Get the Redis key for a task's rate limiter
+    #[must_use]
     pub fn redis_key(&self, task_name: &str) -> String {
         format!("{}:ratelimit:{}", self.namespace, task_name)
     }

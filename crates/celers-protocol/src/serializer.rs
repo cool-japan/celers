@@ -76,10 +76,12 @@ pub trait Serializer: Send + Sync {
 pub struct JsonSerializer;
 
 impl Serializer for JsonSerializer {
+    #[inline]
     fn content_type(&self) -> ContentType {
         ContentType::Json
     }
 
+    #[inline]
     fn content_encoding(&self) -> ContentEncoding {
         ContentEncoding::Utf8
     }
@@ -92,6 +94,7 @@ impl Serializer for JsonSerializer {
         serde_json::from_slice(bytes).map_err(|e| SerializerError::Deserialize(e.to_string()))
     }
 
+    #[inline]
     fn name(&self) -> &'static str {
         "json"
     }
@@ -104,10 +107,12 @@ pub struct MessagePackSerializer;
 
 #[cfg(feature = "msgpack")]
 impl Serializer for MessagePackSerializer {
+    #[inline]
     fn content_type(&self) -> ContentType {
         ContentType::MessagePack
     }
 
+    #[inline]
     fn content_encoding(&self) -> ContentEncoding {
         ContentEncoding::Binary
     }
@@ -120,6 +125,7 @@ impl Serializer for MessagePackSerializer {
         rmp_serde::from_slice(bytes).map_err(|e| SerializerError::Deserialize(e.to_string()))
     }
 
+    #[inline]
     fn name(&self) -> &'static str {
         "msgpack"
     }
@@ -132,10 +138,12 @@ pub struct YamlSerializer;
 
 #[cfg(feature = "yaml")]
 impl Serializer for YamlSerializer {
+    #[inline]
     fn content_type(&self) -> ContentType {
         ContentType::Custom("application/x-yaml".to_string())
     }
 
+    #[inline]
     fn content_encoding(&self) -> ContentEncoding {
         ContentEncoding::Utf8
     }
@@ -150,6 +158,7 @@ impl Serializer for YamlSerializer {
         serde_yaml::from_slice(bytes).map_err(|e| SerializerError::Deserialize(e.to_string()))
     }
 
+    #[inline]
     fn name(&self) -> &'static str {
         "yaml"
     }
@@ -162,10 +171,12 @@ pub struct BsonSerializer;
 
 #[cfg(feature = "bson-format")]
 impl Serializer for BsonSerializer {
+    #[inline]
     fn content_type(&self) -> ContentType {
         ContentType::Custom("application/bson".to_string())
     }
 
+    #[inline]
     fn content_encoding(&self) -> ContentEncoding {
         ContentEncoding::Binary
     }
@@ -178,6 +189,7 @@ impl Serializer for BsonSerializer {
         bson::from_slice(bytes).map_err(|e| SerializerError::Deserialize(e.to_string()))
     }
 
+    #[inline]
     fn name(&self) -> &'static str {
         "bson"
     }
@@ -212,23 +224,26 @@ impl ProtobufSerializer {
     }
 
     /// Get content type for Protobuf
+    #[inline]
     pub fn content_type(&self) -> ContentType {
         ContentType::Custom("application/protobuf".to_string())
     }
 
     /// Get content encoding for Protobuf
+    #[inline]
     pub fn content_encoding(&self) -> ContentEncoding {
         ContentEncoding::Binary
     }
 
     /// Get the name
+    #[inline]
     pub fn name(&self) -> &'static str {
         "protobuf"
     }
 }
 
 /// Serializer type enum for dynamic dispatch without dyn trait issues
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SerializerType {
     /// JSON serializer
     Json,
@@ -287,6 +302,7 @@ impl SerializerType {
     }
 
     /// Get the content type
+    #[inline]
     pub fn content_type(&self) -> ContentType {
         match self {
             SerializerType::Json => JsonSerializer.content_type(),
@@ -300,6 +316,7 @@ impl SerializerType {
     }
 
     /// Get the content encoding
+    #[inline]
     pub fn content_encoding(&self) -> ContentEncoding {
         match self {
             SerializerType::Json => JsonSerializer.content_encoding(),
@@ -313,6 +330,7 @@ impl SerializerType {
     }
 
     /// Get the name
+    #[inline]
     pub fn name(&self) -> &'static str {
         match self {
             SerializerType::Json => JsonSerializer.name(),
@@ -323,6 +341,26 @@ impl SerializerType {
             #[cfg(feature = "bson-format")]
             SerializerType::Bson => BsonSerializer.name(),
         }
+    }
+}
+
+impl fmt::Display for SerializerType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+impl TryFrom<&str> for SerializerType {
+    type Error = SerializerError;
+
+    fn try_from(content_type: &str) -> Result<Self, Self::Error> {
+        Self::from_content_type(content_type)
+    }
+}
+
+impl Default for SerializerType {
+    fn default() -> Self {
+        Self::Json
     }
 }
 
@@ -361,6 +399,7 @@ impl SerializerRegistry {
     }
 
     /// Get the default serializer type
+    #[inline]
     pub fn default_serializer(&self) -> SerializerType {
         self.default
     }
@@ -528,5 +567,91 @@ mod tests {
     fn test_get_serializer_bson() {
         let serializer = get_serializer("application/bson").unwrap();
         assert_eq!(serializer.name(), "bson");
+    }
+
+    #[test]
+    fn test_serializer_type_equality() {
+        let json1 = SerializerType::Json;
+        let json2 = SerializerType::Json;
+        assert_eq!(json1, json2);
+
+        #[cfg(feature = "msgpack")]
+        {
+            let msgpack = SerializerType::MessagePack;
+            assert_ne!(json1, msgpack);
+        }
+    }
+
+    #[test]
+    fn test_serializer_type_hash() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(SerializerType::Json);
+        set.insert(SerializerType::Json); // Duplicate
+
+        #[cfg(feature = "msgpack")]
+        set.insert(SerializerType::MessagePack);
+
+        #[cfg(feature = "msgpack")]
+        assert_eq!(set.len(), 2);
+
+        #[cfg(not(feature = "msgpack"))]
+        assert_eq!(set.len(), 1);
+
+        assert!(set.contains(&SerializerType::Json));
+    }
+
+    #[test]
+    fn test_serializer_type_display() {
+        assert_eq!(SerializerType::Json.to_string(), "json");
+
+        #[cfg(feature = "msgpack")]
+        assert_eq!(SerializerType::MessagePack.to_string(), "msgpack");
+
+        #[cfg(feature = "yaml")]
+        assert_eq!(SerializerType::Yaml.to_string(), "yaml");
+
+        #[cfg(feature = "bson-format")]
+        assert_eq!(SerializerType::Bson.to_string(), "bson");
+    }
+
+    #[test]
+    fn test_serializer_type_try_from() {
+        use std::convert::TryFrom;
+
+        let json = SerializerType::try_from("application/json").unwrap();
+        assert_eq!(json, SerializerType::Json);
+
+        #[cfg(feature = "msgpack")]
+        {
+            let msgpack = SerializerType::try_from("application/x-msgpack").unwrap();
+            assert_eq!(msgpack, SerializerType::MessagePack);
+        }
+
+        #[cfg(feature = "yaml")]
+        {
+            let yaml = SerializerType::try_from("application/yaml").unwrap();
+            assert_eq!(yaml, SerializerType::Yaml);
+        }
+
+        // Test error case
+        let result = SerializerType::try_from("application/unsupported");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_serializer_type_default() {
+        let default_type = SerializerType::default();
+        assert_eq!(default_type, SerializerType::Json);
+    }
+
+    #[test]
+    fn test_serializer_type_copy() {
+        let json = SerializerType::Json;
+        let json_copy = json; // Copy trait
+        let _json_original = json; // Can still use original
+
+        assert_eq!(json_copy, SerializerType::Json);
     }
 }

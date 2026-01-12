@@ -584,12 +584,16 @@ mod tests {
         let config = RetryConfig::default();
         assert!(config.validate().is_ok());
 
-        let mut config = RetryConfig::default();
-        config.jitter_fraction = 1.5;
+        let config = RetryConfig {
+            jitter_fraction: 1.5,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
-        let mut config = RetryConfig::default();
-        config.jitter_fraction = -0.1;
+        let config = RetryConfig {
+            jitter_fraction: -0.1,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 

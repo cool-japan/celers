@@ -96,11 +96,13 @@ impl MessagePipeline {
     }
 
     /// Get the number of middlewares in the pipeline
+    #[inline]
     pub fn len(&self) -> usize {
         self.middlewares.len()
     }
 
     /// Check if the pipeline is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.middlewares.is_empty()
     }

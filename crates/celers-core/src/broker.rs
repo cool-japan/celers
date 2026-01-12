@@ -12,7 +12,8 @@ pub struct BrokerMessage {
 
 impl BrokerMessage {
     /// Create a new broker message
-    pub fn new(task: SerializedTask) -> Self {
+    #[must_use]
+    pub const fn new(task: SerializedTask) -> Self {
         Self {
             task,
             receipt_handle: None,
@@ -20,7 +21,8 @@ impl BrokerMessage {
     }
 
     /// Create a new broker message with a receipt handle
-    pub fn with_receipt_handle(task: SerializedTask, receipt_handle: String) -> Self {
+    #[must_use]
+    pub const fn with_receipt_handle(task: SerializedTask, receipt_handle: String) -> Self {
         Self {
             task,
             receipt_handle: Some(receipt_handle),
@@ -29,36 +31,42 @@ impl BrokerMessage {
 
     /// Check if message has a receipt handle
     #[inline]
-    pub fn has_receipt_handle(&self) -> bool {
+    #[must_use]
+    pub const fn has_receipt_handle(&self) -> bool {
         self.receipt_handle.is_some()
     }
 
     /// Get task ID
     #[inline]
-    pub fn task_id(&self) -> crate::TaskId {
+    #[must_use]
+    pub const fn task_id(&self) -> crate::TaskId {
         self.task.metadata.id
     }
 
     /// Get task name
     #[inline]
+    #[must_use]
     pub fn task_name(&self) -> &str {
         &self.task.metadata.name
     }
 
     /// Get task priority
     #[inline]
-    pub fn priority(&self) -> i32 {
+    #[must_use]
+    pub const fn priority(&self) -> i32 {
         self.task.metadata.priority
     }
 
     /// Check if task is expired
     #[inline]
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         self.task.is_expired()
     }
 
     /// Get task age
     #[inline]
+    #[must_use]
     pub fn age(&self) -> chrono::Duration {
         self.task.age()
     }
@@ -104,7 +112,7 @@ pub trait Broker: Send + Sync {
 
     /// Enqueue multiple tasks in a single operation (batch)
     ///
-    /// Default implementation calls enqueue() for each task.
+    /// Default implementation calls `enqueue()` for each task.
     /// Brokers should override this for better performance.
     async fn enqueue_batch(&self, tasks: Vec<SerializedTask>) -> Result<Vec<TaskId>> {
         let mut task_ids = Vec::with_capacity(tasks.len());
@@ -117,7 +125,7 @@ pub trait Broker: Send + Sync {
     /// Dequeue multiple tasks in a single operation (batch)
     ///
     /// Returns up to `count` messages from the queue.
-    /// Default implementation calls dequeue() multiple times.
+    /// Default implementation calls `dequeue()` multiple times.
     /// Brokers should override this for better performance.
     async fn dequeue_batch(&self, count: usize) -> Result<Vec<BrokerMessage>> {
         let mut messages = Vec::with_capacity(count);
@@ -133,7 +141,7 @@ pub trait Broker: Send + Sync {
 
     /// Acknowledge multiple tasks in a single operation (batch)
     ///
-    /// Default implementation calls ack() for each task.
+    /// Default implementation calls `ack()` for each task.
     async fn ack_batch(&self, tasks: &[(TaskId, Option<String>)]) -> Result<()> {
         for (task_id, receipt_handle) in tasks {
             self.ack(task_id, receipt_handle.as_deref()).await?;
@@ -145,7 +153,7 @@ pub trait Broker: Send + Sync {
 
     /// Schedule a task for execution at a specific Unix timestamp (seconds)
     ///
-    /// Default implementation executes the task immediately via enqueue().
+    /// Default implementation executes the task immediately via `enqueue()`.
     /// Brokers with scheduling support should override this.
     async fn enqueue_at(&self, task: SerializedTask, _execute_at: i64) -> Result<TaskId> {
         // Default: execute immediately
@@ -154,7 +162,7 @@ pub trait Broker: Send + Sync {
 
     /// Schedule a task for execution after a delay (seconds)
     ///
-    /// Default implementation executes the task immediately via enqueue().
+    /// Default implementation executes the task immediately via `enqueue()`.
     /// Brokers with scheduling support should override this.
     async fn enqueue_after(&self, task: SerializedTask, _delay_secs: u64) -> Result<TaskId> {
         // Default: execute immediately
@@ -162,9 +170,9 @@ pub trait Broker: Send + Sync {
     }
 }
 
-/// Batch utilities for BrokerMessage collections
+/// Batch utilities for `BrokerMessage` collections
 pub mod broker_batch {
-    use super::*;
+    use super::{BrokerMessage, TaskId};
     use std::collections::HashMap;
 
     /// Sort messages by priority (highest first)
@@ -183,6 +191,7 @@ pub mod broker_batch {
     /// assert_eq!(messages[0].priority(), 10);
     /// assert_eq!(messages[2].priority(), 1);
     /// ```
+    #[inline]
     pub fn sort_by_priority(messages: &mut [BrokerMessage]) {
         messages.sort_by_key(|b| std::cmp::Reverse(b.priority()));
     }
@@ -203,6 +212,8 @@ pub mod broker_batch {
     /// assert_eq!(grouped.get("task1").unwrap().len(), 2);
     /// assert_eq!(grouped.get("task2").unwrap().len(), 1);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn group_by_task_name(messages: &[BrokerMessage]) -> HashMap<String, Vec<&BrokerMessage>> {
         let mut map: HashMap<String, Vec<&BrokerMessage>> = HashMap::new();
         for msg in messages {
@@ -228,6 +239,8 @@ pub mod broker_batch {
     /// let process_messages = broker_batch::filter_by_name_prefix(&messages, "process");
     /// assert_eq!(process_messages.len(), 2);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn filter_by_name_prefix<'a>(
         messages: &'a [BrokerMessage],
         prefix: &str,
@@ -252,6 +265,8 @@ pub mod broker_batch {
     /// let total_size = broker_batch::total_payload_size(&messages);
     /// assert_eq!(total_size, 5);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn total_payload_size(messages: &[BrokerMessage]) -> usize {
         messages.iter().map(|msg| msg.task.payload.len()).sum()
     }
@@ -271,6 +286,8 @@ pub mod broker_batch {
     /// // Newly created tasks should not be expired
     /// assert_eq!(expired.len(), 0);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn filter_expired(messages: &[BrokerMessage]) -> Vec<&BrokerMessage> {
         messages.iter().filter(|msg| msg.is_expired()).collect()
     }
@@ -295,6 +312,8 @@ pub mod broker_batch {
     /// let ack_data = broker_batch::prepare_ack_batch(&messages);
     /// assert_eq!(ack_data.len(), 2);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn prepare_ack_batch(messages: &[BrokerMessage]) -> Vec<(TaskId, Option<String>)> {
         messages
             .iter()
@@ -369,7 +388,7 @@ mod tests {
         let task = create_test_task();
         let msg = BrokerMessage::new(task);
 
-        let display = format!("{}", msg);
+        let display = format!("{msg}");
         assert!(display.contains("BrokerMessage"));
         assert!(display.contains("task="));
     }
@@ -380,7 +399,7 @@ mod tests {
         let receipt = "very-long-receipt-handle-12345678901234567890".to_string();
         let msg = BrokerMessage::with_receipt_handle(task, receipt);
 
-        let display = format!("{}", msg);
+        let display = format!("{msg}");
         assert!(display.contains("BrokerMessage"));
         assert!(display.contains("receipt="));
         // Should truncate to 8 characters

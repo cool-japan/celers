@@ -32,3 +32,15 @@ backend-redis = ["celers-backend-redis", "chrono"]
 
 [dev-dependencies]
 tokio = { version = "1.42", features = ["full"] }
+
+[[bench]]
+name = "workflow_benchmarks"
+harness = false
+
+[[bench]]
+name = "memory_benchmarks"
+harness = false
+
+[[bench]]
+name = "advanced_benchmarks"
+harness = false

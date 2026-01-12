@@ -304,6 +304,237 @@ impl Clone for RateLimiter {
     }
 }
 
+/// Sliding window rate limiter configuration
+#[derive(Debug, Clone, Copy)]
+pub struct SlidingWindowConfig {
+    /// Maximum requests allowed in the time window
+    pub max_requests: usize,
+    /// Time window duration
+    pub window_duration: Duration,
+}
+
+impl SlidingWindowConfig {
+    /// Create a new sliding window configuration
+    pub fn new(max_requests: usize, window_duration: Duration) -> Self {
+        Self {
+            max_requests,
+            window_duration,
+        }
+    }
+
+    /// Validate configuration
+    pub fn is_valid(&self) -> bool {
+        self.max_requests > 0 && !self.window_duration.is_zero()
+    }
+
+    /// Strict: 10 requests per minute
+    pub fn strict() -> Self {
+        Self {
+            max_requests: 10,
+            window_duration: Duration::from_secs(60),
+        }
+    }
+
+    /// Moderate: 100 requests per minute
+    pub fn moderate() -> Self {
+        Self {
+            max_requests: 100,
+            window_duration: Duration::from_secs(60),
+        }
+    }
+
+    /// Lenient: 1000 requests per minute
+    pub fn lenient() -> Self {
+        Self {
+            max_requests: 1000,
+            window_duration: Duration::from_secs(60),
+        }
+    }
+}
+
+impl Default for SlidingWindowConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: 100,
+            window_duration: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Sliding window for tracking requests
+#[derive(Debug)]
+struct SlidingWindow {
+    /// Request timestamps
+    requests: Vec<Instant>,
+    /// Maximum requests allowed
+    max_requests: usize,
+    /// Window duration
+    window_duration: Duration,
+}
+
+impl SlidingWindow {
+    fn new(config: SlidingWindowConfig) -> Self {
+        Self {
+            requests: Vec::with_capacity(config.max_requests),
+            max_requests: config.max_requests,
+            window_duration: config.window_duration,
+        }
+    }
+
+    /// Remove expired requests outside the current window
+    fn cleanup(&mut self) {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(self.window_duration).unwrap_or(now);
+        self.requests.retain(|&timestamp| timestamp > cutoff);
+    }
+
+    /// Try to record a new request
+    ///
+    /// Returns true if request is allowed, false if rate limited
+    fn try_record(&mut self) -> bool {
+        self.cleanup();
+
+        if self.requests.len() < self.max_requests {
+            self.requests.push(Instant::now());
+            debug!(
+                "Request allowed: {}/{} in window",
+                self.requests.len(),
+                self.max_requests
+            );
+            true
+        } else {
+            debug!(
+                "Rate limit exceeded: {}/{} requests in window",
+                self.requests.len(),
+                self.max_requests
+            );
+            false
+        }
+    }
+
+    /// Get current request count in the window
+    fn current_count(&mut self) -> usize {
+        self.cleanup();
+        self.requests.len()
+    }
+
+    /// Get time until the oldest request expires
+    fn time_until_available(&mut self) -> Duration {
+        self.cleanup();
+
+        if self.requests.len() < self.max_requests {
+            Duration::ZERO
+        } else if let Some(&oldest) = self.requests.first() {
+            let now = Instant::now();
+            let expiry = oldest + self.window_duration;
+            expiry.saturating_duration_since(now)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Reset the window
+    fn reset(&mut self) {
+        self.requests.clear();
+    }
+}
+
+/// Sliding window rate limiter for more accurate rate limiting
+pub struct SlidingWindowLimiter {
+    windows: Arc<RwLock<HashMap<String, SlidingWindow>>>,
+}
+
+impl SlidingWindowLimiter {
+    /// Create a new sliding window rate limiter
+    pub fn new() -> Self {
+        Self {
+            windows: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Set rate limit for a task type
+    pub async fn set_limit(&self, task_name: impl Into<String>, config: SlidingWindowConfig) {
+        if !config.is_valid() {
+            warn!("Invalid sliding window config: {:?}", config);
+            return;
+        }
+
+        let task_name = task_name.into();
+        let mut windows = self.windows.write().await;
+        windows.insert(task_name.clone(), SlidingWindow::new(config));
+        debug!("Set sliding window limit for '{}': {:?}", task_name, config);
+    }
+
+    /// Remove rate limit for a task type
+    pub async fn remove_limit(&self, task_name: &str) {
+        let mut windows = self.windows.write().await;
+        windows.remove(task_name);
+        debug!("Removed sliding window limit for '{}'", task_name);
+    }
+
+    /// Try to record a request
+    ///
+    /// Returns true if request is allowed, false if rate limited
+    pub async fn try_acquire(&self, task_name: &str) -> bool {
+        let mut windows = self.windows.write().await;
+
+        if let Some(window) = windows.get_mut(task_name) {
+            window.try_record()
+        } else {
+            // No rate limit configured, allow execution
+            true
+        }
+    }
+
+    /// Get current request count in the window
+    pub async fn current_count(&self, task_name: &str) -> Option<usize> {
+        let mut windows = self.windows.write().await;
+        windows.get_mut(task_name).map(|w| w.current_count())
+    }
+
+    /// Get time until next request is available
+    pub async fn time_until_available(&self, task_name: &str) -> Option<Duration> {
+        let mut windows = self.windows.write().await;
+        windows.get_mut(task_name).map(|w| w.time_until_available())
+    }
+
+    /// Reset the window for a task type
+    pub async fn reset(&self, task_name: &str) {
+        let mut windows = self.windows.write().await;
+        if let Some(window) = windows.get_mut(task_name) {
+            window.reset();
+            debug!("Reset sliding window for '{}'", task_name);
+        }
+    }
+
+    /// Check if a task type has rate limiting configured
+    pub async fn has_limit(&self, task_name: &str) -> bool {
+        let windows = self.windows.read().await;
+        windows.contains_key(task_name)
+    }
+
+    /// Clear all rate limits
+    pub async fn clear_all(&self) {
+        let mut windows = self.windows.write().await;
+        windows.clear();
+        debug!("Cleared all sliding window limits");
+    }
+}
+
+impl Default for SlidingWindowLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for SlidingWindowLimiter {
+    fn clone(&self) -> Self {
+        Self {
+            windows: Arc::clone(&self.windows),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +692,136 @@ mod tests {
         limiter.try_acquire("test_task", 5.0).await;
 
         // Should need time for refill
+        let wait_time = limiter.time_until_available("test_task").await;
+        assert!(wait_time.is_some());
+        assert!(wait_time.unwrap() > Duration::ZERO);
+    }
+
+    // Sliding window tests
+    #[tokio::test]
+    async fn test_sliding_window_config() {
+        let config = SlidingWindowConfig::new(100, Duration::from_secs(60));
+        assert_eq!(config.max_requests, 100);
+        assert_eq!(config.window_duration, Duration::from_secs(60));
+        assert!(config.is_valid());
+
+        let invalid = SlidingWindowConfig::new(0, Duration::from_secs(60));
+        assert!(!invalid.is_valid());
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_basic() {
+        let limiter = SlidingWindowLimiter::new();
+        let config = SlidingWindowConfig::new(5, Duration::from_secs(1));
+        limiter.set_limit("test_task", config).await;
+
+        // Should succeed for first 5 requests
+        for _ in 0..5 {
+            assert!(limiter.try_acquire("test_task").await);
+        }
+
+        // 6th request should fail
+        assert!(!limiter.try_acquire("test_task").await);
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_expiry() {
+        let limiter = SlidingWindowLimiter::new();
+        let config = SlidingWindowConfig::new(3, Duration::from_millis(100));
+        limiter.set_limit("test_task", config).await;
+
+        // Use up all 3 requests
+        for _ in 0..3 {
+            assert!(limiter.try_acquire("test_task").await);
+        }
+        assert!(!limiter.try_acquire("test_task").await);
+
+        // Wait for window to expire
+        sleep(Duration::from_millis(150)).await;
+
+        // Should succeed again
+        assert!(limiter.try_acquire("test_task").await);
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_current_count() {
+        let limiter = SlidingWindowLimiter::new();
+        let config = SlidingWindowConfig::new(10, Duration::from_secs(1));
+        limiter.set_limit("test_task", config).await;
+
+        assert_eq!(limiter.current_count("test_task").await, Some(0));
+
+        limiter.try_acquire("test_task").await;
+        limiter.try_acquire("test_task").await;
+
+        assert_eq!(limiter.current_count("test_task").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_reset() {
+        let limiter = SlidingWindowLimiter::new();
+        let config = SlidingWindowConfig::new(5, Duration::from_secs(10));
+        limiter.set_limit("test_task", config).await;
+
+        // Use up all requests
+        for _ in 0..5 {
+            limiter.try_acquire("test_task").await;
+        }
+        assert_eq!(limiter.current_count("test_task").await, Some(5));
+
+        // Reset window
+        limiter.reset("test_task").await;
+        assert_eq!(limiter.current_count("test_task").await, Some(0));
+
+        // Should be able to make requests again
+        assert!(limiter.try_acquire("test_task").await);
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_multiple_tasks() {
+        let limiter = SlidingWindowLimiter::new();
+        limiter
+            .set_limit("task1", SlidingWindowConfig::new(2, Duration::from_secs(1)))
+            .await;
+        limiter
+            .set_limit("task2", SlidingWindowConfig::new(3, Duration::from_secs(1)))
+            .await;
+
+        // task1 should allow 2 requests
+        assert!(limiter.try_acquire("task1").await);
+        assert!(limiter.try_acquire("task1").await);
+        assert!(!limiter.try_acquire("task1").await);
+
+        // task2 should allow 3 requests
+        assert!(limiter.try_acquire("task2").await);
+        assert!(limiter.try_acquire("task2").await);
+        assert!(limiter.try_acquire("task2").await);
+        assert!(!limiter.try_acquire("task2").await);
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_remove_limit() {
+        let limiter = SlidingWindowLimiter::new();
+        limiter
+            .set_limit("test_task", SlidingWindowConfig::default())
+            .await;
+
+        assert!(limiter.has_limit("test_task").await);
+        limiter.remove_limit("test_task").await;
+        assert!(!limiter.has_limit("test_task").await);
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_time_until_available() {
+        let limiter = SlidingWindowLimiter::new();
+        let config = SlidingWindowConfig::new(2, Duration::from_millis(100));
+        limiter.set_limit("test_task", config).await;
+
+        // Use up all requests
+        limiter.try_acquire("test_task").await;
+        limiter.try_acquire("test_task").await;
+
+        // Should need to wait
         let wait_time = limiter.time_until_available("test_task").await;
         assert!(wait_time.is_some());
         assert!(wait_time.unwrap() > Duration::ZERO);

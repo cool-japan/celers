@@ -36,6 +36,8 @@ This broker provides production-ready, durable task queue functionality using Po
 - ✅ **Queue Statistics**: Get comprehensive queue metrics
 - ✅ **Health Checks**: Database and connection pool health monitoring
 - ✅ **Database Monitoring**: Table sizes, index usage, and performance stats
+- ✅ **Production Monitoring Utilities**: Consumer lag analysis, message velocity, worker scaling recommendations
+- ✅ **Performance Optimization Utilities**: Batch size calculation, pool sizing, query optimization, autovacuum tuning
 
 ### Storage & Maintenance
 - ✅ **Result Backend**: Store and retrieve task execution results
@@ -250,6 +252,66 @@ if !unused.is_empty() {
     println!("Warning: {} unused indexes found", unused.len());
 }
 ```
+
+### Production Monitoring & Performance Utilities
+
+The broker includes comprehensive monitoring and optimization utilities:
+
+```rust
+use celers_broker_postgres::{monitoring, utilities};
+
+// Analyze consumer lag and get autoscaling recommendations
+let lag_analysis = monitoring::analyze_postgres_consumer_lag(
+    1000,  // pending tasks
+    50,    // processing tasks
+    100.0, // tasks per hour
+).await;
+println!("Recommendation: {:?}", lag_analysis.recommendation);
+
+// Calculate message velocity and queue growth trends
+let velocity = monitoring::calculate_postgres_message_velocity(
+    100.0,  // enqueue rate (tasks/sec)
+    80.0,   // processing rate (tasks/sec)
+    1000,   // current queue depth
+).await;
+
+// Get worker scaling suggestions
+let scaling = monitoring::suggest_postgres_worker_scaling(
+    1000,  // pending tasks
+    10,    // current workers
+    5.0,   // avg processing time (sec)
+    100.0, // target throughput (tasks/sec)
+).await;
+
+// Calculate optimal batch size for your workload
+let batch_config = utilities::calculate_optimal_postgres_batch_size(
+    1000,  // queue depth
+    10.0,  // avg task size KB
+    100.0, // target throughput tasks/sec
+).await;
+
+// Get optimal connection pool size recommendations
+let pool_config = utilities::calculate_optimal_postgres_pool_size(
+    10,    // concurrent workers
+    5,     // avg queries per task
+    0.05,  // avg query duration (sec)
+).await;
+
+// Get PostgreSQL configuration recommendations
+let vacuum_strategy = utilities::suggest_postgres_vacuum_strategy(
+    1000000,  // table rows
+    100000,   // daily inserts
+    50000,    // daily deletes
+).await;
+
+let index_strategy = utilities::suggest_postgres_index_strategy(
+    1000,  // pending tasks
+    500,   // processing tasks
+    80.0,  // tasks per hour
+).await;
+```
+
+See the `monitoring` and `utilities` modules for complete documentation and the `examples/monitoring_performance.rs` example for production usage patterns.
 
 ### Prometheus Metrics
 
@@ -529,6 +591,20 @@ cargo test --all-features -- --ignored
 ## License
 
 See workspace LICENSE file.
+
+## Examples
+
+See the `examples/` directory for comprehensive usage examples:
+
+- **`basic_usage.rs`**: Getting started guide with core operations
+- **`monitoring_performance.rs`**: Production monitoring and optimization utilities
+- **`README.md`**: Detailed examples documentation with setup instructions
+
+Run examples with:
+```bash
+cargo run --example basic_usage
+cargo run --example monitoring_performance
+```
 
 ## See Also
 

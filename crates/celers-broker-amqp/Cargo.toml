@@ -16,6 +16,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.11", features = ["v4"] }
 tracing = "0.1"
+rand = "0.8"
+flate2 = "1.0"
+zstd = "0.13"
 
 # AMQP client
 lapin = "2.5"

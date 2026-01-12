@@ -30,3 +30,7 @@ proptest = "1.4"
 [[bench]]
 name = "task_bench"
 harness = false
+
+[[bench]]
+name = "advanced_bench"
+harness = false

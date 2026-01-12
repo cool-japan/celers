@@ -1,4 +1,41 @@
-//! CLI command implementations
+//! CLI command implementations for `CeleRS` distributed task queue management.
+//!
+//! This module provides all the command implementations for the `CeleRS` CLI tool.
+//! Commands are organized into the following categories:
+//!
+//! - **Worker Management**: Starting, stopping, pausing, scaling workers
+//! - **Queue Operations**: Listing, purging, moving, importing/exporting queues
+//! - **Task Management**: Inspecting, canceling, retrying, and monitoring tasks
+//! - **DLQ Operations**: Managing failed tasks in the Dead Letter Queue
+//! - **Scheduling**: Managing scheduled/periodic tasks with cron expressions
+//! - **Monitoring**: Metrics, dashboard, health checks, and diagnostics
+//! - **Database**: Connection testing, health checks, migrations
+//! - **Configuration**: Validation, initialization, and profile management
+//!
+//! # Error Handling
+//!
+//! All functions return `anyhow::Result<()>` for consistent error handling.
+//! Errors are user-friendly and provide actionable feedback.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use celers_cli::commands;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // Start a worker
+//!     commands::start_worker(
+//!         "redis://localhost:6379",
+//!         "my_queue",
+//!         "fifo",
+//!         4,
+//!         3,
+//!         300
+//!     ).await?;
+//!     Ok(())
+//! }
+//! ```
 
 use celers_broker_redis::{QueueMode, RedisBroker};
 use celers_core::Broker;
@@ -7,7 +44,42 @@ use chrono::Utc;
 use colored::Colorize;
 use tabled::{settings::Style, Table, Tabled};
 
-/// Start a worker with the given configuration
+/// Start a worker with the given configuration.
+///
+/// Creates and runs a worker that processes tasks from the specified queue.
+/// The worker will run until it receives a shutdown signal (Ctrl+C).
+///
+/// # Arguments
+///
+/// * `broker_url` - Redis connection URL (e.g., `redis://localhost:6379`)
+/// * `queue` - Queue name to process tasks from
+/// * `mode` - Queue mode: "fifo" for FIFO, "priority" for priority-based
+/// * `concurrency` - Maximum number of concurrent tasks to process
+/// * `max_retries` - Maximum retry attempts for failed tasks
+/// * `timeout` - Task execution timeout in seconds
+///
+/// # Returns
+///
+/// Returns `Ok(())` on successful shutdown, or an error if worker fails to start.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use celers_cli::commands::start_worker;
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// // Start a FIFO worker with 4 concurrent tasks
+/// start_worker(
+///     "redis://localhost:6379",
+///     "my_queue",
+///     "fifo",
+///     4,
+///     3,
+///     300
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn start_worker(
     broker_url: &str,
     queue: &str,
@@ -59,7 +131,7 @@ pub async fn start_worker(
     // Set up signal handler
     let worker_task = tokio::spawn(async move {
         if let Err(e) = worker.run().await {
-            eprintln!("Worker error: {}", e);
+            eprintln!("Worker error: {e}");
         }
     });
 
@@ -75,7 +147,30 @@ pub async fn start_worker(
     Ok(())
 }
 
-/// Display queue status
+/// Display queue status and statistics.
+///
+/// Shows current queue metrics including pending tasks, DLQ size, and health warnings.
+/// Uses a formatted table for clear visualization of queue state.
+///
+/// # Arguments
+///
+/// * `broker_url` - Redis connection URL
+/// * `queue` - Queue name to check status for
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success, or an error if connection fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use celers_cli::commands::show_status;
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// show_status("redis://localhost:6379", "my_queue").await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn show_status(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     let broker = RedisBroker::new(broker_url, queue)?;
 
@@ -113,26 +208,48 @@ pub async fn show_status(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     ];
 
     let table = Table::new(stats).with(Style::rounded()).to_string();
-    println!("{}", table);
+    println!("{table}");
 
     if dlq_size > 0 {
         println!();
         println!(
             "{}",
-            format!("⚠️  {} tasks in Dead Letter Queue", dlq_size)
+            format!("⚠️  {dlq_size} tasks in Dead Letter Queue")
                 .yellow()
                 .bold()
         );
-        println!(
-            "   Run: celers dlq inspect --broker {} --queue {}",
-            broker_url, queue
-        );
+        println!("   Run: celers dlq inspect --broker {broker_url} --queue {queue}");
     }
 
     Ok(())
 }
 
-/// Inspect Dead Letter Queue
+/// Inspect failed tasks in the Dead Letter Queue (DLQ).
+///
+/// Displays a list of failed tasks with their IDs, task names, and failure metadata.
+/// Useful for debugging and understanding why tasks are failing.
+///
+/// # Arguments
+///
+/// * `broker_url` - Redis connection URL
+/// * `queue` - Queue name
+/// * `limit` - Maximum number of tasks to display (default: 10)
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success, or an error if connection fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use celers_cli::commands::inspect_dlq;
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// // Show last 20 failed tasks
+/// inspect_dlq("redis://localhost:6379", "my_queue", 20).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn inspect_dlq(broker_url: &str, queue: &str, limit: usize) -> anyhow::Result<()> {
     let broker = RedisBroker::new(broker_url, queue)?;
 
@@ -183,7 +300,7 @@ pub async fn clear_dlq(broker_url: &str, queue: &str, confirm: bool) -> anyhow::
     if !confirm {
         println!(
             "{}",
-            format!("⚠️  This will delete {} tasks from DLQ", dlq_size)
+            format!("⚠️  This will delete {dlq_size} tasks from DLQ")
                 .yellow()
                 .bold()
         );
@@ -192,7 +309,7 @@ pub async fn clear_dlq(broker_url: &str, queue: &str, confirm: bool) -> anyhow::
     }
 
     let count = broker.clear_dlq().await?;
-    println!("{}", format!("✓ Cleared {} tasks from DLQ", count).green());
+    println!("{}", format!("✓ Cleared {count} tasks from DLQ").green());
 
     Ok(())
 }
@@ -220,7 +337,34 @@ pub async fn replay_task(broker_url: &str, queue: &str, task_id_str: &str) -> an
     Ok(())
 }
 
-/// Generate a default configuration file
+/// Generate a default configuration file with template settings.
+///
+/// Creates a TOML configuration file with commented examples for all settings.
+/// The generated file can be customized for different environments.
+///
+/// # Arguments
+///
+/// * `path` - Output file path (default: "celers.toml")
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success, or an error if file creation fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use celers_cli::commands::init_config;
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// // Create default config
+/// init_config("celers.toml").await?;
+///
+/// // Create production config
+/// init_config("celers-prod.toml").await?;
+/// # Ok(())
+/// # }
+/// ```
+#[allow(clippy::unused_async)]
 pub async fn init_config(path: &str) -> anyhow::Result<()> {
     let config = crate::config::Config::default_config();
 
@@ -230,7 +374,7 @@ pub async fn init_config(path: &str) -> anyhow::Result<()> {
     println!("  Location: {}", path.cyan());
     println!();
     println!("Edit the file and run:");
-    println!("  celers worker --config {}", path);
+    println!("  celers worker --config {path}");
 
     Ok(())
 }
@@ -310,7 +454,7 @@ pub async fn list_queues(broker_url: &str) -> anyhow::Result<()> {
     }
 
     let table = Table::new(queue_infos).with(Style::rounded()).to_string();
-    println!("{}", table);
+    println!("{table}");
 
     Ok(())
 }
@@ -329,12 +473,9 @@ pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow
     if !confirm {
         println!(
             "{}",
-            format!(
-                "⚠️  This will delete {} tasks from queue '{}'",
-                queue_size, queue
-            )
-            .yellow()
-            .bold()
+            format!("⚠️  This will delete {queue_size} tasks from queue '{queue}'")
+                .yellow()
+                .bold()
         );
         println!("   Add --confirm to proceed");
         return Ok(());
@@ -344,7 +485,7 @@ pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let queue_key = format!("celers:{}", queue);
+    let queue_key = format!("celers:{queue}");
     redis::cmd("DEL")
         .arg(&queue_key)
         .query_async::<()>(&mut conn)
@@ -352,7 +493,7 @@ pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow
 
     println!(
         "{}",
-        format!("✓ Purged {} tasks from queue '{}'", queue_size, queue).green()
+        format!("✓ Purged {queue_size} tasks from queue '{queue}'").green()
     );
 
     Ok(())
@@ -373,7 +514,7 @@ pub async fn inspect_task(broker_url: &str, queue: &str, task_id_str: &str) -> a
     let mut conn = client.get_multiplexed_async_connection().await?;
 
     // Search in main queue
-    let queue_key = format!("celers:{}", queue);
+    let queue_key = format!("celers:{queue}");
     let queue_type: String = redis::cmd("TYPE")
         .arg(&queue_key)
         .query_async(&mut conn)
@@ -420,7 +561,7 @@ pub async fn inspect_task(broker_url: &str, queue: &str, task_id_str: &str) -> a
 
     // Try DLQ if not found
     if !found {
-        let dlq_key = format!("celers:{}:dlq", queue);
+        let dlq_key = format!("celers:{queue}:dlq");
         let dlq_tasks: Vec<String> = redis::cmd("LRANGE")
             .arg(&dlq_key)
             .arg(0)
@@ -441,7 +582,7 @@ pub async fn inspect_task(broker_url: &str, queue: &str, task_id_str: &str) -> a
 
     // Try delayed queue if not found
     if !found {
-        let delayed_key = format!("celers:{}:delayed", queue);
+        let delayed_key = format!("celers:{queue}:delayed");
         let delayed_tasks: Vec<String> = redis::cmd("ZRANGE")
             .arg(&delayed_key)
             .arg(0)
@@ -474,7 +615,7 @@ pub async fn inspect_task(broker_url: &str, queue: &str, task_id_str: &str) -> a
 
 /// Helper to print task details
 fn print_task_details(task: &celers_core::SerializedTask, location: &str) {
-    println!("{}", format!("Location: {}", location).green().bold());
+    println!("{}", format!("Location: {location}").green().bold());
     println!();
 
     #[derive(Tabled)]
@@ -511,8 +652,7 @@ fn print_task_details(task: &celers_core::SerializedTask, location: &str) {
             value: task
                 .metadata
                 .timeout_secs
-                .map(|s| format!("{}s", s))
-                .unwrap_or_else(|| "default".to_string()),
+                .map_or_else(|| "default".to_string(), |s| format!("{s}s")),
         },
         TaskDetail {
             field: "Created At".to_string(),
@@ -525,7 +665,7 @@ fn print_task_details(task: &celers_core::SerializedTask, location: &str) {
     ];
 
     let table = Table::new(details).with(Style::rounded()).to_string();
-    println!("{}", table);
+    println!("{table}");
 }
 
 /// Cancel a running or pending task
@@ -599,7 +739,7 @@ pub async fn retry_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
     let mut source_queue: Option<String> = None;
 
     // Search for task in main queue
-    let queue_key = format!("celers:{}", queue);
+    let queue_key = format!("celers:{queue}");
     let queue_type: String = redis::cmd("TYPE")
         .arg(&queue_key)
         .query_async(&mut conn)
@@ -614,7 +754,7 @@ pub async fn retry_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
             .query_async(&mut conn)
             .await?;
 
-        for task_str in tasks.iter() {
+        for task_str in &tasks {
             if let Ok(t) = serde_json::from_str::<celers_core::SerializedTask>(task_str) {
                 if t.metadata.id == task_id {
                     task = Some(t);
@@ -657,7 +797,7 @@ pub async fn retry_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
 
     // Try DLQ if not found
     if task.is_none() {
-        let dlq_key = format!("celers:{}:dlq", queue);
+        let dlq_key = format!("celers:{queue}:dlq");
         let dlq_tasks: Vec<String> = redis::cmd("LRANGE")
             .arg(&dlq_key)
             .arg(0)
@@ -685,7 +825,7 @@ pub async fn retry_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
 
     // Try delayed queue if not found
     if task.is_none() {
-        let delayed_key = format!("celers:{}:delayed", queue);
+        let delayed_key = format!("celers:{queue}:delayed");
         let delayed_tasks: Vec<String> = redis::cmd("ZRANGE")
             .arg(&delayed_key)
             .arg(0)
@@ -762,7 +902,7 @@ pub async fn show_task_result(backend_url: &str, task_id_str: &str) -> anyhow::R
     let mut conn = client.get_multiplexed_async_connection().await?;
 
     // Check for task result in Redis backend
-    let result_key = format!("celery-task-meta-{}", task_id);
+    let result_key = format!("celery-task-meta-{task_id}");
     let result_data: Option<String> = redis::cmd("GET")
         .arg(&result_key)
         .query_async(&mut conn)
@@ -834,7 +974,7 @@ pub async fn show_task_result(backend_url: &str, task_id_str: &str) -> anyhow::R
         }
 
         let table = Table::new(fields).with(Style::rounded()).to_string();
-        println!("{}", table);
+        println!("{table}");
     } else {
         println!("{}", "✗ Task result not found".red());
         println!();
@@ -863,8 +1003,8 @@ pub async fn requeue_task(
     let mut conn = client.get_multiplexed_async_connection().await?;
 
     // Construct queue keys
-    let from_key = format!("celers:{}", from_queue);
-    let to_key = format!("celers:{}", to_queue);
+    let from_key = format!("celers:{from_queue}");
+    let to_key = format!("celers:{to_queue}");
 
     // Determine the source queue type
     let from_type: String = redis::cmd("TYPE")
@@ -885,7 +1025,7 @@ pub async fn requeue_task(
             .query_async(&mut conn)
             .await?;
 
-        for task_str in tasks.iter() {
+        for task_str in &tasks {
             if let Ok(t) = serde_json::from_str::<celers_core::SerializedTask>(task_str) {
                 if t.metadata.id == task_id {
                     task = Some(t);
@@ -911,7 +1051,7 @@ pub async fn requeue_task(
             .query_async(&mut conn)
             .await?;
 
-        for (task_str, _score) in tasks.iter() {
+        for (task_str, _score) in &tasks {
             if let Ok(t) = serde_json::from_str::<celers_core::SerializedTask>(task_str) {
                 if t.metadata.id == task_id {
                     task = Some(t);
@@ -928,8 +1068,7 @@ pub async fn requeue_task(
         }
     } else {
         return Err(anyhow::anyhow!(
-            "Source queue '{}' not found or invalid queue type",
-            from_queue
+            "Source queue '{from_queue}' not found or invalid queue type"
         ));
     }
 
@@ -951,16 +1090,13 @@ pub async fn requeue_task(
                 .await?;
             println!(
                 "{}",
-                format!(
-                    "✓ Task moved from '{}' ({}) to '{}' (FIFO)",
-                    from_queue, source_type, to_queue
-                )
-                .green()
-                .bold()
+                format!("✓ Task moved from '{from_queue}' ({source_type}) to '{to_queue}' (FIFO)")
+                    .green()
+                    .bold()
             );
         } else if to_type == "zset" {
             // Priority queue
-            let priority = t.metadata.priority as f64;
+            let priority = f64::from(t.metadata.priority);
             let _: usize = redis::cmd("ZADD")
                 .arg(&to_key)
                 .arg(priority)
@@ -970,17 +1106,14 @@ pub async fn requeue_task(
             println!(
                 "{}",
                 format!(
-                    "✓ Task moved from '{}' ({}) to '{}' (Priority)",
-                    from_queue, source_type, to_queue
+                    "✓ Task moved from '{from_queue}' ({source_type}) to '{to_queue}' (Priority)"
                 )
                 .green()
                 .bold()
             );
         } else {
             return Err(anyhow::anyhow!(
-                "Destination queue '{}' has invalid type: {}",
-                to_queue,
-                to_type
+                "Destination queue '{to_queue}' has invalid type: {to_type}"
             ));
         }
 
@@ -992,7 +1125,7 @@ pub async fn requeue_task(
     } else {
         println!(
             "{}",
-            format!("✗ Task not found in queue '{}'", from_queue).red()
+            format!("✗ Task not found in queue '{from_queue}'").red()
         );
         println!();
         println!("Possible reasons:");
@@ -1011,10 +1144,10 @@ pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     let mut conn = client.get_multiplexed_async_connection().await?;
 
     // Construct queue keys
-    let queue_key = format!("celers:{}", queue);
-    let processing_key = format!("{}:processing", queue_key);
-    let dlq_key = format!("{}:dlq", queue_key);
-    let delayed_key = format!("{}:delayed", queue_key);
+    let queue_key = format!("celers:{queue}");
+    let processing_key = format!("{queue_key}:processing");
+    let dlq_key = format!("{queue_key}:dlq");
+    let delayed_key = format!("{queue_key}:delayed");
 
     // Get queue type
     let queue_type: String = redis::cmd("TYPE")
@@ -1086,7 +1219,7 @@ pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     }
 
     // Display statistics
-    println!("{}", format!("Queue Statistics: {}", queue).cyan().bold());
+    println!("{}", format!("Queue Statistics: {queue}").cyan().bold());
     println!();
 
     #[derive(Tabled)]
@@ -1105,7 +1238,7 @@ pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
             } else if queue_type == "zset" {
                 "Priority (Sorted Set)".to_string()
             } else {
-                format!("Unknown ({})", queue_type)
+                format!("Unknown ({queue_type})")
             },
         },
         StatRow {
@@ -1131,7 +1264,7 @@ pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     ];
 
     let table = Table::new(stats).with(Style::rounded()).to_string();
-    println!("{}", table);
+    println!("{table}");
 
     // Show task type distribution if we have data
     if !task_names.is_empty() {
@@ -1160,16 +1293,13 @@ pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
         let table = Table::new(task_types.into_iter().take(10))
             .with(Style::rounded())
             .to_string();
-        println!("{}", table);
+        println!("{table}");
     }
 
     // Health indicators
     println!();
     if dlq_size > 0 {
-        println!(
-            "{}",
-            format!("⚠ Warning: {} tasks in DLQ", dlq_size).yellow()
-        );
+        println!("{}", format!("⚠ Warning: {dlq_size} tasks in DLQ").yellow());
     }
     if processing_size > queue_size * 2 {
         println!(
@@ -1195,8 +1325,8 @@ pub async fn move_queue(
     let mut conn = client.get_multiplexed_async_connection().await?;
 
     // Construct queue keys
-    let from_key = format!("celers:{}", from_queue);
-    let to_key = format!("celers:{}", to_queue);
+    let from_key = format!("celers:{from_queue}");
+    let to_key = format!("celers:{to_queue}");
 
     // Determine the source queue type
     let from_type: String = redis::cmd("TYPE")
@@ -1207,7 +1337,7 @@ pub async fn move_queue(
     if from_type == "none" {
         println!(
             "{}",
-            format!("✗ Source queue '{}' does not exist", from_queue).red()
+            format!("✗ Source queue '{from_queue}' does not exist").red()
         );
         return Ok(());
     }
@@ -1224,14 +1354,14 @@ pub async fn move_queue(
             .query_async(&mut conn)
             .await?
     } else {
-        println!("{}", format!("✗ Unknown queue type: {}", from_type).red());
+        println!("{}", format!("✗ Unknown queue type: {from_type}").red());
         return Ok(());
     };
 
     if queue_size == 0 {
         println!(
             "{}",
-            format!("✗ Source queue '{}' is empty", from_queue).yellow()
+            format!("✗ Source queue '{from_queue}' is empty").yellow()
         );
         return Ok(());
     }
@@ -1241,8 +1371,7 @@ pub async fn move_queue(
         println!(
             "{}",
             format!(
-                "⚠ Warning: This will move {} tasks from '{}' to '{}'",
-                queue_size, from_queue, to_queue
+                "⚠ Warning: This will move {queue_size} tasks from '{from_queue}' to '{to_queue}'"
             )
             .yellow()
         );
@@ -1252,11 +1381,7 @@ pub async fn move_queue(
 
     println!(
         "{}",
-        format!(
-            "Moving {} tasks from '{}' to '{}'...",
-            queue_size, from_queue, to_queue
-        )
-        .cyan()
+        format!("Moving {queue_size} tasks from '{from_queue}' to '{to_queue}'...").cyan()
     );
 
     // Determine destination queue type (or create as list if doesn't exist)
@@ -1290,7 +1415,7 @@ pub async fn move_queue(
                         if let Ok(task) =
                             serde_json::from_str::<celers_core::SerializedTask>(&task_str)
                         {
-                            let priority = task.metadata.priority as f64;
+                            let priority = f64::from(task.metadata.priority);
                             let _: usize = redis::cmd("ZADD")
                                 .arg(&to_key)
                                 .arg(priority)
@@ -1304,7 +1429,7 @@ pub async fn move_queue(
                     if moved_count % 100 == 0 {
                         print!(
                             "\r{}",
-                            format!("Moved {} / {} tasks...", moved_count, queue_size).cyan()
+                            format!("Moved {moved_count} / {queue_size} tasks...").cyan()
                         );
                         use std::io::Write;
                         std::io::stdout().flush()?;
@@ -1338,7 +1463,7 @@ pub async fn move_queue(
             } else if to_type == "zset" {
                 // Destination is priority queue
                 if let Ok(task) = serde_json::from_str::<celers_core::SerializedTask>(task_str) {
-                    let priority = task.metadata.priority as f64;
+                    let priority = f64::from(task.metadata.priority);
                     let _: usize = redis::cmd("ZADD")
                         .arg(&to_key)
                         .arg(priority)
@@ -1352,7 +1477,7 @@ pub async fn move_queue(
             if moved_count % 100 == 0 {
                 print!(
                     "\r{}",
-                    format!("Moved {} / {} tasks...", moved_count, queue_size).cyan()
+                    format!("Moved {moved_count} / {queue_size} tasks...").cyan()
                 );
                 use std::io::Write;
                 std::io::stdout().flush()?;
@@ -1363,12 +1488,9 @@ pub async fn move_queue(
     println!();
     println!(
         "{}",
-        format!(
-            "✓ Successfully moved {} tasks from '{}' to '{}'",
-            moved_count, from_queue, to_queue
-        )
-        .green()
-        .bold()
+        format!("✓ Successfully moved {moved_count} tasks from '{from_queue}' to '{to_queue}'")
+            .green()
+            .bold()
     );
 
     // Show queue type info
@@ -1395,7 +1517,7 @@ pub async fn export_queue(broker_url: &str, queue: &str, output_file: &str) -> a
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let queue_key = format!("celers:{}", queue);
+    let queue_key = format!("celers:{queue}");
 
     // Get queue type
     let queue_type: String = redis::cmd("TYPE")
@@ -1404,11 +1526,11 @@ pub async fn export_queue(broker_url: &str, queue: &str, output_file: &str) -> a
         .await?;
 
     if queue_type == "none" {
-        println!("{}", format!("✗ Queue '{}' does not exist", queue).red());
+        println!("{}", format!("✗ Queue '{queue}' does not exist").red());
         return Ok(());
     }
 
-    println!("{}", format!("Exporting queue '{}'...", queue).cyan());
+    println!("{}", format!("Exporting queue '{queue}'...").cyan());
 
     // Fetch all tasks
     let tasks: Vec<String> = if queue_type == "list" {
@@ -1426,7 +1548,7 @@ pub async fn export_queue(broker_url: &str, queue: &str, output_file: &str) -> a
             .query_async(&mut conn)
             .await?
     } else {
-        println!("{}", format!("✗ Unknown queue type: {}", queue_type).red());
+        println!("{}", format!("✗ Unknown queue type: {queue_type}").red());
         return Ok(());
     };
 
@@ -1521,7 +1643,7 @@ pub async fn import_queue(
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let queue_key = format!("celers:{}", queue);
+    let queue_key = format!("celers:{queue}");
 
     // Determine destination queue type
     let to_type: String = redis::cmd("TYPE")
@@ -1547,7 +1669,7 @@ pub async fn import_queue(
                 .await?;
         } else if to_type == "zset" {
             // Destination is priority queue
-            let priority = task.metadata.priority as f64;
+            let priority = f64::from(task.metadata.priority);
             let _: usize = redis::cmd("ZADD")
                 .arg(&queue_key)
                 .arg(priority)
@@ -1574,12 +1696,9 @@ pub async fn import_queue(
     println!();
     println!(
         "{}",
-        format!(
-            "✓ Successfully imported {} tasks into queue '{}'",
-            imported, queue
-        )
-        .green()
-        .bold()
+        format!("✓ Successfully imported {imported} tasks into queue '{queue}'")
+            .green()
+            .bold()
     );
 
     Ok(())
@@ -1606,7 +1725,7 @@ pub async fn show_metrics(
         println!("{}", "=== Metrics Watch Mode ===".bold().green());
         println!(
             "{}",
-            format!("Refreshing every {} seconds (Ctrl+C to stop)", interval).dimmed()
+            format!("Refreshing every {interval} seconds (Ctrl+C to stop)").dimmed()
         );
         println!();
 
@@ -1721,9 +1840,8 @@ fn format_and_output_metrics(
                     }
                 } else if line.starts_with("# TYPE") {
                     // Skip TYPE lines
-                    continue;
                 } else if line.starts_with('#') || line.trim().is_empty() {
-                    continue;
+                    // Skip comments and empty lines
                 } else {
                     // Parse metric value
                     if let Some(space_idx) = line.rfind(' ') {
@@ -1770,7 +1888,7 @@ fn format_and_output_metrics(
         std::fs::write(file_path, &output)?;
         println!(
             "{}",
-            format!("✓ Metrics exported to '{}'", file_path)
+            format!("✓ Metrics exported to '{file_path}'")
                 .green()
                 .bold()
         );
@@ -1779,7 +1897,7 @@ fn format_and_output_metrics(
             println!("  {} {}", "Filter:".cyan(), pat);
         }
     } else {
-        println!("{}", output);
+        println!("{output}");
     }
 
     Ok(())
@@ -1860,7 +1978,7 @@ fn format_and_display_metrics(format: &str, pattern: Option<&str>) -> anyhow::Re
                         }
                     }
                 } else if line.starts_with('#') || line.trim().is_empty() {
-                    continue;
+                    // Skip comments and empty lines
                 } else if let Some(space_idx) = line.rfind(' ') {
                     let (metric_part, value_str) = line.split_at(space_idx);
                     let value_str = value_str.trim();
@@ -1898,7 +2016,7 @@ fn format_and_display_metrics(format: &str, pattern: Option<&str>) -> anyhow::Re
         }
     };
 
-    println!("{}", output);
+    println!("{output}");
     Ok(())
 }
 
@@ -1913,7 +2031,7 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
     if !Path::new(config_path).exists() {
         println!(
             "{}",
-            format!("✗ Configuration file not found: {}", config_path)
+            format!("✗ Configuration file not found: {config_path}")
                 .red()
                 .bold()
         );
@@ -1922,7 +2040,7 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
 
     println!(
         "{}",
-        format!("📄 Loading configuration from '{}'...", config_path).cyan()
+        format!("📄 Loading configuration from '{config_path}'...").cyan()
     );
     println!();
 
@@ -1934,7 +2052,7 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
         }
         Err(e) => {
             println!("{}", "✗ Failed to parse configuration file:".red().bold());
-            println!("  {}", format!("{}", e).red());
+            println!("  {}", format!("{e}").red());
             return Ok(());
         }
     };
@@ -2028,19 +2146,19 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
                                             "{}",
                                             "✗ Failed to PING Redis broker:".red().bold()
                                         );
-                                        println!("  {}", format!("{}", e).red());
+                                        println!("  {}", format!("{e}").red());
                                     }
                                 }
                             }
                             Err(e) => {
                                 println!("{}", "✗ Failed to connect to Redis broker:".red().bold());
-                                println!("  {}", format!("{}", e).red());
+                                println!("  {}", format!("{e}").red());
                             }
                         }
                     }
                     Err(e) => {
                         println!("{}", "✗ Invalid Redis URL:".red().bold());
-                        println!("  {}", format!("{}", e).red());
+                        println!("  {}", format!("{e}").red());
                     }
                 }
             }
@@ -2060,7 +2178,7 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
                             }
                             Err(e) => {
                                 println!("{}", "✗ Failed to query PostgreSQL broker:".red().bold());
-                                println!("  {}", format!("{}", e).red());
+                                println!("  {}", format!("{e}").red());
                             }
                         }
                         pool.close().await;
@@ -2070,7 +2188,7 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
                             "{}",
                             "✗ Failed to connect to PostgreSQL broker:".red().bold()
                         );
-                        println!("  {}", format!("{}", e).red());
+                        println!("  {}", format!("{e}").red());
                     }
                 }
             }
@@ -2146,7 +2264,7 @@ pub async fn pause_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let pause_key = format!("celers:{}:paused", queue);
+    let pause_key = format!("celers:{queue}:paused");
 
     // Set pause flag with a timestamp
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -2158,9 +2276,7 @@ pub async fn pause_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 
     println!(
         "{}",
-        format!("✓ Queue '{}' has been paused", queue)
-            .green()
-            .bold()
+        format!("✓ Queue '{queue}' has been paused").green().bold()
     );
     println!();
     println!("{}", "Note:".yellow().bold());
@@ -2178,7 +2294,7 @@ pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let pause_key = format!("celers:{}:paused", queue);
+    let pause_key = format!("celers:{queue}:paused");
 
     // Check if queue is paused
     let paused: Option<String> = redis::cmd("GET")
@@ -2187,7 +2303,7 @@ pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
         .await?;
 
     if paused.is_none() {
-        println!("{}", format!("✓ Queue '{}' is not paused", queue).yellow());
+        println!("{}", format!("✓ Queue '{queue}' is not paused").yellow());
         return Ok(());
     }
 
@@ -2199,9 +2315,7 @@ pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 
     println!(
         "{}",
-        format!("✓ Queue '{}' has been resumed", queue)
-            .green()
-            .bold()
+        format!("✓ Queue '{queue}' has been resumed").green().bold()
     );
     println!();
     println!("{}", "Note:".yellow().bold());
@@ -2284,7 +2398,7 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
         Ok(size) => {
             if size > 0 {
                 println!("  {} DLQ size: {} (has failed tasks)", "⚠".yellow(), size);
-                health_warnings.push(format!("{} tasks in Dead Letter Queue", size));
+                health_warnings.push(format!("{size} tasks in Dead Letter Queue"));
             } else {
                 println!("  {} DLQ size: {} (empty)", "✓".green(), size);
             }
@@ -2301,7 +2415,7 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 
     // Test 3: Queue Accessibility
     println!("{}", "3. Queue Accessibility".bold());
-    let queue_key = format!("celers:{}", queue);
+    let queue_key = format!("celers:{queue}");
     let _queue_type: String = match redis::cmd("TYPE")
         .arg(&queue_key)
         .query_async(&mut conn)
@@ -2320,7 +2434,7 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
                 println!("  {} Queue type: Priority (sorted set)", "✓".green());
             } else {
                 println!("  {} Unknown queue type: {}", "⚠".yellow(), t);
-                health_warnings.push(format!("Unknown queue type: {}", t));
+                health_warnings.push(format!("Unknown queue type: {t}"));
             }
             t
         }
@@ -2332,7 +2446,7 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     };
 
     // Check if queue is paused
-    let pause_key = format!("celers:{}:paused", queue);
+    let pause_key = format!("celers:{queue}:paused");
     match redis::cmd("GET")
         .arg(&pause_key)
         .query_async::<Option<String>>(&mut conn)
@@ -2340,7 +2454,7 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     {
         Ok(Some(paused_at)) => {
             println!("  {} Queue is PAUSED (since: {})", "⚠".yellow(), paused_at);
-            health_warnings.push(format!("Queue is paused since {}", paused_at));
+            health_warnings.push(format!("Queue is paused since {paused_at}"));
         }
         Ok(None) => {
             println!("  {} Queue is not paused", "✓".green());
@@ -2505,11 +2619,11 @@ pub async fn list_workers(broker_url: &str) -> anyhow::Result<()> {
     }
 
     let table = Table::new(workers).with(Style::rounded()).to_string();
-    println!("{}", table);
+    println!("{table}");
     println!();
     println!(
         "{}",
-        format!("Total active workers: {}", worker_count)
+        format!("Total active workers: {worker_count}")
             .cyan()
             .bold()
     );
@@ -2524,21 +2638,21 @@ pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<(
 
     println!(
         "{}",
-        format!("=== Worker Statistics: {} ===", worker_id)
+        format!("=== Worker Statistics: {worker_id} ===")
             .bold()
             .cyan()
     );
     println!();
 
     // Check if worker exists
-    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let heartbeat_key = format!("celers:worker:{worker_id}:heartbeat");
     let heartbeat: Option<String> = redis::cmd("GET")
         .arg(&heartbeat_key)
         .query_async(&mut conn)
         .await?;
 
     if heartbeat.is_none() {
-        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        println!("{}", format!("✗ Worker '{worker_id}' not found").red());
         println!();
         println!("Possible reasons:");
         println!("  • Worker is not running");
@@ -2556,7 +2670,7 @@ pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<(
     }
 
     // Gather worker statistics
-    let stats_key = format!("celers:worker:{}:stats", worker_id);
+    let stats_key = format!("celers:worker:{worker_id}:stats");
     let stats: Option<String> = redis::cmd("GET")
         .arg(&stats_key)
         .query_async(&mut conn)
@@ -2594,14 +2708,14 @@ pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<(
             if let Some(uptime) = stats_data.get("uptime_seconds") {
                 stat_rows.push(StatRow {
                     metric: "Uptime".to_string(),
-                    value: format!("{} seconds", uptime),
+                    value: format!("{uptime} seconds"),
                 });
             }
         }
     }
 
     let table = Table::new(stat_rows).with(Style::rounded()).to_string();
-    println!("{}", table);
+    println!("{table}");
 
     Ok(())
 }
@@ -2613,29 +2727,27 @@ pub async fn stop_worker(broker_url: &str, worker_id: &str, graceful: bool) -> a
 
     println!(
         "{}",
-        format!("=== Stop Worker: {} ===", worker_id)
-            .bold()
-            .yellow()
+        format!("=== Stop Worker: {worker_id} ===").bold().yellow()
     );
     println!();
 
     // Check if worker exists
-    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let heartbeat_key = format!("celers:worker:{worker_id}:heartbeat");
     let heartbeat: Option<String> = redis::cmd("GET")
         .arg(&heartbeat_key)
         .query_async(&mut conn)
         .await?;
 
     if heartbeat.is_none() {
-        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        println!("{}", format!("✗ Worker '{worker_id}' not found").red());
         return Ok(());
     }
 
     // Publish stop command via Redis Pub/Sub
     let channel = if graceful {
-        format!("celers:worker:{}:shutdown_graceful", worker_id)
+        format!("celers:worker:{worker_id}:shutdown_graceful")
     } else {
-        format!("celers:worker:{}:shutdown", worker_id)
+        format!("celers:worker:{worker_id}:shutdown")
     };
 
     let subscribers: usize = redis::cmd("PUBLISH")
@@ -2669,7 +2781,7 @@ pub async fn stop_worker(broker_url: &str, worker_id: &str, graceful: bool) -> a
     } else {
         println!(
             "{}",
-            format!("⚠ No subscribers for worker '{}'", worker_id)
+            format!("⚠ No subscribers for worker '{worker_id}'")
                 .yellow()
                 .bold()
         );
@@ -2685,7 +2797,7 @@ pub async fn pause_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let pause_key = format!("celers:worker:{}:paused", worker_id);
+    let pause_key = format!("celers:worker:{worker_id}:paused");
     let timestamp = chrono::Utc::now().to_rfc3339();
 
     let _: () = redis::cmd("SET")
@@ -2696,7 +2808,7 @@ pub async fn pause_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
 
     println!(
         "{}",
-        format!("✓ Worker '{}' has been paused", worker_id)
+        format!("✓ Worker '{worker_id}' has been paused")
             .green()
             .bold()
     );
@@ -2716,7 +2828,7 @@ pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let pause_key = format!("celers:worker:{}:paused", worker_id);
+    let pause_key = format!("celers:worker:{worker_id}:paused");
 
     // Check if worker is paused
     let paused: Option<String> = redis::cmd("GET")
@@ -2727,7 +2839,7 @@ pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<
     if paused.is_none() {
         println!(
             "{}",
-            format!("✓ Worker '{}' is not paused", worker_id).yellow()
+            format!("✓ Worker '{worker_id}' is not paused").yellow()
         );
         return Ok(());
     }
@@ -2740,7 +2852,7 @@ pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<
 
     println!(
         "{}",
-        format!("✓ Worker '{}' has been resumed", worker_id)
+        format!("✓ Worker '{worker_id}' has been resumed")
             .green()
             .bold()
     );
@@ -2792,12 +2904,12 @@ pub async fn doctor(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     println!("  {} DLQ tasks: {}", "•".cyan(), dlq_size);
 
     if dlq_size > 10 {
-        warnings.push(format!("High number of failed tasks in DLQ: {}", dlq_size));
+        warnings.push(format!("High number of failed tasks in DLQ: {dlq_size}"));
         recommendations.push("Inspect DLQ with: celers dlq inspect".to_string());
     }
 
     if queue_size > 1000 {
-        warnings.push(format!("Large queue backlog: {} tasks", queue_size));
+        warnings.push(format!("Large queue backlog: {queue_size} tasks"));
         recommendations.push("Consider scaling up workers".to_string());
     }
     println!();
@@ -2838,14 +2950,14 @@ pub async fn doctor(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 
     // Test 4: Queue pause status
     println!("{}", "4. Checking queue status...".bold());
-    let pause_key = format!("celers:{}:paused", queue);
+    let pause_key = format!("celers:{queue}:paused");
     let paused: Option<String> = redis::cmd("GET")
         .arg(&pause_key)
         .query_async(&mut conn)
         .await?;
 
     if let Some(paused_at) = paused {
-        warnings.push(format!("Queue '{}' is paused since {}", queue, paused_at));
+        warnings.push(format!("Queue '{queue}' is paused since {paused_at}"));
         recommendations.push("Resume queue with: celers queue resume".to_string());
         println!("  {} Queue is PAUSED", "⚠".yellow());
     } else {
@@ -2954,7 +3066,7 @@ pub async fn show_task_logs(
     let mut conn = client.get_multiplexed_async_connection().await?;
 
     // Logs are stored in a Redis list: celers:task:<id>:logs
-    let logs_key = format!("celers:task:{}:logs", task_id);
+    let logs_key = format!("celers:task:{task_id}:logs");
 
     // Check if logs exist
     let exists: bool = redis::cmd("EXISTS")
@@ -2981,7 +3093,7 @@ pub async fn show_task_logs(
 
     println!(
         "{}",
-        format!("Total log entries: {}", log_count).cyan().bold()
+        format!("Total log entries: {log_count}").cyan().bold()
     );
     println!();
 
@@ -3043,7 +3155,7 @@ pub async fn show_task_logs(
         );
         println!(
             "{}",
-            format!("Use --limit to show more entries (max: {})", log_count).dimmed()
+            format!("Use --limit to show more entries (max: {log_count})").dimmed()
         );
     } else {
         println!(
@@ -3133,7 +3245,7 @@ pub async fn list_schedules(broker_url: &str) -> anyhow::Result<()> {
                     .to_string();
 
                 // Check if paused
-                let pause_key = format!("celers:schedule:{}:paused", name);
+                let pause_key = format!("celers:schedule:{name}:paused");
                 let paused: Option<String> = redis::cmd("GET")
                     .arg(&pause_key)
                     .query_async(&mut conn)
@@ -3163,7 +3275,7 @@ pub async fn list_schedules(broker_url: &str) -> anyhow::Result<()> {
     }
 
     let table = Table::new(schedules).with(Style::rounded()).to_string();
-    println!("{}", table);
+    println!("{table}");
     println!();
     println!(
         "{}",
@@ -3210,7 +3322,7 @@ pub async fn add_schedule(
     }
 
     // Check if schedule already exists
-    let schedule_key = format!("celers:schedule:{}", name);
+    let schedule_key = format!("celers:schedule:{name}");
     let exists: bool = redis::cmd("EXISTS")
         .arg(&schedule_key)
         .query_async(&mut conn)
@@ -3219,11 +3331,11 @@ pub async fn add_schedule(
     if exists {
         println!(
             "{}",
-            format!("✗ Schedule '{}' already exists", name).red().bold()
+            format!("✗ Schedule '{name}' already exists").red().bold()
         );
         println!();
         println!("Use a different name or remove the existing schedule first:");
-        println!("  celers schedule remove {} --confirm", name);
+        println!("  celers schedule remove {name} --confirm");
         return Ok(());
     }
 
@@ -3233,7 +3345,7 @@ pub async fn add_schedule(
             Ok(v) => v,
             Err(e) => {
                 println!("{}", "✗ Invalid JSON arguments".red().bold());
-                println!("  Error: {}", e);
+                println!("  Error: {e}");
                 return Ok(());
             }
         }
@@ -3282,7 +3394,7 @@ pub async fn remove_schedule(broker_url: &str, name: &str, confirm: bool) -> any
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let schedule_key = format!("celers:schedule:{}", name);
+    let schedule_key = format!("celers:schedule:{name}");
 
     // Check if schedule exists
     let exists: bool = redis::cmd("EXISTS")
@@ -3291,14 +3403,14 @@ pub async fn remove_schedule(broker_url: &str, name: &str, confirm: bool) -> any
         .await?;
 
     if !exists {
-        println!("{}", format!("✗ Schedule '{}' not found", name).red());
+        println!("{}", format!("✗ Schedule '{name}' not found").red());
         return Ok(());
     }
 
     if !confirm {
         println!(
             "{}",
-            format!("⚠ Warning: This will delete schedule '{}'", name)
+            format!("⚠ Warning: This will delete schedule '{name}'")
                 .yellow()
                 .bold()
         );
@@ -3307,7 +3419,7 @@ pub async fn remove_schedule(broker_url: &str, name: &str, confirm: bool) -> any
     }
 
     // Remove schedule and its pause flag
-    let pause_key = format!("celers:schedule:{}:paused", name);
+    let pause_key = format!("celers:schedule:{name}:paused");
     let _: () = redis::cmd("DEL")
         .arg(&schedule_key)
         .arg(&pause_key)
@@ -3316,7 +3428,7 @@ pub async fn remove_schedule(broker_url: &str, name: &str, confirm: bool) -> any
 
     println!(
         "{}",
-        format!("✓ Schedule '{}' removed successfully", name)
+        format!("✓ Schedule '{name}' removed successfully")
             .green()
             .bold()
     );
@@ -3329,7 +3441,7 @@ pub async fn pause_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> 
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let schedule_key = format!("celers:schedule:{}", name);
+    let schedule_key = format!("celers:schedule:{name}");
 
     // Check if schedule exists
     let exists: bool = redis::cmd("EXISTS")
@@ -3338,12 +3450,12 @@ pub async fn pause_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> 
         .await?;
 
     if !exists {
-        println!("{}", format!("✗ Schedule '{}' not found", name).red());
+        println!("{}", format!("✗ Schedule '{name}' not found").red());
         return Ok(());
     }
 
     // Set pause flag
-    let pause_key = format!("celers:schedule:{}:paused", name);
+    let pause_key = format!("celers:schedule:{name}:paused");
     let timestamp = chrono::Utc::now().to_rfc3339();
     let _: () = redis::cmd("SET")
         .arg(&pause_key)
@@ -3353,14 +3465,14 @@ pub async fn pause_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> 
 
     println!(
         "{}",
-        format!("✓ Schedule '{}' has been paused", name)
+        format!("✓ Schedule '{name}' has been paused")
             .green()
             .bold()
     );
     println!();
     println!("{}", "Note:".yellow().bold());
     println!("  • Schedule will not execute until resumed");
-    println!("  • Use 'celers schedule resume {}' to resume", name);
+    println!("  • Use 'celers schedule resume {name}' to resume");
     println!();
     println!("  Paused at: {}", timestamp.cyan());
 
@@ -3372,7 +3484,7 @@ pub async fn resume_schedule(broker_url: &str, name: &str) -> anyhow::Result<()>
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let schedule_key = format!("celers:schedule:{}", name);
+    let schedule_key = format!("celers:schedule:{name}");
 
     // Check if schedule exists
     let exists: bool = redis::cmd("EXISTS")
@@ -3381,22 +3493,19 @@ pub async fn resume_schedule(broker_url: &str, name: &str) -> anyhow::Result<()>
         .await?;
 
     if !exists {
-        println!("{}", format!("✗ Schedule '{}' not found", name).red());
+        println!("{}", format!("✗ Schedule '{name}' not found").red());
         return Ok(());
     }
 
     // Check if paused
-    let pause_key = format!("celers:schedule:{}:paused", name);
+    let pause_key = format!("celers:schedule:{name}:paused");
     let paused: Option<String> = redis::cmd("GET")
         .arg(&pause_key)
         .query_async(&mut conn)
         .await?;
 
     if paused.is_none() {
-        println!(
-            "{}",
-            format!("✓ Schedule '{}' is not paused", name).yellow()
-        );
+        println!("{}", format!("✓ Schedule '{name}' is not paused").yellow());
         return Ok(());
     }
 
@@ -3408,7 +3517,7 @@ pub async fn resume_schedule(broker_url: &str, name: &str) -> anyhow::Result<()>
 
     println!(
         "{}",
-        format!("✓ Schedule '{}' has been resumed", name)
+        format!("✓ Schedule '{name}' has been resumed")
             .green()
             .bold()
     );
@@ -3427,11 +3536,11 @@ pub async fn trigger_schedule(broker_url: &str, name: &str) -> anyhow::Result<()
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let schedule_key = format!("celers:schedule:{}", name);
+    let schedule_key = format!("celers:schedule:{name}");
 
     println!(
         "{}",
-        format!("=== Trigger Schedule: {} ===", name).bold().cyan()
+        format!("=== Trigger Schedule: {name} ===").bold().cyan()
     );
     println!();
 
@@ -3453,7 +3562,7 @@ pub async fn trigger_schedule(broker_url: &str, name: &str) -> anyhow::Result<()
                 .unwrap_or("celers");
 
             // Publish trigger command via Redis Pub/Sub
-            let trigger_channel = format!("celers:schedule:{}:trigger", name);
+            let trigger_channel = format!("celers:schedule:{name}:trigger");
             let subscribers: usize = redis::cmd("PUBLISH")
                 .arg(&trigger_channel)
                 .arg("TRIGGER")
@@ -3463,7 +3572,7 @@ pub async fn trigger_schedule(broker_url: &str, name: &str) -> anyhow::Result<()
             if subscribers > 0 {
                 println!(
                     "{}",
-                    format!("✓ Trigger signal sent for schedule '{}'", name)
+                    format!("✓ Trigger signal sent for schedule '{name}'")
                         .green()
                         .bold()
                 );
@@ -3487,7 +3596,7 @@ pub async fn trigger_schedule(broker_url: &str, name: &str) -> anyhow::Result<()
             println!("{}", "✗ Invalid schedule data".red());
         }
     } else {
-        println!("{}", format!("✗ Schedule '{}' not found", name).red());
+        println!("{}", format!("✗ Schedule '{name}' not found").red());
     }
 
     Ok(())
@@ -3500,7 +3609,7 @@ pub async fn scale_workers(broker_url: &str, target_count: usize) -> anyhow::Res
 
     println!(
         "{}",
-        format!("=== Scale Workers to {} ===", target_count)
+        format!("=== Scale Workers to {target_count} ===")
             .bold()
             .cyan()
     );
@@ -3528,23 +3637,23 @@ pub async fn scale_workers(broker_url: &str, target_count: usize) -> anyhow::Res
         let needed = target_count - current_count;
         println!(
             "{}",
-            format!("⚠ Need to start {} more workers", needed)
+            format!("⚠ Need to start {needed} more workers")
                 .yellow()
                 .bold()
         );
         println!();
         println!("To scale up, start additional worker instances:");
-        println!("  celers worker --broker {}", broker_url);
+        println!("  celers worker --broker {broker_url}");
         println!();
         println!("Or run them in parallel:");
         for i in 1..=needed {
-            println!("  celers worker --broker {} & # Worker {}", broker_url, i);
+            println!("  celers worker --broker {broker_url} & # Worker {i}");
         }
     } else {
         let excess = current_count - target_count;
         println!(
             "{}",
-            format!("⚠ Need to stop {} workers", excess).yellow().bold()
+            format!("⚠ Need to stop {excess} workers").yellow().bold()
         );
         println!();
         println!("To scale down, stop workers gracefully:");
@@ -3562,24 +3671,24 @@ pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
 
     println!(
         "{}",
-        format!("=== Drain Worker: {} ===", worker_id).bold().cyan()
+        format!("=== Drain Worker: {worker_id} ===").bold().cyan()
     );
     println!();
 
     // Check if worker exists
-    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let heartbeat_key = format!("celers:worker:{worker_id}:heartbeat");
     let exists: bool = redis::cmd("EXISTS")
         .arg(&heartbeat_key)
         .query_async(&mut conn)
         .await?;
 
     if !exists {
-        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        println!("{}", format!("✗ Worker '{worker_id}' not found").red());
         return Ok(());
     }
 
     // Set drain flag
-    let drain_key = format!("celers:worker:{}:draining", worker_id);
+    let drain_key = format!("celers:worker:{worker_id}:draining");
     let timestamp = Utc::now().to_rfc3339();
     redis::cmd("SET")
         .arg(&drain_key)
@@ -3596,7 +3705,7 @@ pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
 
     println!(
         "{}",
-        format!("✓ Worker '{}' is now draining", worker_id)
+        format!("✓ Worker '{worker_id}' is now draining")
             .green()
             .bold()
     );
@@ -3607,7 +3716,7 @@ pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
     println!("  • Shut down automatically when all tasks complete");
     println!();
     println!("To resume normal operation:");
-    println!("  celers worker-mgmt resume {}", worker_id);
+    println!("  celers worker-mgmt resume {worker_id}");
 
     Ok(())
 }
@@ -3619,12 +3728,12 @@ pub async fn schedule_history(broker_url: &str, name: &str, limit: usize) -> any
 
     println!(
         "{}",
-        format!("=== Schedule History: {} ===", name).bold().cyan()
+        format!("=== Schedule History: {name} ===").bold().cyan()
     );
     println!();
 
     // Get history from Redis sorted set
-    let history_key = format!("celers:schedule:{}:history", name);
+    let history_key = format!("celers:schedule:{name}:history");
     let entries: Vec<String> = redis::cmd("ZREVRANGE")
         .arg(&history_key)
         .arg(0)
@@ -3683,7 +3792,7 @@ pub async fn schedule_history(broker_url: &str, name: &str, limit: usize) -> any
     let table = Table::new(history_entries)
         .with(Style::rounded())
         .to_string();
-    println!("{}", table);
+    println!("{table}");
     println!();
     println!(
         "Showing {} of {} entries",
@@ -3700,17 +3809,14 @@ pub async fn debug_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
         .parse::<uuid::Uuid>()
         .map_err(|_| anyhow::anyhow!("Invalid task ID format"))?;
 
-    println!(
-        "{}",
-        format!("=== Debug Task: {} ===", task_id).bold().cyan()
-    );
+    println!("{}", format!("=== Debug Task: {task_id} ===").bold().cyan());
     println!();
 
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
     // Get task logs
-    let logs_key = format!("celers:task:{}:logs", task_id);
+    let logs_key = format!("celers:task:{task_id}:logs");
     let logs: Vec<String> = redis::cmd("LRANGE")
         .arg(&logs_key)
         .arg(0)
@@ -3747,14 +3853,14 @@ pub async fn debug_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
 
                 println!("[{}] {} {}", timestamp.dimmed(), level_colored, message);
             } else {
-                println!("{}", log);
+                println!("{log}");
             }
         }
         println!();
     }
 
     // Get task metadata
-    let metadata_key = format!("celers:task:{}:metadata", task_id);
+    let metadata_key = format!("celers:task:{task_id}:metadata");
     let metadata: Option<String> = redis::cmd("GET")
         .arg(&metadata_key)
         .query_async(&mut conn)
@@ -3766,7 +3872,7 @@ pub async fn debug_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
         if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_str) {
             println!("{}", serde_json::to_string_pretty(&meta_json)?);
         } else {
-            println!("{}", meta_str);
+            println!("{meta_str}");
         }
         println!();
     }
@@ -3784,19 +3890,19 @@ pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
 
     println!(
         "{}",
-        format!("=== Debug Worker: {} ===", worker_id).bold().cyan()
+        format!("=== Debug Worker: {worker_id} ===").bold().cyan()
     );
     println!();
 
     // Get worker heartbeat
-    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let heartbeat_key = format!("celers:worker:{worker_id}:heartbeat");
     let heartbeat: Option<String> = redis::cmd("GET")
         .arg(&heartbeat_key)
         .query_async(&mut conn)
         .await?;
 
     if heartbeat.is_none() {
-        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        println!("{}", format!("✗ Worker '{worker_id}' not found").red());
         println!();
         println!("Possible causes:");
         println!("  • Worker is not running");
@@ -3812,7 +3918,7 @@ pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
     println!();
 
     // Check worker stats
-    let stats_key = format!("celers:worker:{}:stats", worker_id);
+    let stats_key = format!("celers:worker:{worker_id}:stats");
     let stats: Option<String> = redis::cmd("GET")
         .arg(&stats_key)
         .query_async(&mut conn)
@@ -3823,13 +3929,13 @@ pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         if let Ok(stats_json) = serde_json::from_str::<serde_json::Value>(&stats_str) {
             println!("{}", serde_json::to_string_pretty(&stats_json)?);
         } else {
-            println!("{}", stats_str);
+            println!("{stats_str}");
         }
         println!();
     }
 
     // Check for pause status
-    let pause_key = format!("celers:worker:{}:paused", worker_id);
+    let pause_key = format!("celers:worker:{worker_id}:paused");
     let paused: bool = redis::cmd("EXISTS")
         .arg(&pause_key)
         .query_async(&mut conn)
@@ -3842,7 +3948,7 @@ pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
     }
 
     // Check for drain status
-    let drain_key = format!("celers:worker:{}:draining", worker_id);
+    let drain_key = format!("celers:worker:{worker_id}:draining");
     let draining: bool = redis::cmd("EXISTS")
         .arg(&drain_key)
         .query_async(&mut conn)
@@ -3855,7 +3961,7 @@ pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
     }
 
     // Get worker logs
-    let logs_key = format!("celers:worker:{}:logs", worker_id);
+    let logs_key = format!("celers:worker:{worker_id}:logs");
     let logs: Vec<String> = redis::cmd("LRANGE")
         .arg(&logs_key)
         .arg(-20)
@@ -3867,7 +3973,7 @@ pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         println!("{}", "Recent Worker Logs (last 20):".green().bold());
         println!();
         for log in logs {
-            println!("{}", log);
+            println!("{log}");
         }
     }
 
@@ -3906,28 +4012,40 @@ pub async fn report_daily(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 
             let mut daily_metrics = vec![];
 
-            if let Some(total) = metrics_json.get("total_tasks").and_then(|v| v.as_u64()) {
+            if let Some(total) = metrics_json
+                .get("total_tasks")
+                .and_then(serde_json::Value::as_u64)
+            {
                 daily_metrics.push(DailyMetric {
                     metric: "Total Tasks".to_string(),
                     count: total.to_string(),
                 });
             }
 
-            if let Some(succeeded) = metrics_json.get("succeeded").and_then(|v| v.as_u64()) {
+            if let Some(succeeded) = metrics_json
+                .get("succeeded")
+                .and_then(serde_json::Value::as_u64)
+            {
                 daily_metrics.push(DailyMetric {
                     metric: "Succeeded".to_string(),
                     count: succeeded.to_string(),
                 });
             }
 
-            if let Some(failed) = metrics_json.get("failed").and_then(|v| v.as_u64()) {
+            if let Some(failed) = metrics_json
+                .get("failed")
+                .and_then(serde_json::Value::as_u64)
+            {
                 daily_metrics.push(DailyMetric {
                     metric: "Failed".to_string(),
                     count: failed.to_string(),
                 });
             }
 
-            if let Some(retried) = metrics_json.get("retried").and_then(|v| v.as_u64()) {
+            if let Some(retried) = metrics_json
+                .get("retried")
+                .and_then(serde_json::Value::as_u64)
+            {
                 daily_metrics.push(DailyMetric {
                     metric: "Retried".to_string(),
                     count: retried.to_string(),
@@ -3936,16 +4054,16 @@ pub async fn report_daily(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 
             if let Some(avg_time) = metrics_json
                 .get("avg_execution_time")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
             {
                 daily_metrics.push(DailyMetric {
                     metric: "Avg Execution Time".to_string(),
-                    count: format!("{:.2}s", avg_time),
+                    count: format!("{avg_time:.2}s"),
                 });
             }
 
             let table = Table::new(daily_metrics).with(Style::rounded()).to_string();
-            println!("{}", table);
+            println!("{table}");
         }
     } else {
         println!("{}", "No metrics available for today".yellow());
@@ -3996,16 +4114,28 @@ pub async fn report_weekly(broker_url: &str, queue: &str) -> anyhow::Result<()> 
 
         if let Some(metrics_str) = metrics {
             if let Ok(metrics_json) = serde_json::from_str::<serde_json::Value>(&metrics_str) {
-                if let Some(tasks) = metrics_json.get("total_tasks").and_then(|v| v.as_u64()) {
+                if let Some(tasks) = metrics_json
+                    .get("total_tasks")
+                    .and_then(serde_json::Value::as_u64)
+                {
                     total_tasks += tasks;
                 }
-                if let Some(succeeded) = metrics_json.get("succeeded").and_then(|v| v.as_u64()) {
+                if let Some(succeeded) = metrics_json
+                    .get("succeeded")
+                    .and_then(serde_json::Value::as_u64)
+                {
                     total_succeeded += succeeded;
                 }
-                if let Some(failed) = metrics_json.get("failed").and_then(|v| v.as_u64()) {
+                if let Some(failed) = metrics_json
+                    .get("failed")
+                    .and_then(serde_json::Value::as_u64)
+                {
                     total_failed += failed;
                 }
-                if let Some(retried) = metrics_json.get("retried").and_then(|v| v.as_u64()) {
+                if let Some(retried) = metrics_json
+                    .get("retried")
+                    .and_then(serde_json::Value::as_u64)
+                {
                     total_retried += retried;
                 }
             }
@@ -4043,12 +4173,12 @@ pub async fn report_weekly(broker_url: &str, queue: &str) -> anyhow::Result<()> 
         WeeklyMetric {
             metric: "Succeeded".to_string(),
             count: total_succeeded.to_string(),
-            percentage: format!("{:.1}%", success_rate),
+            percentage: format!("{success_rate:.1}%"),
         },
         WeeklyMetric {
             metric: "Failed".to_string(),
             count: total_failed.to_string(),
-            percentage: format!("{:.1}%", failure_rate),
+            percentage: format!("{failure_rate:.1}%"),
         },
         WeeklyMetric {
             metric: "Retried".to_string(),
@@ -4060,7 +4190,7 @@ pub async fn report_weekly(broker_url: &str, queue: &str) -> anyhow::Result<()> 
     let table = Table::new(weekly_metrics)
         .with(Style::rounded())
         .to_string();
-    println!("{}", table);
+    println!("{table}");
 
     if total_tasks == 0 {
         println!();
@@ -4082,7 +4212,7 @@ pub async fn analyze_bottlenecks(broker_url: &str, queue: &str) -> anyhow::Resul
     println!();
 
     // Check queue depth
-    let queue_key = format!("celers:{}", queue);
+    let queue_key = format!("celers:{queue}");
     let queue_type: String = redis::cmd("TYPE")
         .arg(&queue_key)
         .query_async(&mut conn)
@@ -4112,7 +4242,7 @@ pub async fn analyze_bottlenecks(broker_url: &str, queue: &str) -> anyhow::Resul
     let worker_count = worker_keys.len();
 
     // Check DLQ size
-    let dlq_key = format!("celers:{}:dlq", queue);
+    let dlq_key = format!("celers:{queue}:dlq");
     let dlq_size: isize = redis::cmd("LLEN")
         .arg(&dlq_key)
         .query_async(&mut conn)
@@ -4162,7 +4292,7 @@ pub async fn analyze_bottlenecks(broker_url: &str, queue: &str) -> anyhow::Resul
             );
         }
         if worker_count == 0 {
-            println!("  • Start workers: celers worker --broker {}", broker_url);
+            println!("  • Start workers: celers worker --broker {broker_url}");
         }
         if dlq_size > 100 {
             println!("  • Investigate failed tasks: celers dlq inspect");
@@ -4231,7 +4361,7 @@ pub async fn analyze_failures(broker_url: &str, queue: &str) -> anyhow::Result<(
     let table = Table::new(task_failures.iter().take(10))
         .with(Style::rounded())
         .to_string();
-    println!("{}", table);
+    println!("{table}");
     println!();
     println!("{}", "Recommendations:".cyan().bold());
     println!();
@@ -4256,23 +4386,23 @@ pub async fn worker_logs(
 
     println!(
         "{}",
-        format!("=== Worker Logs: {} ===", worker_id).bold().cyan()
+        format!("=== Worker Logs: {worker_id} ===").bold().cyan()
     );
     println!();
 
     // Check if worker exists
-    let heartbeat_key = format!("celers:worker:{}:heartbeat", worker_id);
+    let heartbeat_key = format!("celers:worker:{worker_id}:heartbeat");
     let exists: bool = redis::cmd("EXISTS")
         .arg(&heartbeat_key)
         .query_async(&mut conn)
         .await?;
 
     if !exists {
-        println!("{}", format!("✗ Worker '{}' not found", worker_id).red());
+        println!("{}", format!("✗ Worker '{worker_id}' not found").red());
         return Ok(());
     }
 
-    let logs_key = format!("celers:worker:{}:logs", worker_id);
+    let logs_key = format!("celers:worker:{worker_id}:logs");
 
     // Get initial logs
     let logs: Vec<String> = redis::cmd("LRANGE")
@@ -4378,7 +4508,7 @@ fn display_log_line(log: &str, level_filter: Option<&str>) {
     } else {
         // Non-JSON log, just print it
         if level_filter.is_none() {
-            println!("{}", log);
+            println!("{log}");
         }
     }
 }
@@ -4483,40 +4613,37 @@ pub async fn autoscale_status(
     println!("{}", "=== Auto-Scaling Status ===".bold().cyan());
     println!();
 
-    match autoscale_config {
-        Some(cfg) => {
-            println!(
-                "Status: {}",
-                if cfg.enabled {
-                    "Enabled".green()
-                } else {
-                    "Disabled".red()
-                }
-            );
-            println!();
-            println!("Configuration:");
-            println!("  Min workers: {}", cfg.min_workers);
-            println!("  Max workers: {}", cfg.max_workers);
-            println!("  Scale up threshold: {}", cfg.scale_up_threshold);
-            println!("  Scale down threshold: {}", cfg.scale_down_threshold);
-            println!("  Check interval: {}s", cfg.check_interval_secs);
-            println!();
+    if let Some(cfg) = autoscale_config {
+        println!(
+            "Status: {}",
+            if cfg.enabled {
+                "Enabled".green()
+            } else {
+                "Disabled".red()
+            }
+        );
+        println!();
+        println!("Configuration:");
+        println!("  Min workers: {}", cfg.min_workers);
+        println!("  Max workers: {}", cfg.max_workers);
+        println!("  Scale up threshold: {}", cfg.scale_up_threshold);
+        println!("  Scale down threshold: {}", cfg.scale_down_threshold);
+        println!("  Check interval: {}s", cfg.check_interval_secs);
+        println!();
 
-            // Get current metrics
-            let client = redis::Client::open(broker_url)?;
-            let mut conn = client.get_multiplexed_async_connection().await?;
-            let worker_keys: Vec<String> = redis::cmd("KEYS")
-                .arg("celers:worker:*:heartbeat")
-                .query_async(&mut conn)
-                .await?;
+        // Get current metrics
+        let client = redis::Client::open(broker_url)?;
+        let mut conn = client.get_multiplexed_async_connection().await?;
+        let worker_keys: Vec<String> = redis::cmd("KEYS")
+            .arg("celers:worker:*:heartbeat")
+            .query_async(&mut conn)
+            .await?;
 
-            println!("Current State:");
-            println!("  Active workers: {}", worker_keys.len().to_string().cyan());
-        }
-        None => {
-            println!("{}", "Auto-scaling is not configured".yellow());
-            println!("Add [autoscale] section to your celers.toml");
-        }
+        println!("Current State:");
+        println!("  Active workers: {}", worker_keys.len().to_string().cyan());
+    } else {
+        println!("{}", "Auto-scaling is not configured".yellow());
+        println!("Add [autoscale] section to your celers.toml");
     }
 
     Ok(())
@@ -4676,7 +4803,7 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
             }
             Err(e) => {
                 println!("{}", "✗ Connection failed".red());
-                println!("  Error: {}", e);
+                println!("  Error: {e}");
                 return Err(e);
             }
         }
@@ -4722,7 +4849,7 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
     Ok(())
 }
 
-/// Test PostgreSQL connection
+/// Test `PostgreSQL` connection
 async fn test_postgres_connection(url: &str) -> anyhow::Result<String> {
     use celers_broker_postgres::PostgresBroker;
 
@@ -4766,7 +4893,7 @@ pub async fn db_health(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Check PostgreSQL health
+/// Check `PostgreSQL` health
 async fn check_postgres_health(url: &str) -> anyhow::Result<()> {
     use celers_broker_postgres::PostgresBroker;
 
@@ -4823,7 +4950,7 @@ async fn check_postgres_health(url: &str) -> anyhow::Result<()> {
     println!("  In-Use: {}", pool_metrics.in_use.to_string().cyan());
 
     let utilization = if pool_metrics.max_size > 0 {
-        (pool_metrics.in_use as f64 / pool_metrics.max_size as f64) * 100.0
+        (f64::from(pool_metrics.in_use) / f64::from(pool_metrics.max_size)) * 100.0
     } else {
         0.0
     };
@@ -4902,17 +5029,17 @@ pub async fn db_pool_stats(url: &str) -> anyhow::Result<()> {
         ];
 
         let table = Table::new(stats).with(Style::rounded()).to_string();
-        println!("{}", table);
+        println!("{table}");
         println!();
 
         // Pool utilization
         let utilization = if metrics.max_size > 0 {
-            (metrics.in_use as f64 / metrics.max_size as f64) * 100.0
+            (f64::from(metrics.in_use) / f64::from(metrics.max_size)) * 100.0
         } else {
             0.0
         };
 
-        println!("Pool Utilization: {:.1}%", utilization);
+        println!("Pool Utilization: {utilization:.1}%");
         if utilization > 80.0 {
             println!(
                 "{}",
@@ -4966,7 +5093,7 @@ pub async fn db_migrate(url: &str, action: &str, steps: usize) -> anyhow::Result
                 println!("{}", "✓ Migrations applied successfully".green().bold());
             }
             "rollback" => {
-                println!("Rolling back {} migration(s)...", steps);
+                println!("Rolling back {steps} migration(s)...");
                 println!();
                 println!(
                     "{}",
@@ -4989,10 +5116,7 @@ pub async fn db_migrate(url: &str, action: &str, steps: usize) -> anyhow::Result
                 }
             }
             _ => {
-                anyhow::bail!(
-                    "Unknown action '{}'. Valid actions: apply, rollback, status",
-                    action
-                );
+                anyhow::bail!("Unknown action '{action}'. Valid actions: apply, rollback, status");
             }
         }
     } else {
@@ -5009,9 +5133,9 @@ pub async fn db_migrate(url: &str, action: &str, steps: usize) -> anyhow::Result
 fn mask_password(url: &str) -> String {
     if let Some(at_pos) = url.find('@') {
         if let Some(colon_pos) = url[..at_pos].rfind(':') {
-            let before = &url[..colon_pos + 1];
+            let before = &url[..=colon_pos];
             let after = &url[at_pos..];
-            return format!("{}****{}", before, after);
+            return format!("{before}****{after}");
         }
     }
     url.to_string()
@@ -5091,9 +5215,9 @@ pub async fn run_dashboard(broker_url: &str, queue: &str, refresh_secs: u64) -> 
 
             // Queue stats
             let queue_stats = [
-                format!("Pending Tasks:  {}", queue_size),
-                format!("DLQ Size:       {}", dlq_size),
-                format!("Active Workers: {}", worker_count),
+                format!("Pending Tasks:  {queue_size}"),
+                format!("DLQ Size:       {dlq_size}"),
+                format!("Active Workers: {worker_count}"),
             ];
             let queue_block = Paragraph::new(queue_stats.join("\n"))
                 .style(Style::default().fg(Color::Green))
@@ -5119,7 +5243,7 @@ pub async fn run_dashboard(broker_url: &str, queue: &str, refresh_secs: u64) -> 
                 .block(Block::default().borders(Borders::ALL).title("Queue Depth"))
                 .gauge_style(Style::default().fg(gauge_color))
                 .ratio(ratio)
-                .label(format!("{} / {}", queue_size, max_display));
+                .label(format!("{queue_size} / {max_display}"));
             f.render_widget(gauge, chunks[2]);
 
             // Status messages
@@ -5132,7 +5256,7 @@ pub async fn run_dashboard(broker_url: &str, queue: &str, refresh_secs: u64) -> 
             }
             if dlq_size > 10 {
                 messages.push(
-                    ListItem::new(format!("⚠️  High DLQ size: {} failed tasks", dlq_size))
+                    ListItem::new(format!("⚠️  High DLQ size: {dlq_size} failed tasks"))
                         .style(Style::default().fg(Color::Yellow)),
                 );
             }
@@ -5212,11 +5336,8 @@ where
                 if retries >= max_retries {
                     eprintln!(
                         "{}",
-                        format!(
-                            "✗ {} failed after {} attempts: {}",
-                            operation_name, max_retries, err
-                        )
-                        .red()
+                        format!("✗ {operation_name} failed after {max_retries} attempts: {err}")
+                            .red()
                     );
                     return Err(err);
                 }
@@ -5225,8 +5346,7 @@ where
                 eprintln!(
                     "{}",
                     format!(
-                        "⚠ {} failed (attempt {}/{}), retrying in {}ms...",
-                        operation_name, retries, max_retries, backoff_ms
+                        "⚠ {operation_name} failed (attempt {retries}/{max_retries}), retrying in {backoff_ms}ms..."
                     )
                     .yellow()
                 );
@@ -5259,30 +5379,30 @@ fn format_bytes(bytes: usize) -> String {
 #[allow(dead_code)]
 fn format_duration(seconds: u64) -> String {
     if seconds < 60 {
-        format!("{}s", seconds)
+        format!("{seconds}s")
     } else if seconds < 3600 {
         let minutes = seconds / 60;
         let secs = seconds % 60;
         if secs == 0 {
-            format!("{}m", minutes)
+            format!("{minutes}m")
         } else {
-            format!("{}m {}s", minutes, secs)
+            format!("{minutes}m {secs}s")
         }
     } else if seconds < 86400 {
         let hours = seconds / 3600;
         let minutes = (seconds % 3600) / 60;
         if minutes == 0 {
-            format!("{}h", hours)
+            format!("{hours}h")
         } else {
-            format!("{}h {}m", hours, minutes)
+            format!("{hours}h {minutes}m")
         }
     } else {
         let days = seconds / 86400;
         let hours = (seconds % 86400) / 3600;
         if hours == 0 {
-            format!("{}d", days)
+            format!("{days}d")
         } else {
-            format!("{}d {}h", days, hours)
+            format!("{days}d {hours}h")
         }
     }
 }
@@ -5291,7 +5411,7 @@ fn format_duration(seconds: u64) -> String {
 #[allow(dead_code)]
 fn validate_task_id(task_id: &str) -> anyhow::Result<uuid::Uuid> {
     uuid::Uuid::parse_str(task_id)
-        .map_err(|e| anyhow::anyhow!("Invalid task ID format: {}. Expected UUID format.", e))
+        .map_err(|e| anyhow::anyhow!("Invalid task ID format: {e}. Expected UUID format."))
 }
 
 /// Validate queue name

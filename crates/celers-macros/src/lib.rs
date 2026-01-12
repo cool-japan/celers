@@ -274,10 +274,43 @@
 //! - `not_empty` - Ensures string is not empty
 //! - `alphabetic` - Ensures string contains only alphabetic characters
 //! - `alphanumeric` - Ensures string contains only alphanumeric characters
+//! - `numeric` - Ensures string contains only numeric characters (0-9)
+//! - `hexadecimal` - Ensures string contains only hexadecimal characters (0-9, a-f, A-F)
+//! - `uuid` - Validates UUID format (8-4-4-4-12 hex digits with hyphens)
+//! - `ipv4` - Validates IPv4 address format (e.g., 192.168.1.1)
+//! - `ipv6` - Validates IPv6 address format (e.g., 2001:0db8:85a3:0000:0000:8a2e:0370:7334)
+//! - `slug` - Validates URL-friendly slug (lowercase letters, numbers, hyphens)
+//! - `mac_address` - Validates MAC address format (e.g., 00:1A:2B:3C:4D:5E)
+//! - `json` - Validates JSON string format
+//! - `base64` - Validates base64-encoded strings
+//! - `color_hex` - Validates hex color codes (#RGB or #RRGGBB)
+//! - `semver` - Validates semantic versioning format (e.g., 1.2.3, 2.0.0-alpha)
+//! - `domain` - Validates domain name format (e.g., example.com, subdomain.example.co.uk)
+//! - `ascii` - Ensures string contains only ASCII characters
+//! - `lowercase` - Ensures string contains only lowercase characters
+//! - `uppercase` - Ensures string contains only uppercase characters
+//! - `time_24h` - Validates 24-hour time format (HH:MM or HH:MM:SS)
+//! - `date_iso8601` - Validates ISO 8601 date format (YYYY-MM-DD)
+//! - `credit_card` - Validates credit card number using Luhn algorithm
+//!
+//! #### Geographic and Locale Validators
+//! - `latitude` - Validates latitude coordinates (-90 to 90)
+//! - `longitude` - Validates longitude coordinates (-180 to 180)
+//! - `iso_country` - Validates ISO 3166-1 alpha-2 country codes (e.g., US, CA, GB)
+//! - `iso_language` - Validates ISO 639-1 language codes (e.g., en, es, fr)
+//! - `us_zip` - Validates US ZIP codes (12345 or 12345-6789)
+//! - `ca_postal` - Validates Canadian postal codes (A1A 1A1 or A1A1A1)
 //!
 //! #### Numeric Validators
 //! - `positive` - Ensures number is greater than 0
 //! - `negative` - Ensures number is less than 0
+//!
+//! #### Financial and Specialized Validators
+//! - `iban` - Validates International Bank Account Number (IBAN) format
+//! - `bitcoin_address` - Validates Bitcoin addresses (P2PKH, P2SH, Bech32 formats)
+//! - `ethereum_address` - Validates Ethereum addresses (0x + 40 hex characters)
+//! - `isbn` - Validates ISBN-10 or ISBN-13 with checksum validation
+//! - `password_strength` - Validates strong passwords (8+ chars with uppercase, lowercase, digit, special char)
 //!
 //! Examples:
 //! ```ignore
@@ -290,12 +323,47 @@
 //!     #[validate(positive)] quantity: i32,
 //!     #[validate(alphabetic)] first_name: String,
 //!     #[validate(alphanumeric)] username: String,
+//!     #[validate(numeric)] pin: String,
+//!     #[validate(hexadecimal)] hash: String,
+//!     #[validate(uuid)] transaction_id: String,
+//!     #[validate(ipv4)] server_ip: String,
+//!     #[validate(ipv6)] ipv6_address: String,
+//!     #[validate(slug)] article_slug: String,
+//!     #[validate(mac_address)] device_mac: String,
+//!     #[validate(json)] config_json: String,
+//!     #[validate(base64)] encoded_data: String,
+//!     #[validate(color_hex)] theme_color: String,
+//!     #[validate(semver)] version: String,
+//!     #[validate(domain)] website_domain: String,
+//!     #[validate(ascii)] ascii_code: String,
+//!     #[validate(lowercase)] lowercase_tag: String,
+//!     #[validate(uppercase)] uppercase_code: String,
+//!     #[validate(time_24h)] meeting_time: String,
+//!     #[validate(date_iso8601)] birth_date: String,
+//!     #[validate(credit_card)] card_number: String,
+//!     #[validate(latitude)] location_lat: String,
+//!     #[validate(longitude)] location_lon: String,
+//!     #[validate(iso_country)] country_code: String,
+//!     #[validate(iso_language)] language_code: String,
+//!     #[validate(us_zip)] zip_code: String,
+//!     #[validate(ca_postal)] postal_code: String,
+//!     #[validate(iban)] bank_account: String,
+//!     #[validate(bitcoin_address)] btc_address: String,
+//!     #[validate(ethereum_address)] eth_address: String,
+//!     #[validate(isbn)] book_id: String,
+//!     #[validate(password_strength)] password: String,
 //! ) -> Result<String> {
 //!     Ok(format!("Registered {}", email))
 //! }
 //! ```
 //!
-//! **Note:** Predefined validators (`email`, `url`, `phone`) require the `regex` crate.
+//! **Note:** Predefined validators require dependencies:
+//! - `email`, `url`, `phone`, `uuid`, `ipv4`, `ipv6`, `slug`, `mac_address`, `base64`, `color_hex`, `semver`, `domain`, `time_24h`, `date_iso8601`, `iso_country`, `iso_language`, `us_zip`, `ca_postal`, `iban`, `bitcoin_address`, `ethereum_address` require the `regex` crate
+//! - `json` requires the `serde_json` crate (usually already in dependencies)
+//! - `credit_card`, `latitude`, `longitude`, `isbn`, `password_strength` use inline validation (no extra dependencies)
+//!
+//! **Performance Note:** All regex-based validators use `LazyLock` (Rust 1.80+) to compile patterns once and cache them,
+//! providing significant performance improvements over repeated regex compilation.
 //!
 //! ### Custom Error Messages
 //! - `message` - Custom error message for validation failures
@@ -303,6 +371,48 @@
 //! All validation rules can include a custom `message` parameter to provide clearer, domain-specific error messages:
 //!
 //! Example: `#[validate(min = 18, max = 120, message = "Age must be between 18 and 120")] age: i32`
+//!
+//! ### Custom Validator Functions
+//! - `custom = "function_name"` - Call a custom validation function
+//!
+//! For complex validation logic not covered by predefined validators, you can specify a custom function.
+//! The function must have the signature `fn(&T) -> Result<(), String>` where `T` is the field type.
+//! For `String` fields, you can use either `&String` or the more idiomatic `&str`.
+//!
+//! ```ignore
+//! // Define a custom validator function
+//! fn validate_even_number(value: &i32) -> Result<(), String> {
+//!     if value % 2 == 0 {
+//!         Ok(())
+//!     } else {
+//!         Err("Value must be an even number".to_string())
+//!     }
+//! }
+//!
+//! fn validate_username(value: &str) -> Result<(), String> {
+//!     if value.starts_with('@') {
+//!         Err("Username cannot start with @".to_string())
+//!     } else if value.len() < 3 {
+//!         Err("Username must be at least 3 characters".to_string())
+//!     } else {
+//!         Ok(())
+//!     }
+//! }
+//!
+//! // Use in task parameter
+//! #[task]
+//! async fn process_data(
+//!     #[validate(custom = "validate_even_number")]
+//!     count: i32,
+//!     #[validate(custom = "validate_username", min_length = 3)]
+//!     username: String,
+//! ) -> Result<String> {
+//!     Ok(format!("Processing {} items for {}", count, username))
+//! }
+//! ```
+//!
+//! **Note:** Custom validators can be combined with predefined validators. Predefined validators
+//! (like `min`, `max`, `min_length`) run first, followed by custom validators.
 //!
 //! # Limitations
 //!
@@ -535,6 +645,32 @@ use syn::{
     GenericArgument, ItemFn, Lit, Pat, PathArguments, ReturnType, Token, Type, TypePath,
 };
 
+/// Regex patterns are pre-compiled using LazyLock for optimal performance.
+/// This avoids recompiling patterns on every validation call.
+fn generate_lazy_regex_validation(
+    field_name: &syn::Ident,
+    pattern: &str,
+    pattern_name: &str,
+    error_msg_tokens: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let static_name = syn::Ident::new(
+        &format!("REGEX_{}", pattern_name.to_uppercase()),
+        field_name.span(),
+    );
+
+    quote! {
+        {
+            use std::sync::LazyLock;
+            static #static_name: LazyLock<regex::Regex> = LazyLock::new(|| {
+                regex::Regex::new(#pattern).expect("Invalid regex pattern")
+            });
+            if !#static_name.is_match(&#field_name) {
+                return Err(celers_core::CelersError(#error_msg_tokens));
+            }
+        }
+    }
+}
+
 /// Helper function to check if a type is Option<T>
 fn is_option_type(ty: &Type) -> bool {
     if let Type::Path(TypePath { path, .. }) = ty {
@@ -574,6 +710,40 @@ struct FieldValidation {
     negative: bool,
     alphabetic: bool,
     alphanumeric: bool,
+    numeric: bool,
+    uuid: bool,
+    ipv4: bool,
+    hexadecimal: bool,
+    ipv6: bool,
+    slug: bool,
+    mac_address: bool,
+    json: bool,
+    base64: bool,
+    color_hex: bool,
+    // Additional practical validators
+    semver: bool,
+    domain: bool,
+    ascii: bool,
+    lowercase: bool,
+    uppercase: bool,
+    time_24h: bool,
+    date_iso8601: bool,
+    credit_card: bool,
+    // Geographic and locale validators
+    latitude: bool,
+    longitude: bool,
+    iso_country: bool,
+    iso_language: bool,
+    us_zip: bool,
+    ca_postal: bool,
+    // Financial and specialized validators
+    iban: bool,
+    bitcoin_address: bool,
+    ethereum_address: bool,
+    isbn: bool,
+    password_strength: bool,
+    // Custom validator function
+    custom: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -594,6 +764,36 @@ impl FieldValidation {
             negative: false,
             alphabetic: false,
             alphanumeric: false,
+            numeric: false,
+            uuid: false,
+            ipv4: false,
+            hexadecimal: false,
+            ipv6: false,
+            slug: false,
+            mac_address: false,
+            json: false,
+            base64: false,
+            color_hex: false,
+            semver: false,
+            domain: false,
+            ascii: false,
+            lowercase: false,
+            uppercase: false,
+            time_24h: false,
+            date_iso8601: false,
+            credit_card: false,
+            latitude: false,
+            longitude: false,
+            iso_country: false,
+            iso_language: false,
+            us_zip: false,
+            ca_postal: false,
+            iban: false,
+            bitcoin_address: false,
+            ethereum_address: false,
+            isbn: false,
+            password_strength: false,
+            custom: None,
         }
     }
 
@@ -639,9 +839,70 @@ impl FieldValidation {
                         validation.alphabetic = true;
                     } else if meta.path.is_ident("alphanumeric") {
                         validation.alphanumeric = true;
+                    } else if meta.path.is_ident("numeric") {
+                        validation.numeric = true;
+                    } else if meta.path.is_ident("uuid") {
+                        validation.uuid = true;
+                    } else if meta.path.is_ident("ipv4") {
+                        validation.ipv4 = true;
+                    } else if meta.path.is_ident("hexadecimal") {
+                        validation.hexadecimal = true;
+                    } else if meta.path.is_ident("ipv6") {
+                        validation.ipv6 = true;
+                    } else if meta.path.is_ident("slug") {
+                        validation.slug = true;
+                    } else if meta.path.is_ident("mac_address") {
+                        validation.mac_address = true;
+                    } else if meta.path.is_ident("json") {
+                        validation.json = true;
+                    } else if meta.path.is_ident("base64") {
+                        validation.base64 = true;
+                    } else if meta.path.is_ident("color_hex") {
+                        validation.color_hex = true;
+                    } else if meta.path.is_ident("semver") {
+                        validation.semver = true;
+                    } else if meta.path.is_ident("domain") {
+                        validation.domain = true;
+                    } else if meta.path.is_ident("ascii") {
+                        validation.ascii = true;
+                    } else if meta.path.is_ident("lowercase") {
+                        validation.lowercase = true;
+                    } else if meta.path.is_ident("uppercase") {
+                        validation.uppercase = true;
+                    } else if meta.path.is_ident("time_24h") {
+                        validation.time_24h = true;
+                    } else if meta.path.is_ident("date_iso8601") {
+                        validation.date_iso8601 = true;
+                    } else if meta.path.is_ident("credit_card") {
+                        validation.credit_card = true;
+                    } else if meta.path.is_ident("latitude") {
+                        validation.latitude = true;
+                    } else if meta.path.is_ident("longitude") {
+                        validation.longitude = true;
+                    } else if meta.path.is_ident("iso_country") {
+                        validation.iso_country = true;
+                    } else if meta.path.is_ident("iso_language") {
+                        validation.iso_language = true;
+                    } else if meta.path.is_ident("us_zip") {
+                        validation.us_zip = true;
+                    } else if meta.path.is_ident("ca_postal") {
+                        validation.ca_postal = true;
+                    } else if meta.path.is_ident("iban") {
+                        validation.iban = true;
+                    } else if meta.path.is_ident("bitcoin_address") {
+                        validation.bitcoin_address = true;
+                    } else if meta.path.is_ident("ethereum_address") {
+                        validation.ethereum_address = true;
+                    } else if meta.path.is_ident("isbn") {
+                        validation.isbn = true;
+                    } else if meta.path.is_ident("password_strength") {
+                        validation.password_strength = true;
+                    } else if meta.path.is_ident("custom") {
+                        let value: syn::LitStr = meta.value()?.parse()?;
+                        validation.custom = Some(value.value());
                     } else {
                         return Err(meta.error(format!(
-                            "unknown validation parameter '{}'. Valid parameters: min, max, min_length, max_length, pattern, message, email, url, phone, not_empty, positive, negative, alphabetic, alphanumeric",
+                            "unknown validation parameter '{}'. Valid parameters: min, max, min_length, max_length, pattern, message, email, url, phone, not_empty, positive, negative, alphabetic, alphanumeric, numeric, uuid, ipv4, hexadecimal, ipv6, slug, mac_address, json, base64, color_hex, semver, domain, ascii, lowercase, uppercase, time_24h, date_iso8601, credit_card, latitude, longitude, iso_country, iso_language, us_zip, ca_postal, iban, bitcoin_address, ethereum_address, isbn, password_strength, custom",
                             meta.path.get_ident().map(|i| i.to_string()).unwrap_or_default()
                         )));
                     }
@@ -752,7 +1013,7 @@ impl FieldValidation {
             }
         }
 
-        // Pattern validation for strings
+        // Pattern validation for strings (custom patterns cannot use LazyLock due to dynamic pattern)
         if let Some(pattern) = &self.pattern {
             let error_msg = if let Some(msg) = &self.message {
                 quote! { #msg.to_string() }
@@ -781,7 +1042,7 @@ impl FieldValidation {
             });
         }
 
-        // Predefined validation: email
+        // Predefined validation: email (optimized with LazyLock)
         if self.email {
             let error_msg = if let Some(msg) = &self.message {
                 quote! { #msg.to_string() }
@@ -794,18 +1055,13 @@ impl FieldValidation {
                 }
             };
 
-            validations.push(quote! {
-                {
-                    let email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
-                    let regex = regex::Regex::new(email_pattern).unwrap();
-                    if !regex.is_match(&#field_name) {
-                        return Err(celers_core::CelersError(#error_msg));
-                    }
-                }
-            });
+            let pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "EMAIL", error_msg,
+            ));
         }
 
-        // Predefined validation: url
+        // Predefined validation: url (optimized with LazyLock)
         if self.url {
             let error_msg = if let Some(msg) = &self.message {
                 quote! { #msg.to_string() }
@@ -818,18 +1074,13 @@ impl FieldValidation {
                 }
             };
 
-            validations.push(quote! {
-                {
-                    let url_pattern = r"^https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$";
-                    let regex = regex::Regex::new(url_pattern).unwrap();
-                    if !regex.is_match(&#field_name) {
-                        return Err(celers_core::CelersError(#error_msg));
-                    }
-                }
-            });
+            let pattern = r"^https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "URL", error_msg,
+            ));
         }
 
-        // Predefined validation: phone
+        // Predefined validation: phone (optimized with LazyLock)
         if self.phone {
             let error_msg = if let Some(msg) = &self.message {
                 quote! { #msg.to_string() }
@@ -842,15 +1093,10 @@ impl FieldValidation {
                 }
             };
 
-            validations.push(quote! {
-                {
-                    let phone_pattern = r"^\+?[0-9]{10,15}$";
-                    let regex = regex::Regex::new(phone_pattern).unwrap();
-                    if !regex.is_match(&#field_name) {
-                        return Err(celers_core::CelersError(#error_msg));
-                    }
-                }
-            });
+            let pattern = r"^\+?[0-9]{10,15}$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "PHONE", error_msg,
+            ));
         }
 
         // Predefined validation: not_empty
@@ -949,6 +1195,704 @@ impl FieldValidation {
             validations.push(quote! {
                 if !#field_name.chars().all(|c| c.is_alphanumeric()) {
                     return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: numeric
+        if self.numeric {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must contain only numeric characters",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if !#field_name.chars().all(|c| c.is_numeric()) {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: uuid (optimized with LazyLock)
+        if self.uuid {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid UUID",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern =
+                r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "UUID", error_msg,
+            ));
+        }
+
+        // Predefined validation: ipv4 (optimized with LazyLock)
+        if self.ipv4 {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid IPv4 address",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "IPV4", error_msg,
+            ));
+        }
+
+        // Predefined validation: hexadecimal
+        if self.hexadecimal {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must contain only hexadecimal characters",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if !#field_name.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: ipv6 (optimized with LazyLock)
+        if self.ipv6 {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid IPv6 address",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "IPV6", error_msg,
+            ));
+        }
+
+        // Predefined validation: slug (optimized with LazyLock)
+        if self.slug {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid URL slug (lowercase letters, numbers, and hyphens only)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^[a-z0-9]+(?:-[a-z0-9]+)*$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "SLUG", error_msg,
+            ));
+        }
+
+        // Predefined validation: mac_address (optimized with LazyLock)
+        if self.mac_address {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid MAC address",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$";
+            validations.push(generate_lazy_regex_validation(
+                field_name,
+                pattern,
+                "MAC_ADDRESS",
+                error_msg,
+            ));
+        }
+
+        // Predefined validation: json
+        if self.json {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be valid JSON",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    if serde_json::from_str::<serde_json::Value>(&#field_name).is_err() {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: base64 (optimized with LazyLock)
+        if self.base64 {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be valid base64",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    use std::sync::LazyLock;
+                    static REGEX_BASE64: LazyLock<regex::Regex> = LazyLock::new(|| {
+                        regex::Regex::new(r"^[A-Za-z0-9+/]*={0,2}$").expect("Invalid regex pattern")
+                    });
+                    if !REGEX_BASE64.is_match(&#field_name) || (#field_name.len() % 4 != 0) {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: color_hex (optimized with LazyLock)
+        if self.color_hex {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid hex color code (#RGB or #RRGGBB)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$";
+            validations.push(generate_lazy_regex_validation(
+                field_name,
+                pattern,
+                "COLOR_HEX",
+                error_msg,
+            ));
+        }
+
+        // Predefined validation: semver (optimized with LazyLock)
+        if self.semver {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid semantic version (e.g., 1.2.3)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "SEMVER", error_msg,
+            ));
+        }
+
+        // Predefined validation: domain (optimized with LazyLock)
+        if self.domain {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid domain name",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "DOMAIN", error_msg,
+            ));
+        }
+
+        // Predefined validation: ascii
+        if self.ascii {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must contain only ASCII characters",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if !#field_name.is_ascii() {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: lowercase
+        if self.lowercase {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must contain only lowercase characters",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if !#field_name.chars().all(|c| c.is_lowercase() || !c.is_alphabetic()) {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: uppercase
+        if self.uppercase {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must contain only uppercase characters",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                if !#field_name.chars().all(|c| c.is_uppercase() || !c.is_alphabetic()) {
+                    return Err(celers_core::CelersError(#error_msg));
+                }
+            });
+        }
+
+        // Predefined validation: time_24h (optimized with LazyLock)
+        if self.time_24h {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid 24-hour time (HH:MM or HH:MM:SS)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "TIME_24H", error_msg,
+            ));
+        }
+
+        // Predefined validation: date_iso8601 (optimized with LazyLock)
+        if self.date_iso8601 {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid ISO 8601 date (YYYY-MM-DD)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$";
+            validations.push(generate_lazy_regex_validation(
+                field_name,
+                pattern,
+                "DATE_ISO8601",
+                error_msg,
+            ));
+        }
+
+        // Predefined validation: credit_card (Luhn algorithm)
+        if self.credit_card {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid credit card number",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    // Remove spaces and hyphens
+                    let cleaned: String = #field_name.chars().filter(|c| c.is_numeric()).collect();
+
+                    // Check length (13-19 digits for most cards)
+                    if cleaned.len() < 13 || cleaned.len() > 19 {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+
+                    // Luhn algorithm
+                    let mut sum = 0;
+                    let mut double = false;
+                    for ch in cleaned.chars().rev() {
+                        let mut digit = ch.to_digit(10).unwrap_or(0) as i32;
+                        if double {
+                            digit *= 2;
+                            if digit > 9 {
+                                digit -= 9;
+                            }
+                        }
+                        sum += digit;
+                        double = !double;
+                    }
+
+                    if sum % 10 != 0 {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: latitude (geographic coordinate)
+        if self.latitude {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid latitude (-90 to 90)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    let lat: f64 = #field_name.parse().map_err(|_| {
+                        celers_core::CelersError(#error_msg.clone())
+                    })?;
+                    if !(-90.0..=90.0).contains(&lat) {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: longitude (geographic coordinate)
+        if self.longitude {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid longitude (-180 to 180)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    let lon: f64 = #field_name.parse().map_err(|_| {
+                        celers_core::CelersError(#error_msg.clone())
+                    })?;
+                    if !(-180.0..=180.0).contains(&lon) {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: iso_country (ISO 3166-1 alpha-2 country code)
+        if self.iso_country {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid ISO 3166-1 alpha-2 country code (e.g., US, CA, GB)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^[A-Z]{2}$";
+            validations.push(generate_lazy_regex_validation(
+                field_name,
+                pattern,
+                "ISO_COUNTRY",
+                error_msg,
+            ));
+        }
+
+        // Predefined validation: iso_language (ISO 639-1 language code)
+        if self.iso_language {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid ISO 639-1 language code (e.g., en, es, fr)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^[a-z]{2}$";
+            validations.push(generate_lazy_regex_validation(
+                field_name,
+                pattern,
+                "ISO_LANGUAGE",
+                error_msg,
+            ));
+        }
+
+        // Predefined validation: us_zip (US ZIP code)
+        if self.us_zip {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid US ZIP code (12345 or 12345-6789)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^\d{5}(?:-\d{4})?$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "US_ZIP", error_msg,
+            ));
+        }
+
+        // Predefined validation: ca_postal (Canadian postal code)
+        if self.ca_postal {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid Canadian postal code (A1A 1A1 or A1A1A1)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            let pattern = r"^[A-Z]\d[A-Z]\s?\d[A-Z]\d$";
+            validations.push(generate_lazy_regex_validation(
+                field_name,
+                pattern,
+                "CA_POSTAL",
+                error_msg,
+            ));
+        }
+
+        // Predefined validation: iban (International Bank Account Number)
+        if self.iban {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid IBAN (International Bank Account Number)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            // IBAN format: 2 letter country code + 2 check digits + up to 30 alphanumeric
+            let pattern = r"^[A-Z]{2}[0-9]{2}[A-Z0-9]{1,30}$";
+            validations.push(generate_lazy_regex_validation(
+                field_name, pattern, "IBAN", error_msg,
+            ));
+        }
+
+        // Predefined validation: bitcoin_address
+        if self.bitcoin_address {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid Bitcoin address",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            // Bitcoin address formats: P2PKH (1...), P2SH (3...), Bech32 (bc1...)
+            let pattern =
+                r"^(1[a-km-zA-HJ-NP-Z1-9]{25,34}|3[a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z0-9]{39,59})$";
+            validations.push(generate_lazy_regex_validation(
+                field_name,
+                pattern,
+                "BITCOIN_ADDRESS",
+                error_msg,
+            ));
+        }
+
+        // Predefined validation: ethereum_address
+        if self.ethereum_address {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid Ethereum address",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            // Ethereum address: 0x followed by 40 hexadecimal characters
+            let pattern = r"^0x[a-fA-F0-9]{40}$";
+            validations.push(generate_lazy_regex_validation(
+                field_name,
+                pattern,
+                "ETHEREUM_ADDRESS",
+                error_msg,
+            ));
+        }
+
+        // Predefined validation: isbn
+        if self.isbn {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a valid ISBN (10 or 13 digits)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    // Remove hyphens and spaces
+                    let cleaned: String = #field_name.chars().filter(|c| c.is_alphanumeric()).collect();
+
+                    if cleaned.len() == 10 {
+                        // ISBN-10 validation with checksum
+                        if !cleaned.chars().take(9).all(|c| c.is_numeric()) {
+                            return Err(celers_core::CelersError(#error_msg));
+                        }
+
+                        let mut sum = 0;
+                        for (i, ch) in cleaned.chars().take(9).enumerate() {
+                            sum += (10 - i) * ch.to_digit(10).unwrap_or(0) as usize;
+                        }
+
+                        let check_char = cleaned.chars().nth(9).unwrap_or('?');
+                        let check_digit = if check_char == 'X' || check_char == 'x' {
+                            10
+                        } else {
+                            check_char.to_digit(10).unwrap_or(11) as usize
+                        };
+
+                        if (sum + check_digit) % 11 != 0 {
+                            return Err(celers_core::CelersError(#error_msg));
+                        }
+                    } else if cleaned.len() == 13 {
+                        // ISBN-13 validation with checksum
+                        if !cleaned.chars().all(|c| c.is_numeric()) {
+                            return Err(celers_core::CelersError(#error_msg));
+                        }
+
+                        let mut sum = 0;
+                        for (i, ch) in cleaned.chars().enumerate() {
+                            let digit = ch.to_digit(10).unwrap_or(0) as usize;
+                            sum += if i % 2 == 0 { digit } else { digit * 3 };
+                        }
+
+                        if sum % 10 != 0 {
+                            return Err(celers_core::CelersError(#error_msg));
+                        }
+                    } else {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Predefined validation: password_strength
+        if self.password_strength {
+            let error_msg = if let Some(msg) = &self.message {
+                quote! { #msg.to_string() }
+            } else {
+                quote! {
+                    format!(
+                        "Field '{}' must be a strong password (at least 8 characters with uppercase, lowercase, digit, and special character)",
+                        stringify!(#field_name)
+                    )
+                }
+            };
+
+            validations.push(quote! {
+                {
+                    if #field_name.len() < 8 {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+
+                    let has_uppercase = #field_name.chars().any(|c| c.is_uppercase());
+                    let has_lowercase = #field_name.chars().any(|c| c.is_lowercase());
+                    let has_digit = #field_name.chars().any(|c| c.is_numeric());
+                    let has_special = #field_name.chars().any(|c| !c.is_alphanumeric());
+
+                    if !has_uppercase || !has_lowercase || !has_digit || !has_special {
+                        return Err(celers_core::CelersError(#error_msg));
+                    }
+                }
+            });
+        }
+
+        // Custom validator function
+        if let Some(custom_fn) = &self.custom {
+            let custom_fn_ident = syn::Ident::new(custom_fn, proc_macro2::Span::call_site());
+
+            validations.push(quote! {
+                if let Err(e) = #custom_fn_ident(&#field_name) {
+                    return Err(celers_core::CelersError(e));
                 }
             });
         }

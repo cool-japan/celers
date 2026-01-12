@@ -32,3 +32,15 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 [[bench]]
 name = "broker_benchmarks"
 harness = false
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "monitoring_performance"
+path = "examples/monitoring_performance.rs"
+
+[[example]]
+name = "advanced_utilities"
+path = "examples/advanced_utilities.rs"

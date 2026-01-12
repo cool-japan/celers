@@ -73,7 +73,7 @@ struct TaskRecord {
 }
 
 /// Performance statistics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PerformanceStats {
     /// Tasks completed per second
     pub tasks_per_second: f64,
@@ -330,6 +330,50 @@ impl PerformanceTracker {
         let mut state = self.state.write().await;
         state.records.clear();
         state.window_start = Instant::now();
+    }
+
+    /// Check if performance is degraded based on thresholds
+    pub async fn is_degraded(&self, max_failure_rate: f64, max_p99_latency_ms: f64) -> bool {
+        let stats = self.get_stats().await;
+        stats.failure_rate > max_failure_rate
+            || stats.p99_latency.as_millis() as f64 > max_p99_latency_ms
+    }
+
+    /// Get stats as JSON string
+    pub async fn get_stats_json(&self) -> Result<String, serde_json::Error> {
+        let stats = self.get_stats().await;
+        serde_json::to_string(&stats)
+    }
+
+    /// Get stats as pretty JSON string
+    pub async fn get_stats_json_pretty(&self) -> Result<String, serde_json::Error> {
+        let stats = self.get_stats().await;
+        serde_json::to_string_pretty(&stats)
+    }
+
+    /// Get the number of records in the current window
+    pub async fn record_count(&self) -> usize {
+        self.state.read().await.records.len()
+    }
+
+    /// Check if there's enough data for meaningful statistics
+    pub async fn has_sufficient_data(&self, min_samples: usize) -> bool {
+        self.record_count().await >= min_samples
+    }
+
+    /// Get task throughput for a specific time window
+    pub async fn get_throughput(&self, window_secs: u64) -> f64 {
+        let state = self.state.read().await;
+        let now = Instant::now();
+        let window_start = now - Duration::from_secs(window_secs);
+
+        let count = state
+            .records
+            .iter()
+            .filter(|r| r.completed_at >= window_start)
+            .count();
+
+        count as f64 / window_secs as f64
     }
 }
 

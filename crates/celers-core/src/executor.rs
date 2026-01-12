@@ -1,3 +1,4 @@
+#![allow(clippy::missing_errors_doc)]
 use crate::{Result, SerializedTask, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,8 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
+    #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self {
             handlers: Arc::new(RwLock::new(HashMap::new())),
@@ -112,7 +115,7 @@ mod tests {
             })
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "add"
         }
     }

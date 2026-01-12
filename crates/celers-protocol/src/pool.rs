@@ -70,7 +70,7 @@ impl MessagePool {
         // Clear the message for reuse
         msg.headers.task.clear();
         msg.headers.id = Uuid::nil();
-        msg.headers.lang = "rust".to_string();
+        msg.headers.lang = crate::DEFAULT_LANG.to_string();
         msg.headers.root_id = None;
         msg.headers.parent_id = None;
         msg.headers.group = None;
@@ -80,8 +80,8 @@ impl MessagePool {
         msg.headers.extra.clear();
         msg.properties = crate::MessageProperties::default();
         msg.body.clear();
-        msg.content_type = "application/json".to_string();
-        msg.content_encoding = "utf-8".to_string();
+        msg.content_type = crate::CONTENT_TYPE_JSON.to_string();
+        msg.content_encoding = crate::ENCODING_UTF8.to_string();
 
         PooledMessage {
             message: Some(msg),
@@ -99,11 +99,13 @@ impl MessagePool {
     }
 
     /// Get the current number of messages in the pool
+    #[inline]
     pub fn size(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
 
     /// Get the maximum pool size
+    #[inline]
     pub fn max_size(&self) -> usize {
         self.max_size
     }
@@ -135,11 +137,13 @@ impl PooledMessage {
     }
 
     /// Get a reference to the message
+    #[inline]
     pub fn get(&self) -> &crate::Message {
         self.message.as_ref().unwrap()
     }
 
     /// Get a mutable reference to the message
+    #[inline]
     pub fn get_mut(&mut self) -> &mut crate::Message {
         self.message.as_mut().unwrap()
     }
@@ -216,11 +220,13 @@ impl TaskArgsPool {
     }
 
     /// Get the current number of task args in the pool
+    #[inline]
     pub fn size(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
 
     /// Get the maximum pool size
+    #[inline]
     pub fn max_size(&self) -> usize {
         self.max_size
     }
@@ -250,11 +256,13 @@ impl PooledTaskArgs {
     }
 
     /// Get a reference
+    #[inline]
     pub fn get(&self) -> &crate::TaskArgs {
         self.args.as_ref().unwrap()
     }
 
     /// Get a mutable reference
+    #[inline]
     pub fn get_mut(&mut self) -> &mut crate::TaskArgs {
         self.args.as_mut().unwrap()
     }

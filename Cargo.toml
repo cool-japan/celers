@@ -61,6 +61,9 @@ hostname = "0.4.1"
 regex = "1.11"
 rand = "0.9"
 flate2 = "1.0"
+crossbeam-deque = "0.8"
+num_cpus = "1.16"
+libc = "0.2"
 
 # Root package for examples
 [package]

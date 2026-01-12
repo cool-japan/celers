@@ -31,6 +31,9 @@ use celers_metrics::{
     DLQ_SIZE, PROCESSING_QUEUE_SIZE, QUEUE_SIZE, TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL,
 };
 
+pub mod monitoring;
+pub mod utilities;
+
 /// Task state in the database
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -662,12 +665,554 @@ impl CircuitBreakerStateInternal {
     }
 }
 
+/// Idempotency key information for duplicate prevention
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdempotencyRecord {
+    pub id: Uuid,
+    pub idempotency_key: String,
+    pub task_name: String,
+    pub task_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Idempotency statistics per task type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdempotencyStats {
+    pub task_name: String,
+    pub total_keys: i64,
+    pub unique_keys: i64,
+    pub active_keys: i64,
+    pub expired_keys: i64,
+    pub oldest_key: Option<DateTime<Utc>>,
+    pub newest_key: Option<DateTime<Utc>>,
+}
+
+/// Idempotency configuration
+#[derive(Debug, Clone)]
+pub struct IdempotencyConfig {
+    /// Default TTL for idempotency keys (in seconds)
+    pub default_ttl_secs: u64,
+    /// Whether to automatically cleanup expired keys
+    pub auto_cleanup: bool,
+}
+
+impl Default for IdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_secs: 86400, // 24 hours
+            auto_cleanup: true,
+        }
+    }
+}
+
+/// Workflow state
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl std::fmt::Display for WorkflowState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkflowState::Pending => write!(f, "pending"),
+            WorkflowState::Running => write!(f, "running"),
+            WorkflowState::Completed => write!(f, "completed"),
+            WorkflowState::Failed => write!(f, "failed"),
+            WorkflowState::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+/// Workflow stage state
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StageState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+impl std::fmt::Display for StageState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StageState::Pending => write!(f, "pending"),
+            StageState::Running => write!(f, "running"),
+            StageState::Completed => write!(f, "completed"),
+            StageState::Failed => write!(f, "failed"),
+            StageState::Skipped => write!(f, "skipped"),
+        }
+    }
+}
+
+/// Workflow definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workflow {
+    pub id: Uuid,
+    pub workflow_name: String,
+    pub state: WorkflowState,
+    pub config: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+}
+
+/// Workflow stage for parallel execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStage {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    pub stage_number: i32,
+    pub stage_name: String,
+    pub state: StageState,
+    pub task_count: i32,
+    pub completed_count: i32,
+    pub failed_count: i32,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Task dependency for DAG execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDependency {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub parent_task_id: Uuid,
+    pub workflow_id: Option<Uuid>,
+    pub stage_id: Option<Uuid>,
+    pub satisfied: bool,
+    pub created_at: DateTime<Utc>,
+    pub satisfied_at: Option<DateTime<Utc>>,
+}
+
+/// Workflow statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStatistics {
+    pub workflow_id: Uuid,
+    pub workflow_name: String,
+    pub workflow_state: WorkflowState,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub total_stages: i64,
+    pub completed_stages: i64,
+    pub failed_stages: i64,
+    pub running_stages: i64,
+    pub total_tasks: i64,
+    pub completed_tasks: i64,
+    pub failed_tasks: i64,
+    pub duration_secs: Option<i64>,
+}
+
+/// Workflow builder for creating complex DAG workflows
+#[derive(Debug, Clone)]
+pub struct WorkflowBuilder {
+    workflow_name: String,
+    stages: Vec<WorkflowStageBuilder>,
+}
+
+/// Workflow stage builder
+#[derive(Debug, Clone)]
+pub struct WorkflowStageBuilder {
+    stage_name: String,
+    tasks: Vec<SerializedTask>,
+    dependencies: Vec<String>, // Stage names this stage depends on
+}
+
+impl WorkflowBuilder {
+    /// Create a new workflow builder
+    pub fn new(workflow_name: String) -> Self {
+        Self {
+            workflow_name,
+            stages: Vec::new(),
+        }
+    }
+
+    /// Add a new stage to the workflow
+    pub fn add_stage(mut self, stage_name: String) -> Self {
+        self.stages.push(WorkflowStageBuilder {
+            stage_name,
+            tasks: Vec::new(),
+            dependencies: Vec::new(),
+        });
+        self
+    }
+
+    /// Add a task to the current stage
+    pub fn add_task_to_stage(mut self, task: SerializedTask) -> Self {
+        if let Some(stage) = self.stages.last_mut() {
+            stage.tasks.push(task);
+        }
+        self
+    }
+
+    /// Add dependencies to the current stage
+    pub fn add_stage_dependencies(mut self, dependencies: Vec<String>) -> Self {
+        if let Some(stage) = self.stages.last_mut() {
+            stage.dependencies = dependencies;
+        }
+        self
+    }
+
+    /// Get the workflow name
+    pub fn workflow_name(&self) -> &str {
+        &self.workflow_name
+    }
+
+    /// Get the stages
+    pub fn stages(&self) -> &[WorkflowStageBuilder] {
+        &self.stages
+    }
+}
+
+impl WorkflowStageBuilder {
+    /// Get the stage name
+    pub fn stage_name(&self) -> &str {
+        &self.stage_name
+    }
+
+    /// Get the tasks in this stage
+    pub fn tasks(&self) -> &[SerializedTask] {
+        &self.tasks
+    }
+
+    /// Get the dependencies
+    pub fn dependencies(&self) -> &[String] {
+        &self.dependencies
+    }
+}
+
+/// Type alias for async lifecycle hook functions
+///
+/// Hooks are async functions that take a hook context and serialized task,
+/// and return a Result. They can be used to inject custom logic at various
+/// points in the task lifecycle.
+pub type HookFn = Arc<
+    dyn Fn(
+            &HookContext,
+            &SerializedTask,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Context passed to lifecycle hooks
+#[derive(Debug, Clone)]
+pub struct HookContext {
+    /// Queue name
+    pub queue_name: String,
+    /// Task ID (if available)
+    pub task_id: Option<Uuid>,
+    /// Current timestamp
+    pub timestamp: DateTime<Utc>,
+    /// Additional metadata
+    pub metadata: serde_json::Value,
+}
+
+/// Task lifecycle hook enum
+#[derive(Clone)]
+pub enum TaskHook {
+    /// Called before a task is enqueued
+    BeforeEnqueue(HookFn),
+    /// Called after a task is successfully enqueued
+    AfterEnqueue(HookFn),
+    /// Called before a task is dequeued (reserved for future use)
+    BeforeDequeue(HookFn),
+    /// Called after a task is dequeued
+    AfterDequeue(HookFn),
+    /// Called before a task is acknowledged
+    BeforeAck(HookFn),
+    /// Called after a task is acknowledged
+    AfterAck(HookFn),
+    /// Called before a task is rejected
+    BeforeReject(HookFn),
+    /// Called after a task is rejected
+    AfterReject(HookFn),
+}
+
+/// Container for all registered hooks
+#[derive(Clone, Default)]
+pub struct TaskHooks {
+    before_enqueue: Vec<HookFn>,
+    after_enqueue: Vec<HookFn>,
+    before_dequeue: Vec<HookFn>,
+    after_dequeue: Vec<HookFn>,
+    before_ack: Vec<HookFn>,
+    after_ack: Vec<HookFn>,
+    before_reject: Vec<HookFn>,
+    after_reject: Vec<HookFn>,
+}
+
+impl TaskHooks {
+    /// Create empty hooks container
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a hook
+    pub fn add(&mut self, hook: TaskHook) {
+        match hook {
+            TaskHook::BeforeEnqueue(f) => self.before_enqueue.push(f),
+            TaskHook::AfterEnqueue(f) => self.after_enqueue.push(f),
+            TaskHook::BeforeDequeue(f) => self.before_dequeue.push(f),
+            TaskHook::AfterDequeue(f) => self.after_dequeue.push(f),
+            TaskHook::BeforeAck(f) => self.before_ack.push(f),
+            TaskHook::AfterAck(f) => self.after_ack.push(f),
+            TaskHook::BeforeReject(f) => self.before_reject.push(f),
+            TaskHook::AfterReject(f) => self.after_reject.push(f),
+        }
+    }
+
+    /// Clear all hooks
+    pub fn clear(&mut self) {
+        self.before_enqueue.clear();
+        self.after_enqueue.clear();
+        self.before_dequeue.clear();
+        self.after_dequeue.clear();
+        self.before_ack.clear();
+        self.after_ack.clear();
+        self.before_reject.clear();
+        self.after_reject.clear();
+    }
+
+    /// Execute before_enqueue hooks
+    async fn run_before_enqueue(&self, ctx: &HookContext, task: &SerializedTask) -> Result<()> {
+        for hook in &self.before_enqueue {
+            hook(ctx, task).await?;
+        }
+        Ok(())
+    }
+
+    /// Execute after_enqueue hooks
+    async fn run_after_enqueue(&self, ctx: &HookContext, task: &SerializedTask) -> Result<()> {
+        for hook in &self.after_enqueue {
+            hook(ctx, task).await?;
+        }
+        Ok(())
+    }
+
+    /// Execute before_ack hooks
+    #[allow(dead_code)]
+    async fn run_before_ack(&self, ctx: &HookContext, task: &SerializedTask) -> Result<()> {
+        for hook in &self.before_ack {
+            hook(ctx, task).await?;
+        }
+        Ok(())
+    }
+
+    /// Execute after_ack hooks
+    #[allow(dead_code)]
+    async fn run_after_ack(&self, ctx: &HookContext, task: &SerializedTask) -> Result<()> {
+        for hook in &self.after_ack {
+            hook(ctx, task).await?;
+        }
+        Ok(())
+    }
+
+    /// Execute before_reject hooks
+    #[allow(dead_code)]
+    async fn run_before_reject(&self, ctx: &HookContext, task: &SerializedTask) -> Result<()> {
+        for hook in &self.before_reject {
+            hook(ctx, task).await?;
+        }
+        Ok(())
+    }
+
+    /// Execute after_reject hooks
+    #[allow(dead_code)]
+    async fn run_after_reject(&self, ctx: &HookContext, task: &SerializedTask) -> Result<()> {
+        for hook in &self.after_reject {
+            hook(ctx, task).await?;
+        }
+        Ok(())
+    }
+
+    /// Execute after_dequeue hooks
+    #[allow(dead_code)]
+    async fn run_after_dequeue(&self, ctx: &HookContext, task: &SerializedTask) -> Result<()> {
+        for hook in &self.after_dequeue {
+            hook(ctx, task).await?;
+        }
+        Ok(())
+    }
+}
+
+/// W3C Trace Context for distributed tracing
+///
+/// Compatible with OpenTelemetry, Jaeger, Zipkin, and other distributed tracing systems.
+/// See: https://www.w3.org/TR/trace-context/
+///
+/// # Example
+/// ```
+/// use celers_broker_sql::{MysqlBroker, TraceContext};
+/// use celers_core::{Broker, SerializedTask};
+///
+/// # async fn example() -> celers_core::Result<()> {
+/// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+/// // Create a trace context
+/// let trace_ctx = TraceContext::new(
+///     "4bf92f3577b34da6a3ce929d0e0e4736",
+///     "00f067aa0ba902b7"
+/// );
+///
+/// // Enqueue task with trace context
+/// let task = SerializedTask::new("my_task".to_string(), vec![]);
+/// broker.enqueue_with_trace_context(task, trace_ctx).await?;
+///
+/// // Extract trace context when processing
+/// if let Some(msg) = broker.dequeue().await? {
+///     if let Some(ctx) = broker.extract_trace_context(&msg.task.metadata.id).await? {
+///         println!("Processing task with trace_id: {}", ctx.trace_id);
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceContext {
+    /// W3C Trace ID (32 hex characters, 16 bytes)
+    pub trace_id: String,
+    /// W3C Span ID (16 hex characters, 8 bytes)
+    pub span_id: String,
+    /// Trace flags (8-bit field, typically "01" for sampled)
+    #[serde(default = "default_trace_flags")]
+    pub trace_flags: String,
+    /// Optional trace state for vendor-specific data
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_state: Option<String>,
+}
+
+fn default_trace_flags() -> String {
+    "01".to_string()
+}
+
+impl TraceContext {
+    /// Create a new trace context with trace_id and span_id
+    ///
+    /// # Arguments
+    /// * `trace_id` - 32 hex character trace ID (W3C format)
+    /// * `span_id` - 16 hex character span ID (W3C format)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_broker_sql::TraceContext;
+    ///
+    /// let ctx = TraceContext::new(
+    ///     "4bf92f3577b34da6a3ce929d0e0e4736",
+    ///     "00f067aa0ba902b7"
+    /// );
+    /// assert_eq!(ctx.trace_flags, "01"); // Sampled by default
+    /// ```
+    pub fn new(trace_id: impl Into<String>, span_id: impl Into<String>) -> Self {
+        Self {
+            trace_id: trace_id.into(),
+            span_id: span_id.into(),
+            trace_flags: default_trace_flags(),
+            trace_state: None,
+        }
+    }
+
+    /// Create trace context from W3C traceparent header value
+    ///
+    /// Format: "00-{trace_id}-{span_id}-{flags}"
+    ///
+    /// # Example
+    /// ```
+    /// use celers_broker_sql::TraceContext;
+    ///
+    /// let ctx = TraceContext::from_traceparent(
+    ///     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    /// ).unwrap();
+    /// assert_eq!(ctx.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    /// assert_eq!(ctx.span_id, "00f067aa0ba902b7");
+    /// ```
+    pub fn from_traceparent(traceparent: &str) -> Result<Self> {
+        let parts: Vec<&str> = traceparent.split('-').collect();
+        if parts.len() != 4 || parts[0] != "00" {
+            return Err(CelersError::Other(format!(
+                "Invalid traceparent format: {}",
+                traceparent
+            )));
+        }
+
+        Ok(Self {
+            trace_id: parts[1].to_string(),
+            span_id: parts[2].to_string(),
+            trace_flags: parts[3].to_string(),
+            trace_state: None,
+        })
+    }
+
+    /// Convert to W3C traceparent header value
+    ///
+    /// # Example
+    /// ```
+    /// use celers_broker_sql::TraceContext;
+    ///
+    /// let ctx = TraceContext::new(
+    ///     "4bf92f3577b34da6a3ce929d0e0e4736",
+    ///     "00f067aa0ba902b7"
+    /// );
+    /// assert_eq!(
+    ///     ctx.to_traceparent(),
+    ///     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    /// );
+    /// ```
+    pub fn to_traceparent(&self) -> String {
+        format!("00-{}-{}-{}", self.trace_id, self.span_id, self.trace_flags)
+    }
+
+    /// Check if trace is sampled (should be recorded)
+    pub fn is_sampled(&self) -> bool {
+        self.trace_flags == "01"
+    }
+
+    /// Generate a new child span ID for this trace
+    ///
+    /// # Example
+    /// ```
+    /// use celers_broker_sql::TraceContext;
+    ///
+    /// let parent_ctx = TraceContext::new(
+    ///     "4bf92f3577b34da6a3ce929d0e0e4736",
+    ///     "00f067aa0ba902b7"
+    /// );
+    /// let child_ctx = parent_ctx.create_child_span();
+    ///
+    /// // Same trace ID, different span ID
+    /// assert_eq!(child_ctx.trace_id, parent_ctx.trace_id);
+    /// assert_ne!(child_ctx.span_id, parent_ctx.span_id);
+    /// ```
+    pub fn create_child_span(&self) -> Self {
+        let span_id = format!(
+            "{:016x}",
+            uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFFFFFFFFFF
+        );
+        Self {
+            trace_id: self.trace_id.clone(),
+            span_id,
+            trace_flags: self.trace_flags.clone(),
+            trace_state: self.trace_state.clone(),
+        }
+    }
+}
+
 /// MySQL-based broker implementation using SKIP LOCKED
 pub struct MysqlBroker {
     pool: MySqlPool,
     queue_name: String,
     paused: AtomicBool,
     circuit_breaker: Arc<RwLock<CircuitBreakerStateInternal>>,
+    hooks: Arc<tokio::sync::RwLock<TaskHooks>>,
 }
 
 impl MysqlBroker {
@@ -716,6 +1261,7 @@ impl MysqlBroker {
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerStateInternal::new(
                 CircuitBreakerConfig::default(),
             ))),
+            hooks: Arc::new(tokio::sync::RwLock::new(TaskHooks::new())),
         })
     }
 
@@ -751,6 +1297,7 @@ impl MysqlBroker {
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerStateInternal::new(
                 circuit_breaker_config,
             ))),
+            hooks: Arc::new(tokio::sync::RwLock::new(TaskHooks::new())),
         })
     }
 
@@ -779,6 +1326,27 @@ impl MysqlBroker {
             "003",
             "performance_indexes",
             include_str!("../migrations/003_performance_indexes.sql"),
+        )
+        .await?;
+
+        self.run_migration_tracked(
+            "006",
+            "idempotency_keys",
+            include_str!("../migrations/006_idempotency.sql"),
+        )
+        .await?;
+
+        self.run_migration_tracked(
+            "007",
+            "workflow_dag",
+            include_str!("../migrations/007_workflow.sql"),
+        )
+        .await?;
+
+        self.run_migration_tracked(
+            "008",
+            "production_features",
+            include_str!("../migrations/008_production_features.sql"),
         )
         .await?;
 
@@ -2377,6 +2945,279 @@ impl MysqlBroker {
             .map_err(|e| CelersError::Other(format!("Failed to commit batch dequeue: {}", e)))?;
 
         Ok(messages)
+    }
+}
+
+// ========== Distributed Tracing & Lifecycle Hooks ==========
+impl MysqlBroker {
+    /// Enqueue a task with distributed tracing context
+    ///
+    /// Stores W3C Trace Context with the task for distributed tracing compatibility.
+    /// Compatible with OpenTelemetry, Jaeger, Zipkin, and other tracing systems.
+    ///
+    /// # Arguments
+    /// * `task` - The task to enqueue
+    /// * `trace_ctx` - W3C Trace Context to propagate
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, TraceContext};
+    /// # use celers_core::{Broker, SerializedTask};
+    /// # async fn example() -> celers_core::Result<()> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// // Create trace context (typically from incoming HTTP request)
+    /// let trace_ctx = TraceContext::from_traceparent(
+    ///     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    /// )?;
+    ///
+    /// let task = SerializedTask::new("my_task".to_string(), vec![]);
+    /// broker.enqueue_with_trace_context(task, trace_ctx).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_with_trace_context(
+        &self,
+        task: SerializedTask,
+        trace_ctx: TraceContext,
+    ) -> Result<TaskId> {
+        let task_id = task.metadata.id;
+
+        // Run before_enqueue hooks
+        let hook_ctx = HookContext {
+            queue_name: self.queue_name.clone(),
+            task_id: Some(task_id),
+            timestamp: Utc::now(),
+            metadata: json!({}),
+        };
+        {
+            let hooks = self.hooks.read().await;
+            hooks.run_before_enqueue(&hook_ctx, &task).await?;
+        }
+
+        let mut db_metadata = json!({
+            "queue": self.queue_name,
+            "enqueued_at": chrono::Utc::now().to_rfc3339(),
+            "trace_context": {
+                "trace_id": trace_ctx.trace_id,
+                "span_id": trace_ctx.span_id,
+                "trace_flags": trace_ctx.trace_flags,
+                "trace_state": trace_ctx.trace_state,
+            }
+        });
+
+        // Merge task metadata if present
+        if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
+            if let Some(obj) = db_metadata.as_object_mut() {
+                if let Some(meta_obj) = task_meta.as_object() {
+                    for (k, v) in meta_obj {
+                        if k != "trace_context" {
+                            // Don't override trace context
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+            "#,
+        )
+        .bind(task_id)
+        .bind(&task.metadata.name)
+        .bind(&task.payload)
+        .bind(task.metadata.priority)
+        .bind(task.metadata.max_retries as i32)
+        .bind(db_metadata)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to enqueue task with trace: {}", e)))?;
+
+        #[cfg(feature = "metrics")]
+        {
+            TASKS_ENQUEUED_TOTAL.inc();
+            TASKS_ENQUEUED_BY_TYPE
+                .with_label_values(&[&task.metadata.name])
+                .inc();
+        }
+
+        // Run after_enqueue hooks
+        {
+            let hooks = self.hooks.read().await;
+            hooks.run_after_enqueue(&hook_ctx, &task).await?;
+        }
+
+        Ok(task_id)
+    }
+
+    /// Extract distributed tracing context from a task's metadata
+    ///
+    /// Retrieves W3C Trace Context that was stored with the task.
+    ///
+    /// # Arguments
+    /// * `task_id` - The task ID to extract trace context from
+    ///
+    /// # Returns
+    /// * `Some(TraceContext)` if trace context was found
+    /// * `None` if no trace context was stored with the task
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::Broker;
+    /// # async fn example() -> celers_core::Result<()> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// if let Some(msg) = broker.dequeue().await? {
+    ///     if let Some(trace_ctx) = broker.extract_trace_context(&msg.task.metadata.id).await? {
+    ///         println!("Processing task in trace: {}", trace_ctx.trace_id);
+    ///
+    ///         // Create child span for nested operations
+    ///         let child_span = trace_ctx.create_child_span();
+    ///         println!("Child span: {}", child_span.span_id);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn extract_trace_context(&self, task_id: &TaskId) -> Result<Option<TraceContext>> {
+        let row = sqlx::query(
+            r#"
+            SELECT metadata
+            FROM celers_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch task metadata: {}", e)))?;
+
+        if let Some(row) = row {
+            let metadata: serde_json::Value = row.get("metadata");
+            if let Some(trace_value) = metadata.get("trace_context") {
+                let trace_ctx: TraceContext =
+                    serde_json::from_value(trace_value.clone()).map_err(|e| {
+                        CelersError::Other(format!("Failed to deserialize trace context: {}", e))
+                    })?;
+                return Ok(Some(trace_ctx));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Enqueue a child task with trace context propagated from a parent task
+    ///
+    /// Creates a child span and enqueues the task with the propagated trace context.
+    /// This maintains the distributed trace across task boundaries.
+    ///
+    /// # Arguments
+    /// * `parent_task_id` - The parent task ID to propagate trace from
+    /// * `child_task` - The child task to enqueue
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::{Broker, SerializedTask};
+    /// # async fn example() -> celers_core::Result<()> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    ///
+    /// if let Some(msg) = broker.dequeue().await? {
+    ///     // Create and enqueue child task with propagated trace
+    ///     let child_task = SerializedTask::new("child_task".to_string(), vec![]);
+    ///     broker.enqueue_with_parent_trace(&msg.task.metadata.id, child_task).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_with_parent_trace(
+        &self,
+        parent_task_id: &TaskId,
+        child_task: SerializedTask,
+    ) -> Result<TaskId> {
+        if let Some(parent_ctx) = self.extract_trace_context(parent_task_id).await? {
+            // Create child span
+            let child_ctx = parent_ctx.create_child_span();
+            self.enqueue_with_trace_context(child_task, child_ctx).await
+        } else {
+            // No trace context, enqueue normally
+            self.enqueue(child_task).await
+        }
+    }
+
+    /// Add a task lifecycle hook
+    ///
+    /// Hooks allow you to inject custom logic at various points in the task lifecycle.
+    /// Multiple hooks can be registered for each lifecycle event.
+    ///
+    /// # Available Hook Types
+    /// * `BeforeEnqueue` - Before a task is enqueued
+    /// * `AfterEnqueue` - After a task is successfully enqueued
+    /// * `BeforeDequeue` - Before a task is dequeued (reserved)
+    /// * `AfterDequeue` - After a task is dequeued
+    /// * `BeforeAck` - Before a task is acknowledged
+    /// * `AfterAck` - After a task is acknowledged
+    /// * `BeforeReject` - Before a task is rejected
+    /// * `AfterReject` - After a task is rejected
+    ///
+    /// # Example
+    /// ```
+    /// # use celers_broker_sql::{MysqlBroker, TaskHook, HookContext};
+    /// # use celers_core::{Broker, SerializedTask};
+    /// # use std::sync::Arc;
+    /// # async fn example() -> celers_core::Result<()> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// # broker.migrate().await?;
+    /// // Add a logging hook for enqueue
+    /// broker.add_hook(TaskHook::BeforeEnqueue(Arc::new(|_ctx, task| {
+    ///     let task_name = task.metadata.name.clone();
+    ///     Box::pin(async move {
+    ///         println!("Enqueueing task: {}", task_name);
+    ///         Ok(())
+    ///     })
+    /// }))).await;
+    ///
+    /// // Add validation hook
+    /// broker.add_hook(TaskHook::BeforeEnqueue(Arc::new(|_ctx, task| {
+    ///     let is_empty = task.payload.is_empty();
+    ///     Box::pin(async move {
+    ///         if is_empty {
+    ///             return Err(celers_core::CelersError::Other(
+    ///                 "Task payload cannot be empty".to_string()
+    ///             ));
+    ///         }
+    ///         Ok(())
+    ///     })
+    /// }))).await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn add_hook(&self, hook: TaskHook) {
+        let mut hooks = self.hooks.write().await;
+        hooks.add(hook);
+    }
+
+    /// Clear all registered lifecycle hooks
+    ///
+    /// Removes all hooks that were previously registered with `add_hook`.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> celers_core::Result<()> {
+    /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
+    /// // ... add hooks ...
+    /// broker.clear_hooks().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn clear_hooks(&self) {
+        let mut hooks = self.hooks.write().await;
+        hooks.clear();
     }
 }
 
@@ -4412,6 +5253,20 @@ impl MysqlBroker {
     pub async fn apply_dlq_retention(&self, retention_period: Duration) -> Result<u64> {
         let retention_seconds = retention_period.as_secs() as i64;
 
+        // Validate retention period (warn if too short to prevent accidental deletion)
+        if retention_seconds < 3600 {
+            return Err(CelersError::Other(
+                "DLQ retention period must be at least 1 hour to prevent accidental deletion"
+                    .to_string(),
+            ));
+        }
+        if retention_seconds < 86400 {
+            tracing::warn!(
+                retention_hours = retention_seconds / 3600,
+                "DLQ retention period is less than 24 hours"
+            );
+        }
+
         let result = sqlx::query(
             r#"
             DELETE FROM celers_dead_letter_queue
@@ -4462,6 +5317,21 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn get_optimal_batch_size(&self, max_batch_size: Option<i64>) -> Result<i64> {
+        // Validate max_batch_size if provided
+        if let Some(max) = max_batch_size {
+            if max <= 0 {
+                return Err(CelersError::Other(
+                    "max_batch_size must be positive".to_string(),
+                ));
+            }
+            if max > 10000 {
+                tracing::warn!(
+                    max_batch_size = max,
+                    "Very large max_batch_size may impact performance"
+                );
+            }
+        }
+
         let max_size = max_batch_size.unwrap_or(200);
 
         // Get current pending task count
@@ -4735,6 +5605,24 @@ impl MysqlBroker {
         age_threshold_secs: i64,
         priority_boost: i32,
     ) -> Result<u64> {
+        // Validate parameters
+        if age_threshold_secs <= 0 {
+            return Err(CelersError::Other(
+                "age_threshold_secs must be positive".to_string(),
+            ));
+        }
+        if priority_boost <= 0 {
+            return Err(CelersError::Other(
+                "priority_boost must be positive".to_string(),
+            ));
+        }
+        if priority_boost > 100 {
+            tracing::warn!(
+                priority_boost = priority_boost,
+                "Large priority boost may cause priority inversion"
+            );
+        }
+
         let result = sqlx::query(
             r#"
             UPDATE celers_tasks
@@ -4795,6 +5683,14 @@ impl MysqlBroker {
         progress_percent: f64,
         current_step: Option<&str>,
     ) -> Result<bool> {
+        // Validate progress_percent is in valid range
+        if !(0.0..=100.0).contains(&progress_percent) {
+            return Err(CelersError::Other(format!(
+                "progress_percent must be between 0.0 and 100.0, got {}",
+                progress_percent
+            )));
+        }
+
         let progress_json = serde_json::json!({
             "progress_percent": progress_percent,
             "current_step": current_step,
@@ -5918,6 +6814,348 @@ impl MysqlBroker {
             }
         }
     }
+
+    /// Enqueue a task with idempotency key for duplicate prevention
+    ///
+    /// This method ensures that tasks with the same idempotency key are only
+    /// enqueued once within the configured TTL window. If a task with the same
+    /// key already exists, it returns the existing task ID instead of creating
+    /// a new task.
+    ///
+    /// Critical for preventing duplicate operations in distributed systems:
+    /// - Financial transactions (same payment ID)
+    /// - Email/notification sending (same message ID)
+    /// - External API calls (same request ID)
+    ///
+    /// # Arguments
+    /// * `task` - Task to enqueue
+    /// * `idempotency_key` - Unique key for deduplication (e.g., request ID)
+    /// * `ttl_secs` - Time-to-live for the idempotency record (in seconds)
+    /// * `metadata` - Optional metadata for the idempotency record
+    ///
+    /// # Returns
+    /// Task ID (either newly created or existing)
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::SerializedTask;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// let task = SerializedTask::new("send_payment".to_string(), vec![1, 2, 3]);
+    /// let task_id = broker.enqueue_with_idempotency(
+    ///     task,
+    ///     "payment-12345",
+    ///     86400, // 24 hour TTL
+    ///     None
+    /// ).await?;
+    ///
+    /// // Attempting to enqueue again with same key returns the same task_id
+    /// let task2 = SerializedTask::new("send_payment".to_string(), vec![1, 2, 3]);
+    /// let task_id2 = broker.enqueue_with_idempotency(
+    ///     task2,
+    ///     "payment-12345",
+    ///     86400,
+    ///     None
+    /// ).await?;
+    /// assert_eq!(task_id, task_id2); // Same task ID!
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_with_idempotency(
+        &self,
+        task: SerializedTask,
+        idempotency_key: &str,
+        ttl_secs: u64,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<TaskId> {
+        // First, check if an idempotency record already exists for this key
+        let existing: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT task_id
+            FROM celers_task_idempotency
+            WHERE idempotency_key = ?
+              AND task_name = ?
+              AND expires_at > NOW()
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(&task.metadata.name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check idempotency record: {}", e)))?;
+
+        if let Some((task_id_str,)) = existing {
+            // Idempotency record exists, return existing task ID
+            let task_id = Uuid::parse_str(&task_id_str)
+                .map_err(|e| CelersError::Other(format!("Invalid task UUID: {}", e)))?;
+
+            tracing::debug!(
+                idempotency_key = %idempotency_key,
+                task_id = %task_id,
+                "Duplicate task detected, returning existing task ID"
+            );
+
+            return Ok(task_id);
+        }
+
+        // No existing record, create new task
+        let task_id = Uuid::new_v4();
+        let idempotency_id = Uuid::new_v4();
+
+        // Begin transaction to ensure atomicity
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        // Insert the task
+        sqlx::query(
+            r#"
+            INSERT INTO celers_tasks
+                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+            VALUES (?, ?, ?, 'pending', ?, ?, '{}', NOW(), NOW())
+            "#,
+        )
+        .bind(task_id.to_string())
+        .bind(&task.metadata.name)
+        .bind(&task.payload)
+        .bind(task.metadata.priority)
+        .bind(task.metadata.max_retries as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
+
+        // Insert idempotency record
+        sqlx::query(
+            r#"
+            INSERT INTO celers_task_idempotency
+                (id, idempotency_key, task_name, task_id, created_at, expires_at, metadata)
+            VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? SECOND), ?)
+            "#,
+        )
+        .bind(idempotency_id.to_string())
+        .bind(idempotency_key)
+        .bind(&task.metadata.name)
+        .bind(task_id.to_string())
+        .bind(ttl_secs as i64)
+        .bind(metadata.map(|m| serde_json::to_string(&m).unwrap_or_else(|_| "{}".to_string())))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to insert idempotency record: {}", e)))?;
+
+        // Commit transaction
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
+
+        tracing::info!(
+            task_id = %task_id,
+            idempotency_key = %idempotency_key,
+            ttl_secs = ttl_secs,
+            "Task enqueued with idempotency key"
+        );
+
+        #[cfg(feature = "metrics")]
+        {
+            TASKS_ENQUEUED_TOTAL.inc();
+            TASKS_ENQUEUED_BY_TYPE
+                .with_label_values(&[&task.metadata.name])
+                .inc();
+        }
+
+        Ok(task_id)
+    }
+
+    /// Get an idempotency record by key and task name
+    ///
+    /// # Arguments
+    /// * `idempotency_key` - The idempotency key to look up
+    /// * `task_name` - The task name to scope the lookup
+    ///
+    /// # Returns
+    /// The idempotency record if found
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// if let Some(record) = broker.get_idempotency_record("payment-12345", "send_payment").await? {
+    ///     println!("Found existing task: {}", record.task_id);
+    ///     println!("Expires at: {}", record.expires_at);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::type_complexity)]
+    pub async fn get_idempotency_record(
+        &self,
+        idempotency_key: &str,
+        task_name: &str,
+    ) -> Result<Option<IdempotencyRecord>> {
+        let record: Option<(
+            String,
+            String,
+            String,
+            String,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, idempotency_key, task_name, task_id, created_at, expires_at, metadata
+            FROM celers_task_idempotency
+            WHERE idempotency_key = ?
+              AND task_name = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(task_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch idempotency record: {}", e)))?;
+
+        if let Some((id, key, task_name, task_id, created_at, expires_at, metadata)) = record {
+            Ok(Some(IdempotencyRecord {
+                id: Uuid::parse_str(&id)
+                    .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
+                idempotency_key: key,
+                task_name,
+                task_id: Uuid::parse_str(&task_id)
+                    .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
+                created_at,
+                expires_at,
+                metadata: metadata.and_then(|m| serde_json::from_str(&m).ok()),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Cleanup expired idempotency keys
+    ///
+    /// Removes idempotency records that have exceeded their TTL.
+    /// Should be called periodically to prevent unbounded table growth.
+    ///
+    /// # Returns
+    /// Number of records deleted
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// let deleted = broker.cleanup_expired_idempotency_keys().await?;
+    /// println!("Cleaned up {} expired idempotency keys", deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cleanup_expired_idempotency_keys(&self) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM celers_task_idempotency
+            WHERE expires_at <= NOW()
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            CelersError::Other(format!("Failed to cleanup expired idempotency keys: {}", e))
+        })?;
+
+        let deleted = result.rows_affected();
+
+        if deleted > 0 {
+            tracing::info!(count = deleted, "Cleaned up expired idempotency keys");
+        }
+
+        Ok(deleted)
+    }
+
+    /// Get idempotency statistics by task name
+    ///
+    /// Returns statistics about idempotency key usage for each task type.
+    ///
+    /// # Returns
+    /// Vector of idempotency statistics per task type
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// let stats = broker.get_idempotency_statistics().await?;
+    /// for stat in stats {
+    ///     println!("{}: {} total keys ({} active, {} expired)",
+    ///         stat.task_name, stat.total_keys, stat.active_keys, stat.expired_keys);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::type_complexity)]
+    pub async fn get_idempotency_statistics(&self) -> Result<Vec<IdempotencyStats>> {
+        let rows: Vec<(
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT
+                task_name,
+                COUNT(*) as total_keys,
+                COUNT(DISTINCT idempotency_key) as unique_keys,
+                SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active_keys,
+                SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired_keys,
+                MIN(created_at) as oldest_key,
+                MAX(created_at) as newest_key
+            FROM celers_task_idempotency
+            GROUP BY task_name
+            ORDER BY task_name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            CelersError::Other(format!("Failed to fetch idempotency statistics: {}", e))
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    task_name,
+                    total_keys,
+                    unique_keys,
+                    active_keys,
+                    expired_keys,
+                    oldest_key,
+                    newest_key,
+                )| {
+                    IdempotencyStats {
+                        task_name,
+                        total_keys,
+                        unique_keys,
+                        active_keys,
+                        expired_keys,
+                        oldest_key,
+                        newest_key,
+                    }
+                },
+            )
+            .collect())
+    }
 }
 
 /// Slow query information from performance_schema
@@ -5928,6 +7166,1918 @@ pub struct SlowQueryInfo {
     pub avg_time_ms: f64,
     pub max_time_ms: f64,
     pub total_time_ms: f64,
+}
+
+/// Worker heartbeat information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerHeartbeat {
+    pub worker_id: String,
+    pub last_heartbeat: DateTime<Utc>,
+    pub status: WorkerStatus,
+    pub task_count: i64,
+    pub capabilities: Option<serde_json::Value>,
+}
+
+/// Worker status
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerStatus {
+    Active,
+    Idle,
+    Busy,
+    Offline,
+}
+
+impl std::fmt::Display for WorkerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerStatus::Active => write!(f, "active"),
+            WorkerStatus::Idle => write!(f, "idle"),
+            WorkerStatus::Busy => write!(f, "busy"),
+            WorkerStatus::Offline => write!(f, "offline"),
+        }
+    }
+}
+
+/// Task group information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskGroup {
+    pub group_id: String,
+    pub task_ids: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Task group status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskGroupStatus {
+    pub group_id: String,
+    pub total_tasks: i64,
+    pub pending_tasks: i64,
+    pub processing_tasks: i64,
+    pub completed_tasks: i64,
+    pub failed_tasks: i64,
+    pub cancelled_tasks: i64,
+}
+
+/// Batch result storage input
+#[derive(Debug, Clone)]
+pub struct BatchResultInput {
+    pub task_id: Uuid,
+    pub task_name: String,
+    pub status: TaskResultStatus,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub traceback: Option<String>,
+    pub runtime_ms: Option<i64>,
+}
+
+impl MysqlBroker {
+    /// Store multiple task results in a single transaction for efficiency
+    ///
+    /// # Arguments
+    ///
+    /// * `results` - Vector of result inputs to store
+    ///
+    /// # Returns
+    ///
+    /// Number of results successfully stored
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, BatchResultInput, TaskResultStatus};
+    /// # use uuid::Uuid;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let results = vec![
+    ///     BatchResultInput {
+    ///         task_id: Uuid::new_v4(),
+    ///         task_name: "task1".to_string(),
+    ///         status: TaskResultStatus::Success,
+    ///         result: Some(serde_json::json!({"value": 42})),
+    ///         error: None,
+    ///         traceback: None,
+    ///         runtime_ms: Some(100),
+    ///     },
+    ///     BatchResultInput {
+    ///         task_id: Uuid::new_v4(),
+    ///         task_name: "task2".to_string(),
+    ///         status: TaskResultStatus::Success,
+    ///         result: Some(serde_json::json!({"value": 24})),
+    ///         error: None,
+    ///         traceback: None,
+    ///         runtime_ms: Some(150),
+    ///     },
+    /// ];
+    ///
+    /// let stored = broker.store_result_batch(&results).await?;
+    /// println!("Stored {} results", stored);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn store_result_batch(&self, results: &[BatchResultInput]) -> Result<u64> {
+        if results.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        let mut stored = 0u64;
+        for result in results {
+            let result_json = result
+                .result
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
+                .unwrap_or_else(|| "null".to_string());
+
+            let rows_affected = sqlx::query(
+                r#"
+                INSERT INTO celers_task_results
+                    (task_id, task_name, status, result, error, traceback, runtime_ms, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                ON DUPLICATE KEY UPDATE
+                    task_name = VALUES(task_name),
+                    status = VALUES(status),
+                    result = VALUES(result),
+                    error = VALUES(error),
+                    traceback = VALUES(traceback),
+                    runtime_ms = VALUES(runtime_ms),
+                    completed_at = NOW()
+                "#,
+            )
+            .bind(result.task_id.to_string())
+            .bind(&result.task_name)
+            .bind(result.status.to_string())
+            .bind(result_json)
+            .bind(&result.error)
+            .bind(&result.traceback)
+            .bind(result.runtime_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to store result for task {}: {}", result.task_id, e))
+            })?
+            .rows_affected();
+
+            stored += rows_affected;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
+
+        Ok(stored)
+    }
+
+    /// Get multiple task results in a single query
+    ///
+    /// # Arguments
+    ///
+    /// * `task_ids` - Vector of task IDs to retrieve results for
+    ///
+    /// # Returns
+    ///
+    /// Vector of task results found
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use uuid::Uuid;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let task_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+    /// let results = broker.get_result_batch(&task_ids).await?;
+    /// println!("Retrieved {} results", results.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_result_batch(&self, task_ids: &[Uuid]) -> Result<Vec<TaskResult>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = task_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query_str = format!(
+            r#"
+            SELECT task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms
+            FROM celers_task_results
+            WHERE task_id IN ({})
+            "#,
+            placeholders
+        );
+
+        let mut query = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+                Option<i64>,
+            ),
+        >(&query_str);
+        for task_id in task_ids {
+            query = query.bind(task_id.to_string());
+        }
+
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch results: {}", e)))?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    task_id,
+                    task_name,
+                    status,
+                    result,
+                    error,
+                    traceback,
+                    created_at,
+                    completed_at,
+                    runtime_ms,
+                )| {
+                    Ok(TaskResult {
+                        task_id: Uuid::parse_str(&task_id)
+                            .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
+                        task_name,
+                        status: status.parse()?,
+                        result: serde_json::from_str(&result).ok(),
+                        error,
+                        traceback,
+                        created_at,
+                        completed_at,
+                        runtime_ms,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Enable drain mode - prevents new tasks from being enqueued while allowing processing of existing tasks
+    ///
+    /// This is useful for graceful shutdown scenarios where you want to:
+    /// 1. Stop accepting new work
+    /// 2. Allow workers to finish current tasks
+    /// 3. Drain the queue before shutting down
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// // Enable drain mode
+    /// broker.enable_drain_mode().await?;
+    ///
+    /// // Check drain status
+    /// let is_draining = broker.is_drain_mode().await?;
+    /// println!("Drain mode: {}", is_draining);
+    ///
+    /// // Disable drain mode when ready
+    /// broker.disable_drain_mode().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enable_drain_mode(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO celers_queue_config (queue_name, config_key, config_value, updated_at)
+            VALUES (?, 'drain_mode', 'true', NOW())
+            ON DUPLICATE KEY UPDATE config_value = 'true', updated_at = NOW()
+            "#,
+        )
+        .bind(&self.queue_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to enable drain mode: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Disable drain mode - allows new tasks to be enqueued again
+    pub async fn disable_drain_mode(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO celers_queue_config (queue_name, config_key, config_value, updated_at)
+            VALUES (?, 'drain_mode', 'false', NOW())
+            ON DUPLICATE KEY UPDATE config_value = 'false', updated_at = NOW()
+            "#,
+        )
+        .bind(&self.queue_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to disable drain mode: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Check if drain mode is enabled
+    pub async fn is_drain_mode(&self) -> Result<bool> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT config_value
+            FROM celers_queue_config
+            WHERE queue_name = ? AND config_key = 'drain_mode'
+            "#,
+        )
+        .bind(&self.queue_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check drain mode: {}", e)))?;
+
+        Ok(row.map(|(val,)| val == "true").unwrap_or(false))
+    }
+
+    /// Register a worker and update its heartbeat
+    ///
+    /// # Arguments
+    ///
+    /// * `worker_id` - Unique identifier for the worker
+    /// * `status` - Current worker status
+    /// * `capabilities` - Optional JSON object describing worker capabilities
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, WorkerStatus};
+    /// # use serde_json::json;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// broker.register_worker(
+    ///     "worker-1",
+    ///     WorkerStatus::Active,
+    ///     Some(json!({"cpu_cores": 4, "memory_gb": 8}))
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn register_worker(
+        &self,
+        worker_id: &str,
+        status: WorkerStatus,
+        capabilities: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let capabilities_json = capabilities
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
+            .unwrap_or_else(|| "null".to_string());
+
+        sqlx::query(
+            r#"
+            INSERT INTO celers_worker_heartbeat
+                (worker_id, queue_name, last_heartbeat, status, capabilities, task_count, updated_at)
+            VALUES (?, ?, NOW(), ?, ?, 0, NOW())
+            ON DUPLICATE KEY UPDATE
+                last_heartbeat = NOW(),
+                status = VALUES(status),
+                capabilities = VALUES(capabilities),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(worker_id)
+        .bind(&self.queue_name)
+        .bind(status.to_string())
+        .bind(capabilities_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            CelersError::Other(format!("Failed to register worker: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Update worker heartbeat to indicate it's still alive
+    pub async fn update_worker_heartbeat(
+        &self,
+        worker_id: &str,
+        status: WorkerStatus,
+    ) -> Result<()> {
+        let rows_affected = sqlx::query(
+            r#"
+            UPDATE celers_worker_heartbeat
+            SET last_heartbeat = NOW(), status = ?, updated_at = NOW()
+            WHERE worker_id = ? AND queue_name = ?
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(worker_id)
+        .bind(&self.queue_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to update worker heartbeat: {}", e)))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(CelersError::Other(format!(
+                "Worker {} not found",
+                worker_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Get heartbeat information for all workers
+    ///
+    /// # Arguments
+    ///
+    /// * `stale_threshold_secs` - Seconds after which a worker is considered stale/offline
+    ///
+    /// # Returns
+    ///
+    /// Vector of worker heartbeat information
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let workers = broker.get_all_worker_heartbeats(60).await?;
+    /// for worker in workers {
+    ///     println!("Worker {} status: {}", worker.worker_id, worker.status);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_all_worker_heartbeats(
+        &self,
+        stale_threshold_secs: i64,
+    ) -> Result<Vec<WorkerHeartbeat>> {
+        let rows: Vec<(String, DateTime<Utc>, String, i64, String)> = sqlx::query_as(
+            r#"
+            SELECT
+                worker_id,
+                last_heartbeat,
+                CASE
+                    WHEN TIMESTAMPDIFF(SECOND, last_heartbeat, NOW()) > ? THEN 'offline'
+                    ELSE status
+                END as status,
+                task_count,
+                COALESCE(capabilities, 'null') as capabilities
+            FROM celers_worker_heartbeat
+            WHERE queue_name = ?
+            ORDER BY last_heartbeat DESC
+            "#,
+        )
+        .bind(stale_threshold_secs)
+        .bind(&self.queue_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch worker heartbeats: {}", e)))?;
+
+        rows.into_iter()
+            .map(
+                |(worker_id, last_heartbeat, status, task_count, capabilities)| {
+                    let status = match status.as_str() {
+                        "active" => WorkerStatus::Active,
+                        "idle" => WorkerStatus::Idle,
+                        "busy" => WorkerStatus::Busy,
+                        _ => WorkerStatus::Offline,
+                    };
+                    let capabilities = serde_json::from_str(&capabilities).ok();
+                    Ok(WorkerHeartbeat {
+                        worker_id,
+                        last_heartbeat,
+                        status,
+                        task_count,
+                        capabilities,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Enqueue a group of related tasks
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - Unique identifier for the task group
+    /// * `tasks` - Vector of tasks to enqueue
+    /// * `metadata` - Optional metadata for the group
+    ///
+    /// # Returns
+    ///
+    /// Vector of task IDs that were enqueued
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use celers_core::SerializedTask;
+    /// # use serde_json::json;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// # let task1 = SerializedTask::new("test".to_string(), vec![])
+    /// #     .with_priority(0)
+    /// #     .with_max_retries(3);
+    /// # let task2 = SerializedTask::new("test".to_string(), vec![])
+    /// #     .with_priority(0)
+    /// #     .with_max_retries(3);
+    /// let task_ids = broker.enqueue_group(
+    ///     "batch-123",
+    ///     vec![task1, task2],
+    ///     Some(json!({"batch_type": "data_processing"}))
+    /// ).await?;
+    /// println!("Enqueued group with {} tasks", task_ids.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_group(
+        &self,
+        group_id: &str,
+        tasks: Vec<SerializedTask>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<Vec<TaskId>> {
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        let mut task_ids = Vec::new();
+
+        for task in tasks {
+            let task_id = Uuid::new_v4();
+
+            sqlx::query(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, retry_count, max_retries, created_at, scheduled_at, metadata)
+                VALUES (?, ?, ?, 'pending', ?, 0, ?, NOW(), NOW(), ?)
+                "#,
+            )
+            .bind(task_id.to_string())
+            .bind(&task.metadata.name)
+            .bind(&task.payload)
+            .bind(task.metadata.priority)
+            .bind(task.metadata.max_retries as i32)
+            .bind(serde_json::to_string(&json!({"group_id": group_id})).unwrap_or_else(|_| "{}".to_string()))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to insert task: {}", e))
+            })?;
+
+            task_ids.push(task_id);
+        }
+
+        // Store group metadata
+        let metadata_json = metadata
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
+            .unwrap_or_else(|| "null".to_string());
+
+        sqlx::query(
+            r#"
+            INSERT INTO celers_task_groups
+                (group_id, queue_name, task_count, created_at, metadata)
+            VALUES (?, ?, ?, NOW(), ?)
+            "#,
+        )
+        .bind(group_id)
+        .bind(&self.queue_name)
+        .bind(task_ids.len() as i64)
+        .bind(metadata_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to insert task group: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
+
+        Ok(task_ids)
+    }
+
+    /// Get status of a task group
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The task group identifier
+    ///
+    /// # Returns
+    ///
+    /// Task group status with counts by state
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let status = broker.get_group_status("batch-123").await?;
+    /// println!("Group has {} completed tasks out of {} total",
+    ///     status.completed_tasks, status.total_tasks);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_group_status(&self, group_id: &str) -> Result<TaskGroupStatus> {
+        let row: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) as total_tasks,
+                SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending_tasks,
+                SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as processing_tasks,
+                SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+                SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed_tasks,
+                SUM(CASE WHEN state = 'cancelled' THEN 1 ELSE 0 END) as cancelled_tasks
+            FROM celers_tasks
+            WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.group_id')) = ?
+            "#,
+        )
+        .bind(group_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to fetch group status: {}", e)))?;
+
+        Ok(TaskGroupStatus {
+            group_id: group_id.to_string(),
+            total_tasks: row.0,
+            pending_tasks: row.1,
+            processing_tasks: row.2,
+            completed_tasks: row.3,
+            failed_tasks: row.4,
+            cancelled_tasks: row.5,
+        })
+    }
+
+    /// Check if connection pool is healthy and can handle current load
+    ///
+    /// Performs a comprehensive health check of the connection pool including:
+    /// - Connection availability (can acquire a connection)
+    /// - Pool utilization (not over-utilized)
+    /// - Database responsiveness (simple query performance)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if healthy, `Ok(false)` if degraded, `Err` if critical failure
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// match broker.check_connection_health().await {
+    ///     Ok(true) => println!("Connection pool is healthy"),
+    ///     Ok(false) => println!("Connection pool is degraded"),
+    ///     Err(e) => println!("Connection pool has critical issues: {}", e),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn check_connection_health(&self) -> Result<bool> {
+        // Try to acquire a connection with timeout
+        let start = std::time::Instant::now();
+        let conn_result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.pool.acquire()).await;
+
+        match conn_result {
+            Err(_) => {
+                tracing::error!("Connection pool timeout: failed to acquire connection within 5s");
+                Err(CelersError::Other(
+                    "Connection pool exhausted: timeout acquiring connection".to_string(),
+                ))
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "Connection pool error");
+                Err(CelersError::Other(format!("Connection pool error: {}", e)))
+            }
+            Ok(Ok(mut conn)) => {
+                let acquire_time = start.elapsed();
+
+                // Warn if connection acquisition took too long
+                if acquire_time > std::time::Duration::from_secs(1) {
+                    tracing::warn!(
+                        acquire_time_ms = acquire_time.as_millis(),
+                        "Slow connection acquisition indicates pool pressure"
+                    );
+                }
+
+                // Test database responsiveness with simple query
+                let query_start = std::time::Instant::now();
+                let result = sqlx::query_scalar::<_, i64>("SELECT 1")
+                    .fetch_one(&mut *conn)
+                    .await;
+
+                match result {
+                    Err(e) => {
+                        tracing::error!(error = %e, "Database health check query failed");
+                        Err(CelersError::Other(format!("Database unresponsive: {}", e)))
+                    }
+                    Ok(_) => {
+                        let query_time = query_start.elapsed();
+
+                        // Warn if database is responding slowly
+                        if query_time > std::time::Duration::from_millis(100) {
+                            tracing::warn!(
+                                query_time_ms = query_time.as_millis(),
+                                "Slow database response indicates potential issues"
+                            );
+                            return Ok(false); // Degraded
+                        }
+
+                        // Check pool utilization
+                        let pool_size = self.pool.size();
+                        let idle_conns = self.pool.num_idle() as u32;
+                        let active_conns = pool_size.saturating_sub(idle_conns);
+                        let utilization = (active_conns as f64 / pool_size as f64) * 100.0;
+
+                        if utilization > 90.0 {
+                            tracing::warn!(
+                                utilization_percent = utilization,
+                                pool_size = pool_size,
+                                active = active_conns,
+                                idle = idle_conns,
+                                "High connection pool utilization"
+                            );
+                            return Ok(false); // Degraded
+                        }
+
+                        tracing::debug!(
+                            acquire_time_ms = acquire_time.as_millis(),
+                            query_time_ms = query_time.as_millis(),
+                            utilization_percent = utilization,
+                            "Connection pool health check passed"
+                        );
+
+                        Ok(true) // Healthy
+                    }
+                }
+            }
+        }
+    }
+
+    /// Batch replay tasks from DLQ with filtering
+    ///
+    /// Requeues multiple tasks from the dead letter queue based on filter criteria.
+    /// This is useful for recovering from systematic failures or replaying tasks
+    /// after fixing bugs.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_name_filter` - Optional task name pattern to match (None = all tasks)
+    /// * `min_retry_count` - Minimum retry count to include (for filtering partial failures)
+    /// * `limit` - Maximum number of tasks to replay
+    ///
+    /// # Returns
+    ///
+    /// Number of tasks successfully requeued from DLQ
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// // Replay all tasks with "payment" in the name that failed with 3+ retries
+    /// let count = broker.replay_dlq_batch(Some("payment"), Some(3), 100).await?;
+    /// println!("Replayed {} payment tasks from DLQ", count);
+    ///
+    /// // Replay all failed tasks (no filter)
+    /// let count = broker.replay_dlq_batch(None, None, 1000).await?;
+    /// println!("Replayed {} tasks from DLQ", count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn replay_dlq_batch(
+        &self,
+        task_name_filter: Option<&str>,
+        min_retry_count: Option<i32>,
+        limit: i64,
+    ) -> Result<u64> {
+        let mut query = String::from("SELECT id FROM celers_dead_letter_queue WHERE 1=1");
+
+        if task_name_filter.is_some() {
+            query.push_str(" AND task_name LIKE ?");
+        }
+
+        if min_retry_count.is_some() {
+            query.push_str(" AND retry_count >= ?");
+        }
+
+        query.push_str(" ORDER BY failed_at ASC LIMIT ?");
+
+        let mut q = sqlx::query_scalar::<_, String>(&query);
+
+        if let Some(filter) = task_name_filter {
+            q = q.bind(format!("%{}%", filter));
+        }
+
+        if let Some(min_retries) = min_retry_count {
+            q = q.bind(min_retries);
+        }
+
+        q = q.bind(limit);
+
+        let dlq_ids = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ IDs: {}", e)))?;
+
+        let mut replayed = 0u64;
+        for dlq_id in dlq_ids {
+            match Uuid::parse_str(&dlq_id) {
+                Ok(id) => {
+                    if self.requeue_from_dlq(&id).await.is_ok() {
+                        replayed += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(dlq_id = %dlq_id, error = %e, "Failed to parse DLQ ID");
+                }
+            }
+        }
+
+        tracing::info!(
+            replayed = replayed,
+            task_filter = ?task_name_filter,
+            min_retries = ?min_retry_count,
+            "Batch replay from DLQ completed"
+        );
+
+        Ok(replayed)
+    }
+
+    /// Generate synthetic load for performance testing
+    ///
+    /// Creates a specified number of test tasks with configurable properties.
+    /// Useful for load testing, performance benchmarking, and capacity planning.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_count` - Number of tasks to generate
+    /// * `task_name` - Name for generated tasks
+    /// * `payload_size_bytes` - Size of payload for each task (filled with random data)
+    /// * `priority_range` - Optional priority range (min, max) for random priorities
+    ///
+    /// # Returns
+    ///
+    /// Vector of generated task IDs
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// // Generate 1000 test tasks with 1KB payload, random priorities 1-10
+    /// let task_ids = broker.generate_load(
+    ///     1000,
+    ///     "load_test",
+    ///     1024,
+    ///     Some((1, 10))
+    /// ).await?;
+    /// println!("Generated {} test tasks", task_ids.len());
+    ///
+    /// // Generate 500 high-priority tasks with 512-byte payload
+    /// let task_ids = broker.generate_load(
+    ///     500,
+    ///     "stress_test",
+    ///     512,
+    ///     Some((8, 10))
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn generate_load(
+        &self,
+        task_count: usize,
+        task_name: &str,
+        payload_size_bytes: usize,
+        priority_range: Option<(i32, i32)>,
+    ) -> Result<Vec<Uuid>> {
+        use rand::Rng;
+
+        let mut tasks = Vec::with_capacity(task_count);
+        let mut rng = rand::thread_rng();
+
+        for _i in 0..task_count {
+            // Generate random payload
+            let payload: Vec<u8> = (0..payload_size_bytes).map(|_| rng.gen::<u8>()).collect();
+
+            let mut task = SerializedTask::new(task_name.to_string(), payload);
+
+            // Set random priority if range specified
+            if let Some((min_prio, max_prio)) = priority_range {
+                task.metadata.priority = rng.gen_range(min_prio..=max_prio);
+            }
+
+            tasks.push(task);
+        }
+
+        let task_ids = self.enqueue_batch(tasks).await?;
+
+        tracing::info!(
+            count = task_count,
+            task_name = task_name,
+            payload_size = payload_size_bytes,
+            "Generated synthetic load"
+        );
+
+        Ok(task_ids)
+    }
+
+    /// Verify migration integrity
+    ///
+    /// Checks that all required migrations have been applied and that the
+    /// database schema matches expectations. This is useful for deployment
+    /// verification and troubleshooting.
+    ///
+    /// # Returns
+    ///
+    /// Result containing migration verification status
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// match broker.verify_migrations().await {
+    ///     Ok(report) => {
+    ///         println!("Migrations verified: {} applied, {} missing",
+    ///             report.applied_count, report.missing_count);
+    ///         if report.is_complete {
+    ///             println!("All migrations applied successfully");
+    ///         }
+    ///     }
+    ///     Err(e) => eprintln!("Migration verification failed: {}", e),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn verify_migrations(&self) -> Result<MigrationVerification> {
+        // Check if migrations table exists
+        let table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = DATABASE()
+             AND table_name = 'celers_migrations'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to check migrations table: {}", e)))?;
+
+        if table_exists == 0 {
+            return Ok(MigrationVerification {
+                is_complete: false,
+                applied_count: 0,
+                missing_count: 8, // Total number of migrations
+                applied_migrations: vec![],
+                missing_migrations: vec![
+                    "001_init.sql".to_string(),
+                    "002_results.sql".to_string(),
+                    "003_performance_indexes.sql".to_string(),
+                    "004_partitioning_guide.sql".to_string(),
+                    "005_uuid_optimization.sql".to_string(),
+                    "006_idempotency.sql".to_string(),
+                    "007_workflow.sql".to_string(),
+                    "008_production_features.sql".to_string(),
+                ],
+                schema_valid: false,
+            });
+        }
+
+        // Get applied migrations
+        let applied: Vec<String> =
+            sqlx::query_scalar("SELECT version FROM celers_migrations ORDER BY version")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to fetch applied migrations: {}", e))
+                })?;
+
+        let expected = [
+            "001_init.sql",
+            "002_results.sql",
+            "003_performance_indexes.sql",
+            "006_idempotency.sql",
+            "008_production_features.sql",
+        ];
+
+        let missing: Vec<String> = expected
+            .iter()
+            .filter(|&v| !applied.contains(&v.to_string()))
+            .map(|s| s.to_string())
+            .collect();
+
+        // Check core tables exist
+        let core_tables = vec![
+            "celers_tasks",
+            "celers_dead_letter_queue",
+            "celers_task_results",
+            "celers_task_idempotency",
+            "celers_queue_config",
+            "celers_worker_heartbeat",
+            "celers_task_groups",
+        ];
+
+        let mut schema_valid = true;
+        for table in &core_tables {
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_schema = DATABASE() AND table_name = ?",
+            )
+            .bind(table)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to check table {}: {}", table, e)))?;
+
+            if exists == 0 {
+                schema_valid = false;
+                tracing::warn!(table = table, "Core table missing");
+            }
+        }
+
+        Ok(MigrationVerification {
+            is_complete: missing.is_empty() && schema_valid,
+            applied_count: applied.len(),
+            missing_count: missing.len(),
+            applied_migrations: applied,
+            missing_migrations: missing,
+            schema_valid,
+        })
+    }
+
+    /// Profile query performance and identify slow operations
+    ///
+    /// Analyzes recent query performance from MySQL performance_schema and
+    /// identifies potential bottlenecks. Requires performance_schema to be enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `min_execution_time_ms` - Minimum execution time to report (filters fast queries)
+    /// * `limit` - Maximum number of slow queries to return
+    ///
+    /// # Returns
+    ///
+    /// Vector of query performance profiles
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// // Find queries taking more than 100ms
+    /// let slow_queries = broker.profile_query_performance(100.0, 10).await?;
+    /// for query in slow_queries {
+    ///     println!("Slow query: {} ({}ms, {} calls)",
+    ///         query.query_digest,
+    ///         query.avg_execution_time_ms,
+    ///         query.execution_count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn profile_query_performance(
+        &self,
+        min_execution_time_ms: f64,
+        limit: i64,
+    ) -> Result<Vec<QueryPerformanceProfile>> {
+        let rows = sqlx::query(
+            "SELECT
+                DIGEST_TEXT as query_digest,
+                COUNT_STAR as execution_count,
+                AVG_TIMER_WAIT / 1000000000000 as avg_execution_time_ms,
+                SUM_ROWS_EXAMINED as total_rows_examined,
+                SUM_ROWS_SENT as total_rows_sent,
+                SUM_NO_INDEX_USED as no_index_used_count,
+                SUM_NO_GOOD_INDEX_USED as no_good_index_used_count
+             FROM performance_schema.events_statements_summary_by_digest
+             WHERE DIGEST_TEXT IS NOT NULL
+               AND SCHEMA_NAME = DATABASE()
+               AND AVG_TIMER_WAIT / 1000000000000 >= ?
+             ORDER BY AVG_TIMER_WAIT DESC
+             LIMIT ?",
+        )
+        .bind(min_execution_time_ms)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await;
+
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                // performance_schema might not be enabled
+                tracing::warn!(error = %e, "Failed to query performance_schema");
+                return Ok(vec![]);
+            }
+        };
+
+        let mut profiles = Vec::new();
+        for row in rows {
+            let query_digest: String = row.try_get("query_digest").unwrap_or_default();
+            let execution_count: i64 = row.try_get("execution_count").unwrap_or(0);
+            let avg_time: rust_decimal::Decimal =
+                row.try_get("avg_execution_time_ms").unwrap_or_default();
+            let rows_examined: i64 = row.try_get("total_rows_examined").unwrap_or(0);
+            let rows_sent: i64 = row.try_get("total_rows_sent").unwrap_or(0);
+            let no_index: i64 = row.try_get("no_index_used_count").unwrap_or(0);
+            let no_good_index: i64 = row.try_get("no_good_index_used_count").unwrap_or(0);
+
+            if query_digest.is_empty() {
+                continue; // Skip rows with empty query digest
+            }
+
+            profiles.push(QueryPerformanceProfile {
+                query_digest,
+                execution_count,
+                avg_execution_time_ms: avg_time.to_string().parse().unwrap_or(0.0),
+                total_rows_examined: rows_examined,
+                total_rows_sent: rows_sent,
+                no_index_used_count: no_index,
+                no_good_index_used_count: no_good_index,
+                needs_optimization: no_index > 0 || no_good_index > 0,
+            });
+        }
+
+        Ok(profiles)
+    }
+
+    /// Acknowledge multiple tasks and store their results atomically in a single transaction
+    ///
+    /// This is more efficient than calling ack() and store_result() separately for each task.
+    ///
+    /// # Arguments
+    ///
+    /// * `tasks_with_results` - Vector of (task_id, receipt_handle, result_input) tuples
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, BatchResultInput, TaskResultStatus};
+    /// # use uuid::Uuid;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let tasks_with_results = vec![
+    ///     (
+    ///         Uuid::new_v4(),
+    ///         Some("receipt1".to_string()),
+    ///         BatchResultInput {
+    ///             task_id: Uuid::new_v4(),
+    ///             task_name: "task1".to_string(),
+    ///             status: TaskResultStatus::Success,
+    ///             result: Some(serde_json::json!({"value": 42})),
+    ///             error: None,
+    ///             traceback: None,
+    ///             runtime_ms: Some(100),
+    ///         },
+    ///     ),
+    /// ];
+    ///
+    /// broker.ack_batch_with_results(&tasks_with_results).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn ack_batch_with_results(
+        &self,
+        tasks_with_results: &[(TaskId, Option<String>, BatchResultInput)],
+    ) -> Result<()> {
+        if tasks_with_results.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        // Acknowledge all tasks
+        for (task_id, _receipt_handle, _) in tasks_with_results {
+            sqlx::query(
+                "UPDATE celers_tasks
+                 SET state = 'completed', completed_at = NOW()
+                 WHERE id = ? AND state = 'processing'",
+            )
+            .bind(task_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to acknowledge task {}: {}", task_id, e))
+            })?;
+        }
+
+        // Store all results
+        for (_, _, result) in tasks_with_results {
+            let result_json = result
+                .result
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
+                .unwrap_or_else(|| "null".to_string());
+
+            sqlx::query(
+                r#"
+                INSERT INTO celers_task_results
+                    (task_id, task_name, status, result, error, traceback, runtime_ms, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                ON DUPLICATE KEY UPDATE
+                    task_name = VALUES(task_name),
+                    status = VALUES(status),
+                    result = VALUES(result),
+                    error = VALUES(error),
+                    traceback = VALUES(traceback),
+                    runtime_ms = VALUES(runtime_ms),
+                    completed_at = NOW()
+                "#,
+            )
+            .bind(result.task_id.to_string())
+            .bind(&result.task_name)
+            .bind(result.status.to_string())
+            .bind(result_json)
+            .bind(&result.error)
+            .bind(&result.traceback)
+            .bind(result.runtime_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to store result for task {}: {}", result.task_id, e))
+            })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
+
+        tracing::info!(
+            count = tasks_with_results.len(),
+            "Acknowledged tasks with results"
+        );
+        Ok(())
+    }
+
+    /// Pre-warm the connection pool by establishing minimum connections
+    ///
+    /// This reduces cold start latency by ensuring connections are available
+    /// before the first query. Useful for production deployments.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// // Pre-warm connections before starting workers
+    /// broker.warmup_connection_pool().await?;
+    /// println!("Connection pool is ready");
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn warmup_connection_pool(&self) -> Result<()> {
+        // Get pool configuration
+        let pool_options = self.pool.options();
+        let min_connections = pool_options.get_min_connections();
+
+        tracing::info!(
+            min_connections = min_connections,
+            "Warming up connection pool"
+        );
+
+        // Execute simple queries to establish connections
+        for i in 0..min_connections {
+            let _ = sqlx::query("SELECT 1")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to warm up connection {}: {}", i, e))
+                })?;
+        }
+
+        tracing::info!("Connection pool warmup complete");
+        Ok(())
+    }
+
+    /// Get task latency statistics (time from enqueue to dequeue)
+    ///
+    /// Provides insights into how long tasks wait in the queue before processing.
+    /// Useful for SLA monitoring and capacity planning.
+    ///
+    /// # Returns
+    ///
+    /// TaskLatencyStats with min, max, avg latency in seconds
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let stats = broker.get_task_latency_stats().await?;
+    /// println!("Average queue latency: {:.2}s", stats.avg_latency_secs);
+    /// println!("Max queue latency: {:.2}s", stats.max_latency_secs);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn get_task_latency_stats(&self) -> Result<TaskLatencyStats> {
+        let row = sqlx::query(
+            "SELECT
+                COUNT(*) as task_count,
+                MIN(TIMESTAMPDIFF(SECOND, created_at, started_at)) as min_latency,
+                MAX(TIMESTAMPDIFF(SECOND, created_at, started_at)) as max_latency,
+                AVG(TIMESTAMPDIFF(SECOND, created_at, started_at)) as avg_latency,
+                STDDEV(TIMESTAMPDIFF(SECOND, created_at, started_at)) as stddev_latency
+             FROM celers_tasks
+             WHERE state IN ('processing', 'completed')
+               AND started_at IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task latency stats: {}", e)))?;
+
+        let task_count: i64 = row.try_get("task_count").unwrap_or(0);
+        let min_latency: Option<i64> = row.try_get("min_latency").ok();
+        let max_latency: Option<i64> = row.try_get("max_latency").ok();
+        let avg_latency: Option<rust_decimal::Decimal> = row.try_get("avg_latency").ok();
+        let stddev_latency: Option<rust_decimal::Decimal> = row.try_get("stddev_latency").ok();
+
+        Ok(TaskLatencyStats {
+            task_count,
+            min_latency_secs: min_latency.unwrap_or(0) as f64,
+            max_latency_secs: max_latency.unwrap_or(0) as f64,
+            avg_latency_secs: avg_latency
+                .map(|d| d.to_string().parse().unwrap_or(0.0))
+                .unwrap_or(0.0),
+            stddev_latency_secs: stddev_latency
+                .map(|d| d.to_string().parse().unwrap_or(0.0))
+                .unwrap_or(0.0),
+        })
+    }
+
+    /// Get statistics broken down by priority level
+    ///
+    /// Provides insights into task distribution across priority levels.
+    /// Useful for tuning priority-based scheduling.
+    ///
+    /// # Returns
+    ///
+    /// Vector of PriorityQueueStats sorted by priority (highest first)
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let stats = broker.get_priority_queue_stats().await?;
+    /// for stat in stats {
+    ///     println!("Priority {}: {} pending, {} processing",
+    ///         stat.priority, stat.pending_count, stat.processing_count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn get_priority_queue_stats(&self) -> Result<Vec<PriorityQueueStats>> {
+        let rows = sqlx::query(
+            "SELECT
+                priority,
+                SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending_count,
+                SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as processing_count,
+                SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed_count,
+                SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed_count,
+                AVG(CASE WHEN started_at IS NOT NULL
+                    THEN TIMESTAMPDIFF(SECOND, created_at, started_at)
+                    ELSE NULL END) as avg_wait_time_secs
+             FROM celers_tasks
+             GROUP BY priority
+             ORDER BY priority DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get priority queue stats: {}", e)))?;
+
+        let mut stats = Vec::new();
+        for row in rows {
+            let priority: i32 = row.try_get("priority").unwrap_or(0);
+            let pending_count: i64 = row.try_get("pending_count").unwrap_or(0);
+            let processing_count: i64 = row.try_get("processing_count").unwrap_or(0);
+            let completed_count: i64 = row.try_get("completed_count").unwrap_or(0);
+            let failed_count: i64 = row.try_get("failed_count").unwrap_or(0);
+            let avg_wait_time: Option<rust_decimal::Decimal> =
+                row.try_get("avg_wait_time_secs").ok();
+
+            stats.push(PriorityQueueStats {
+                priority,
+                pending_count,
+                processing_count,
+                completed_count,
+                failed_count,
+                avg_wait_time_secs: avg_wait_time
+                    .map(|d| d.to_string().parse().unwrap_or(0.0))
+                    .unwrap_or(0.0),
+            });
+        }
+
+        Ok(stats)
+    }
+
+    /// Get task execution time statistics (time from start to completion)
+    ///
+    /// Measures how long tasks take to execute, complementing latency statistics.
+    /// Useful for identifying slow tasks and optimizing task implementation.
+    ///
+    /// # Returns
+    ///
+    /// TaskExecutionStats with min, max, avg execution time in seconds
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let stats = broker.get_task_execution_stats().await?;
+    /// println!("Average execution time: {:.2}s", stats.avg_execution_secs);
+    /// println!("P95 execution time: {:.2}s", stats.p95_execution_secs);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn get_task_execution_stats(&self) -> Result<TaskExecutionStats> {
+        let row = sqlx::query(
+            "SELECT
+                COUNT(*) as task_count,
+                MIN(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as min_execution,
+                MAX(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as max_execution,
+                AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as avg_execution,
+                STDDEV(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as stddev_execution
+             FROM celers_tasks
+             WHERE state = 'completed'
+               AND started_at IS NOT NULL
+               AND completed_at IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task execution stats: {}", e)))?;
+
+        let task_count: i64 = row.try_get("task_count").unwrap_or(0);
+        let min_execution: Option<i64> = row.try_get("min_execution").ok();
+        let max_execution: Option<i64> = row.try_get("max_execution").ok();
+        let avg_execution: Option<rust_decimal::Decimal> = row.try_get("avg_execution").ok();
+        let stddev_execution: Option<rust_decimal::Decimal> = row.try_get("stddev_execution").ok();
+
+        // Calculate approximate P95 using ORDER BY LIMIT approach
+        let p95_row = sqlx::query(
+            "SELECT TIMESTAMPDIFF(SECOND, started_at, completed_at) as execution_time
+             FROM celers_tasks
+             WHERE state = 'completed'
+               AND started_at IS NOT NULL
+               AND completed_at IS NOT NULL
+             ORDER BY execution_time DESC
+             LIMIT 1 OFFSET ?",
+        )
+        .bind((task_count as f64 * 0.05).ceil() as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to calculate P95: {}", e)))?;
+
+        let p95_execution = p95_row
+            .and_then(|r| r.try_get::<i64, _>("execution_time").ok())
+            .unwrap_or(0);
+
+        Ok(TaskExecutionStats {
+            task_count,
+            min_execution_secs: min_execution.unwrap_or(0) as f64,
+            max_execution_secs: max_execution.unwrap_or(0) as f64,
+            avg_execution_secs: avg_execution
+                .map(|d| d.to_string().parse().unwrap_or(0.0))
+                .unwrap_or(0.0),
+            stddev_execution_secs: stddev_execution
+                .map(|d| d.to_string().parse().unwrap_or(0.0))
+                .unwrap_or(0.0),
+            p95_execution_secs: p95_execution as f64,
+        })
+    }
+
+    /// Monitor queue saturation and capacity utilization
+    ///
+    /// Detects when queue is approaching capacity limits based on pending tasks,
+    /// processing rate, and historical patterns. Essential for auto-scaling decisions.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity_threshold` - Maximum recommended pending tasks (e.g., 10000)
+    ///
+    /// # Returns
+    ///
+    /// QueueSaturation with utilization percentage and status
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let saturation = broker.get_queue_saturation(10000).await?;
+    /// if saturation.is_saturated {
+    ///     println!("WARNING: Queue is {}% saturated!", saturation.utilization_percent);
+    ///     println!("Consider scaling up workers");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn get_queue_saturation(&self, capacity_threshold: i64) -> Result<QueueSaturation> {
+        if capacity_threshold <= 0 {
+            return Err(CelersError::Other(
+                "Capacity threshold must be positive".to_string(),
+            ));
+        }
+
+        let row = sqlx::query(
+            "SELECT
+                SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending_count,
+                SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as processing_count,
+                COUNT(*) as total_tasks
+             FROM celers_tasks",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get queue saturation: {}", e)))?;
+
+        let pending_count: i64 = row.try_get("pending_count").unwrap_or(0);
+        let processing_count: i64 = row.try_get("processing_count").unwrap_or(0);
+        let total_tasks: i64 = row.try_get("total_tasks").unwrap_or(0);
+
+        let utilization_percent =
+            (pending_count as f64 / capacity_threshold as f64 * 100.0).min(100.0);
+        let is_saturated = pending_count >= (capacity_threshold as f64 * 0.8) as i64; // 80% threshold
+        let is_critical = pending_count >= (capacity_threshold as f64 * 0.95) as i64; // 95% threshold
+
+        let status = if is_critical {
+            "critical".to_string()
+        } else if is_saturated {
+            "warning".to_string()
+        } else {
+            "healthy".to_string()
+        };
+
+        Ok(QueueSaturation {
+            pending_count,
+            processing_count,
+            total_tasks,
+            capacity_threshold,
+            utilization_percent,
+            is_saturated,
+            is_critical,
+            status,
+        })
+    }
+
+    /// Get task latency percentiles (P50, P95, P99) for SLA monitoring
+    ///
+    /// Provides detailed percentile analysis of queue latency, essential for
+    /// tracking SLA compliance and identifying performance degradation.
+    ///
+    /// # Returns
+    ///
+    /// TaskLatencyPercentiles with P50, P95, P99 values in seconds
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// let percentiles = broker.get_task_latency_percentiles().await?;
+    /// println!("P50 latency: {:.2}s", percentiles.p50_latency_secs);
+    /// println!("P95 latency: {:.2}s", percentiles.p95_latency_secs);
+    /// println!("P99 latency: {:.2}s", percentiles.p99_latency_secs);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn get_task_latency_percentiles(&self) -> Result<TaskLatencyPercentiles> {
+        // Get total count
+        let count_row = sqlx::query(
+            "SELECT COUNT(*) as task_count
+             FROM celers_tasks
+             WHERE state IN ('processing', 'completed')
+               AND started_at IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to count tasks: {}", e)))?;
+
+        let task_count: i64 = count_row.try_get("task_count").unwrap_or(0);
+
+        if task_count == 0 {
+            return Ok(TaskLatencyPercentiles {
+                task_count: 0,
+                p50_latency_secs: 0.0,
+                p95_latency_secs: 0.0,
+                p99_latency_secs: 0.0,
+            });
+        }
+
+        // Calculate P50 (median)
+        let p50_offset = (task_count as f64 * 0.5) as i64;
+        let p50_row = sqlx::query(
+            "SELECT TIMESTAMPDIFF(SECOND, created_at, started_at) as latency
+             FROM celers_tasks
+             WHERE state IN ('processing', 'completed')
+               AND started_at IS NOT NULL
+             ORDER BY latency
+             LIMIT 1 OFFSET ?",
+        )
+        .bind(p50_offset)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to calculate P50: {}", e)))?;
+
+        let p50_latency = p50_row
+            .and_then(|r| r.try_get::<i64, _>("latency").ok())
+            .unwrap_or(0);
+
+        // Calculate P95
+        let p95_offset = (task_count as f64 * 0.95) as i64;
+        let p95_row = sqlx::query(
+            "SELECT TIMESTAMPDIFF(SECOND, created_at, started_at) as latency
+             FROM celers_tasks
+             WHERE state IN ('processing', 'completed')
+               AND started_at IS NOT NULL
+             ORDER BY latency
+             LIMIT 1 OFFSET ?",
+        )
+        .bind(p95_offset)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to calculate P95: {}", e)))?;
+
+        let p95_latency = p95_row
+            .and_then(|r| r.try_get::<i64, _>("latency").ok())
+            .unwrap_or(0);
+
+        // Calculate P99
+        let p99_offset = (task_count as f64 * 0.99) as i64;
+        let p99_row = sqlx::query(
+            "SELECT TIMESTAMPDIFF(SECOND, created_at, started_at) as latency
+             FROM celers_tasks
+             WHERE state IN ('processing', 'completed')
+               AND started_at IS NOT NULL
+             ORDER BY latency
+             LIMIT 1 OFFSET ?",
+        )
+        .bind(p99_offset)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to calculate P99: {}", e)))?;
+
+        let p99_latency = p99_row
+            .and_then(|r| r.try_get::<i64, _>("latency").ok())
+            .unwrap_or(0);
+
+        Ok(TaskLatencyPercentiles {
+            task_count,
+            p50_latency_secs: p50_latency as f64,
+            p95_latency_secs: p95_latency as f64,
+            p99_latency_secs: p99_latency as f64,
+        })
+    }
+
+    /// Track task state transitions for debugging and analysis
+    ///
+    /// Records when tasks move between states, useful for debugging stuck tasks,
+    /// analyzing processing patterns, and detecting anomalies.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task to get transition history for
+    ///
+    /// # Returns
+    ///
+    /// Vector of TaskStateTransition records
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use uuid::Uuid;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let broker = MysqlBroker::new("mysql://localhost/test").await?;
+    /// # let task_id = Uuid::new_v4();
+    /// let transitions = broker.get_task_state_transitions(&task_id).await?;
+    /// for transition in transitions {
+    ///     println!("{:?} -> {:?} at {}",
+    ///         transition.from_state, transition.to_state, transition.transitioned_at);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(dead_code)]
+    pub async fn get_task_state_transitions(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<TaskStateTransition>> {
+        // This requires the task_history table to track transitions
+        // We'll infer transitions from timestamp fields
+        let row = sqlx::query(
+            "SELECT state, created_at, started_at, completed_at
+             FROM celers_tasks
+             WHERE id = ?",
+        )
+        .bind(task_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to get task state transitions: {}", e)))?;
+
+        let Some(row) = row else {
+            return Ok(vec![]);
+        };
+
+        let current_state: String = row.try_get("state").unwrap_or_default();
+        let created_at: chrono::DateTime<Utc> =
+            row.try_get("created_at").unwrap_or_else(|_| Utc::now());
+        let started_at: Option<chrono::DateTime<Utc>> = row.try_get("started_at").ok();
+        let completed_at: Option<chrono::DateTime<Utc>> = row.try_get("completed_at").ok();
+
+        let mut transitions = Vec::new();
+
+        // Infer transitions based on timestamps
+        transitions.push(TaskStateTransition {
+            task_id: *task_id,
+            from_state: None,
+            to_state: "pending".to_string(),
+            transitioned_at: created_at,
+        });
+
+        if let Some(started) = started_at {
+            transitions.push(TaskStateTransition {
+                task_id: *task_id,
+                from_state: Some("pending".to_string()),
+                to_state: "processing".to_string(),
+                transitioned_at: started,
+            });
+        }
+
+        if let Some(completed) = completed_at {
+            transitions.push(TaskStateTransition {
+                task_id: *task_id,
+                from_state: Some("processing".to_string()),
+                to_state: current_state,
+                transitioned_at: completed,
+            });
+        }
+
+        Ok(transitions)
+    }
+}
+
+/// Task execution time statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskExecutionStats {
+    /// Number of completed tasks measured
+    pub task_count: i64,
+    /// Minimum execution time in seconds
+    pub min_execution_secs: f64,
+    /// Maximum execution time in seconds
+    pub max_execution_secs: f64,
+    /// Average execution time in seconds
+    pub avg_execution_secs: f64,
+    /// Standard deviation of execution time in seconds
+    pub stddev_execution_secs: f64,
+    /// P95 execution time in seconds
+    pub p95_execution_secs: f64,
+}
+
+/// Queue saturation monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueSaturation {
+    /// Number of pending tasks
+    pub pending_count: i64,
+    /// Number of processing tasks
+    pub processing_count: i64,
+    /// Total tasks in all states
+    pub total_tasks: i64,
+    /// Configured capacity threshold
+    pub capacity_threshold: i64,
+    /// Utilization percentage (0-100)
+    pub utilization_percent: f64,
+    /// Whether queue is saturated (>= 80% of capacity)
+    pub is_saturated: bool,
+    /// Whether queue is critical (>= 95% of capacity)
+    pub is_critical: bool,
+    /// Status: healthy, warning, or critical
+    pub status: String,
+}
+
+/// Task latency percentiles for SLA monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLatencyPercentiles {
+    /// Number of tasks measured
+    pub task_count: i64,
+    /// P50 (median) latency in seconds
+    pub p50_latency_secs: f64,
+    /// P95 latency in seconds
+    pub p95_latency_secs: f64,
+    /// P99 latency in seconds
+    pub p99_latency_secs: f64,
+}
+
+/// Task state transition record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStateTransition {
+    /// Task ID
+    pub task_id: TaskId,
+    /// Previous state (None if this is initial state)
+    pub from_state: Option<String>,
+    /// New state
+    pub to_state: String,
+    /// When the transition occurred
+    pub transitioned_at: chrono::DateTime<Utc>,
+}
+
+/// Task latency statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLatencyStats {
+    /// Number of tasks measured
+    pub task_count: i64,
+    /// Minimum latency in seconds
+    pub min_latency_secs: f64,
+    /// Maximum latency in seconds
+    pub max_latency_secs: f64,
+    /// Average latency in seconds
+    pub avg_latency_secs: f64,
+    /// Standard deviation of latency in seconds
+    pub stddev_latency_secs: f64,
+}
+
+/// Priority queue statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriorityQueueStats {
+    /// Priority level
+    pub priority: i32,
+    /// Number of pending tasks at this priority
+    pub pending_count: i64,
+    /// Number of processing tasks at this priority
+    pub processing_count: i64,
+    /// Number of completed tasks at this priority
+    pub completed_count: i64,
+    /// Number of failed tasks at this priority
+    pub failed_count: i64,
+    /// Average wait time in seconds for this priority
+    pub avg_wait_time_secs: f64,
+}
+
+/// Migration verification report
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationVerification {
+    /// Whether all required migrations are applied
+    pub is_complete: bool,
+    /// Number of migrations applied
+    pub applied_count: usize,
+    /// Number of migrations missing
+    pub missing_count: usize,
+    /// List of applied migration versions
+    pub applied_migrations: Vec<String>,
+    /// List of missing migration versions
+    pub missing_migrations: Vec<String>,
+    /// Whether core database schema is valid
+    pub schema_valid: bool,
+}
+
+/// Query performance profile
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryPerformanceProfile {
+    /// Query digest (normalized query text)
+    pub query_digest: String,
+    /// Number of times executed
+    pub execution_count: i64,
+    /// Average execution time in milliseconds
+    pub avg_execution_time_ms: f64,
+    /// Total rows examined
+    pub total_rows_examined: i64,
+    /// Total rows sent
+    pub total_rows_sent: i64,
+    /// Number of executions without index
+    pub no_index_used_count: i64,
+    /// Number of executions with suboptimal index
+    pub no_good_index_used_count: i64,
+    /// Whether query needs optimization
+    pub needs_optimization: bool,
 }
 
 #[cfg(test)]

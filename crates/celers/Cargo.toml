@@ -56,6 +56,7 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter
 
 # Helper dependencies
 num_cpus = "1.16"
+rand = "0.8"
 
 [features]
 default = ["redis", "json"]

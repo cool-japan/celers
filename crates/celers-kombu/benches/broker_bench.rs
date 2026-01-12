@@ -486,6 +486,536 @@ fn bench_config_builders(c: &mut Criterion) {
     });
 }
 
+fn bench_monitoring_utilities(c: &mut Criterion) {
+    c.bench_function("analyze_consumer_lag", |b| {
+        b.iter(|| {
+            let (lag, falling_behind, action) =
+                utils::analyze_consumer_lag(black_box(1000), black_box(50), black_box(100));
+            black_box((lag, falling_behind, action))
+        })
+    });
+
+    c.bench_function("calculate_message_velocity", |b| {
+        b.iter(|| {
+            let (velocity, trend) =
+                utils::calculate_message_velocity(black_box(200), black_box(100), black_box(10));
+            black_box((velocity, trend))
+        })
+    });
+
+    c.bench_function("suggest_worker_scaling", |b| {
+        b.iter(|| {
+            let (workers, action) = utils::suggest_worker_scaling(
+                black_box(5000),
+                black_box(5),
+                black_box(100),
+                black_box(60),
+            );
+            black_box((workers, action))
+        })
+    });
+
+    c.bench_function("calculate_message_age_distribution", |b| {
+        let ages: Vec<u64> = (1..=100).collect();
+        b.iter(|| {
+            let (p50, p95, p99, max) = utils::calculate_message_age_distribution(black_box(&ages));
+            black_box((p50, p95, p99, max))
+        })
+    });
+
+    c.bench_function("estimate_processing_capacity", |b| {
+        b.iter(|| {
+            let (per_sec, per_min, per_hour) =
+                utils::estimate_processing_capacity(black_box(10), black_box(100), black_box(4));
+            black_box((per_sec, per_min, per_hour))
+        })
+    });
+}
+
+fn bench_new_middleware_types(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("deadline_middleware_before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = DeadlineMiddleware::new(Duration::from_secs(300));
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("content_type_middleware_before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = ContentTypeMiddleware::new(vec![]);
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("routing_key_middleware_before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = RoutingKeyMiddleware::from_task_name();
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+}
+
+fn bench_v047_middleware(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("idempotency_middleware_after_consume", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = IdempotencyMiddleware::new(10000);
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.after_consume(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("backoff_middleware_after_consume", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = BackoffMiddleware::with_defaults();
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                msg.headers
+                    .extra
+                    .insert("retries".to_string(), serde_json::json!(3));
+                middleware.after_consume(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("caching_middleware_after_consume", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = CachingMiddleware::with_defaults();
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.after_consume(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+}
+
+fn bench_v047_utilities(c: &mut Criterion) {
+    c.bench_function("detect_anomalies", |b| {
+        b.iter(|| {
+            let current = vec![100, 105, 98, 102, 500];
+            let baseline = vec![100, 105, 98, 102, 100];
+            black_box(utils::detect_anomalies(&current, &baseline, 2.0))
+        })
+    });
+
+    c.bench_function("calculate_sla_compliance", |b| {
+        b.iter(|| {
+            let processing_times = vec![100, 150, 200, 120, 90, 180, 110, 130];
+            black_box(utils::calculate_sla_compliance(&processing_times, 180))
+        })
+    });
+
+    c.bench_function("estimate_infrastructure_cost", |b| {
+        b.iter(|| black_box(utils::estimate_infrastructure_cost(1_000_000, 0.50, 30)))
+    });
+
+    c.bench_function("calculate_error_budget", |b| {
+        b.iter(|| black_box(utils::calculate_error_budget(99.9, 100_000, 50, 10_000)))
+    });
+
+    c.bench_function("predict_queue_saturation", |b| {
+        b.iter(|| {
+            let samples = vec![1000, 1100, 1200, 1300, 1400];
+            black_box(utils::predict_queue_saturation(&samples, 2000, 1.0))
+        })
+    });
+
+    c.bench_function("calculate_consumer_efficiency", |b| {
+        b.iter(|| black_box(utils::calculate_consumer_efficiency(8000, 2000, 100)))
+    });
+
+    c.bench_function("suggest_connection_pool_size", |b| {
+        b.iter(|| black_box(utils::suggest_connection_pool_size(50, 20, 100)))
+    });
+
+    c.bench_function("calculate_message_processing_trend", |b| {
+        b.iter(|| {
+            let times = vec![100, 95, 90, 85, 80, 75, 70];
+            black_box(utils::calculate_message_processing_trend(&times))
+        })
+    });
+
+    c.bench_function("suggest_prefetch_count", |b| {
+        b.iter(|| black_box(utils::suggest_prefetch_count(100, 10, 200)))
+    });
+
+    c.bench_function("analyze_dead_letter_queue", |b| {
+        b.iter(|| black_box(utils::analyze_dead_letter_queue(50, 10000, 10)))
+    });
+}
+
+fn bench_v0410_middleware(c: &mut Criterion) {
+    c.bench_function("BulkheadMiddleware::new", |b| {
+        b.iter(|| {
+            let middleware = BulkheadMiddleware::new(black_box(50));
+            black_box(middleware)
+        })
+    });
+
+    c.bench_function("BulkheadMiddleware::try_acquire", |b| {
+        let middleware = BulkheadMiddleware::new(50);
+        b.iter(|| black_box(middleware.try_acquire("test_partition")))
+    });
+
+    c.bench_function("PriorityBoostMiddleware::new", |b| {
+        b.iter(|| {
+            let middleware = PriorityBoostMiddleware::new()
+                .with_age_boost(Duration::from_secs(300), Priority::High);
+            black_box(middleware)
+        })
+    });
+
+    c.bench_function("ErrorClassificationMiddleware::classify", |b| {
+        let middleware = ErrorClassificationMiddleware::new();
+        b.iter(|| black_box(middleware.classify_error("connection timeout error")))
+    });
+}
+
+fn bench_v0410_utilities(c: &mut Criterion) {
+    c.bench_function("forecast_queue_capacity_ml", |b| {
+        b.iter(|| {
+            let history = vec![100, 150, 180, 220, 250, 280];
+            black_box(utils::forecast_queue_capacity_ml(&history, 24))
+        })
+    });
+
+    c.bench_function("optimize_batch_strategy", |b| {
+        b.iter(|| black_box(utils::optimize_batch_strategy(1024, 50, 10, 1000)))
+    });
+
+    c.bench_function("calculate_multi_queue_efficiency", |b| {
+        b.iter(|| {
+            let sizes = vec![100, 150, 120, 200, 180];
+            let rates = vec![10, 12, 11, 15, 13];
+            black_box(utils::calculate_multi_queue_efficiency(&sizes, &rates))
+        })
+    });
+
+    c.bench_function("predict_resource_exhaustion", |b| {
+        b.iter(|| black_box(utils::predict_resource_exhaustion(7000, 10000, 500)))
+    });
+
+    c.bench_function("suggest_autoscaling_policy", |b| {
+        b.iter(|| black_box(utils::suggest_autoscaling_policy(1000, 500, 100, 200)))
+    });
+}
+
+fn bench_v0411_middleware(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("CorrelationMiddleware::before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = CorrelationMiddleware::new();
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("ThrottlingMiddleware::before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = ThrottlingMiddleware::new(100.0);
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("CircuitBreakerMiddleware::before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = CircuitBreakerMiddleware::new(5, Duration::from_secs(60));
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+}
+
+fn bench_v0412_middleware(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("SchemaValidationMiddleware::new", |b| {
+        b.iter(|| {
+            black_box(
+                SchemaValidationMiddleware::new()
+                    .with_required_field("user_id")
+                    .with_max_field_count(20)
+                    .with_max_body_size(1024 * 1024),
+            )
+        })
+    });
+
+    c.bench_function("SchemaValidationMiddleware::before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = SchemaValidationMiddleware::new().with_max_body_size(1024 * 1024);
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                msg.headers
+                    .extra
+                    .insert("user_id".to_string(), serde_json::json!("123"));
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("MessageEnrichmentMiddleware::new", |b| {
+        b.iter(|| {
+            black_box(
+                MessageEnrichmentMiddleware::new()
+                    .with_hostname("worker-01")
+                    .with_environment("production")
+                    .with_version("1.0.0")
+                    .with_add_timestamp(true),
+            )
+        })
+    });
+
+    c.bench_function("MessageEnrichmentMiddleware::before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = MessageEnrichmentMiddleware::new()
+                    .with_hostname("worker-01")
+                    .with_environment("production");
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+}
+
+fn bench_v0412_utilities(c: &mut Criterion) {
+    c.bench_function("calculate_message_affinity", |b| {
+        b.iter(|| {
+            black_box(utils::calculate_message_affinity(
+                black_box("user:12345"),
+                black_box(8),
+            ))
+        })
+    });
+
+    c.bench_function("analyze_queue_temperature", |b| {
+        b.iter(|| {
+            black_box(utils::analyze_queue_temperature(
+                black_box(100),
+                black_box(30),
+            ))
+        })
+    });
+
+    c.bench_function("detect_processing_bottleneck", |b| {
+        b.iter(|| {
+            black_box(utils::detect_processing_bottleneck(
+                black_box(100),
+                black_box(50),
+                black_box(1000),
+                black_box(500),
+            ))
+        })
+    });
+
+    c.bench_function("calculate_optimal_prefetch_multiplier", |b| {
+        b.iter(|| {
+            black_box(utils::calculate_optimal_prefetch_multiplier(
+                black_box(100),
+                black_box(10),
+                black_box(4),
+            ))
+        })
+    });
+
+    c.bench_function("suggest_queue_consolidation", |b| {
+        b.iter(|| {
+            let sizes = vec![10, 5, 8];
+            let rates = vec![2, 1, 3];
+            black_box(utils::suggest_queue_consolidation(
+                black_box(&sizes),
+                black_box(&rates),
+            ))
+        })
+    });
+}
+
+fn bench_v0416_middleware(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("HealthCheckMiddleware::new", |b| {
+        b.iter(|| black_box(HealthCheckMiddleware::new().with_check_interval_secs(60)))
+    });
+
+    c.bench_function("HealthCheckMiddleware::before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware = HealthCheckMiddleware::new();
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("MessageTaggingMiddleware::new", |b| {
+        b.iter(|| {
+            black_box(
+                MessageTaggingMiddleware::new("production")
+                    .with_tag("region", "us-east-1")
+                    .with_tag("team", "backend"),
+            )
+        })
+    });
+
+    c.bench_function("MessageTaggingMiddleware::before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware =
+                    MessageTaggingMiddleware::new("production").with_tag("region", "us-east-1");
+                let mut msg = Message::new(
+                    "email_task".to_string(),
+                    Uuid::new_v4(),
+                    b"test body".to_vec(),
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+
+    c.bench_function("CostAttributionMiddleware::new", |b| {
+        b.iter(|| {
+            black_box(
+                CostAttributionMiddleware::new(0.001)
+                    .with_compute_cost_per_sec(0.0001)
+                    .with_storage_cost_per_mb(0.00001),
+            )
+        })
+    });
+
+    c.bench_function("CostAttributionMiddleware::before_publish", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let middleware =
+                    CostAttributionMiddleware::new(0.001).with_storage_cost_per_mb(0.00001);
+                let mut msg = Message::new(
+                    "test_task".to_string(),
+                    Uuid::new_v4(),
+                    vec![0u8; 1024 * 1024], // 1MB
+                );
+                middleware.before_publish(&mut msg).await.unwrap();
+                black_box(msg)
+            })
+        })
+    });
+}
+
+fn bench_v0416_utilities(c: &mut Criterion) {
+    c.bench_function("calculate_message_deduplication_window", |b| {
+        b.iter(|| {
+            black_box(utils::calculate_message_deduplication_window(
+                black_box(100),
+                black_box(3),
+                black_box(5000),
+            ))
+        })
+    });
+
+    c.bench_function("analyze_retry_effectiveness", |b| {
+        b.iter(|| {
+            black_box(utils::analyze_retry_effectiveness(
+                black_box(1000),
+                black_box(100),
+                black_box(80),
+                black_box(20),
+            ))
+        })
+    });
+
+    c.bench_function("calculate_queue_overflow_risk", |b| {
+        b.iter(|| {
+            black_box(utils::calculate_queue_overflow_risk(
+                black_box(8000),
+                black_box(10000),
+                black_box(100),
+                black_box(50),
+            ))
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_message_creation,
@@ -500,5 +1030,16 @@ criterion_group!(
     bench_new_middleware,
     bench_utility_functions,
     bench_config_builders,
+    bench_monitoring_utilities,
+    bench_new_middleware_types,
+    bench_v047_middleware,
+    bench_v047_utilities,
+    bench_v0410_middleware,
+    bench_v0410_utilities,
+    bench_v0411_middleware,
+    bench_v0412_middleware,
+    bench_v0412_utilities,
+    bench_v0416_middleware,
+    bench_v0416_utilities,
 );
 criterion_main!(benches);

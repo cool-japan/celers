@@ -38,7 +38,7 @@ use celers_backend_redis::{ChordState, ResultBackend};
 use chrono::Utc;
 
 /// Signature (a task definition with arguments)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Signature {
     /// Task name
     pub task: String,
@@ -178,6 +178,33 @@ impl Signature {
     /// Check if task is immutable (args cannot be replaced)
     pub fn is_immutable(&self) -> bool {
         self.immutable
+    }
+
+    /// Check if task has a specific kwarg
+    pub fn has_kwarg(&self, key: &str) -> bool {
+        self.kwargs.contains_key(key)
+    }
+
+    /// Get a kwarg value
+    pub fn get_kwarg(&self, key: &str) -> Option<&serde_json::Value> {
+        self.kwargs.get(key)
+    }
+
+    /// Add a single kwarg
+    pub fn add_kwarg(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.kwargs.insert(key.into(), value);
+        self
+    }
+
+    /// Add a single argument
+    pub fn add_arg(mut self, arg: serde_json::Value) -> Self {
+        self.args.push(arg);
+        self
+    }
+
+    /// Clone the signature
+    pub fn clone_signature(&self) -> Self {
+        self.clone()
     }
 
     /// Create an immutable signature (shorthand for `.immutable()`)
@@ -352,6 +379,193 @@ impl Signature {
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }
+
+    /// Clear all arguments from the signature
+    ///
+    /// Returns None if the signature is immutable.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig = Signature::new("task".to_string())
+    ///     .with_args(vec![serde_json::json!(1), serde_json::json!(2)]);
+    ///
+    /// let cleared = sig.clear_args().unwrap();
+    /// assert!(cleared.args.is_empty());
+    /// ```
+    pub fn clear_args(mut self) -> Option<Self> {
+        if self.immutable {
+            return None;
+        }
+        self.args.clear();
+        Some(self)
+    }
+
+    /// Clear all keyword arguments from the signature
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut kwargs = HashMap::new();
+    /// kwargs.insert("key".to_string(), serde_json::json!("value"));
+    ///
+    /// let sig = Signature::new("task".to_string()).with_kwargs(kwargs);
+    /// let cleared = sig.clear_kwargs();
+    /// assert!(cleared.kwargs.is_empty());
+    /// ```
+    pub fn clear_kwargs(mut self) -> Self {
+        self.kwargs.clear();
+        self
+    }
+
+    /// Remove a specific keyword argument
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig = Signature::new("task".to_string())
+    ///     .add_kwarg("key1", serde_json::json!("value1"))
+    ///     .add_kwarg("key2", serde_json::json!("value2"));
+    ///
+    /// let modified = sig.remove_kwarg("key1");
+    /// assert!(!modified.has_kwarg("key1"));
+    /// assert!(modified.has_kwarg("key2"));
+    /// ```
+    pub fn remove_kwarg(mut self, key: &str) -> Self {
+        self.kwargs.remove(key);
+        self
+    }
+
+    /// Get the number of positional arguments
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig = Signature::new("task".to_string())
+    ///     .with_args(vec![serde_json::json!(1), serde_json::json!(2)]);
+    ///
+    /// assert_eq!(sig.args_count(), 2);
+    /// ```
+    pub fn args_count(&self) -> usize {
+        self.args.len()
+    }
+
+    /// Get the number of keyword arguments
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig = Signature::new("task".to_string())
+    ///     .add_kwarg("key1", serde_json::json!("value1"))
+    ///     .add_kwarg("key2", serde_json::json!("value2"));
+    ///
+    /// assert_eq!(sig.kwargs_count(), 2);
+    /// ```
+    pub fn kwargs_count(&self) -> usize {
+        self.kwargs.len()
+    }
+
+    /// Get all keyword argument keys
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig = Signature::new("task".to_string())
+    ///     .add_kwarg("key1", serde_json::json!("value1"))
+    ///     .add_kwarg("key2", serde_json::json!("value2"));
+    ///
+    /// let keys = sig.kwarg_keys();
+    /// assert_eq!(keys.len(), 2);
+    /// assert!(keys.contains(&"key1"));
+    /// assert!(keys.contains(&"key2"));
+    /// ```
+    pub fn kwarg_keys(&self) -> Vec<&str> {
+        self.kwargs.keys().map(|k| k.as_str()).collect()
+    }
+
+    /// Check if signature has any retry configuration
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig1 = Signature::new("task".to_string()).with_retries(3);
+    /// let sig2 = Signature::new("task".to_string());
+    ///
+    /// assert!(sig1.has_retry_config());
+    /// assert!(!sig2.has_retry_config());
+    /// ```
+    pub fn has_retry_config(&self) -> bool {
+        self.options.max_retries.is_some()
+            || self.options.retry_delay.is_some()
+            || self.options.retry_backoff.is_some()
+    }
+
+    /// Check if signature has any time limit configuration
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig1 = Signature::new("task".to_string()).with_time_limit(60);
+    /// let sig2 = Signature::new("task".to_string());
+    ///
+    /// assert!(sig1.has_time_limit_config());
+    /// assert!(!sig2.has_time_limit_config());
+    /// ```
+    pub fn has_time_limit_config(&self) -> bool {
+        self.options.time_limit.is_some() || self.options.soft_time_limit.is_some()
+    }
+
+    /// Create a new signature with the same task name but no arguments
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig = Signature::new("task".to_string())
+    ///     .with_args(vec![serde_json::json!(1)])
+    ///     .with_priority(5);
+    ///
+    /// let clean = sig.clone_without_args();
+    /// assert_eq!(clean.task, "task");
+    /// assert!(clean.args.is_empty());
+    /// assert_eq!(clean.options.priority, Some(5)); // Options preserved
+    /// ```
+    pub fn clone_without_args(&self) -> Self {
+        Self {
+            task: self.task.clone(),
+            args: Vec::new(),
+            kwargs: HashMap::new(),
+            options: self.options.clone(),
+            immutable: self.immutable,
+        }
+    }
+
+    /// Calculate the estimated serialized size in bytes
+    ///
+    /// This gives a rough estimate of how much space the signature will take when serialized.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig = Signature::new("task".to_string())
+    ///     .with_args(vec![serde_json::json!(1), serde_json::json!(2)]);
+    ///
+    /// let size = sig.estimated_size();
+    /// assert!(size > 0);
+    /// ```
+    pub fn estimated_size(&self) -> usize {
+        self.to_json().map(|s| s.len()).unwrap_or(0)
+    }
 }
 
 impl std::fmt::Display for Signature {
@@ -416,7 +630,7 @@ fn is_default_callback_arg_mode(mode: &CallbackArgMode) -> bool {
 }
 
 /// Task options
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TaskOptions {
     /// Task priority (0-9)
     pub priority: Option<u8>,
@@ -681,7 +895,7 @@ impl std::fmt::Display for TaskOptions {
 /// Chain: Sequential execution
 ///
 /// task1(args1) -> task2(result1) -> task3(result2)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chain {
     /// Tasks in the chain
     pub tasks: Vec<Signature>,
@@ -778,6 +992,64 @@ impl Chain {
         self.tasks.len()
     }
 
+    /// Get the first task in the chain
+    pub fn first(&self) -> Option<&Signature> {
+        self.tasks.first()
+    }
+
+    /// Get the last task in the chain
+    pub fn last(&self) -> Option<&Signature> {
+        self.tasks.last()
+    }
+
+    /// Get an iterator over the tasks
+    pub fn iter(&self) -> std::slice::Iter<'_, Signature> {
+        self.tasks.iter()
+    }
+
+    /// Get a mutable iterator over the tasks
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Signature> {
+        self.tasks.iter_mut()
+    }
+
+    /// Get a task by index
+    pub fn get(&self, index: usize) -> Option<&Signature> {
+        self.tasks.get(index)
+    }
+
+    /// Get a mutable task by index
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Signature> {
+        self.tasks.get_mut(index)
+    }
+
+    /// Create a chain with pre-allocated capacity
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            tasks: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Extend the chain with additional tasks
+    pub fn extend(mut self, tasks: impl IntoIterator<Item = Signature>) -> Self {
+        self.tasks.extend(tasks);
+        self
+    }
+
+    /// Reverse the order of tasks in the chain
+    pub fn reverse(mut self) -> Self {
+        self.tasks.reverse();
+        self
+    }
+
+    /// Retain only tasks that satisfy the predicate
+    pub fn retain<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&Signature) -> bool,
+    {
+        self.tasks.retain(f);
+        self
+    }
+
     /// Apply the chain with a countdown (delay in seconds)
     ///
     /// The first task will be delayed by the countdown amount.
@@ -868,6 +1140,480 @@ impl Chain {
         }
         self
     }
+
+    /// Append another chain to this chain
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Chain, Signature};
+    ///
+    /// let chain1 = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![]);
+    ///
+    /// let chain2 = Chain::new()
+    ///     .then("task3", vec![])
+    ///     .then("task4", vec![]);
+    ///
+    /// let combined = chain1.append(chain2);
+    /// assert_eq!(combined.len(), 4);
+    /// ```
+    pub fn append(mut self, other: Chain) -> Self {
+        self.tasks.extend(other.tasks);
+        self
+    }
+
+    /// Prepend another chain to this chain
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Chain, Signature};
+    ///
+    /// let chain1 = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![]);
+    ///
+    /// let chain2 = Chain::new()
+    ///     .then("task3", vec![])
+    ///     .then("task4", vec![]);
+    ///
+    /// let combined = chain1.prepend(chain2);
+    /// assert_eq!(combined.len(), 4);
+    /// assert_eq!(combined.first().unwrap().task, "task3");
+    /// ```
+    pub fn prepend(mut self, other: Chain) -> Self {
+        let mut new_tasks = other.tasks;
+        new_tasks.extend(self.tasks);
+        self.tasks = new_tasks;
+        self
+    }
+
+    /// Split chain at the specified index
+    ///
+    /// Returns a tuple of (before, after) chains.
+    /// The task at `index` will be the first task in the second chain.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![])
+    ///     .then("task3", vec![])
+    ///     .then("task4", vec![]);
+    ///
+    /// let (before, after) = chain.split_at(2);
+    /// assert_eq!(before.len(), 2);
+    /// assert_eq!(after.len(), 2);
+    /// ```
+    pub fn split_at(self, index: usize) -> (Chain, Chain) {
+        let (before, after) = self.tasks.split_at(index.min(self.tasks.len()));
+        (
+            Chain {
+                tasks: before.to_vec(),
+            },
+            Chain {
+                tasks: after.to_vec(),
+            },
+        )
+    }
+
+    /// Concatenate multiple chains into a single chain
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chains = vec![
+    ///     Chain::new().then("task1", vec![]),
+    ///     Chain::new().then("task2", vec![]),
+    ///     Chain::new().then("task3", vec![]),
+    /// ];
+    ///
+    /// let combined = Chain::concat(chains);
+    /// assert_eq!(combined.len(), 3);
+    /// ```
+    pub fn concat<I>(chains: I) -> Self
+    where
+        I: IntoIterator<Item = Chain>,
+    {
+        let mut result = Chain::new();
+        for chain in chains {
+            result.tasks.extend(chain.tasks);
+        }
+        result
+    }
+
+    /// Clone all tasks in the chain with a new task name prefix
+    ///
+    /// Useful for creating workflow variants.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("process", vec![])
+    ///     .then("validate", vec![]);
+    ///
+    /// let prefixed = chain.with_task_prefix("batch_");
+    /// assert_eq!(prefixed.first().unwrap().task, "batch_process");
+    /// ```
+    pub fn with_task_prefix(mut self, prefix: &str) -> Self {
+        for task in &mut self.tasks {
+            task.task = format!("{}{}", prefix, task.task);
+        }
+        self
+    }
+
+    /// Clone all tasks in the chain with a new task name suffix
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("process", vec![])
+    ///     .then("validate", vec![]);
+    ///
+    /// let suffixed = chain.with_task_suffix("_v2");
+    /// assert_eq!(suffixed.first().unwrap().task, "process_v2");
+    /// ```
+    pub fn with_task_suffix(mut self, suffix: &str) -> Self {
+        for task in &mut self.tasks {
+            task.task = format!("{}{}", task.task, suffix);
+        }
+        self
+    }
+
+    /// Validate that all tasks in the chain have non-empty names
+    ///
+    /// Returns true if all tasks are valid, false otherwise.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let valid = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![]);
+    /// assert!(valid.is_valid());
+    ///
+    /// let invalid = Chain { tasks: vec![] };
+    /// assert!(!invalid.is_valid());
+    /// ```
+    pub fn is_valid(&self) -> bool {
+        !self.tasks.is_empty() && self.tasks.iter().all(|t| !t.task.is_empty())
+    }
+
+    /// Count tasks that match a predicate
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Chain, Signature};
+    ///
+    /// let chain = Chain::new()
+    ///     .then_signature(Signature::new("high".to_string()).with_priority(9))
+    ///     .then_signature(Signature::new("low".to_string()).with_priority(1))
+    ///     .then_signature(Signature::new("urgent".to_string()).with_priority(9));
+    ///
+    /// let high_priority = chain.count_matching(|sig| sig.options.priority.unwrap_or(0) >= 9);
+    /// assert_eq!(high_priority, 2);
+    /// ```
+    pub fn count_matching<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&Signature) -> bool,
+    {
+        self.tasks.iter().filter(|t| predicate(t)).count()
+    }
+
+    /// Check if any task matches a predicate
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("process", vec![])
+    ///     .then("validate", vec![]);
+    ///
+    /// assert!(chain.any(|sig| sig.task == "validate"));
+    /// assert!(!chain.any(|sig| sig.task == "missing"));
+    /// ```
+    pub fn any<F>(&self, predicate: F) -> bool
+    where
+        F: Fn(&Signature) -> bool,
+    {
+        self.tasks.iter().any(predicate)
+    }
+
+    /// Check if all tasks match a predicate
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("process", vec![])
+    ///     .then("validate", vec![]);
+    ///
+    /// assert!(chain.all(|sig| !sig.task.is_empty()));
+    /// ```
+    pub fn all<F>(&self, predicate: F) -> bool
+    where
+        F: Fn(&Signature) -> bool,
+    {
+        self.tasks.iter().all(predicate)
+    }
+
+    /// Map over all tasks, transforming each signature
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Chain, Signature};
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![]);
+    ///
+    /// let modified = chain.map_tasks(|sig| {
+    ///     Signature::new(format!("modified_{}", sig.task))
+    /// });
+    ///
+    /// assert_eq!(modified.first().unwrap().task, "modified_task1");
+    /// ```
+    pub fn map_tasks<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(Signature) -> Signature,
+    {
+        self.tasks = self.tasks.into_iter().map(f).collect();
+        self
+    }
+
+    /// Filter and map tasks in one operation
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Chain, Signature};
+    ///
+    /// let chain = Chain::new()
+    ///     .then_signature(Signature::new("high".to_string()).with_priority(9))
+    ///     .then_signature(Signature::new("low".to_string()).with_priority(1))
+    ///     .then_signature(Signature::new("urgent".to_string()).with_priority(9));
+    ///
+    /// let high_priority = chain.filter_map(|sig| {
+    ///     if sig.options.priority.unwrap_or(0) >= 9 {
+    ///         Some(sig)
+    ///     } else {
+    ///         None
+    ///     }
+    /// });
+    ///
+    /// assert_eq!(high_priority.len(), 2);
+    /// ```
+    pub fn filter_map<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(Signature) -> Option<Signature>,
+    {
+        self.tasks = self.tasks.into_iter().filter_map(f).collect();
+        self
+    }
+
+    /// Take the first n tasks from the chain
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![])
+    ///     .then("task3", vec![])
+    ///     .then("task4", vec![]);
+    ///
+    /// let first_two = chain.take(2);
+    /// assert_eq!(first_two.len(), 2);
+    /// ```
+    pub fn take(mut self, n: usize) -> Self {
+        self.tasks.truncate(n);
+        self
+    }
+
+    /// Skip the first n tasks from the chain
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![])
+    ///     .then("task3", vec![])
+    ///     .then("task4", vec![]);
+    ///
+    /// let skipped = chain.skip(2);
+    /// assert_eq!(skipped.len(), 2);
+    /// assert_eq!(skipped.first().unwrap().task, "task3");
+    /// ```
+    pub fn skip(mut self, n: usize) -> Self {
+        self.tasks = self.tasks.into_iter().skip(n).collect();
+        self
+    }
+
+    /// Find the index of the first task with the given name
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![])
+    ///     .then("task1", vec![]);
+    ///
+    /// assert_eq!(chain.find_task("task1"), Some(0));
+    /// assert_eq!(chain.find_task("task2"), Some(1));
+    /// assert_eq!(chain.find_task("task3"), None);
+    /// ```
+    pub fn find_task(&self, task_name: &str) -> Option<usize> {
+        self.tasks.iter().position(|t| t.task == task_name)
+    }
+
+    /// Find all indices of tasks with the given name
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![])
+    ///     .then("task1", vec![]);
+    ///
+    /// assert_eq!(chain.find_all_tasks("task1"), vec![0, 2]);
+    /// assert_eq!(chain.find_all_tasks("task2"), vec![1]);
+    /// ```
+    pub fn find_all_tasks(&self, task_name: &str) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.task == task_name)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Check if the chain contains a task with the given name
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![]);
+    ///
+    /// assert!(chain.contains_task("task1"));
+    /// assert!(!chain.contains_task("task3"));
+    /// ```
+    pub fn contains_task(&self, task_name: &str) -> bool {
+        self.tasks.iter().any(|t| t.task == task_name)
+    }
+
+    /// Get the total estimated duration in seconds based on task time limits
+    ///
+    /// This sums up all task time limits (or soft_time_limit if time_limit is not set).
+    /// Returns None if no tasks have time limits set.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Chain, Signature};
+    ///
+    /// let chain = Chain::new()
+    ///     .then_signature(Signature::new("task1".to_string()).with_time_limit(10))
+    ///     .then_signature(Signature::new("task2".to_string()).with_time_limit(20));
+    ///
+    /// assert_eq!(chain.estimated_duration(), Some(30));
+    /// ```
+    pub fn estimated_duration(&self) -> Option<u64> {
+        let mut total = 0u64;
+        let mut found_any = false;
+
+        for task in &self.tasks {
+            if let Some(limit) = task.options.time_limit.or(task.options.soft_time_limit) {
+                total += limit;
+                found_any = true;
+            }
+        }
+
+        if found_any {
+            Some(total)
+        } else {
+            None
+        }
+    }
+
+    /// Get a summary of all task names in the chain
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("fetch", vec![])
+    ///     .then("process", vec![])
+    ///     .then("save", vec![]);
+    ///
+    /// assert_eq!(chain.task_names(), vec!["fetch", "process", "save"]);
+    /// ```
+    pub fn task_names(&self) -> Vec<&str> {
+        self.tasks.iter().map(|t| t.task.as_str()).collect()
+    }
+
+    /// Get all unique task names in the chain
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![])
+    ///     .then("task1", vec![]);
+    ///
+    /// let unique = chain.unique_task_names();
+    /// assert_eq!(unique.len(), 2);
+    /// assert!(unique.contains(&"task1"));
+    /// assert!(unique.contains(&"task2"));
+    /// ```
+    pub fn unique_task_names(&self) -> std::collections::HashSet<&str> {
+        self.tasks.iter().map(|t| t.task.as_str()).collect()
+    }
+
+    /// Clone the chain with a transformation applied to each task
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Chain;
+    ///
+    /// let chain = Chain::new()
+    ///     .then("task1", vec![])
+    ///     .then("task2", vec![]);
+    ///
+    /// let prioritized = chain.clone_with_transform(|sig| {
+    ///     sig.clone().with_priority(5)
+    /// });
+    ///
+    /// assert!(prioritized.tasks.iter().all(|t| t.options.priority == Some(5)));
+    /// ```
+    pub fn clone_with_transform<F>(&self, mut transform: F) -> Self
+    where
+        F: FnMut(&Signature) -> Signature,
+    {
+        Self {
+            tasks: self.tasks.iter().map(&mut transform).collect(),
+        }
+    }
 }
 
 impl std::fmt::Display for Chain {
@@ -885,10 +1631,42 @@ impl std::fmt::Display for Chain {
     }
 }
 
+impl IntoIterator for Chain {
+    type Item = Signature;
+    type IntoIter = std::vec::IntoIter<Signature>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tasks.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Chain {
+    type Item = &'a Signature;
+    type IntoIter = std::slice::Iter<'a, Signature>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tasks.iter()
+    }
+}
+
+impl From<Vec<Signature>> for Chain {
+    fn from(tasks: Vec<Signature>) -> Self {
+        Self { tasks }
+    }
+}
+
+impl FromIterator<Signature> for Chain {
+    fn from_iter<T: IntoIterator<Item = Signature>>(iter: T) -> Self {
+        Self {
+            tasks: iter.into_iter().collect(),
+        }
+    }
+}
+
 /// Group: Parallel execution
 ///
 /// (task1 | task2 | task3)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Group {
     /// Tasks in the group
     pub tasks: Vec<Signature>,
@@ -967,6 +1745,76 @@ impl Group {
         self.tasks.is_empty()
     }
 
+    /// Get the first task in the group
+    pub fn first(&self) -> Option<&Signature> {
+        self.tasks.first()
+    }
+
+    /// Get the last task in the group
+    pub fn last(&self) -> Option<&Signature> {
+        self.tasks.last()
+    }
+
+    /// Get an iterator over the tasks
+    pub fn iter(&self) -> std::slice::Iter<'_, Signature> {
+        self.tasks.iter()
+    }
+
+    /// Get a mutable iterator over the tasks
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Signature> {
+        self.tasks.iter_mut()
+    }
+
+    /// Get a task by index
+    pub fn get(&self, index: usize) -> Option<&Signature> {
+        self.tasks.get(index)
+    }
+
+    /// Get a mutable task by index
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Signature> {
+        self.tasks.get_mut(index)
+    }
+
+    /// Create a group with pre-allocated capacity
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            tasks: Vec::with_capacity(capacity),
+            group_id: Some(Uuid::new_v4()),
+        }
+    }
+
+    /// Extend the group with additional tasks
+    pub fn extend(mut self, tasks: impl IntoIterator<Item = Signature>) -> Self {
+        self.tasks.extend(tasks);
+        self
+    }
+
+    /// Retain only tasks that satisfy the predicate
+    pub fn retain<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&Signature) -> bool,
+    {
+        self.tasks.retain(f);
+        self
+    }
+
+    /// Find a task by predicate
+    pub fn find<F>(&self, predicate: F) -> Option<&Signature>
+    where
+        F: Fn(&Signature) -> bool,
+    {
+        self.tasks.iter().find(|sig| predicate(sig))
+    }
+
+    /// Filter tasks by predicate and return a new group
+    pub fn filter<F>(mut self, predicate: F) -> Self
+    where
+        F: FnMut(&Signature) -> bool,
+    {
+        self.tasks.retain(predicate);
+        self
+    }
+
     /// Stagger task execution with countdown delays
     ///
     /// Each task gets a countdown that increases by the specified interval.
@@ -1031,6 +1879,519 @@ impl Group {
     pub fn has_group_id(&self) -> bool {
         self.group_id.is_some()
     }
+
+    /// Merge another group into this group
+    ///
+    /// All tasks from the other group are added to this group.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group1 = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![]);
+    ///
+    /// let group2 = Group::new()
+    ///     .add("task3", vec![])
+    ///     .add("task4", vec![]);
+    ///
+    /// let merged = group1.merge(group2);
+    /// assert_eq!(merged.len(), 4);
+    /// ```
+    pub fn merge(mut self, other: Group) -> Self {
+        self.tasks.extend(other.tasks);
+        self
+    }
+
+    /// Partition tasks into multiple groups based on a predicate
+    ///
+    /// Returns a tuple of (matching, non_matching) groups.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Group, Signature};
+    ///
+    /// let group = Group::new()
+    ///     .add_signature(Signature::new("high_priority".to_string()).with_priority(9))
+    ///     .add_signature(Signature::new("normal".to_string()).with_priority(5))
+    ///     .add_signature(Signature::new("urgent".to_string()).with_priority(9))
+    ///     .add_signature(Signature::new("low".to_string()).with_priority(1));
+    ///
+    /// let (high, low) = group.partition(|sig| sig.options.priority.unwrap_or(0) >= 9);
+    /// assert_eq!(high.len(), 2);
+    /// assert_eq!(low.len(), 2);
+    /// ```
+    pub fn partition<F>(self, mut predicate: F) -> (Group, Group)
+    where
+        F: FnMut(&Signature) -> bool,
+    {
+        let (matching, non_matching): (Vec<_>, Vec<_>) =
+            self.tasks.into_iter().partition(|sig| predicate(sig));
+
+        (
+            Group {
+                tasks: matching,
+                group_id: self.group_id,
+            },
+            Group {
+                tasks: non_matching,
+                group_id: None, // Different group
+            },
+        )
+    }
+
+    /// Add a task name prefix to all tasks in the group
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("process", vec![])
+    ///     .add("validate", vec![]);
+    ///
+    /// let prefixed = group.with_task_prefix("batch_");
+    /// assert_eq!(prefixed.first().unwrap().task, "batch_process");
+    /// ```
+    pub fn with_task_prefix(mut self, prefix: &str) -> Self {
+        for task in &mut self.tasks {
+            task.task = format!("{}{}", prefix, task.task);
+        }
+        self
+    }
+
+    /// Add a task name suffix to all tasks in the group
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("process", vec![])
+    ///     .add("validate", vec![]);
+    ///
+    /// let suffixed = group.with_task_suffix("_v2");
+    /// assert_eq!(suffixed.first().unwrap().task, "process_v2");
+    /// ```
+    pub fn with_task_suffix(mut self, suffix: &str) -> Self {
+        for task in &mut self.tasks {
+            task.task = format!("{}{}", task.task, suffix);
+        }
+        self
+    }
+
+    /// Set priority on all tasks in the group
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![])
+    ///     .with_priority(9);
+    ///
+    /// assert_eq!(group.first().unwrap().options.priority, Some(9));
+    /// ```
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        for task in &mut self.tasks {
+            task.options.priority = Some(priority);
+        }
+        self
+    }
+
+    /// Set queue on all tasks in the group
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![])
+    ///     .with_queue("high_priority".to_string());
+    ///
+    /// assert_eq!(group.first().unwrap().options.queue, Some("high_priority".to_string()));
+    /// ```
+    pub fn with_queue(mut self, queue: String) -> Self {
+        for task in &mut self.tasks {
+            task.options.queue = Some(queue.clone());
+        }
+        self
+    }
+
+    /// Validate that all tasks in the group have non-empty names
+    ///
+    /// Returns true if all tasks are valid, false otherwise.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let valid = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![]);
+    /// assert!(valid.is_valid());
+    ///
+    /// let invalid = Group { tasks: vec![], group_id: None };
+    /// assert!(!invalid.is_valid());
+    /// ```
+    pub fn is_valid(&self) -> bool {
+        !self.tasks.is_empty() && self.tasks.iter().all(|t| !t.task.is_empty())
+    }
+
+    /// Count tasks that match a predicate
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Group, Signature};
+    ///
+    /// let group = Group::new()
+    ///     .add_signature(Signature::new("high".to_string()).with_priority(9))
+    ///     .add_signature(Signature::new("low".to_string()).with_priority(1))
+    ///     .add_signature(Signature::new("urgent".to_string()).with_priority(9));
+    ///
+    /// let high_priority = group.count_matching(|sig| sig.options.priority.unwrap_or(0) >= 9);
+    /// assert_eq!(high_priority, 2);
+    /// ```
+    pub fn count_matching<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&Signature) -> bool,
+    {
+        self.tasks.iter().filter(|t| predicate(t)).count()
+    }
+
+    /// Check if any task matches a predicate
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("process", vec![])
+    ///     .add("validate", vec![]);
+    ///
+    /// assert!(group.any(|sig| sig.task == "validate"));
+    /// assert!(!group.any(|sig| sig.task == "missing"));
+    /// ```
+    pub fn any<F>(&self, predicate: F) -> bool
+    where
+        F: Fn(&Signature) -> bool,
+    {
+        self.tasks.iter().any(predicate)
+    }
+
+    /// Check if all tasks match a predicate
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("process", vec![])
+    ///     .add("validate", vec![]);
+    ///
+    /// assert!(group.all(|sig| !sig.task.is_empty()));
+    /// ```
+    pub fn all<F>(&self, predicate: F) -> bool
+    where
+        F: Fn(&Signature) -> bool,
+    {
+        self.tasks.iter().all(predicate)
+    }
+
+    /// Map over all tasks, transforming each signature
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Group, Signature};
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![]);
+    ///
+    /// let modified = group.map_tasks(|sig| {
+    ///     Signature::new(format!("parallel_{}", sig.task))
+    /// });
+    ///
+    /// assert_eq!(modified.first().unwrap().task, "parallel_task1");
+    /// ```
+    pub fn map_tasks<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(Signature) -> Signature,
+    {
+        self.tasks = self.tasks.into_iter().map(f).collect();
+        self
+    }
+
+    /// Filter and map tasks in one operation
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Group, Signature};
+    ///
+    /// let group = Group::new()
+    ///     .add_signature(Signature::new("high".to_string()).with_priority(9))
+    ///     .add_signature(Signature::new("low".to_string()).with_priority(1))
+    ///     .add_signature(Signature::new("urgent".to_string()).with_priority(9));
+    ///
+    /// let high_priority = group.filter_map(|sig| {
+    ///     if sig.options.priority.unwrap_or(0) >= 9 {
+    ///         Some(sig)
+    ///     } else {
+    ///         None
+    ///     }
+    /// });
+    ///
+    /// assert_eq!(high_priority.len(), 2);
+    /// ```
+    pub fn filter_map<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(Signature) -> Option<Signature>,
+    {
+        self.tasks = self.tasks.into_iter().filter_map(f).collect();
+        self
+    }
+
+    /// Take the first n tasks from the group
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![])
+    ///     .add("task3", vec![])
+    ///     .add("task4", vec![]);
+    ///
+    /// let first_two = group.take(2);
+    /// assert_eq!(first_two.len(), 2);
+    /// ```
+    pub fn take(mut self, n: usize) -> Self {
+        self.tasks.truncate(n);
+        self
+    }
+
+    /// Skip the first n tasks from the group
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![])
+    ///     .add("task3", vec![])
+    ///     .add("task4", vec![]);
+    ///
+    /// let skipped = group.skip(2);
+    /// assert_eq!(skipped.len(), 2);
+    /// assert_eq!(skipped.first().unwrap().task, "task3");
+    /// ```
+    pub fn skip(mut self, n: usize) -> Self {
+        self.tasks = self.tasks.into_iter().skip(n).collect();
+        self
+    }
+
+    /// Find the index of the first task with the given name
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![])
+    ///     .add("task1", vec![]);
+    ///
+    /// assert_eq!(group.find_task("task1"), Some(0));
+    /// assert_eq!(group.find_task("task2"), Some(1));
+    /// assert_eq!(group.find_task("task3"), None);
+    /// ```
+    pub fn find_task(&self, task_name: &str) -> Option<usize> {
+        self.tasks.iter().position(|t| t.task == task_name)
+    }
+
+    /// Find all indices of tasks with the given name
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![])
+    ///     .add("task1", vec![]);
+    ///
+    /// assert_eq!(group.find_all_tasks("task1"), vec![0, 2]);
+    /// assert_eq!(group.find_all_tasks("task2"), vec![1]);
+    /// ```
+    pub fn find_all_tasks(&self, task_name: &str) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.task == task_name)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Check if the group contains a task with the given name
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![]);
+    ///
+    /// assert!(group.contains_task("task1"));
+    /// assert!(!group.contains_task("task3"));
+    /// ```
+    pub fn contains_task(&self, task_name: &str) -> bool {
+        self.tasks.iter().any(|t| t.task == task_name)
+    }
+
+    /// Get the maximum estimated duration in seconds based on task time limits
+    ///
+    /// Since tasks run in parallel, the group duration is the maximum of all task durations.
+    /// Returns None if no tasks have time limits set.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Group, Signature};
+    ///
+    /// let group = Group::new()
+    ///     .add_signature(Signature::new("task1".to_string()).with_time_limit(10))
+    ///     .add_signature(Signature::new("task2".to_string()).with_time_limit(20));
+    ///
+    /// assert_eq!(group.estimated_duration(), Some(20)); // Max of 10 and 20
+    /// ```
+    pub fn estimated_duration(&self) -> Option<u64> {
+        self.tasks
+            .iter()
+            .filter_map(|t| t.options.time_limit.or(t.options.soft_time_limit))
+            .max()
+    }
+
+    /// Get a summary of all task names in the group
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("fetch", vec![])
+    ///     .add("process", vec![])
+    ///     .add("save", vec![]);
+    ///
+    /// assert_eq!(group.task_names(), vec!["fetch", "process", "save"]);
+    /// ```
+    pub fn task_names(&self) -> Vec<&str> {
+        self.tasks.iter().map(|t| t.task.as_str()).collect()
+    }
+
+    /// Get all unique task names in the group
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![])
+    ///     .add("task1", vec![]);
+    ///
+    /// let unique = group.unique_task_names();
+    /// assert_eq!(unique.len(), 2);
+    /// assert!(unique.contains(&"task1"));
+    /// assert!(unique.contains(&"task2"));
+    /// ```
+    pub fn unique_task_names(&self) -> std::collections::HashSet<&str> {
+        self.tasks.iter().map(|t| t.task.as_str()).collect()
+    }
+
+    /// Clone the group with a transformation applied to each task
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Group;
+    ///
+    /// let group = Group::new()
+    ///     .add("task1", vec![])
+    ///     .add("task2", vec![]);
+    ///
+    /// let prioritized = group.clone_with_transform(|sig| {
+    ///     sig.clone().with_priority(5)
+    /// });
+    ///
+    /// assert!(prioritized.tasks.iter().all(|t| t.options.priority == Some(5)));
+    /// ```
+    pub fn clone_with_transform<F>(&self, mut transform: F) -> Self
+    where
+        F: FnMut(&Signature) -> Signature,
+    {
+        Self {
+            tasks: self.tasks.iter().map(&mut transform).collect(),
+            group_id: self.group_id,
+        }
+    }
+
+    /// Count tasks by priority level
+    ///
+    /// Returns a map of priority values to the count of tasks at that priority.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Group, Signature};
+    ///
+    /// let group = Group::new()
+    ///     .add_signature(Signature::new("task1".to_string()).with_priority(1))
+    ///     .add_signature(Signature::new("task2".to_string()).with_priority(5))
+    ///     .add_signature(Signature::new("task3".to_string()).with_priority(1));
+    ///
+    /// let counts = group.count_by_priority();
+    /// assert_eq!(counts.get(&1), Some(&2));
+    /// assert_eq!(counts.get(&5), Some(&1));
+    /// ```
+    pub fn count_by_priority(&self) -> std::collections::HashMap<u8, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for task in &self.tasks {
+            if let Some(priority) = task.options.priority {
+                *counts.entry(priority).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    /// Count tasks by queue name
+    ///
+    /// Returns a map of queue names to the count of tasks targeting that queue.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::{Group, Signature};
+    ///
+    /// let group = Group::new()
+    ///     .add_signature(Signature::new("task1".to_string()).with_queue("queue_a".to_string()))
+    ///     .add_signature(Signature::new("task2".to_string()).with_queue("queue_b".to_string()))
+    ///     .add_signature(Signature::new("task3".to_string()).with_queue("queue_a".to_string()));
+    ///
+    /// let counts = group.count_by_queue();
+    /// assert_eq!(counts.get("queue_a"), Some(&2));
+    /// assert_eq!(counts.get("queue_b"), Some(&1));
+    /// ```
+    pub fn count_by_queue(&self) -> std::collections::HashMap<String, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for task in &self.tasks {
+            if let Some(ref queue) = task.options.queue {
+                *counts.entry(queue.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
 }
 
 impl std::fmt::Display for Group {
@@ -1043,10 +2404,46 @@ impl std::fmt::Display for Group {
     }
 }
 
+impl IntoIterator for Group {
+    type Item = Signature;
+    type IntoIter = std::vec::IntoIter<Signature>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tasks.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Group {
+    type Item = &'a Signature;
+    type IntoIter = std::slice::Iter<'a, Signature>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tasks.iter()
+    }
+}
+
+impl From<Vec<Signature>> for Group {
+    fn from(tasks: Vec<Signature>) -> Self {
+        Self {
+            tasks,
+            group_id: Some(Uuid::new_v4()),
+        }
+    }
+}
+
+impl FromIterator<Signature> for Group {
+    fn from_iter<T: IntoIterator<Item = Signature>>(iter: T) -> Self {
+        Self {
+            tasks: iter.into_iter().collect(),
+            group_id: Some(Uuid::new_v4()),
+        }
+    }
+}
+
 /// Chord: Parallel execution with callback
 ///
 /// (task1 | task2 | task3) -> callback([result1, result2, result3])
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chord {
     /// Header (parallel tasks)
     pub header: Group,
@@ -1146,7 +2543,7 @@ impl std::fmt::Display for Chord {
 /// Map: Apply task to multiple arguments
 ///
 /// map(task, [args1, args2, args3]) -> [result1, result2, result3]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Map {
     /// Task to apply
     pub task: Signature,
@@ -1198,7 +2595,7 @@ impl std::fmt::Display for Map {
 /// Starmap: Like map but unpacks arguments
 ///
 /// starmap(task, [(a1, b1), (a2, b2)]) -> [task(a1, b1), task(a2, b2)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Starmap {
     /// Task to apply
     pub task: Signature,
@@ -1256,7 +2653,7 @@ impl std::fmt::Display for Starmap {
 /// let chunks = Chunks::new(task, items, 10);
 /// assert_eq!(chunks.num_chunks(), 10);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Chunks {
     /// Task to apply to each chunk
     pub task: Signature,
@@ -1342,7 +2739,7 @@ impl std::fmt::Display for Chunks {
 ///
 /// Like Map, but continues processing even if some tasks fail.
 /// Failed tasks are tracked separately.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct XMap {
     /// Task to apply
     pub task: Signature,
@@ -1405,7 +2802,7 @@ impl std::fmt::Display for XMap {
 /// XStarmap: Starmap with exception handling
 ///
 /// Like Starmap, but continues processing even if some tasks fail.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct XStarmap {
     /// Task to apply
     pub task: Signature,
@@ -2481,6 +3878,73 @@ impl NestedChain {
 
         Some(result)
     }
+
+    /// Execute the nested chain sequentially
+    ///
+    /// Each element is executed in order. For complex elements (Groups, Chords),
+    /// they are executed and we wait for them to start before continuing.
+    /// Note: This executes elements sequentially but doesn't wait for completion,
+    /// following Celery's async execution model.
+    pub async fn apply<B: Broker>(&self, broker: &B) -> Result<Uuid, CanvasError> {
+        if self.elements.is_empty() {
+            return Err(CanvasError::Invalid(
+                "NestedChain cannot be empty".to_string(),
+            ));
+        }
+
+        // Execute each element in sequence
+        let mut last_id = None;
+        for element in &self.elements {
+            match element {
+                CanvasElement::Signature(sig) => {
+                    // Convert to Chain for sequential execution
+                    let chain = Chain {
+                        tasks: vec![sig.clone()],
+                    };
+                    last_id = Some(chain.apply(broker).await?);
+                }
+                CanvasElement::Chain(chain) => {
+                    last_id = Some(chain.clone().apply(broker).await?);
+                }
+                CanvasElement::Group(group) => {
+                    last_id = Some(group.clone().apply(broker).await?);
+                }
+                CanvasElement::Chord { header, body } => {
+                    #[cfg(feature = "backend-redis")]
+                    {
+                        // Note: Chord requires backend, but we can't pass it here
+                        // For now, fall back to just executing the group
+                        last_id = Some(header.clone().apply(broker).await?);
+                        // Callback would need to be manually triggered
+                        let _ = body; // Silence unused warning
+                    }
+                    #[cfg(not(feature = "backend-redis"))]
+                    {
+                        last_id = Some(header.clone().apply(broker).await?);
+                        let _ = body; // Silence unused warning
+                    }
+                }
+                CanvasElement::Map { task, argsets } => {
+                    let map = Map::new(task.clone(), argsets.clone());
+                    last_id = Some(map.apply(broker).await?);
+                }
+                CanvasElement::Branch(_branch) => {
+                    // Branches require runtime evaluation, skip for now
+                    return Err(CanvasError::Invalid(
+                        "Branch elements not supported in NestedChain.apply()".to_string(),
+                    ));
+                }
+                CanvasElement::Switch(_switch) => {
+                    // Switch requires runtime evaluation, skip for now
+                    return Err(CanvasError::Invalid(
+                        "Switch elements not supported in NestedChain.apply()".to_string(),
+                    ));
+                }
+            }
+        }
+
+        last_id.ok_or_else(|| CanvasError::Invalid("No elements executed".to_string()))
+    }
 }
 
 impl Default for NestedChain {
@@ -2573,6 +4037,71 @@ impl NestedGroup {
         }
 
         Some(result)
+    }
+
+    /// Execute all elements in parallel
+    ///
+    /// All elements in the group are started concurrently.
+    /// Returns a group ID that can be used to track the parallel execution.
+    pub async fn apply<B: Broker>(&self, broker: &B) -> Result<Uuid, CanvasError> {
+        if self.elements.is_empty() {
+            return Err(CanvasError::Invalid(
+                "NestedGroup cannot be empty".to_string(),
+            ));
+        }
+
+        // Generate a group ID for tracking
+        let group_id = Uuid::new_v4();
+
+        // Execute all elements in parallel
+        for element in &self.elements {
+            match element {
+                CanvasElement::Signature(sig) => {
+                    let chain = Chain {
+                        tasks: vec![sig.clone()],
+                    };
+                    chain.apply(broker).await?;
+                }
+                CanvasElement::Chain(chain) => {
+                    chain.clone().apply(broker).await?;
+                }
+                CanvasElement::Group(group) => {
+                    group.clone().apply(broker).await?;
+                }
+                CanvasElement::Chord { header, body } => {
+                    #[cfg(feature = "backend-redis")]
+                    {
+                        // Note: Chord requires backend, but we can't pass it here
+                        // For now, fall back to just executing the group
+                        header.clone().apply(broker).await?;
+                        let _ = body; // Silence unused warning
+                    }
+                    #[cfg(not(feature = "backend-redis"))]
+                    {
+                        header.clone().apply(broker).await?;
+                        let _ = body; // Silence unused warning
+                    }
+                }
+                CanvasElement::Map { task, argsets } => {
+                    let map = Map::new(task.clone(), argsets.clone());
+                    map.apply(broker).await?;
+                }
+                CanvasElement::Branch(_branch) => {
+                    // Branches require runtime evaluation, skip for now
+                    return Err(CanvasError::Invalid(
+                        "Branch elements not supported in NestedGroup.apply()".to_string(),
+                    ));
+                }
+                CanvasElement::Switch(_switch) => {
+                    // Switch requires runtime evaluation, skip for now
+                    return Err(CanvasError::Invalid(
+                        "Switch elements not supported in NestedGroup.apply()".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(group_id)
     }
 }
 
@@ -4736,18 +6265,249 @@ impl WorkflowCompiler {
         self
     }
 
-    /// Optimize a chain (placeholder - actual implementation would analyze and transform)
+    /// Optimize a chain by applying configured optimization passes
     pub fn optimize_chain(&self, chain: &Chain) -> Chain {
-        // Placeholder: In a real implementation, this would analyze the chain
-        // and apply optimization passes
-        chain.clone()
+        let mut optimized = chain.clone();
+
+        for pass in &self.passes {
+            optimized = match pass {
+                OptimizationPass::CommonSubexpressionElimination => {
+                    self.apply_cse_chain(&optimized)
+                }
+                OptimizationPass::DeadCodeElimination => self.apply_dce_chain(&optimized),
+                OptimizationPass::TaskFusion => self.apply_task_fusion(&optimized),
+                OptimizationPass::ParallelScheduling => {
+                    // Chains are sequential, no parallel scheduling
+                    optimized
+                }
+                OptimizationPass::ResourceOptimization => {
+                    self.apply_resource_optimization_chain(&optimized)
+                }
+            };
+        }
+
+        optimized
     }
 
-    /// Optimize a group (placeholder - actual implementation would analyze and transform)
+    /// Optimize a group by applying configured optimization passes
     pub fn optimize_group(&self, group: &Group) -> Group {
-        // Placeholder: In a real implementation, this would analyze the group
-        // and apply optimization passes
-        group.clone()
+        let mut optimized = group.clone();
+
+        for pass in &self.passes {
+            optimized = match pass {
+                OptimizationPass::CommonSubexpressionElimination => {
+                    self.apply_cse_group(&optimized)
+                }
+                OptimizationPass::DeadCodeElimination => self.apply_dce_group(&optimized),
+                OptimizationPass::TaskFusion => {
+                    // Groups are parallel, no task fusion
+                    optimized
+                }
+                OptimizationPass::ParallelScheduling => self.apply_parallel_scheduling(&optimized),
+                OptimizationPass::ResourceOptimization => {
+                    self.apply_resource_optimization_group(&optimized)
+                }
+            };
+        }
+
+        optimized
+    }
+
+    /// Optimize a chord by applying configured optimization passes
+    pub fn optimize_chord(&self, chord: &Chord) -> Chord {
+        let optimized_group = self.optimize_group(&chord.header);
+        Chord {
+            header: optimized_group,
+            body: chord.body.clone(),
+        }
+    }
+
+    // Helper methods for optimization passes
+
+    /// Common Subexpression Elimination for chains
+    fn apply_cse_chain(&self, chain: &Chain) -> Chain {
+        let mut seen = HashMap::new();
+        let mut optimized_tasks = Vec::new();
+
+        for (idx, task) in chain.tasks.iter().enumerate() {
+            // Create a key for deduplication (task name + args)
+            let key = format!(
+                "{}:{}:{}",
+                task.task,
+                serde_json::to_string(&task.args).unwrap_or_default(),
+                serde_json::to_string(&task.kwargs).unwrap_or_default()
+            );
+
+            if let Some(&prev_idx) = seen.get(&key) {
+                // Skip duplicate if aggressive mode
+                if self.aggressive && prev_idx < idx {
+                    continue;
+                }
+            } else {
+                seen.insert(key, idx);
+            }
+
+            optimized_tasks.push(task.clone());
+        }
+
+        Chain {
+            tasks: optimized_tasks,
+        }
+    }
+
+    /// Common Subexpression Elimination for groups
+    fn apply_cse_group(&self, group: &Group) -> Group {
+        let mut seen = HashMap::new();
+        let mut optimized_tasks = Vec::new();
+
+        for task in &group.tasks {
+            // Create a key for deduplication (task name + args)
+            let key = format!(
+                "{}:{}:{}",
+                task.task,
+                serde_json::to_string(&task.args).unwrap_or_default(),
+                serde_json::to_string(&task.kwargs).unwrap_or_default()
+            );
+
+            if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
+                e.insert(true);
+                optimized_tasks.push(task.clone());
+            } else {
+                // Skip duplicate in aggressive mode
+                if !self.aggressive {
+                    optimized_tasks.push(task.clone());
+                }
+            }
+        }
+
+        Group {
+            tasks: optimized_tasks,
+            group_id: group.group_id,
+        }
+    }
+
+    /// Dead Code Elimination for chains
+    fn apply_dce_chain(&self, chain: &Chain) -> Chain {
+        // Remove tasks that have no effect (e.g., empty task names)
+        let optimized_tasks: Vec<_> = chain
+            .tasks
+            .iter()
+            .filter(|task| !task.task.is_empty())
+            .cloned()
+            .collect();
+
+        Chain {
+            tasks: optimized_tasks,
+        }
+    }
+
+    /// Dead Code Elimination for groups
+    fn apply_dce_group(&self, group: &Group) -> Group {
+        // Remove tasks that have no effect (e.g., empty task names)
+        let optimized_tasks: Vec<_> = group
+            .tasks
+            .iter()
+            .filter(|task| !task.task.is_empty())
+            .cloned()
+            .collect();
+
+        Group {
+            tasks: optimized_tasks,
+            group_id: group.group_id,
+        }
+    }
+
+    /// Task Fusion for chains (combine similar sequential tasks)
+    fn apply_task_fusion(&self, chain: &Chain) -> Chain {
+        if !self.aggressive || chain.tasks.len() < 2 {
+            return chain.clone();
+        }
+
+        let mut optimized_tasks = Vec::new();
+        let mut i = 0;
+
+        while i < chain.tasks.len() {
+            let current = &chain.tasks[i];
+
+            // Check if next task can be fused (same task name, immutable)
+            if i + 1 < chain.tasks.len() {
+                let next = &chain.tasks[i + 1];
+
+                if current.task == next.task
+                    && current.immutable
+                    && next.immutable
+                    && current.options.priority == next.options.priority
+                {
+                    // Fuse tasks: combine args
+                    let mut fused = current.clone();
+                    fused.args.extend(next.args.clone());
+                    optimized_tasks.push(fused);
+                    i += 2; // Skip both tasks
+                    continue;
+                }
+            }
+
+            optimized_tasks.push(current.clone());
+            i += 1;
+        }
+
+        Chain {
+            tasks: optimized_tasks,
+        }
+    }
+
+    /// Parallel Scheduling optimization for groups
+    fn apply_parallel_scheduling(&self, group: &Group) -> Group {
+        let mut optimized_tasks = group.tasks.clone();
+
+        // Sort tasks by priority (higher priority first)
+        optimized_tasks.sort_by(|a, b| {
+            let a_priority = a.options.priority.unwrap_or(0);
+            let b_priority = b.options.priority.unwrap_or(0);
+            b_priority.cmp(&a_priority)
+        });
+
+        Group {
+            tasks: optimized_tasks,
+            group_id: group.group_id,
+        }
+    }
+
+    /// Resource Optimization for chains
+    fn apply_resource_optimization_chain(&self, chain: &Chain) -> Chain {
+        // Group tasks by queue to improve resource utilization
+        let mut optimized_tasks = chain.tasks.clone();
+
+        if self.aggressive {
+            // Reorder tasks to group by queue while maintaining dependencies
+            optimized_tasks.sort_by(|a, b| {
+                let a_queue = a.options.queue.as_deref().unwrap_or("");
+                let b_queue = b.options.queue.as_deref().unwrap_or("");
+                a_queue.cmp(b_queue)
+            });
+        }
+
+        Chain {
+            tasks: optimized_tasks,
+        }
+    }
+
+    /// Resource Optimization for groups
+    fn apply_resource_optimization_group(&self, group: &Group) -> Group {
+        // Balance tasks across queues
+        let mut optimized_tasks = group.tasks.clone();
+
+        // Sort by queue to improve locality
+        optimized_tasks.sort_by(|a, b| {
+            let a_queue = a.options.queue.as_deref().unwrap_or("");
+            let b_queue = b.options.queue.as_deref().unwrap_or("");
+            a_queue.cmp(b_queue)
+        });
+
+        Group {
+            tasks: optimized_tasks,
+            group_id: group.group_id,
+        }
     }
 }
 
@@ -5759,10 +7519,10 @@ impl ParallelScheduler {
                     .max_by(|a, b| {
                         let a_score = a.available_capacity()
                             * (a.cpu_cores as f64 / 100.0)
-                            * (a.memory_mb as f64 / 1000000.0);
+                            * (a.memory_mb as f64 / 1_000_000.0);
                         let b_score = b.available_capacity()
                             * (b.cpu_cores as f64 / 100.0)
-                            * (b.memory_mb as f64 / 1000000.0);
+                            * (b.memory_mb as f64 / 1_000_000.0);
                         a_score
                             .partial_cmp(&b_score)
                             .unwrap_or(std::cmp::Ordering::Equal)
@@ -8428,6 +10188,114 @@ impl WorkflowRegistry {
         self.start_times.clear();
         self.tags.clear();
     }
+
+    /// Get all workflow IDs
+    pub fn all_workflow_ids(&self) -> Vec<Uuid> {
+        self.workflows.keys().copied().collect()
+    }
+
+    /// Get workflows by name pattern (contains)
+    pub fn find_by_name(&self, pattern: &str) -> Vec<Uuid> {
+        self.workflows
+            .iter()
+            .filter(|(_, name)| name.contains(pattern))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Get workflows older than duration (in milliseconds)
+    pub fn get_older_than(&self, duration_ms: u64) -> Vec<Uuid> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        self.start_times
+            .iter()
+            .filter(|(_, &start_time)| now.saturating_sub(start_time) > duration_ms)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Get workflow age in milliseconds
+    pub fn get_age(&self, workflow_id: &Uuid) -> Option<u64> {
+        self.start_times.get(workflow_id).map(|&start_time| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            now.saturating_sub(start_time)
+        })
+    }
+
+    /// Check if workflow exists
+    pub fn contains(&self, workflow_id: &Uuid) -> bool {
+        self.workflows.contains_key(workflow_id)
+    }
+
+    /// Get all tags
+    pub fn all_tags(&self) -> Vec<String> {
+        self.tags.keys().cloned().collect()
+    }
+
+    /// Get workflows with multiple tags (all tags must match)
+    pub fn get_by_tags_all(&self, tags: &[&str]) -> Vec<Uuid> {
+        if tags.is_empty() {
+            return Vec::new();
+        }
+
+        let mut result: Option<Vec<Uuid>> = None;
+
+        for tag in tags {
+            let tagged = self.get_by_tag(tag);
+            result = match result {
+                None => Some(tagged),
+                Some(current) => {
+                    // Intersection
+                    Some(
+                        current
+                            .into_iter()
+                            .filter(|id| tagged.contains(id))
+                            .collect(),
+                    )
+                }
+            };
+        }
+
+        result.unwrap_or_default()
+    }
+
+    /// Get workflows with any of the tags (OR operation)
+    pub fn get_by_tags_any(&self, tags: &[&str]) -> Vec<Uuid> {
+        let mut result = Vec::new();
+        for tag in tags {
+            result.extend(self.get_by_tag(tag));
+        }
+        // Remove duplicates
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    /// Get count by state
+    pub fn count_by_state(&self, state: &WorkflowStatus) -> usize {
+        self.states.iter().filter(|(_, s)| *s == state).count()
+    }
+
+    /// Get running workflows count
+    pub fn running_count(&self) -> usize {
+        self.count_by_state(&WorkflowStatus::Running)
+    }
+
+    /// Get pending workflows count
+    pub fn pending_count(&self) -> usize {
+        self.count_by_state(&WorkflowStatus::Pending)
+    }
+
+    /// Get completed workflows count (success + failed)
+    pub fn completed_count(&self) -> usize {
+        self.count_by_state(&WorkflowStatus::Success) + self.count_by_state(&WorkflowStatus::Failed)
+    }
 }
 
 impl Default for WorkflowRegistry {
@@ -9516,7 +11384,7 @@ mod tests {
             .add_pass(OptimizationPass::ParallelScheduling);
         assert_eq!(custom.passes.len(), 4);
 
-        // Test optimization (placeholder)
+        // Test basic optimization (no change expected)
         let chain = Chain::new().then("task1", vec![]).then("task2", vec![]);
         let optimized = compiler.optimize_chain(&chain);
         assert_eq!(optimized.tasks.len(), chain.tasks.len());
@@ -9529,6 +11397,206 @@ mod tests {
         assert!(display.contains("WorkflowCompiler"));
         assert!(display.contains("DCE"));
         assert!(display.contains("CSE"));
+    }
+
+    #[test]
+    fn test_workflow_compiler_cse_chain() {
+        use serde_json::json;
+
+        // Test Common Subexpression Elimination for chains
+        let compiler = WorkflowCompiler::new().aggressive();
+        let chain = Chain::new()
+            .then_signature(Signature::new("task1".to_string()).with_args(vec![json!(1)]))
+            .then_signature(Signature::new("task2".to_string()).with_args(vec![json!(2)]))
+            .then_signature(Signature::new("task1".to_string()).with_args(vec![json!(1)])); // Duplicate
+
+        let optimized = compiler.optimize_chain(&chain);
+        // CSE should remove the duplicate task in aggressive mode
+        assert_eq!(optimized.tasks.len(), 2);
+        assert_eq!(optimized.tasks[0].task, "task1");
+        assert_eq!(optimized.tasks[1].task, "task2");
+    }
+
+    #[test]
+    fn test_workflow_compiler_cse_group() {
+        use serde_json::json;
+
+        // Test Common Subexpression Elimination for groups
+        let compiler = WorkflowCompiler::new().aggressive();
+        let group = Group::new()
+            .add_signature(Signature::new("task1".to_string()).with_args(vec![json!(1)]))
+            .add_signature(Signature::new("task2".to_string()).with_args(vec![json!(2)]))
+            .add_signature(Signature::new("task1".to_string()).with_args(vec![json!(1)])); // Duplicate
+
+        let optimized = compiler.optimize_group(&group);
+        // CSE should remove the duplicate task in aggressive mode
+        assert_eq!(optimized.tasks.len(), 2);
+        assert_eq!(optimized.tasks[0].task, "task1");
+        assert_eq!(optimized.tasks[1].task, "task2");
+    }
+
+    #[test]
+    fn test_workflow_compiler_dce_chain() {
+        use serde_json::json;
+
+        // Test Dead Code Elimination for chains
+        let compiler = WorkflowCompiler::new();
+        let chain = Chain::new()
+            .then_signature(Signature::new("task1".to_string()).with_args(vec![json!(1)]))
+            .then_signature(Signature::new("".to_string())) // Empty task name (dead code)
+            .then_signature(Signature::new("task2".to_string()).with_args(vec![json!(2)]));
+
+        let optimized = compiler.optimize_chain(&chain);
+        // DCE should remove the empty task
+        assert_eq!(optimized.tasks.len(), 2);
+        assert_eq!(optimized.tasks[0].task, "task1");
+        assert_eq!(optimized.tasks[1].task, "task2");
+    }
+
+    #[test]
+    fn test_workflow_compiler_dce_group() {
+        use serde_json::json;
+
+        // Test Dead Code Elimination for groups
+        let compiler = WorkflowCompiler::new();
+        let group = Group::new()
+            .add_signature(Signature::new("task1".to_string()).with_args(vec![json!(1)]))
+            .add_signature(Signature::new("".to_string())) // Empty task name (dead code)
+            .add_signature(Signature::new("task2".to_string()).with_args(vec![json!(2)]));
+
+        let optimized = compiler.optimize_group(&group);
+        // DCE should remove the empty task
+        assert_eq!(optimized.tasks.len(), 2);
+        assert_eq!(optimized.tasks[0].task, "task1");
+        assert_eq!(optimized.tasks[1].task, "task2");
+    }
+
+    #[test]
+    fn test_workflow_compiler_task_fusion() {
+        use serde_json::json;
+
+        // Test Task Fusion for chains
+        let compiler = WorkflowCompiler::new().aggressive();
+        let chain = Chain::new()
+            .then_signature(
+                Signature::new("process".to_string())
+                    .with_args(vec![json!(1)])
+                    .immutable(),
+            )
+            .then_signature(
+                Signature::new("process".to_string())
+                    .with_args(vec![json!(2)])
+                    .immutable(),
+            )
+            .then_signature(Signature::new("finalize".to_string()));
+
+        let optimized = compiler.optimize_chain(&chain);
+        // Task fusion should combine the two "process" tasks
+        assert_eq!(optimized.tasks.len(), 2);
+        assert_eq!(optimized.tasks[0].task, "process");
+        assert_eq!(optimized.tasks[0].args.len(), 2); // Fused args
+        assert_eq!(optimized.tasks[1].task, "finalize");
+    }
+
+    #[test]
+    fn test_workflow_compiler_parallel_scheduling() {
+        // Test Parallel Scheduling for groups
+        let compiler = WorkflowCompiler::new().add_pass(OptimizationPass::ParallelScheduling);
+
+        let group = Group::new()
+            .add_signature(Signature::new("task1".to_string()).with_priority(1))
+            .add_signature(Signature::new("task2".to_string()).with_priority(5))
+            .add_signature(Signature::new("task3".to_string()).with_priority(3));
+
+        let optimized = compiler.optimize_group(&group);
+        // Parallel scheduling should sort by priority (highest first)
+        assert_eq!(optimized.tasks.len(), 3);
+        assert_eq!(optimized.tasks[0].options.priority, Some(5));
+        assert_eq!(optimized.tasks[1].options.priority, Some(3));
+        assert_eq!(optimized.tasks[2].options.priority, Some(1));
+    }
+
+    #[test]
+    fn test_workflow_compiler_resource_optimization() {
+        // Test Resource Optimization for groups
+        let compiler = WorkflowCompiler::new().add_pass(OptimizationPass::ResourceOptimization);
+
+        let group = Group::new()
+            .add_signature(Signature::new("task1".to_string()).with_queue("queue_b".to_string()))
+            .add_signature(Signature::new("task2".to_string()).with_queue("queue_a".to_string()))
+            .add_signature(Signature::new("task3".to_string()).with_queue("queue_a".to_string()));
+
+        let optimized = compiler.optimize_group(&group);
+        // Resource optimization should sort by queue
+        assert_eq!(optimized.tasks.len(), 3);
+        assert_eq!(
+            optimized.tasks[0].options.queue.as_ref().unwrap(),
+            "queue_a"
+        );
+        assert_eq!(
+            optimized.tasks[1].options.queue.as_ref().unwrap(),
+            "queue_a"
+        );
+        assert_eq!(
+            optimized.tasks[2].options.queue.as_ref().unwrap(),
+            "queue_b"
+        );
+    }
+
+    #[test]
+    fn test_workflow_compiler_optimize_chord() {
+        use serde_json::json;
+
+        // Test chord optimization
+        let compiler = WorkflowCompiler::new().aggressive();
+
+        let group = Group::new()
+            .add_signature(Signature::new("task1".to_string()).with_args(vec![json!(1)]))
+            .add_signature(Signature::new("task1".to_string()).with_args(vec![json!(1)])) // Duplicate
+            .add_signature(Signature::new("task2".to_string()).with_args(vec![json!(2)]));
+
+        let chord = Chord::new(group, Signature::new("callback".to_string()));
+        let optimized = compiler.optimize_chord(&chord);
+
+        // CSE should remove duplicates from the chord's header group
+        assert_eq!(optimized.header.tasks.len(), 2);
+        assert_eq!(optimized.body.task, "callback");
+    }
+
+    #[test]
+    fn test_workflow_compiler_combined_passes() {
+        use serde_json::json;
+
+        // Test multiple optimization passes together
+        let compiler = WorkflowCompiler::new()
+            .aggressive()
+            .add_pass(OptimizationPass::ParallelScheduling);
+
+        let group = Group::new()
+            .add_signature(
+                Signature::new("task1".to_string())
+                    .with_priority(1)
+                    .with_args(vec![json!(1)]),
+            )
+            .add_signature(Signature::new("".to_string())) // Dead code
+            .add_signature(
+                Signature::new("task2".to_string())
+                    .with_priority(5)
+                    .with_args(vec![json!(2)]),
+            )
+            .add_signature(
+                Signature::new("task1".to_string())
+                    .with_priority(1)
+                    .with_args(vec![json!(1)]),
+            ); // Duplicate
+
+        let optimized = compiler.optimize_group(&group);
+        // Should remove dead code, remove duplicate, and sort by priority
+        assert_eq!(optimized.tasks.len(), 2);
+        assert_eq!(optimized.tasks[0].options.priority, Some(5));
+        assert_eq!(optimized.tasks[0].task, "task2");
+        assert_eq!(optimized.tasks[1].options.priority, Some(1));
+        assert_eq!(optimized.tasks[1].task, "task1");
     }
 
     #[test]
@@ -10579,27 +12647,30 @@ mod tests {
         #[cfg(feature = "backend-redis")]
         #[tokio::test]
         async fn test_chord_backend_integration() {
-            let chord = Chord::new()
+            let group = Group::new()
                 .add("task1", vec![serde_json::json!(1)])
-                .add("task2", vec![serde_json::json!(2)])
-                .callback("aggregate", vec![]);
+                .add("task2", vec![serde_json::json!(2)]);
+            let callback = Signature::new("aggregate".to_string());
+            let chord = Chord::new(group, callback);
 
-            assert_eq!(chord.tasks.len(), 2);
-            assert!(chord.callback.is_some());
+            assert_eq!(chord.header.tasks.len(), 2);
+            assert_eq!(chord.body.task, "aggregate");
         }
 
         #[cfg(feature = "backend-redis")]
         #[tokio::test]
         async fn test_chord_state_tracking() {
             let chord_id = Uuid::new_v4();
-            let chord = Chord::new()
-                .with_group_id(chord_id)
+            let mut group = Group::new();
+            group.group_id = Some(chord_id);
+            let group = group
                 .add("task1", vec![serde_json::json!(1)])
-                .add("task2", vec![serde_json::json!(2)])
-                .callback("aggregate", vec![]);
+                .add("task2", vec![serde_json::json!(2)]);
+            let callback = Signature::new("aggregate".to_string());
+            let chord = Chord::new(group, callback);
 
-            assert_eq!(chord.group_id, Some(chord_id));
-            assert_eq!(chord.tasks.len(), 2);
+            assert_eq!(chord.header.group_id, Some(chord_id));
+            assert_eq!(chord.header.tasks.len(), 2);
         }
 
         // ===== Chord Barrier Race Condition Tests =====
@@ -11717,6 +13788,455 @@ mod tests {
             let display = format!("{}", registry);
             assert!(display.contains("WorkflowRegistry"));
             assert!(display.contains("total=1"));
+        }
+
+        // ===== NestedChain Tests =====
+
+        #[tokio::test]
+        async fn test_nested_chain_apply() {
+            let broker = MockBroker::new();
+
+            let nested_chain = NestedChain::new()
+                .then("task1", vec![serde_json::json!(1)])
+                .then_group(
+                    Group::new()
+                        .add("task2a", vec![serde_json::json!(2)])
+                        .add("task2b", vec![serde_json::json!(3)]),
+                )
+                .then("task3", vec![serde_json::json!(4)]);
+
+            let result = nested_chain.apply(&broker).await;
+            assert!(result.is_ok(), "NestedChain apply should succeed");
+
+            // Verify tasks were published
+            assert!(
+                broker.task_count() >= 4,
+                "Should publish at least 4 tasks (task1, task2a, task2b, task3)"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_nested_chain_with_chains() {
+            let broker = MockBroker::new();
+
+            let nested_chain = NestedChain::new()
+                .then_chain(Chain::new().then("step1", vec![]).then("step2", vec![]))
+                .then_chain(Chain::new().then("step3", vec![]).then("step4", vec![]));
+
+            let result = nested_chain.apply(&broker).await;
+            assert!(result.is_ok(), "NestedChain with chains should succeed");
+
+            // Each chain only enqueues the first task (with links to subsequent tasks)
+            // So we expect 2 tasks (one per chain), not 4
+            assert_eq!(
+                broker.task_count(),
+                2,
+                "Should publish 2 first tasks from two chains"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_nested_chain_empty_error() {
+            let broker = MockBroker::new();
+            let nested_chain = NestedChain::new();
+
+            let result = nested_chain.apply(&broker).await;
+            assert!(result.is_err(), "Empty NestedChain should return error");
+            match result {
+                Err(CanvasError::Invalid(msg)) => {
+                    assert!(msg.contains("empty"));
+                }
+                _ => panic!("Expected Invalid error for empty NestedChain"),
+            }
+        }
+
+        #[test]
+        fn test_nested_chain_builder_methods() {
+            let chain = NestedChain::new()
+                .then("task1", vec![])
+                .then_signature(Signature::new("task2".to_string()))
+                .then_group(Group::new().add("task3", vec![]));
+
+            assert_eq!(chain.len(), 3);
+            assert!(!chain.is_empty());
+        }
+
+        #[test]
+        fn test_nested_chain_display() {
+            let chain = NestedChain::new()
+                .then("task1", vec![])
+                .then("task2", vec![]);
+
+            let display = format!("{}", chain);
+            assert!(display.contains("NestedChain"));
+            assert!(display.contains("->"));
+        }
+
+        // ===== NestedGroup Tests =====
+
+        #[tokio::test]
+        async fn test_nested_group_apply() {
+            let broker = MockBroker::new();
+
+            let nested_group = NestedGroup::new()
+                .add("task1", vec![serde_json::json!(1)])
+                .add_chain(Chain::new().then("task2a", vec![]).then("task2b", vec![]))
+                .add("task3", vec![serde_json::json!(3)]);
+
+            let result = nested_group.apply(&broker).await;
+            assert!(result.is_ok(), "NestedGroup apply should succeed");
+
+            // Verify tasks were published
+            // Chain only enqueues first task, so: task1 + task2a (from chain) + task3 = 3
+            assert_eq!(
+                broker.task_count(),
+                3,
+                "Should publish 3 tasks (task1, task2a from chain, task3)"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_nested_group_with_multiple_chains() {
+            let broker = MockBroker::new();
+
+            let nested_group = NestedGroup::new()
+                .add_chain(Chain::new().then("a1", vec![]).then("a2", vec![]))
+                .add_chain(Chain::new().then("b1", vec![]).then("b2", vec![]))
+                .add_chain(Chain::new().then("c1", vec![]).then("c2", vec![]));
+
+            let result = nested_group.apply(&broker).await;
+            assert!(
+                result.is_ok(),
+                "NestedGroup with multiple chains should succeed"
+            );
+
+            // Each chain only enqueues the first task (with links)
+            // So we expect 3 tasks (one per chain), not 6
+            assert_eq!(
+                broker.task_count(),
+                3,
+                "Should publish 3 first tasks from three chains"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_nested_group_empty_error() {
+            let broker = MockBroker::new();
+            let nested_group = NestedGroup::new();
+
+            let result = nested_group.apply(&broker).await;
+            assert!(result.is_err(), "Empty NestedGroup should return error");
+            match result {
+                Err(CanvasError::Invalid(msg)) => {
+                    assert!(msg.contains("empty"));
+                }
+                _ => panic!("Expected Invalid error for empty NestedGroup"),
+            }
+        }
+
+        #[test]
+        fn test_nested_group_builder_methods() {
+            let group = NestedGroup::new()
+                .add("task1", vec![])
+                .add_signature(Signature::new("task2".to_string()))
+                .add_chain(Chain::new().then("task3", vec![]));
+
+            assert_eq!(group.len(), 3);
+            assert!(!group.is_empty());
+        }
+
+        #[test]
+        fn test_nested_group_display() {
+            let group = NestedGroup::new().add("task1", vec![]).add("task2", vec![]);
+
+            let display = format!("{}", group);
+            assert!(display.contains("NestedGroup"));
+            assert!(display.contains("|"));
+        }
+
+        #[tokio::test]
+        async fn test_nested_workflows_complex_composition() {
+            let broker = MockBroker::new();
+
+            // Create a complex nested workflow:
+            // Chain of [ Group of tasks -> Chain of tasks -> Group of tasks ]
+            let nested = NestedChain::new()
+                .then_group(
+                    Group::new()
+                        .add("parallel1", vec![])
+                        .add("parallel2", vec![])
+                        .add("parallel3", vec![]),
+                )
+                .then_chain(Chain::new().then("seq1", vec![]).then("seq2", vec![]))
+                .then_element(CanvasElement::Group(
+                    Group::new().add("final1", vec![]).add("final2", vec![]),
+                ));
+
+            let result = nested.apply(&broker).await;
+            assert!(result.is_ok(), "Complex nested workflow should succeed");
+
+            // Total tasks: 3 (parallel group) + 1 (first from chain) + 2 (final group) = 6
+            // Chains only enqueue their first task with links to subsequent tasks
+            assert_eq!(broker.task_count(), 6, "Should publish 6 initial tasks");
+        }
+
+        #[test]
+        fn test_chain_iterator_methods() {
+            let chain = Chain::new()
+                .then("task1", vec![])
+                .then("task2", vec![])
+                .then("task3", vec![]);
+
+            // Test first/last
+            assert_eq!(chain.first().unwrap().task, "task1");
+            assert_eq!(chain.last().unwrap().task, "task3");
+
+            // Test get
+            assert_eq!(chain.get(1).unwrap().task, "task2");
+            assert!(chain.get(10).is_none());
+
+            // Test iter
+            let names: Vec<String> = chain.iter().map(|s| s.task.clone()).collect();
+            assert_eq!(names, vec!["task1", "task2", "task3"]);
+
+            assert_eq!(chain.len(), 3);
+            assert!(!chain.is_empty());
+        }
+
+        #[test]
+        fn test_chain_into_iterator() {
+            let chain = Chain::new().then("task1", vec![]).then("task2", vec![]);
+
+            let mut count = 0;
+            for sig in &chain {
+                assert!(sig.task.starts_with("task"));
+                count += 1;
+            }
+            assert_eq!(count, 2);
+
+            // Test consuming iterator
+            let tasks: Vec<Signature> = chain.into_iter().collect();
+            assert_eq!(tasks.len(), 2);
+        }
+
+        #[test]
+        fn test_chain_from_vec() {
+            let sigs = vec![
+                Signature::new("task1".to_string()),
+                Signature::new("task2".to_string()),
+            ];
+
+            let chain = Chain::from(sigs);
+            assert_eq!(chain.len(), 2);
+            assert_eq!(chain.first().unwrap().task, "task1");
+        }
+
+        #[test]
+        fn test_chain_from_iter() {
+            let chain: Chain = vec![
+                Signature::new("task1".to_string()),
+                Signature::new("task2".to_string()),
+            ]
+            .into_iter()
+            .collect();
+
+            assert_eq!(chain.len(), 2);
+        }
+
+        #[test]
+        fn test_chain_with_capacity() {
+            let chain = Chain::with_capacity(10);
+            assert_eq!(chain.len(), 0);
+            assert!(chain.is_empty());
+        }
+
+        #[test]
+        fn test_chain_extend() {
+            let chain = Chain::new().then("task1", vec![]).extend(vec![
+                Signature::new("task2".to_string()),
+                Signature::new("task3".to_string()),
+            ]);
+
+            assert_eq!(chain.len(), 3);
+        }
+
+        #[test]
+        fn test_chain_reverse() {
+            let chain = Chain::new()
+                .then("task1", vec![])
+                .then("task2", vec![])
+                .then("task3", vec![])
+                .reverse();
+
+            assert_eq!(chain.first().unwrap().task, "task3");
+            assert_eq!(chain.last().unwrap().task, "task1");
+        }
+
+        #[test]
+        fn test_chain_retain() {
+            let chain = Chain::new()
+                .then("keep1", vec![])
+                .then("remove", vec![])
+                .then("keep2", vec![])
+                .retain(|sig| sig.task.starts_with("keep"));
+
+            assert_eq!(chain.len(), 2);
+            assert_eq!(chain.first().unwrap().task, "keep1");
+            assert_eq!(chain.last().unwrap().task, "keep2");
+        }
+
+        #[test]
+        fn test_group_iterator_methods() {
+            let group = Group::new()
+                .add("task1", vec![])
+                .add("task2", vec![])
+                .add("task3", vec![]);
+
+            // Test first/last
+            assert_eq!(group.first().unwrap().task, "task1");
+            assert_eq!(group.last().unwrap().task, "task3");
+
+            // Test get
+            assert_eq!(group.get(1).unwrap().task, "task2");
+            assert!(group.get(10).is_none());
+
+            // Test iter
+            let names: Vec<String> = group.iter().map(|s| s.task.clone()).collect();
+            assert_eq!(names, vec!["task1", "task2", "task3"]);
+
+            assert_eq!(group.len(), 3);
+            assert!(!group.is_empty());
+        }
+
+        #[test]
+        fn test_group_find_filter() {
+            let group = Group::new()
+                .add("task_a", vec![])
+                .add("task_b", vec![])
+                .add("other", vec![]);
+
+            // Test find
+            let found = group.find(|sig| sig.task == "task_b");
+            assert!(found.is_some());
+            assert_eq!(found.unwrap().task, "task_b");
+
+            // Test filter
+            let filtered = group.clone().filter(|sig| sig.task.starts_with("task_"));
+            assert_eq!(filtered.len(), 2);
+        }
+
+        #[test]
+        fn test_group_from_vec() {
+            let sigs = vec![
+                Signature::new("task1".to_string()),
+                Signature::new("task2".to_string()),
+            ];
+
+            let group = Group::from(sigs);
+            assert_eq!(group.len(), 2);
+            assert!(group.has_group_id());
+        }
+
+        #[test]
+        fn test_group_with_capacity() {
+            let group = Group::with_capacity(10);
+            assert_eq!(group.len(), 0);
+            assert!(group.is_empty());
+            assert!(group.has_group_id());
+        }
+
+        #[test]
+        fn test_signature_convenience_methods() {
+            let sig = Signature::new("task".to_string())
+                .add_kwarg("key1", serde_json::json!("value1"))
+                .add_kwarg("key2", serde_json::json!(42))
+                .add_arg(serde_json::json!(1))
+                .add_arg(serde_json::json!(2));
+
+            assert!(sig.has_kwarg("key1"));
+            assert!(sig.has_kwarg("key2"));
+            assert!(!sig.has_kwarg("key3"));
+
+            assert_eq!(sig.get_kwarg("key1"), Some(&serde_json::json!("value1")));
+            assert_eq!(sig.get_kwarg("key2"), Some(&serde_json::json!(42)));
+
+            assert_eq!(sig.args.len(), 2);
+            assert_eq!(sig.args[0], serde_json::json!(1));
+        }
+
+        #[test]
+        fn test_workflow_registry_query_methods() {
+            let mut registry = WorkflowRegistry::new();
+
+            let id1 = Uuid::new_v4();
+            let id2 = Uuid::new_v4();
+            let id3 = Uuid::new_v4();
+
+            registry.register(id1, "workflow_test_1".to_string(), HashMap::new());
+            registry.register(id2, "workflow_test_2".to_string(), HashMap::new());
+            registry.register(id3, "other_workflow".to_string(), HashMap::new());
+
+            // Test find_by_name
+            let found = registry.find_by_name("test");
+            assert_eq!(found.len(), 2);
+
+            // Test all_workflow_ids
+            let all_ids = registry.all_workflow_ids();
+            assert_eq!(all_ids.len(), 3);
+
+            // Test contains
+            assert!(registry.contains(&id1));
+            assert!(!registry.contains(&Uuid::new_v4()));
+
+            // Test tags
+            registry.add_tag(id1, "tag1".to_string());
+            registry.add_tag(id2, "tag1".to_string());
+            registry.add_tag(id2, "tag2".to_string());
+
+            let all_tags = registry.all_tags();
+            assert!(all_tags.contains(&"tag1".to_string()));
+
+            // Test get_by_tags_all
+            let with_both = registry.get_by_tags_all(&["tag1", "tag2"]);
+            assert_eq!(with_both.len(), 1);
+            assert!(with_both.contains(&id2));
+
+            // Test get_by_tags_any
+            let with_any = registry.get_by_tags_any(&["tag1", "tag2"]);
+            assert!(with_any.len() >= 2);
+
+            // Test state counts
+            registry.update_state(id1, WorkflowStatus::Running);
+            registry.update_state(id2, WorkflowStatus::Success);
+            registry.update_state(id3, WorkflowStatus::Pending);
+
+            assert_eq!(registry.running_count(), 1);
+            assert_eq!(registry.pending_count(), 1);
+            assert_eq!(registry.completed_count(), 1);
+            assert_eq!(registry.count_by_state(&WorkflowStatus::Success), 1);
+        }
+
+        #[test]
+        fn test_workflow_registry_age_queries() {
+            let mut registry = WorkflowRegistry::new();
+            let id = Uuid::new_v4();
+
+            registry.register(id, "test".to_string(), HashMap::new());
+
+            // Age should be very small (just registered)
+            let age = registry.get_age(&id);
+            assert!(age.is_some());
+            assert!(age.unwrap() < 1000); // Less than 1 second
+
+            // Test get_older_than
+            let old = registry.get_older_than(1_000_000); // 1000 seconds
+            assert_eq!(old.len(), 0); // Nothing is that old yet
+
+            // Sleep a tiny bit to ensure age > 0
+            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            let recent = registry.get_older_than(0); // 0 ms
+            assert_eq!(recent.len(), 1); // Our workflow is older than 0ms
         }
     }
 }

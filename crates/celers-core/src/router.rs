@@ -88,6 +88,10 @@ impl PatternMatcher {
     /// assert!(matcher.matches("tasks.add"));
     /// assert!(!matcher.matches("tasks.Add"));
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the regex pattern is invalid.
     pub fn regex(pattern: &str) -> Result<Self, regex::Error> {
         Ok(Self::Regex(RegexPattern::new(pattern)?))
     }
@@ -99,6 +103,7 @@ impl PatternMatcher {
     }
 
     /// Check if a task name matches this pattern
+    #[inline]
     #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         match self {
@@ -119,6 +124,10 @@ pub struct GlobPattern {
 
 impl GlobPattern {
     /// Create a new glob pattern
+    ///
+    /// # Panics
+    ///
+    /// Panics if the glob pattern cannot be converted to a valid regex.
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
         let pattern = pattern.into();
@@ -128,12 +137,14 @@ impl GlobPattern {
     }
 
     /// Check if a task name matches this glob pattern
+    #[inline]
     #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         self.regex.is_match(task_name)
     }
 
     /// Get the original pattern string
+    #[inline]
     #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
@@ -149,6 +160,10 @@ pub struct RegexPattern {
 
 impl RegexPattern {
     /// Create a new regex pattern
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the regex pattern is invalid.
     pub fn new(pattern: &str) -> Result<Self, regex::Error> {
         let regex = Regex::new(pattern)?;
         Ok(Self {
@@ -158,12 +173,14 @@ impl RegexPattern {
     }
 
     /// Check if a task name matches this regex pattern
+    #[inline]
     #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         self.regex.is_match(task_name)
     }
 
     /// Get the original pattern string
+    #[inline]
     #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
@@ -251,6 +268,7 @@ impl RouteRule {
     }
 
     /// Check if this rule matches a task name
+    #[inline]
     #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         self.matcher.matches(task_name)
@@ -260,7 +278,7 @@ impl RouteRule {
     ///
     /// Returns true if:
     /// - The task name matches the pattern matcher
-    /// - AND (if argument_condition is set) the arguments match the condition
+    /// - AND (if `argument_condition` is set) the arguments match the condition
     #[must_use]
     pub fn matches_with_args(
         &self,
@@ -504,15 +522,11 @@ impl ArgumentCondition {
         match self {
             Self::Always => true,
 
-            Self::ArgEquals { index, value } => {
-                args.get(*index).map(|v| v == value).unwrap_or(false)
-            }
+            Self::ArgEquals { index, value } => args.get(*index).is_some_and(|v| v == value),
 
             Self::ArgExists { index } => args.len() > *index,
 
-            Self::KwargEquals { key, value } => {
-                kwargs.get(key).map(|v| v == value).unwrap_or(false)
-            }
+            Self::KwargEquals { key, value } => kwargs.get(key).is_some_and(|v| v == value),
 
             Self::KwargExists { key } => kwargs.contains_key(key),
 
@@ -528,27 +542,23 @@ impl ArgumentCondition {
 
             Self::ArgGreaterThan { index, threshold } => args
                 .get(*index)
-                .and_then(|v| v.as_f64())
-                .map(|v| v > *threshold)
-                .unwrap_or(false),
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|v| v > *threshold),
 
             Self::ArgLessThan { index, threshold } => args
                 .get(*index)
-                .and_then(|v| v.as_f64())
-                .map(|v| v < *threshold)
-                .unwrap_or(false),
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|v| v < *threshold),
 
             Self::KwargGreaterThan { key, threshold } => kwargs
                 .get(key)
-                .and_then(|v| v.as_f64())
-                .map(|v| v > *threshold)
-                .unwrap_or(false),
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|v| v > *threshold),
 
             Self::KwargLessThan { key, threshold } => kwargs
                 .get(key)
-                .and_then(|v| v.as_f64())
-                .map(|v| v < *threshold)
-                .unwrap_or(false),
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|v| v < *threshold),
 
             Self::KwargContains { key, value } => {
                 if let Some(v) = kwargs.get(key) {
@@ -581,33 +591,33 @@ impl std::fmt::Display for ArgumentCondition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Always => write!(f, "always"),
-            Self::ArgEquals { index, value } => write!(f, "args[{}] == {}", index, value),
-            Self::ArgExists { index } => write!(f, "args[{}] exists", index),
-            Self::KwargEquals { key, value } => write!(f, "kwargs[{}] == {}", key, value),
-            Self::KwargExists { key } => write!(f, "kwargs[{}] exists", key),
+            Self::ArgEquals { index, value } => write!(f, "args[{index}] == {value}"),
+            Self::ArgExists { index } => write!(f, "args[{index}] exists"),
+            Self::KwargEquals { key, value } => write!(f, "kwargs[{key}] == {value}"),
+            Self::KwargExists { key } => write!(f, "kwargs[{key}] exists"),
             Self::KwargMatches { key, pattern } => {
-                write!(f, "kwargs[{}] matches /{}/", key, pattern)
+                write!(f, "kwargs[{key}] matches /{pattern}/")
             }
             Self::ArgGreaterThan { index, threshold } => {
-                write!(f, "args[{}] > {}", index, threshold)
+                write!(f, "args[{index}] > {threshold}")
             }
-            Self::ArgLessThan { index, threshold } => write!(f, "args[{}] < {}", index, threshold),
+            Self::ArgLessThan { index, threshold } => write!(f, "args[{index}] < {threshold}"),
             Self::KwargGreaterThan { key, threshold } => {
-                write!(f, "kwargs[{}] > {}", key, threshold)
+                write!(f, "kwargs[{key}] > {threshold}")
             }
-            Self::KwargLessThan { key, threshold } => write!(f, "kwargs[{}] < {}", key, threshold),
+            Self::KwargLessThan { key, threshold } => write!(f, "kwargs[{key}] < {threshold}"),
             Self::KwargContains { key, value } => {
-                write!(f, "kwargs[{}] contains {}", key, value)
+                write!(f, "kwargs[{key}] contains {value}")
             }
             Self::And(conditions) => {
-                let parts: Vec<String> = conditions.iter().map(|c| format!("{}", c)).collect();
+                let parts: Vec<String> = conditions.iter().map(|c| format!("{c}")).collect();
                 write!(f, "({})", parts.join(" AND "))
             }
             Self::Or(conditions) => {
-                let parts: Vec<String> = conditions.iter().map(|c| format!("{}", c)).collect();
+                let parts: Vec<String> = conditions.iter().map(|c| format!("{c}")).collect();
                 write!(f, "({})", parts.join(" OR "))
             }
-            Self::Not(condition) => write!(f, "NOT ({})", condition),
+            Self::Not(condition) => write!(f, "NOT ({condition})"),
         }
     }
 }
@@ -766,6 +776,7 @@ impl Router {
     }
 
     /// Check if a task has any matching route
+    #[inline]
     #[must_use]
     pub fn has_route(&self, task_name: &str) -> bool {
         self.direct_routes.contains_key(task_name)
@@ -774,6 +785,7 @@ impl Router {
     }
 
     /// Get all registered rules
+    #[inline]
     #[must_use]
     pub fn rules(&self) -> &[RouteRule] {
         &self.rules
@@ -813,6 +825,10 @@ impl RouterBuilder {
     }
 
     /// Add a rule that routes tasks matching a regex pattern to a queue
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the regex pattern is invalid.
     pub fn route_regex(mut self, pattern: &str, queue: &str) -> Result<Self, regex::Error> {
         self.router
             .add_rule(RouteRule::new(PatternMatcher::regex(pattern)?, queue));
@@ -1015,6 +1031,8 @@ impl TopicPattern {
     }
 
     /// Check if a routing key matches this topic pattern
+    #[inline]
+    #[must_use]
     pub fn matches(&self, routing_key: &str) -> bool {
         let key_parts: Vec<&str> = routing_key.split('.').collect();
         self.matches_parts(&key_parts, 0, 0)
@@ -1064,16 +1082,22 @@ impl TopicPattern {
     }
 
     /// Get the original pattern string
+    #[inline]
+    #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
 
     /// Get pattern complexity (number of segments)
-    pub fn complexity(&self) -> usize {
+    #[inline]
+    #[must_use]
+    pub const fn complexity(&self) -> usize {
         self.segments.len()
     }
 
     /// Check if pattern contains wildcards
+    #[inline]
+    #[must_use]
     pub fn has_wildcards(&self) -> bool {
         self.segments
             .iter()
@@ -1081,6 +1105,8 @@ impl TopicPattern {
     }
 
     /// Check if pattern is exact (no wildcards)
+    #[inline]
+    #[must_use]
     pub fn is_exact(&self) -> bool {
         !self.has_wildcards()
     }
@@ -1100,6 +1126,7 @@ pub struct TopicRouter {
 
 impl TopicRouter {
     /// Create a new topic router
+    #[must_use]
     pub fn new() -> Self {
         Self {
             bindings: Vec::new(),
@@ -1129,6 +1156,7 @@ impl TopicRouter {
     /// Route a message based on routing key
     ///
     /// Returns the first matching queue, or the default queue if no match.
+    #[must_use]
     pub fn route(&self, routing_key: &str) -> Option<String> {
         for (pattern, queue) in &self.bindings {
             if pattern.matches(routing_key) {
@@ -1140,6 +1168,7 @@ impl TopicRouter {
     }
 
     /// Get all queues that match a routing key
+    #[must_use]
     pub fn route_all(&self, routing_key: &str) -> Vec<String> {
         self.bindings
             .iter()
@@ -1163,6 +1192,7 @@ impl TopicRouter {
     }
 
     /// Get all bindings
+    #[must_use]
     pub fn bindings(&self) -> Vec<(String, String)> {
         self.bindings
             .iter()
@@ -1177,11 +1207,14 @@ impl TopicRouter {
     }
 
     /// Get number of bindings
-    pub fn binding_count(&self) -> usize {
+    #[must_use]
+    pub const fn binding_count(&self) -> usize {
         self.bindings.len()
     }
 
     /// Check if a routing key has any matches
+    #[inline]
+    #[must_use]
     pub fn has_match(&self, routing_key: &str) -> bool {
         self.bindings.iter().any(|(p, _)| p.matches(routing_key)) || self.default_queue.is_some()
     }
@@ -1232,24 +1265,28 @@ impl TopicExchangeConfig {
     }
 
     /// Add a topic binding
+    #[must_use]
     pub fn with_binding(mut self, pattern: impl Into<String>, queue: impl Into<String>) -> Self {
         self.bindings.insert(pattern.into(), queue.into());
         self
     }
 
     /// Set default queue
+    #[must_use]
     pub fn with_default_queue(mut self, queue: impl Into<String>) -> Self {
         self.default_queue = Some(queue.into());
         self
     }
 
     /// Set durable flag
+    #[must_use]
     pub fn with_durable(mut self, durable: bool) -> Self {
         self.durable = durable;
         self
     }
 
     /// Build a topic router from this configuration
+    #[must_use]
     pub fn build_router(&self) -> TopicRouter {
         let mut router = TopicRouter::new();
 

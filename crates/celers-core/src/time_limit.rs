@@ -38,23 +38,27 @@ pub struct TimeLimitConfig {
 
 impl TimeLimitConfig {
     /// Create a new time limit configuration with no limits
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the soft time limit
+    #[must_use]
     pub fn with_soft_limit(mut self, duration: Duration) -> Self {
         self.soft_seconds = Some(duration.as_secs());
         self
     }
 
     /// Set the hard time limit
+    #[must_use]
     pub fn with_hard_limit(mut self, duration: Duration) -> Self {
         self.hard_seconds = Some(duration.as_secs());
         self
     }
 
     /// Set both soft and hard limits
+    #[must_use]
     pub fn with_limits(mut self, soft: Duration, hard: Duration) -> Self {
         self.soft_seconds = Some(soft.as_secs());
         self.hard_seconds = Some(hard.as_secs());
@@ -72,11 +76,14 @@ impl TimeLimitConfig {
     }
 
     /// Check if any time limit is configured
-    pub fn has_limits(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn has_limits(&self) -> bool {
         self.soft_seconds.is_some() || self.hard_seconds.is_some()
     }
 
     /// Merge with another config, taking non-None values from the other
+    #[must_use]
     pub fn merge(&self, other: &TimeLimitConfig) -> TimeLimitConfig {
         TimeLimitConfig {
             soft_seconds: other.soft_seconds.or(self.soft_seconds),
@@ -118,8 +125,7 @@ impl std::fmt::Display for TimeLimitExceeded {
             } => {
                 write!(
                     f,
-                    "Soft time limit exceeded for task {}: {}s elapsed (limit: {}s)",
-                    task_id, elapsed_seconds, limit_seconds
+                    "Soft time limit exceeded for task {task_id}: {elapsed_seconds}s elapsed (limit: {limit_seconds}s)"
                 )
             }
             Self::HardLimitExceeded {
@@ -129,8 +135,7 @@ impl std::fmt::Display for TimeLimitExceeded {
             } => {
                 write!(
                     f,
-                    "Hard time limit exceeded for task {}: {}s elapsed (limit: {}s)",
-                    task_id, elapsed_seconds, limit_seconds
+                    "Hard time limit exceeded for task {task_id}: {elapsed_seconds}s elapsed (limit: {limit_seconds}s)"
                 )
             }
         }
@@ -189,16 +194,20 @@ impl TimeLimit {
     }
 
     /// Get elapsed time since task started
+    #[must_use]
     pub fn elapsed(&self) -> Duration {
         self.started_at.elapsed()
     }
 
     /// Get elapsed time in seconds
+    #[inline]
+    #[must_use]
     pub fn elapsed_seconds(&self) -> u64 {
         self.elapsed().as_secs()
     }
 
     /// Check current time limit status
+    #[must_use]
     pub fn check(&self) -> TimeLimitStatus {
         let elapsed = self.elapsed();
 
@@ -220,6 +229,7 @@ impl TimeLimit {
     }
 
     /// Check and return error if limit exceeded
+    #[must_use]
     pub fn check_exceeded(&self) -> Option<TimeLimitExceeded> {
         let elapsed_seconds = self.elapsed_seconds();
 
@@ -249,7 +259,9 @@ impl TimeLimit {
     }
 
     /// Check if soft limit was already warned
-    pub fn soft_limit_warned(&self) -> bool {
+    #[inline]
+    #[must_use]
+    pub const fn soft_limit_warned(&self) -> bool {
         self.soft_limit_warned
     }
 
@@ -259,6 +271,7 @@ impl TimeLimit {
     }
 
     /// Get remaining time until soft limit
+    #[must_use]
     pub fn time_until_soft_limit(&self) -> Option<Duration> {
         self.config.soft_limit().and_then(|limit| {
             let elapsed = self.elapsed();
@@ -271,6 +284,7 @@ impl TimeLimit {
     }
 
     /// Get remaining time until hard limit
+    #[must_use]
     pub fn time_until_hard_limit(&self) -> Option<Duration> {
         self.config.hard_limit().and_then(|limit| {
             let elapsed = self.elapsed();
@@ -283,11 +297,15 @@ impl TimeLimit {
     }
 
     /// Get the task ID
+    #[inline]
+    #[must_use]
     pub fn task_id(&self) -> &str {
         &self.task_id
     }
 
     /// Get the configuration
+    #[inline]
+    #[must_use]
     pub fn config(&self) -> &TimeLimitConfig {
         &self.config
     }
@@ -299,7 +317,7 @@ impl TimeLimit {
 /// limits per task name.
 #[derive(Debug, Default)]
 pub struct TaskTimeLimits {
-    /// Per-task time limits (task_name -> config)
+    /// Per-task time limits (`task_name` -> config)
     limits: HashMap<String, TimeLimitConfig>,
     /// Default time limit for tasks without specific configuration
     default_config: Option<TimeLimitConfig>,
@@ -307,11 +325,13 @@ pub struct TaskTimeLimits {
 
 impl TaskTimeLimits {
     /// Create a new task time limits manager
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create with a default time limit for all tasks
+    #[must_use]
     pub fn with_default(config: TimeLimitConfig) -> Self {
         Self {
             limits: HashMap::new(),
@@ -330,16 +350,19 @@ impl TaskTimeLimits {
     }
 
     /// Get time limit configuration for a task
+    #[must_use]
     pub fn get_limit(&self, task_name: &str) -> Option<&TimeLimitConfig> {
         self.limits.get(task_name).or(self.default_config.as_ref())
     }
 
     /// Check if a task type has time limits configured
+    #[must_use]
     pub fn has_limit(&self, task_name: &str) -> bool {
         self.limits.contains_key(task_name) || self.default_config.is_some()
     }
 
     /// Create a time limit tracker for a task
+    #[must_use]
     pub fn create_tracker(&self, task_id: &str, task_name: &str) -> Option<TimeLimit> {
         self.get_limit(task_name)
             .filter(|c| c.has_limits())
@@ -366,11 +389,13 @@ pub struct WorkerTimeLimits {
 
 impl WorkerTimeLimits {
     /// Create a new worker time limits manager
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create with a default time limit
+    #[must_use]
     pub fn with_default(config: TimeLimitConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(TaskTimeLimits::with_default(config))),
@@ -392,6 +417,7 @@ impl WorkerTimeLimits {
     }
 
     /// Create a time limit tracker for a task
+    #[must_use]
     pub fn create_tracker(&self, task_id: &str, task_name: &str) -> Option<TimeLimit> {
         if let Ok(guard) = self.inner.read() {
             guard.create_tracker(task_id, task_name)
@@ -401,6 +427,7 @@ impl WorkerTimeLimits {
     }
 
     /// Check if a task type has time limits configured
+    #[must_use]
     pub fn has_limit(&self, task_name: &str) -> bool {
         if let Ok(guard) = self.inner.read() {
             guard.has_limit(task_name)
@@ -426,18 +453,20 @@ pub struct TimeLimitSettings {
     /// Default hard time limit in seconds
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_hard_limit: Option<u64>,
-    /// Per-task time limits (task_name -> config)
+    /// Per-task time limits (`task_name` -> config)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub task_limits: HashMap<String, TimeLimitConfig>,
 }
 
 impl TimeLimitSettings {
     /// Create a new empty settings
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a TaskTimeLimits from settings
+    /// Create a `TaskTimeLimits` from settings
+    #[must_use]
     pub fn into_task_time_limits(self) -> TaskTimeLimits {
         let default_config =
             if self.default_soft_limit.is_some() || self.default_hard_limit.is_some() {
@@ -665,8 +694,8 @@ mod tests {
                 let l = limits_clone.clone();
                 thread::spawn(move || {
                     for _ in 0..10 {
-                        l.has_limit("my.task");
-                        l.create_tracker(&format!("task-{i}"), "my.task");
+                        let _ = l.has_limit("my.task");
+                        let _ = l.create_tracker(&format!("task-{i}"), "my.task");
                     }
                 })
             })

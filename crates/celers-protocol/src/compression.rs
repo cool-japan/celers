@@ -41,6 +41,7 @@ pub enum CompressionType {
 
 impl CompressionType {
     /// Get the content encoding string for this compression type
+    #[inline]
     pub fn as_encoding(&self) -> &'static str {
         match self {
             CompressionType::None => "utf-8",
@@ -84,6 +85,14 @@ impl Default for CompressionType {
 impl fmt::Display for CompressionType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_encoding())
+    }
+}
+
+impl TryFrom<&str> for CompressionType {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::from_encoding(s).ok_or_else(|| format!("Unknown compression type: {}", s))
     }
 }
 
@@ -143,6 +152,7 @@ impl Compressor {
     }
 
     /// Set compression level
+    #[must_use]
     pub fn with_level(mut self, level: u32) -> Self {
         self.level = level;
         self
@@ -386,5 +396,35 @@ mod tests {
     fn test_compression_type_available() {
         let available = CompressionType::available();
         assert!(available.contains(&CompressionType::None));
+    }
+
+    #[test]
+    fn test_compression_type_try_from() {
+        use std::convert::TryFrom;
+
+        assert_eq!(
+            CompressionType::try_from("utf-8").unwrap(),
+            CompressionType::None
+        );
+        assert_eq!(
+            CompressionType::try_from("identity").unwrap(),
+            CompressionType::None
+        );
+
+        #[cfg(feature = "gzip")]
+        assert_eq!(
+            CompressionType::try_from("gzip").unwrap(),
+            CompressionType::Gzip
+        );
+
+        #[cfg(feature = "zstd-compression")]
+        assert_eq!(
+            CompressionType::try_from("zstd").unwrap(),
+            CompressionType::Zstd
+        );
+
+        // Test error case
+        assert!(CompressionType::try_from("unknown").is_err());
+        assert!(CompressionType::try_from("lz4").is_err());
     }
 }

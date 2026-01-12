@@ -1,8 +1,8 @@
-//! Celery-compatible configuration for CeleRS
+//! Celery-compatible configuration for `CeleRS`
 //!
 //! This module provides configuration structures that are compatible with
 //! Python Celery's configuration format, making it easy to migrate from
-//! Celery to CeleRS or run them side-by-side.
+//! Celery to `CeleRS` or run them side-by-side.
 //!
 //! # Example
 //!
@@ -28,110 +28,110 @@ use std::time::Duration;
 /// Celery-compatible main configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CeleryConfig {
-    /// Broker connection URL (CELERY_BROKER_URL)
+    /// Broker connection URL (`CELERY_BROKER_URL`)
     pub broker_url: String,
 
-    /// Result backend URL (CELERY_RESULT_BACKEND)
+    /// Result backend URL (`CELERY_RESULT_BACKEND`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_backend: Option<String>,
 
-    /// Task serializer format (CELERY_TASK_SERIALIZER)
+    /// Task serializer format (`CELERY_TASK_SERIALIZER`)
     #[serde(default = "default_serializer")]
     pub task_serializer: String,
 
-    /// Result serializer format (CELERY_RESULT_SERIALIZER)
+    /// Result serializer format (`CELERY_RESULT_SERIALIZER`)
     #[serde(default = "default_serializer")]
     pub result_serializer: String,
 
-    /// Accepted content types (CELERY_ACCEPT_CONTENT)
+    /// Accepted content types (`CELERY_ACCEPT_CONTENT`)
     #[serde(default = "default_accept_content")]
     pub accept_content: Vec<String>,
 
-    /// Timezone for scheduling (CELERY_TIMEZONE)
+    /// Timezone for scheduling (`CELERY_TIMEZONE`)
     #[serde(default = "default_timezone")]
     pub timezone: String,
 
-    /// Use UTC timestamps (CELERY_ENABLE_UTC)
+    /// Use UTC timestamps (`CELERY_ENABLE_UTC`)
     #[serde(default = "default_true")]
     pub enable_utc: bool,
 
-    /// Track task started events (CELERY_TASK_TRACK_STARTED)
+    /// Track task started events (`CELERY_TASK_TRACK_STARTED`)
     #[serde(default)]
     pub task_track_started: bool,
 
-    /// Send task sent events (CELERY_TASK_SEND_SENT_EVENT)
+    /// Send task sent events (`CELERY_TASK_SEND_SENT_EVENT`)
     #[serde(default)]
     pub task_send_sent_event: bool,
 
-    /// Acknowledge tasks late (CELERY_TASK_ACKS_LATE)
+    /// Acknowledge tasks late (`CELERY_TASK_ACKS_LATE`)
     #[serde(default)]
     pub task_acks_late: bool,
 
-    /// Reject on worker lost (CELERY_TASK_REJECT_ON_WORKER_LOST)
+    /// Reject on worker lost (`CELERY_TASK_REJECT_ON_WORKER_LOST`)
     #[serde(default)]
     pub task_reject_on_worker_lost: bool,
 
-    /// Worker concurrency (CELERYD_CONCURRENCY)
+    /// Worker concurrency (`CELERYD_CONCURRENCY`)
     #[serde(default = "default_concurrency")]
     pub worker_concurrency: usize,
 
-    /// Worker prefetch multiplier (CELERYD_PREFETCH_MULTIPLIER)
+    /// Worker prefetch multiplier (`CELERYD_PREFETCH_MULTIPLIER`)
     #[serde(default = "default_prefetch_multiplier")]
     pub worker_prefetch_multiplier: usize,
 
-    /// Maximum tasks per child before restart (CELERYD_MAX_TASKS_PER_CHILD)
+    /// Maximum tasks per child before restart (`CELERYD_MAX_TASKS_PER_CHILD`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_max_tasks_per_child: Option<usize>,
 
-    /// Maximum memory per child in KB (CELERYD_MAX_MEMORY_PER_CHILD)
+    /// Maximum memory per child in KB (`CELERYD_MAX_MEMORY_PER_CHILD`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_max_memory_per_child: Option<usize>,
 
-    /// Worker heartbeat interval in seconds (CELERY_WORKER_HEARTBEAT)
+    /// Worker heartbeat interval in seconds (`CELERY_WORKER_HEARTBEAT`)
     #[serde(default = "default_heartbeat_interval")]
     pub worker_heartbeat: u64,
 
-    /// Task default queue (CELERY_DEFAULT_QUEUE)
+    /// Task default queue (`CELERY_DEFAULT_QUEUE`)
     #[serde(default = "default_queue_name")]
     pub task_default_queue: String,
 
-    /// Task default exchange (CELERY_DEFAULT_EXCHANGE)
+    /// Task default exchange (`CELERY_DEFAULT_EXCHANGE`)
     #[serde(default = "default_queue_name")]
     pub task_default_exchange: String,
 
-    /// Task default exchange type (CELERY_DEFAULT_EXCHANGE_TYPE)
+    /// Task default exchange type (`CELERY_DEFAULT_EXCHANGE_TYPE`)
     #[serde(default = "default_exchange_type")]
     pub task_default_exchange_type: String,
 
-    /// Task default routing key (CELERY_DEFAULT_ROUTING_KEY)
+    /// Task default routing key (`CELERY_DEFAULT_ROUTING_KEY`)
     #[serde(default = "default_queue_name")]
     pub task_default_routing_key: String,
 
-    /// Task routes (CELERY_TASK_ROUTES)
+    /// Task routes (`CELERY_TASK_ROUTES`)
     #[serde(default)]
     pub task_routes: HashMap<String, TaskRoute>,
 
-    /// Task time limit in seconds (CELERY_TASK_TIME_LIMIT)
+    /// Task time limit in seconds (`CELERY_TASK_TIME_LIMIT`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_time_limit: Option<u64>,
 
-    /// Task soft time limit in seconds (CELERY_TASK_SOFT_TIME_LIMIT)
+    /// Task soft time limit in seconds (`CELERY_TASK_SOFT_TIME_LIMIT`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_soft_time_limit: Option<u64>,
 
-    /// Task default retry delay in seconds (CELERY_TASK_DEFAULT_RETRY_DELAY)
+    /// Task default retry delay in seconds (`CELERY_TASK_DEFAULT_RETRY_DELAY`)
     #[serde(default = "default_retry_delay")]
     pub task_default_retry_delay: u64,
 
-    /// Task max retries (CELERY_TASK_MAX_RETRIES)
+    /// Task max retries (`CELERY_TASK_MAX_RETRIES`)
     #[serde(default = "default_max_retries")]
     pub task_max_retries: u32,
 
-    /// Result expires in seconds (CELERY_RESULT_EXPIRES)
+    /// Result expires in seconds (`CELERY_RESULT_EXPIRES`)
     #[serde(default = "default_result_expires")]
     pub result_expires: u64,
 
-    /// Result compression (CELERY_RESULT_COMPRESSION)
+    /// Result compression (`CELERY_RESULT_COMPRESSION`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_compression: Option<String>,
 
@@ -143,7 +143,7 @@ pub struct CeleryConfig {
     #[serde(default)]
     pub task_annotations: HashMap<String, TaskConfig>,
 
-    /// Broker transport options (CELERY_BROKER_TRANSPORT_OPTIONS)
+    /// Broker transport options (`CELERY_BROKER_TRANSPORT_OPTIONS`)
     #[serde(default)]
     pub broker_transport_options: BrokerTransport,
 
@@ -151,7 +151,7 @@ pub struct CeleryConfig {
     #[serde(default)]
     pub result_backend_transport_options: BackendTransport,
 
-    /// Beat schedule configuration (CELERYBEAT_SCHEDULE)
+    /// Beat schedule configuration (`CELERYBEAT_SCHEDULE`)
     #[serde(default)]
     pub beat_schedule: HashMap<String, BeatSchedule>,
 
@@ -348,6 +348,7 @@ impl Default for CeleryConfig {
 
 impl CeleryConfig {
     /// Create a new configuration with broker URL
+    #[inline]
     pub fn new(broker_url: impl Into<String>) -> Self {
         Self {
             broker_url: broker_url.into(),
@@ -356,127 +357,165 @@ impl CeleryConfig {
     }
 
     /// Set broker URL
+    #[inline]
+    #[must_use]
     pub fn with_broker_url(mut self, url: impl Into<String>) -> Self {
         self.broker_url = url.into();
         self
     }
 
     /// Set result backend URL
+    #[inline]
+    #[must_use]
     pub fn with_result_backend(mut self, url: impl Into<String>) -> Self {
         self.result_backend = Some(url.into());
         self
     }
 
     /// Set task serializer
+    #[inline]
+    #[must_use]
     pub fn with_task_serializer(mut self, serializer: impl Into<String>) -> Self {
         self.task_serializer = serializer.into();
         self
     }
 
     /// Set result serializer
+    #[inline]
+    #[must_use]
     pub fn with_result_serializer(mut self, serializer: impl Into<String>) -> Self {
         self.result_serializer = serializer.into();
         self
     }
 
     /// Set accepted content types
+    #[inline]
+    #[must_use]
     pub fn with_accept_content(mut self, content: Vec<String>) -> Self {
         self.accept_content = content;
         self
     }
 
     /// Set timezone
+    #[inline]
+    #[must_use]
     pub fn with_timezone(mut self, tz: impl Into<String>) -> Self {
         self.timezone = tz.into();
         self
     }
 
     /// Enable/disable UTC
-    pub fn with_enable_utc(mut self, enabled: bool) -> Self {
+    #[must_use]
+    pub const fn with_enable_utc(mut self, enabled: bool) -> Self {
         self.enable_utc = enabled;
         self
     }
 
     /// Set worker concurrency
-    pub fn with_worker_concurrency(mut self, concurrency: usize) -> Self {
+    #[must_use]
+    pub const fn with_worker_concurrency(mut self, concurrency: usize) -> Self {
         self.worker_concurrency = concurrency;
         self
     }
 
     /// Set worker prefetch multiplier
-    pub fn with_prefetch_multiplier(mut self, multiplier: usize) -> Self {
+    #[must_use]
+    pub const fn with_prefetch_multiplier(mut self, multiplier: usize) -> Self {
         self.worker_prefetch_multiplier = multiplier;
         self
     }
 
     /// Set default queue name
+    #[inline]
+    #[must_use]
     pub fn with_default_queue(mut self, queue: impl Into<String>) -> Self {
         self.task_default_queue = queue.into();
         self
     }
 
     /// Add task route
+    #[inline]
+    #[must_use]
     pub fn with_task_route(mut self, task: impl Into<String>, route: TaskRoute) -> Self {
         self.task_routes.insert(task.into(), route);
         self
     }
 
     /// Add task annotation
+    #[inline]
+    #[must_use]
     pub fn with_task_annotation(mut self, task: impl Into<String>, config: TaskConfig) -> Self {
         self.task_annotations.insert(task.into(), config);
         self
     }
 
     /// Set result expiration
-    pub fn with_result_expires(mut self, expires: u64) -> Self {
+    #[must_use]
+    pub const fn with_result_expires(mut self, expires: u64) -> Self {
         self.result_expires = expires;
         self
     }
 
     /// Enable result compression
+    #[inline]
+    #[must_use]
     pub fn with_result_compression(mut self, algorithm: impl Into<String>) -> Self {
         self.result_compression = Some(algorithm.into());
         self
     }
 
     /// Set compression threshold
-    pub fn with_compression_threshold(mut self, threshold: usize) -> Self {
+    #[must_use]
+    pub const fn with_compression_threshold(mut self, threshold: usize) -> Self {
         self.result_compression_threshold = threshold;
         self
     }
 
     /// Add beat schedule
+    #[inline]
+    #[must_use]
     pub fn with_beat_schedule(mut self, name: impl Into<String>, schedule: BeatSchedule) -> Self {
         self.beat_schedule.insert(name.into(), schedule);
         self
     }
 
     /// Get task configuration for a specific task
+    #[inline]
+    #[must_use]
     pub fn get_task_config(&self, task_name: &str) -> Option<&TaskConfig> {
         self.task_annotations.get(task_name)
     }
 
     /// Get task route for a specific task
+    #[inline]
+    #[must_use]
     pub fn get_task_route(&self, task_name: &str) -> Option<&TaskRoute> {
         self.task_routes.get(task_name)
     }
 
     /// Get result expiration duration
-    pub fn result_expires_duration(&self) -> Duration {
+    #[inline]
+    #[must_use]
+    pub const fn result_expires_duration(&self) -> Duration {
         Duration::from_secs(self.result_expires)
     }
 
     /// Get task time limit duration
+    #[inline]
+    #[must_use]
     pub fn task_time_limit_duration(&self) -> Option<Duration> {
         self.task_time_limit.map(Duration::from_secs)
     }
 
     /// Get task soft time limit duration
+    #[inline]
+    #[must_use]
     pub fn task_soft_time_limit_duration(&self) -> Option<Duration> {
         self.task_soft_time_limit.map(Duration::from_secs)
     }
 
     /// Load configuration from environment variables
+    #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
@@ -502,6 +541,10 @@ impl CeleryConfig {
     }
 
     /// Validate configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid (e.g., empty broker URL, invalid concurrency, unsupported serializer).
     pub fn validate(&self) -> Result<(), String> {
         if self.broker_url.is_empty() {
             return Err("broker_url is required".to_string());

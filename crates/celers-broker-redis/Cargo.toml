@@ -23,6 +23,7 @@ flate2 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 crc32fast = "1.4"
+rand = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

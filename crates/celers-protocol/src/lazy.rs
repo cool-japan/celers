@@ -80,6 +80,7 @@ impl LazyBody {
     }
 
     /// Get the body size in bytes
+    #[inline]
     pub fn size(&self) -> usize {
         self.raw.len()
     }

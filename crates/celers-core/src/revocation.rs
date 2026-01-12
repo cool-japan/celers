@@ -63,6 +63,7 @@ pub struct RevocationRequest {
 
 impl RevocationRequest {
     /// Create a new revocation request
+    #[must_use]
     pub fn new(task_id: Uuid, mode: RevocationMode) -> Self {
         Self {
             task_id,
@@ -75,24 +76,29 @@ impl RevocationRequest {
     }
 
     /// Set expiration time
+    #[must_use]
     pub fn with_expiration(mut self, expires_in: Duration) -> Self {
         self.expires = Some(current_timestamp() + expires_in.as_secs_f64());
         self
     }
 
     /// Set reason for revocation
+    #[must_use]
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
     }
 
     /// Set signal to send (for terminate mode)
+    #[must_use]
     pub fn with_signal(mut self, signal: impl Into<String>) -> Self {
         self.signal = Some(signal.into());
         self
     }
 
     /// Check if this revocation has expired
+    #[inline]
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         if let Some(expires) = self.expires {
             current_timestamp() > expires
@@ -119,6 +125,7 @@ pub struct PatternRevocation {
 
 impl PatternRevocation {
     /// Create a new pattern revocation
+    #[must_use]
     pub fn new(pattern: PatternMatcher, mode: RevocationMode) -> Self {
         Self {
             pattern,
@@ -130,18 +137,22 @@ impl PatternRevocation {
     }
 
     /// Set expiration time
+    #[must_use]
     pub fn with_expiration(mut self, expires_in: Duration) -> Self {
         self.expires = Some(current_timestamp() + expires_in.as_secs_f64());
         self
     }
 
     /// Set reason for revocation
+    #[must_use]
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
     }
 
     /// Check if this revocation has expired
+    #[inline]
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         if let Some(expires) = self.expires {
             current_timestamp() > expires
@@ -151,6 +162,8 @@ impl PatternRevocation {
     }
 
     /// Check if a task name matches this pattern
+    #[inline]
+    #[must_use]
     pub fn matches(&self, task_name: &str) -> bool {
         self.pattern.matches(task_name)
     }
@@ -171,6 +184,7 @@ pub struct RevocationResult {
 
 impl RevocationResult {
     /// Create a result indicating task is not revoked
+    #[must_use]
     pub fn not_revoked() -> Self {
         Self {
             revoked: false,
@@ -181,6 +195,7 @@ impl RevocationResult {
     }
 
     /// Create a result indicating task is revoked
+    #[must_use]
     pub fn revoked(mode: RevocationMode, reason: Option<String>, signal: Option<String>) -> Self {
         Self {
             revoked: true,
@@ -194,13 +209,13 @@ impl RevocationResult {
 /// Serializable revocation state for persistence
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RevocationState {
-    /// Revoked task IDs (task_id -> request)
+    /// Revoked task IDs (`task_id` -> request)
     pub revoked_tasks: HashMap<String, RevocationRequest>,
     /// Pattern-based revocations (serializable form)
     pub pattern_revocations: Vec<SerializablePatternRevocation>,
 }
 
-/// Serializable form of PatternRevocation
+/// Serializable form of `PatternRevocation`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializablePatternRevocation {
     /// Pattern string (glob format)
@@ -235,7 +250,8 @@ impl From<&PatternRevocation> for SerializablePatternRevocation {
 }
 
 impl SerializablePatternRevocation {
-    /// Convert to PatternRevocation
+    /// Convert to `PatternRevocation`
+    #[must_use]
     pub fn into_pattern_revocation(self) -> PatternRevocation {
         PatternRevocation {
             pattern: PatternMatcher::glob(&self.pattern),
@@ -260,6 +276,7 @@ pub struct RevocationManager {
 
 impl RevocationManager {
     /// Create a new revocation manager
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -294,6 +311,8 @@ impl RevocationManager {
     }
 
     /// Check if a task is revoked (by ID)
+    #[inline]
+    #[must_use]
     pub fn is_revoked(&self, task_id: Uuid) -> bool {
         if let Some(request) = self.revoked_ids.get(&task_id) {
             !request.is_expired()
@@ -303,6 +322,7 @@ impl RevocationManager {
     }
 
     /// Check if a task should be revoked (by ID or pattern)
+    #[must_use]
     pub fn check_revocation(&self, task_id: Uuid, task_name: &str) -> RevocationResult {
         // Check by ID first
         if let Some(request) = self.revoked_ids.get(&task_id) {
@@ -335,6 +355,8 @@ impl RevocationManager {
     }
 
     /// Check if a task has been terminated
+    #[inline]
+    #[must_use]
     pub fn is_terminated(&self, task_id: Uuid) -> bool {
         self.terminated.contains(&task_id)
     }
@@ -362,6 +384,7 @@ impl RevocationManager {
     }
 
     /// Get all revoked task IDs
+    #[must_use]
     pub fn revoked_ids(&self) -> Vec<Uuid> {
         self.revoked_ids
             .iter()
@@ -371,6 +394,8 @@ impl RevocationManager {
     }
 
     /// Get count of revoked tasks
+    #[inline]
+    #[must_use]
     pub fn revoked_count(&self) -> usize {
         self.revoked_ids
             .values()
@@ -434,6 +459,7 @@ pub struct WorkerRevocationManager {
 
 impl WorkerRevocationManager {
     /// Create a new worker revocation manager
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -467,6 +493,7 @@ impl WorkerRevocationManager {
     }
 
     /// Check if a task is revoked by ID
+    #[must_use]
     pub fn is_revoked(&self, task_id: Uuid) -> bool {
         if let Ok(guard) = self.inner.read() {
             guard.is_revoked(task_id)
@@ -476,6 +503,7 @@ impl WorkerRevocationManager {
     }
 
     /// Check revocation status (by ID and pattern)
+    #[must_use]
     pub fn check_revocation(&self, task_id: Uuid, task_name: &str) -> RevocationResult {
         if let Ok(guard) = self.inner.read() {
             guard.check_revocation(task_id, task_name)
@@ -492,6 +520,7 @@ impl WorkerRevocationManager {
     }
 
     /// Check if a task has been terminated
+    #[must_use]
     pub fn is_terminated(&self, task_id: Uuid) -> bool {
         if let Ok(guard) = self.inner.read() {
             guard.is_terminated(task_id)
@@ -515,6 +544,7 @@ impl WorkerRevocationManager {
     }
 
     /// Get all revoked task IDs
+    #[must_use]
     pub fn revoked_ids(&self) -> Vec<Uuid> {
         if let Ok(guard) = self.inner.read() {
             guard.revoked_ids()
@@ -524,6 +554,7 @@ impl WorkerRevocationManager {
     }
 
     /// Get count of revoked tasks
+    #[must_use]
     pub fn revoked_count(&self) -> usize {
         if let Ok(guard) = self.inner.read() {
             guard.revoked_count()
@@ -533,6 +564,7 @@ impl WorkerRevocationManager {
     }
 
     /// Export state for persistence
+    #[must_use]
     pub fn export_state(&self) -> RevocationState {
         if let Ok(guard) = self.inner.read() {
             guard.export_state()

@@ -2,11 +2,238 @@
 
 > RabbitMQ/AMQP broker implementation for CeleRS
 
-## Status: ✅ FEATURE COMPLETE + ENHANCED v4
+## Status: ✅ FEATURE COMPLETE + ENHANCED v9
 
-Full-featured AMQP broker with exchange/queue topology, message confirmation, priority support, DLX, TTL, connection retry, RPC pattern support, bulk operations, advanced topology features, comprehensive ergonomic improvements, and enhanced monitoring capabilities.
+Enterprise-ready AMQP broker with comprehensive production patterns including backpressure management, poison message detection, advanced routing, performance optimization, lifecycle hooks, DLX analytics, adaptive batching, performance profiling, rate limiting, bulkhead isolation, message scheduling, metrics export, circuit breaker pattern, advanced retry strategies, message compression, topology validation, observability enhancements, consumer group management, and comprehensive monitoring/utility modules.
 
-## Recent Enhancements (v4) ✨ NEW
+## Latest Enhancements (v9) 🚀 NEW
+
+### Enterprise Flow Control ✅
+- [x] **backpressure module** - Intelligent backpressure management
+  - [x] BackpressureManager - Prevent overwhelming broker or consumers
+  - [x] Dynamic prefetch adjustment based on queue depth
+  - [x] Flow control with configurable thresholds (warning, critical)
+  - [x] BackpressureAction - Recommended actions (Continue, ReduceRate, PauseConsumption)
+  - [x] Queue utilization monitoring and health status
+  - [x] Automatic prefetch optimization based on load
+  - [x] Statistics tracking (trigger count, adjustments, peak depth)
+
+### Message Quality Assurance ✅
+- [x] **poison_detector module** - Poison message detection and handling
+  - [x] PoisonDetector - Track and identify repeatedly failing messages
+  - [x] Retry tracking with configurable window and max retries
+  - [x] Failure pattern detection across message groups
+  - [x] MessageInfo - Detailed per-message failure/success tracking
+  - [x] PoisonAnalytics - Comprehensive failure analysis
+  - [x] Automatic quarantine recommendations
+  - [x] Common error pattern identification
+  - [x] Systemic failure detection
+
+### Advanced Message Routing ✅
+- [x] **router module** - Sophisticated routing beyond basic AMQP exchanges
+  - [x] MessageRouter - Content-based, priority-based, conditional routing
+  - [x] RouteCondition - Priority, size, content, pattern-based routing
+  - [x] RoutingStrategy - FirstMatch, Multicast, RoundRobin, WeightedRandom
+  - [x] RouteBuilder - Fluent API for building routing rules
+  - [x] RoutingStats - Track routing decisions and queue distribution
+  - [x] Fallback routing with statistics
+  - [x] Weighted selection for load balancing
+
+### Performance Tuning ✅
+- [x] **optimization module** - Advanced performance optimization
+  - [x] PerformanceOptimizer - Track and optimize system performance
+  - [x] Latency, throughput, and memory tracking
+  - [x] Percentile analysis (p95, p99) for latency
+  - [x] OptimizationRecommendation - Actionable improvement suggestions
+  - [x] Optimal prefetch, batch size, pool size calculation
+  - [x] Performance scoring (0.0-1.0)
+  - [x] Drain time estimation
+  - [x] Target-based optimization with auto-tuning
+
+## Previous Enhancements (v8)
+
+### Extensibility & Observability ✅
+- [x] **hooks module** - Lifecycle hooks for message interception
+  - [x] PublishHook - Intercept and validate messages before/after publishing
+  - [x] ConsumeHook - Preprocess messages before/after consuming
+  - [x] AcknowledgmentHook - React to acknowledgment/rejection events
+  - [x] ErrorHook - Handle errors during message processing
+  - [x] HookContext - Rich context passed to hooks with metadata
+  - [x] AmqpHookRegistry - Manage and execute multiple hooks
+  - [x] Composable hook chains with async support
+  - [x] Example hooks: validation, payload size checking, logging
+
+### Dead Letter Exchange Analytics ✅
+- [x] **dlx_analytics module** - Comprehensive DLX analytics and insights
+  - [x] DlxAnalyzer - Track and analyze dead letter patterns
+  - [x] FailureReason enum - Categorize failure types (Rejected, Expired, MaxLengthExceeded, etc.)
+  - [x] DlxEvent - Record individual dead letter events with metadata
+  - [x] DlxInsights - Comprehensive analytics with health status
+  - [x] QueueDlxStats - Per-queue DLX statistics
+  - [x] Failure pattern detection and root cause analysis
+  - [x] Retry analysis and success rate tracking
+  - [x] Health status determination (Healthy, Warning, Critical)
+  - [x] Actionable recommendations for system improvement
+
+### Adaptive Performance Optimization ✅
+- [x] **batch_optimizer module** - Dynamic batch size optimization
+  - [x] BatchOptimizer - Automatically adjust batch sizes based on performance
+  - [x] Latency-based optimization - Target and max acceptable latency
+  - [x] Success rate monitoring - Reduce batch size on failures
+  - [x] Queue state adaptation - Adjust for queue depth and consumer count
+  - [x] OptimizationMetrics - Track throughput, latency, success rate
+  - [x] Safety bounds - Configurable min/max batch sizes
+  - [x] Sliding window analysis - Consider recent operations for decisions
+
+### Performance Profiling ✅
+- [x] **profiler module** - Detailed performance profiling and analysis
+  - [x] AmqpProfiler - Track latencies for all AMQP operations
+  - [x] OperationType enum - Publish, Consume, Acknowledge, Reject, etc.
+  - [x] PerformanceReport - Comprehensive performance analysis
+  - [x] Percentile analysis - p50, p95, p99 latency tracking
+  - [x] Operation-specific stats - Breakdown by operation type
+  - [x] Bottleneck detection - Identify slowest operations
+  - [x] Throughput monitoring - Operations per second tracking
+  - [x] Payload size analysis - Track message sizes and their impact
+  - [x] Actionable recommendations - Suggest performance improvements
+
+## Previous Enhancements (v7)
+
+### Production Resilience Patterns ✅
+- [x] **rate_limiter module** - Control message publishing rates
+  - [x] TokenBucket - Allow bursts up to capacity, refill at fixed rate
+  - [x] LeakyBucket - Smooth traffic by processing at constant rate
+  - [x] RateLimiter enum - Generic rate limiter with strategy selection
+  - [x] try_acquire() / acquire() - Non-blocking and blocking token acquisition
+  - [x] Statistics tracking - Monitor utilization and capacity
+  - [x] Configurable rates, capacity, and bucket sizes
+  - [x] Async-first design with tokio integration
+
+### Resource Isolation ✅
+- [x] **bulkhead module** - Prevent cascading failures with resource isolation
+  - [x] Bulkhead - Limit concurrent operations using semaphores
+  - [x] BulkheadConfig - Configure max concurrency and wait timeouts
+  - [x] call() / try_call() - Execute operations with resource limits
+  - [x] BulkheadStats - Track success/failure/rejection rates
+  - [x] Automatic permit management
+  - [x] Configurable wait timeouts
+  - [x] Statistics and utilization metrics
+
+### Message Scheduling ✅
+- [x] **scheduler module** - Delayed message delivery
+  - [x] MessageScheduler - Priority queue-based message scheduling
+  - [x] ScheduledMessage - Messages with delivery times and priorities
+  - [x] schedule_at() / schedule_after() - Schedule messages for specific times or delays
+  - [x] poll() / next() - Non-blocking and blocking message retrieval
+  - [x] Message cancellation by ID
+  - [x] SchedulerStats - Track scheduled, delivered, and cancelled messages
+  - [x] Priority support for message ordering
+  - [x] Automatic time-based message delivery
+
+### Metrics & Observability ✅
+- [x] **metrics_export module** - Export metrics to monitoring systems
+  - [x] MetricsCollector - Collect AMQP broker metrics
+  - [x] PrometheusExporter - Export metrics in Prometheus text format
+  - [x] StatsDExporter - Export metrics in StatsD format
+  - [x] JsonExporter - Export metrics as structured JSON
+  - [x] Track published, consumed, acknowledged, rejected messages
+  - [x] Monitor connections, channels, and errors
+  - [x] Queue-level and system-level metrics
+  - [x] Async-friendly API design
+
+## Previous Enhancements (v6) ✨
+
+### Resilience & Reliability ✅
+- [x] **circuit_breaker module** - Circuit breaker pattern for fault tolerance
+  - [x] CircuitBreaker - Prevent cascading failures with automatic recovery
+  - [x] Circuit states: Closed, Open, HalfOpen
+  - [x] Configurable failure threshold, success threshold, and timeout
+  - [x] CircuitBreakerMetrics - Monitor circuit breaker state and health
+  - [x] Half-open state with limited call testing
+  - [x] Automatic state transitions based on success/failure patterns
+
+### Advanced Retry Strategies ✅
+- [x] **retry module** - Sophisticated retry strategies with exponential backoff
+  - [x] ExponentialBackoff - Exponentially increasing delays between retries
+  - [x] Jitter support: None, Full, Equal, Decorrelated
+  - [x] FixedDelay - Simple fixed delay retry strategy
+  - [x] RetryExecutor - Execute operations with automatic retry logic
+  - [x] calculate_adaptive_retry_delay() - Adaptive retry delay calculation
+  - [x] Configurable max retries, max delay, and backoff multiplier
+  - [x] Prevents thundering herd with randomized delays
+
+### Message Compression ✅
+- [x] **compression module** - Reduce network overhead with message compression
+  - [x] Gzip compression - Standard compression with good balance
+  - [x] Zstd compression - Modern compression with better ratios
+  - [x] CompressionCodec enum - None, Gzip, Zstd
+  - [x] compress_message() / decompress_message() - Compression utilities
+  - [x] calculate_compression_ratio() - Measure compression effectiveness
+  - [x] CompressionStats - Track compression metrics
+  - [x] should_compress_message() - Smart compression threshold logic
+
+### Topology Management ✅
+- [x] **topology module** - Advanced topology validation and analysis
+  - [x] TopologyValidator - Validate AMQP topology before deployment
+  - [x] ExchangeDefinition, QueueDefinition, BindingDefinition types
+  - [x] Detect duplicate resources, missing exchanges, invalid bindings
+  - [x] Reserved name validation (amq.* prefixes)
+  - [x] find_unbound_queues() - Identify queues with no bindings
+  - [x] find_unused_exchanges() - Identify unused exchanges
+  - [x] calculate_topology_complexity() - Assess topology complexity
+  - [x] analyze_topology_issues() - Comprehensive topology analysis
+  - [x] validate_queue_naming() - Enforce naming conventions
+
+### Observability & Tracing ✅
+- [x] **tracing_util module** - Message tracing and flow analysis
+  - [x] MessageTrace - Track message lifecycle events
+  - [x] TraceEvent - Published, Consumed, Acknowledged, Rejected, etc.
+  - [x] TraceRecorder - Record and manage message traces
+  - [x] MessageFlowAnalyzer - Analyze message flow patterns
+  - [x] MessageFlowInsights - Success rates, rejection rates, processing times
+  - [x] Automatic eviction of old traces (configurable capacity)
+  - [x] Health status determination (healthy, degraded, unhealthy)
+  - [x] Average processing time calculation
+
+### Consumer Group Management ✅
+- [x] **consumer_groups module** - Coordinate multiple consumers
+  - [x] ConsumerGroup - Manage groups of consumers
+  - [x] ConsumerInfo - Track individual consumer metadata
+  - [x] LoadBalancingStrategy - RoundRobin, LeastConnections, Priority, Random
+  - [x] next_consumer() - Intelligent consumer selection
+  - [x] ConsumerGroupStats - Group-level statistics
+  - [x] ConsumerGroupManager - Manage multiple consumer groups
+  - [x] Consumer activation/deactivation
+  - [x] Message processing tracking per consumer
+  - [x] Utilization metrics and health monitoring
+
+## Previous Enhancements (v5) ✨
+
+### Production Monitoring & Utilities ✅
+- [x] **monitoring module** - Production-grade monitoring utilities
+  - [x] analyze_amqp_consumer_lag() - Consumer lag analysis with autoscaling recommendations
+  - [x] calculate_amqp_message_velocity() - Message velocity and queue growth trends
+  - [x] suggest_amqp_worker_scaling() - Worker scaling suggestions based on queue metrics
+  - [x] calculate_amqp_message_age_distribution() - SLA monitoring with percentile analysis
+  - [x] estimate_amqp_processing_capacity() - Processing capacity estimation
+  - [x] assess_amqp_queue_health() - Queue health assessment with recommendations
+  - [x] AmqpPerformanceMetrics - AMQP-specific performance metrics
+  - [x] ConsumerLagAnalysis, MessageVelocity, WorkerScalingSuggestion types
+  - [x] QueueHealthAssessment, MessageAgeDistribution types
+- [x] **utilities module** - Performance tuning and optimization utilities
+  - [x] calculate_optimal_amqp_batch_size() - Optimal batch size for operations
+  - [x] estimate_amqp_queue_memory() - Memory usage estimation
+  - [x] calculate_optimal_amqp_channel_pool_size() - Channel pool sizing
+  - [x] calculate_amqp_pipeline_depth() - Pipeline depth optimization
+  - [x] calculate_optimal_amqp_prefetch() - QoS prefetch calculation
+  - [x] estimate_amqp_drain_time() - Queue drain time estimation
+  - [x] calculate_optimal_amqp_connection_pool_size() - Connection pool sizing
+  - [x] estimate_amqp_confirm_latency() - Publisher confirm latency estimation
+  - [x] calculate_amqp_max_throughput() - Maximum throughput calculation
+  - [x] should_use_amqp_lazy_mode() - Lazy mode recommendation
+- [x] **Example: monitoring_utilities.rs** - Comprehensive demonstration of monitoring and utility functions
+
+## Previous Enhancements (v4)
 
 ### Advanced Consumption & Monitoring ✅
 - [x] **consume_batch()** - Efficient batch message consumption
@@ -348,7 +575,7 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
   - Troubleshooting for common issues
   - Performance benchmarks
   - Testing instructions
-- [x] **9 Runnable Examples** in `examples/` directory:
+- [x] **16 Runnable Examples** in `examples/` directory:
   - `basic_publish_consume.rs` - Basic message workflow
   - `batch_publish.rs` - High-throughput batch operations
   - `priority_queue.rs` - Priority-based message processing
@@ -357,7 +584,14 @@ Full-featured AMQP broker with exchange/queue topology, message confirmation, pr
   - `transaction.rs` - AMQP transaction support
   - `streaming_consumer.rs` - Async streaming consumer pattern
   - `modern_queue_features.rs` - Modern RabbitMQ queue features (v3)
-  - `advanced_monitoring.rs` - Advanced monitoring & batch consumption (v4) ✨ NEW
+  - `advanced_monitoring.rs` - Advanced monitoring & batch consumption (v4)
+  - `monitoring_utilities.rs` - Monitoring & utility functions demo (v5)
+  - `v6_features_demo.rs` - Circuit breaker, retry, compression, topology, tracing, consumer groups (v6)
+  - `production_patterns.rs` - Production-ready integration of all v6 features (v6)
+  - `v7_features_demo.rs` - Rate limiting, bulkhead, scheduling, metrics export (v7)
+  - `v8_features_demo.rs` - Hooks, DLX analytics, adaptive batching, profiling (v8)
+  - `v9_features_demo.rs` - Backpressure, poison detection, routing, optimization (v9)
+  - `v9_production_integration.rs` - Complete production-ready integration of all v9 features (v9) ✨ NEW
 
 ## Dependencies
 
@@ -441,7 +675,7 @@ let config = AmqpConfig::default()
 
 ## Performance Testing
 
-Criterion benchmarks are now enabled! ✨ NEW
+Criterion benchmarks are now enabled! ✨ ENHANCED v5
 
 Run benchmarks with:
 ```bash
@@ -453,6 +687,9 @@ Benchmarks include:
 - Queue configuration building
 - Broker configuration building
 - Batch operation sizing
+- v4 Helper methods (QueueStats, ConnectionInfo helpers)
+- v5 Monitoring functions (lag analysis, velocity, scaling suggestions, health assessment) ✨ NEW
+- v5 Utility functions (batch size, memory estimation, pool sizing, throughput) ✨ NEW
 
 For integration performance testing, use the example programs with timing:
 

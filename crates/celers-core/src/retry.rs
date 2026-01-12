@@ -1,3 +1,9 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap
+)]
 //! Retry strategies for task execution
 //!
 //! This module provides various retry strategies that determine how long to wait
@@ -55,7 +61,7 @@ pub enum RetryStrategy {
     },
 
     /// Decorrelated jitter (AWS recommended for distributed systems)
-    /// delay = random(base, previous_delay * 3)
+    /// delay = random(base, `previous_delay` * 3)
     DecorrelatedJitter {
         /// Base delay in seconds
         base: u64,
@@ -227,7 +233,7 @@ impl RetryStrategy {
                 increment,
                 max_delay,
             } => {
-                let delay = initial + (increment * retry_count as u64);
+                let delay = *initial + (*increment * u64::from(retry_count));
                 max_delay.map_or(delay, |max| delay.min(max))
             }
 
@@ -245,7 +251,7 @@ impl RetryStrategy {
                 power,
                 max_delay,
             } => {
-                let delay = (*initial as f64 * (retry_count as f64 + 1.0).powf(*power)) as u64;
+                let delay = (*initial as f64 * (f64::from(retry_count) + 1.0).powf(*power)) as u64;
                 max_delay.map_or(delay, |max| delay.min(max))
             }
 
@@ -306,8 +312,9 @@ impl RetryStrategy {
     }
 
     /// Get the strategy name as a string
+    #[inline]
     #[must_use]
-    pub fn name(&self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Fixed { .. } => "fixed",
             Self::Linear { .. } => "linear",
@@ -323,8 +330,9 @@ impl RetryStrategy {
     }
 
     /// Check if this strategy uses randomness
+    #[inline]
     #[must_use]
-    pub fn is_jittered(&self) -> bool {
+    pub const fn is_jittered(&self) -> bool {
         matches!(
             self,
             Self::DecorrelatedJitter { .. } | Self::FullJitter { .. } | Self::EqualJitter { .. }
@@ -335,32 +343,32 @@ impl RetryStrategy {
 impl std::fmt::Display for RetryStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Fixed { delay } => write!(f, "Fixed({}s)", delay),
+            Self::Fixed { delay } => write!(f, "Fixed({delay}s)"),
             Self::Linear {
                 initial, increment, ..
-            } => write!(f, "Linear({}s + {}s/retry)", initial, increment),
+            } => write!(f, "Linear({initial}s + {increment}s/retry)"),
             Self::Exponential {
                 initial,
                 multiplier,
                 ..
-            } => write!(f, "Exponential({}s * {}^n)", initial, multiplier),
+            } => write!(f, "Exponential({initial}s * {multiplier}^n)"),
             Self::Polynomial { initial, power, .. } => {
-                write!(f, "Polynomial({}s * n^{})", initial, power)
+                write!(f, "Polynomial({initial}s * n^{power})")
             }
-            Self::Fibonacci { initial, .. } => write!(f, "Fibonacci({}s)", initial),
+            Self::Fibonacci { initial, .. } => write!(f, "Fibonacci({initial}s)"),
             Self::DecorrelatedJitter { base, max_delay } => {
-                write!(f, "DecorrelatedJitter(base={}s, max={}s)", base, max_delay)
+                write!(f, "DecorrelatedJitter(base={base}s, max={max_delay}s)")
             }
             Self::FullJitter {
                 initial,
                 multiplier,
                 ..
-            } => write!(f, "FullJitter({}s * {}^n)", initial, multiplier),
+            } => write!(f, "FullJitter({initial}s * {multiplier}^n)"),
             Self::EqualJitter {
                 initial,
                 multiplier,
                 ..
-            } => write!(f, "EqualJitter({}s * {}^n)", initial, multiplier),
+            } => write!(f, "EqualJitter({initial}s * {multiplier}^n)"),
             Self::Custom { delays, fallback } => {
                 write!(f, "Custom({} delays, fallback={}s)", delays.len(), fallback)
             }
@@ -372,7 +380,7 @@ impl std::fmt::Display for RetryStrategy {
 /// Calculate the nth Fibonacci number
 fn fibonacci_number(n: u32) -> u64 {
     if n <= 1 {
-        return n as u64;
+        return u64::from(n);
     }
 
     let mut a = 0u64;
@@ -517,14 +525,16 @@ impl RetryPolicy {
     }
 
     /// Get the delay before the next retry
+    #[inline]
     #[must_use]
     pub fn get_retry_delay(&self, retry_count: u32, previous_delay: Option<u64>) -> u64 {
         self.strategy.calculate_delay(retry_count, previous_delay)
     }
 
     /// Check if this policy allows retries
+    #[inline]
     #[must_use]
-    pub fn allows_retry(&self) -> bool {
+    pub const fn allows_retry(&self) -> bool {
         self.max_retries > 0
     }
 }
@@ -690,7 +700,7 @@ mod tests {
                 attempt in 0u32..50
             ) {
                 let strategy = RetryStrategy::linear(initial, increment);
-                let expected = initial + (increment * attempt as u64);
+                let expected = initial + (increment * u64::from(attempt));
                 let calculated = strategy.calculate_delay(attempt, None);
                 prop_assert_eq!(calculated, expected);
             }

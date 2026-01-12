@@ -1,5 +1,62 @@
+//! `CeleRS` CLI - Command-line interface for distributed task queue management.
+//!
+//! The `CeleRS` CLI provides comprehensive tools for managing workers, queues, tasks,
+//! and monitoring distributed task execution. It supports multiple brokers
+//! (Redis, `PostgreSQL`) and provides advanced features like auto-scaling,
+//! alerting, and real-time dashboards.
+//!
+//! # Features
+//!
+//! - **Worker Management**: Start, stop, pause, resume, and scale workers
+//! - **Queue Operations**: List, purge, move, export, and import queues
+//! - **Task Management**: Inspect, cancel, retry, and monitor tasks
+//! - **DLQ Operations**: Manage failed tasks in the Dead Letter Queue
+//! - **Scheduling**: Cron-based task scheduling with Beat scheduler
+//! - **Monitoring**: Metrics, live dashboard, health checks
+//! - **Debugging**: Diagnostic tools and automatic problem detection
+//! - **Database**: Connection testing, health checks, migrations
+//!
+//! # Quick Start
+//!
+//! ```bash
+//! # Initialize configuration
+//! celers init
+//!
+//! # Start a worker
+//! celers worker --broker redis://localhost:6379 --queue my_queue
+//!
+//! # Check queue status
+//! celers status --broker redis://localhost:6379 --queue my_queue
+//!
+//! # Run health diagnostics
+//! celers health --broker redis://localhost:6379
+//! ```
+//!
+//! # Configuration
+//!
+//! The CLI can be configured via:
+//! - Command-line arguments
+//! - Configuration files (TOML format)
+//! - Environment variables
+//!
+//! Generate a default configuration:
+//! ```bash
+//! celers init --output celers.toml
+//! ```
+//!
+//! # Documentation
+//!
+//! For detailed command documentation, use `--help`:
+//! ```bash
+//! celers --help
+//! celers worker --help
+//! celers queue --help
+//! ```
+
+mod backup;
 mod commands;
 mod config;
+mod interactive;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -19,7 +76,7 @@ struct Cli {
 enum Commands {
     /// Start a worker to process tasks
     Worker {
-        /// Broker URL (e.g., redis://localhost:6379)
+        /// Broker URL (e.g., <redis://localhost:6379>)
         #[arg(short, long)]
         broker: Option<String>,
 
@@ -201,6 +258,59 @@ enum Commands {
         /// Refresh interval in seconds
         #[arg(short, long, default_value_t = 1)]
         refresh: u64,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Interactive REPL mode for running multiple commands
+    Interactive {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Queue name
+        #[arg(short, long)]
+        queue: Option<String>,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Create a backup of broker state
+    Backup {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Output file path (should end with .tar.gz)
+        #[arg(short, long, default_value = "celers-backup.tar.gz")]
+        output: String,
+
+        /// Configuration file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Restore broker state from backup
+    Restore {
+        /// Broker URL
+        #[arg(short, long)]
+        broker: Option<String>,
+
+        /// Backup file path (.tar.gz)
+        #[arg(short, long)]
+        input: String,
+
+        /// Dry run mode (validate without restoring)
+        #[arg(short, long)]
+        dry_run: bool,
+
+        /// Only restore specific queues (comma-separated)
+        #[arg(short = 'q', long)]
+        queues: Option<String>,
 
         /// Configuration file path
         #[arg(long)]
@@ -471,7 +581,7 @@ enum TaskCommands {
         /// Task ID (UUID)
         task_id: String,
 
-        /// Redis backend URL (e.g., redis://localhost:6379)
+        /// Redis backend URL (e.g., <redis://localhost:6379>)
         #[arg(short, long)]
         backend: Option<String>,
 
@@ -935,7 +1045,7 @@ enum AlertCommands {
 enum DbCommands {
     /// Test database connection
     TestConnection {
-        /// Database URL (PostgreSQL, MySQL, etc.)
+        /// Database URL (`PostgreSQL`, `MySQL`, etc.)
         #[arg(short, long)]
         url: String,
 
@@ -1287,18 +1397,18 @@ async fn main() -> anyhow::Result<()> {
             let mut buffer = Vec::new();
             man.render(&mut buffer)?;
 
-            let man_path = format!("{}/celers.1", output);
+            let man_path = format!("{output}/celers.1");
             fs::write(&man_path, buffer)?;
 
             println!("{}", "✓ Man page generated successfully".green());
             println!("  Output: {}", man_path.cyan());
             println!();
             println!("To install:");
-            println!("  sudo cp {} /usr/share/man/man1/", man_path);
+            println!("  sudo cp {man_path} /usr/share/man/man1/");
             println!("  sudo mandb");
             println!();
             println!("To view:");
-            println!("  man {}", man_path);
+            println!("  man {man_path}");
         }
 
         Commands::Health {
@@ -1656,6 +1766,51 @@ async fn main() -> anyhow::Result<()> {
             let queue_name = queue.unwrap_or(cfg.broker.queue);
 
             commands::run_dashboard(&broker_url, &queue_name, refresh).await?;
+        }
+
+        Commands::Interactive {
+            broker,
+            queue,
+            config,
+        } => {
+            let mut cfg = load_config(config)?;
+
+            // Override config with command-line args if provided
+            if let Some(broker_url) = broker {
+                cfg.broker.url = broker_url;
+            }
+            if let Some(queue_name) = queue {
+                cfg.broker.queue = queue_name;
+            }
+
+            interactive::start_interactive(cfg).await?;
+        }
+
+        Commands::Backup {
+            broker,
+            output,
+            config,
+        } => {
+            let cfg = load_config(config)?;
+            let broker_url = broker.unwrap_or(cfg.broker.url);
+
+            backup::create_backup(&broker_url, &output).await?;
+        }
+
+        Commands::Restore {
+            broker,
+            input,
+            dry_run,
+            queues,
+            config,
+        } => {
+            let cfg = load_config(config)?;
+            let broker_url = broker.unwrap_or(cfg.broker.url);
+
+            let selective_queues =
+                queues.map(|q| q.split(',').map(|s| s.trim().to_string()).collect());
+
+            backup::restore_backup(&broker_url, &input, dry_run, selective_queues).await?;
         }
     }
 

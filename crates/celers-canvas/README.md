@@ -283,6 +283,87 @@ async fn aggregate_results(results: Vec<Option<String>>) -> Result<String, Strin
 }
 ```
 
+### Workflow Optimization
+
+Optimize workflows before execution using the `WorkflowCompiler`:
+
+```rust
+use celers_canvas::{Chain, Group, WorkflowCompiler, OptimizationPass};
+
+// Create a workflow with redundant tasks
+let chain = Chain::new()
+    .then_signature(Signature::new("process".to_string()).with_args(vec![json!(1)]))
+    .then_signature(Signature::new("validate".to_string()))
+    .then_signature(Signature::new("process".to_string()).with_args(vec![json!(1)])); // Duplicate
+
+// Optimize the workflow
+let compiler = WorkflowCompiler::new().aggressive();
+let optimized = compiler.optimize_chain(&chain);
+
+// The optimized chain has duplicates removed
+assert_eq!(optimized.tasks.len(), 2); // Was 3, now 2
+```
+
+**Available Optimization Passes:**
+
+- **Common Subexpression Elimination (CSE)**: Removes duplicate task signatures
+  ```rust
+  let compiler = WorkflowCompiler::new().aggressive();
+  // Deduplicates identical tasks (same name, args, kwargs)
+  ```
+
+- **Dead Code Elimination (DCE)**: Removes unreachable or invalid tasks
+  ```rust
+  let compiler = WorkflowCompiler::new();
+  // Removes tasks with empty names or no effect
+  ```
+
+- **Task Fusion**: Combines sequential tasks with the same name
+  ```rust
+  let compiler = WorkflowCompiler::new().aggressive();
+  // Combines immutable tasks with same name and priority
+  ```
+
+- **Parallel Scheduling**: Optimizes task execution order
+  ```rust
+  let compiler = WorkflowCompiler::new()
+      .add_pass(OptimizationPass::ParallelScheduling);
+  // Sorts group tasks by priority (highest first)
+  ```
+
+- **Resource Optimization**: Improves resource utilization
+  ```rust
+  let compiler = WorkflowCompiler::new()
+      .add_pass(OptimizationPass::ResourceOptimization);
+  // Groups tasks by queue for better locality
+  ```
+
+**Example: Combined Optimizations**
+
+```rust
+use celers_canvas::{Group, WorkflowCompiler, OptimizationPass};
+
+let group = Group::new()
+    .add_signature(Signature::new("task1".to_string()).with_priority(1).with_args(vec![json!(1)]))
+    .add_signature(Signature::new("".to_string())) // Dead code
+    .add_signature(Signature::new("task2".to_string()).with_priority(9).with_args(vec![json!(2)]))
+    .add_signature(Signature::new("task1".to_string()).with_priority(1).with_args(vec![json!(1)])); // Duplicate
+
+let compiler = WorkflowCompiler::new()
+    .aggressive()
+    .add_pass(OptimizationPass::ParallelScheduling);
+
+let optimized = compiler.optimize_group(&group);
+// Result: 2 tasks (dead code removed, duplicate removed, sorted by priority)
+// Task order: task2 (priority 9), task1 (priority 1)
+```
+
+**Performance Benefits:**
+- Reduced task count (faster workflow setup)
+- Better queue locality (improved throughput)
+- Optimized scheduling (higher priority tasks first)
+- See `examples/workflow_optimization.rs` for detailed examples
+
 ## Chord Barrier Synchronization
 
 The Chord primitive uses Redis atomic operations for barrier synchronization:

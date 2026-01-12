@@ -18,6 +18,38 @@
 //! - **Health Monitoring** with `health_status()` and `is_healthy()`
 //! - **Transaction Support** with `start_transaction()`, `commit_transaction()`, `rollback_transaction()`
 //! - **Management API Integration** for queue listing, statistics, and server monitoring
+//! - **Monitoring Utilities** for autoscaling, capacity planning, and SLA monitoring (see [`monitoring`] module)
+//! - **Utility Functions** for performance tuning and optimization (see [`utilities`] module)
+//!
+//! # Enhanced Features (v6)
+//!
+//! - **Circuit Breaker Pattern** - Prevent cascading failures with automatic recovery (see [`circuit_breaker`] module)
+//! - **Advanced Retry Strategies** - Exponential backoff with jitter support (see [`retry`] module)
+//! - **Message Compression** - Reduce network overhead with Gzip/Zstd (see [`compression`] module)
+//! - **Topology Validation** - Validate AMQP topology before deployment (see [`topology`] module)
+//! - **Message Tracing** - Track message lifecycle and flow analysis (see [`tracing_util`] module)
+//! - **Consumer Groups** - Load balancing with multiple strategies (see [`consumer_groups`] module)
+//!
+//! # Production Features (v7)
+//!
+//! - **Rate Limiting** - Token bucket and leaky bucket algorithms for controlling message rates (see [`rate_limiter`] module)
+//! - **Bulkhead Pattern** - Resource isolation to prevent cascading failures (see [`bulkhead`] module)
+//! - **Message Scheduling** - Delayed message delivery for scheduled tasks and retries (see [`scheduler`] module)
+//! - **Metrics Export** - Export metrics to Prometheus, StatsD, and JSON formats (see [`metrics_export`] module)
+//!
+//! # Advanced Production Features (v8)
+//!
+//! - **Lifecycle Hooks** - Extensible hooks for intercepting publish, consume, and acknowledgment events (see [`hooks`] module)
+//! - **DLX Analytics** - Comprehensive Dead Letter Exchange analytics and insights (see [`dlx_analytics`] module)
+//! - **Adaptive Batching** - Dynamic batch size optimization based on system load and latency (see [`batch_optimizer`] module)
+//! - **Performance Profiling** - Detailed performance profiling with percentile analysis (see [`profiler`] module)
+//!
+//! # Enterprise Production Features (v9)
+//!
+//! - **Backpressure Management** - Intelligent flow control to prevent overwhelming the broker or consumers (see [`backpressure`] module)
+//! - **Poison Message Detection** - Identify and handle messages that repeatedly fail processing (see [`poison_detector`] module)
+//! - **Advanced Routing** - Sophisticated routing strategies beyond basic AMQP exchange types (see [`router`] module)
+//! - **Performance Optimization** - Advanced optimization strategies for connection tuning and resource management (see [`optimization`] module)
 //!
 //! # Example
 //!
@@ -99,6 +131,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+// Public modules
+pub mod backpressure;
+pub mod batch_optimizer;
+pub mod bulkhead;
+pub mod circuit_breaker;
+pub mod compression;
+pub mod consumer_groups;
+pub mod dlx_analytics;
+pub mod hooks;
+pub mod metrics_export;
+pub mod monitoring;
+pub mod optimization;
+pub mod poison_detector;
+pub mod profiler;
+pub mod rate_limiter;
+pub mod retry;
+pub mod router;
+pub mod scheduler;
+pub mod topology;
+pub mod tracing_util;
+pub mod utilities;
 
 /// Exchange type for AMQP
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

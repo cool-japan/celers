@@ -17,6 +17,20 @@
 //! - CloudWatch metrics integration
 //! - Adaptive polling strategies
 //! - Parallel message processing
+//! - **Circuit breaker pattern** for AWS API resilience ✨ NEW
+//! - **Real-time cost tracking** with detailed breakdown ✨ NEW
+//! - **Advanced batch optimizer** with dynamic sizing ✨ NEW
+//! - **Distributed tracing** with correlation IDs and trace context ✨ NEW
+//! - **Quota/budget management** for cost control ✨ NEW
+//! - **Multi-queue routing** for message distribution ✨ NEW
+//! - **Performance profiling** with latency tracking ✨ NEW
+//! - **Message deduplication** utilities for preventing duplicate processing ✨ NEW
+//! - **Advanced DLQ analytics** with error pattern detection and retry recommendations ✨ NEW
+//! - **Observability hooks** for custom metrics and logging integration ✨ NEW
+//! - **Backpressure management** for preventing system overload ✨ NEW
+//! - **Poison message detection** for isolating repeatedly failing messages ✨ NEW
+//! - **Cost alert system** with configurable thresholds and callbacks ✨ NEW
+//! - **Lambda integration helpers** for AWS Lambda SQS event processing ✨ NEW
 //!
 //! # Quick Start
 //!
@@ -175,6 +189,29 @@
 //! 5. EC2 instance metadata
 //!
 //! **Recommendation**: Use IAM roles in production for enhanced security.
+
+pub mod auto_tuner;
+pub mod backpressure;
+pub mod batch_optimizer;
+pub mod circuit_breaker;
+pub mod cost_alerts;
+pub mod cost_tracker;
+pub mod dedup;
+pub mod dlq_analytics;
+pub mod hooks;
+pub mod lambda_helpers;
+pub mod metrics_aggregator;
+pub mod monitoring;
+pub mod optimization;
+pub mod poison_detector;
+pub mod profiler;
+pub mod quota_manager;
+pub mod replay;
+pub mod router;
+pub mod sla_monitor;
+pub mod tracing_util;
+pub mod utilities;
+pub mod workload_presets;
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;

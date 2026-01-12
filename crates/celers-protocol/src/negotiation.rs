@@ -143,6 +143,7 @@ impl ProtocolNegotiator {
     }
 
     /// Set the preferred protocol version
+    #[must_use]
     pub fn prefer(mut self, version: ProtocolVersion) -> Self {
         self.preferred = Some(version);
         self.supported.insert(version);
@@ -150,12 +151,14 @@ impl ProtocolNegotiator {
     }
 
     /// Add support for a protocol version
+    #[must_use]
     pub fn support(mut self, version: ProtocolVersion) -> Self {
         self.supported.insert(version);
         self
     }
 
     /// Remove support for a protocol version
+    #[must_use]
     pub fn unsupport(mut self, version: ProtocolVersion) -> Self {
         self.supported.remove(&version);
         if self.preferred == Some(version) {
@@ -165,16 +168,19 @@ impl ProtocolNegotiator {
     }
 
     /// Check if a protocol version is supported
+    #[inline]
     pub fn is_supported(&self, version: ProtocolVersion) -> bool {
         self.supported.contains(&version)
     }
 
     /// Get all supported versions
+    #[inline]
     pub fn supported_versions(&self) -> Vec<ProtocolVersion> {
         self.supported.iter().copied().collect()
     }
 
     /// Get the preferred version
+    #[inline]
     pub fn preferred_version(&self) -> Option<ProtocolVersion> {
         self.preferred
     }

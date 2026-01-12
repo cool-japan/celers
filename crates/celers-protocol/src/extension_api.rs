@@ -120,11 +120,13 @@ impl ExtensionRegistry {
     }
 
     /// Check if an extension is registered
+    #[inline]
     pub fn has(&self, name: &str) -> bool {
         self.extensions.contains_key(name)
     }
 
     /// List all registered extension names
+    #[inline]
     pub fn list(&self) -> Vec<&str> {
         self.extensions.keys().map(|s| s.as_str()).collect()
     }

@@ -13,6 +13,8 @@ Production-ready message broker using Redis with:
 - ✅ **Atomic Operations**: BRPOPLPUSH for reliable delivery
 - ✅ **Prometheus Metrics**: Full instrumentation
 - ✅ **Lua Scripts**: Atomic visibility timeout support
+- ✅ **Production Monitoring**: Consumer lag analysis, autoscaling, anomaly detection (v0.1.2+)
+- ✅ **Performance Utilities**: Batch sizing, memory estimation, optimization tools (v0.1.2+)
 
 ## Features
 
@@ -299,13 +301,143 @@ match broker.enqueue(task).await {
 - Transactional guarantees needed
 - Already using PostgreSQL
 
+## Production Monitoring (v0.1.2+)
+
+Advanced monitoring utilities for production deployments:
+
+```rust
+use celers_broker_redis::monitoring::*;
+
+// Consumer lag analysis with autoscaling recommendations
+let lag_analysis = analyze_redis_consumer_lag(
+    queue_size,
+    processing_rate,
+    target_lag_seconds
+);
+match lag_analysis.recommendation {
+    ScalingRecommendation::ScaleUp { additional_workers } => {
+        println!("Scale up by {} workers", additional_workers);
+    }
+    ScalingRecommendation::Optimal => {
+        println!("Current worker count is optimal");
+    }
+    _ => {}
+}
+
+// Message velocity and queue growth trends
+let velocity = calculate_redis_message_velocity(
+    previous_size,
+    current_size,
+    time_window_secs
+);
+println!("Queue trend: {:?}", velocity.trend);
+
+// Worker scaling recommendations
+let scaling = suggest_redis_worker_scaling(
+    queue_size,
+    current_workers,
+    avg_processing_rate,
+    target_lag_seconds
+);
+println!("Recommended workers: {}", scaling.recommended_workers);
+
+// Message age distribution for SLA monitoring
+let age_dist = calculate_redis_message_age_distribution(
+    &message_ages,
+    sla_threshold
+);
+println!("P95 age: {:.1} sec", age_dist.p95_age_secs);
+
+// Queue saturation detection
+let saturation = detect_redis_queue_saturation(
+    current_size,
+    max_capacity,
+    growth_rate
+);
+println!("Saturation level: {:?}", saturation.saturation_level);
+
+// Statistical anomaly detection
+let anomaly = detect_redis_queue_anomaly(
+    current_size,
+    historical_sizes,
+    sensitivity
+);
+if anomaly.is_anomaly {
+    println!("Anomaly detected! Severity: {:.2}", anomaly.severity_score);
+}
+
+// DLQ health analysis
+let dlq_health = analyze_redis_dlq_health(
+    dlq_size,
+    total_processed,
+    time_window_secs
+);
+println!("Error rate: {:.2}%", dlq_health.error_rate);
+```
+
+## Performance Utilities (v0.1.2+)
+
+Optimization utilities for fine-tuning performance:
+
+```rust
+use celers_broker_redis::utilities::*;
+
+// Calculate optimal batch size
+let batch_size = calculate_optimal_redis_batch_size(
+    queue_size,
+    avg_message_size,
+    target_latency_ms
+);
+
+// Estimate memory usage
+let memory_bytes = estimate_redis_queue_memory(
+    queue_size,
+    avg_message_size,
+    QueueMode::Priority
+);
+
+// Calculate optimal connection pool size
+let pool_size = calculate_optimal_redis_pool_size(
+    expected_concurrency,
+    avg_operation_duration_ms
+);
+
+// Pipeline size optimization
+let pipeline_size = calculate_redis_pipeline_size(
+    network_latency_ms,
+    batch_size
+);
+
+// Estimate queue drain time
+let drain_time_secs = estimate_redis_queue_drain_time(
+    queue_size,
+    processing_rate
+);
+
+// Command performance analysis
+let analysis = analyze_redis_command_performance(&command_latencies);
+
+// Persistence strategy recommendations
+let strategy = suggest_redis_persistence_strategy(
+    throughput,
+    durability_level
+);
+
+// Timeout value calculation
+let (conn_timeout, op_timeout) = calculate_redis_timeout_values(
+    avg_latency_ms,
+    p99_latency_ms
+);
+```
+
 ## Examples
 
 See `examples/` directory:
-- `phase1_complete.rs` - Basic usage
-- `priority_queue.rs` - Priority queues
-- `dead_letter_queue.rs` - DLQ management
-- `task_cancellation.rs` - Pub/Sub cancellation
+- `basic_usage.rs` - Basic usage
+- `advanced_features.rs` - Advanced features
+- `resilience_features.rs` - Resilience patterns
+- `geo_distribution.rs` - Geo-distribution
+- `monitoring_performance.rs` - Monitoring and performance tuning (v0.1.2+)
 
 ## License
 

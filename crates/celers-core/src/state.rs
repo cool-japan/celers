@@ -46,7 +46,7 @@ impl TaskState {
     /// Check if the task is in a terminal state
     #[inline]
     #[must_use]
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
             TaskState::Succeeded(_)
@@ -77,7 +77,7 @@ impl TaskState {
     /// Check if this is a custom state
     #[inline]
     #[must_use]
-    pub fn is_custom(&self) -> bool {
+    pub const fn is_custom(&self) -> bool {
         matches!(self, TaskState::Custom { .. })
     }
 
@@ -104,28 +104,28 @@ impl TaskState {
     /// Check if the task is revoked
     #[inline]
     #[must_use]
-    pub fn is_revoked(&self) -> bool {
+    pub const fn is_revoked(&self) -> bool {
         matches!(self, TaskState::Revoked)
     }
 
     /// Check if the task is rejected
     #[inline]
     #[must_use]
-    pub fn is_rejected(&self) -> bool {
+    pub const fn is_rejected(&self) -> bool {
         matches!(self, TaskState::Rejected)
     }
 
     /// Check if the task is received
     #[inline]
     #[must_use]
-    pub fn is_received(&self) -> bool {
+    pub const fn is_received(&self) -> bool {
         matches!(self, TaskState::Received)
     }
 
     /// Check if the task can be retried
     #[inline]
     #[must_use]
-    pub fn can_retry(&self, max_retries: u32) -> bool {
+    pub const fn can_retry(&self, max_retries: u32) -> bool {
         match self {
             TaskState::Failed(_) => true,
             TaskState::Retrying(count) => *count < max_retries,
@@ -136,7 +136,7 @@ impl TaskState {
     /// Get the retry count
     #[inline]
     #[must_use]
-    pub fn retry_count(&self) -> u32 {
+    pub const fn retry_count(&self) -> u32 {
         match self {
             TaskState::Retrying(count) => *count,
             _ => 0,
@@ -146,49 +146,49 @@ impl TaskState {
     /// Check if the task is in an active (non-terminal) state
     #[inline]
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         !self.is_terminal()
     }
 
     /// Check if the task is pending
     #[inline]
     #[must_use]
-    pub fn is_pending(&self) -> bool {
+    pub const fn is_pending(&self) -> bool {
         matches!(self, TaskState::Pending)
     }
 
     /// Check if the task is reserved
     #[inline]
     #[must_use]
-    pub fn is_reserved(&self) -> bool {
+    pub const fn is_reserved(&self) -> bool {
         matches!(self, TaskState::Reserved)
     }
 
     /// Check if the task is running
     #[inline]
     #[must_use]
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         matches!(self, TaskState::Running)
     }
 
     /// Check if the task is retrying
     #[inline]
     #[must_use]
-    pub fn is_retrying(&self) -> bool {
+    pub const fn is_retrying(&self) -> bool {
         matches!(self, TaskState::Retrying(_))
     }
 
     /// Check if the task succeeded
     #[inline]
     #[must_use]
-    pub fn is_succeeded(&self) -> bool {
+    pub const fn is_succeeded(&self) -> bool {
         matches!(self, TaskState::Succeeded(_))
     }
 
     /// Check if the task failed
     #[inline]
     #[must_use]
-    pub fn is_failed(&self) -> bool {
+    pub const fn is_failed(&self) -> bool {
         matches!(self, TaskState::Failed(_))
     }
 
@@ -220,18 +220,19 @@ impl fmt::Display for TaskState {
             TaskState::Received => write!(f, "RECEIVED"),
             TaskState::Reserved => write!(f, "RESERVED"),
             TaskState::Running => write!(f, "RUNNING"),
-            TaskState::Retrying(count) => write!(f, "RETRYING({})", count),
+            TaskState::Retrying(count) => write!(f, "RETRYING({count})"),
             TaskState::Succeeded(_) => write!(f, "SUCCEEDED"),
-            TaskState::Failed(err) => write!(f, "FAILED: {}", err),
+            TaskState::Failed(err) => write!(f, "FAILED: {err}"),
             TaskState::Revoked => write!(f, "REVOKED"),
             TaskState::Rejected => write!(f, "REJECTED"),
-            TaskState::Custom { name, .. } => write!(f, "CUSTOM({})", name),
+            TaskState::Custom { name, .. } => write!(f, "CUSTOM({name})"),
         }
     }
 }
 
 impl TaskState {
     /// Get a short string representation of the state name
+    #[inline]
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
@@ -356,30 +357,35 @@ impl StateHistory {
     }
 
     /// Get the current state
+    #[inline]
     #[must_use]
     pub fn current_state(&self) -> Option<&TaskState> {
         self.current.as_ref()
     }
 
     /// Get all transitions
+    #[inline]
     #[must_use]
     pub fn get_transitions(&self) -> &[StateTransition] {
         &self.transitions
     }
 
     /// Get the last transition
+    #[inline]
     #[must_use]
     pub fn last_transition(&self) -> Option<&StateTransition> {
         self.transitions.last()
     }
 
     /// Get the number of transitions
+    #[inline]
     #[must_use]
-    pub fn transition_count(&self) -> usize {
+    pub const fn transition_count(&self) -> usize {
         self.transitions.len()
     }
 
     /// Check if task has ever been in a specific state
+    #[inline]
     #[must_use]
     pub fn has_been_in_state(&self, state_name: &str) -> bool {
         self.transitions.iter().any(|t| t.to.name() == state_name)
