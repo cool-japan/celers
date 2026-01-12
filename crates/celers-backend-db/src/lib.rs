@@ -179,6 +179,9 @@ impl ResultBackend for PostgresResultBackend {
                     completed_at: row.get("completed_at"),
                     worker: row.get("worker"),
                     progress: None,
+                    version: 0,
+                    tags: Vec::new(),
+                    metadata: std::collections::HashMap::new(),
                 };
 
                 Ok(Some(meta))
@@ -286,6 +289,8 @@ impl ResultBackend for PostgresResultBackend {
                         .map(|s| std::time::Duration::from_secs(s as u64)),
                     cancelled: row.get("cancelled"),
                     cancellation_reason: row.get("cancellation_reason"),
+                    retry_count: 0,
+                    max_retries: None,
                 };
 
                 Ok(Some(state))
@@ -401,6 +406,9 @@ impl ResultBackend for PostgresResultBackend {
                 completed_at: row.get("completed_at"),
                 worker: row.get("worker"),
                 progress: None,
+                version: 0,
+                tags: Vec::new(),
+                metadata: std::collections::HashMap::new(),
             };
 
             results_map.insert(task_id, meta);
@@ -593,6 +601,9 @@ impl ResultBackend for MysqlResultBackend {
                     completed_at: row.get("completed_at"),
                     worker: row.get("worker"),
                     progress: None,
+                    version: 0,
+                    tags: Vec::new(),
+                    metadata: std::collections::HashMap::new(),
                 };
 
                 Ok(Some(meta))
@@ -710,6 +721,8 @@ impl ResultBackend for MysqlResultBackend {
                         .map(|s| std::time::Duration::from_secs(s as u64)),
                     cancelled: row.get("cancelled"),
                     cancellation_reason: row.get("cancellation_reason"),
+                    retry_count: 0,
+                    max_retries: None,
                 };
 
                 Ok(Some(state))
@@ -833,6 +846,9 @@ impl ResultBackend for MysqlResultBackend {
                 completed_at: row.get("completed_at"),
                 worker: row.get("worker"),
                 progress: None,
+                version: 0,
+                tags: Vec::new(),
+                metadata: std::collections::HashMap::new(),
             };
 
             results_map.insert(task_id, meta);

@@ -64,6 +64,7 @@ wheels/
 .installed.cfg
 *.egg
 **/.claude/settings.local.json
+**/,claude/
 **/CLAUDE.local.md
 **/CLAUDE.md
 
