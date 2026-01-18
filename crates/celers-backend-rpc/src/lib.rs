@@ -152,6 +152,9 @@ impl GrpcResultBackend {
             completed_at,
             worker: proto_meta.worker,
             progress: None,
+            version: 0,
+            tags: Vec::new(),
+            metadata: std::collections::HashMap::new(),
         })
     }
 
@@ -197,6 +200,8 @@ impl GrpcResultBackend {
             timeout: proto_state.timeout_seconds.map(Duration::from_secs),
             cancelled: proto_state.cancelled,
             cancellation_reason: proto_state.cancellation_reason,
+            retry_count: 0,
+            max_retries: None,
         })
     }
 }
@@ -322,6 +327,9 @@ mod tests {
             completed_at: None,
             worker: None,
             progress: None,
+            version: 0,
+            tags: Vec::new(),
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -332,6 +340,12 @@ mod tests {
             completed: 0,
             callback: Some("callback_task".to_string()),
             task_ids: vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()],
+            created_at: Utc::now(),
+            timeout: None,
+            cancelled: false,
+            cancellation_reason: None,
+            retry_count: 0,
+            max_retries: None,
         }
     }
 

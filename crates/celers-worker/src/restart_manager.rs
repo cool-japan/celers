@@ -304,7 +304,20 @@ impl RestartManager {
         // Check strategy
         match self.policy.strategy {
             RestartStrategy::Never => false,
-            RestartStrategy::Always => true,
+            RestartStrategy::Always => {
+                // Check restart count limit even for Always strategy
+                if let Some(max) = self.policy.max_restarts {
+                    let stats = self.get_stats().await;
+                    if stats.has_reached_limit(Some(max)) {
+                        warn!(
+                            "Restart limit reached ({} restarts in {:?}), not restarting",
+                            stats.recent_restarts, self.policy.restart_window
+                        );
+                        return false;
+                    }
+                }
+                true
+            }
             RestartStrategy::ExponentialBackoff | RestartStrategy::LinearBackoff => {
                 // Check restart count limit
                 let stats = self.get_stats().await;
@@ -365,11 +378,15 @@ impl RestartManager {
         let reason = reason.into();
         let record = RestartRecord::new(reason.clone(), severity);
 
-        let mut history = self.history.write().await;
-        history.push(record);
+        {
+            let mut history = self.history.write().await;
+            history.push(record);
+        }
 
-        let mut last_restart = self.last_restart.write().await;
-        *last_restart = Some(Instant::now());
+        {
+            let mut last_restart = self.last_restart.write().await;
+            *last_restart = Some(Instant::now());
+        }
 
         info!("Recorded restart: {} (severity: {})", reason, severity);
 

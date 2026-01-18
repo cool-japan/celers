@@ -4371,10 +4371,41 @@ impl MetricsProfiler {
         let times = self.operation_times.lock().unwrap();
         let mut stats = Vec::new();
 
-        for operation_name in times.keys() {
-            if let Some(stat) = self.get_operation_stats(operation_name) {
-                stats.push(stat);
+        for (operation_name, operation_times) in times.iter() {
+            if operation_times.is_empty() {
+                continue;
             }
+
+            let count = operation_times.len();
+            let sum: f64 = operation_times.iter().sum();
+            let mean = sum / count as f64;
+
+            let min = operation_times
+                .iter()
+                .copied()
+                .min_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap();
+            let max = operation_times
+                .iter()
+                .copied()
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap();
+
+            let variance = if count > 1 {
+                let sq_diff_sum: f64 = operation_times.iter().map(|t| (t - mean).powi(2)).sum();
+                sq_diff_sum / (count - 1) as f64
+            } else {
+                0.0
+            };
+
+            stats.push(OperationStats {
+                operation_name: operation_name.to_string(),
+                call_count: count,
+                mean_micros: mean,
+                min_micros: min,
+                max_micros: max,
+                std_dev_micros: variance.sqrt(),
+            });
         }
 
         stats.sort_by(|a, b| {
@@ -8899,11 +8930,11 @@ mod tests {
 
         let json = export_metrics_json();
 
-        assert!(json.contains("\"tasks_enqueued\""));
-        assert!(json.contains("\"tasks_completed\""));
-        assert!(json.contains("\"tasks_failed\""));
-        assert!(json.contains("\"queue_size\""));
-        assert!(json.contains("\"active_workers\""));
+        assert!(json.contains("\"enqueued\""));
+        assert!(json.contains("\"completed\""));
+        assert!(json.contains("\"failed\""));
+        assert!(json.contains("\"pending\""));
+        assert!(json.contains("\"active\""));
         assert!(json.contains("\"success_rate\""));
         assert!(json.contains("\"error_rate\""));
     }
@@ -8952,7 +8983,7 @@ mod tests {
         assert!(!exports.csv.is_empty());
         assert!(!exports.prometheus.is_empty());
 
-        assert!(exports.json.contains("\"tasks_enqueued\""));
+        assert!(exports.json.contains("\"enqueued\""));
         assert!(exports.csv.contains("timestamp,tasks_enqueued"));
         assert!(exports.prometheus.contains("celers_tasks_enqueued_total"));
     }
@@ -9288,10 +9319,15 @@ mod tests {
     fn test_capacity_prediction_growing() {
         let history = MetricHistory::new(100);
 
-        // Simulate growing queue
-        for i in 0..50 {
-            history.record((i * 10) as f64);
-        }
+        // Simulate growing queue with explicit timestamps
+        let base_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let samples: Vec<(u64, f64)> = (0..50)
+            .map(|i| (base_time + i as u64, (i * 10) as f64))
+            .collect();
+        history.record_batch(&samples);
 
         let prediction = predict_capacity_exhaustion(&history, 1000.0, 0.8);
 
@@ -9319,10 +9355,15 @@ mod tests {
     fn test_capacity_prediction_decreasing() {
         let history = MetricHistory::new(100);
 
-        // Simulate decreasing usage
-        for i in 0..50 {
-            history.record((50 - i) as f64);
-        }
+        // Simulate decreasing usage with explicit timestamps
+        let base_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let samples: Vec<(u64, f64)> = (0..50)
+            .map(|i| (base_time + i as u64, (50 - i) as f64))
+            .collect();
+        history.record_batch(&samples);
 
         let prediction = predict_capacity_exhaustion(&history, 100.0, 0.8);
 

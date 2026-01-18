@@ -1,0 +1,343 @@
+-- MySQL Table Partitioning Guide for CeleRS Broker
+--
+-- This migration provides comprehensive documentation and examples for implementing
+-- table partitioning to improve performance at scale.
+--
+-- ============================================================================
+-- WHY PARTITION?
+-- ============================================================================
+--
+-- Partitioning improves performance by:
+-- 1. Partition Pruning: Queries scan only relevant partitions
+-- 2. Easier Maintenance: Archive/delete old data by dropping partitions
+-- 3. Parallel Query Processing: MySQL can scan partitions in parallel
+-- 4. Better Index Performance: Smaller indexes per partition
+--
+-- Consider partitioning when:
+-- - Queue has millions of tasks
+-- - Historical data needs regular archiving
+-- - Query performance degrades with table size
+-- - You need to delete old data efficiently
+--
+-- ============================================================================
+-- PARTITIONING STRATEGY: RANGE BY created_at
+-- ============================================================================
+--
+-- The most effective partitioning strategy for task queues is RANGE partitioning
+-- by created_at timestamp. This allows efficient archiving of old completed tasks
+-- and improves query performance for recent tasks.
+--
+-- Example: Create partitioned celers_tasks table (monthly partitions)
+--
+-- NOTE: You CANNOT add partitioning to an existing table with data.
+-- You must either:
+-- 1. Create a new partitioned table and migrate data
+-- 2. Plan partitioning from the start during initial deployment
+--
+-- DROP TABLE IF EXISTS celers_tasks;
+--
+-- CREATE TABLE celers_tasks (
+--     id CHAR(36) PRIMARY KEY,
+--     queue_name VARCHAR(255) NOT NULL,
+--     task_name VARCHAR(255) NOT NULL,
+--     payload MEDIUMBLOB NOT NULL,
+--     state VARCHAR(20) NOT NULL,
+--     priority INT NOT NULL DEFAULT 0,
+--     retry_count INT NOT NULL DEFAULT 0,
+--     max_retries INT NOT NULL DEFAULT 3,
+--     created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+--     scheduled_at TIMESTAMP(6) NULL,
+--     started_at TIMESTAMP(6) NULL,
+--     completed_at TIMESTAMP(6) NULL,
+--     worker_id VARCHAR(255) NULL,
+--     error_message TEXT NULL,
+--     metadata JSON NULL,
+--
+--     INDEX idx_tasks_state_priority (queue_name, state, priority DESC, created_at ASC),
+--     INDEX idx_tasks_scheduled (scheduled_at, state),
+--     INDEX idx_tasks_worker (worker_id, state),
+--     INDEX idx_tasks_task_name (task_name),
+--     INDEX idx_tasks_task_name_state (task_name, state),
+--     INDEX idx_tasks_created_at (created_at)
+-- ) PARTITION BY RANGE (UNIX_TIMESTAMP(created_at)) (
+--     PARTITION p2024_01 VALUES LESS THAN (UNIX_TIMESTAMP('2024-02-01 00:00:00')),
+--     PARTITION p2024_02 VALUES LESS THAN (UNIX_TIMESTAMP('2024-03-01 00:00:00')),
+--     PARTITION p2024_03 VALUES LESS THAN (UNIX_TIMESTAMP('2024-04-01 00:00:00')),
+--     PARTITION p2024_04 VALUES LESS THAN (UNIX_TIMESTAMP('2024-05-01 00:00:00')),
+--     PARTITION p2024_05 VALUES LESS THAN (UNIX_TIMESTAMP('2024-06-01 00:00:00')),
+--     PARTITION p2024_06 VALUES LESS THAN (UNIX_TIMESTAMP('2024-07-01 00:00:00')),
+--     PARTITION p2024_07 VALUES LESS THAN (UNIX_TIMESTAMP('2024-08-01 00:00:00')),
+--     PARTITION p2024_08 VALUES LESS THAN (UNIX_TIMESTAMP('2024-09-01 00:00:00')),
+--     PARTITION p2024_09 VALUES LESS THAN (UNIX_TIMESTAMP('2024-10-01 00:00:00')),
+--     PARTITION p2024_10 VALUES LESS THAN (UNIX_TIMESTAMP('2024-11-01 00:00:00')),
+--     PARTITION p2024_11 VALUES LESS THAN (UNIX_TIMESTAMP('2024-12-01 00:00:00')),
+--     PARTITION p2024_12 VALUES LESS THAN (UNIX_TIMESTAMP('2025-01-01 00:00:00')),
+--     PARTITION p_future VALUES LESS THAN MAXVALUE
+-- );
+--
+-- ============================================================================
+-- PARTITIONING STRATEGY: HASH BY queue_name
+-- ============================================================================
+--
+-- For multi-tenant deployments with many queues, HASH partitioning by queue_name
+-- can distribute load across partitions and improve concurrent access.
+--
+-- DROP TABLE IF EXISTS celers_tasks;
+--
+-- CREATE TABLE celers_tasks (
+--     -- ... (same columns as above) ...
+-- ) PARTITION BY HASH(CRC32(queue_name))
+-- PARTITIONS 16;
+--
+-- ============================================================================
+-- PARTITIONING STRATEGY: RANGE-HASH (Subpartitioning)
+-- ============================================================================
+--
+-- For very large deployments, combine RANGE and HASH partitioning:
+--
+-- CREATE TABLE celers_tasks (
+--     -- ... (same columns as above) ...
+-- ) PARTITION BY RANGE (UNIX_TIMESTAMP(created_at))
+-- SUBPARTITION BY HASH(CRC32(queue_name))
+-- SUBPARTITIONS 4 (
+--     PARTITION p2024_01 VALUES LESS THAN (UNIX_TIMESTAMP('2024-02-01 00:00:00')),
+--     PARTITION p2024_02 VALUES LESS THAN (UNIX_TIMESTAMP('2024-03-01 00:00:00')),
+--     -- ... more partitions ...
+--     PARTITION p_future VALUES LESS THAN MAXVALUE
+-- );
+--
+-- ============================================================================
+-- PARTITION MAINTENANCE
+-- ============================================================================
+--
+-- Add new partitions (do this monthly/quarterly):
+--
+-- ALTER TABLE celers_tasks REORGANIZE PARTITION p_future INTO (
+--     PARTITION p2025_01 VALUES LESS THAN (UNIX_TIMESTAMP('2025-02-01 00:00:00')),
+--     PARTITION p_future VALUES LESS THAN MAXVALUE
+-- );
+--
+-- Drop old partitions (archive completed tasks older than 6 months):
+--
+-- ALTER TABLE celers_tasks DROP PARTITION p2024_01;
+--
+-- Archive partition before dropping (recommended):
+--
+-- CREATE TABLE celers_tasks_archive_2024_01 AS
+-- SELECT * FROM celers_tasks PARTITION (p2024_01);
+--
+-- ALTER TABLE celers_tasks DROP PARTITION p2024_01;
+--
+-- ============================================================================
+-- AUTOMATED PARTITION MANAGEMENT
+-- ============================================================================
+--
+-- MySQL Event Scheduler can automate partition management:
+--
+-- Enable event scheduler (add to my.cnf):
+-- event_scheduler = ON
+--
+-- Create monthly partition creation event:
+--
+-- DELIMITER //
+-- CREATE EVENT IF NOT EXISTS create_monthly_partitions
+-- ON SCHEDULE EVERY 1 MONTH
+-- STARTS CONCAT(DATE_FORMAT(CURRENT_DATE + INTERVAL 1 MONTH, '%Y-%m'), '-01 00:00:00')
+-- DO
+-- BEGIN
+--     DECLARE partition_name VARCHAR(20);
+--     DECLARE partition_limit TIMESTAMP;
+--
+--     SET partition_name = CONCAT('p', DATE_FORMAT(CURRENT_DATE + INTERVAL 2 MONTH, '%Y_%m'));
+--     SET partition_limit = DATE_FORMAT(CURRENT_DATE + INTERVAL 3 MONTH, '%Y-%m-01 00:00:00');
+--
+--     SET @sql = CONCAT('ALTER TABLE celers_tasks REORGANIZE PARTITION p_future INTO (',
+--                       'PARTITION ', partition_name, ' VALUES LESS THAN (UNIX_TIMESTAMP(''',
+--                       partition_limit, ''')),',
+--                       'PARTITION p_future VALUES LESS THAN MAXVALUE)');
+--
+--     PREPARE stmt FROM @sql;
+--     EXECUTE stmt;
+--     DEALLOCATE PREPARE stmt;
+-- END//
+-- DELIMITER ;
+--
+-- Create partition cleanup event (drop partitions older than 6 months):
+--
+-- DELIMITER //
+-- CREATE EVENT IF NOT EXISTS cleanup_old_partitions
+-- ON SCHEDULE EVERY 1 MONTH
+-- STARTS CONCAT(DATE_FORMAT(CURRENT_DATE + INTERVAL 1 MONTH, '%Y-%m'), '-01 02:00:00')
+-- DO
+-- BEGIN
+--     DECLARE old_partition VARCHAR(20);
+--     DECLARE partition_exists INT;
+--
+--     SET old_partition = CONCAT('p', DATE_FORMAT(CURRENT_DATE - INTERVAL 6 MONTH, '%Y_%m'));
+--
+--     SELECT COUNT(*) INTO partition_exists
+--     FROM information_schema.partitions
+--     WHERE table_schema = DATABASE()
+--       AND table_name = 'celers_tasks'
+--       AND partition_name = old_partition;
+--
+--     IF partition_exists > 0 THEN
+--         SET @sql = CONCAT('ALTER TABLE celers_tasks DROP PARTITION ', old_partition);
+--         PREPARE stmt FROM @sql;
+--         EXECUTE stmt;
+--         DEALLOCATE PREPARE stmt;
+--     END IF;
+-- END//
+-- DELIMITER ;
+--
+-- ============================================================================
+-- QUERYING PARTITION INFORMATION
+-- ============================================================================
+--
+-- View partition information:
+--
+-- SELECT
+--     partition_name,
+--     partition_expression,
+--     partition_description,
+--     table_rows,
+--     ROUND(data_length / 1024 / 1024, 2) AS data_mb,
+--     ROUND(index_length / 1024 / 1024, 2) AS index_mb,
+--     create_time,
+--     update_time
+-- FROM information_schema.partitions
+-- WHERE table_schema = DATABASE()
+--   AND table_name = 'celers_tasks'
+-- ORDER BY partition_ordinal_position;
+--
+-- Check partition pruning in EXPLAIN:
+--
+-- EXPLAIN PARTITIONS
+-- SELECT * FROM celers_tasks
+-- WHERE created_at >= '2024-06-01'
+--   AND created_at < '2024-07-01'
+--   AND state = 'pending';
+--
+-- ============================================================================
+-- PERFORMANCE CONSIDERATIONS
+-- ============================================================================
+--
+-- 1. Partition Key in WHERE Clause:
+--    Always include partition key (created_at) in WHERE clause for pruning:
+--
+--    GOOD:  WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) AND state = 'pending'
+--    BAD:   WHERE state = 'pending'  -- Scans all partitions
+--
+-- 2. Primary Key Must Include Partition Key:
+--    MySQL requires primary key to include partition columns.
+--    If using RANGE(created_at), primary key must be (id, created_at).
+--
+--    Solution: Use UNIQUE KEY instead of PRIMARY KEY on id alone:
+--    UNIQUE KEY idx_tasks_id (id),
+--    PRIMARY KEY (id, created_at)
+--
+-- 3. Partition Count:
+--    Too many partitions (>100) can slow down queries.
+--    Aim for 12-24 monthly partitions for typical use cases.
+--
+-- 4. Partition Size:
+--    Each partition should have 10M-100M rows for optimal performance.
+--    Adjust partition interval (daily/weekly/monthly) based on insert rate.
+--
+-- 5. Index Per Partition:
+--    Each partition has its own indexes, reducing index size per partition.
+--    This improves index cache hit rates and query performance.
+--
+-- ============================================================================
+-- MIGRATION TO PARTITIONED TABLE
+-- ============================================================================
+--
+-- If you have an existing non-partitioned table with data:
+--
+-- Step 1: Create partitioned table with new name
+-- CREATE TABLE celers_tasks_partitioned LIKE celers_tasks;
+-- ALTER TABLE celers_tasks_partitioned
+--     PARTITION BY RANGE (UNIX_TIMESTAMP(created_at)) (...);
+--
+-- Step 2: Copy data in batches (to avoid long locks)
+-- INSERT INTO celers_tasks_partitioned
+-- SELECT * FROM celers_tasks
+-- WHERE created_at >= '2024-01-01' AND created_at < '2024-02-01';
+--
+-- -- Repeat for each month...
+--
+-- Step 3: Rename tables (atomic swap)
+-- RENAME TABLE celers_tasks TO celers_tasks_old,
+--              celers_tasks_partitioned TO celers_tasks;
+--
+-- Step 4: Verify and cleanup
+-- -- Verify data integrity
+-- SELECT COUNT(*) FROM celers_tasks;
+-- SELECT COUNT(*) FROM celers_tasks_old;
+--
+-- -- Drop old table when confident
+-- DROP TABLE celers_tasks_old;
+--
+-- ============================================================================
+-- MONITORING PARTITIONS
+-- ============================================================================
+--
+-- Monitor partition sizes:
+--
+-- SELECT
+--     partition_name,
+--     table_rows,
+--     ROUND(data_length / 1024 / 1024, 2) AS data_mb,
+--     ROUND((data_length + index_length) / 1024 / 1024, 2) AS total_mb
+-- FROM information_schema.partitions
+-- WHERE table_schema = DATABASE()
+--   AND table_name = 'celers_tasks'
+-- ORDER BY partition_ordinal_position DESC
+-- LIMIT 12;
+--
+-- Monitor partition access patterns (requires performance_schema):
+--
+-- SELECT
+--     object_name,
+--     index_name,
+--     count_read,
+--     count_write,
+--     sum_timer_read,
+--     sum_timer_write
+-- FROM performance_schema.table_io_waits_summary_by_index_usage
+-- WHERE object_schema = DATABASE()
+--   AND object_name = 'celers_tasks'
+-- ORDER BY sum_timer_read + sum_timer_write DESC;
+--
+-- ============================================================================
+-- RECOMMENDATIONS
+-- ============================================================================
+--
+-- For most CeleRS deployments:
+--
+-- 1. Start WITHOUT partitioning
+-- 2. Monitor table size and query performance
+-- 3. Consider partitioning when:
+--    - Table exceeds 100M rows
+--    - Queries become slow despite proper indexes
+--    - Regular archiving is needed
+--
+-- 4. If implementing partitioning:
+--    - Use RANGE(created_at) with monthly intervals
+--    - Keep 6-12 months of data
+--    - Automate partition creation/deletion
+--    - Monitor partition pruning with EXPLAIN
+--
+-- 5. Test partitioning strategy on staging first
+-- 6. Have a rollback plan (backup before migration)
+-- 7. Monitor performance after migration
+--
+-- ============================================================================
+-- THIS FILE IS DOCUMENTATION ONLY - NO SCHEMA CHANGES
+-- ============================================================================
+--
+-- This migration is for documentation purposes only. No schema changes are applied.
+-- To implement partitioning, you must manually execute the appropriate commands
+-- from this file based on your specific requirements.
+--
+SELECT 'Partitioning guide loaded - no schema changes applied' AS message;
