@@ -1,0 +1,13 @@
+{
+  "tasks": {},
+  "lock_manager": {
+    "locks": {},
+    "default_ttl": 300
+  },
+  "alert_manager": {
+    "alerts": [],
+    "max_history": 1000,
+    "dedup_window_seconds": 300,
+    "last_alert_time": {}
+  }
+}

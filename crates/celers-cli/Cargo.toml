@@ -1,0 +1,48 @@
+[package]
+name = "celers-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for CeleRS worker and queue management"
+keywords = ["celery", "cli", "worker", "queue", "management"]
+categories = ["asynchronous", "command-line-utilities"]
+
+[[bin]]
+name = "celers"
+path = "src/main.rs"
+
+[dependencies]
+celers-core = { path = "../celers-core", version = "0.1.0" }
+celers-worker = { path = "../celers-worker", version = "0.1.0" }
+celers-broker-redis = { path = "../celers-broker-redis", version = "0.1.0" }
+celers-broker-postgres = { path = "../celers-broker-postgres", version = "0.1.0" }
+celers-metrics = { path = "../celers-metrics", version = "0.1.0" }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+redis = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+toml = { workspace = true }
+tabled = { workspace = true }
+colored = { workspace = true }
+reqwest = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+rustyline = { workspace = true }
+csv = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

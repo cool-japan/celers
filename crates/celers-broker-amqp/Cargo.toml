@@ -1,0 +1,43 @@
+[package]
+name = "celers-broker-amqp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RabbitMQ/AMQP broker implementation for CeleRS"
+keywords = ["celery", "rabbitmq", "amqp", "broker", "messaging"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+
+# AMQP client
+lapin = { workspace = true }
+tokio = { workspace = true }
+
+# HTTP client for RabbitMQ Management API
+reqwest = { workspace = true }
+urlencoding = { workspace = true }
+
+# Core dependencies
+celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+celers-kombu = { path = "../celers-kombu", version = "0.1.0" }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "amqp_benchmarks"
+harness = false

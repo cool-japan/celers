@@ -1,0 +1,45 @@
+[package]
+name = "celers-beat"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Periodic task scheduler for CeleRS (Celery Beat equivalent)"
+keywords = ["celery", "scheduler", "cron", "periodic", "beat"]
+categories = ["asynchronous", "date-and-time"]
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+# Core dependencies
+celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+
+# Optional: Cron expression parsing
+cron = { workspace = true, optional = true }
+
+# Optional: Solar event calculation
+sunrise = { workspace = true, optional = true }
+
+[features]
+default = []
+cron = ["dep:cron"]
+solar = ["dep:sunrise"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+
+[[example]]
+name = "schedule_builders"
+required-features = ["cron"]
+
+[[example]]
+name = "timezone_utilities"
+required-features = ["cron"]

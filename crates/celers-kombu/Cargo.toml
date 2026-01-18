@@ -1,0 +1,40 @@
+[package]
+name = "celers-kombu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Broker abstraction layer for CeleRS (inspired by Python Kombu)"
+keywords = ["celery", "kombu", "messaging", "amqp", "queue"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+
+# Core protocol
+celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "broker_bench"
+harness = false
+
+[features]
+default = []
+# Compression middleware (requires celers-protocol compression features)
+compression = ["celers-protocol/gzip"]
+# Message signing middleware (requires celers-protocol signing feature)
+signing = ["celers-protocol/signing"]
+# Message encryption middleware (requires celers-protocol encryption feature)
+encryption = ["celers-protocol/encryption"]
+# Enable all middleware features
+full = ["compression", "signing", "encryption"]

@@ -1,0 +1,73 @@
+[package]
+name = "celers-examples"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Facade (re-exports everything)
+celers = { path = "../celers" }
+
+# Core & Protocol
+celers-core = { path = "../celers-core" }
+celers-protocol = { path = "../celers-protocol" }
+
+# Messaging Layer
+celers-kombu = { path = "../celers-kombu" }
+celers-broker-redis = { path = "../celers-broker-redis" }
+celers-broker-postgres = { path = "../celers-broker-postgres" }
+celers-broker-amqp = { path = "../celers-broker-amqp" }
+celers-broker-sqs = { path = "../celers-broker-sqs" }
+celers-broker-sql = { path = "../celers-broker-sql" }
+
+# Result Backend
+celers-backend-redis = { path = "../celers-backend-redis" }
+
+# Runtime & Workflow
+celers-worker = { path = "../celers-worker" }
+celers-canvas = { path = "../celers-canvas" }
+celers-beat = { path = "../celers-beat" }
+
+# Utilities
+celers-macros = { path = "../celers-macros" }
+celers-metrics = { path = "../celers-metrics" }
+
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+oxicode.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+sqlx.workspace = true
+redis.workspace = true
+futures-util = { workspace = true }
+
+[[example]]
+name = "prometheus_metrics"
+required-features = ["metrics"]
+
+[features]
+default = []
+metrics = ["celers-worker/metrics", "celers-broker-redis/metrics"]
+workflows = ["celers-worker/workflows", "celers-canvas/backend-redis"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "serialization"
+harness = false
+
+[[bench]]
+name = "queue_operations"
+harness = false
+
+[[bench]]
+name = "batch_operations"
+harness = false

@@ -1,0 +1,38 @@
+[package]
+name = "celers-backend-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Database (PostgreSQL/MySQL) result backend for CeleRS"
+keywords = ["celery", "database", "backend", "postgresql", "mysql"]
+categories = ["asynchronous", "database"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+# SQL client supporting both PostgreSQL and MySQL
+sqlx = { workspace = true }
+
+# Core protocol
+celers-core = { path = "../celers-core", version = "0.1.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+
+# Re-export types from backend-redis for trait compatibility
+celers-backend-redis = { path = "../celers-backend-redis", version = "0.1.0" }
+
+[features]
+default = ["postgres"]
+postgres = []
+mysql = []
+
+[dev-dependencies]
+tokio-test = { workspace = true }

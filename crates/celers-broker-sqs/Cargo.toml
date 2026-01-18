@@ -1,0 +1,37 @@
+[package]
+name = "celers-broker-sqs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AWS SQS broker implementation for CeleRS"
+keywords = ["celery", "aws", "sqs", "broker", "cloud"]
+categories = ["asynchronous", "network-programming", "web-programming"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+
+# AWS SDK for SQS
+aws-config = { workspace = true }
+aws-sdk-sqs = { workspace = true }
+aws-sdk-cloudwatch = { workspace = true }
+
+# Compression support
+flate2 = { workspace = true }
+base64 = { workspace = true }
+
+# Core dependencies
+celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+celers-kombu = { path = "../celers-kombu", version = "0.1.0" }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true }

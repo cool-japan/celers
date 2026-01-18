@@ -1,0 +1,171 @@
+[workspace]
+members = [
+    # Facade
+    "crates/celers",
+
+    # Core & Protocol (The "Vine" & "Celery Core" equivalent)
+    "crates/celers-core",
+    "crates/celers-protocol",
+
+    # Messaging Layer (The "Kombu" equivalent)
+    "crates/celers-kombu",
+    "crates/celers-broker-redis",
+    "crates/celers-broker-postgres",
+    "crates/celers-broker-amqp",
+    "crates/celers-broker-sqs",
+    "crates/celers-broker-sql",
+
+    # Result Backend Layer
+    "crates/celers-backend-redis",
+    "crates/celers-backend-db",
+    "crates/celers-backend-rpc",
+
+    # Runtime & Workflow (The "Billiard" & "Canvas" equivalent)
+    "crates/celers-worker",
+    "crates/celers-canvas",
+    "crates/celers-beat",
+
+    # Utilities
+    "crates/celers-macros",
+    "crates/celers-cli",
+    "crates/celers-metrics",
+
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cool-japan/celers"
+
+[workspace.dependencies]
+# Core dependencies
+tokio = { version = "1.49.0", features = ["full"] }
+async-trait = "0.1.89"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+oxicode = { version = "0.1.1", features = ["serde", "derive"] }
+thiserror = "2.0.17"
+anyhow = "1.0.100"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+
+# Broker implementations
+redis = { version = "1.0.2", features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "uuid", "json"] }
+lapin = "3.7.2"
+
+# AWS SDK
+aws-config = "1.8"
+aws-sdk-sqs = "1.92"
+aws-sdk-cloudwatch = "1.101"
+
+# CLI and utilities
+clap = { version = "4.5.54", features = ["derive"] }
+clap_complete = "4.5.65"
+clap_mangen = "0.2.31"
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.43", features = ["serde"] }
+chrono-tz = "0.10"
+hostname = "0.4.2"
+regex = "1.12"
+rand = "0.9.2"
+flate2 = "1.1"
+zstd = "0.13"
+crossbeam-deque = "0.8"
+num_cpus = "1.17"
+libc = "0.2"
+base64 = "0.22"
+hex = "0.4"
+
+# gRPC dependencies
+tonic = "0.14.2"
+tonic-prost = "0.14.2"
+prost = "0.14.3"
+prost-types = "0.14.3"
+tonic-build = "0.14.2"
+tonic-prost-build = "0.14.2"
+
+# Serialization formats
+rmp-serde = "1.3"
+serde_yaml = "0.9"
+bson = { version = "3.1.0", features = ["serde"] }
+
+# Crypto dependencies
+hmac = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+
+# Scheduling dependencies
+cron = "0.15.0"
+sunrise = "3.0.0"
+
+# CLI tools
+toml = "0.9.11"
+tabled = "0.20.0"
+colored = "3.1.1"
+reqwest = { version = "0.13.1", features = ["json"] }
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+rustyline = "17.0.2"
+csv = "1.4"
+tar = "0.4"
+dirs = "6.0.0"
+urlencoding = "2.1"
+futures-util = "0.3.31"
+
+# Metrics
+prometheus = "0.14.0"
+lazy_static = "1.5.0"
+
+# Observability
+opentelemetry = { version = "0.31.0", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.31.0", features = ["trace", "rt-tokio"] }
+tracing-opentelemetry = "0.32.1"
+
+# Testing
+criterion = { version = "0.8.1", features = ["html_reports", "async_tokio"] }
+proptest = "1.9"
+tokio-test = "0.4"
+tempfile = "3.24.0"
+serial_test = "3.3.1"
+futures = "0.3"
+
+# Macro dependencies
+quote = "1.0.43"
+syn = { version = "2.0.114", features = ["full"] }
+proc-macro2 = "1.0.105"
+
+# Other utilities
+crc32fast = "1.5"
+rust_decimal = "1.40"
+
+# Bundle size optimization profiles
+[profile.release]
+# Enable link-time optimization for smaller binaries
+lto = true
+# Use a single code generation unit for better optimization
+codegen-units = 1
+# Strip debug symbols to reduce binary size
+strip = true
+# Maximum optimization level
+opt-level = 3
+
+[profile.release-small]
+# Optimize for size rather than speed
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-fast]
+# Optimize for speed with moderate size
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true

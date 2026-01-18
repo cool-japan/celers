@@ -1,0 +1,97 @@
+[package]
+name = "celers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Celery-compatible distributed task queue for Rust (Facade crate)"
+readme = "README.md"
+keywords = ["celery", "task-queue", "distributed", "async", "worker"]
+categories = ["asynchronous", "network-programming", "concurrency"]
+
+[dependencies]
+# Re-export core functionality
+celers-core = { path = "../celers-core", version = "0.1.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+celers-kombu = { path = "../celers-kombu", version = "0.1.0" }
+celers-worker = { path = "../celers-worker", version = "0.1.0" }
+celers-canvas = { path = "../celers-canvas", version = "0.1.0" }
+celers-macros = { path = "../celers-macros", version = "0.1.0" }
+
+# Optional broker implementations
+celers-broker-redis = { path = "../celers-broker-redis", version = "0.1.0", optional = true }
+celers-broker-postgres = { path = "../celers-broker-postgres", version = "0.1.0", optional = true }
+celers-broker-sql = { path = "../celers-broker-sql", version = "0.1.0", optional = true }
+celers-broker-amqp = { path = "../celers-broker-amqp", version = "0.1.0", optional = true }
+celers-broker-sqs = { path = "../celers-broker-sqs", version = "0.1.0", optional = true }
+
+# Optional backend implementations
+celers-backend-redis = { path = "../celers-backend-redis", version = "0.1.0", optional = true }
+celers-backend-db = { path = "../celers-backend-db", version = "0.1.0", optional = true }
+celers-backend-rpc = { path = "../celers-backend-rpc", version = "0.1.0", optional = true }
+
+# Optional beat scheduler
+celers-beat = { path = "../celers-beat", version = "0.1.0", optional = true }
+
+# Optional metrics
+celers-metrics = { path = "../celers-metrics", version = "0.1.0", optional = true }
+
+# Core async runtime
+tokio = { workspace = true }
+
+# Re-exported types
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+# Optional tracing dependencies
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# Helper dependencies
+num_cpus = { workspace = true }
+rand = { workspace = true }
+
+[features]
+default = ["redis", "json"]
+
+# Broker features
+redis = ["celers-broker-redis"]
+postgres = ["celers-broker-postgres"]
+mysql = ["celers-broker-sql"]
+amqp = ["celers-broker-amqp"]
+sqs = ["celers-broker-sqs"]
+
+# Backend features
+backend-redis = ["celers-backend-redis"]
+backend-db = ["celers-backend-db"]
+backend-rpc = ["celers-backend-rpc"]
+
+# Scheduler
+beat = ["celers-beat"]
+beat-cron = ["beat", "celers-beat/cron"]
+beat-solar = ["beat", "celers-beat/solar"]
+
+# Serialization
+json = []
+msgpack = ["celers-protocol/msgpack"]
+
+# Observability
+metrics = ["celers-metrics"]
+tracing = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry", "dep:tracing", "dep:tracing-subscriber"]
+
+# Development utilities
+dev-utils = []
+
+# Full feature set
+full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-db", "backend-rpc", "beat", "beat-cron", "beat-solar", "json", "msgpack", "metrics", "tracing", "dev-utils"]
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+anyhow = { workspace = true }

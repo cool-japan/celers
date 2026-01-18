@@ -1,0 +1,44 @@
+[package]
+name = "celers-worker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Task execution runtime for CeleRS with concurrency control and health checks"
+keywords = ["celery", "worker", "runtime", "executor", "async"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+celers-core = { path = "../celers-core", version = "0.1.0" }
+celers-canvas = { path = "../celers-canvas", version = "0.1.0", optional = true }
+celers-backend-redis = { path = "../celers-backend-redis", version = "0.1.0", optional = true }
+celers-metrics = { path = "../celers-metrics", version = "0.1.0", optional = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hostname = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+crossbeam-deque = { workspace = true }
+num_cpus = { workspace = true }
+libc = { workspace = true }
+redis = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true, features = ["runtime-tokio", "postgres", "json", "uuid"] }
+
+[features]
+default = []
+metrics = ["celers-metrics"]
+canvas = ["celers-canvas"]
+workflows = ["canvas", "celers-backend-redis"]
+redis = ["dep:redis"]
+postgres = ["dep:sqlx"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

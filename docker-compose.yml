@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  # Redis broker
+  redis:
+    image: redis:7-alpine
+    container_name: celers-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - celers-network
+
+  # PostgreSQL broker/backend
+  postgres:
+    image: postgres:16-alpine
+    container_name: celers-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: celers
+      POSTGRES_USER: celers
+      POSTGRES_PASSWORD: celers_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./crates/celers-broker-postgres/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U celers"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - celers-network
+
+  # RabbitMQ broker
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: celers-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP port
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: celers
+      RABBITMQ_DEFAULT_PASS: celers_password
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - celers-network
+
+  # Prometheus (monitoring)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: celers-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+    networks:
+      - celers-network
+
+  # Grafana (visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: celers-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    volumes:
+      - ./docs/grafana:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - celers-network
+
+  # CeleRS Worker (example)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: celers-worker
+    environment:
+      RUST_LOG: info
+      REDIS_URL: redis://redis:6379
+      POSTGRES_URL: postgres://celers:celers_password@postgres:5432/celers
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - celers-network
+    command: worker start --concurrency 4
+
+volumes:
+  redis-data:
+  postgres-data:
+  rabbitmq-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  celers-network:
+    driver: bridge
