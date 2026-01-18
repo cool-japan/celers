@@ -325,8 +325,12 @@ impl ReplayScheduler {
 
         let mut tick = interval(Duration::from_secs(60)); // Check every minute
 
-        while self.running {
+        loop {
             tick.tick().await;
+
+            if !self.running {
+                break;
+            }
 
             if let Err(e) = self.execute_once().await {
                 error!("Scheduler execution error: {}", e);

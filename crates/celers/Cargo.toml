@@ -75,6 +75,8 @@ backend-rpc = ["celers-backend-rpc"]
 
 # Scheduler
 beat = ["celers-beat"]
+beat-cron = ["beat", "celers-beat/cron"]
+beat-solar = ["beat", "celers-beat/solar"]
 
 # Serialization
 json = []
@@ -88,7 +90,7 @@ tracing = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-openteleme
 dev-utils = []
 
 # Full feature set
-full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-db", "backend-rpc", "beat", "json", "msgpack", "metrics", "tracing", "dev-utils"]
+full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-db", "backend-rpc", "beat", "beat-cron", "beat-solar", "json", "msgpack", "metrics", "tracing", "dev-utils"]
 
 [dev-dependencies]
 tokio-test = "0.4"

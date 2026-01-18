@@ -469,8 +469,6 @@ impl Coordinator for WorkerCoordinator {
     }
 
     async fn release_leadership(&self, task_type: &str) -> Result<()> {
-        use redis::AsyncCommands;
-
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
@@ -537,8 +535,6 @@ impl Coordinator for WorkerCoordinator {
     }
 
     async fn release_lock(&self, lock_name: &str) -> Result<()> {
-        use redis::AsyncCommands;
-
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
