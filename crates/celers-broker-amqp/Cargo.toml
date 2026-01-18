@@ -14,15 +14,15 @@ async-trait = "0.1"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.11", features = ["v4"] }
+uuid = { version = "1.19", features = ["v4"] }
 tracing = "0.1"
 rand = "0.8"
-flate2 = "1.0"
+flate2 = "1.1"
 zstd = "0.13"
 
 # AMQP client
 lapin = "2.5"
-tokio = { version = "1.42", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # HTTP client for RabbitMQ Management API
 reqwest = { version = "0.12", features = ["json"] }

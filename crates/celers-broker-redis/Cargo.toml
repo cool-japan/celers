@@ -22,7 +22,7 @@ tracing = { workspace = true }
 flate2 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-crc32fast = "1.4"
+crc32fast = "1.5"
 rand = { workspace = true }
 
 [dev-dependencies]

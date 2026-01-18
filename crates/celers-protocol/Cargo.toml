@@ -12,18 +12,18 @@ repository = "https://github.com/yourusername/celers"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.11", features = ["v4", "serde"] }
+uuid = { version = "1.19", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 hex = { version = "0.4", optional = true }
 
 # Optional serialization formats
 rmp-serde = { version = "1.3", optional = true }  # MessagePack
-bincode = { version = "2.0.0-rc.3", optional = true }  # Binary
+bincode = { version = "2.0.1", optional = true }  # Binary
 serde_yaml = { version = "0.9", optional = true }  # YAML
 
 # Optional compression
-flate2 = { version = "1.0", optional = true }  # gzip/deflate
+flate2 = { version = "1.1", optional = true }  # gzip/deflate
 zstd = { version = "0.13", optional = true }  # Zstandard
 
 # Optional security/crypto
@@ -33,7 +33,7 @@ aes-gcm = { version = "0.10", optional = true }  # AES-256-GCM encryption
 
 # Optional serialization formats
 prost = { version = "0.13", optional = true }  # Protobuf
-bson = { version = "2.13", optional = true }  # BSON
+bson = { version = "2.15", optional = true }  # BSON
 
 [features]
 default = ["json"]

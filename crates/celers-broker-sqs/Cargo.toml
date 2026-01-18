@@ -14,14 +14,14 @@ async-trait = "0.1"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.11", features = ["v4"] }
+uuid = { version = "1.19", features = ["v4"] }
 tracing = "0.1"
-tokio = { version = "1.42", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # AWS SDK for SQS
-aws-config = "1.5"
-aws-sdk-sqs = "1.64"
-aws-sdk-cloudwatch = "1.68"
+aws-config = "1.8"
+aws-sdk-sqs = "1.91"
+aws-sdk-cloudwatch = "1.100"
 
 # Compression support
 flate2 = "1.1"

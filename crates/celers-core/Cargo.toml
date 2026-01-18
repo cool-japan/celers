@@ -21,11 +21,11 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
 rand = { workspace = true }
-num_cpus = "1.16"
+num_cpus = "1.17"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1.4"
+proptest = "1.9"
 
 [[bench]]
 name = "task_bench"
