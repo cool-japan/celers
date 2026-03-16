@@ -46,7 +46,7 @@ tokio = { version = "1.49.0", features = ["full"] }
 async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-oxicode = { version = "0.1.1", features = ["serde", "derive"] }
+oxicode = { version = "0.2.0", features = ["serde", "derive"] }
 thiserror = "2.0.17"
 anyhow = "1.0.100"
 tracing = "0.1.44"
@@ -55,7 +55,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 # Broker implementations
 redis = { version = "1.0.2", features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "uuid", "json"] }
-lapin = "3.7.2"
+lapin = "4.3.0"
 
 # AWS SDK
 aws-config = "1.8"
@@ -71,7 +71,7 @@ chrono = { version = "0.4.43", features = ["serde"] }
 chrono-tz = "0.10"
 hostname = "0.4.2"
 regex = "1.12"
-rand = "0.9.2"
+rand = "0.10.0"
 flate2 = "1.1"
 zstd = "0.13"
 crossbeam-deque = "0.8"
@@ -103,7 +103,7 @@ cron = "0.15.0"
 sunrise = "3.0.0"
 
 # CLI tools
-toml = "0.9.11"
+toml = "1.0.6"
 tabled = "0.20.0"
 colored = "3.1.1"
 reqwest = { version = "0.13.1", features = ["json"] }
