@@ -2,6 +2,8 @@
 
 Celery protocol v2/v5 implementation for CeleRS. Ensures wire-level compatibility with Python Celery workers and brokers.
 
+**Status: [Stable] — v0.2.0 (2026-03-27) — 461 tests**
+
 ## Overview
 
 Production-ready protocol implementation with:
@@ -10,10 +12,19 @@ Production-ready protocol implementation with:
 - ✅ **Celery Protocol v5**: Compatible with Celery 5.x+
 - ✅ **JSON Serialization**: Default, universally compatible
 - ✅ **MessagePack**: Optional high-performance binary format
+- ✅ **BSON Serialization**: Optional `bson-format` feature
+- ✅ **YAML Serialization**: Optional `yaml` feature
+- ✅ **HMAC Signing**: HMAC-SHA256 message authentication
+- ✅ **AES-256-GCM Encryption**: Authenticated message encryption
 - ✅ **AMQP Properties**: Correlation ID, reply-to, delivery mode
 - ✅ **Workflow Headers**: Parent ID, root ID, group ID
 - ✅ **Base64 Encoding**: Binary-safe message bodies
 - ✅ **Full Metadata**: ETA, expiration, retries, priority
+- ✅ **Protocol Negotiation**: Auto-detect protocol from message
+- ✅ **Compression**: Gzip, Zstd, Zlib with auto-detection
+- ✅ **Message Builder**: Fluent API for message construction
+- ✅ **Result Messages**: Celery-compatible task result format
+- ✅ **Event Messages**: Task and worker lifecycle events
 
 ## Quick Start
 
@@ -318,7 +329,7 @@ assert_eq!(content_type.as_str(), "application/json");
 
 ```toml
 [dependencies]
-celers-protocol = { version = "0.1", features = ["msgpack"] }
+celers-protocol = { version = "0.2", features = ["msgpack"] }
 ```
 
 ```rust
@@ -341,7 +352,7 @@ assert_eq!(content_type.as_str(), "application/x-msgpack");
 
 ```toml
 [dependencies]
-celers-protocol = { version = "0.1", features = ["binary"] }
+celers-protocol = { version = "0.2", features = ["binary"] }
 ```
 
 ```rust
@@ -742,4 +753,4 @@ mod tests {
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

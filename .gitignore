@@ -75,3 +75,6 @@ wheels/
 
 
 # SQL
+
+# Rustc ICE dumps
+rustc-ice-*.txt

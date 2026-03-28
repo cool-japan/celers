@@ -3,10 +3,15 @@
 //! This module provides compression utilities to reduce network overhead
 //! and storage requirements for large messages.
 //!
+//! This module uses [`celers_protocol::compression::CompressionType`] as
+//! the canonical compression enum. The legacy `CompressionCodec` type
+//! alias is retained for backward compatibility but is deprecated.
+//!
 //! # Supported Compression Algorithms
 //!
 //! - **Gzip**: Standard compression, good balance of speed and ratio
 //! - **Zstd**: Modern compression, faster with better ratios
+//! - **Zlib**: Deflate-based compression
 //! - **None**: No compression
 //!
 //! # Examples
@@ -28,48 +33,19 @@
 //! # }
 //! ```
 
-use flate2::read::{GzDecoder, GzEncoder};
-use flate2::Compression;
+use celers_protocol::compression::CompressionType as ProtocolCompressionType;
+use oxiarc_deflate::{gzip_compress, gzip_decompress};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 
-/// Compression codec for messages
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CompressionCodec {
-    /// No compression
-    None,
-    /// Gzip compression
-    Gzip,
-    /// Zstandard compression
-    Zstd,
-}
-
-impl std::fmt::Display for CompressionCodec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CompressionCodec::None => write!(f, "none"),
-            CompressionCodec::Gzip => write!(f, "gzip"),
-            CompressionCodec::Zstd => write!(f, "zstd"),
-        }
-    }
-}
-
-impl CompressionCodec {
-    /// Get codec from string name
-    pub fn from_name(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "none" => Some(CompressionCodec::None),
-            "gzip" => Some(CompressionCodec::Gzip),
-            "zstd" => Some(CompressionCodec::Zstd),
-            _ => None,
-        }
-    }
-
-    /// Check if compression is enabled
-    pub fn is_enabled(&self) -> bool {
-        !matches!(self, CompressionCodec::None)
-    }
-}
+/// Deprecated -- use [`celers_protocol::compression::CompressionType`] directly.
+///
+/// This type alias maps the legacy `CompressionCodec` name to the
+/// canonical `CompressionType` from `celers-protocol`.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use celers_protocol::compression::CompressionType instead"
+)]
+pub type CompressionCodec = ProtocolCompressionType;
 
 /// Compression error
 #[derive(Debug, thiserror::Error)]
@@ -109,16 +85,21 @@ pub enum CompressionError {
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let data = b"Test message";
+/// #[allow(deprecated)]
 /// let compressed = compress_message(data, CompressionCodec::Gzip)?;
 /// assert!(compressed.len() > 0);
 /// # Ok(())
 /// # }
 /// ```
-pub fn compress_message(data: &[u8], codec: CompressionCodec) -> Result<Vec<u8>, CompressionError> {
+pub fn compress_message(
+    data: &[u8],
+    codec: ProtocolCompressionType,
+) -> Result<Vec<u8>, CompressionError> {
     match codec {
-        CompressionCodec::None => Ok(data.to_vec()),
-        CompressionCodec::Gzip => compress_gzip(data),
-        CompressionCodec::Zstd => compress_zstd(data),
+        ProtocolCompressionType::None => Ok(data.to_vec()),
+        ProtocolCompressionType::Gzip => compress_gzip(data),
+        ProtocolCompressionType::Zlib => compress_zlib(data),
+        ProtocolCompressionType::Zstd => compress_zstd(data),
     }
 }
 
@@ -140,7 +121,9 @@ pub fn compress_message(data: &[u8], codec: CompressionCodec) -> Result<Vec<u8>,
 ///
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let original = b"Test message";
+/// #[allow(deprecated)]
 /// let compressed = compress_message(original, CompressionCodec::Gzip)?;
+/// #[allow(deprecated)]
 /// let decompressed = decompress_message(&compressed, CompressionCodec::Gzip)?;
 /// assert_eq!(original, decompressed.as_slice());
 /// # Ok(())
@@ -148,39 +131,46 @@ pub fn compress_message(data: &[u8], codec: CompressionCodec) -> Result<Vec<u8>,
 /// ```
 pub fn decompress_message(
     data: &[u8],
-    codec: CompressionCodec,
+    codec: ProtocolCompressionType,
 ) -> Result<Vec<u8>, CompressionError> {
     match codec {
-        CompressionCodec::None => Ok(data.to_vec()),
-        CompressionCodec::Gzip => decompress_gzip(data),
-        CompressionCodec::Zstd => decompress_zstd(data),
+        ProtocolCompressionType::None => Ok(data.to_vec()),
+        ProtocolCompressionType::Gzip => decompress_gzip(data),
+        ProtocolCompressionType::Zlib => decompress_zlib(data),
+        ProtocolCompressionType::Zstd => decompress_zstd(data),
     }
 }
 
 /// Compress data using gzip
 fn compress_gzip(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    let mut encoder = GzEncoder::new(data, Compression::default());
-    let mut compressed = Vec::new();
-    encoder.read_to_end(&mut compressed)?;
-    Ok(compressed)
+    gzip_compress(data, 6).map_err(|e| CompressionError::CompressionFailed(e.to_string()))
 }
 
 /// Decompress data using gzip
 fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    let mut decoder = GzDecoder::new(data);
-    let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
-    Ok(decompressed)
+    gzip_decompress(data).map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
+}
+
+/// Compress data using zlib
+fn compress_zlib(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
+    oxiarc_deflate::zlib_compress(data, 6)
+        .map_err(|e| CompressionError::CompressionFailed(e.to_string()))
+}
+
+/// Decompress data using zlib
+fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
+    oxiarc_deflate::zlib_decompress(data)
+        .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
 }
 
 /// Compress data using zstd
 fn compress_zstd(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    zstd::encode_all(data, 3).map_err(|e| CompressionError::CompressionFailed(e.to_string()))
+    oxiarc_zstd::encode_all(data, 3).map_err(|e| CompressionError::CompressionFailed(e.to_string()))
 }
 
 /// Decompress data using zstd
 fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    zstd::decode_all(data).map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
+    oxiarc_zstd::decode_all(data).map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
 }
 
 /// Calculate compression ratio
@@ -315,8 +305,10 @@ mod tests {
     fn test_gzip_compression() {
         // Use larger, repetitive data that compresses well
         let data = b"Hello, World! This is a test message that should compress well. ".repeat(100);
-        let compressed = compress_message(&data, CompressionCodec::Gzip).unwrap();
-        let decompressed = decompress_message(&compressed, CompressionCodec::Gzip).unwrap();
+        let compressed =
+            compress_message(&data, ProtocolCompressionType::Gzip).expect("gzip compress failed");
+        let decompressed = decompress_message(&compressed, ProtocolCompressionType::Gzip)
+            .expect("gzip decompress failed");
 
         assert_eq!(data, decompressed);
         assert!(compressed.len() < data.len());
@@ -326,8 +318,22 @@ mod tests {
     fn test_zstd_compression() {
         // Use larger, repetitive data that compresses well
         let data = b"Hello, World! This is a test message that should compress well. ".repeat(100);
-        let compressed = compress_message(&data, CompressionCodec::Zstd).unwrap();
-        let decompressed = decompress_message(&compressed, CompressionCodec::Zstd).unwrap();
+        let compressed =
+            compress_message(&data, ProtocolCompressionType::Zstd).expect("zstd compress failed");
+        let decompressed = decompress_message(&compressed, ProtocolCompressionType::Zstd)
+            .expect("zstd decompress failed");
+
+        assert_eq!(data, decompressed);
+        assert!(compressed.len() < data.len());
+    }
+
+    #[test]
+    fn test_zlib_compression() {
+        let data = b"Hello, World! This is a test message that should compress well. ".repeat(100);
+        let compressed =
+            compress_message(&data, ProtocolCompressionType::Zlib).expect("zlib compress failed");
+        let decompressed = decompress_message(&compressed, ProtocolCompressionType::Zlib)
+            .expect("zlib decompress failed");
 
         assert_eq!(data, decompressed);
         assert!(compressed.len() < data.len());
@@ -336,8 +342,10 @@ mod tests {
     #[test]
     fn test_no_compression() {
         let data = b"Test data";
-        let compressed = compress_message(data, CompressionCodec::None).unwrap();
-        let decompressed = decompress_message(&compressed, CompressionCodec::None).unwrap();
+        let compressed =
+            compress_message(data, ProtocolCompressionType::None).expect("none compress failed");
+        let decompressed = decompress_message(&compressed, ProtocolCompressionType::None)
+            .expect("none decompress failed");
 
         assert_eq!(data, compressed.as_slice());
         assert_eq!(data, decompressed.as_slice());
@@ -388,33 +396,33 @@ mod tests {
     }
 
     #[test]
-    fn test_codec_from_string() {
+    fn test_codec_from_name() {
         assert_eq!(
-            CompressionCodec::from_name("none"),
-            Some(CompressionCodec::None)
+            ProtocolCompressionType::from_name("none"),
+            Some(ProtocolCompressionType::None)
         );
         assert_eq!(
-            CompressionCodec::from_name("gzip"),
-            Some(CompressionCodec::Gzip)
+            ProtocolCompressionType::from_name("gzip"),
+            Some(ProtocolCompressionType::Gzip)
         );
         assert_eq!(
-            CompressionCodec::from_name("zstd"),
-            Some(CompressionCodec::Zstd)
+            ProtocolCompressionType::from_name("zstd"),
+            Some(ProtocolCompressionType::Zstd)
         );
-        assert_eq!(CompressionCodec::from_name("invalid"), None);
+        assert_eq!(ProtocolCompressionType::from_name("invalid"), None);
     }
 
     #[test]
     fn test_codec_display() {
-        assert_eq!(CompressionCodec::None.to_string(), "none");
-        assert_eq!(CompressionCodec::Gzip.to_string(), "gzip");
-        assert_eq!(CompressionCodec::Zstd.to_string(), "zstd");
+        assert_eq!(ProtocolCompressionType::None.to_string(), "utf-8");
+        assert_eq!(ProtocolCompressionType::Gzip.to_string(), "gzip");
+        assert_eq!(ProtocolCompressionType::Zstd.to_string(), "zstd");
     }
 
     #[test]
     fn test_codec_is_enabled() {
-        assert!(!CompressionCodec::None.is_enabled());
-        assert!(CompressionCodec::Gzip.is_enabled());
-        assert!(CompressionCodec::Zstd.is_enabled());
+        assert!(!ProtocolCompressionType::None.is_enabled());
+        assert!(ProtocolCompressionType::Gzip.is_enabled());
+        assert!(ProtocolCompressionType::Zstd.is_enabled());
     }
 }

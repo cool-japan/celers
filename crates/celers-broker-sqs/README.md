@@ -2,6 +2,8 @@
 
 Production-ready AWS SQS broker implementation for CeleRS with batch operations, FIFO queues, CloudWatch integration, and comprehensive cost optimization.
 
+**Version: 0.2.0 | Status: [Stable] | Tests: 294 | Updated: 2026-03-27**
+
 ## Overview
 
 Cloud-native message broker using AWS SQS with:
@@ -871,7 +873,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
 
 ## Contributing
 

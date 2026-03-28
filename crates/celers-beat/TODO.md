@@ -2,9 +2,11 @@
 
 > Periodic task scheduler (Celery Beat equivalent)
 
-## Status: ✅ FEATURE COMPLETE
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 312**
 
-All schedule types implemented and production-ready.
+## Status: ✅ FEATURE COMPLETE + v0.2.0 ENHANCED
+
+All schedule types implemented and production-ready. v0.2.0 adds distributed locks and modular file structure.
 
 ## Completed Features
 
@@ -38,6 +40,18 @@ All schedule types implemented and production-ready.
 - [x] Task execution loop
 - [x] Due time calculation
 - [x] Basic task management
+- [x] Distributed lock integration (BeatScheduler with DistributedLockBackend)
+
+### v0.2.0: Distributed Locks ✅
+- [x] BeatScheduler integration with DistributedLockBackend trait
+- [x] RedisLockBackend support (SET NX EX + Lua CAS)
+- [x] DbLockBackend support (PostgreSQL table-based locks)
+- [x] InMemoryLockBackend for single-instance/testing
+- [x] Leader election for multi-beat deployments
+
+### v0.2.0: File Structure Refactoring ✅
+- [x] Split 12,515-line lib.rs into 12 focused modules
+- [x] All modules under 2000 lines (refactoring policy compliant)
 
 ### Persistence ✅
 - [x] `with_persistence()` - Create scheduler with state file
@@ -555,8 +569,17 @@ All schedule types implemented and production-ready.
 - [x] Zero warnings in cargo test
 - [x] Zero warnings in cargo build
 - [x] Zero warnings in cargo clippy
-- [x] All tests passing (271 tests + 62 doc tests)
+- [x] All tests passing (312 total: unit + doc tests across 12 focused modules)
 - [x] Comprehensive test coverage
+
+### Phase 9: Heartbeat & Failover ✅ COMPLETE
+- [x] BeatRole enum (Leader, Standby, Unknown)
+- [x] HeartbeatInfo with instance metadata
+- [x] HeartbeatConfig (5s heartbeat, 30s lease, 45s failover)
+- [x] BeatHeartbeat with leader election and lease renewal
+- [x] Automatic failover detection and promotion
+- [x] HeartbeatStats with atomic counters
+- [x] BeatScheduler integration (is_leader check)
 
 ## Future Enhancements
 

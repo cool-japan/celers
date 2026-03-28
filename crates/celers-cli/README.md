@@ -1,5 +1,7 @@
 # celers-cli
 
+**Version: 0.2.0 | Status: [Alpha] | Updated: 2026-03-27**
+
 Command-line interface for managing CeleRS workers, queues, and task execution.
 
 ## Overview
@@ -526,6 +528,10 @@ See the main CeleRS repository for contribution guidelines.
 - `celers-broker-redis`: Redis broker implementation
 - `celers-broker-postgres`: PostgreSQL broker implementation
 - `celers-metrics`: Metrics collection and export
+
+## Testing
+
+**101 tests passing** (unit tests for command parsing, backup operations, and TUI components)
 
 ## License
 

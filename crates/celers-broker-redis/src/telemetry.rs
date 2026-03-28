@@ -334,7 +334,7 @@ pub struct SpanEvent {
 ///
 /// Format: 32 hexadecimal characters
 fn generate_trace_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     use std::time::SystemTime;
 
     let now = SystemTime::now()
@@ -353,7 +353,7 @@ fn generate_trace_id() -> String {
 ///
 /// Format: 16 hexadecimal characters
 fn generate_span_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
 
     // Generate a 64-bit span ID using random values for uniqueness
     let random: u64 = rand::rng().random();

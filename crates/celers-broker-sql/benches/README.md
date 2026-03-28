@@ -267,4 +267,4 @@ fn create_task(id: u64) -> SerializedTask {
 
 ## License
 
-Same as parent project (MIT OR Apache-2.0)
+Same as parent project (Apache-2.0)

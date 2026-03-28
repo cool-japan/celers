@@ -21,10 +21,10 @@ uuid = { workspace = true }
 chrono = { workspace = true, optional = true }
 
 # Core dependencies
-celers-core = { path = "../celers-core", version = "0.1.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
-celers-kombu = { path = "../celers-kombu", version = "0.1.0" }
-celers-backend-redis = { path = "../celers-backend-redis", version = "0.1.0", optional = true }
+celers-core = { path = "../celers-core", version = "0.2.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+celers-kombu = { path = "../celers-kombu", version = "0.2.0" }
+celers-backend-redis = { path = "../celers-backend-redis", version = "0.2.0", optional = true }
 
 [features]
 default = []

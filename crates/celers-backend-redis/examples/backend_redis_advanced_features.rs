@@ -9,7 +9,7 @@
 /// - Result streaming
 use celers_backend_redis::{
     cache::{CacheConfig, ResultCache},
-    compression::CompressionConfig,
+    compression::{CompressionAlgorithm, CompressionConfig},
     encryption::{EncryptionConfig, EncryptionKey},
     metrics::BackendMetrics,
     RedisResultBackend, ResultBackend, TaskMeta, TaskResult,
@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enabled: true,
             threshold: 100, // Compress results larger than 100 bytes
             level: 6,       // Compression level 1-9
+            algorithm: CompressionAlgorithm::Gzip,
         });
 
     let task_id = Uuid::new_v4();
@@ -229,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enabled: true,
             threshold: 100,
             level: 6,
+            algorithm: CompressionAlgorithm::Gzip,
         })
         .with_encryption(EncryptionConfig::new(EncryptionKey::generate()))
         .with_cache(ResultCache::new(CacheConfig {

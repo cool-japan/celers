@@ -2,7 +2,7 @@
 
 > PostgreSQL-based broker implementation for CeleRS
 
-## Status: ✅ FEATURE COMPLETE + PRODUCTION-READY + ADVANCED + ENTERPRISE
+## Status: ✅ STABLE (v0.2.0) — 117 tests passing | Updated: 2026-03-27
 
 ### Latest Enhancements - Round 6 (2026-01-07)
 

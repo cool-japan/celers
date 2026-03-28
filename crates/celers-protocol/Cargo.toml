@@ -23,8 +23,8 @@ oxicode = { workspace = true, optional = true }  # Binary (OxiCode)
 serde_yaml = { workspace = true, optional = true }  # YAML
 
 # Optional compression
-flate2 = { workspace = true, optional = true }  # gzip/deflate
-zstd = { workspace = true, optional = true }  # Zstandard
+oxiarc-deflate = { workspace = true, optional = true }  # gzip/deflate
+oxiarc-zstd = { workspace = true, optional = true }  # Zstandard (Pure Rust)
 
 # Optional security/crypto
 hmac = { workspace = true, optional = true }  # HMAC for message signing
@@ -43,9 +43,10 @@ binary = ["oxicode"]
 yaml = ["serde_yaml"]
 protobuf = ["prost"]
 bson-format = ["bson"]
-gzip = ["flate2"]
-zstd-compression = ["zstd"]
-compression = ["gzip", "zstd-compression"]
+gzip = ["oxiarc-deflate"]
+zlib = ["oxiarc-deflate"]
+zstd-compression = ["oxiarc-zstd"]
+compression = ["gzip", "zlib", "zstd-compression"]
 signing = ["hmac", "sha2", "hex"]
 encryption = ["aes-gcm", "hex"]
 crypto = ["signing", "encryption"]

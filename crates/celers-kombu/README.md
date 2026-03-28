@@ -2,6 +2,8 @@
 
 Broker abstraction layer for CeleRS, inspired by Python's Kombu library. Provides unified traits for message broker implementations.
 
+**Status: [Stable] — v0.2.0 (2026-03-27) — 323 tests**
+
 ## Overview
 
 Production-ready broker abstraction with:
@@ -949,7 +951,7 @@ Compresses message bodies (requires `compression` feature):
 
 ```toml
 [dependencies]
-celers-kombu = { version = "0.1", features = ["compression"] }
+celers-kombu = { version = "0.2", features = ["compression"] }
 ```
 
 ```rust
@@ -975,7 +977,7 @@ Signs messages with HMAC-SHA256 (requires `signing` feature):
 
 ```toml
 [dependencies]
-celers-kombu = { version = "0.1", features = ["signing"] }
+celers-kombu = { version = "0.2", features = ["signing"] }
 ```
 
 ```rust
@@ -998,7 +1000,7 @@ Encrypts messages with AES-256-GCM (requires `encryption` feature):
 
 ```toml
 [dependencies]
-celers-kombu = { version = "0.1", features = ["encryption"] }
+celers-kombu = { version = "0.2", features = ["encryption"] }
 ```
 
 ```rust
@@ -1019,7 +1021,7 @@ use celers_kombu::EncryptionMiddleware;
 
 ```toml
 [dependencies]
-celers-kombu = { version = "0.1", features = ["full"] }
+celers-kombu = { version = "0.2", features = ["full"] }
 ```
 
 ### Combining Middleware
@@ -1632,4 +1634,4 @@ Each example includes detailed comments and demonstrates best practices for prod
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

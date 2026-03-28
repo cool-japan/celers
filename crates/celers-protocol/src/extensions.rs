@@ -94,7 +94,7 @@ pub trait MessageExt {
 
     /// Sign the message body
     #[cfg(feature = "signing")]
-    fn sign_body(&self, signer: &MessageSigner) -> Vec<u8>;
+    fn sign_body(&self, signer: &MessageSigner) -> Result<Vec<u8>, crate::auth::SignatureError>;
 
     /// Verify the message body signature
     #[cfg(feature = "signing")]
@@ -141,7 +141,7 @@ impl MessageExt for Message {
     }
 
     #[cfg(feature = "signing")]
-    fn sign_body(&self, signer: &MessageSigner) -> Vec<u8> {
+    fn sign_body(&self, signer: &MessageSigner) -> Result<Vec<u8>, crate::auth::SignatureError> {
         signer.sign(&self.body)
     }
 
@@ -182,9 +182,12 @@ pub struct SignedMessage {
 #[cfg(feature = "signing")]
 impl SignedMessage {
     /// Create a new signed message
-    pub fn new(message: Message, signer: &MessageSigner) -> Self {
-        let signature = message.sign_body(signer);
-        Self { message, signature }
+    pub fn new(
+        message: Message,
+        signer: &MessageSigner,
+    ) -> Result<Self, crate::auth::SignatureError> {
+        let signature = message.sign_body(signer)?;
+        Ok(Self { message, signature })
     }
 
     /// Verify the signature
@@ -295,7 +298,11 @@ impl SecureMessageBuilder {
     /// Build with both signing and encryption
     #[cfg(all(feature = "signing", feature = "encryption"))]
     pub fn build_secure(mut self) -> SecureBuildResult {
-        let signature = self.signer.as_ref().map(|s| self.message.sign_body(s));
+        let signature = self
+            .signer
+            .as_ref()
+            .map(|s| self.message.sign_body(s))
+            .transpose()?;
         let nonce = if let Some(enc) = self.encryptor.as_ref() {
             Some(self.message.encrypt_body(enc)?)
         } else {
@@ -370,7 +377,7 @@ mod tests {
         let msg = Message::new("tasks.add".to_string(), task_id, body);
 
         let signer = MessageSigner::new(b"secret-key");
-        let signature = msg.sign_body(&signer);
+        let signature = msg.sign_body(&signer).expect("signing failed in test");
 
         assert!(msg.verify_body(&signer, &signature).is_ok());
     }
@@ -383,7 +390,7 @@ mod tests {
         let msg = Message::new("tasks.add".to_string(), task_id, body);
 
         let signer = MessageSigner::new(b"secret-key");
-        let signed = SignedMessage::new(msg, &signer);
+        let signed = SignedMessage::new(msg, &signer).expect("signing should not fail");
 
         assert!(signed.verify(&signer).is_ok());
         assert!(!signed.signature_hex().is_empty());

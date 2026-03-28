@@ -11,7 +11,7 @@
 //! # Example
 //!
 //! ```
-//! use celers_worker::sandbox::{Sandbox, SandboxConfig, ResourceLimits};
+//! use celers_worker::sandbox::{Sandbox, SandboxConfig};
 //!
 //! let config = SandboxConfig::default()
 //!     .with_max_memory_mb(512)

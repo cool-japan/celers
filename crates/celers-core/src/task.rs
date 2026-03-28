@@ -102,7 +102,7 @@ pub mod batch {
     /// assert_eq!(tasks[2].metadata.priority, 1);
     /// ```
     pub fn sort_by_priority(tasks: &mut [SerializedTask]) {
-        tasks.sort_by(|a, b| b.metadata.priority.cmp(&a.metadata.priority));
+        tasks.sort_by_key(|b| std::cmp::Reverse(b.metadata.priority));
     }
 
     /// Count tasks by state

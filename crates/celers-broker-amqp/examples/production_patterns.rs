@@ -17,7 +17,7 @@
 
 use celers_broker_amqp::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
-    compression::{compress_message, decompress_message, CompressionCodec, CompressionStats},
+    compression::{compress_message, decompress_message, CompressionStats},
     consumer_groups::{ConsumerGroup, ConsumerInfo, LoadBalancingStrategy},
     monitoring::{analyze_amqp_consumer_lag, assess_amqp_queue_health},
     retry::{ExponentialBackoff, Jitter, RetryExecutor},
@@ -318,11 +318,15 @@ fn compressed_message_pipeline() -> Result<(), Box<dyn std::error::Error>> {
         let original_size = data.len();
 
         // Use Zstd for better compression
-        let compressed = compress_message(&data, CompressionCodec::Zstd)?;
+        let compressed =
+            compress_message(&data, celers_protocol::compression::CompressionType::Zstd)?;
         stats.record_compression(original_size, compressed.len());
 
         // Verify decompression
-        let decompressed = decompress_message(&compressed, CompressionCodec::Zstd)?;
+        let decompressed = decompress_message(
+            &compressed,
+            celers_protocol::compression::CompressionType::Zstd,
+        )?;
         assert_eq!(data, decompressed);
 
         let ratio = original_size as f64 / compressed.len() as f64;

@@ -2,6 +2,8 @@
 
 RabbitMQ/AMQP broker implementation for CeleRS, providing a full-featured message broker with exchange/queue topology management, publisher confirms, and advanced features like priority queues, dead letter exchanges, and transactions.
 
+**Version: 0.2.0 | Status: [Stable] | Tests: 244 | Updated: 2026-03-27**
+
 ## Features
 
 - **Full AMQP Protocol Support** - Complete implementation via RabbitMQ
@@ -24,11 +26,16 @@ RabbitMQ/AMQP broker implementation for CeleRS, providing a full-featured messag
 - **Message Scheduling** - Delayed message delivery for scheduled tasks and retries
 - **Metrics Export** - Export metrics to Prometheus, StatsD, and JSON formats
 
-### Enterprise Production Features (v9) NEW
+### Enterprise Production Features (v9)
 - **Backpressure Management** - Intelligent flow control to prevent overwhelming the broker or consumers
 - **Poison Message Detection** - Identify and handle messages that repeatedly fail processing
 - **Advanced Routing** - Sophisticated routing strategies beyond basic AMQP exchange types
 - **Performance Optimization** - Advanced optimization strategies for connection tuning and resource management
+
+### v0.2.0 Features
+- **AMQP Event Transport** - AmqpEventEmitter/Receiver for fanout exchange event broadcasting
+- **Topic Routing** - TopicRouter with AmqpRoutingConfig for pattern-based task routing
+- **Unified Compression** - CompressionType aligned across protocol, broker-redis, broker-amqp
 
 ### Advanced Production Features (v8)
 - **Lifecycle Hooks** - Extensible hooks for message interception and validation
@@ -50,9 +57,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-broker-amqp = "0.1"
-celers-protocol = "0.1"
-celers-kombu = "0.1"
+celers-broker-amqp = "0.2"
+celers-protocol = "0.2"
+celers-kombu = "0.2"
 ```
 
 ## Quick Start
@@ -1092,4 +1099,4 @@ This implementation is 100% compatible with Python Celery:
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

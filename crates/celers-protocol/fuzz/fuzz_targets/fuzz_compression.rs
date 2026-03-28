@@ -11,7 +11,7 @@ fuzz_target!(|data: &[u8]| {
         // Test gzip compression
         #[cfg(feature = "gzip")]
         {
-            let compressor = Compressor::new(CompressionType::Gzip, 6);
+            let compressor = Compressor::new(CompressionType::Gzip).with_level(6);
             if let Ok(compressed) = compressor.compress(data) {
                 let _ = compressor.decompress(&compressed);
             }
@@ -20,7 +20,7 @@ fuzz_target!(|data: &[u8]| {
         // Test zstd compression
         #[cfg(feature = "zstd-compression")]
         {
-            let compressor = Compressor::new(CompressionType::Zstd, 3);
+            let compressor = Compressor::new(CompressionType::Zstd).with_level(3);
             if let Ok(compressed) = compressor.compress(data) {
                 let _ = compressor.decompress(&compressed);
             }

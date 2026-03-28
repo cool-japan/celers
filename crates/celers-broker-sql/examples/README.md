@@ -1001,4 +1001,4 @@ cargo run --example production_operations
 
 ## License
 
-Same as parent project (MIT OR Apache-2.0)
+Same as parent project (Apache-2.0)

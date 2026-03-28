@@ -39,6 +39,7 @@
 //! # }
 //! ```
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -373,7 +374,7 @@ impl ErrorAggregator {
             .map(|(error_type, stats)| (error_type.clone(), stats.count))
             .collect();
 
-        error_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        error_counts.sort_by_key(|item| Reverse(item.1));
         error_counts.into_iter().take(n).collect()
     }
 
@@ -385,7 +386,7 @@ impl ErrorAggregator {
             .map(|(task, stats)| (task.clone(), stats.count))
             .collect();
 
-        task_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        task_counts.sort_by_key(|item| Reverse(item.1));
         task_counts.into_iter().take(n).collect()
     }
 

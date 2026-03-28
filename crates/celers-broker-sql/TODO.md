@@ -2,9 +2,9 @@
 
 > MySQL database broker implementation for CeleRS
 
-## Status: FEATURE COMPLETE
+## Status: [Alpha] (v0.2.0) — 68 tests passing | Updated: 2026-03-27
 
-MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-performance batch operations, queue control, task inspection, result storage, worker tracking, and comprehensive maintenance utilities.
+MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-performance batch operations, queue control, task inspection, result storage, worker tracking, comprehensive maintenance utilities, TraceContext (W3C), circuit breaker, resilience patterns, and advanced hooks/diagnostics.
 
 ## Completed Features
 
@@ -314,6 +314,13 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 - [x] Queue pause/resume functionality (COMPLETED)
 - [x] Worker tracking (COMPLETED)
 - [x] Batch operations (COMPLETED - enqueue, dequeue, ack, reject)
+- [x] TraceContext (W3C) distributed tracing (COMPLETED - tracing module)
+- [x] Enhanced broker features (COMPLETED - broker_enhanced module)
+- [x] Lifecycle hooks (COMPLETED - broker_hooks module)
+- [x] Resilience patterns (COMPLETED - broker_resilience module)
+- [x] Diagnostics and observability (COMPLETED - broker_diagnostics module)
+- [x] Advanced analytics (COMPLETED - broker_advanced module)
+- [x] Workflow support (COMPLETED - workflow module)
 
 ### Monitoring
 - [x] Prometheus metrics integration (COMPLETED)
@@ -333,13 +340,19 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 
 ## Testing Status
 
-- [x] Compilation tests
+- [x] Compilation tests (68 unit tests passing — v0.2.0)
 - [x] Unit test structure
 - [x] DbTaskState tests (display, from_str, serialization)
 - [x] TaskResultStatus tests (display, from_str, serialization)
 - [x] QueueStatistics tests
 - [x] PoolConfig tests (COMPLETED)
 - [x] TaskChain builder tests (COMPLETED)
+- [x] TraceContext W3C tests (COMPLETED)
+- [x] Enhanced broker tests (COMPLETED)
+- [x] Hooks tests (COMPLETED)
+- [x] Resilience tests (COMPLETED)
+- [x] Diagnostics tests (COMPLETED)
+- [x] Workflow tests (COMPLETED)
 - [x] Integration tests with real MySQL (COMPLETED - 13 tests)
   - [x] Batch operations test
   - [x] Task chain test

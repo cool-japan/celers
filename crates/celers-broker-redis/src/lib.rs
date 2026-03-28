@@ -83,6 +83,7 @@ pub use cluster::{
     ClusterConfig, ClusterConfigBuilder, ClusterNode, ClusterNodeRole, ClusterTopology, HashSlot,
     RedisMode,
 };
+#[allow(deprecated)]
 pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionStats, Compressor};
 pub use connection::{ConnectionStats, RedisConfig, TlsConfig};
 pub use cron_scheduler::{CronExpression, CronScheduler, ScheduledTask};

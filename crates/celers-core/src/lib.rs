@@ -114,8 +114,11 @@ pub mod control;
 pub mod dag;
 pub mod error;
 pub mod event;
+pub mod event_filter;
+pub mod event_persistence;
 pub mod exception;
 pub mod executor;
+pub mod lock;
 pub mod rate_limit;
 pub mod result;
 pub mod retry;
@@ -127,8 +130,8 @@ pub mod time_limit;
 
 pub use broker::{Broker, BrokerMessage};
 pub use config::{
-    BackendTransport, BeatSchedule, BrokerTransport, CeleryConfig, ScheduleDefinition, TaskConfig,
-    TaskRoute,
+    BackendTransport, BeatSchedule, BrokerTransport, CeleryConfig, ConfigError, ConfigValidation,
+    ConfigWarning, ScheduleDefinition, TaskConfig, TaskRoute,
 };
 pub use control::{
     ActiveTaskInfo, BrokerStats, ControlCommand, ControlResponse, DeliveryInfo, InspectCommand,
@@ -144,11 +147,19 @@ pub use event::{
     InMemoryEventStorage, LogLevel, LoggingAlertHandler, LoggingEventEmitter, NoOpEventEmitter,
     TaskEvent, TaskEventBuilder, WorkerEvent, WorkerEventBuilder,
 };
+pub use event_filter::{
+    CollectingEventHandler, CompositeEventFilter, EventFilterTrait, EventHandlerTrait, EventRouter,
+    ExactEventFilter, FilterMode, GlobEventFilter, LoggingEventHandler, PrefixEventFilter,
+};
+pub use event_persistence::{
+    EventPersister, FileEventPersister, FileEventPersisterConfig, RotationPolicy,
+};
 pub use exception::{
     ExceptionAction, ExceptionCategory, ExceptionHandler, ExceptionHandlerChain, ExceptionPolicy,
     LoggingExceptionHandler, PolicyExceptionHandler, TaskException, TracebackFrame,
 };
 pub use executor::TaskRegistry;
+pub use lock::DistributedLockBackend;
 pub use rate_limit::{
     create_rate_limiter, DistributedRateLimiter, DistributedRateLimiterCoordinator,
     DistributedRateLimiterState, DistributedSlidingWindowSpec, DistributedTokenBucketSpec,

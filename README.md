@@ -115,6 +115,30 @@ CeleRS follows a **layered architecture** inspired by Python Celery's design:
 - **celers-cli**: Command-line worker and queue management
 - **celers-metrics**: Prometheus metrics and observability
 
+### Crate Status (v0.2.0)
+
+| Crate | Status | Tests |
+|-------|--------|-------|
+| celers-worker | [Stable] | 486 |
+| celers-protocol | [Stable] | 461 |
+| celers-broker-redis | [Stable] | 454 |
+| celers-kombu | [Stable] | 323 |
+| celers-beat | [Stable] | 312 |
+| celers-broker-sqs | [Stable] | 294 |
+| celers-core | [Stable] | 247 |
+| celers-broker-amqp | [Stable] | 244 |
+| celers-macros | [Stable] | 221 |
+| celers-backend-redis | [Stable] | 208 |
+| celers-canvas | [Stable] | 196 |
+| celers-metrics | [Stable] | 183 |
+| celers (facade) | [Stable] | 145 |
+| celers-broker-postgres | [Stable] | 117 |
+| celers-cli | [Stable] | 101 |
+| celers-broker-sql | [Stable] | 68 |
+| celers-backend-rpc | [Stable] | 8 |
+| celers-backend-db | [Stable] | 7 |
+| **Total** | **18/18** | **4075** |
+
 ## 🚀 Quick Start
 
 ### Installation
@@ -123,11 +147,11 @@ Add CeleRS to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-core = "0.1"
-celers-protocol = "0.1"
-celers-broker-redis = "0.1"
-celers-worker = "0.1"
-celers-macros = "0.1"
+celers-core = "0.2"
+celers-protocol = "0.2"
+celers-broker-redis = "0.2"
+celers-worker = "0.2"
+celers-macros = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -267,20 +291,22 @@ let info = checker.get_health();
 
 ## 🗺️ Roadmap
 
-### Current Status (v0.1.0)
+### Current Status (v0.2.0) — Released 2026-03-28
 
 - ✅ **Phase 1**: The Backbone (Core runtime)
 - ✅ **Phase 2**: Advanced Features (Priorities, DLQ, Cancellation)
 - ✅ **Phase 3**: Developer Experience (Macros, CLI, Metrics)
-- ✅ **Phase 4**: Enterprise Architecture (Protocol layer, ADRs)
-- 🚧 **Phase 5**: Celery Protocol Compatibility (Next)
+- ✅ **Phase 4**: Performance & Scalability
+- ✅ **Phase 5**: Beat Scheduler (Cron, Interval, Solar)
+- ✅ **Phase 6**: Extended Brokers & Backends (AMQP, SQS, DB, gRPC)
+- ✅ **Phase 7**: Full Celery Protocol Compatibility (v2 wire format)
+- ✅ **Phase 8**: v0.2.0 Enhancements (Compression, Distributed Locks, Events)
+- ✅ **Phase 9**: v0.2.0 Production Features (Event Persistence, Chunking, Heartbeat)
 
 ### Upcoming Milestones
 
-- **Q1 2026**: Celery Protocol v2 compatibility
-- **Q2 2026**: Advanced broker support (RabbitMQ, SQS)
-- **Q3 2026**: Production-grade Canvas workflows
-- **Q4 2026**: v1.0.0 release
+- **v0.3.0**: Full Python Celery interoperability (bidirectional task exchange, Protocol v5)
+- **v1.0.0**: Stable API, Kafka/NATS brokers, web admin dashboard, security hardening
 
 ## 📖 Documentation
 
@@ -345,7 +371,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 ### Development Setup
 
 ```bash
-git clone https://github.com/yourusername/celers.git
+git clone https://github.com/cool-japan/celers.git
 cd celers
 cargo build --all-features
 cargo test --all-features
@@ -358,9 +384,24 @@ cargo test --all-features
 - **Documentation**: Public APIs must have rustdoc comments
 - **Formatting**: Use `cargo fmt` before committing
 
+## Sponsorship
+
+CeleRS is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+
+If you find CeleRS useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red?logo=github)](https://github.com/sponsors/cool-japan)
+
+**[https://github.com/sponsors/cool-japan](https://github.com/sponsors/cool-japan)**
+
+Your sponsorship helps us:
+- Maintain and improve the COOLJAPAN ecosystem
+- Keep the entire ecosystem (OxiBLAS, OxiFFT, SciRS2, etc.) 100% Pure Rust
+- Provide long-term support and security updates
+
 ## 📜 License
 
-Dual-licensed under MIT OR Apache-2.0
+Licensed under Apache-2.0
 
 ## 🙏 Acknowledgments
 
@@ -376,6 +417,6 @@ Dual-licensed under MIT OR Apache-2.0
 
 ---
 
-**Status**: Active Development | **Version**: 0.1.0 | **Rust**: 1.70+ (MSRV)
+**Status**: Active Development | **Version**: 0.2.0 | **Rust**: 1.70+ (MSRV)
 
 Built with ❤️ for the Rust community

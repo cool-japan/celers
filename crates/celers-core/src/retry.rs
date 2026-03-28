@@ -9,7 +9,7 @@
 //! This module provides various retry strategies that determine how long to wait
 //! between task retry attempts.
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 /// Retry strategy configuration

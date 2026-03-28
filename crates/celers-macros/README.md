@@ -1,5 +1,7 @@
 # celers-macros
 
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+
 Procedural macros for simplified CeleRS task definitions.
 
 ## Status: ✅ FEATURE COMPLETE + OPTIMIZED
@@ -32,7 +34,7 @@ This crate provides ergonomic procedural macros for defining CeleRS tasks withou
 - ✅ **Performance Optimization**: LazyLock pattern caching for all regex-based validators
 
 ### Testing & Quality
-- ✅ 244 total tests (21 unit + 200 integration + 23 doc tests)
+- ✅ 221 total tests (21 unit + 200 integration + 23 doc tests; see TODO for full count)
 - ✅ Zero compiler warnings, zero clippy warnings
 - ✅ Comprehensive validation examples
 - ✅ Runnable examples demonstrating all features

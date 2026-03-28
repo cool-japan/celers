@@ -14,11 +14,11 @@ name = "celers"
 path = "src/main.rs"
 
 [dependencies]
-celers-core = { path = "../celers-core", version = "0.1.0" }
-celers-worker = { path = "../celers-worker", version = "0.1.0" }
-celers-broker-redis = { path = "../celers-broker-redis", version = "0.1.0" }
-celers-broker-postgres = { path = "../celers-broker-postgres", version = "0.1.0" }
-celers-metrics = { path = "../celers-metrics", version = "0.1.0" }
+celers-core = { path = "../celers-core", version = "0.2.0" }
+celers-worker = { path = "../celers-worker", version = "0.2.0" }
+celers-broker-redis = { path = "../celers-broker-redis", version = "0.2.0" }
+celers-broker-postgres = { path = "../celers-broker-postgres", version = "0.2.0" }
+celers-metrics = { path = "../celers-metrics", version = "0.2.0" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 clap_mangen = { workspace = true }
@@ -40,8 +40,8 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 rustyline = { workspace = true }
 csv = { workspace = true }
-flate2 = { workspace = true }
-tar = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxiarc-archive = { workspace = true }
 dirs = { workspace = true }
 
 [dev-dependencies]

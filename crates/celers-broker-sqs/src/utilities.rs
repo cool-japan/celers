@@ -37,11 +37,10 @@ pub fn calculate_optimal_sqs_batch_size(
     // - Smaller batches for large messages
     // - Larger batches for small messages
 
-    let max_batch_from_size = if avg_message_size > 0 {
-        (256_000 / avg_message_size).min(10)
-    } else {
-        10
-    };
+    let max_batch_from_size = 256_000usize
+        .checked_div(avg_message_size)
+        .map(|v| v.min(10))
+        .unwrap_or(10);
 
     let base_batch_size = if avg_message_size > 100_000 {
         // Large messages (> 100KB): very small batches

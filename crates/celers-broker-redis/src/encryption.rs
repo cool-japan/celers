@@ -343,7 +343,7 @@ impl EncryptionManager {
 
     /// Generate initialization vector (mock implementation)
     fn generate_iv(&self) -> Vec<u8> {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rng();
         let mut iv = vec![0u8; 12]; // 12 bytes for GCM
         rng.fill(&mut iv[..]);

@@ -343,7 +343,7 @@ impl RetryConfig {
 
     /// Apply jitter to a delay
     fn apply_jitter(&self, delay: Duration) -> Duration {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rng();
 
         // Calculate jitter range

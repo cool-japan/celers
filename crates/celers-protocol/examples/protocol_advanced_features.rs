@@ -144,7 +144,7 @@ fn main() {
         let signer = MessageSigner::new(b"secret-key");
         let message = b"important message";
 
-        let signature = signer.sign_hex(message);
+        let signature = signer.sign_hex(message).expect("signing should not fail");
         println!("   Message: {:?}", String::from_utf8_lossy(message));
         println!("   Signature: {}", signature);
 

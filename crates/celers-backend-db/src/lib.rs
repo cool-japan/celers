@@ -27,11 +27,16 @@
 //! # }
 //! ```
 
+pub mod event_persistence;
+#[cfg(feature = "distributed-locks")]
+pub mod lock;
 pub mod result_store;
+
+pub use event_persistence::{DbEventPersister, DbEventPersisterConfig};
 
 use async_trait::async_trait;
 pub use celers_backend_redis::{
-    BackendError, ChordState, Result, ResultBackend, TaskMeta, TaskResult,
+    BackendError, ChordState, Result, ResultBackend, TaskMeta, TaskResult, TaskTtlConfig,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -43,6 +48,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct PostgresResultBackend {
     pool: PgPool,
+    ttl_config: TaskTtlConfig,
 }
 
 impl PostgresResultBackend {
@@ -60,7 +66,26 @@ impl PostgresResultBackend {
                 BackendError::Connection(format!("Failed to connect to database: {}", e))
             })?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            ttl_config: TaskTtlConfig::new(),
+        })
+    }
+
+    /// Configure per-task-type TTL
+    pub fn with_ttl_config(mut self, config: TaskTtlConfig) -> Self {
+        self.ttl_config = config;
+        self
+    }
+
+    /// Get the TTL configuration
+    pub fn ttl_config(&self) -> &TaskTtlConfig {
+        &self.ttl_config
+    }
+
+    /// Get a mutable reference to the TTL configuration
+    pub fn ttl_config_mut(&mut self) -> &mut TaskTtlConfig {
+        &mut self.ttl_config
     }
 
     /// Run database migrations
@@ -136,6 +161,11 @@ impl ResultBackend for PostgresResultBackend {
         .await
         .map_err(|e| BackendError::Connection(format!("Failed to store result: {}", e)))?;
 
+        // Apply per-task TTL if configured
+        if let Some(ttl) = self.ttl_config.get_ttl(&meta.task_name) {
+            self.set_expiration(task_id, ttl).await?;
+        }
+
         Ok(())
     }
 
@@ -182,6 +212,11 @@ impl ResultBackend for PostgresResultBackend {
                     version: 0,
                     tags: Vec::new(),
                     metadata: std::collections::HashMap::new(),
+                    worker_hostname: None,
+                    runtime_ms: None,
+                    memory_bytes: None,
+                    retries: None,
+                    queue: None,
                 };
 
                 Ok(Some(meta))
@@ -201,7 +236,9 @@ impl ResultBackend for PostgresResultBackend {
     }
 
     async fn set_expiration(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
-        let expires_at = Utc::now() + chrono::Duration::from_std(ttl).unwrap();
+        let expires_at = Utc::now()
+            + chrono::Duration::from_std(ttl)
+                .map_err(|e| BackendError::Serialization(format!("Invalid TTL duration: {}", e)))?;
 
         sqlx::query("UPDATE celers_task_results SET expires_at = $1 WHERE task_id = $2")
             .bind(expires_at)
@@ -409,6 +446,11 @@ impl ResultBackend for PostgresResultBackend {
                 version: 0,
                 tags: Vec::new(),
                 metadata: std::collections::HashMap::new(),
+                worker_hostname: None,
+                runtime_ms: None,
+                memory_bytes: None,
+                retries: None,
+                queue: None,
             };
 
             results_map.insert(task_id, meta);
@@ -440,6 +482,7 @@ impl ResultBackend for PostgresResultBackend {
 #[derive(Clone)]
 pub struct MysqlResultBackend {
     pool: MySqlPool,
+    ttl_config: TaskTtlConfig,
 }
 
 impl MysqlResultBackend {
@@ -457,7 +500,26 @@ impl MysqlResultBackend {
                 BackendError::Connection(format!("Failed to connect to database: {}", e))
             })?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            ttl_config: TaskTtlConfig::new(),
+        })
+    }
+
+    /// Configure per-task-type TTL
+    pub fn with_ttl_config(mut self, config: TaskTtlConfig) -> Self {
+        self.ttl_config = config;
+        self
+    }
+
+    /// Get the TTL configuration
+    pub fn ttl_config(&self) -> &TaskTtlConfig {
+        &self.ttl_config
+    }
+
+    /// Get a mutable reference to the TTL configuration
+    pub fn ttl_config_mut(&mut self) -> &mut TaskTtlConfig {
+        &mut self.ttl_config
     }
 
     /// Run database migrations
@@ -554,6 +616,11 @@ impl ResultBackend for MysqlResultBackend {
         .await
         .map_err(|e| BackendError::Connection(format!("Failed to store result: {}", e)))?;
 
+        // Apply per-task TTL if configured
+        if let Some(ttl) = self.ttl_config.get_ttl(&meta.task_name) {
+            self.set_expiration(task_id, ttl).await?;
+        }
+
         Ok(())
     }
 
@@ -604,6 +671,11 @@ impl ResultBackend for MysqlResultBackend {
                     version: 0,
                     tags: Vec::new(),
                     metadata: std::collections::HashMap::new(),
+                    worker_hostname: None,
+                    runtime_ms: None,
+                    memory_bytes: None,
+                    retries: None,
+                    queue: None,
                 };
 
                 Ok(Some(meta))
@@ -623,7 +695,9 @@ impl ResultBackend for MysqlResultBackend {
     }
 
     async fn set_expiration(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
-        let expires_at = Utc::now() + chrono::Duration::from_std(ttl).unwrap();
+        let expires_at = Utc::now()
+            + chrono::Duration::from_std(ttl)
+                .map_err(|e| BackendError::Serialization(format!("Invalid TTL duration: {}", e)))?;
 
         sqlx::query("UPDATE celers_task_results SET expires_at = ? WHERE task_id = ?")
             .bind(expires_at)
@@ -849,6 +923,11 @@ impl ResultBackend for MysqlResultBackend {
                 version: 0,
                 tags: Vec::new(),
                 metadata: std::collections::HashMap::new(),
+                worker_hostname: None,
+                runtime_ms: None,
+                memory_bytes: None,
+                retries: None,
+                queue: None,
             };
 
             results_map.insert(task_id, meta);

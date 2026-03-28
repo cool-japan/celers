@@ -807,7 +807,7 @@ impl DLQArchivalManager {
 
     /// Generate a unique archive ID
     fn generate_archive_id(&self) -> String {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rng();
         let random_suffix: String = (0..8)
             .map(|_| format!("{:02x}", rng.random::<u8>()))

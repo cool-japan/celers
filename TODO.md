@@ -10,6 +10,8 @@
 - **Phase 4**: Performance & Scalability ✅ **COMPLETE**
 - **Phase 5**: Beat Scheduler ✅ **COMPLETE**
 - **Phase 6**: Extended Brokers & Backends ✅ **COMPLETE**
+- **Phase 8**: v0.2.0 Enhancements ✅ **COMPLETE**
+- **Phase 9**: v0.2.0 Production Features ✅ **COMPLETE**
 
 **🎉 100% PROJECT COMPLETION - ALL 18/18 CRATES IMPLEMENTED! 🎉**
 
@@ -20,7 +22,7 @@
 - **Backends**: Redis, PostgreSQL/MySQL (Database), gRPC - ALL with ResultStore adapters
 - **Examples**: 15 working examples (including Canvas workflows, web scraper, image processing, AsyncResult API)
 - **Benchmarks**: 3 comprehensive benchmark suites
-- **Unit Tests**: 220+ tests passing (20 test suites, 7 ignored integration tests)
+- **Unit Tests**: 4075 tests passing across all crates (Phase 9 features included)
 - **Build Status**: ✅ 0 errors, 0 warnings, 0 clippy warnings, 0 doc warnings
 - **Documentation**: 1500+ lines of guides + 18 TODO.md files
 - **Monitoring**: Full Prometheus + Grafana + OpenTelemetry support
@@ -268,7 +270,7 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [x] Task routing by name patterns (glob, regex)
   - [x] Task routing by arguments/kwargs (ArgumentCondition)
   - [x] Queue routing based on task type
-  - [ ] Topic-based routing (AMQP exchanges)
+  - [x] Topic-based routing (AMQP exchanges)
   - [x] Priority-based routing
   - [x] Custom routing strategies (RouterBuilder, RoutingConfig)
 
@@ -336,12 +338,12 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [x] Event emitting from worker (received, started, succeeded, failed, retried, rejected)
   - [x] Worker lifecycle events (online, offline)
   - [x] Redis event transport (pub/sub) - RedisEventEmitter, RedisEventReceiver
-  - [ ] AMQP event transport (fanout)
+  - [x] AMQP event transport (fanout)
 
-- [ ] **Event Consumers**
-  - [ ] Event receiver/dispatcher
-  - [ ] Event filtering and routing
-  - [ ] Event persistence (database, file)
+- [x] **Event Consumers**
+  - [x] Event receiver/dispatcher
+  - [x] Event filtering and routing
+  - [x] Event persistence (database, file)
   - [ ] Event streaming (WebSocket, SSE)
   - [ ] Snapshot events for monitoring
   - [ ] Event-based alerting
@@ -393,10 +395,10 @@ Each crate has its own detailed TODO.md with implementation status and future en
 
 ### Result Backend Enhancements
 - [ ] **Advanced Result Features**
-  - [ ] Result metadata (task_id, name, args, kwargs, worker, etc.)
+  - [x] Result metadata (task_id, name, args, kwargs, worker, etc.)
   - [ ] Result TTL per task type
-  - [ ] Result compression (gzip, lz4, zstd)
-  - [ ] Result chunking for large payloads
+  - [x] Result compression (gzip, lz4, zstd)
+  - [x] Result chunking for large payloads
   - [ ] Result streaming for long-running tasks
   - [ ] Result tombstones (mark deleted results)
   - [ ] Result groups (grouped results for Chord)
@@ -422,17 +424,17 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [ ] YAML serializer
   - [ ] Pickle serializer (Python compat - security warning)
   - [ ] Custom serializers
-  - [ ] Compression support (gzip, brotli, zstd)
-  - [ ] Serializer auto-detection
+  - [x] Compression support (gzip, brotli, zstd)
+  - [x] Serializer auto-detection
 
 ### Configuration & Settings
 - [ ] **Celery-Compatible Configuration**
   - [ ] Support celeryconfig.py-style configuration
-  - [ ] Environment variable configuration (CELERY_*)
+  - [x] Environment variable configuration (CELERY_*)
   - [ ] Configuration via CLI arguments
   - [ ] Configuration via YAML/TOML files ✅ (partial)
   - [ ] Dynamic configuration updates
-  - [ ] Configuration validation and defaults
+  - [x] Configuration validation and defaults
 
 ### Beat Scheduler Enhancements
 - [ ] **Advanced Scheduling**
@@ -445,10 +447,10 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [ ] Holiday calendar support
   - [ ] Business day calculations
 
-- [ ] **Beat Synchronization**
-  - [ ] Leader election for multi-beat deployments
-  - [ ] Heartbeat mechanism
-  - [ ] Failover support
+- [x] **Beat Synchronization**
+  - [x] Leader election for multi-beat deployments
+  - [x] Heartbeat mechanism
+  - [x] Failover support
   - [ ] Schedule replication
 
 ### Error Handling & Retry Policies
@@ -509,6 +511,79 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [ ] Interoperability examples
   - [ ] Best practices for mixed deployments
 
+## Phase 8: v0.2.0 Enhancements ✅ COMPLETE
+
+### Compression Unification ✅ COMPLETE
+- [x] Unified CompressionType across protocol, broker-redis, broker-amqp
+- [x] CompressionRegistry for managing available algorithms
+- [x] CompressionStats for tracking compression effectiveness
+- [x] Zlib compression support added
+
+### Distributed Beat Locks ✅ COMPLETE
+- [x] DistributedLockBackend trait in celers-core
+- [x] InMemoryLockBackend for single-instance/testing
+- [x] RedisLockBackend (SET NX EX + Lua CAS)
+- [x] DbLockBackend (PostgreSQL table-based locks)
+- [x] BeatScheduler integration with distributed locks
+
+### AMQP Event Transport ✅ COMPLETE
+- [x] AmqpEventEmitter (fanout exchange, JSON serialization)
+- [x] AmqpEventReceiver (exclusive auto-delete queue)
+- [x] Publisher confirms for reliability
+- [x] Event transport statistics tracking
+
+### Event Filtering & Routing ✅ COMPLETE
+- [x] EventFilter trait with GlobEventFilter
+- [x] ExactEventFilter and PrefixEventFilter
+- [x] CompositeEventFilter (AND/OR/NOT modes)
+- [x] EventRouter with priority-based dispatch
+- [x] EventHandler async trait
+
+### Result Backend Enhancements ✅ COMPLETE
+- [x] Per-task-type result TTL configuration
+- [x] Result metadata enrichment (worker_hostname, runtime_ms, memory_bytes)
+- [x] Zstd compression support in Redis backend
+- [x] Compression statistics tracking
+
+### Serialization Auto-Detection ✅ COMPLETE
+- [x] Magic number detection for JSON, MessagePack, BSON, YAML, Protobuf
+- [x] Format negotiation between endpoints
+- [x] Available types enumeration based on features
+
+### Beat Crate Refactoring ✅ COMPLETE
+- [x] Split 12,515-line lib.rs into 12 focused modules
+- [x] All modules under 2000 lines
+
+## Phase 9: v0.2.0 Production Features ✅ COMPLETE
+
+### Event Persistence ✅ COMPLETE
+- [x] EventPersister trait (query, count, cleanup, flush)
+- [x] FileEventPersister (JSONL with daily/size rotation, retention cleanup)
+- [x] DbEventPersister (PostgreSQL batch insert, SQL queries)
+
+### Result Chunking ✅ COMPLETE
+- [x] ChunkingConfig (threshold, chunk size, CRC32 checksum)
+- [x] ResultChunker (split, reassemble, sentinel markers)
+- [x] Wire into RedisResultBackend (chunking_config, chunker fields)
+
+### Beat Heartbeat & Failover ✅ COMPLETE
+- [x] BeatRole enum (Leader, Standby, Unknown)
+- [x] HeartbeatConfig with configurable intervals
+- [x] BeatHeartbeat (leader election, lease renewal, failover detection)
+- [x] BeatScheduler integration (is_leader check)
+
+### AMQP Topic Routing ✅ COMPLETE
+- [x] TopicRoutingRule (glob patterns, priority)
+- [x] TopicRouter (resolve_routing_key, dynamic add/remove)
+- [x] AmqpRoutingConfig (exchange, rules, default key)
+
+### Enhanced Celery Config ✅ COMPLETE
+- [x] Expanded from_env() with 23+ CELERY_* environment variables
+- [x] ConfigValidation (errors, warnings, suggestions)
+- [x] validate_detailed() for comprehensive config checking
+- [x] to_env_vars() for config export
+- [x] dump() for debug output
+
 ## Future Enhancements (Post v1.0)
 
 ### Infrastructure & Brokers
@@ -547,7 +622,7 @@ Each crate has its own detailed TODO.md with implementation status and future en
 
 ### Scheduling & Beat
 - [x] Add persistent state for beat scheduler ✅ (JSON file-based persistence)
-- [ ] Add leader election for beat scheduler (distributed coordination)
+- [x] Add leader election for beat scheduler ✅ (implemented in celers-beat/src/heartbeat.rs — BeatHeartbeat with BeatRole enum, Phase 9)
 - [ ] Timezone-aware cron schedules
 - [ ] Dynamic schedule updates via API
 - [ ] Schedule conflict detection

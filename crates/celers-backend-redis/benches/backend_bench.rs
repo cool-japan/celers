@@ -4,7 +4,7 @@
 /// Run with: cargo bench --bench backend_bench
 use celers_backend_redis::{
     cache::{CacheConfig, ResultCache},
-    compression::CompressionConfig,
+    compression::{CompressionAlgorithm, CompressionConfig},
     encryption::{EncryptionConfig, EncryptionKey},
     metrics::BackendMetrics,
     ProgressInfo, RedisResultBackend, ResultBackend, TaskMeta, TaskResult,
@@ -141,6 +141,7 @@ fn bench_compression(c: &mut Criterion) {
         enabled: true,
         threshold: 100,
         level: 6,
+        algorithm: CompressionAlgorithm::default(),
     });
 
     group.bench_function("with_compression", |b| {

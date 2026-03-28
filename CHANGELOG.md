@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-28
+
+### Added
+
+#### Event Persistence
+- File-based event storage with JSONL format and automatic log rotation for audit trails
+- Database-backed event persistence for durable, queryable event history
+- Event filtering and routing system with topic-based subscription and pattern matching
+- AMQP event transport using fanout exchange for real-time event broadcasting
+
+#### Result Chunking
+- Auto-split large task results across multiple Redis keys to bypass size limits
+- CRC32 checksum verification for chunked result integrity
+- Transparent reassembly on result retrieval with configurable chunk size thresholds
+
+#### Beat Heartbeat and Failover
+- Leader election for beat scheduler instances using distributed locks
+- Lease renewal with configurable heartbeat intervals
+- Automatic standby failover when the active leader becomes unresponsive
+- Distributed beat locks with Redis and database backends for single-leader scheduling
+
+#### AMQP Topic Routing
+- Glob pattern matching for task name to routing key mapping
+- Wildcard-based topic exchange routing for flexible task distribution
+- Configurable routing rules per task type with fallback defaults
+
+#### Enhanced Configuration
+- Support for 23+ `CELERY_*` environment variables for runtime configuration
+- `validate_detailed()` method for comprehensive configuration validation with diagnostics
+- Configuration export to TOML/JSON for reproducible deployments
+- Centralized `celers-core::config` module for unified configuration management
+
+#### Protocol and Serialization
+- Serialization auto-detection for incoming messages (JSON, MessagePack, YAML, BSON)
+- Dedicated `celers-protocol::serializer` module extracted for cleaner separation
+- Compression type unification across crates (unified `CompressionType` enum shared by all broker and backend crates)
+
+#### Other Additions
+- Per-task TTL configuration and metadata storage in result backends
+- Zstd compression support across all broker and backend crates via OxiARC
+
+### Changed
+
+- Massive codebase refactoring: split all source files to under 2000 lines each (552 Rust files, 198K SLoC total)
+- Extracted large modules into focused sub-modules across all 18 workspace crates (net reduction of ~115K lines through deduplication and reorganization)
+- Replaced compression backends with OxiARC (oxiarc-*) for Pure Rust compliance across celers-protocol, celers-broker-amqp, celers-broker-redis, and celers-backend-redis
+- Upgraded dependencies: lapin 4.3, rand 0.10, sha2/hmac version alignment, OxiARC integration
+- Moved CLI commands module out of monolithic file into dedicated sub-modules in celers-cli
+- Reorganized celers-kombu, celers-canvas, celers-metrics, and celers-macros internals for maintainability
+- Test suite expanded to 4075 tests (up from 3979 in 0.1.0)
+
+### Fixed
+
+- Compression round-trip correctness across all broker and backend crates after OxiARC migration
+- Result backend key handling for large payloads that previously exceeded single-key Redis limits
+- Beat scheduler stability under concurrent leader election scenarios
+- Configuration validation edge cases for environment variable overrides
+
 ## [0.1.0] - 2026-01-18
 
 ### Added
@@ -105,7 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Edition: 2021
 
 ### License
-- MIT OR Apache-2.0
+- Apache-2.0
 
 ### Authors
 - COOLJAPAN OU (Team Kitasan)
@@ -113,5 +171,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Repository
 - https://github.com/cool-japan/celers
 
-[unreleased]: https://github.com/cool-japan/celers/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/cool-japan/celers/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/cool-japan/celers/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cool-japan/celers/releases/tag/v0.1.0

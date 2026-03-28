@@ -2,9 +2,11 @@
 
 > Database (PostgreSQL/MySQL) result backend for CeleRS
 
-## Status: ✅ FEATURE COMPLETE
+**Version: 0.2.0 | Status: [Alpha] | Updated: 2026-03-27 | Tests: 7**
 
-Full database result backend implementation with PostgreSQL and MySQL support for durable task result storage and chord synchronization.
+## Status: ✅ FEATURE COMPLETE + v0.2.0 ENHANCED
+
+Full database result backend implementation with PostgreSQL and MySQL support for durable task result storage and chord synchronization. v0.2.0 adds distributed lock support.
 
 ## Completed Features
 
@@ -200,6 +202,16 @@ if completed == 10 {
 let state = backend.chord_get_state(chord_id).await?;
 ```
 
+### v0.2.0: Distributed Locks ✅
+- [x] DbLockBackend for PostgreSQL table-based distributed locks
+- [x] Lock acquire/release/renew operations
+- [x] Integration with BeatScheduler for leader election
+
+### Phase 9: Event Persistence ✅ COMPLETE
+- [x] DbEventPersister with batch insert buffer
+- [x] SQL migration for celers_events table with indexes
+- [x] EventPersister trait implementation (query, count, cleanup)
+
 ## Future Enhancements
 
 ### Performance
@@ -230,7 +242,7 @@ let state = backend.chord_get_state(chord_id).await?;
 ## Testing Status
 
 - [x] Compilation tests
-- [x] Unit tests (backend creation)
+- [x] Unit tests (7 passing: backend creation, ResultStore conversions, event persister)
 - [ ] Integration tests with PostgreSQL
 - [ ] Integration tests with MySQL
 - [ ] Chord synchronization tests

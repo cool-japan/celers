@@ -348,7 +348,8 @@ fn bench_retry_strategies(c: &mut Criterion) {
 
 /// Benchmark v6 compression operations
 fn bench_compression(c: &mut Criterion) {
-    use celers_broker_amqp::compression::{compress_message, decompress_message, CompressionCodec};
+    use celers_broker_amqp::compression::{compress_message, decompress_message};
+    use celers_protocol::compression::CompressionType;
 
     let mut group = c.benchmark_group("v6_compression");
 
@@ -357,29 +358,31 @@ fn bench_compression(c: &mut Criterion) {
     let large_data = b"Hello, World! ".repeat(1000);
 
     group.bench_function("gzip_compress_small", |b| {
-        b.iter(|| compress_message(&small_data, CompressionCodec::Gzip));
+        b.iter(|| compress_message(&small_data, CompressionType::Gzip));
     });
 
     group.bench_function("gzip_compress_medium", |b| {
-        b.iter(|| compress_message(&medium_data, CompressionCodec::Gzip));
+        b.iter(|| compress_message(&medium_data, CompressionType::Gzip));
     });
 
     group.bench_function("gzip_compress_large", |b| {
-        b.iter(|| compress_message(&large_data, CompressionCodec::Gzip));
+        b.iter(|| compress_message(&large_data, CompressionType::Gzip));
     });
 
-    let compressed = compress_message(&medium_data, CompressionCodec::Gzip).unwrap();
+    let compressed =
+        compress_message(&medium_data, CompressionType::Gzip).expect("compress failed");
     group.bench_function("gzip_decompress_medium", |b| {
-        b.iter(|| decompress_message(&compressed, CompressionCodec::Gzip));
+        b.iter(|| decompress_message(&compressed, CompressionType::Gzip));
     });
 
     group.bench_function("zstd_compress_medium", |b| {
-        b.iter(|| compress_message(&medium_data, CompressionCodec::Zstd));
+        b.iter(|| compress_message(&medium_data, CompressionType::Zstd));
     });
 
-    let zstd_compressed = compress_message(&medium_data, CompressionCodec::Zstd).unwrap();
+    let zstd_compressed =
+        compress_message(&medium_data, CompressionType::Zstd).expect("compress failed");
     group.bench_function("zstd_decompress_medium", |b| {
-        b.iter(|| decompress_message(&zstd_compressed, CompressionCodec::Zstd));
+        b.iter(|| decompress_message(&zstd_compressed, CompressionType::Zstd));
     });
 
     group.finish();

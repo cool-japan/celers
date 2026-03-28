@@ -284,7 +284,7 @@ impl DlxAnalyzer {
         }
 
         let mut top_problematic_queues: Vec<(String, u64)> = queue_counts.into_iter().collect();
-        top_problematic_queues.sort_by(|a, b| b.1.cmp(&a.1));
+        top_problematic_queues.sort_by_key(|b| std::cmp::Reverse(b.1));
         top_problematic_queues.truncate(10);
 
         // Calculate total payload bytes

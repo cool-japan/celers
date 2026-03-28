@@ -2,7 +2,7 @@
 
 > Redis-based broker implementation for CeleRS
 
-## Status: ✅ PRODUCTION READY++ (v0.1.9 - DLQ Archival, Advanced Pooling, Pipelining & Encryption)
+## Status: ✅ STABLE (v0.2.0) — 454 tests passing | Updated: 2026-03-27
 
 Full-featured Redis broker with FIFO/priority queues, DLQ, task cancellation, health checks, queue control, task deduplication, circuit breaker, rate limiting, automatic retry, script versioning, performance profiling, keyspace statistics, replication monitoring, data integrity validation, graceful degradation, TLS/SSL support, comprehensive connection management, **advanced batch operations with filtering**, **dynamic priority management**, **comprehensive task inspection and search**, **complete backup/restore capabilities**, **task result backend with compression**, **distributed locks for coordination**, **task groups for batch processing**, **production monitoring utilities**, **performance optimization utilities**, **queue size prediction** (v0.1.3+), **memory efficiency analysis** (v0.1.3+), **comprehensive scaling strategy recommendations** (v0.1.3+), **cost estimation and optimization** (v0.1.4+), **alert threshold recommendations** (v0.1.4+), **comprehensive health reporting** (v0.1.4+), **performance trend analysis** (v0.1.4+), **Redis slowlog analysis** (v0.1.5+), **memory fragmentation detection** (v0.1.5+), **performance regression detection** (v0.1.5+), **task completion pattern analysis** (v0.1.5+), **queue burst detection** (v0.1.5+), **bulkhead pattern for resource isolation** (v0.1.6+), **cron-based task scheduling** (v0.1.6+), **quota management for multi-tenancy** (v0.1.6+), **distributed tracing with OpenTelemetry-style context propagation** (v0.1.7+), **extensible task lifecycle hooks for validation and enrichment** (v0.1.7+), **DLQ analytics with failure pattern detection** (v0.1.8+), **automatic DLQ replay policies** (v0.1.8+), **structured logging with correlation** (v0.1.8+), **advanced hook features with conditional execution** (v0.1.8+), **OpenTelemetry integration for distributed tracing** (v0.1.8+), **DLQ archival and retention** (v0.1.9+), **adaptive connection pooling** (v0.1.9+), **advanced pipeline optimizations** (v0.1.9+), and **field-level encryption** (v0.1.9+).
 
@@ -832,7 +832,7 @@ Full-featured Redis broker with FIFO/priority queues, DLQ, task cancellation, he
 
 ## Testing Status
 
-- [x] Unit tests ✅ (455 tests passing - up from 425, +30 v0.1.9 tests)
+- [x] Unit tests ✅ (454 tests passing — v0.2.0)
   - [x] QueueMode tests
   - [x] Broker construction and accessor tests
   - [x] Health check tests

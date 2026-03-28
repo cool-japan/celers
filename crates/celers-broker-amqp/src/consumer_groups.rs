@@ -194,7 +194,7 @@ impl ConsumerGroup {
                 active_consumers.into_iter().max_by_key(|c| c.priority)?
             }
             LoadBalancingStrategy::Random => {
-                use rand::Rng;
+                use rand::RngExt;
                 let mut rng = rand::rng();
                 let idx = rng.random_range(0..active_consumers.len());
                 active_consumers[idx].clone()

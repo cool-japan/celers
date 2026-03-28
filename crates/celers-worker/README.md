@@ -1,5 +1,7 @@
 # celers-worker
 
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+
 Production-ready worker runtime for consuming and executing CeleRS tasks with comprehensive monitoring, memory optimization, and workflow support.
 
 ## Overview
@@ -589,6 +591,10 @@ let config = WorkerConfig {
 };
 ```
 
+## Testing
+
+**486 tests passing** (unit + doc + integration + load tests)
+
 ## See Also
 
 - **Core**: `celers-core` - Task registry and execution
@@ -598,4 +604,4 @@ let config = WorkerConfig {
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

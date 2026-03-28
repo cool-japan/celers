@@ -2,7 +2,9 @@
 
 > Procedural macros for simplified CeleRS task definition
 
-## Status: FEATURE COMPLETE
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 221**
+
+## Status: ✅ FEATURE COMPLETE
 
 Provides ergonomic macros for defining tasks without boilerplate.
 
@@ -76,8 +78,9 @@ async fn process_data(id: u64, name: String) -> celers_core::Result<String> {
 
 ## Testing
 
+- 221 total tests passing
 - 21 unit tests
-- 200+ integration tests
+- 200 integration tests (task_attr, task_macro, derive_macro, validation modules)
 - 23 doc tests
 - 3 runnable examples (basic_task, derive_task, validation)
 

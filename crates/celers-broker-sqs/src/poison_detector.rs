@@ -44,6 +44,7 @@
 //! # }
 //! ```
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
@@ -339,7 +340,7 @@ impl PoisonDetector {
             .collect();
 
         // Sort by count (most common first)
-        patterns.sort_by(|a, b| b.count.cmp(&a.count));
+        patterns.sort_by_key(|p| Reverse(p.count));
 
         patterns
     }

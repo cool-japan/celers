@@ -23,16 +23,17 @@ tokio = { workspace = true }
 sqlx = { workspace = true }
 
 # Core protocol
-celers-core = { path = "../celers-core", version = "0.1.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+celers-core = { path = "../celers-core", version = "0.2.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
 
 # Re-export types from backend-redis for trait compatibility
-celers-backend-redis = { path = "../celers-backend-redis", version = "0.1.0" }
+celers-backend-redis = { path = "../celers-backend-redis", version = "0.2.0" }
 
 [features]
 default = ["postgres"]
 postgres = []
 mysql = []
+distributed-locks = []
 
 [dev-dependencies]
 tokio-test = { workspace = true }

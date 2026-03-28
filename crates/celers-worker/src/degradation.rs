@@ -318,7 +318,7 @@ impl DegradationPolicy {
     ///
     /// Uses probabilistic rejection to gradually reduce load
     pub fn should_accept_task(&self, level: DegradationLevel) -> bool {
-        use rand::Rng;
+        use rand::RngExt;
 
         let probability = level.acceptance_probability();
         if probability == 1.0 {

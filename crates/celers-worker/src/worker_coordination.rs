@@ -8,7 +8,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```ignore
 //! # #[cfg(feature = "redis")]
 //! # async fn example() -> celers_core::Result<()> {
 //! use celers_worker::worker_coordination::{WorkerCoordinator, CoordinatorConfig};

@@ -155,6 +155,11 @@ impl GrpcResultBackend {
             version: 0,
             tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
+            worker_hostname: None,
+            runtime_ms: None,
+            memory_bytes: None,
+            retries: None,
+            queue: None,
         })
     }
 
@@ -330,6 +335,11 @@ mod tests {
             version: 0,
             tags: Vec::new(),
             metadata: std::collections::HashMap::new(),
+            worker_hostname: None,
+            runtime_ms: None,
+            memory_bytes: None,
+            retries: None,
+            queue: None,
         }
     }
 

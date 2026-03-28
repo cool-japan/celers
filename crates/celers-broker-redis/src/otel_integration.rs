@@ -371,7 +371,7 @@ impl OtelBrokerInstrumentation {
 
 /// Generate a random trace ID (32 hex characters)
 fn generate_trace_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let bytes: Vec<u8> = (0..16).map(|_| rng.random()).collect();
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -379,7 +379,7 @@ fn generate_trace_id() -> String {
 
 /// Generate a random span ID (16 hex characters)
 fn generate_span_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let bytes: Vec<u8> = (0..8).map(|_| rng.random()).collect();
     bytes.iter().map(|b| format!("{:02x}", b)).collect()

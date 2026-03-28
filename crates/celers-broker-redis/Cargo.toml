@@ -10,8 +10,9 @@ keywords = ["celery", "redis", "broker", "queue", "async"]
 categories = ["asynchronous", "network-programming", "caching"]
 
 [dependencies]
-celers-core = { path = "../celers-core", version = "0.1.0" }
-celers-metrics = { path = "../celers-metrics", version = "0.1.0", optional = true }
+celers-core = { path = "../celers-core", version = "0.2.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.2.0", features = ["gzip", "zlib"] }
+celers-metrics = { path = "../celers-metrics", version = "0.2.0", optional = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -19,7 +20,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 redis = { workspace = true, features = ["cluster-async"] }
 tracing = { workspace = true }
-flate2 = { workspace = true }
+oxiarc-deflate = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 crc32fast = { workspace = true }

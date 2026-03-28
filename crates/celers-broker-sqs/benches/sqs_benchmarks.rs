@@ -133,11 +133,8 @@ async fn benchmark_consume_operations() -> Result<(), Box<dyn std::error::Error>
 
     println!("\nIndividual Consume ({} messages):", count);
     println!("  Total time: {:?}", individual_duration);
-    if count > 0 {
-        println!(
-            "  Per message: {} ms",
-            individual_duration.as_millis() / count
-        );
+    if let Some(per_msg) = individual_duration.as_millis().checked_div(count) {
+        println!("  Per message: {} ms", per_msg);
         println!(
             "  Throughput: {:.2} msg/s",
             count as f64 / individual_duration.as_secs_f64()
@@ -321,11 +318,8 @@ async fn benchmark_parallel_processing() -> Result<(), Box<dyn std::error::Error
 
     println!("\nSequential Processing ({} messages):", seq_count);
     println!("  Total time: {:?}", sequential_duration);
-    if seq_count > 0 {
-        println!(
-            "  Per message: {} ms",
-            sequential_duration.as_millis() / seq_count
-        );
+    if let Some(per_msg) = sequential_duration.as_millis().checked_div(seq_count) {
+        println!("  Per message: {} ms", per_msg);
     }
 
     // Parallel processing

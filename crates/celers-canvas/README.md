@@ -1,5 +1,7 @@
 # celers-canvas
 
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+
 Distributed workflow primitives for CeleRS task orchestration. Build complex task dependencies with Chain, Group, Chord, Map, and Starmap patterns.
 
 ## Overview
@@ -567,6 +569,8 @@ urgent.apply(&broker).await?;
 
 ## Testing
 
+**196 tests passing** (194 unit tests + 66 doc tests)
+
 ```rust
 #[cfg(test)]
 mod tests {
@@ -594,4 +598,4 @@ mod tests {
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

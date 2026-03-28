@@ -237,7 +237,7 @@ impl DLQAnalyzer {
             .collect();
 
         // Sort by count descending
-        patterns.sort_by(|a, b| b.count.cmp(&a.count));
+        patterns.sort_by_key(|b| std::cmp::Reverse(b.count));
 
         debug!("Detected {} failure patterns in DLQ", patterns.len());
 
@@ -282,7 +282,7 @@ impl DLQAnalyzer {
         }
 
         let mut result: Vec<ErrorCluster> = clusters.into_values().collect();
-        result.sort_by(|a, b| b.task_count.cmp(&a.task_count));
+        result.sort_by_key(|b| std::cmp::Reverse(b.task_count));
 
         debug!("Clustered errors into {} groups", result.len());
 

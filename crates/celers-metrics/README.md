@@ -1,5 +1,7 @@
 # celers-metrics
 
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+
 Prometheus metrics integration for CeleRS distributed task queue monitoring. Comprehensive instrumentation with 25+ metrics for production observability.
 
 ## Overview
@@ -502,6 +504,8 @@ celers_tasks_failed_total > 1000
 
 ## Testing
 
+**183 tests passing** (unit + doc tests)
+
 ```rust
 #[cfg(test)]
 mod tests {
@@ -603,4 +607,4 @@ pub static ref OVERSIZED_RESULTS_TOTAL: Counter
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

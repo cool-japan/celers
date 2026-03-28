@@ -2,7 +2,9 @@
 
 > Redis result backend for task results and workflow state
 
-## Status: ✅ FEATURE COMPLETE + ENHANCED + PRODUCTION-READY + UTILITIES & MONITORING + BATCH ANALYTICS + ADVANCED OPERATIONS + TRANSACTIONS & DEPENDENCIES + QUERYING & ARCHIVAL + TAGS & CUSTOM METADATA + TAG-BASED BULK OPS + DETAILED BATCH TRACKING + TELEMETRY & OBSERVABILITY + CONNECTION RETRY + BATCH STREAMING + PIPELINE OPTIMIZATION + PERFORMANCE PROFILING
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 208**
+
+## Status: ✅ FEATURE COMPLETE + ENHANCED + PRODUCTION-READY + UTILITIES & MONITORING + BATCH ANALYTICS + ADVANCED OPERATIONS + TRANSACTIONS & DEPENDENCIES + QUERYING & ARCHIVAL + TAGS & CUSTOM METADATA + TAG-BASED BULK OPS + DETAILED BATCH TRACKING + TELEMETRY & OBSERVABILITY + CONNECTION RETRY + BATCH STREAMING + PIPELINE OPTIMIZATION + PERFORMANCE PROFILING + v0.2.0 ENHANCEMENTS
 
 All core result backend features implemented plus advanced features:
 - ✅ Result compression (gzip with configurable threshold/level)
@@ -41,6 +43,9 @@ All core result backend features implemented plus advanced features:
 - ✅ Batch streaming utilities for large result sets ✨ NEW
 - ✅ Pipeline optimization and analysis ✨ NEW
 - ✅ Performance profiling and metrics collection ✨ NEW
+- ✅ Per-task-type result TTL configuration (v0.2.0)
+- ✅ Result metadata enrichment: worker_hostname, runtime_ms, memory_bytes (v0.2.0)
+- ✅ Zstd compression support (v0.2.0)
 
 ## Completed Features
 
@@ -107,6 +112,8 @@ All core result backend features implemented plus advanced features:
 - [x] Configurable compression level
 - [x] Automatic compression/decompression
 - [x] Compression marker detection
+- [x] Zstd compression support (v0.2.0)
+- [x] Compression statistics tracking (v0.2.0)
 
 ### Metrics & Monitoring ✅
 - [x] Operation metrics (store, get, delete, batch, chord)
@@ -406,6 +413,12 @@ All core result backend features implemented plus advanced features:
   - [x] Operations per second calculation
   - [x] Sample management
 
+### Phase 9: Result Chunking ✅ COMPLETE
+- [x] ChunkingConfig (threshold 512KB, chunk size 256KB, CRC32)
+- [x] ResultChunker with split, reassemble, sentinel detection
+- [x] ChunkingStats with atomic counters
+- [x] Wired into RedisResultBackend (chunking_config, chunker fields)
+
 ## Future Enhancements
 
 ### Advanced Features
@@ -486,9 +499,9 @@ All core result backend features implemented plus advanced features:
   - Get statistics
   - Cleanup old results
   - Cleanup completed chords
-- **Total: 213 tests passing with 0 warnings (+ 14 integration tests available)** ✨ UPDATED
-  - 173 unit tests (+56 from new modules: telemetry, retry, batch_stream, pipeline, profiler)
-  - 40 doc tests (+1 from retry module)
+- **Total: 208 tests passing with 0 warnings (+ 14 integration tests available)**
+  - unit tests (telemetry, retry, batch_stream, pipeline, profiler modules)
+  - doc tests (all public APIs)
 
 ## Examples
 

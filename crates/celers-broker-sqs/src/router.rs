@@ -40,6 +40,7 @@
 //! ```
 
 use serde_json::Value;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 /// Routing strategy for message distribution
@@ -242,7 +243,7 @@ impl MessageRouter {
     pub fn add_rule(&mut self, rule: RoutingRule) {
         self.rules.push(rule);
         // Sort by priority (descending)
-        self.rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.rules.sort_by_key(|r| Reverse(r.priority));
     }
 
     /// Set default queue for messages that don't match any rules

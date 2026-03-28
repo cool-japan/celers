@@ -2,19 +2,26 @@
 
 High-performance Redis broker implementation for CeleRS with batch operations, priority queues, and comprehensive monitoring.
 
+**Version: 0.2.0 | Status: [Stable] | Tests: 454 | Updated: 2026-03-27**
+
 ## Overview
 
 Production-ready message broker using Redis with:
 
 - ✅ **Batch Operations**: 10-100x throughput improvement via pipelining
 - ✅ **Priority Queues**: ZADD-based priority scheduling
-- ✅ **Dead Letter Queue**: Automatic failed task handling
+- ✅ **Dead Letter Queue**: Automatic failed task handling with archival and replay policies
 - ✅ **Task Cancellation**: Pub/Sub-based cancellation signals
 - ✅ **Atomic Operations**: BRPOPLPUSH for reliable delivery
 - ✅ **Prometheus Metrics**: Full instrumentation
-- ✅ **Lua Scripts**: Atomic visibility timeout support
-- ✅ **Production Monitoring**: Consumer lag analysis, autoscaling, anomaly detection (v0.1.2+)
-- ✅ **Performance Utilities**: Batch sizing, memory estimation, optimization tools (v0.1.2+)
+- ✅ **Lua Scripts**: Atomic visibility timeout support with script versioning
+- ✅ **Production Monitoring**: Consumer lag analysis, autoscaling, anomaly detection
+- ✅ **Performance Utilities**: Batch sizing, memory estimation, pipeline optimization
+- ✅ **DLQ Analytics**: Failure pattern detection, automatic replay policies, archival
+- ✅ **OpenTelemetry Integration**: Distributed tracing with W3C trace context propagation
+- ✅ **Result Backend Adapter**: Store and retrieve task execution results with compression
+- ✅ **Topic/Priority Routing**: Redis-based routing with priority management
+- ✅ **Advanced Connection Pooling**: Adaptive pooling, Sentinel and cluster support
 
 ## Features
 
@@ -171,13 +178,22 @@ let broker = RedisBroker::new("redis://localhost:6379", "celery")?
 // Prevents lost tasks due to worker crashes
 ```
 
+## Installation
+
+```toml
+[dependencies]
+celers-broker-redis = "0.2"
+
+# Enable Prometheus metrics (optional)
+# celers-broker-redis = { version = "0.2", features = ["metrics"] }
+```
+
 ## Prometheus Metrics
 
 When `metrics` feature is enabled:
 
-```rust
-[features]
-metrics = ["celers-broker-redis/metrics"]
+```toml
+celers-broker-redis = { version = "0.2", features = ["metrics"] }
 ```
 
 **Available Metrics:**
@@ -301,7 +317,7 @@ match broker.enqueue(task).await {
 - Transactional guarantees needed
 - Already using PostgreSQL
 
-## Production Monitoring (v0.1.2+)
+## Production Monitoring
 
 Advanced monitoring utilities for production deployments:
 
@@ -435,10 +451,12 @@ let (conn_timeout, op_timeout) = calculate_redis_timeout_values(
 See `examples/` directory:
 - `basic_usage.rs` - Basic usage
 - `advanced_features.rs` - Advanced features
-- `resilience_features.rs` - Resilience patterns
+- `resilience_features.rs` - Resilience patterns with circuit breaker, bulkhead
 - `geo_distribution.rs` - Geo-distribution
-- `monitoring_performance.rs` - Monitoring and performance tuning (v0.1.2+)
+- `monitoring_performance.rs` - Monitoring and performance tuning
+- `dlq_analytics.rs` - DLQ analytics, archival, and replay policies
+- `otel_integration.rs` - OpenTelemetry distributed tracing integration
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

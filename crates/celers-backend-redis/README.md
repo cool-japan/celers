@@ -1,5 +1,7 @@
 # celers-backend-redis
 
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+
 Redis-based result backend for CeleRS task result storage and workflow state management. Provides atomic operations for Chord barrier synchronization.
 
 ## Overview
@@ -575,6 +577,8 @@ Task metadata format matches Celery's backend structure:
 
 ## Testing
 
+**208 tests passing** (unit + doc tests + integration tests)
+
 ```rust
 #[cfg(test)]
 mod tests {
@@ -651,4 +655,4 @@ mod tests {
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

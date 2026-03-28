@@ -2,6 +2,8 @@
 
 Production-ready, Celery-compatible distributed task queue library for Rust. Binary-level protocol compatibility with Python Celery while delivering superior performance, type safety, and reliability.
 
+**Status: [Stable] — v0.2.0 (2026-03-27) — 145 tests**
+
 ## Overview
 
 **CeleRS** provides:
@@ -21,7 +23,7 @@ Production-ready, Celery-compatible distributed task queue library for Rust. Bin
 
 ```toml
 [dependencies]
-celers = { version = "0.1", features = ["redis"] }
+celers = { version = "0.2", features = ["redis"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -104,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
 
 ```toml
 [dependencies]
-celers = { version = "0.1", features = [
+celers = { version = "0.2", features = [
     "redis",           # Redis broker support
     "postgres",        # PostgreSQL broker support
     "backend-redis",   # Redis result backend
@@ -273,7 +275,7 @@ let broker = PostgresBroker::new("postgresql://localhost/celery", "celery").awai
 3. **Use Redis for High Throughput**
    ```toml
    [dependencies]
-   celers = { version = "0.1", features = ["redis"] }
+   celers = { version = "0.2", features = ["redis"] }
    ```
 
 ## Monitoring
@@ -517,9 +519,9 @@ See `examples/` directory:
 - [x] Prometheus metrics
 - [x] Batch operations
 - [x] Memory optimization
-- [ ] RabbitMQ broker
-- [ ] AWS SQS broker
-- [ ] OpenTelemetry tracing
+- [x] RabbitMQ broker (AMQP)
+- [x] AWS SQS broker
+- [x] OpenTelemetry tracing
 - [ ] Web UI dashboard
 - [ ] Distributed tracing
 
@@ -534,7 +536,7 @@ See [CONTRIBUTING.md](../../CONTRIBUTING.md) for contribution guidelines.
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
 
 ## See Also
 

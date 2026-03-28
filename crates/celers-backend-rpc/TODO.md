@@ -2,6 +2,8 @@
 
 > gRPC/RPC result backend for CeleRS
 
+**Version: 0.2.0 | Status: [Alpha] | Updated: 2026-03-27 | Tests: 8**
+
 ## Status: ✅ FEATURE COMPLETE
 
 Full gRPC result backend client implementation for distributed microservices architectures and service mesh deployments.
@@ -280,7 +282,7 @@ Benefits:
 ## Testing Status
 
 - [x] Compilation tests
-- [x] Unit test structure
+- [x] Unit tests (8 passing: type conversions, chord operations, connection modes)
 - [ ] Integration tests with mock server
 - [ ] Integration tests with real server
 - [ ] Load testing

@@ -1,5 +1,7 @@
 # celers-beat
 
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+
 Periodic task scheduler for CeleRS, equivalent to Celery Beat. Schedule tasks to run at regular intervals or specific times using interval or crontab expressions.
 
 ## Overview
@@ -1034,6 +1036,10 @@ registry.register("generate_report", |args| async move {
 - **Broker**: `celers-broker-redis` - Message broker
 - **Core**: `celers-core` - Task registry
 
+## Testing
+
+**312 tests passing** (unit + doc tests across 12 focused modules)
+
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

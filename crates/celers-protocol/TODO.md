@@ -2,7 +2,7 @@
 
 > Celery protocol v2/v5 implementation
 
-## Status: ✅ FEATURE COMPLETE + ENHANCED + OPTIMIZED
+## Status: ✅ STABLE — v0.2.0 (2026-03-27) — 461 tests
 
 Full Celery protocol compatibility with advanced utilities and performance optimizations.
 
@@ -49,6 +49,9 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - [x] `SerializerType` enum for dynamic dispatch
 - [x] `SerializerRegistry` for managing serializers
 - [x] Auto-detection by content type
+- [x] Magic number detection for JSON, MessagePack, BSON, YAML, Protobuf
+- [x] Format negotiation between endpoints
+- [x] Available types enumeration based on features
 
 ### Result Messages ✅ (NEW)
 - [x] `ResultMessage` - Celery-compatible task result format
@@ -71,12 +74,15 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - [x] Event timestamps and hostname tracking
 
 ### Compression Support ✅ (NEW)
-- [x] `CompressionType` enum (None, Gzip, Zstd)
+- [x] `CompressionType` enum (None, Gzip, Zstd, Zlib)
 - [x] `Compressor` with configurable levels
 - [x] Gzip compression (optional `gzip` feature)
 - [x] Zstandard compression (optional `zstd-compression` feature)
+- [x] Zlib compression support
 - [x] Auto-detection from magic bytes
 - [x] `auto_decompress()` helper function
+- [x] `CompressionRegistry` for managing available algorithms
+- [x] `CompressionStats` for tracking compression effectiveness
 
 ### Embedded Body Format ✅ (NEW)
 - [x] `EmbeddedBody` - Protocol v2 [args, kwargs, embed] format
@@ -293,7 +299,7 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 ### Protocol Extensions
 - [ ] Celery Protocol v6 (when released)
 
-## Testing
+## Testing (Total: 461 tests) ✅
 
 - [x] Message serialization tests (27 tests)
 - [x] Builder pattern tests (22 tests)

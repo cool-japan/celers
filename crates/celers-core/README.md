@@ -2,14 +2,25 @@
 
 Core abstractions and traits for the CeleRS distributed task queue system.
 
+**Status: [Stable] — v0.2.0 (2026-03-27) — 247 tests**
+
 ## Overview
 
 This crate provides the fundamental building blocks for CeleRS:
+- **Task trait**: Type-safe executable task interface
 - **Broker trait**: Abstract interface for message brokers (Redis, Postgres, AMQP, SQS, etc.)
-- **Task types**: Serialized tasks, metadata, and state management
-- **Executor trait**: Task execution and registry
-- **Error types**: Comprehensive error handling
+- **ResultBackend trait**: Task result storage abstraction
+- **TaskExecutor / TaskRegistry**: Task execution and registration
+- **Error types**: Comprehensive error handling with retryability classification
 - **Batch operations**: High-performance bulk enqueue/dequeue (10-100x faster)
+- **CeleryConfig**: Full configuration with 23+ environment variables
+- **Router**: Pattern-based task routing
+- **RateLimit, TimeLimit**: Task rate and time limiting
+- **Revocation**: Task cancellation and revocation
+- **Retry / Exception**: Advanced retry strategies and exception policies
+- **Event / Control**: Worker events and control commands
+- **Distributed Locks**: DistributedLockBackend, InMemoryLockBackend, RedisLockBackend, DbLockBackend
+- **DAG support**: Task dependency graphs with cycle detection
 
 ## Features
 
@@ -19,6 +30,7 @@ This crate provides the fundamental building blocks for CeleRS:
 - **Batch operation support** (10-100x performance improvement)
 - Workflow support (Group, Chain, Chord)
 - Async/await native
+- Property-based testing coverage
 
 ## Usage
 
@@ -146,7 +158,14 @@ pub enum CelersError {
     Deserialization(String),
     TaskNotFound(String),
     TaskTimeout,
+    RateLimit(String),
+    Revoked(String),
     Other(String),
+}
+
+impl CelersError {
+    pub fn is_retryable(&self) -> bool;
+    pub fn category(&self) -> &str;
 }
 
 pub type Result<T> = std::result::Result<T, CelersError>;
@@ -191,15 +210,27 @@ task.metadata.chord_id = Some(chord_id);
 
 See `celers-canvas` for high-level workflow APIs.
 
+## Configuration
+
+`CeleryConfig` supports 23+ environment variables including:
+
+- `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`
+- `CELERY_TASK_SERIALIZER`, `CELERY_RESULT_SERIALIZER`
+- `CELERY_TASK_DEFAULT_QUEUE`, `CELERY_TASK_ROUTES`
+- `CELERY_WORKER_CONCURRENCY`, `CELERY_TASK_SOFT_TIME_LIMIT`, `CELERY_TASK_TIME_LIMIT`
+- And more — use `CeleryConfig::from_env()` or `ConfigValidation::validate_detailed()`
+
 ## Dependencies
 
 ```toml
 [dependencies]
 async-trait = "0.1"
-uuid = { version = "1.0", features = ["v4", "serde"] }
-serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "2.0"
+thiserror = "2"
+regex = "1"
+rand = "0.9"
 ```
 
 ## See Also
@@ -211,4 +242,4 @@ thiserror = "2.0"
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

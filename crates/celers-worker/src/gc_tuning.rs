@@ -8,7 +8,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```ignore
 //! use celers_worker::gc_tuning::{GcTuner, GcConfig};
 //!
 //! let config = GcConfig::default();

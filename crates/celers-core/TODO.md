@@ -2,7 +2,7 @@
 
 > Core traits and types for the CeleRS task queue system
 
-## Status: ✅ FEATURE COMPLETE
+## Status: ✅ STABLE — v0.2.0 (2026-03-27) — 247 tests
 
 The core crate provides all fundamental building blocks for task queue systems.
 
@@ -135,6 +135,21 @@ The core crate provides all fundamental building blocks for task queue systems.
   - [x] 6 comprehensive tests for dependency management
 - [x] Integrated with `SerializedTask` for full workflow support
 
+### v0.2.0 Enhancements ✅
+- [x] DistributedLockBackend trait for distributed beat locks
+- [x] InMemoryLockBackend for single-instance/testing
+- [x] EventFilter trait with GlobEventFilter, ExactEventFilter, PrefixEventFilter
+- [x] CompositeEventFilter (AND/OR/NOT modes)
+- [x] EventRouter with priority-based dispatch
+- [x] EventHandler async trait
+
+### Phase 9: Event Persistence & Config Enhancement ✅ COMPLETE
+- [x] EventPersister trait with query, count, cleanup, flush
+- [x] FileEventPersister with JSONL rotation and retention
+- [x] Expanded CeleryConfig::from_env() with 23+ env vars
+- [x] ConfigValidation system (errors, warnings, suggestions)
+- [x] validate_detailed(), to_env_vars(), dump() methods
+
 ### Potential Improvements
 - [x] Add task dependencies/DAG support ✅
 - [x] Implement task result storage backend (celers-backend-*)
@@ -262,7 +277,7 @@ The core crate provides all fundamental building blocks for task queue systems.
   - [x] Workflow with multiple dependencies (DAG)
   - [x] Task state history full lifecycle
 
-**Total: 185 unit tests + 58 doc tests = 243 tests, all passing** ✅
+**Total: 247 tests, all passing** ✅
 
 ## Latest Enhancements (Jan 7, 2026):
 
@@ -286,7 +301,7 @@ The core crate provides all fundamental building blocks for task queue systems.
   - **Impact**: Better performance for worker control operations, configuration setup, and task registration; constructor and builder methods now inline for reduced overhead
 
 ### Testing and Verification
-- **All 243 tests passing** (185 unit + 58 doc tests)
+- **All 247 tests passing**
 - **Zero standard clippy warnings** - complete compliance maintained
 - **Zero pedantic clippy warnings** - NO WARNINGS policy preserved
 
@@ -317,7 +332,7 @@ The core crate provides all fundamental building blocks for task queue systems.
   - **Impact**: Time limit warning status can now be evaluated at compile-time where applicable, reducing runtime overhead
 
 ### Testing and Verification
-- **All 243 tests passing** (185 unit + 58 doc tests)
+- **All 247 tests passing**
 - **Zero standard clippy warnings** - complete compliance maintained
 - **Zero pedantic clippy warnings** - NO WARNINGS policy preserved
 
@@ -372,7 +387,7 @@ The core crate provides all fundamental building blocks for task queue systems.
 - **Total: 64 const fn** across the codebase (55 previous + 9 new)
 
 ### Testing and Verification
-- **All 243 tests passing** (185 unit + 58 doc tests)
+- **All 247 tests passing**
 - **Zero standard clippy warnings** - complete compliance maintained
 - **Zero pedantic clippy warnings** - NO WARNINGS policy preserved
 
@@ -412,7 +427,7 @@ The core crate provides all fundamental building blocks for task queue systems.
 - **Total: 55 const fn** across the codebase (42 previous + 13 new)
 
 ### Testing and Verification
-- **All 243 tests passing** (185 unit + 58 doc tests)
+- **All 247 tests passing**
 - **Zero standard clippy warnings** - complete compliance maintained
 - **Zero pedantic clippy warnings** - NO WARNINGS policy preserved
 

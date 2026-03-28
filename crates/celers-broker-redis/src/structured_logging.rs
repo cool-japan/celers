@@ -370,12 +370,12 @@ impl StructuredLogger {
 
         // Top errors
         let mut top_errors: Vec<_> = error_messages.into_iter().collect();
-        top_errors.sort_by(|a, b| b.1.cmp(&a.1));
+        top_errors.sort_by_key(|b| std::cmp::Reverse(b.1));
         top_errors.truncate(10);
 
         // Problematic tasks
         let mut problematic_tasks: Vec<_> = task_errors.into_iter().collect();
-        problematic_tasks.sort_by(|a, b| b.1.cmp(&a.1));
+        problematic_tasks.sort_by_key(|b| std::cmp::Reverse(b.1));
         problematic_tasks.truncate(10);
 
         PerformanceAnalysis {

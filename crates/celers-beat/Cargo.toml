@@ -19,7 +19,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 # Core dependencies
-celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+celers-core = { path = "../celers-core", version = "0.2.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
 
 # Optional: Cron expression parsing
 cron = { workspace = true, optional = true }

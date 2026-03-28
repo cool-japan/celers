@@ -2,16 +2,18 @@
 
 > Canvas workflow primitives for distributed task orchestration
 
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 196**
+
 ## Status: ✅ COMPLETE - Production-Ready with Full Feature Set
 
 All Canvas workflow primitives implemented and production-ready.
 Major enhancements added: cancellation, retry policies, timeouts, loops, state tracking, DAG export, error propagation control, sub-workflow isolation, workflow recovery/checkpointing, workflow compilation/optimization framework, comprehensive visualization support, and production-ready enhancements (metrics collection, rate limiting, concurrency control, workflow registry).
 
-**Latest enhancements (2026-01-06):**
+**Latest enhancements (v0.2.0):**
 - Added comprehensive utility methods for workflow introspection and manipulation
 - Enhanced Chain, Group, and Signature with 20+ new convenience methods
 - Improved code quality with zero clippy warnings
-- All 194 unit tests + 66 doc tests passing
+- All 194 unit tests + 66 doc tests passing (196 total)
 
 ## Completed Features
 

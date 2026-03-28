@@ -12,30 +12,30 @@ categories = ["asynchronous", "network-programming", "concurrency"]
 
 [dependencies]
 # Re-export core functionality
-celers-core = { path = "../celers-core", version = "0.1.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
-celers-kombu = { path = "../celers-kombu", version = "0.1.0" }
-celers-worker = { path = "../celers-worker", version = "0.1.0" }
-celers-canvas = { path = "../celers-canvas", version = "0.1.0" }
-celers-macros = { path = "../celers-macros", version = "0.1.0" }
+celers-core = { path = "../celers-core", version = "0.2.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+celers-kombu = { path = "../celers-kombu", version = "0.2.0" }
+celers-worker = { path = "../celers-worker", version = "0.2.0" }
+celers-canvas = { path = "../celers-canvas", version = "0.2.0" }
+celers-macros = { path = "../celers-macros", version = "0.2.0" }
 
 # Optional broker implementations
-celers-broker-redis = { path = "../celers-broker-redis", version = "0.1.0", optional = true }
-celers-broker-postgres = { path = "../celers-broker-postgres", version = "0.1.0", optional = true }
-celers-broker-sql = { path = "../celers-broker-sql", version = "0.1.0", optional = true }
-celers-broker-amqp = { path = "../celers-broker-amqp", version = "0.1.0", optional = true }
-celers-broker-sqs = { path = "../celers-broker-sqs", version = "0.1.0", optional = true }
+celers-broker-redis = { path = "../celers-broker-redis", version = "0.2.0", optional = true }
+celers-broker-postgres = { path = "../celers-broker-postgres", version = "0.2.0", optional = true }
+celers-broker-sql = { path = "../celers-broker-sql", version = "0.2.0", optional = true }
+celers-broker-amqp = { path = "../celers-broker-amqp", version = "0.2.0", optional = true }
+celers-broker-sqs = { path = "../celers-broker-sqs", version = "0.2.0", optional = true }
 
 # Optional backend implementations
-celers-backend-redis = { path = "../celers-backend-redis", version = "0.1.0", optional = true }
-celers-backend-db = { path = "../celers-backend-db", version = "0.1.0", optional = true }
-celers-backend-rpc = { path = "../celers-backend-rpc", version = "0.1.0", optional = true }
+celers-backend-redis = { path = "../celers-backend-redis", version = "0.2.0", optional = true }
+celers-backend-db = { path = "../celers-backend-db", version = "0.2.0", optional = true }
+celers-backend-rpc = { path = "../celers-backend-rpc", version = "0.2.0", optional = true }
 
 # Optional beat scheduler
-celers-beat = { path = "../celers-beat", version = "0.1.0", optional = true }
+celers-beat = { path = "../celers-beat", version = "0.2.0", optional = true }
 
 # Optional metrics
-celers-metrics = { path = "../celers-metrics", version = "0.1.0", optional = true }
+celers-metrics = { path = "../celers-metrics", version = "0.2.0", optional = true }
 
 # Core async runtime
 tokio = { workspace = true }

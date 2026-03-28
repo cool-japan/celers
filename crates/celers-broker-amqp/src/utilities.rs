@@ -206,11 +206,10 @@ pub fn calculate_optimal_amqp_prefetch(
     }
 
     let total_time = avg_processing_time_ms + network_latency_ms;
-    let prefetch_per_consumer = if network_latency_ms > 0 {
-        (total_time / network_latency_ms).max(1)
-    } else {
-        10
-    };
+    let prefetch_per_consumer = total_time
+        .checked_div(network_latency_ms)
+        .map(|v| v.max(1))
+        .unwrap_or(10);
 
     // Clamp to reasonable values (1-1000)
     (prefetch_per_consumer as u16).clamp(1, 1000)

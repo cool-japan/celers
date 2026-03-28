@@ -15,7 +15,7 @@
 //! let signer = MessageSigner::new(secret);
 //!
 //! let message = b"task message body";
-//! let signature = signer.sign(message);
+//! let signature = signer.sign(message).expect("signing failed");
 //!
 //! // Verify signature
 //! assert!(signer.verify(message, &signature).is_ok());
@@ -83,11 +83,13 @@ impl MessageSigner {
     ///
     /// # Returns
     ///
-    /// The HMAC-SHA256 signature as a byte vector
-    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
-        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC can take key of any size");
+    /// The HMAC-SHA256 signature as a byte vector, or `Err(SignatureError::InvalidKeyLength)`
+    /// if the key is invalid.
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignatureError> {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.key).map_err(|_| SignatureError::InvalidKeyLength)?;
         mac.update(message);
-        mac.finalize().into_bytes().to_vec()
+        Ok(mac.finalize().into_bytes().to_vec())
     }
 
     /// Verify a message signature
@@ -101,7 +103,8 @@ impl MessageSigner {
     ///
     /// `Ok(())` if the signature is valid, `Err(SignatureError)` otherwise
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), SignatureError> {
-        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC can take key of any size");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.key).map_err(|_| SignatureError::InvalidKeyLength)?;
         mac.update(message);
 
         mac.verify_slice(signature)
@@ -117,9 +120,9 @@ impl MessageSigner {
     /// # Returns
     ///
     /// The signature encoded as a lowercase hex string
-    pub fn sign_hex(&self, message: &[u8]) -> String {
-        let sig = self.sign(message);
-        hex::encode(sig)
+    pub fn sign_hex(&self, message: &[u8]) -> Result<String, SignatureError> {
+        let sig = self.sign(message)?;
+        Ok(hex::encode(sig))
     }
 
     /// Verify a hex-encoded signature
@@ -133,8 +136,9 @@ impl MessageSigner {
     ///
     /// `Ok(())` if the signature is valid, `Err(SignatureError)` otherwise
     pub fn verify_hex(&self, message: &[u8], signature_hex: &str) -> Result<(), SignatureError> {
-        let signature = hex::decode(signature_hex).map_err(|_| SignatureError::InvalidSignature)?;
-        self.verify(message, &signature)
+        let signature_bytes =
+            hex::decode(signature_hex).map_err(|_| SignatureError::InvalidSignature)?;
+        self.verify(message, &signature_bytes)
     }
 }
 
@@ -159,7 +163,7 @@ mod tests {
         let signer = MessageSigner::new(secret);
 
         let message = b"test message";
-        let signature = signer.sign(message);
+        let signature = signer.sign(message).expect("signing should not fail");
 
         assert!(signer.verify(message, &signature).is_ok());
     }
@@ -181,7 +185,7 @@ mod tests {
         let signer = MessageSigner::new(secret);
 
         let message = b"test message";
-        let signature = signer.sign(message);
+        let signature = signer.sign(message).expect("signing should not fail");
 
         let wrong_message = b"different message";
         assert!(signer.verify(wrong_message, &signature).is_err());
@@ -193,7 +197,7 @@ mod tests {
         let signer = MessageSigner::new(secret);
 
         let message = b"test message";
-        let signature_hex = signer.sign_hex(message);
+        let signature_hex = signer.sign_hex(message).expect("signing should not fail");
 
         // Verify it's valid hex
         assert!(hex::decode(&signature_hex).is_ok());
@@ -222,8 +226,8 @@ mod tests {
         let signer = MessageSigner::new(secret);
 
         let message = b"test message";
-        let sig1 = signer.sign(message);
-        let sig2 = signer.sign(message);
+        let sig1 = signer.sign(message).expect("signing should not fail");
+        let sig2 = signer.sign(message).expect("signing should not fail");
 
         assert_eq!(sig1, sig2);
     }
@@ -235,8 +239,8 @@ mod tests {
         let signer1 = MessageSigner::new(b"key1");
         let signer2 = MessageSigner::new(b"key2");
 
-        let sig1 = signer1.sign(message);
-        let sig2 = signer2.sign(message);
+        let sig1 = signer1.sign(message).expect("signing should not fail");
+        let sig2 = signer2.sign(message).expect("signing should not fail");
 
         assert_ne!(sig1, sig2);
     }

@@ -197,14 +197,14 @@ impl Profiler {
     /// Get sorted profiles by total duration (slowest first)
     pub fn slowest_operations(&self) -> Vec<&OperationProfile> {
         let mut profiles: Vec<&OperationProfile> = self.profiles.values().collect();
-        profiles.sort_by(|a, b| b.total_duration.cmp(&a.total_duration));
+        profiles.sort_by_key(|b| std::cmp::Reverse(b.total_duration));
         profiles
     }
 
     /// Get sorted profiles by error rate (highest first)
     pub fn most_errors(&self) -> Vec<&OperationProfile> {
         let mut profiles: Vec<&OperationProfile> = self.profiles.values().collect();
-        profiles.sort_by(|a, b| b.error_count.cmp(&a.error_count));
+        profiles.sort_by_key(|b| std::cmp::Reverse(b.error_count));
         profiles
     }
 

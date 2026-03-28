@@ -2,9 +2,18 @@
 
 > RabbitMQ/AMQP broker implementation for CeleRS
 
-## Status: ✅ FEATURE COMPLETE + ENHANCED v9
+## Status: ✅ STABLE (v0.2.0) — 244 tests passing | Updated: 2026-03-27
 
 Enterprise-ready AMQP broker with comprehensive production patterns including backpressure management, poison message detection, advanced routing, performance optimization, lifecycle hooks, DLX analytics, adaptive batching, performance profiling, rate limiting, bulkhead isolation, message scheduling, metrics export, circuit breaker pattern, advanced retry strategies, message compression, topology validation, observability enhancements, consumer group management, and comprehensive monitoring/utility modules.
+
+## v0.2.0: AMQP Event Transport ✅ NEW
+
+### Event Emission & Reception ✅
+- [x] AmqpEventEmitter (fanout exchange, JSON serialization)
+- [x] AmqpEventReceiver (exclusive auto-delete queue)
+- [x] Publisher confirms for reliability
+- [x] Event transport statistics tracking
+- [x] Unified CompressionType across protocol, broker-redis, broker-amqp
 
 ## Latest Enhancements (v9) 🚀 NEW
 
@@ -485,6 +494,13 @@ Enterprise-ready AMQP broker with comprehensive production patterns including ba
 - [x] HTTP client for Management API requests
 - [x] Comprehensive data structures (QueueInfo, QueueStats, ServerOverview, ConnectionInfo, ChannelInfo, ExchangeInfo, BindingInfo)
 
+### Phase 9: Topic Routing Integration ✅ COMPLETE
+- [x] TopicRoutingRule with glob pattern matching
+- [x] TopicRouter with priority-based rule resolution
+- [x] AmqpRoutingConfig (exchange, rules, default routing key)
+- [x] Dynamic rule add/remove at runtime
+- [x] TopicRoutingStats for match tracking
+
 ## Future Enhancements
 
 ### Advanced Features
@@ -517,6 +533,7 @@ Enterprise-ready AMQP broker with comprehensive production patterns including ba
 
 ## Testing Status
 
+- [x] **244 total unit tests passing** (v0.2.0)
 - [x] Broker creation test
 - [x] Broker name test
 - [x] Config builder tests

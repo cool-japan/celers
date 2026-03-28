@@ -448,30 +448,14 @@ impl ResultBackend {
 
     /// Compress data using gzip
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(data)
-            .map_err(|e| CelersError::Other(format!("Compression failed: {}", e)))?;
-        encoder
-            .finish()
+        oxiarc_deflate::gzip_compress(data, 6)
             .map_err(|e| CelersError::Other(format!("Compression failed: {}", e)))
     }
 
     /// Decompress data using gzip
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        use flate2::read::GzDecoder;
-        use std::io::Read;
-
-        let mut decoder = GzDecoder::new(data);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .map_err(|e| CelersError::Other(format!("Decompression failed: {}", e)))?;
-        Ok(decompressed)
+        oxiarc_deflate::gzip_decompress(data)
+            .map_err(|e| CelersError::Other(format!("Decompression failed: {}", e)))
     }
 
     /// Check if data is compressed (gzip magic bytes)

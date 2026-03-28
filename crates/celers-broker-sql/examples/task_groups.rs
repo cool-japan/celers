@@ -303,11 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_progress_bar(label: &str, current: usize, total: usize) {
     let width = 40;
-    let filled = if total > 0 {
-        (current * width) / total
-    } else {
-        0
-    };
+    let filled = (current * width).checked_div(total).unwrap_or(0);
     let empty = width - filled;
 
     print!("  {}: [", label);

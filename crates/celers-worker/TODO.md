@@ -2,6 +2,8 @@
 
 > Worker runtime for processing CeleRS tasks
 
+**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 486**
+
 ## Status: ✅ FEATURE COMPLETE
 
 Full-featured worker with retry logic, timeouts, health checks, and observability.
@@ -492,8 +494,7 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
   - Long-running worker, allocation cycles, queue overflow tests
   - Connection pool exhaustion, cascading failures, fragmentation tests
 
-**Total Unit Tests**: 457+ passing
-**Total Doc Tests**: 24 passing
+**Total Tests**: 486 passing (unit + doc + integration + load tests)
 
 ## Documentation
 

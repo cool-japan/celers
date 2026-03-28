@@ -2,9 +2,11 @@
 
 PostgreSQL-based broker implementation for CeleRS using `FOR UPDATE SKIP LOCKED`.
 
+**Version: 0.2.0 | Status: [Stable] | Tests: 117 | Updated: 2026-03-27**
+
 ## Overview
 
-**Status: ✅ FEATURE COMPLETE**
+**Status: ✅ STABLE**
 
 This broker provides production-ready, durable task queue functionality using PostgreSQL as the backend. It's suitable for scenarios where:
 
@@ -51,10 +53,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-broker-postgres = "0.1"
+celers-broker-postgres = "0.2"
 
 # Enable Prometheus metrics (optional)
-celers-broker-postgres = { version = "0.1", features = ["metrics"] }
+celers-broker-postgres = { version = "0.2", features = ["metrics"] }
 ```
 
 ## Quick Start
@@ -319,7 +321,7 @@ Enable the `metrics` feature:
 
 ```toml
 [dependencies]
-celers-broker-postgres = { version = "0.1", features = ["metrics"] }
+celers-broker-postgres = { version = "0.2", features = ["metrics"] }
 ```
 
 Update metrics periodically:

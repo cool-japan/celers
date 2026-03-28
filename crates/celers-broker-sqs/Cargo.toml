@@ -25,12 +25,12 @@ aws-sdk-sqs = { workspace = true }
 aws-sdk-cloudwatch = { workspace = true }
 
 # Compression support
-flate2 = { workspace = true }
+oxiarc-deflate = { workspace = true }
 base64 = { workspace = true }
 
 # Core dependencies
-celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
-celers-kombu = { path = "../celers-kombu", version = "0.1.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+celers-kombu = { path = "../celers-kombu", version = "0.2.0" }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

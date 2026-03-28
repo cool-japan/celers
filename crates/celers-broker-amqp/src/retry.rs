@@ -38,7 +38,7 @@
 //! # async fn perform_operation() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
 //! ```
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

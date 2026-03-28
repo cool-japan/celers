@@ -5,15 +5,11 @@
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use oxiarc_archive::{TarReader, TarWriter};
+use oxiarc_deflate::{gzip_compress, gzip_decompress};
 use redis::Commands;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::Read;
-use tar::{Archive, Builder};
 
 /// Mask password in URL for safe display
 fn mask_password(url: &str) -> String {
@@ -211,21 +207,29 @@ pub async fn create_backup(broker_url: &str, output_path: &str) -> Result<()> {
     };
 
     // Create tar.gz archive
-    let tar_gz = File::create(output_path).context("Failed to create output file")?;
-    let enc = GzEncoder::new(tar_gz, Compression::default());
-    let mut tar = Builder::new(enc);
+    // First build the tar in memory, then gzip compress, then write to file
+    let mut tar_buf = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut tar_buf);
+        let mut tar_writer = TarWriter::new(cursor);
 
-    // Add backup data as JSON
-    let json_data = serde_json::to_string_pretty(&backup)?;
-    let mut header = tar::Header::new_gnu();
-    header.set_size(json_data.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
+        // Add backup data as JSON
+        let json_data = serde_json::to_string_pretty(&backup)?;
 
-    tar.append_data(&mut header, "backup.json", json_data.as_bytes())?;
+        tar_writer
+            .add_file("backup.json", json_data.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Failed to add file to tar: {}", e))?;
 
-    // Finish the archive
-    tar.into_inner()?;
+        // Finish the archive
+        tar_writer
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("Failed to finish tar: {}", e))?;
+    }
+
+    // Gzip compress the tar data and write to file
+    let compressed = gzip_compress(&tar_buf, 6)
+        .map_err(|e| anyhow::anyhow!("Failed to gzip compress: {}", e))?;
+    std::fs::write(output_path, &compressed).context("Failed to write output file")?;
 
     println!();
     println!("{} Backup created successfully", "✓".green().bold());
@@ -266,18 +270,19 @@ pub async fn restore_backup(
     println!("{}", "Restoring from backup...".cyan());
 
     // Extract and parse backup
-    let tar_gz = File::open(input_path).context("Failed to open backup file")?;
-    let dec = GzDecoder::new(tar_gz);
-    let mut archive = Archive::new(dec);
+    let compressed_data = std::fs::read(input_path).context("Failed to read backup file")?;
+    let tar_data = gzip_decompress(&compressed_data)
+        .map_err(|e| anyhow::anyhow!("Failed to decompress backup: {}", e))?;
+    let cursor = std::io::Cursor::new(tar_data);
+    let mut tar_reader =
+        TarReader::new(cursor).map_err(|e| anyhow::anyhow!("Failed to read tar: {}", e))?;
 
-    let mut backup_json = String::new();
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        if entry.path()?.to_str() == Some("backup.json") {
-            entry.read_to_string(&mut backup_json)?;
-            break;
-        }
-    }
+    let backup_json_data = tar_reader
+        .extract_by_name("backup.json")
+        .map_err(|e| anyhow::anyhow!("Failed to extract backup.json: {}", e))?
+        .context("backup.json not found in archive")?;
+    let backup_json =
+        String::from_utf8(backup_json_data).context("backup.json contains invalid UTF-8")?;
 
     let backup: Backup =
         serde_json::from_str(&backup_json).context("Failed to parse backup data")?;

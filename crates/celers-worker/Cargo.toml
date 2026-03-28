@@ -10,10 +10,10 @@ keywords = ["celery", "worker", "runtime", "executor", "async"]
 categories = ["asynchronous", "concurrency"]
 
 [dependencies]
-celers-core = { path = "../celers-core", version = "0.1.0" }
-celers-canvas = { path = "../celers-canvas", version = "0.1.0", optional = true }
-celers-backend-redis = { path = "../celers-backend-redis", version = "0.1.0", optional = true }
-celers-metrics = { path = "../celers-metrics", version = "0.1.0", optional = true }
+celers-core = { path = "../celers-core", version = "0.2.0" }
+celers-canvas = { path = "../celers-canvas", version = "0.2.0", optional = true }
+celers-backend-redis = { path = "../celers-backend-redis", version = "0.2.0", optional = true }
+celers-metrics = { path = "../celers-metrics", version = "0.2.0", optional = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

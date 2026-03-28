@@ -21,6 +21,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -352,7 +353,7 @@ impl DlqAnalyzer {
     pub fn top_error_patterns(&self, limit: usize) -> Vec<(ErrorPattern, usize)> {
         let stats = self.statistics();
         let mut patterns: Vec<_> = stats.errors_by_pattern.into_iter().collect();
-        patterns.sort_by(|a, b| b.1.cmp(&a.1));
+        patterns.sort_by_key(|item| Reverse(item.1));
         patterns.into_iter().take(limit).collect()
     }
 
@@ -362,7 +363,7 @@ impl DlqAnalyzer {
     pub fn top_failing_tasks(&self, limit: usize) -> Vec<(String, usize)> {
         let stats = self.statistics();
         let mut tasks: Vec<_> = stats.errors_by_task.into_iter().collect();
-        tasks.sort_by(|a, b| b.1.cmp(&a.1));
+        tasks.sort_by_key(|item| Reverse(item.1));
         tasks.into_iter().take(limit).collect()
     }
 

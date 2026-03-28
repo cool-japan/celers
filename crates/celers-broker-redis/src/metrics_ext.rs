@@ -356,11 +356,10 @@ impl TaskAgeHistogram {
                 ">=10m".to_string(),
             ],
             total_tasks: inner.total_tasks,
-            avg_age_ms: if inner.total_tasks > 0 {
-                inner.total_age_ms / inner.total_tasks
-            } else {
-                0
-            },
+            avg_age_ms: inner
+                .total_age_ms
+                .checked_div(inner.total_tasks)
+                .unwrap_or(0),
         }
     }
 

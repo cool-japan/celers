@@ -298,7 +298,7 @@ impl ReplayScheduler {
 
         // Sort policies by priority (highest first)
         let mut policies: Vec<_> = self.policies.iter().filter(|(_, p)| p.enabled).collect();
-        policies.sort_by(|a, b| b.1.priority.cmp(&a.1.priority));
+        policies.sort_by_key(|b| std::cmp::Reverse(b.1.priority));
 
         for (name, policy) in policies {
             match self.execute_policy(name, policy).await {

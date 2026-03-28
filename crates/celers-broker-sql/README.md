@@ -2,6 +2,8 @@
 
 MySQL database broker implementation for CeleRS - a high-performance Celery-compatible task queue framework for Rust.
 
+**Version: 0.2.0 | Status: [Alpha] | Tests: 68 | Updated: 2026-03-27**
+
 ## Features
 
 - **Reliable Task Queue**: MySQL-based task queue with `FOR UPDATE SKIP LOCKED` for distributed workers
@@ -28,11 +30,11 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-broker-sql = "0.1"
-celers-core = "0.1"
+celers-broker-sql = "0.2"
+celers-core = "0.2"
 
 # Optional: Enable Prometheus metrics
-# celers-broker-sql = { version = "0.1", features = ["metrics"] }
+# celers-broker-sql = { version = "0.2", features = ["metrics"] }
 ```
 
 ## Quick Start
@@ -627,7 +629,7 @@ For detailed usage instructions, see [examples/README.md](examples/README.md).
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
 
 ## Contributing
 

@@ -20,14 +20,21 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-flate2 = { workspace = true }
+oxiarc-deflate = { workspace = true }
+oxiarc-zstd = { workspace = true, optional = true }
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+crc32fast = { workspace = true }
 
 # Core protocol
-celers-core = { path = "../celers-core", version = "0.1.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.1.0" }
+celers-core = { path = "../celers-core", version = "0.2.0" }
+celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+
+[features]
+default = []
+distributed-locks = []
+zstd-compression = ["dep:oxiarc-zstd"]
 
 [dev-dependencies]
 tokio = { workspace = true }

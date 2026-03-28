@@ -257,6 +257,9 @@ pub enum SerializerType {
     /// BSON serializer
     #[cfg(feature = "bson-format")]
     Bson,
+    /// Protobuf serializer
+    #[cfg(feature = "protobuf")]
+    Protobuf,
 }
 
 impl SerializerType {
@@ -270,6 +273,8 @@ impl SerializerType {
             "application/x-yaml" | "application/yaml" | "text/yaml" => Ok(SerializerType::Yaml),
             #[cfg(feature = "bson-format")]
             "application/bson" => Ok(SerializerType::Bson),
+            #[cfg(feature = "protobuf")]
+            "application/protobuf" | "application/x-protobuf" => Ok(SerializerType::Protobuf),
             _ => Err(SerializerError::UnsupportedContentType(
                 content_type.to_string(),
             )),
@@ -286,6 +291,10 @@ impl SerializerType {
             SerializerType::Yaml => YamlSerializer.serialize(value),
             #[cfg(feature = "bson-format")]
             SerializerType::Bson => BsonSerializer.serialize(value),
+            #[cfg(feature = "protobuf")]
+            SerializerType::Protobuf => Err(SerializerError::Serialize(
+                "Protobuf requires prost::Message; use ProtobufSerializer::serialize_message instead".to_string(),
+            )),
         }
     }
 
@@ -299,6 +308,10 @@ impl SerializerType {
             SerializerType::Yaml => YamlSerializer.deserialize(bytes),
             #[cfg(feature = "bson-format")]
             SerializerType::Bson => BsonSerializer.deserialize(bytes),
+            #[cfg(feature = "protobuf")]
+            SerializerType::Protobuf => Err(SerializerError::Deserialize(
+                "Protobuf requires prost::Message; use ProtobufSerializer::deserialize_message instead".to_string(),
+            )),
         }
     }
 
@@ -313,6 +326,8 @@ impl SerializerType {
             SerializerType::Yaml => YamlSerializer.content_type(),
             #[cfg(feature = "bson-format")]
             SerializerType::Bson => BsonSerializer.content_type(),
+            #[cfg(feature = "protobuf")]
+            SerializerType::Protobuf => ProtobufSerializer.content_type(),
         }
     }
 
@@ -327,6 +342,8 @@ impl SerializerType {
             SerializerType::Yaml => YamlSerializer.content_encoding(),
             #[cfg(feature = "bson-format")]
             SerializerType::Bson => BsonSerializer.content_encoding(),
+            #[cfg(feature = "protobuf")]
+            SerializerType::Protobuf => ProtobufSerializer.content_encoding(),
         }
     }
 
@@ -341,6 +358,8 @@ impl SerializerType {
             SerializerType::Yaml => YamlSerializer.name(),
             #[cfg(feature = "bson-format")]
             SerializerType::Bson => BsonSerializer.name(),
+            #[cfg(feature = "protobuf")]
+            SerializerType::Protobuf => ProtobufSerializer.name(),
         }
     }
 }
@@ -414,7 +433,123 @@ impl SerializerRegistry {
             "application/x-yaml",
             #[cfg(feature = "bson-format")]
             "application/bson",
+            #[cfg(feature = "protobuf")]
+            "application/protobuf",
         ]
+    }
+
+    /// Detect serialization format from raw bytes using magic numbers and heuristics.
+    ///
+    /// This performs best-effort detection by examining byte patterns:
+    /// - JSON: starts with `{` or `[` (after optional whitespace)
+    /// - YAML: starts with `---` document marker
+    /// - BSON: 4-byte LE size header matching data length, trailing `0x00`
+    /// - MessagePack: binary type markers in the `0x80..=0x9f` / `0xc0..=0xdf` ranges
+    /// - Protobuf: valid wire-type and field-number in the first tag byte (weak heuristic)
+    ///
+    /// Returns `None` if the format cannot be determined.
+    pub fn detect_format(data: &[u8]) -> Option<SerializerType> {
+        if data.is_empty() {
+            return None;
+        }
+
+        // JSON: starts with '{' or '[' (after optional whitespace)
+        let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
+        if let Some(pos) = trimmed {
+            if data[pos] == b'{' || data[pos] == b'[' {
+                return Some(SerializerType::Json);
+            }
+        }
+
+        // YAML: starts with "---" document marker
+        #[cfg(feature = "yaml")]
+        if data.starts_with(b"---") {
+            return Some(SerializerType::Yaml);
+        }
+
+        // BSON: starts with 4-byte LE document size, ends with 0x00
+        #[cfg(feature = "bson-format")]
+        if data.len() >= 5 {
+            let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if size == data.len() && data[data.len() - 1] == 0x00 {
+                return Some(SerializerType::Bson);
+            }
+        }
+
+        // MessagePack: various type markers
+        // fixmap (0x80-0x8f), fixarray (0x90-0x9f), nil/bool/bin/ext/float/int/str/array/map
+        #[cfg(feature = "msgpack")]
+        if matches!(
+            data[0],
+            0x80..=0x9f | 0xc0..=0xd3 | 0xd4..=0xd8 | 0xd9..=0xdf
+        ) {
+            // Additional heuristic: not valid JSON start
+            if data[0] != b'{' && data[0] != b'[' {
+                return Some(SerializerType::MessagePack);
+            }
+        }
+
+        // Protobuf: harder to detect, use heuristic
+        // Field tag format: (field_number << 3) | wire_type
+        // Wire type 0-5, field number > 0
+        // Require at least 2 bytes (tag + value) and the first byte must not be
+        // plain ASCII whitespace or printable text (to avoid false positives).
+        #[cfg(feature = "protobuf")]
+        if data.len() >= 2 {
+            let first = data[0];
+            let wire_type = first & 0x07;
+            let field_number = first >> 3;
+            if wire_type <= 5
+                && field_number > 0
+                && field_number < 100
+                && !first.is_ascii_whitespace()
+                && !first.is_ascii_alphanumeric()
+                && first != b'_'
+                && first != b'-'
+            {
+                return Some(SerializerType::Protobuf);
+            }
+        }
+
+        None
+    }
+
+    /// Negotiate the best serialization format between local and remote capabilities.
+    ///
+    /// Iterates through `local_preferred` in order and returns the first type
+    /// that also appears in `remote_supported`. Returns `None` if there is no
+    /// overlap between the two sets.
+    pub fn negotiate(
+        local_preferred: &[SerializerType],
+        remote_supported: &[SerializerType],
+    ) -> Option<SerializerType> {
+        local_preferred
+            .iter()
+            .find(|s| remote_supported.contains(s))
+            .copied()
+    }
+
+    /// Get all available serializer types based on enabled features.
+    ///
+    /// JSON is always included. Additional types are added when their
+    /// corresponding Cargo features are enabled.
+    pub fn available_types() -> Vec<SerializerType> {
+        #[allow(unused_mut)]
+        let mut types = vec![SerializerType::Json]; // always available
+
+        #[cfg(feature = "msgpack")]
+        types.push(SerializerType::MessagePack);
+
+        #[cfg(feature = "yaml")]
+        types.push(SerializerType::Yaml);
+
+        #[cfg(feature = "bson-format")]
+        types.push(SerializerType::Bson);
+
+        #[cfg(feature = "protobuf")]
+        types.push(SerializerType::Protobuf);
+
+        types
     }
 }
 
@@ -648,5 +783,272 @@ mod tests {
         let _json_original = json; // Can still use original
 
         assert_eq!(json_copy, SerializerType::Json);
+    }
+
+    // ---- Format detection tests ----
+
+    #[test]
+    fn test_detect_format_empty_data() {
+        assert!(SerializerRegistry::detect_format(&[]).is_none());
+    }
+
+    #[test]
+    fn test_detect_format_json_object() {
+        let data = br#"{"key": "value"}"#;
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::Json)
+        );
+    }
+
+    #[test]
+    fn test_detect_format_json_array() {
+        let data = b"[1,2,3]";
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::Json)
+        );
+    }
+
+    #[test]
+    fn test_detect_format_json_with_leading_whitespace() {
+        let data = b"  \t\n  {\"key\": \"value\"}";
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::Json)
+        );
+    }
+
+    #[test]
+    fn test_detect_format_json_array_with_whitespace() {
+        let data = b"   [1, 2, 3]";
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::Json)
+        );
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_detect_format_msgpack() {
+        use std::collections::HashMap;
+
+        let mut map = HashMap::new();
+        map.insert("key", "value");
+        let bytes = rmp_serde::to_vec(&map).expect("msgpack serialization failed");
+        assert_eq!(
+            SerializerRegistry::detect_format(&bytes),
+            Some(SerializerType::MessagePack)
+        );
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_detect_format_msgpack_fixmap() {
+        // fixmap with 1 entry: 0x81
+        let data: &[u8] = &[
+            0x81, 0xa3, b'k', b'e', b'y', 0xa5, b'v', b'a', b'l', b'u', b'e',
+        ];
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::MessagePack)
+        );
+    }
+
+    #[cfg(feature = "bson-format")]
+    #[test]
+    fn test_detect_format_bson() {
+        let data = TestData {
+            name: "bson_detect".to_string(),
+            value: 42,
+        };
+        let bytes = bson::serialize_to_vec(&data).expect("bson serialization failed");
+        assert_eq!(
+            SerializerRegistry::detect_format(&bytes),
+            Some(SerializerType::Bson)
+        );
+    }
+
+    #[cfg(feature = "bson-format")]
+    #[test]
+    fn test_detect_format_bson_not_matching_size() {
+        // 4-byte LE size says 100, but actual length is 5 -> not BSON
+        let data: &[u8] = &[100, 0, 0, 0, 0x00];
+        assert_ne!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::Bson)
+        );
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_detect_format_yaml() {
+        let data = b"---\nkey: value\n";
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::Yaml)
+        );
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_detect_format_yaml_minimal() {
+        let data = b"---";
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::Yaml)
+        );
+    }
+
+    #[test]
+    fn test_detect_format_unknown_binary() {
+        // Random binary that doesn't match any known pattern
+        let data: &[u8] = &[0x00, 0x00, 0x00];
+        // With all features, BSON check: size=0 != len=3, msgpack: 0x00 not in range,
+        // protobuf: field_number=0 (invalid). Should be None.
+        assert!(SerializerRegistry::detect_format(data).is_none());
+    }
+
+    #[test]
+    fn test_detect_format_whitespace_only() {
+        let data = b"   \t\n  ";
+        // No non-whitespace byte found, trimmed position is None
+        assert!(SerializerRegistry::detect_format(data).is_none());
+    }
+
+    // ---- Negotiation tests ----
+
+    #[test]
+    fn test_negotiate_overlap() {
+        let local = [SerializerType::Json];
+        let remote = [SerializerType::Json];
+        assert_eq!(
+            SerializerRegistry::negotiate(&local, &remote),
+            Some(SerializerType::Json)
+        );
+    }
+
+    #[test]
+    fn test_negotiate_prefers_local_order() {
+        #[cfg(feature = "msgpack")]
+        {
+            let local = [SerializerType::MessagePack, SerializerType::Json];
+            let remote = [SerializerType::Json, SerializerType::MessagePack];
+            assert_eq!(
+                SerializerRegistry::negotiate(&local, &remote),
+                Some(SerializerType::MessagePack)
+            );
+        }
+    }
+
+    #[test]
+    fn test_negotiate_disjoint() {
+        // With only Json on one side and nothing on the other
+        let local = [SerializerType::Json];
+        let remote: &[SerializerType] = &[];
+        assert!(SerializerRegistry::negotiate(&local, remote).is_none());
+    }
+
+    #[test]
+    fn test_negotiate_empty_local() {
+        let local: &[SerializerType] = &[];
+        let remote = [SerializerType::Json];
+        assert!(SerializerRegistry::negotiate(local, &remote).is_none());
+    }
+
+    #[test]
+    fn test_negotiate_both_empty() {
+        let local: &[SerializerType] = &[];
+        let remote: &[SerializerType] = &[];
+        assert!(SerializerRegistry::negotiate(local, remote).is_none());
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_negotiate_partial_overlap() {
+        let local = [SerializerType::MessagePack, SerializerType::Json];
+        let remote = [SerializerType::Json];
+        assert_eq!(
+            SerializerRegistry::negotiate(&local, &remote),
+            Some(SerializerType::Json)
+        );
+    }
+
+    // ---- available_types tests ----
+
+    #[test]
+    fn test_available_types_always_has_json() {
+        let types = SerializerRegistry::available_types();
+        assert!(types.contains(&SerializerType::Json));
+        // JSON should be the first element
+        assert_eq!(types[0], SerializerType::Json);
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_available_types_has_msgpack() {
+        let types = SerializerRegistry::available_types();
+        assert!(types.contains(&SerializerType::MessagePack));
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_available_types_has_yaml() {
+        let types = SerializerRegistry::available_types();
+        assert!(types.contains(&SerializerType::Yaml));
+    }
+
+    #[cfg(feature = "bson-format")]
+    #[test]
+    fn test_available_types_has_bson() {
+        let types = SerializerRegistry::available_types();
+        assert!(types.contains(&SerializerType::Bson));
+    }
+
+    #[cfg(feature = "protobuf")]
+    #[test]
+    fn test_available_types_has_protobuf() {
+        let types = SerializerRegistry::available_types();
+        assert!(types.contains(&SerializerType::Protobuf));
+    }
+
+    #[test]
+    fn test_available_types_count() {
+        let types = SerializerRegistry::available_types();
+        let mut expected = 1; // Json always
+
+        #[cfg(feature = "msgpack")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "yaml")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "bson-format")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "protobuf")]
+        {
+            expected += 1;
+        }
+
+        assert_eq!(types.len(), expected);
+    }
+
+    #[cfg(feature = "protobuf")]
+    #[test]
+    fn test_serializer_type_protobuf_name() {
+        assert_eq!(SerializerType::Protobuf.name(), "protobuf");
+    }
+
+    #[cfg(feature = "protobuf")]
+    #[test]
+    fn test_serializer_type_protobuf_content_type() {
+        assert_eq!(
+            SerializerType::Protobuf.content_type(),
+            ContentType::Custom("application/protobuf".to_string())
+        );
     }
 }

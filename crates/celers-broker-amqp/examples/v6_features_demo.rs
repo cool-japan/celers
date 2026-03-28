@@ -12,7 +12,7 @@
 
 use celers_broker_amqp::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
-    compression::{compress_message, decompress_message, CompressionCodec, CompressionStats},
+    compression::{compress_message, decompress_message, CompressionStats},
     consumer_groups::{ConsumerGroup, ConsumerInfo, LoadBalancingStrategy},
     retry::{ExponentialBackoff, Jitter, RetryStrategy},
     topology::{
@@ -145,7 +145,8 @@ fn demonstrate_compression() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Original message size: {} bytes", original_size);
 
     // Test Gzip compression
-    let gzip_compressed = compress_message(&data, CompressionCodec::Gzip)?;
+    let gzip_compressed =
+        compress_message(&data, celers_protocol::compression::CompressionType::Gzip)?;
     let gzip_ratio = original_size as f64 / gzip_compressed.len() as f64;
     println!("\n📊 Gzip compression:");
     println!("  - Compressed size: {} bytes", gzip_compressed.len());
@@ -153,7 +154,8 @@ fn demonstrate_compression() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - Space saved: {:.1}%", (1.0 - 1.0 / gzip_ratio) * 100.0);
 
     // Test Zstd compression
-    let zstd_compressed = compress_message(&data, CompressionCodec::Zstd)?;
+    let zstd_compressed =
+        compress_message(&data, celers_protocol::compression::CompressionType::Zstd)?;
     let zstd_ratio = original_size as f64 / zstd_compressed.len() as f64;
     println!("\n📊 Zstd compression:");
     println!("  - Compressed size: {} bytes", zstd_compressed.len());
@@ -161,7 +163,10 @@ fn demonstrate_compression() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - Space saved: {:.1}%", (1.0 - 1.0 / zstd_ratio) * 100.0);
 
     // Verify decompression
-    let decompressed = decompress_message(&gzip_compressed, CompressionCodec::Gzip)?;
+    let decompressed = decompress_message(
+        &gzip_compressed,
+        celers_protocol::compression::CompressionType::Gzip,
+    )?;
     assert_eq!(data, decompressed);
     println!("\n✓ Decompression verified successfully");
 

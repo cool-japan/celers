@@ -689,7 +689,7 @@ impl Router {
     pub fn add_rule(&mut self, rule: RouteRule) {
         self.rules.push(rule);
         // Sort by priority (descending)
-        self.rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.rules.sort_by_key(|b| std::cmp::Reverse(b.priority));
     }
 
     /// Add a direct route for a specific task
