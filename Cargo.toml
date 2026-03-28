@@ -65,7 +65,7 @@ aws-sdk-cloudwatch = "1.108"
 # CLI and utilities
 clap = { version = "4.6.0", features = ["derive"] }
 clap_complete = "4.6.0"
-clap_mangen = "0.2.33"
+clap_mangen = "0.3.0"
 uuid = { version = "1.23.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 chrono-tz = "0.10"
@@ -95,7 +95,7 @@ bson = { version = "3.1.0", features = ["serde"] }
 
 # Crypto dependencies
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 aes-gcm = "0.10"
 
 # Scheduling dependencies
