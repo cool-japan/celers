@@ -999,9 +999,18 @@ impl Broker for RedisBroker {
         let result = match self.mode {
             QueueMode::Fifo => {
                 // Use BRPOPLPUSH for atomic dequeue and move to processing queue
-                conn.brpoplpush(&self.queue_name, &self.processing_queue, 1.0)
-                    .await
-                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue task: {}", e)))?
+                match conn.brpoplpush::<_, _, Option<String>>(&self.queue_name, &self.processing_queue, 1.0).await {
+                    Ok(data) => data, // 拿到任务返回 Some(String)，或者 Redis 正常返回 nil 变成 None
+                    Err(e) => {
+                        // 关键修复：识别由于阻塞拉取导致的网络超时
+                        if e.is_timeout() || e.to_string().to_lowercase().contains("timed out") {
+                            None // 把它当作正常的队列为空处理
+                        } else {
+                            // 真正的错误才抛出
+                            return Err(CelersError::Broker(format!("Failed to dequeue task: {}", e)));
+                        }
+                    }
+                }
             }
             QueueMode::Priority => {
                 // Use ZPOPMIN to get highest priority task (lowest score due to negation)
