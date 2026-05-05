@@ -410,7 +410,7 @@ struct MockBroker;
 #[async_trait::async_trait]
 impl Broker for MockBroker {
     async fn enqueue(&self, _task: celers_core::SerializedTask) -> Result<celers_core::TaskId> {
-        unimplemented!()
+        Ok(celers_core::TaskId::new_v4())
     }
 
     async fn dequeue(&self) -> Result<Option<celers_core::BrokerMessage>> {
@@ -441,4 +441,21 @@ impl Broker for MockBroker {
     async fn cancel(&self, _task_id: &celers_core::TaskId) -> Result<bool> {
         Ok(false)
     }
+}
+
+#[tokio::test]
+async fn test_mock_broker_enqueue_returns_unique_ids() {
+    use celers_core::Broker;
+    let broker = MockBroker;
+    let task1 = celers_core::SerializedTask::new("test_task_1".to_string(), vec![1, 2, 3]);
+    let task2 = celers_core::SerializedTask::new("test_task_2".to_string(), vec![4, 5, 6]);
+    let id1 = broker
+        .enqueue(task1)
+        .await
+        .expect("enqueue should succeed");
+    let id2 = broker
+        .enqueue(task2)
+        .await
+        .expect("enqueue should succeed");
+    assert_ne!(id1, id2, "Each enqueue should return a unique TaskId");
 }
