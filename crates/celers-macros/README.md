@@ -1,6 +1,6 @@
 # celers-macros
 
-**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13**
 
 Procedural macros for simplified CeleRS task definitions.
 

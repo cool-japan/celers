@@ -2,7 +2,7 @@
 
 Production-ready, Celery-compatible distributed task queue library for Rust. Binary-level protocol compatibility with Python Celery while delivering superior performance, type safety, and reliability.
 
-**Status: [Stable] — v0.3.0 (2026-07-13) — 145 tests**
+**Status: [Stable] — v0.3.1 (2026-07-13) — 145 tests**
 
 ## Overview
 

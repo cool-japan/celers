@@ -1,6 +1,6 @@
 # celers-canvas
 
-**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13**
 
 Distributed workflow primitives for CeleRS task orchestration. Build complex task dependencies with Chain, Group, Chord, Map, and Starmap patterns.
 

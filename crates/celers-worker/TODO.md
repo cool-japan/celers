@@ -2,7 +2,7 @@
 
 > Worker runtime for processing CeleRS tasks
 
-**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 703 (655 unit/integration + 48 doc)**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 703 (655 unit/integration + 48 doc)**
 
 ## Status: ✅ FEATURE COMPLETE
 

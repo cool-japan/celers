@@ -2,7 +2,7 @@
 
 RabbitMQ/AMQP broker implementation for CeleRS, providing a full-featured message broker with exchange/queue topology management, publisher confirms, and advanced features like priority queues, dead letter exchanges, and transactions.
 
-**Version: 0.3.0 | Status: [Stable] | Tests: 244 | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 244 | Updated: 2026-07-13**
 
 ## Features
 

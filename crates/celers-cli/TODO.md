@@ -2,7 +2,7 @@
 
 > Command-line interface for CeleRS task queue management
 
-**Version: 0.3.0 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 757**
+**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 757**
 
 ## Status: ✅ FEATURE COMPLETE
 

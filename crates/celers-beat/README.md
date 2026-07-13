@@ -1,6 +1,6 @@
 # celers-beat
 
-**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13**
 
 Periodic task scheduler for CeleRS, equivalent to Celery Beat. Schedule tasks to run at regular intervals or specific times using interval or crontab expressions.
 

@@ -2,7 +2,7 @@
 
 PostgreSQL-based broker implementation for CeleRS using `FOR UPDATE SKIP LOCKED`.
 
-**Version: 0.3.0 | Status: [Stable] | Tests: 149 (26 ignored, require PostgreSQL) + 179 doc tests | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 149 (26 ignored, require PostgreSQL) + 179 doc tests | Updated: 2026-07-13**
 
 ## Overview
 

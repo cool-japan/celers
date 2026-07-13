@@ -2,7 +2,7 @@
 
 > PostgreSQL-based broker implementation for CeleRS
 
-## Status: ✅ STABLE (v0.3.0) — 149 tests passing, 26 ignored (require a real PostgreSQL instance) + 179 doc tests passing, 6 ignored | Updated: 2026-07-13
+## Status: ✅ STABLE (v0.3.1) — 149 tests passing, 26 ignored (require a real PostgreSQL instance) + 179 doc tests passing, 6 ignored | Updated: 2026-07-13
 
 ## queue_name schema drift (2026-07)
 

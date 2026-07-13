@@ -2,7 +2,7 @@
 
 > Celery protocol v2/v5 implementation
 
-## Status: ✅ STABLE — v0.3.0 (2026-07-13) — 503 tests
+## Status: ✅ STABLE — v0.3.1 (2026-07-13) — 503 tests
 
 Full Celery protocol compatibility with advanced utilities and performance optimizations.
 

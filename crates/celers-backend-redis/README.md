@@ -1,6 +1,6 @@
 # celers-backend-redis
 
-**Version: 0.3.0 | Status: [Stable] | Tests: 208 | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 208 | Updated: 2026-07-13**
 
 Redis-based result backend for CeleRS task result storage and workflow state management. Provides atomic operations for Chord barrier synchronization.
 

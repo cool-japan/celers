@@ -2,7 +2,7 @@
 
 > Broker abstraction layer (Kombu-style)
 
-## Status: ✅ STABLE — v0.3.0 (2026-07-13) — 343 tests (+ 145 doc tests, 1 ignored)
+## Status: ✅ STABLE — v0.3.1 (2026-07-13) — 343 tests (+ 145 doc tests, 1 ignored)
 
 All core abstractions implemented with advanced production features: DLQ, transactions, scheduling, consumer groups, message replay, quota management, comprehensive middleware, flow control, poison message detection, utilities, benchmarks, and examples.
 

@@ -2,7 +2,7 @@
 
 > AWS SQS broker implementation for CeleRS
 
-## Status: ✅ STABLE (v0.3.0) — 294 tests passing | Updated: 2026-07-13
+## Status: ✅ STABLE (v0.3.1) — 294 tests passing | Updated: 2026-07-13
 
 Full AWS SQS broker implementation with long polling, visibility timeout management, FIFO queues, DLQ, SSE, IAM authentication, circuit breaker pattern, real-time cost tracking, advanced batch optimization, distributed tracing, quota management, multi-queue routing, performance profiling, message replay, SLA monitoring, **unified metrics aggregation**, **workload-specific presets**, and **self-adaptive auto-tuning**.
 

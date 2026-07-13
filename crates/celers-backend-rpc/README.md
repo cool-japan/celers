@@ -1,6 +1,6 @@
 # celers-backend-rpc
 
-**Version: 0.3.0 | Status: [Alpha] | Tests: 18 passing, 1 skipped (requires a live gRPC server) | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Alpha] | Tests: 18 passing, 1 skipped (requires a live gRPC server) | Updated: 2026-07-13**
 
 gRPC/RPC result backend for CeleRS. Enables remote task result storage and retrieval over gRPC, suitable for distributed microservices architectures and service mesh deployments.
 

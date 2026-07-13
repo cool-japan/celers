@@ -1,6 +1,6 @@
 # celers-backend-db
 
-**Version: 0.3.0 | Status: [Alpha] | Tests: 55 passing, 6 skipped (require live DB) | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Alpha] | Tests: 55 passing, 6 skipped (require live DB) | Updated: 2026-07-13**
 
 Database (PostgreSQL/MySQL) result backend for CeleRS. Provides persistent task result storage, event persistence, chord state management, database analytics, and optional distributed locks using SQL databases.
 

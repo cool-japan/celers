@@ -2,7 +2,7 @@
 
 > Procedural macros for simplified CeleRS task definition
 
-**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 221**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 221**
 
 ## Status: ✅ FEATURE COMPLETE
 

@@ -128,7 +128,7 @@ CeleRS follows a **layered architecture** inspired by Python Celery's design:
 - **celers-cli**: Command-line worker and queue management
 - **celers-metrics**: Prometheus metrics and observability
 
-### Crate Status (v0.3.0)
+### Crate Status (v0.3.1)
 
 | Crate | Status | Tests |
 |-------|--------|-------|
@@ -330,7 +330,7 @@ let info = checker.get_health();
 
 ## 🗺️ Roadmap
 
-### Current Status (v0.3.0) — Released 2026-07-12
+### Current Status (v0.3.1) — In Development (v0.3.0 released 2026-07-12)
 
 - ✅ **Phase 1**: The Backbone (Core runtime)
 - ✅ **Phase 2**: Advanced Features (Priorities, DLQ, Cancellation)
@@ -466,6 +466,6 @@ Licensed under Apache-2.0
 
 ---
 
-**Status**: Active Development | **Version**: 0.3.0 | **Rust**: 1.70+ (MSRV)
+**Status**: Active Development | **Version**: 0.3.1 | **Rust**: 1.70+ (MSRV)
 
 Built with ❤️ for the Rust community

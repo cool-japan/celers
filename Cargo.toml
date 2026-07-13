@@ -34,7 +34,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 license = "Apache-2.0"
@@ -132,20 +132,20 @@ cron = "0.17.0"
 sunrise = "3.0.0"
 
 # Internal workspace crates
-celers-backend-redis = { path = "crates/celers-backend-redis", version = "0.3.0" }
-celers-beat = { path = "crates/celers-beat", version = "0.3.0" }
-celers-broker-amqp = { path = "crates/celers-broker-amqp", version = "0.3.0" }
-celers-broker-postgres = { path = "crates/celers-broker-postgres", version = "0.3.0" }
-celers-broker-redis = { path = "crates/celers-broker-redis", version = "0.3.0" }
-celers-broker-sql = { path = "crates/celers-broker-sql", version = "0.3.0" }
-celers-broker-sqs = { path = "crates/celers-broker-sqs", version = "0.3.0" }
-celers-canvas = { path = "crates/celers-canvas", version = "0.3.0" }
-celers-core = { path = "crates/celers-core", version = "0.3.0" }
-celers-kombu = { path = "crates/celers-kombu", version = "0.3.0" }
-celers-macros = { path = "crates/celers-macros", version = "0.3.0" }
-celers-metrics = { path = "crates/celers-metrics", version = "0.3.0" }
-celers-protocol = { path = "crates/celers-protocol", version = "0.3.0" }
-celers-worker = { path = "crates/celers-worker", version = "0.3.0" }
+celers-backend-redis = { path = "crates/celers-backend-redis", version = "0.3.1" }
+celers-beat = { path = "crates/celers-beat", version = "0.3.1" }
+celers-broker-amqp = { path = "crates/celers-broker-amqp", version = "0.3.1" }
+celers-broker-postgres = { path = "crates/celers-broker-postgres", version = "0.3.1" }
+celers-broker-redis = { path = "crates/celers-broker-redis", version = "0.3.1" }
+celers-broker-sql = { path = "crates/celers-broker-sql", version = "0.3.1" }
+celers-broker-sqs = { path = "crates/celers-broker-sqs", version = "0.3.1" }
+celers-canvas = { path = "crates/celers-canvas", version = "0.3.1" }
+celers-core = { path = "crates/celers-core", version = "0.3.1" }
+celers-kombu = { path = "crates/celers-kombu", version = "0.3.1" }
+celers-macros = { path = "crates/celers-macros", version = "0.3.1" }
+celers-metrics = { path = "crates/celers-metrics", version = "0.3.1" }
+celers-protocol = { path = "crates/celers-protocol", version = "0.3.1" }
+celers-worker = { path = "crates/celers-worker", version = "0.3.1" }
 
 # CLI tools
 toml = "1.1.2"

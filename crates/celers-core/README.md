@@ -2,7 +2,7 @@
 
 Core abstractions and traits for the CeleRS distributed task queue system.
 
-**Status: [Stable] — v0.3.0 (2026-07-13) — 438 tests**
+**Status: [Stable] — v0.3.1 (2026-07-13) — 438 tests**
 
 ## Overview
 

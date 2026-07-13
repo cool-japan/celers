@@ -2,7 +2,7 @@
 
 Celery protocol v2/v5 implementation for CeleRS. Ensures wire-level compatibility with Python Celery workers and brokers.
 
-**Status: [Stable] — v0.3.0 (2026-07-13) — 503 tests**
+**Status: [Stable] — v0.3.1 (2026-07-13) — 503 tests**
 
 ## Overview
 

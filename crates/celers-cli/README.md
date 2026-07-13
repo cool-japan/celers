@@ -1,6 +1,6 @@
 # celers-cli
 
-**Version: 0.3.0 | Status: [Alpha] | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-07-13**
 
 Command-line interface for managing CeleRS workers, queues, and task execution.
 

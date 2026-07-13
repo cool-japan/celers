@@ -2,7 +2,7 @@
 
 > Core traits and types for the CeleRS task queue system
 
-## Status: ✅ STABLE — v0.3.0 (2026-07-13) — 438 tests
+## Status: ✅ STABLE — v0.3.1 (2026-07-13) — 438 tests
 
 The core crate provides all fundamental building blocks for task queue systems.
 

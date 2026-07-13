@@ -2,7 +2,7 @@
 
 > Database (PostgreSQL/MySQL) result backend for CeleRS
 
-**Version: 0.3.0 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 55**
+**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 55**
 
 ## Status: ✅ FEATURE COMPLETE + v0.2.0 ENHANCED + v0.3.0 PURE-RUST MIGRATION + ANALYTICS
 

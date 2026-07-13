@@ -2,7 +2,7 @@
 
 > Periodic task scheduler (Celery Beat equivalent)
 
-**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 501 (425 unit/integration + 76 doc)**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 501 (425 unit/integration + 76 doc)**
 
 ## Status: ✅ FEATURE COMPLETE + v0.3.0 ENHANCED
 

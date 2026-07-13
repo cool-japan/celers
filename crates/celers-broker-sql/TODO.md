@@ -2,7 +2,7 @@
 
 > MySQL database broker implementation for CeleRS
 
-## Status: [Alpha] (v0.3.0) — 106 tests passing, 20 skipped (require live DB) | Updated: 2026-07-13
+## Status: [Alpha] (v0.3.1) — 106 tests passing, 20 skipped (require live DB) | Updated: 2026-07-13
 
 MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-performance batch operations, queue control, task inspection, result storage, worker tracking, comprehensive maintenance utilities, TraceContext (W3C), circuit breaker, resilience patterns, and advanced hooks/diagnostics.
 

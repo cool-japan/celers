@@ -2,7 +2,7 @@
 
 > gRPC/RPC result backend for CeleRS
 
-**Version: 0.3.0 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 18**
+**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 18**
 
 ## Status: ✅ FEATURE COMPLETE + v0.3.0 CLIENT-SIDE METRICS
 

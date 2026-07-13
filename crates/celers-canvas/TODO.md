@@ -2,7 +2,7 @@
 
 > Canvas workflow primitives for distributed task orchestration
 
-**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 396 (318 unit/integration + 78 doc)**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 396 (318 unit/integration + 78 doc)**
 
 ## Status: ✅ COMPLETE - Production-Ready with Full Feature Set
 

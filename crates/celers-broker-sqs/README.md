@@ -2,7 +2,7 @@
 
 Production-ready AWS SQS broker implementation for CeleRS with batch operations, FIFO queues, CloudWatch integration, and comprehensive cost optimization.
 
-**Version: 0.3.0 | Status: [Stable] | Tests: 294 | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 294 | Updated: 2026-07-13**
 
 ## Overview
 
