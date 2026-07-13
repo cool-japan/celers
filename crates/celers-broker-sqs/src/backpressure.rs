@@ -209,13 +209,13 @@ impl BackpressureManager {
 
     /// Check if we should consume more messages
     pub fn should_consume(&mut self) -> bool {
-        let in_flight = self.in_flight.read().unwrap();
+        let in_flight = self.in_flight.read().unwrap_or_else(|e| e.into_inner());
         let in_flight_count = in_flight.len();
         let utilization = in_flight_count as f64 / self.config.max_in_flight_messages as f64;
 
         // Update metrics
         {
-            let mut metrics = self.metrics.write().unwrap();
+            let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
             metrics.in_flight_count = in_flight_count;
             metrics.utilization = utilization;
 
@@ -229,7 +229,10 @@ impl BackpressureManager {
                 metrics.state = BackpressureState::Normal;
                 // Reset throttle multiplier when back to normal
                 if self.config.adaptive_throttling {
-                    *self.throttle_wait_multiplier.write().unwrap() = 1.0;
+                    *self
+                        .throttle_wait_multiplier
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = 1.0;
                 }
             }
         }
@@ -249,7 +252,10 @@ impl BackpressureManager {
 
     /// Apply throttling delay
     fn apply_throttle(&self) {
-        let multiplier = *self.throttle_wait_multiplier.read().unwrap();
+        let multiplier = *self
+            .throttle_wait_multiplier
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let wait_duration = Duration::from_millis(
             (self.config.throttle_wait_duration.as_millis() as f64 * multiplier) as u64,
         )
@@ -259,7 +265,10 @@ impl BackpressureManager {
 
         // Increase multiplier for adaptive throttling
         if self.config.adaptive_throttling {
-            let mut multiplier = self.throttle_wait_multiplier.write().unwrap();
+            let mut multiplier = self
+                .throttle_wait_multiplier
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             *multiplier = (*multiplier * 1.5).min(10.0);
         }
     }
@@ -273,18 +282,26 @@ impl BackpressureManager {
 
         self.in_flight
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(message_id.to_string(), track);
     }
 
     /// Track the completion of message processing
     pub fn track_message_complete(&mut self, message_id: &str) {
-        if let Some(track) = self.in_flight.write().unwrap().remove(message_id) {
+        if let Some(track) = self
+            .in_flight
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(message_id)
+        {
             let processing_time = track.start_time.elapsed();
 
             // Track processing time
             {
-                let mut times = self.processing_times.write().unwrap();
+                let mut times = self
+                    .processing_times
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
                 times.push(processing_time);
 
                 // Keep only last 1000 times for efficiency
@@ -296,13 +313,16 @@ impl BackpressureManager {
 
             // Update metrics
             {
-                let mut metrics = self.metrics.write().unwrap();
+                let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
                 if processing_time > self.config.max_processing_time {
                     metrics.slow_message_count += 1;
                 }
 
                 // Calculate statistics
-                let times = self.processing_times.read().unwrap();
+                let times = self
+                    .processing_times
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
                 if !times.is_empty() {
                     let total_ms: f64 = times.iter().map(|d| d.as_millis() as f64).sum();
                     metrics.avg_processing_time_ms = total_ms / times.len() as f64;
@@ -326,17 +346,20 @@ impl BackpressureManager {
 
     /// Get current metrics
     pub fn metrics(&self) -> BackpressureMetrics {
-        self.metrics.read().unwrap().clone()
+        self.metrics
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get current state
     pub fn state(&self) -> BackpressureState {
-        self.metrics.read().unwrap().state
+        self.metrics.read().unwrap_or_else(|e| e.into_inner()).state
     }
 
     /// Check for slow messages and return their IDs
     pub fn detect_slow_messages(&self) -> Vec<String> {
-        let in_flight = self.in_flight.read().unwrap();
+        let in_flight = self.in_flight.read().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
         in_flight
@@ -348,12 +371,15 @@ impl BackpressureManager {
 
     /// Reset all metrics
     pub fn reset_metrics(&mut self) {
-        let mut metrics = self.metrics.write().unwrap();
+        let mut metrics = self.metrics.write().unwrap_or_else(|e| e.into_inner());
         metrics.throttle_count = 0;
         metrics.stop_count = 0;
         metrics.slow_message_count = 0;
 
-        self.processing_times.write().unwrap().clear();
+        self.processing_times
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -523,11 +549,17 @@ mod tests {
 
         // First throttle check
         manager.should_consume();
-        let multiplier1 = *manager.throttle_wait_multiplier.read().unwrap();
+        let multiplier1 = *manager
+            .throttle_wait_multiplier
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Second throttle check (should increase multiplier)
         manager.should_consume();
-        let multiplier2 = *manager.throttle_wait_multiplier.read().unwrap();
+        let multiplier2 = *manager
+            .throttle_wait_multiplier
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
 
         assert!(multiplier2 > multiplier1);
     }

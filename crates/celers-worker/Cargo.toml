@@ -6,20 +6,20 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Task execution runtime for CeleRS with concurrency control and health checks"
+readme = "README.md"
 keywords = ["celery", "worker", "runtime", "executor", "async"]
 categories = ["asynchronous", "concurrency"]
 
 [dependencies]
-celers-core = { path = "../celers-core", version = "0.2.0" }
-celers-canvas = { path = "../celers-canvas", version = "0.2.0", optional = true }
-celers-backend-redis = { path = "../celers-backend-redis", version = "0.2.0", optional = true }
-celers-metrics = { path = "../celers-metrics", version = "0.2.0", optional = true }
+celers-core = { workspace = true }
+celers-canvas = { workspace = true, optional = true }
+celers-backend-redis = { workspace = true, optional = true }
+celers-metrics = { workspace = true, optional = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -30,7 +30,12 @@ crossbeam-deque = { workspace = true }
 num_cpus = { workspace = true }
 libc = { workspace = true }
 redis = { workspace = true, optional = true }
-sqlx = { workspace = true, optional = true, features = ["runtime-tokio", "postgres", "json", "uuid"] }
+oxisql-core = { workspace = true, optional = true }
+oxisql-postgres = { workspace = true, optional = true }
+oxitls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -38,7 +43,6 @@ metrics = ["celers-metrics"]
 canvas = ["celers-canvas"]
 workflows = ["canvas", "celers-backend-redis"]
 redis = ["dep:redis"]
-postgres = ["dep:sqlx"]
+postgres = ["dep:oxisql-core", "dep:oxisql-postgres", "dep:oxitls", "dep:rustls", "dep:url", "dep:anyhow"]
 
 [dev-dependencies]
-tempfile = { workspace = true }

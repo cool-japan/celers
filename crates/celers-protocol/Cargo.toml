@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Celery Protocol v2/v5 implementation for CeleRS"
+readme = "README.md"
 keywords = ["celery", "protocol", "messaging", "serialization", "kombu"]
 categories = ["encoding", "network-programming"]
 
@@ -19,7 +20,6 @@ hex = { workspace = true, optional = true }
 
 # Optional serialization formats
 rmp-serde = { workspace = true, optional = true }  # MessagePack
-oxicode = { workspace = true, optional = true }  # Binary (OxiCode)
 serde_yaml = { workspace = true, optional = true }  # YAML
 
 # Optional compression
@@ -39,7 +39,7 @@ bson = { workspace = true, optional = true }  # BSON
 default = ["json"]
 json = []
 msgpack = ["rmp-serde"]
-binary = ["oxicode"]
+binary = []
 yaml = ["serde_yaml"]
 protobuf = ["prost"]
 bson-format = ["bson"]

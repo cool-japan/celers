@@ -2,7 +2,7 @@
 
 > Redis-based broker implementation for CeleRS
 
-## Status: ✅ STABLE (v0.2.0) — 454 tests passing | Updated: 2026-03-27
+## Status: ✅ STABLE (v0.3.0) — 478 tests passing (+ 68 doc tests, 3 ignored) | Updated: 2026-07-13
 
 Full-featured Redis broker with FIFO/priority queues, DLQ, task cancellation, health checks, queue control, task deduplication, circuit breaker, rate limiting, automatic retry, script versioning, performance profiling, keyspace statistics, replication monitoring, data integrity validation, graceful degradation, TLS/SSL support, comprehensive connection management, **advanced batch operations with filtering**, **dynamic priority management**, **comprehensive task inspection and search**, **complete backup/restore capabilities**, **task result backend with compression**, **distributed locks for coordination**, **task groups for batch processing**, **production monitoring utilities**, **performance optimization utilities**, **queue size prediction** (v0.1.3+), **memory efficiency analysis** (v0.1.3+), **comprehensive scaling strategy recommendations** (v0.1.3+), **cost estimation and optimization** (v0.1.4+), **alert threshold recommendations** (v0.1.4+), **comprehensive health reporting** (v0.1.4+), **performance trend analysis** (v0.1.4+), **Redis slowlog analysis** (v0.1.5+), **memory fragmentation detection** (v0.1.5+), **performance regression detection** (v0.1.5+), **task completion pattern analysis** (v0.1.5+), **queue burst detection** (v0.1.5+), **bulkhead pattern for resource isolation** (v0.1.6+), **cron-based task scheduling** (v0.1.6+), **quota management for multi-tenancy** (v0.1.6+), **distributed tracing with OpenTelemetry-style context propagation** (v0.1.7+), **extensible task lifecycle hooks for validation and enrichment** (v0.1.7+), **DLQ analytics with failure pattern detection** (v0.1.8+), **automatic DLQ replay policies** (v0.1.8+), **structured logging with correlation** (v0.1.8+), **advanced hook features with conditional execution** (v0.1.8+), **OpenTelemetry integration for distributed tracing** (v0.1.8+), **DLQ archival and retention** (v0.1.9+), **adaptive connection pooling** (v0.1.9+), **advanced pipeline optimizations** (v0.1.9+), and **field-level encryption** (v0.1.9+).
 
@@ -176,9 +176,20 @@ Full-featured Redis broker with FIFO/priority queues, DLQ, task cancellation, he
 ### Data Integrity ✅ (NEW)
 - [x] `IntegrityValidator` - Task checksum validation
 - [x] `ChecksumAlgorithm` - Multiple checksum algorithms
-  - [x] CRC32 (fast, good for error detection)
-  - [x] XXHash (very fast, good distribution)
-  - [x] SHA256 (cryptographically secure)
+  - [x] CRC32 (fast, good for error detection) — real `crc32fast::hash()`
+  - [ ] XXHash (very fast, good distribution) — **not real**: `ChecksumAlgorithm::XxHash::compute()`
+    in `src/integrity.rs` is still a `DefaultHasher` (SipHash) placeholder formatted to look like an
+    xxHash digest (`// Use a simple hash for now (could use xxhash crate)`). This is a **different**
+    module from `partitioning.rs`'s `HashAlgorithm::XxHash`, which genuinely was fixed in v0.3.0 to
+    use real xxHash64 via `twox-hash` (see Security/Data Integrity fixes below) — do not conflate the
+    two. Verified by direct source read on 2026-07-13; not fabricated, not fixed by this release.
+  - [ ] SHA256 (cryptographically secure) — **not real**: `ChecksumAlgorithm::Sha256::compute()` in
+    `src/integrity.rs` is also a `DefaultHasher` placeholder (`// Use a simple hash for now (could use
+    sha2 crate)`), zero-padded to look like a 64-hex-char SHA256 digest. Despite the doc comment
+    ("cryptographically secure, slower"), this provides no cryptographic guarantee at all. Verified by
+    direct source read on 2026-07-13; not fabricated, not fixed by this release. The `sha2` crate is
+    already a workspace dependency (used correctly elsewhere, e.g. HMAC signing) — wiring it in here is
+    a real, scoped follow-up.
 - [x] `IntegrityWrappedTask` - Tasks with integrity metadata
 - [x] Checksum computation and validation
 - [x] Sequence number tracking for ordered delivery
@@ -532,6 +543,11 @@ Full-featured Redis broker with FIFO/priority queues, DLQ, task cancellation, he
 - [x] `CronExpression` - Cron expression support
   - [x] Standard 5-field format validation
   - [x] Preset expressions (hourly, daily, weekly, monthly)
+  - [x] **Fixed in v0.3.0**: `CronScheduler::calculate_next_run` now parses arbitrary 5-field cron
+    expressions via the `cron` crate, translating the Unix day-of-week convention (0-6, 0=Sunday) to
+    the crate's Quartz numbering (1-7, 1=Sunday) — previously it matched five literal preset patterns
+    and silently defaulted everything else to hourly. Verified against `src/cron_scheduler.rs` on
+    2026-07-13 (`translate_day_of_week`, `calculate_next_run`).
 - [x] `ScheduledTask` - Scheduled task metadata
   - [x] Last run tracking
   - [x] Next run calculation
@@ -998,6 +1014,12 @@ save ""  # disable snapshots for performance
   - [x] Gradual replay with rate limiting (ReplayPolicy::RateLimited)
   - [x] Smart adaptive replay (ReplayPolicy::Smart)
   - [x] Policy scheduler (ReplayScheduler)
+  - [x] **Fixed in v0.3.0**: smart/adaptive replay (`src/dlq_replay.rs`) now classifies each DLQ entry
+    (transient vs. permanent) from its real recorded failure reason and prioritizes transient failures
+    first, skipping permanent ones — previously it used a single fixed strategy regardless of failure
+    type. DLQ analytics (`src/dlq_analytics.rs`) likewise now classify errors and build error
+    signatures (`classify_error`, `extract_error_signature`) from the real recorded task failure
+    message rather than a simplified placeholder. Verified against source on 2026-07-13.
 - [x] DLQ archival and retention ✅ (v0.1.9)
   - [x] Archive old DLQ items to cheaper storage (DLQArchivalManager)
   - [x] Configurable retention policies (RetentionPolicy)
@@ -1082,6 +1104,11 @@ save ""  # disable snapshots for performance
   - [x] Envelope encryption (two-tier encryption)
   - [x] AES-256-GCM and ChaCha20-Poly1305 algorithms
   - [x] Field-level selective encryption
+  - [x] **Fixed in v0.3.0**: the algorithms above (`src/encryption.rs`) were previously a mock XOR
+    "cipher" — any ciphertext "decrypted" successfully with no integrity check at all. Now genuine
+    AES-256-GCM / ChaCha20-Poly1305 AEAD via the `aes-gcm` / `chacha20poly1305` crates, wrapping the
+    DEK with the KEK under AES-256-GCM, generating IVs from `OsRng`, and cryptographically verifying
+    the authentication tag on decrypt. Verified directly against `src/encryption.rs` on 2026-07-13.
 - [ ] Audit logging
   - [ ] Comprehensive audit trail
   - [ ] Compliance reporting

@@ -38,6 +38,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
 
+use crate::sysinfo;
+
 /// Resource usage snapshot
 #[derive(Debug, Clone)]
 pub struct ResourceUsage {
@@ -111,11 +113,10 @@ pub struct TaskResourceTracker {
     end_time: Option<Instant>,
     /// Initial memory baseline
     initial_memory: usize,
+    /// Initial CPU time baseline
+    initial_cpu: Option<Duration>,
     /// Memory samples
     memory_samples: Vec<usize>,
-    /// CPU time samples (mock for now)
-    #[allow(dead_code)]
-    cpu_samples: Vec<Duration>,
     /// I/O statistics
     io_read_ops: u64,
     io_write_ops: u64,
@@ -131,8 +132,8 @@ impl TaskResourceTracker {
             start_time: None,
             end_time: None,
             initial_memory: 0,
+            initial_cpu: None,
             memory_samples: Vec::new(),
-            cpu_samples: Vec::new(),
             io_read_ops: 0,
             io_write_ops: 0,
             io_read_bytes: 0,
@@ -144,6 +145,7 @@ impl TaskResourceTracker {
     pub fn start(&mut self) {
         self.start_time = Some(Instant::now());
         self.initial_memory = Self::get_current_memory();
+        self.initial_cpu = sysinfo::read_process_cpu_time();
         self.memory_samples.push(self.initial_memory);
         debug!("Started resource tracking for task {}", self.task_id);
     }
@@ -173,9 +175,13 @@ impl TaskResourceTracker {
             peak_memory / 1024
         );
 
+        let cpu_time = sysinfo::read_process_cpu_time()
+            .and_then(|end| self.initial_cpu.map(|start| end.saturating_sub(start)))
+            .unwrap_or(Duration::ZERO);
+
         ResourceUsage {
             task_id: self.task_id.clone(),
-            cpu_time: Duration::ZERO, // Would need actual CPU time tracking
+            cpu_time,
             peak_memory_bytes: peak_memory,
             avg_memory_bytes: avg_memory,
             io_read_ops: self.io_read_ops,
@@ -204,11 +210,9 @@ impl TaskResourceTracker {
         self.io_written_bytes += bytes;
     }
 
-    /// Get current memory usage (mock implementation)
+    /// Returns current process RSS memory in bytes.
     fn get_current_memory() -> usize {
-        // In a real implementation, this would read from /proc/self/status on Linux
-        // For now, return a mock value
-        0
+        sysinfo::read_process_memory_bytes()
     }
 }
 

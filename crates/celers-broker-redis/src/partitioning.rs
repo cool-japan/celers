@@ -5,7 +5,6 @@
 
 use crate::{CelersError, Result, SerializedTask};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Hash algorithm for consistent hashing
@@ -25,12 +24,7 @@ impl HashAlgorithm {
                 let hash = crc32fast::hash(key);
                 hash as u64
             }
-            HashAlgorithm::XxHash => {
-                // Simple FNV-1a hash as a placeholder for xxhash
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut hasher);
-                hasher.finish()
-            }
+            HashAlgorithm::XxHash => twox_hash::xxhash64::Hasher::oneshot(0_u64, key),
         }
     }
 }
@@ -289,6 +283,7 @@ mod tests {
                 timeout_secs: None,
                 group_id: None,
                 chord_id: None,
+                on_success_link: None,
                 dependencies: HashSet::new(),
             },
             payload: b"test payload".to_vec(),

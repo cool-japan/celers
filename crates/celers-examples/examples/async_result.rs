@@ -41,7 +41,7 @@ impl MockResultStore {
 
     /// Simulate storing a task result (used for demo setup)
     fn simulate_result(&self, task_id: Uuid, result: TaskResultValue) {
-        self.results.lock().unwrap().insert(task_id, result);
+        self.results.lock().unwrap_or_else(|e| e.into_inner()).insert(task_id, result);
     }
 }
 
@@ -52,7 +52,7 @@ impl ResultStore for MockResultStore {
         task_id: celers_core::TaskId,
         result: TaskResultValue,
     ) -> celers_core::Result<()> {
-        self.results.lock().unwrap().insert(task_id, result);
+        self.results.lock().unwrap_or_else(|e| e.into_inner()).insert(task_id, result);
         Ok(())
     }
 
@@ -60,14 +60,14 @@ impl ResultStore for MockResultStore {
         &self,
         task_id: celers_core::TaskId,
     ) -> celers_core::Result<Option<TaskResultValue>> {
-        Ok(self.results.lock().unwrap().get(&task_id).cloned())
+        Ok(self.results.lock().unwrap_or_else(|e| e.into_inner()).get(&task_id).cloned())
     }
 
     async fn get_state(
         &self,
         task_id: celers_core::TaskId,
     ) -> celers_core::Result<celers_core::TaskState> {
-        let result = self.results.lock().unwrap().get(&task_id).cloned();
+        let result = self.results.lock().unwrap_or_else(|e| e.into_inner()).get(&task_id).cloned();
         Ok(match result {
             Some(TaskResultValue::Pending) => TaskState::Pending,
             Some(TaskResultValue::Received) => TaskState::Reserved,
@@ -84,12 +84,12 @@ impl ResultStore for MockResultStore {
     }
 
     async fn forget(&self, task_id: celers_core::TaskId) -> celers_core::Result<()> {
-        self.results.lock().unwrap().remove(&task_id);
+        self.results.lock().unwrap_or_else(|e| e.into_inner()).remove(&task_id);
         Ok(())
     }
 
     async fn has_result(&self, task_id: celers_core::TaskId) -> celers_core::Result<bool> {
-        Ok(self.results.lock().unwrap().contains_key(&task_id))
+        Ok(self.results.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&task_id))
     }
 }
 

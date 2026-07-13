@@ -65,6 +65,10 @@ pub struct MessageHeadersRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<DateTime<Utc>>,
 
+    /// Message creation timestamp (UTC)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+
     /// Additional custom headers
     #[serde(flatten)]
     pub extra: HashMap<Cow<'a, str>, serde_json::Value>,
@@ -151,6 +155,7 @@ impl<'a> MessageRef<'a> {
                 retries: None,
                 eta: None,
                 expires: None,
+                created_at: Some(Utc::now()),
                 extra: HashMap::new(),
             },
             properties: MessagePropertiesRef::default(),
@@ -213,6 +218,7 @@ impl<'a> MessageRef<'a> {
                 retries: self.headers.retries,
                 eta: self.headers.eta,
                 expires: self.headers.expires,
+                created_at: self.headers.created_at,
                 extra: self
                     .headers
                     .extra

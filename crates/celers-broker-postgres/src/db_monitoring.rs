@@ -1,20 +1,52 @@
 //! Database monitoring operations (table sizes, index usage, etc.)
 
 use celers_core::{CelersError, Result};
-use sqlx::Row;
+use oxisql_core::Connection;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::row_ext::RowExt;
 use crate::types::{DbTaskState, IndexUsageInfo, TableSizeInfo};
 use crate::PostgresBroker;
+
+/// Map an `IndexUsageInfo`-shaped row. Shared by [`PostgresBroker::get_index_usage`]
+/// and [`PostgresBroker::get_unused_indexes`], which select the same 7-column
+/// projection with only a differing `WHERE`/`ORDER BY`.
+fn row_to_index_usage_info(row: &oxisql_core::Row) -> Result<IndexUsageInfo> {
+    Ok(IndexUsageInfo {
+        index_name: row
+            .col("index_name")
+            .map_err(|e| CelersError::Other(format!("Failed to read index_name: {}", e)))?,
+        table_name: row
+            .col("table_name")
+            .map_err(|e| CelersError::Other(format!("Failed to read table_name: {}", e)))?,
+        index_scans: row
+            .col("index_scans")
+            .map_err(|e| CelersError::Other(format!("Failed to read index_scans: {}", e)))?,
+        tuples_read: row
+            .col("tuples_read")
+            .map_err(|e| CelersError::Other(format!("Failed to read tuples_read: {}", e)))?,
+        tuples_fetched: row
+            .col("tuples_fetched")
+            .map_err(|e| CelersError::Other(format!("Failed to read tuples_fetched: {}", e)))?,
+        index_size_bytes: row
+            .col("index_size_bytes")
+            .map_err(|e| CelersError::Other(format!("Failed to read index_size_bytes: {}", e)))?,
+        index_size_pretty: row
+            .col("index_size_pretty")
+            .map_err(|e| CelersError::Other(format!("Failed to read index_size_pretty: {}", e)))?,
+    })
+}
 
 impl PostgresBroker {
     // ========== Database Monitoring ==========
 
     /// Get table size information for CeleRS tables
     pub async fn get_table_sizes(&self) -> Result<Vec<TableSizeInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 relname as table_name,
                 n_live_tup as row_count,
@@ -26,20 +58,32 @@ impl PostgresBroker {
             WHERE relname LIKE 'celers_%'
             ORDER BY pg_total_relation_size(relid) DESC
             "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {}", e)))?;
 
         let mut tables = Vec::with_capacity(rows.len());
-        for row in rows {
+        for row in &rows {
             tables.push(TableSizeInfo {
-                table_name: row.get("table_name"),
-                row_count: row.get("row_count"),
-                total_size_bytes: row.get("total_size_bytes"),
-                table_size_bytes: row.get("table_size_bytes"),
-                index_size_bytes: row.get("index_size_bytes"),
-                total_size_pretty: row.get("total_size_pretty"),
+                table_name: row
+                    .col("table_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read table_name: {}", e)))?,
+                row_count: row
+                    .col("row_count")
+                    .map_err(|e| CelersError::Other(format!("Failed to read row_count: {}", e)))?,
+                total_size_bytes: row.col("total_size_bytes").map_err(|e| {
+                    CelersError::Other(format!("Failed to read total_size_bytes: {}", e))
+                })?,
+                table_size_bytes: row.col("table_size_bytes").map_err(|e| {
+                    CelersError::Other(format!("Failed to read table_size_bytes: {}", e))
+                })?,
+                index_size_bytes: row.col("index_size_bytes").map_err(|e| {
+                    CelersError::Other(format!("Failed to read index_size_bytes: {}", e))
+                })?,
+                total_size_pretty: row.col("total_size_pretty").map_err(|e| {
+                    CelersError::Other(format!("Failed to read total_size_pretty: {}", e))
+                })?,
             });
         }
         Ok(tables)
@@ -47,8 +91,10 @@ impl PostgresBroker {
 
     /// Get index usage statistics for CeleRS tables
     pub async fn get_index_usage(&self) -> Result<Vec<IndexUsageInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 indexrelname as index_name,
                 relname as table_name,
@@ -61,22 +107,14 @@ impl PostgresBroker {
             WHERE relname LIKE 'celers_%'
             ORDER BY idx_scan DESC
             "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get index usage: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get index usage: {}", e)))?;
 
         let mut indexes = Vec::with_capacity(rows.len());
-        for row in rows {
-            indexes.push(IndexUsageInfo {
-                index_name: row.get("index_name"),
-                table_name: row.get("table_name"),
-                index_scans: row.get("index_scans"),
-                tuples_read: row.get("tuples_read"),
-                tuples_fetched: row.get("tuples_fetched"),
-                index_size_bytes: row.get("index_size_bytes"),
-                index_size_pretty: row.get("index_size_pretty"),
-            });
+        for row in &rows {
+            indexes.push(row_to_index_usage_info(row)?);
         }
         Ok(indexes)
     }
@@ -85,8 +123,10 @@ impl PostgresBroker {
     ///
     /// This can help identify indexes that can be safely dropped.
     pub async fn get_unused_indexes(&self) -> Result<Vec<IndexUsageInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 indexrelname as index_name,
                 relname as table_name,
@@ -100,22 +140,14 @@ impl PostgresBroker {
               AND idx_scan = 0
             ORDER BY pg_relation_size(indexrelid) DESC
             "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get unused indexes: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get unused indexes: {}", e)))?;
 
         let mut indexes = Vec::with_capacity(rows.len());
-        for row in rows {
-            indexes.push(IndexUsageInfo {
-                index_name: row.get("index_name"),
-                table_name: row.get("table_name"),
-                index_scans: row.get("index_scans"),
-                tuples_read: row.get("tuples_read"),
-                tuples_fetched: row.get("tuples_fetched"),
-                index_size_bytes: row.get("index_size_bytes"),
-                index_size_pretty: row.get("index_size_pretty"),
-            });
+        for row in &rows {
+            indexes.push(row_to_index_usage_info(row)?);
         }
         Ok(indexes)
     }
@@ -124,20 +156,20 @@ impl PostgresBroker {
     ///
     /// This should be run periodically for optimal query performance.
     pub async fn analyze_tables(&self) -> Result<()> {
-        sqlx::query("ANALYZE celers_tasks")
-            .execute(&self.pool)
+        self.conn
+            .execute("ANALYZE celers_tasks", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to analyze celers_tasks: {}", e)))?;
 
-        sqlx::query("ANALYZE celers_dead_letter_queue")
-            .execute(&self.pool)
+        self.conn
+            .execute("ANALYZE celers_dead_letter_queue", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to analyze celers_dead_letter_queue: {}", e))
             })?;
 
-        sqlx::query("ANALYZE celers_task_results")
-            .execute(&self.pool)
+        self.conn
+            .execute("ANALYZE celers_task_results", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to analyze celers_task_results: {}", e))
@@ -152,20 +184,20 @@ impl PostgresBroker {
     /// This is useful for high-churn queues. For most cases, PostgreSQL's
     /// autovacuum is sufficient.
     pub async fn vacuum_tables(&self) -> Result<()> {
-        sqlx::query("VACUUM ANALYZE celers_tasks")
-            .execute(&self.pool)
+        self.conn
+            .execute("VACUUM ANALYZE celers_tasks", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to vacuum celers_tasks: {}", e)))?;
 
-        sqlx::query("VACUUM ANALYZE celers_dead_letter_queue")
-            .execute(&self.pool)
+        self.conn
+            .execute("VACUUM ANALYZE celers_dead_letter_queue", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to vacuum celers_dead_letter_queue: {}", e))
             })?;
 
-        sqlx::query("VACUUM ANALYZE celers_task_results")
-            .execute(&self.pool)
+        self.conn
+            .execute("VACUUM ANALYZE celers_task_results", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to vacuum celers_task_results: {}", e))
@@ -271,50 +303,65 @@ impl PostgresBroker {
     ///
     /// Returns the number of tasks in the specified state.
     pub async fn count_by_state(&self, state: DbTaskState) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE state = $1")
-            .bind(state.to_string())
-            .fetch_one(&self.pool)
+        let state_param = state.to_string();
+        let rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM celers_tasks WHERE state = $1",
+                &[&state_param],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to count tasks by state: {}", e)))?;
-
-        Ok(count)
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to count tasks by state: no rows returned".to_string())
+        })?;
+        // Unaliased `COUNT(*)`: positional access per the `RowExt`
+        // convention (see `row_ext.rs`).
+        row.col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))
     }
 
     /// Get the number of tasks scheduled for future execution
     ///
     /// Returns the count of tasks that are pending but scheduled for a future time.
     pub async fn count_scheduled(&self) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM celers_tasks WHERE state = 'pending' AND scheduled_at > NOW()",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to count scheduled tasks: {}", e)))?;
-
-        Ok(count)
+        let rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM celers_tasks WHERE state = 'pending' AND scheduled_at > NOW()",
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to count scheduled tasks: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to count scheduled tasks: no rows returned".to_string())
+        })?;
+        row.col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))
     }
 
     /// Cancel all pending tasks
     ///
     /// Returns the number of tasks cancelled.
     pub async fn cancel_all_pending(&self) -> Result<u64> {
-        let result = sqlx::query(
-            r#"
+        let affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW()
             WHERE state = 'pending'
             "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to cancel all pending tasks: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to cancel all pending tasks: {}", e))
+            })?;
 
-        tracing::warn!(
-            count = result.rows_affected(),
-            "Cancelled all pending tasks"
-        );
-        Ok(result.rows_affected())
+        tracing::warn!(count = affected, "Cancelled all pending tasks");
+        Ok(affected)
     }
 
     /// Test database connectivity
@@ -322,9 +369,16 @@ impl PostgresBroker {
     /// Performs a simple query to verify the connection is working.
     /// Returns true if the connection is healthy.
     pub async fn test_connection(&self) -> Result<bool> {
-        let result: i32 = sqlx::query_scalar("SELECT 1")
-            .fetch_one(&self.pool)
+        let rows = self
+            .conn
+            .query("SELECT 1", &[])
             .await
+            .map_err(|e| CelersError::Other(format!("Connection test failed: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Connection test failed: no rows returned".to_string())
+        })?;
+        let result: i32 = row
+            .col_idx(0)
             .map_err(|e| CelersError::Other(format!("Connection test failed: {}", e)))?;
 
         Ok(result == 1)
@@ -334,40 +388,56 @@ impl PostgresBroker {
     ///
     /// Returns None if there are no pending tasks.
     pub async fn oldest_pending_age_secs(&self) -> Result<Option<i64>> {
-        let age: Option<i64> = sqlx::query_scalar(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT EXTRACT(EPOCH FROM (NOW() - created_at))::BIGINT
             FROM celers_tasks
             WHERE state = 'pending'
             ORDER BY created_at ASC
             LIMIT 1
             "#,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get oldest pending age: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get oldest pending age: {}", e)))?;
 
-        Ok(age)
+        match rows.into_iter().next() {
+            Some(row) => row.col_idx(0).map_err(|e| {
+                CelersError::Other(format!("Failed to read oldest pending age: {}", e))
+            }),
+            None => Ok(None),
+        }
     }
 
     /// Get the age (in seconds) of the oldest processing task
     ///
     /// This is useful for detecting stuck tasks. Returns None if there are no processing tasks.
     pub async fn oldest_processing_age_secs(&self) -> Result<Option<i64>> {
-        let age: Option<i64> = sqlx::query_scalar(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT EXTRACT(EPOCH FROM (NOW() - started_at))::BIGINT
             FROM celers_tasks
             WHERE state = 'processing' AND started_at IS NOT NULL
             ORDER BY started_at ASC
             LIMIT 1
             "#,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get oldest processing age: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to get oldest processing age: {}", e))
+            })?;
 
-        Ok(age)
+        match rows.into_iter().next() {
+            Some(row) => row.col_idx(0).map_err(|e| {
+                CelersError::Other(format!("Failed to read oldest processing age: {}", e))
+            }),
+            None => Ok(None),
+        }
     }
 
     /// Get average task processing time for completed tasks (in milliseconds)
@@ -375,8 +445,10 @@ impl PostgresBroker {
     /// Calculates the average time between started_at and completed_at for recently completed tasks.
     /// Uses the last 1000 completed tasks by default.
     pub async fn avg_processing_time_ms(&self) -> Result<Option<f64>> {
-        let avg: Option<f64> = sqlx::query_scalar(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
             FROM (
                 SELECT started_at, completed_at
@@ -388,22 +460,29 @@ impl PostgresBroker {
                 LIMIT 1000
             ) recent_tasks
             "#,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| {
-            CelersError::Other(format!("Failed to calculate avg processing time: {}", e))
-        })?;
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to calculate avg processing time: {}", e))
+            })?;
 
-        Ok(avg)
+        match rows.into_iter().next() {
+            Some(row) => row.col_idx(0).map_err(|e| {
+                CelersError::Other(format!("Failed to read avg processing time: {}", e))
+            }),
+            None => Ok(None),
+        }
     }
 
     /// Get the retry rate (percentage of tasks that have been retried at least once)
     ///
     /// Returns a value between 0.0 and 100.0.
     pub async fn retry_rate(&self) -> Result<f64> {
-        let rate: Option<f64> = sqlx::query_scalar(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 CASE WHEN COUNT(*) > 0
                 THEN (COUNT(*) FILTER (WHERE retry_count > 0)::FLOAT / COUNT(*)::FLOAT * 100.0)
@@ -412,10 +491,16 @@ impl PostgresBroker {
             FROM celers_tasks
             WHERE state IN ('completed', 'failed', 'processing')
             "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to calculate retry rate: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to calculate retry rate: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to calculate retry rate: no rows returned".to_string())
+        })?;
+        let rate: Option<f64> = row
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read retry rate: {}", e)))?;
 
         Ok(rate.unwrap_or(0.0))
     }
@@ -424,8 +509,10 @@ impl PostgresBroker {
     ///
     /// Returns a value between 0.0 and 100.0.
     pub async fn success_rate(&self) -> Result<f64> {
-        let rate: Option<f64> = sqlx::query_scalar(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 CASE WHEN COUNT(*) > 0
                 THEN (COUNT(*) FILTER (WHERE state = 'completed')::FLOAT / COUNT(*)::FLOAT * 100.0)
@@ -434,10 +521,16 @@ impl PostgresBroker {
             FROM celers_tasks
             WHERE state IN ('completed', 'failed')
             "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to calculate success rate: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to calculate success rate: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to calculate success rate: no rows returned".to_string())
+        })?;
+        let rate: Option<f64> = row
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read success rate: {}", e)))?;
 
         Ok(rate.unwrap_or(0.0))
     }

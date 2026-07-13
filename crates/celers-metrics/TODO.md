@@ -2,11 +2,11 @@
 
 > Prometheus metrics integration for CeleRS monitoring
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 183**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 319 unit + 48 doc**
 
-## Status: ✅ FEATURE COMPLETE + ENHANCED WITH ADVANCED ANALYTICS & PRODUCTION-READY TOOLS + VALIDATION & REGISTRY + EXPORT UTILITIES + SLA & HEALTH MANAGEMENT + CAPACITY PLANNING + ALERT HISTORY + QUERY BUILDER
+## Status: ✅ FEATURE COMPLETE + ENHANCED WITH ADVANCED ANALYTICS & PRODUCTION-READY TOOLS + VALIDATION & REGISTRY + EXPORT UTILITIES + SLA & HEALTH MANAGEMENT + CAPACITY PLANNING + ALERT HISTORY + QUERY BUILDER + NATIVE HISTOGRAMS/SUMMARIES + STATSD BACKEND + STATEFUL SLO TRACKING + ANOMALY DETECTION + AUDIT LOG (0.3.0)
 
-Complete Prometheus metrics implementation with comprehensive task queue monitoring, multi-backend export support, and advanced analytics capabilities including time-series analysis, auto-scaling recommendations, forecasting (linear & exponential), cost estimation with optimization recommendations, cardinality protection, trend-based alerting, correlation analysis, windowed statistics, adaptive sampling, metric export batching, label sanitization and validation, histogram heatmap generation, dynamic metric registry, resource usage tracking, **JSON/CSV export utilities**, **performance profiling utilities**, **SLA reporting**, **alert debouncing**, **health scoring**, **metric retention management**, **capacity planning and resource exhaustion prediction**, **alert history tracking**, **Prometheus query builder**, and **metric collection scheduler**.
+Complete Prometheus metrics implementation with comprehensive task queue monitoring, multi-backend export support, and advanced analytics capabilities including time-series analysis, auto-scaling recommendations, forecasting (linear & exponential), cost estimation with optimization recommendations, cardinality protection, trend-based alerting, correlation analysis, windowed statistics, adaptive sampling, metric export batching, label sanitization and validation, histogram heatmap generation, dynamic metric registry, resource usage tracking, **JSON/CSV export utilities**, **performance profiling utilities**, **SLA reporting**, **alert debouncing**, **health scoring**, **metric retention management**, **capacity planning and resource exhaustion prediction**, **alert history tracking**, **Prometheus query builder**, **metric collection scheduler**, and — new in 0.3.0 — **dependency-free native Prometheus histograms/summaries with a P² streaming quantile estimator**, **a pure-UDP StatsD backend**, **stateful SLA/SLO tracking with error-budget burn-rate alerting**, **an online statistical anomaly detector**, and **a task lifecycle audit log** (ring-buffer + JSONL sinks).
 
 ## Completed Features
 
@@ -82,6 +82,33 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
 - [x] `celers_task_execution_seconds` - Task execution time distribution
   - Buckets: 1ms, 10ms, 100ms, 500ms, 1s, 5s, 10s, 30s, 60s, 300s
 
+#### Enhanced Prometheus Metrics (percentiles, histograms) ✅ (NEW)
+- [x] **Native histogram** (`NativeHistogram`, dependency-free) ✅
+  - [x] Configurable cumulative buckets with sort + validation
+  - [x] Thread-safe `observe(value)` (atomic per-bucket counters)
+  - [x] Cumulative exposition: `<name>_bucket{le="..."}` incl. mandatory `le="+Inf"`
+  - [x] `<name>_sum` and `<name>_count` series
+  - [x] Linear bucket helper (`linear_buckets`, `with_linear_buckets`)
+  - [x] Exponential bucket helper (`exponential_buckets`, `with_exponential_buckets`)
+  - [x] `cumulative_count` / `cumulative_counts` / `reset` accessors
+- [x] **Native summary with streaming quantiles** (`NativeSummary`, dependency-free) ✅
+  - [x] P² (P-Square) streaming quantile estimator implemented natively (no external crate)
+  - [x] Constant memory per quantile (5 markers, no samples stored)
+  - [x] Configurable target quantiles + `with_default_quantiles` (p50/p90/p99)
+  - [x] Exposition: `<name>{quantile="..."}`, `<name>_sum`, `<name>_count`
+  - [x] `quantile` / `quantile_estimates` / `reset` accessors
+- [x] **Enhanced registry + exposition integration** ✅
+  - [x] `EnhancedMetricsRegistry` (register/retrieve native histograms & summaries)
+  - [x] Process-global registry + `register_global_histogram` / `register_global_summary`
+  - [x] `gather_enhanced_metrics()` merges static `prometheus` output with native metrics
+  - [x] `format_float()` Prometheus-compliant float formatting (`+Inf`/`-Inf`/`NaN`)
+- [x] **Tests** (`tests_enhanced.rs`, 33 unit tests) ✅
+  - [x] Bucket counting + cumulative monotonicity
+  - [x] `+Inf` bucket == total count
+  - [x] Quantile accuracy on uniform 1..=1000 (p50/p90/p99 within tolerance)
+  - [x] Exact exposition-format strings (histogram + summary)
+  - [x] Bucket helper correctness + error cases; registry idempotency & combined gather
+
 ### Utilities ✅
 - [x] `gather_metrics()` - Export metrics in Prometheus format
 - [x] `reset_metrics()` - Reset all counters (for testing)
@@ -136,6 +163,20 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
 - [x] Metric aggregation across workers ✅
 - [x] SLO/SLA tracking ✅
 - [x] Anomaly detection helpers ✅
+- [x] **SLA/SLO tracking & alerting (stateful, rolling-window)** ✅ (`slo_tracker` module)
+  - [x] `Slo` - objective definition (`availability` / `latency` constructors, builder for window/warmup/burn-rate)
+  - [x] `SloKind` - `Availability` and `LatencyThreshold { threshold_seconds, report_percentile }` indicators
+  - [x] `SloWindow` - rolling `Events(n)` or `Seconds(d)` evaluation window
+  - [x] `SloTracker` - feed `record_success`/`record_failure`/`record_outcome`/`record_latency`, O(1) rolling eviction
+  - [x] `ErrorBudget` - allowed/consumed/remaining, remaining fraction, burn rate (float-floor robust)
+  - [x] `SloStatus` + `SloState` - `Warming`/`Healthy`/`AtRisk`/`Exhausted`/`Breaching` with alerting + human-readable message
+  - [x] Rolling-percentile (p99) reporting for latency SLOs (via `calculate_percentile`)
+- [x] **Anomaly detection for task failures (online statistical detector)** ✅ (`anomaly` module)
+  - [x] `AnomalyDetector` - online EWMA mean+variance, rolling z-score, constant memory
+  - [x] `AnomalyDetectorConfig` - alpha, sigma threshold, warm-up, `update_on_anomaly`, `min_std_dev`
+  - [x] `AnomalyVerdict` - `Warmup`/`Normal`/`High`/`Low` with signed z-score + `is_anomaly()`
+  - [x] Warm-up handling, baseline-poisoning guard (anomalies excluded from baseline by default)
+  - [x] Non-mutating `score()`, batch `observe_all()`, `reset()`
 - [x] Rate calculation helpers ✅
 - [x] Current metrics snapshot utility ✅
 - [x] Health check utilities ✅
@@ -149,6 +190,9 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
   - [x] Moving average computation
   - [x] Min/max tracking
   - [x] Historical sample retrieval
+  - [x] **Data Integrity fix (0.3.0)**: `MetricHistory::remove_samples_older_than()` — the method
+    `MetricRetentionManager::apply_retention()` was already calling — is now implemented
+    (`history.rs`)
 - [x] **Auto-scaling recommendations** ✅
   - [x] `AutoScalingConfig` - Configure scaling parameters
   - [x] `recommend_scaling()` - Generate scaling recommendations
@@ -168,6 +212,10 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
   - [x] Compute cost tracking (worker-hours)
   - [x] Task execution cost tracking
   - [x] Cost breakdown (compute, tasks, data)
+  - [x] **Data Integrity fix (0.3.0)**: `estimate_costs()` previously hardcoded the data-transfer
+    cost component to `0.0`; it now computes a real value from a new
+    `TOTAL_PAYLOAD_BYTES_PROCESSED` counter (`record_payload_bytes()`, `prometheus_metrics.rs`),
+    so `CostConfig::cost_per_gb` is live configuration instead of dead code
 - [x] **Cardinality protection** ✅
   - [x] `CardinalityLimiter` - Prevent label explosion in production
   - [x] Track unique label combinations
@@ -333,9 +381,35 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
   - [x] `mark_collected()` - Mark task as collected
   - [x] Interval-based scheduling
   - [x] Task registration and management
+- [x] **Audit log for task lifecycle events** ✅ (NEW) (`audit` module)
+  - [x] `AuditEntry` - timestamp, task id/name, event kind, optional actor/worker, before/after state, free-form metadata (`BTreeMap`)
+  - [x] `AuditEventKind` - `Sent`/`Received`/`Started`/`Succeeded`/`Failed`/`Retried`/`Revoked` (+ `as_str`/`FromStr`/`is_terminal`)
+  - [x] `AuditSink` trait - append-only, `Send + Sync`, panic-free `record`/`record_all`/`len`/`is_empty`
+  - [x] `AuditQuery` - composable filter by task id / event kind(s) / inclusive time range
+  - [x] `RingBufferAuditSink` - in-memory bounded ring buffer, evicts oldest at capacity, poison-safe locking
+  - [x] `JsonlAuditSink` - append-only JSON Lines file sink (`try_record`/`try_record_all`/`load_entries`/`load_report`/`query`/`clear`)
+  - [x] Dependency-free hand-written JSON serialize + recursive-descent parser (no `serde`)
+  - [x] Malformed-line tolerance on reload (`JsonlLoadReport` captures per-line parse errors)
 
 ### Alternative Backends
 - [x] StatsD backend ✅
+  - [x] `StatsDConfig` - StatsD wire format support with tags (formatting helper)
+  - [x] **StatsD metrics backend** (`statsd` module, dependency-free UDP) ✅
+    - [x] `StatsdMetricKind` - counter/gauge/gauge-delta/timer/histogram/set wire types
+    - [x] `format_statsd_line()` - pure per-kind line formatter
+      (`name:value|c|g|ms|h|s`) with optional sample rate (`|@0.1`) and
+      DogStatsD tags (`|#k:v,...`)
+    - [x] `sanitize_statsd_name()` - replace illegal wire chars (`:|@#`/whitespace)
+    - [x] `StatsdMetric` - owned metric builder (`counter`/`gauge`/`gauge_delta`/
+      `timer`/`histogram`/`set`, `with_sample_rate`, `with_tag`)
+    - [x] `pack_statsd_lines()` - batch lines into newline-separated packets
+      respecting a max packet size
+    - [x] `StatsdExporter` - UDP exporter over `std::net::UdpSocket`, fallible
+      (non-panicking) construction (`connect`/`connect_with_packet_size`/
+      `from_socket`), `send`/`send_batch`/`send_lines` with batching
+    - [x] `StatsdError` - typed, non-panicking error type
+    - [x] `statsd_lines_from_current()` + `StatsdExporter::send_current_metrics()`
+      - registry-integrated path serializing `CurrentMetrics`
 - [x] OpenTelemetry metrics ✅
 - [x] CloudWatch metrics ✅
 - [x] Datadog integration ✅
@@ -348,7 +422,9 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
 
 ## Testing Status
 
-**Total: 183 tests passing** (unit + doc + integration-style)
+**Total: 319 unit + 48 doc tests passing** (unit + doc + integration-style) — verified 2026-07-13
+via `cargo nextest run -p celers-metrics --all-features` and
+`cargo test --doc -p celers-metrics --all-features`
 
 - [x] Unit tests for metrics increment (1 test)
 - [x] Unit tests for execution time (1 test)
@@ -361,6 +437,18 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
 - [x] Unit tests for concurrent access (1 test) ✅
 - [x] Unit tests for sampled observations (1 test)
 - [x] Unit tests for anomaly detection (4 tests) ✅
+- [x] **Unit tests for stateful SLO tracker** (18 tests) ✅
+  - [x] Error-budget math: 99% over 1000 allows 10 failures; 11 breaches; half/untouched budget
+  - [x] Burn-rate math (2.0x over-budget, 1.0x on-budget, 0.5x slow, undefined for objective 1.0)
+  - [x] Float-floor robustness regression (50 * (1-0.80) allows 10, not 9)
+  - [x] Tracker states: met-on-budget (Exhausted), over-budget (Breaching), Healthy, AtRisk, Warming
+  - [x] Rolling event-window eviction, latency SLO classification + p99 reporting + breach
+  - [x] Empty window, reset, record_outcome dispatch
+- [x] **Unit tests for online anomaly detector** (12 tests) ✅
+  - [x] Warm-up returns no anomaly (even for a spike during warm-up)
+  - [x] Flags injected high/low spikes (z-score beyond sigma); no false positives on in-distribution noise
+  - [x] Baseline-poisoning guard (default) vs. `update_on_anomaly` adaptation
+  - [x] Flat-stream `min_std_dev` floor, non-mutating `score()`, warm-up `score()` None, `observe_all`, `reset`, verdict helpers
 - [x] Unit tests for metric stats (2 tests) ✅
 - [x] Unit tests for metric aggregator (2 tests) ✅
 - [x] Unit tests for custom labels (4 tests) ✅
@@ -511,6 +599,12 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
   - [x] Collection task basics
   - [x] Scheduler registration
   - [x] Should collect timing
+- [x] **Unit tests for task lifecycle audit log** (30 tests) ✅ (NEW, `audit.rs`)
+  - [x] `AuditEntry` construction, builders (`with_worker`/`with_actor`/`with_metadata`/`with_state`)
+  - [x] `AuditEventKind` `as_str`/`FromStr`/`is_terminal` round-trips
+  - [x] `RingBufferAuditSink`: capacity eviction, poison-safe locking, `query`/`query_by_task_id`
+  - [x] `JsonlAuditSink`: append/reload round-trip, `JsonlLoadReport` malformed-line tolerance
+  - [x] Hand-written JSON serialize/parse (no `serde`) round-trips, including edge cases
 - [x] Integration-style tests (7 tests) ✅
   - [x] Complete worker lifecycle simulation
   - [x] Broker operations simulation
@@ -521,10 +615,23 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
   - [x] Delayed task scheduling
 - [x] Performance impact testing ✅
 
-**Total: 183 tests (172 unit + 4 profiling + 14 new features + 7 integration-style) - All passing ✅**
-**Doc tests: 31 tests (29 original + 2 new features) - All passing ✅**
-**Benchmarks: 33 performance benchmarks - All working ✅** (includes benchmarks for all features)
-**Clippy warnings: 0 ✅**
+**Total: 319 unit tests (incl. 18 SLO-tracker + 12 anomaly-detector + 30 audit-log) - All passing ✅**
+**Doc tests: 48 tests (incl. slo_tracker + anomaly + audit module examples) - All passing ✅**
+**Benchmarks: 51 benchmark cases across 27 groups - builds clean** (`cargo bench -p celers-metrics --no-run --all-features`, includes benchmarks for all features)
+**Clippy warnings: 0 ✅** (`cargo clippy -p celers-metrics --all-features --all-targets`, verified 2026-07-13)
+
+## Deferred / Known Follow-Ups (OPEN)
+
+- **[OPEN — deferred by user]** `src/tests_core.rs` is exactly 2000 lines — at the workspace's
+  refactor-policy threshold (files should be under 2000 lines). Found during the 0.3.0
+  release-check; splitting was explicitly deferred to a dedicated follow-up session rather than
+  bundled into this docs refresh. Recommended tool: `splitrs` (SMT-solver-assisted Rust file
+  splitter). Candidate split boundaries: the file currently covers metrics-config/sampling, rate
+  calculations, SLO compliance helpers, anomaly-threshold helpers, aggregation, custom labels,
+  distributed aggregation, backend integration, health checks, percentiles, comparisons, alert
+  rules, and cost estimation — several of these already have dedicated sibling modules
+  (`slo.rs`, `anomaly.rs`, `aggregation.rs`, `health.rs`, `alerts.rs`) whose own tests live
+  elsewhere, so a first pass could relocate `tests_core.rs` cases to match their subject module.
 
 ## Documentation
 

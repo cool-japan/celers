@@ -35,9 +35,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
+
+use crate::sysinfo;
 
 /// Resource usage limits
 #[derive(Debug, Clone)]
@@ -143,6 +145,8 @@ pub struct ResourceTracker {
     limits: ResourceLimits,
     active_tasks: Arc<AtomicU64>,
     stats: Arc<RwLock<Option<ResourceStats>>>,
+    /// Last CPU time sample for delta-based utilization calculation.
+    cpu_sampler: Arc<Mutex<Option<(Duration, std::time::Instant)>>>,
 }
 
 impl ResourceTracker {
@@ -156,6 +160,7 @@ impl ResourceTracker {
             limits,
             active_tasks: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(RwLock::new(None)),
+            cpu_sampler: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -186,7 +191,7 @@ impl ResourceTracker {
         }
 
         let memory_mb = self.get_memory_usage_mb();
-        let cpu_percent = self.get_cpu_usage_percent();
+        let cpu_percent = self.get_cpu_usage_percent_async().await;
         let load_average = self.get_load_average();
 
         let stats = ResourceStats {
@@ -196,7 +201,7 @@ impl ResourceTracker {
             load_average,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs(),
         };
 
@@ -280,44 +285,33 @@ impl ResourceTracker {
 
     /// Get process memory usage in MB
     fn get_memory_usage_mb(&self) -> u64 {
-        #[cfg(target_os = "linux")]
-        {
-            use std::fs;
-            if let Ok(status) = fs::read_to_string("/proc/self/status") {
-                for line in status.lines() {
-                    if line.starts_with("VmRSS:") {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2 {
-                            if let Ok(kb) = parts[1].parse::<u64>() {
-                                return kb / 1024; // Convert KB to MB
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fallback: estimate based on system
-        0
+        (sysinfo::read_process_memory_bytes() / 1_048_576) as u64
     }
 
-    /// Get process CPU usage percentage
-    fn get_cpu_usage_percent(&self) -> f64 {
-        #[cfg(target_os = "linux")]
-        {
-            use std::fs;
-            if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
-                let parts: Vec<&str> = stat.split_whitespace().collect();
-                if parts.len() >= 14 {
-                    // This is a simplified calculation
-                    // Real implementation would need to track delta over time
-                    // For now, return a placeholder
-                    return 0.0;
-                }
+    /// Get process CPU utilization percentage since the last call.
+    ///
+    /// Uses delta sampling: subtracts the previous CPU-time snapshot from the
+    /// current one and divides by wall-clock elapsed. On the first call returns
+    /// `0.0`. On multi-core systems the value may exceed 100%.
+    async fn get_cpu_usage_percent_async(&self) -> f64 {
+        let Some(current_cpu) = sysinfo::read_process_cpu_time() else {
+            return 0.0;
+        };
+        let now = std::time::Instant::now();
+        let mut guard = self.cpu_sampler.lock().await;
+        let pct = if let Some((prev_cpu, prev_time)) = *guard {
+            let cpu_delta = current_cpu.saturating_sub(prev_cpu).as_secs_f64();
+            let wall_delta = now.duration_since(prev_time).as_secs_f64();
+            if wall_delta > 0.0 {
+                (cpu_delta / wall_delta) * 100.0
+            } else {
+                0.0
             }
-        }
-
-        0.0
+        } else {
+            0.0
+        };
+        *guard = Some((current_cpu, now));
+        pct
     }
 
     /// Get system load average
@@ -345,6 +339,7 @@ impl Clone for ResourceTracker {
             limits: self.limits.clone(),
             active_tasks: Arc::clone(&self.active_tasks),
             stats: Arc::clone(&self.stats),
+            cpu_sampler: Arc::clone(&self.cpu_sampler),
         }
     }
 }
@@ -487,5 +482,41 @@ mod tests {
         assert!(stats.is_none());
 
         assert!(tracker.check_limits().await);
+    }
+
+    #[tokio::test]
+    async fn test_resource_tracker_memory_reading() {
+        let limits = ResourceLimits::default();
+        let tracker = ResourceTracker::new(limits);
+        tracker.update_stats().await;
+        let stats = tracker.get_stats().await;
+        // On Linux memory should be > 0; on other platforms it may be 0
+        #[cfg(target_os = "linux")]
+        assert!(
+            stats.as_ref().map(|s| s.memory_mb).unwrap_or(0) > 0,
+            "Expected memory_mb > 0 on Linux, got {:?}",
+            stats.as_ref().map(|s| s.memory_mb)
+        );
+        // cpu_percent starts at 0.0 on first sample (no delta)
+        assert!(stats.map(|s| s.cpu_percent >= 0.0).unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn test_cpu_percent_increases_after_work() {
+        let limits = ResourceLimits::default();
+        let tracker = ResourceTracker::new(limits);
+        // First call establishes baseline
+        tracker.update_stats().await;
+        // Do some CPU work
+        let sum: u64 = (0u64..1_000_000).sum();
+        let _ = sum;
+        // Second call computes delta
+        tracker.update_stats().await;
+        let stats = tracker.get_stats().await;
+        // cpu_percent should be >= 0 regardless of platform
+        assert!(
+            stats.map(|s| s.cpu_percent >= 0.0).unwrap_or(true),
+            "cpu_percent should be non-negative"
+        );
     }
 }

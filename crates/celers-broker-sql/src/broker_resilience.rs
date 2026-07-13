@@ -7,11 +7,12 @@ use crate::broker_core::MysqlBroker;
 use crate::circuit_breaker::{
     CircuitBreakerState, CircuitBreakerStats, IdempotencyRecord, IdempotencyStats,
 };
+use crate::row_ext::RowExt;
 use crate::types::*;
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use chrono::{DateTime, Utc};
+use oxisql_core::Connection;
 use serde_json::json;
-use sqlx::Row;
 use uuid::Uuid;
 
 #[cfg(feature = "metrics")]
@@ -75,23 +76,26 @@ impl MysqlBroker {
                 }
             }
         }
+        let metadata_str = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
 
-        sqlx::query(
-            r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
-            "#,
-        )
-        .bind(task_id.to_string())
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(retry_policy.max_retries as i32)
-        .bind(serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string()))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                "#,
+                &[
+                    &task_id.to_string(),
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(retry_policy.max_retries as i32),
+                    &metadata_str,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
 
         #[cfg(feature = "metrics")]
         {
@@ -138,13 +142,16 @@ impl MysqlBroker {
         // Extract retry policy from metadata
         let retry_delay_secs = if let Ok(Some(task)) = self.get_task(task_id).await {
             // Try to get retry policy from metadata
-            let metadata_str =
-                sqlx::query_scalar::<_, String>("SELECT metadata FROM celers_tasks WHERE id = ?")
-                    .bind(task_id.to_string())
-                    .fetch_optional(&self.pool)
-                    .await
-                    .ok()
-                    .flatten();
+            let metadata_str: Option<String> = self
+                .connection()
+                .query(
+                    "SELECT metadata FROM celers_tasks WHERE id = ?",
+                    &[&task_id.to_string()],
+                )
+                .await
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .and_then(|row| row.col::<String>("metadata").ok());
 
             if let Some(meta_str) = metadata_str {
                 if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
@@ -170,25 +177,28 @@ impl MysqlBroker {
         };
 
         // Update task with retry scheduling
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'pending',
-                retry_count = retry_count + 1,
-                error_message = ?,
-                scheduled_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
-                started_at = NULL
-            WHERE id = ? AND state = 'processing'
-            "#,
-        )
-        .bind(error_message)
-        .bind(retry_delay_secs as i64)
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to reject task: {}", e)))?;
+        let affected = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'pending',
+                    retry_count = retry_count + 1,
+                    error_message = ?,
+                    scheduled_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
+                    started_at = NULL
+                WHERE id = ? AND state = 'processing'
+                "#,
+                &[
+                    &error_message,
+                    &(retry_delay_secs as i64),
+                    &task_id.to_string(),
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to reject task: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Register a recurring task
@@ -227,23 +237,22 @@ impl MysqlBroker {
         let config_id = Uuid::new_v4().to_string();
         let config_json = serde_json::to_string(&config)
             .map_err(|e| CelersError::Other(format!("Failed to serialize config: {}", e)))?;
+        let recurring_name = format!("__recurring__{}", config.task_name);
 
-        sqlx::query(
-            r#"
-            INSERT INTO celers_task_results
-                (task_id, task_name, status, result, created_at)
-            VALUES (?, ?, 'PENDING', ?, NOW())
-            ON DUPLICATE KEY UPDATE
-                result = VALUES(result),
-                created_at = NOW()
-            "#,
-        )
-        .bind(&config_id)
-        .bind(format!("__recurring__{}", config.task_name))
-        .bind(&config_json)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to register recurring task: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                INSERT INTO celers_task_results
+                    (task_id, task_name, status, result, created_at)
+                VALUES (?, ?, 'PENDING', ?, NOW())
+                ON DUPLICATE KEY UPDATE
+                    result = VALUES(result),
+                    created_at = NOW()
+                "#,
+                &[&config_id, &recurring_name, &config_json],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to register recurring task: {}", e)))?;
 
         tracing::info!(
             config_id = config_id,
@@ -275,24 +284,30 @@ impl MysqlBroker {
     /// ```
     pub async fn process_recurring_tasks(&self) -> Result<u64> {
         // Get all recurring task configurations
-        let rows = sqlx::query(
-            r#"
-            SELECT task_id, result
-            FROM celers_task_results
-            WHERE task_name LIKE '__recurring__%'
-              AND status = 'PENDING'
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT task_id, result
+                FROM celers_task_results
+                WHERE task_name LIKE '__recurring__%'
+                  AND status = 'PENDING'
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {}", e)))?;
 
         let mut enqueued = 0u64;
         let now = Utc::now();
 
         for row in rows {
-            let config_id: String = row.get("task_id");
-            let config_json: String = row.get("result");
+            let config_id: String = row
+                .col("task_id")
+                .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {e}")))?;
+            let config_json: String = row
+                .col("result")
+                .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {e}")))?;
 
             let mut config: RecurringTaskConfig =
                 serde_json::from_str(&config_json).map_err(|e| {
@@ -317,17 +332,17 @@ impl MysqlBroker {
                     let updated_json = serde_json::to_string(&config).unwrap_or(config_json);
 
                     // Update configuration
-                    let _ = sqlx::query(
-                        r#"
-                        UPDATE celers_task_results
-                        SET result = ?
-                        WHERE task_id = ?
-                        "#,
-                    )
-                    .bind(&updated_json)
-                    .bind(&config_id)
-                    .execute(&self.pool)
-                    .await;
+                    let _ = self
+                        .connection()
+                        .execute(
+                            r#"
+                            UPDATE celers_task_results
+                            SET result = ?
+                            WHERE task_id = ?
+                            "#,
+                            &[&updated_json, &config_id],
+                        )
+                        .await;
 
                     tracing::debug!(
                         config_id = config_id,
@@ -354,22 +369,28 @@ impl MysqlBroker {
     /// # Returns
     /// List of recurring task configurations
     pub async fn list_recurring_tasks(&self) -> Result<Vec<(String, RecurringTaskConfig)>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT task_id, result
-            FROM celers_task_results
-            WHERE task_name LIKE '__recurring__%'
-              AND status = 'PENDING'
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT task_id, result
+                FROM celers_task_results
+                WHERE task_name LIKE '__recurring__%'
+                  AND status = 'PENDING'
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {}", e)))?;
 
         let mut configs = Vec::new();
         for row in rows {
-            let config_id: String = row.get("task_id");
-            let config_json: String = row.get("result");
+            let config_id: String = row
+                .col("task_id")
+                .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {e}")))?;
+            let config_json: String = row
+                .col("result")
+                .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {e}")))?;
 
             if let Ok(config) = serde_json::from_str::<RecurringTaskConfig>(&config_json) {
                 configs.push((config_id, config));
@@ -387,18 +408,19 @@ impl MysqlBroker {
     /// # Returns
     /// true if configuration was deleted
     pub async fn delete_recurring_task(&self, config_id: &str) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM celers_task_results
-            WHERE task_id = ? AND task_name LIKE '__recurring__%'
-            "#,
-        )
-        .bind(config_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to delete recurring task: {}", e)))?;
+        let affected = self
+            .connection()
+            .execute(
+                r#"
+                DELETE FROM celers_task_results
+                WHERE task_id = ? AND task_name LIKE '__recurring__%'
+                "#,
+                &[&config_id],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to delete recurring task: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Export tasks to JSON format for backup or migration
@@ -438,38 +460,50 @@ impl MysqlBroker {
             "#,
         );
 
-        if let Some(s) = &state {
-            query.push_str(&format!(" WHERE state = '{}'", s));
+        if state.is_some() {
+            query.push_str(" WHERE state = ?");
         }
 
         query.push_str(" ORDER BY created_at ASC");
 
-        if let Some(l) = limit {
-            query.push_str(&format!(" LIMIT {}", l));
+        if limit.is_some() {
+            query.push_str(" LIMIT ?");
         }
 
-        let rows = sqlx::query(&query)
-            .fetch_all(&self.pool)
+        // Placeholder order matches param push order below — only the `?`
+        // *count* (never a value) was conditionally appended to `query`.
+        let state_str = state.as_ref().map(|s| s.to_string());
+        let mut param_refs: Vec<&dyn oxisql_core::ToSqlValue> = Vec::new();
+        if let Some(s) = &state_str {
+            param_refs.push(s);
+        }
+        if let Some(l) = &limit {
+            param_refs.push(l);
+        }
+
+        let rows = self
+            .connection()
+            .query(&query, &param_refs)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to export tasks: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
             let task = serde_json::json!({
-                "id": row.get::<String, _>("id"),
-                "task_name": row.get::<String, _>("task_name"),
-                "payload": row.get::<Vec<u8>, _>("payload"),
-                "state": row.get::<String, _>("state"),
-                "priority": row.get::<i32, _>("priority"),
-                "retry_count": row.get::<i32, _>("retry_count"),
-                "max_retries": row.get::<i32, _>("max_retries"),
-                "created_at": row.get::<DateTime<Utc>, _>("created_at"),
-                "scheduled_at": row.get::<DateTime<Utc>, _>("scheduled_at"),
-                "started_at": row.get::<Option<DateTime<Utc>>, _>("started_at"),
-                "completed_at": row.get::<Option<DateTime<Utc>>, _>("completed_at"),
-                "worker_id": row.get::<Option<String>, _>("worker_id"),
-                "error_message": row.get::<Option<String>, _>("error_message"),
-                "metadata": row.get::<String, _>("metadata"),
+                "id": row.col::<String>("id").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "task_name": row.col::<String>("task_name").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "payload": row.col::<Vec<u8>>("payload").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "state": row.col::<String>("state").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "priority": row.col::<i32>("priority").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "retry_count": row.col::<i32>("retry_count").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "max_retries": row.col::<i32>("max_retries").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "created_at": row.col::<DateTime<Utc>>("created_at").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "scheduled_at": row.col::<DateTime<Utc>>("scheduled_at").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "started_at": row.col::<Option<DateTime<Utc>>>("started_at").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "completed_at": row.col::<Option<DateTime<Utc>>>("completed_at").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "worker_id": row.col::<Option<String>>("worker_id").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "error_message": row.col::<Option<String>>("error_message").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
+                "metadata": row.col::<String>("metadata").map_err(|e| CelersError::Other(format!("Failed to export tasks: {e}")))?,
             });
             tasks.push(task);
         }
@@ -516,14 +550,24 @@ impl MysqlBroker {
 
             // Check if task already exists
             if skip_existing {
-                let exists: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE id = ?")
-                        .bind(id)
-                        .fetch_one(&self.pool)
-                        .await
-                        .map_err(|e| {
-                            CelersError::Other(format!("Failed to check task existence: {}", e))
-                        })?;
+                let exists_rows = self
+                    .connection()
+                    .query(
+                        "SELECT COUNT(*) AS c FROM celers_tasks WHERE id = ?",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(|e| {
+                        CelersError::Other(format!("Failed to check task existence: {}", e))
+                    })?;
+                let exists: i64 = exists_rows
+                    .first()
+                    .map(|r| r.col("c"))
+                    .transpose()
+                    .map_err(|e| {
+                        CelersError::Other(format!("Failed to check task existence: {e}"))
+                    })?
+                    .unwrap_or(0);
 
                 if exists > 0 {
                     tracing::debug!(task_id = id, "Skipping existing task");
@@ -532,34 +576,84 @@ impl MysqlBroker {
             }
 
             // Insert task
-            let result = sqlx::query(
-                r#"
-                INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, retry_count, max_retries,
-                     created_at, scheduled_at, started_at, completed_at, worker_id, error_message, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(id)
-            .bind(task["task_name"].as_str().unwrap_or(""))
-            .bind(task["payload"].as_array().map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u8))
-                    .collect::<Vec<u8>>()
-            }).unwrap_or_default())
-            .bind(task["state"].as_str().unwrap_or("pending"))
-            .bind(task["priority"].as_i64().unwrap_or(0) as i32)
-            .bind(task["retry_count"].as_i64().unwrap_or(0) as i32)
-            .bind(task["max_retries"].as_i64().unwrap_or(3) as i32)
-            .bind(task["created_at"].as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(Utc::now))
-            .bind(task["scheduled_at"].as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(Utc::now))
-            .bind(task["started_at"].as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)))
-            .bind(task["completed_at"].as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)))
-            .bind(task["worker_id"].as_str())
-            .bind(task["error_message"].as_str())
-            .bind(task["metadata"].as_str().unwrap_or("{}"))
-            .execute(&self.pool)
-            .await;
+            let payload: Vec<u8> = task["payload"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u8))
+                        .collect::<Vec<u8>>()
+                })
+                .unwrap_or_default();
+            let task_name = task["task_name"].as_str().unwrap_or("");
+            let state = task["state"].as_str().unwrap_or("pending");
+            let priority = task["priority"].as_i64().unwrap_or(0) as i32;
+            let retry_count = task["retry_count"].as_i64().unwrap_or(0) as i32;
+            let max_retries = task["max_retries"].as_i64().unwrap_or(3) as i32;
+            // MySQL DATETIME/TIMESTAMP parameter convention — see
+            // `row_ext.rs`'s "DateTime<Utc> parameter convention (MySQL)"
+            // section. Source JSON stores RFC3339 (from a prior
+            // `export_tasks` call, or hand-authored); parse then reformat.
+            let created_at = task["created_at"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now)
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string();
+            let scheduled_at = task["scheduled_at"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now)
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string();
+            let started_at = task["started_at"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| {
+                    dt.with_timezone(&Utc)
+                        .format("%Y-%m-%d %H:%M:%S%.6f")
+                        .to_string()
+                });
+            let completed_at = task["completed_at"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| {
+                    dt.with_timezone(&Utc)
+                        .format("%Y-%m-%d %H:%M:%S%.6f")
+                        .to_string()
+                });
+            let worker_id = task["worker_id"].as_str();
+            let error_message = task["error_message"].as_str();
+            let metadata = task["metadata"].as_str().unwrap_or("{}");
+
+            let result = self
+                .connection()
+                .execute(
+                    r#"
+                    INSERT INTO celers_tasks
+                        (id, task_name, payload, state, priority, retry_count, max_retries,
+                         created_at, scheduled_at, started_at, completed_at, worker_id, error_message, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "#,
+                    &[
+                        &id,
+                        &task_name,
+                        &payload,
+                        &state,
+                        &priority,
+                        &retry_count,
+                        &max_retries,
+                        &created_at,
+                        &scheduled_at,
+                        &started_at,
+                        &completed_at,
+                        &worker_id,
+                        &error_message,
+                        &metadata,
+                    ],
+                )
+                .await;
 
             match result {
                 Ok(_) => {
@@ -613,26 +707,32 @@ impl MysqlBroker {
             "#,
         );
 
-        if let Some(l) = limit {
-            query.push_str(&format!(" LIMIT {}", l));
+        if limit.is_some() {
+            query.push_str(" LIMIT ?");
         }
 
-        let rows = sqlx::query(&query)
-            .fetch_all(&self.pool)
+        let mut param_refs: Vec<&dyn oxisql_core::ToSqlValue> = Vec::new();
+        if let Some(l) = &limit {
+            param_refs.push(l);
+        }
+
+        let rows = self
+            .connection()
+            .query(&query, &param_refs)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to export DLQ: {}", e)))?;
 
         let mut dlq_entries = Vec::new();
         for row in rows {
             let entry = serde_json::json!({
-                "id": row.get::<String, _>("id"),
-                "task_id": row.get::<String, _>("task_id"),
-                "task_name": row.get::<String, _>("task_name"),
-                "payload": row.get::<Vec<u8>, _>("payload"),
-                "retry_count": row.get::<i32, _>("retry_count"),
-                "error_message": row.get::<Option<String>, _>("error_message"),
-                "failed_at": row.get::<DateTime<Utc>, _>("failed_at"),
-                "metadata": row.get::<String, _>("metadata"),
+                "id": row.col::<String>("id").map_err(|e| CelersError::Other(format!("Failed to export DLQ: {e}")))?,
+                "task_id": row.col::<String>("task_id").map_err(|e| CelersError::Other(format!("Failed to export DLQ: {e}")))?,
+                "task_name": row.col::<String>("task_name").map_err(|e| CelersError::Other(format!("Failed to export DLQ: {e}")))?,
+                "payload": row.col::<Vec<u8>>("payload").map_err(|e| CelersError::Other(format!("Failed to export DLQ: {e}")))?,
+                "retry_count": row.col::<i32>("retry_count").map_err(|e| CelersError::Other(format!("Failed to export DLQ: {e}")))?,
+                "error_message": row.col::<Option<String>>("error_message").map_err(|e| CelersError::Other(format!("Failed to export DLQ: {e}")))?,
+                "failed_at": row.col::<DateTime<Utc>>("failed_at").map_err(|e| CelersError::Other(format!("Failed to export DLQ: {e}")))?,
+                "metadata": row.col::<String>("metadata").map_err(|e| CelersError::Other(format!("Failed to export DLQ: {e}")))?,
             });
             dlq_entries.push(entry);
         }
@@ -893,22 +993,27 @@ impl MysqlBroker {
         metadata: Option<serde_json::Value>,
     ) -> Result<TaskId> {
         // First, check if an idempotency record already exists for this key
-        let existing: Option<(String,)> = sqlx::query_as(
-            r#"
-            SELECT task_id
-            FROM celers_task_idempotency
-            WHERE idempotency_key = ?
-              AND task_name = ?
-              AND expires_at > NOW()
-            "#,
-        )
-        .bind(idempotency_key)
-        .bind(&task.metadata.name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to check idempotency record: {}", e)))?;
+        let existing_rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT task_id
+                FROM celers_task_idempotency
+                WHERE idempotency_key = ?
+                  AND task_name = ?
+                  AND expires_at > NOW()
+                "#,
+                &[&idempotency_key, &task.metadata.name],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to check idempotency record: {}", e))
+            })?;
 
-        if let Some((task_id_str,)) = existing {
+        if let Some(row) = existing_rows.into_iter().next() {
+            let task_id_str: String = row.col("task_id").map_err(|e| {
+                CelersError::Other(format!("Failed to check idempotency record: {e}"))
+            })?;
             // Idempotency record exists, return existing task ID
             let task_id = Uuid::parse_str(&task_id_str)
                 .map_err(|e| CelersError::Other(format!("Invalid task UUID: {}", e)))?;
@@ -928,43 +1033,47 @@ impl MysqlBroker {
 
         // Begin transaction to ensure atomicity
         let mut tx = self
-            .pool
-            .begin()
+            .connection()
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
         // Insert the task
-        sqlx::query(
+        tx.execute(
             r#"
             INSERT INTO celers_tasks
                 (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
             VALUES (?, ?, ?, 'pending', ?, ?, '{}', NOW(), NOW())
             "#,
+            &[
+                &task_id.to_string(),
+                &task.metadata.name,
+                &task.payload,
+                &task.metadata.priority,
+                &(task.metadata.max_retries as i32),
+            ],
         )
-        .bind(task_id.to_string())
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .execute(&mut *tx)
         .await
         .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
 
         // Insert idempotency record
-        sqlx::query(
+        let metadata_str =
+            metadata.map(|m| serde_json::to_string(&m).unwrap_or_else(|_| "{}".to_string()));
+        tx.execute(
             r#"
             INSERT INTO celers_task_idempotency
                 (id, idempotency_key, task_name, task_id, created_at, expires_at, metadata)
             VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? SECOND), ?)
             "#,
+            &[
+                &idempotency_id.to_string(),
+                &idempotency_key,
+                &task.metadata.name,
+                &task_id.to_string(),
+                &(ttl_secs as i64),
+                &metadata_str,
+            ],
         )
-        .bind(idempotency_id.to_string())
-        .bind(idempotency_key)
-        .bind(&task.metadata.name)
-        .bind(task_id.to_string())
-        .bind(ttl_secs as i64)
-        .bind(metadata.map(|m| serde_json::to_string(&m).unwrap_or_else(|_| "{}".to_string())))
-        .execute(&mut *tx)
         .await
         .map_err(|e| CelersError::Other(format!("Failed to insert idempotency record: {}", e)))?;
 
@@ -1019,31 +1128,47 @@ impl MysqlBroker {
         idempotency_key: &str,
         task_name: &str,
     ) -> Result<Option<IdempotencyRecord>> {
-        let record: Option<(
-            String,
-            String,
-            String,
-            String,
-            DateTime<Utc>,
-            DateTime<Utc>,
-            Option<String>,
-        )> = sqlx::query_as(
-            r#"
-            SELECT id, idempotency_key, task_name, task_id, created_at, expires_at, metadata
-            FROM celers_task_idempotency
-            WHERE idempotency_key = ?
-              AND task_name = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(idempotency_key)
-        .bind(task_name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch idempotency record: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT id, idempotency_key, task_name, task_id, created_at, expires_at, metadata
+                FROM celers_task_idempotency
+                WHERE idempotency_key = ?
+                  AND task_name = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                &[&idempotency_key, &task_name],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency record: {}", e))
+            })?;
 
-        if let Some((id, key, task_name, task_id, created_at, expires_at, metadata)) = record {
+        if let Some(row) = rows.into_iter().next() {
+            let id: String = row.col("id").map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency record: {e}"))
+            })?;
+            let key: String = row.col("idempotency_key").map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency record: {e}"))
+            })?;
+            let task_name: String = row.col("task_name").map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency record: {e}"))
+            })?;
+            let task_id: String = row.col("task_id").map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency record: {e}"))
+            })?;
+            let created_at: DateTime<Utc> = row.col("created_at").map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency record: {e}"))
+            })?;
+            let expires_at: DateTime<Utc> = row.col("expires_at").map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency record: {e}"))
+            })?;
+            let metadata: Option<String> = row.col("metadata").map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency record: {e}"))
+            })?;
+
             Ok(Some(IdempotencyRecord {
                 id: Uuid::parse_str(&id)
                     .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
@@ -1080,19 +1205,19 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn cleanup_expired_idempotency_keys(&self) -> Result<u64> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM celers_task_idempotency
-            WHERE expires_at <= NOW()
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            CelersError::Other(format!("Failed to cleanup expired idempotency keys: {}", e))
-        })?;
-
-        let deleted = result.rows_affected();
+        let deleted = self
+            .connection()
+            .execute(
+                r#"
+                DELETE FROM celers_task_idempotency
+                WHERE expires_at <= NOW()
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to cleanup expired idempotency keys: {}", e))
+            })?;
 
         if deleted > 0 {
             tracing::info!(count = deleted, "Cleaned up expired idempotency keys");
@@ -1124,58 +1249,66 @@ impl MysqlBroker {
     /// ```
     #[allow(clippy::type_complexity)]
     pub async fn get_idempotency_statistics(&self) -> Result<Vec<IdempotencyStats>> {
-        let rows: Vec<(
-            String,
-            i64,
-            i64,
-            i64,
-            i64,
-            Option<DateTime<Utc>>,
-            Option<DateTime<Utc>>,
-        )> = sqlx::query_as(
-            r#"
-            SELECT
-                task_name,
-                COUNT(*) as total_keys,
-                COUNT(DISTINCT idempotency_key) as unique_keys,
-                SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active_keys,
-                SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired_keys,
-                MIN(created_at) as oldest_key,
-                MAX(created_at) as newest_key
-            FROM celers_task_idempotency
-            GROUP BY task_name
-            ORDER BY task_name
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| {
-            CelersError::Other(format!("Failed to fetch idempotency statistics: {}", e))
-        })?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT
+                    task_name,
+                    COUNT(*) as total_keys,
+                    COUNT(DISTINCT idempotency_key) as unique_keys,
+                    SUM(CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END) as active_keys,
+                    SUM(CASE WHEN expires_at <= NOW() THEN 1 ELSE 0 END) as expired_keys,
+                    MIN(created_at) as oldest_key,
+                    MAX(created_at) as newest_key
+                FROM celers_task_idempotency
+                GROUP BY task_name
+                ORDER BY task_name
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to fetch idempotency statistics: {}", e))
+            })?;
 
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
+        rows.into_iter()
+            .map(|row| {
+                let task_name: String = row.col("task_name").map_err(|e| {
+                    CelersError::Other(format!("Failed to fetch idempotency statistics: {e}"))
+                })?;
+                let total_keys: i64 = row.col("total_keys").map_err(|e| {
+                    CelersError::Other(format!("Failed to fetch idempotency statistics: {e}"))
+                })?;
+                let unique_keys: i64 = row.col("unique_keys").map_err(|e| {
+                    CelersError::Other(format!("Failed to fetch idempotency statistics: {e}"))
+                })?;
+                // Plain COUNT(*)/SUM(0-or-1) aggregates are I64, not
+                // DECIMAL, on MySQL — read directly as Option<i64> rather
+                // than through the Decimal-text-parse path used for AVG().
+                let active_keys: Option<i64> = row.col("active_keys").map_err(|e| {
+                    CelersError::Other(format!("Failed to fetch idempotency statistics: {e}"))
+                })?;
+                let expired_keys: Option<i64> = row.col("expired_keys").map_err(|e| {
+                    CelersError::Other(format!("Failed to fetch idempotency statistics: {e}"))
+                })?;
+                let oldest_key: Option<DateTime<Utc>> = row.col("oldest_key").map_err(|e| {
+                    CelersError::Other(format!("Failed to fetch idempotency statistics: {e}"))
+                })?;
+                let newest_key: Option<DateTime<Utc>> = row.col("newest_key").map_err(|e| {
+                    CelersError::Other(format!("Failed to fetch idempotency statistics: {e}"))
+                })?;
+
+                Ok(IdempotencyStats {
                     task_name,
                     total_keys,
                     unique_keys,
-                    active_keys,
-                    expired_keys,
+                    active_keys: active_keys.unwrap_or(0),
+                    expired_keys: expired_keys.unwrap_or(0),
                     oldest_key,
                     newest_key,
-                )| {
-                    IdempotencyStats {
-                        task_name,
-                        total_keys,
-                        unique_keys,
-                        active_keys,
-                        expired_keys,
-                        oldest_key,
-                        newest_key,
-                    }
-                },
-            )
-            .collect())
+                })
+            })
+            .collect()
     }
 }

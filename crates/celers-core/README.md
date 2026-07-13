@@ -2,7 +2,7 @@
 
 Core abstractions and traits for the CeleRS distributed task queue system.
 
-**Status: [Stable] — v0.2.0 (2026-03-27) — 247 tests**
+**Status: [Stable] — v0.3.0 (2026-07-13) — 438 tests**
 
 ## Overview
 
@@ -19,8 +19,13 @@ This crate provides the fundamental building blocks for CeleRS:
 - **Revocation**: Task cancellation and revocation
 - **Retry / Exception**: Advanced retry strategies and exception policies
 - **Event / Control**: Worker events and control commands
-- **Distributed Locks**: DistributedLockBackend, InMemoryLockBackend, RedisLockBackend, DbLockBackend
+- **Distributed Locks**: `DistributedLockBackend` trait (implementations live downstream: `InMemoryLockBackend` in celers-beat, `RedisLockBackend` in celers-backend-redis, `DbLockBackend` in celers-backend-db)
 - **DAG support**: Task dependency graphs with cycle detection
+- **Local development mode**: `InMemoryBroker` / `InMemoryResultBackend` (full trait coverage, no external services) plus a `CachingResultBackend<B>` LRU wrapper fronting any `ResultStore`
+- **Distributed rate limiting**: `DistributedRateLimiter` + `DistributedRateLimitBackend` trait (Redis-ready), `TenantRateLimiter` for per-tenant quotas, and `TaskTypeCircuitBreakers` for per-task-type circuit breaking
+- **Result lifecycle**: tombstones (`TombstoneRegistry` / `ResultExistence`), result groups (`ResultGroup`), and per-task-type result TTL (`ResultTtlConfig`)
+- **Alerting**: event snapshots (`EventSnapshot`) and a rule engine (`AlertRule` / `AlertEvaluator`) for failure-rate, queue-depth, and no-heartbeat alerts
+- **Task security**: HMAC-SHA256 task signing (`TaskSigner`), argument sanitization (`Sanitizer`), and PII detection/masking (`PiiDetector`)
 
 ## Features
 
@@ -74,6 +79,10 @@ pub trait Broker: Send + Sync {
     async fn dequeue_batch(&self, count: usize) -> Result<Vec<BrokerMessage>>;
     async fn ack_batch(&self, tasks: &[(TaskId, Option<String>)]) -> Result<()>;
 
+    // Delayed execution (optional, default: execute immediately via enqueue())
+    async fn enqueue_at(&self, task: SerializedTask, execute_at: i64) -> Result<TaskId>;
+    async fn enqueue_after(&self, task: SerializedTask, delay_secs: u64) -> Result<TaskId>;
+
     // Management
     async fn queue_size(&self) -> Result<usize>;
     async fn cancel(&self, task_id: &TaskId) -> Result<bool>;
@@ -87,11 +96,11 @@ pub trait Broker: Send + Sync {
 ```rust
 pub struct SerializedTask {
     pub metadata: TaskMetadata,
-    pub args: Vec<u8>,          // JSON-serialized arguments
+    pub payload: Vec<u8>,       // JSON-serialized arguments
 }
 
 impl SerializedTask {
-    pub fn new(name: String, args: Vec<u8>) -> Self;
+    pub fn new(name: String, payload: Vec<u8>) -> Self;
     pub fn with_priority(self, priority: i32) -> Self;
     pub fn with_max_retries(self, max_retries: u32) -> Self;
     pub fn with_timeout(self, timeout_secs: u64) -> Self;
@@ -114,6 +123,8 @@ pub struct TaskMetadata {
     // Workflow support
     pub group_id: Option<Uuid>,   // Group ID for parallel execution
     pub chord_id: Option<Uuid>,    // Chord ID for barrier synchronization
+    pub on_success_link: Option<String>,  // Next task to chain-enqueue on success
+    pub dependencies: HashSet<TaskId>,    // Tasks that must complete before this one
 }
 ```
 
@@ -135,15 +146,30 @@ pub enum TaskState {
 Execute registered tasks by name:
 
 ```rust
-use celers_core::TaskRegistry;
+use celers_core::{Task, TaskRegistry};
 
-let mut registry = TaskRegistry::new();
+// Implement `Task` for your task type (register() takes a value, not a closure)
+struct MyTask;
 
-// Register a task executor
-registry.register("my_task", |args| async move {
-    // Task implementation
-    Ok(result)
-});
+#[async_trait::async_trait]
+impl Task for MyTask {
+    type Input = MyInput;
+    type Output = MyOutput;
+
+    async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
+        // Task implementation
+        Ok(output)
+    }
+
+    fn name(&self) -> &str {
+        "my_task"
+    }
+}
+
+let registry = TaskRegistry::new();
+
+// Register by value — the task name comes from `Task::name()`
+registry.register(MyTask).await;
 
 // Execute by name
 let result = registry.execute(&task).await?;
@@ -153,19 +179,22 @@ let result = registry.execute(&task).await?;
 
 ```rust
 pub enum CelersError {
-    Broker(String),
     Serialization(String),
     Deserialization(String),
+    Broker(String),
     TaskNotFound(String),
-    TaskTimeout,
-    RateLimit(String),
-    Revoked(String),
+    TaskExecution(String),
+    TaskRevoked(TaskId),
+    Timeout(String),
+    InvalidStateTransition { from: String, to: String },
+    Configuration(String),
+    Io(std::io::Error),
     Other(String),
 }
 
 impl CelersError {
-    pub fn is_retryable(&self) -> bool;
-    pub fn category(&self) -> &str;
+    pub const fn is_retryable(&self) -> bool;
+    pub const fn category(&self) -> &'static str;
 }
 
 pub type Result<T> = std::result::Result<T, CelersError>;
@@ -225,12 +254,16 @@ See `celers-canvas` for high-level workflow APIs.
 ```toml
 [dependencies]
 async-trait = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
 regex = "1"
-rand = "0.9"
+rand = "0.10"
+num_cpus = "1"
 ```
 
 ## See Also

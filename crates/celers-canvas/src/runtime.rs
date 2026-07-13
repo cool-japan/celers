@@ -34,7 +34,7 @@ impl WorkflowEventStream {
     pub fn push(&mut self, event: WorkflowEvent) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         self.events.push((timestamp, event));
@@ -115,7 +115,7 @@ impl WorkflowMetricsCollector {
             workflow_id,
             start_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64,
             end_time: None,
             total_tasks: 0,
@@ -156,7 +156,7 @@ impl WorkflowMetricsCollector {
     pub fn finalize(&mut self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         self.end_time = Some(now);
@@ -225,7 +225,7 @@ impl WorkflowRateLimiter {
     pub fn allow_workflow(&mut self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         // Remove old timestamps outside the window
@@ -251,7 +251,7 @@ impl WorkflowRateLimiter {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         let active_timestamps: Vec<_> = self
@@ -330,7 +330,7 @@ impl WorkflowConcurrencyControl {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         self.active_workflows.insert(workflow_id, now);
@@ -378,7 +378,7 @@ impl WorkflowConcurrencyControl {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         let total_duration: u64 = self
@@ -502,7 +502,7 @@ impl WorkflowRegistry {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
         self.start_times.insert(workflow_id, now);
     }
@@ -593,7 +593,7 @@ impl WorkflowRegistry {
     pub fn get_older_than(&self, duration_ms: u64) -> Vec<Uuid> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         self.start_times
@@ -608,7 +608,7 @@ impl WorkflowRegistry {
         self.start_times.get(workflow_id).map(|&start_time| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64;
             now.saturating_sub(start_time)
         })

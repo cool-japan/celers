@@ -25,9 +25,13 @@ impl Default for SloTarget {
     }
 }
 
-/// SLO compliance status
-#[derive(Debug, Clone, PartialEq)]
-pub enum SloStatus {
+/// SLO compliance status (snapshot, point-in-time check).
+///
+/// For stateful, rolling-window SLO attainment and error-budget burn-rate
+/// tracking see [`crate::slo_tracker::SloTracker`] and its richer
+/// [`crate::slo_tracker::SloStatus`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SloComplianceStatus {
     /// Meeting SLO targets
     Compliant,
     /// Not meeting SLO targets
@@ -42,9 +46,9 @@ pub fn check_slo_compliance(
     p95_latency_seconds: f64,
     throughput: f64,
     target: &SloTarget,
-) -> SloStatus {
+) -> SloComplianceStatus {
     if success_rate < 0.0 || p95_latency_seconds < 0.0 || throughput < 0.0 {
-        return SloStatus::Unknown;
+        return SloComplianceStatus::Unknown;
     }
 
     let meets_success = success_rate >= target.success_rate;
@@ -52,9 +56,9 @@ pub fn check_slo_compliance(
     let meets_throughput = throughput >= target.throughput;
 
     if meets_success && meets_latency && meets_throughput {
-        SloStatus::Compliant
+        SloComplianceStatus::Compliant
     } else {
-        SloStatus::NonCompliant
+        SloComplianceStatus::NonCompliant
     }
 }
 
@@ -252,7 +256,7 @@ pub fn calculate_percentile(values: &[f64], percentile: f64) -> Option<f64> {
 /// use celers_metrics::calculate_percentiles;
 ///
 /// let mut values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-/// values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+/// values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 ///
 /// let (p50, p95, p99) = calculate_percentiles(&values).unwrap();
 /// println!("p50: {:.2}, p95: {:.2}, p99: {:.2}", p50, p95, p99);

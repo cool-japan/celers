@@ -406,7 +406,7 @@ pub fn calculate_sqs_message_age_distribution(
         };
     }
 
-    message_ages_secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    message_ages_secs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let total_messages = message_ages_secs.len();
     let min_age_secs = message_ages_secs[0];

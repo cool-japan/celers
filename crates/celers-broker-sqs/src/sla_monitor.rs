@@ -322,7 +322,10 @@ impl SlaMonitor {
             return 0.0;
         }
 
-        let elapsed = self.start_time.unwrap().elapsed();
+        let elapsed = self
+            .start_time
+            .expect("start_time validated to be Some just above")
+            .elapsed();
         if elapsed.as_secs_f64() == 0.0 {
             return 0.0;
         }

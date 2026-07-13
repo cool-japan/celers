@@ -241,7 +241,7 @@ impl TaskDebugger {
     pub fn tasks_by_state(&self, state: &str) -> Vec<TaskDebugInfo> {
         self.task_history
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|info| info.state == state)
             .cloned()
@@ -333,7 +333,7 @@ impl EventTracker {
     pub fn events_by_type(&self, event_type: &str) -> Vec<TrackedEvent> {
         self.events
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|e| e.event_type == event_type)
             .cloned()

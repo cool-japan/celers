@@ -2,7 +2,7 @@
 
 PostgreSQL-based broker implementation for CeleRS using `FOR UPDATE SKIP LOCKED`.
 
-**Version: 0.2.0 | Status: [Stable] | Tests: 117 | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Tests: 149 (26 ignored, require PostgreSQL) + 179 doc tests | Updated: 2026-07-13**
 
 ## Overview
 
@@ -32,6 +32,18 @@ This broker provides production-ready, durable task queue functionality using Po
 - ✅ **Exponential Backoff**: Automatic retry with backoff
 - ✅ **Max Retry Limits**: Configurable retry policies
 
+### Security (hardened in 0.3.0)
+- ✅ **SQL identifier validation**: table-name-bearing call sites reject anything not matching
+  `^[A-Za-z_][A-Za-z0-9_]*$` before interpolation (`validate_sql_identifier`)
+- ✅ **Closed-vocabulary state filters**: retention-policy task-state filtering parses through the
+  `DbTaskState` enum instead of splicing a raw string into the generated `WHERE` clause
+- ✅ **Parameterized metadata filters**: JSONB metadata queries bind both the key and the value as
+  query parameters instead of interpolating the key into the query text
+- ✅ **URL-driven TLS**: `sslmode` in the connection URL is honored again (`src/tls_mode.rs`) after a
+  regression in the initial `sqlx`→`oxisql` port silently hardcoded `TlsMode::Disabled`
+- Note: these fixes harden specific call sites; they do not change the `queue_name` field's
+  documented status as a logical label rather than a real table/column (see `TODO.md`)
+
 ### Observability
 - ✅ **Prometheus Metrics**: Optional metrics support (enable with `metrics` feature)
 - ✅ **Task Inspection**: Query task state and history
@@ -53,10 +65,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-broker-postgres = "0.2"
+celers-broker-postgres = "0.3"
 
 # Enable Prometheus metrics (optional)
-celers-broker-postgres = { version = "0.2", features = ["metrics"] }
+celers-broker-postgres = { version = "0.3", features = ["metrics"] }
 ```
 
 ## Quick Start
@@ -321,7 +333,7 @@ Enable the `metrics` feature:
 
 ```toml
 [dependencies]
-celers-broker-postgres = { version = "0.2", features = ["metrics"] }
+celers-broker-postgres = { version = "0.3", features = ["metrics"] }
 ```
 
 Update metrics periodically:
@@ -596,16 +608,19 @@ See workspace LICENSE file.
 
 ## Examples
 
-See the `examples/` directory for comprehensive usage examples:
+See the `examples/` directory for comprehensive usage examples (verified against
+`crates/celers-broker-postgres/examples/` on 2026-07-13):
 
-- **`basic_usage.rs`**: Getting started guide with core operations
-- **`monitoring_performance.rs`**: Production monitoring and optimization utilities
+- **`postgres_basic_usage.rs`**: Getting started guide with core operations
+- **`postgres_monitoring_performance.rs`**: Production monitoring and optimization utilities
+- **`postgres_advanced_utilities.rs`**: Compression analysis, query regression detection, task execution metrics
 - **`README.md`**: Detailed examples documentation with setup instructions
 
 Run examples with:
 ```bash
-cargo run --example basic_usage
-cargo run --example monitoring_performance
+cargo run --example postgres_basic_usage
+cargo run --example postgres_monitoring_performance
+cargo run --example postgres_advanced_utilities
 ```
 
 ## See Also

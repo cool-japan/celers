@@ -1,10 +1,27 @@
+## `celers-examples` is deliberately excluded from the main workspace's
+## `members` list (see commit 4fae8bec: "remove examples and benchmarks
+## crate from workspace members") so that routine `cargo build/test/clippy
+## --workspace` runs at the repo root never compile these 15 examples + 3
+## benches. Cargo has no "member of the workspace's dependency-inheritance
+## scope but not built by --workspace" middle ground: `workspace.exclude`
+## only affects glob-based `members` sweeping, and a manifest that is not a
+## workspace member cannot use `.workspace = true` inheritance at all (both
+## verified directly against this repo's Cargo while doing this migration).
+## This crate is therefore its own single-crate workspace (`[workspace]`
+## below, empty on purpose) with every former `.workspace = true` value
+## replaced by the literal it resolved to in the root `Cargo.toml` at the
+## time of writing. Build/check it standalone from this directory, e.g.
+## `cargo check --all-features` — NOT `cargo check -p celers-examples` from
+## the repo root, which will not find it.
+[workspace]
+
 [package]
 name = "celers-examples"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.3.0"
+edition = "2021"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/celers"
 publish = false
 
 [dependencies]
@@ -29,24 +46,23 @@ celers-backend-redis = { path = "../celers-backend-redis" }
 # Runtime & Workflow
 celers-worker = { path = "../celers-worker" }
 celers-canvas = { path = "../celers-canvas" }
-celers-beat = { path = "../celers-beat" }
+celers-beat = { path = "../celers-beat", version = "0.3.0" }
 
 # Utilities
 celers-macros = { path = "../celers-macros" }
 celers-metrics = { path = "../celers-metrics" }
 
-tokio.workspace = true
-async-trait.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-oxicode.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-uuid.workspace = true
-sqlx.workspace = true
-redis.workspace = true
-futures-util = { workspace = true }
+tokio = { version = "1.52.3", features = ["full"] }
+async-trait = "0.1.89"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+oxicode = { version = "0.2.4", features = ["serde", "derive"] }
+anyhow = "1.0.103"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
+redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
+futures-util = "0.3.32"
 
 [[example]]
 name = "prometheus_metrics"
@@ -58,7 +74,7 @@ metrics = ["celers-worker/metrics", "celers-broker-redis/metrics"]
 workflows = ["celers-worker/workflows", "celers-canvas/backend-redis"]
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
 
 [[bench]]
 name = "serialization"

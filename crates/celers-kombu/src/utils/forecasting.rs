@@ -434,11 +434,17 @@ pub fn detect_message_hotspots(message_counts: &[usize]) -> (bool, usize, f64, S
     }
 
     // Find max and average
-    let max_count = *message_counts.iter().max().unwrap();
+    let max_count = *message_counts
+        .iter()
+        .max()
+        .expect("message_counts validated to be non-empty");
     let avg_count = message_counts.iter().sum::<usize>() as f64 / message_counts.len() as f64;
 
     // Find index of hotspot
-    let hotspot_index = message_counts.iter().position(|&c| c == max_count).unwrap();
+    let hotspot_index = message_counts
+        .iter()
+        .position(|&c| c == max_count)
+        .expect("max_count came from this iterator so it must exist");
 
     // Calculate imbalance ratio (max / avg)
     let imbalance_ratio = if avg_count > 0.0 {

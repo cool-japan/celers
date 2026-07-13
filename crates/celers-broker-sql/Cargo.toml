@@ -6,12 +6,13 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "SQL database broker implementation for CeleRS (MySQL)"
+readme = "README.md"
 keywords = ["celery", "mysql", "broker", "queue", "sql"]
 categories = ["asynchronous", "database", "network-programming"]
 
 [dependencies]
-celers-core = { path = "../celers-core", version = "0.2.0" }
-celers-metrics = { path = "../celers-metrics", version = "0.2.0", optional = true }
+celers-core = { workspace = true }
+celers-metrics = { workspace = true, optional = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -21,9 +22,20 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 
-# SQL client (sqlx supports both Postgres and MySQL)
-sqlx = { workspace = true, features = ["runtime-tokio-rustls", "mysql", "chrono", "uuid", "rust_decimal"] }
-rust_decimal = { workspace = true }
+# SQL client (Pure Rust OxiSQL, MySQL backend).
+#
+# `oxisql-postgres` is also depended on (unused by this crate's own broker
+# logic, which is MySQL-only) solely because `tls_mode.rs` is copied
+# verbatim from the proven dual-backend reference (`celers-cli`'s
+# `tls_mode.rs`) rather than trimmed to a MySQL-only subset, matching the
+# established pattern from the prior `celers-backend-db` migration.
+oxisql-core = { workspace = true }
+oxisql-mysql = { workspace = true }
+oxisql-postgres = { workspace = true }
+oxitls = { workspace = true }
+rustls = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
 oxiarc-deflate = { workspace = true }
 rand = { workspace = true }
 
@@ -32,11 +44,9 @@ default = []
 metrics = ["celers-metrics"]
 
 [dev-dependencies]
-tokio-test = { workspace = true }
 futures = { workspace = true }
 criterion = { workspace = true }
 tracing-subscriber = { workspace = true }
-tempfile = { workspace = true }
 
 [[bench]]
 name = "broker_benchmark"

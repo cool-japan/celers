@@ -34,7 +34,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 license = "Apache-2.0"
@@ -42,38 +42,63 @@ repository = "https://github.com/cool-japan/celers"
 
 [workspace.dependencies]
 # Core dependencies
-tokio = { version = "1.50.0", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-oxicode = { version = "0.2", features = ["serde", "derive"] }
+serde_json = "1.0.150"
+oxicode = { version = "0.2.4", features = ["serde", "derive"] }
 thiserror = "2.0.18"
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 # Broker implementations
-redis = { version = "1.1.0", features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "uuid", "json"] }
-lapin = "4.3.0"
+redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
+# NOTE: neither oxisql-postgres nor oxisql-mysql 0.3.2 exposes a `chrono`
+# Cargo feature (confirmed against their published Cargo.toml manifests) —
+# the `chrono`-gated `FromValue` impls (e.g. `DateTime<Utc>`) live in
+# oxisql-core itself, so `chrono` is enabled here on oxisql-core directly;
+# Cargo feature unification turns the impls on for every crate in the build
+# graph that references `oxisql_core::Row`/`FromValue`, including
+# oxisql-postgres/oxisql-mysql row decoding.
+oxisql-core = { version = "0.3.2", features = ["chrono"] }
+oxisql-postgres = "0.3.2"
+oxisql-mysql = "0.3.2"
+# Pure-Rust TLS facade (rustls + rustls-rustcrypto, no ring/aws-lc/openssl).
+# Depended on with the exact same feature set oxisql-postgres itself uses
+# internally (see its Cargo.toml), so the `Arc<rustls::ClientConfig>`
+# produced by `oxitls::client_config` is guaranteed compatible with
+# `oxisql_postgres::TlsMode::Rustls` / `oxisql_mysql::TlsMode::Rustls`.
+oxitls = { version = "0.2.0", default-features = false, features = ["pure", "webpki-roots"] }
+# Named directly (not just pulled in transitively via oxitls/oxisql-*) so
+# `celers-cli`'s `tls_mode.rs` can name `rustls::ClientConfig` in its public
+# API. Same version/feature pin as oxitls/oxisql's own Cargo.toml
+# (`default-features = false` keeps the default `ring`/`aws-lc-rs` crypto
+# backends out of the build; `rustls-rustcrypto`, pulled in transitively by
+# oxisql-postgres/oxisql-mysql/oxitls, supplies the actual Pure-Rust
+# `CryptoProvider`).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+lapin = "4.10.0"
+oxihttp-client = { version = "0.2.0", features = ["tls"] }
+http = "1.4.2"
 
 # AWS SDK
-aws-config = "1.8"
-aws-sdk-sqs = "1.97"
-aws-sdk-cloudwatch = "1.108"
+aws-config = "1.9"
+aws-sdk-sqs = "1.103"
+aws-sdk-cloudwatch = "1.120"
 
 # CLI and utilities
-clap = { version = "4.6.0", features = ["derive"] }
-clap_complete = "4.6.0"
-clap_mangen = "0.2.33"
-uuid = { version = "1.23.0", features = ["v4", "serde"] }
-chrono = { version = "0.4.44", features = ["serde"] }
+clap = { version = "4.6.1", features = ["derive"] }
+clap_complete = "4.6.7"
+clap_mangen = "0.3.0"
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10"
 hostname = "0.4.2"
-regex = "1.12"
-rand = "0.10.0"
-oxiarc-deflate = "0.2.6"
-oxiarc-zstd = "0.2.6"
+regex = "1.13"
+rand = "0.10.2"
+oxiarc-deflate = "0.3.5"
+oxiarc-zstd = "0.3.5"
 crossbeam-deque = "0.8"
 num_cpus = "1.17"
 libc = "0.2"
@@ -81,12 +106,12 @@ base64 = "0.22"
 hex = "0.4"
 
 # gRPC dependencies
-tonic = "0.14.5"
-tonic-prost = "0.14.5"
-prost = "0.14.3"
-prost-types = "0.14.3"
-tonic-build = "0.14.5"
-tonic-prost-build = "0.14.5"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+prost = "0.14.4"
+prost-types = "0.14.4"
+tonic-build = "0.14.6"
+tonic-prost-build = "0.14.6"
 
 # Serialization formats
 rmp-serde = "1.3"
@@ -94,24 +119,45 @@ serde_yaml = "0.9"
 bson = { version = "3.1.0", features = ["serde"] }
 
 # Crypto dependencies
-hmac = "0.12"
-sha2 = "0.10"
-aes-gcm = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
+
+# Hashing
+twox-hash = "2"
 
 # Scheduling dependencies
-cron = "0.16.0"
+cron = "0.17.0"
 sunrise = "3.0.0"
 
+# Internal workspace crates
+celers-backend-redis = { path = "crates/celers-backend-redis", version = "0.3.0" }
+celers-beat = { path = "crates/celers-beat", version = "0.3.0" }
+celers-broker-amqp = { path = "crates/celers-broker-amqp", version = "0.3.0" }
+celers-broker-postgres = { path = "crates/celers-broker-postgres", version = "0.3.0" }
+celers-broker-redis = { path = "crates/celers-broker-redis", version = "0.3.0" }
+celers-broker-sql = { path = "crates/celers-broker-sql", version = "0.3.0" }
+celers-broker-sqs = { path = "crates/celers-broker-sqs", version = "0.3.0" }
+celers-canvas = { path = "crates/celers-canvas", version = "0.3.0" }
+celers-core = { path = "crates/celers-core", version = "0.3.0" }
+celers-kombu = { path = "crates/celers-kombu", version = "0.3.0" }
+celers-macros = { path = "crates/celers-macros", version = "0.3.0" }
+celers-metrics = { path = "crates/celers-metrics", version = "0.3.0" }
+celers-protocol = { path = "crates/celers-protocol", version = "0.3.0" }
+celers-worker = { path = "crates/celers-worker", version = "0.3.0" }
+
 # CLI tools
-toml = "1.1.0"
-tabled = "0.20.0"
+toml = "1.1.2"
+tabled = "0.21.0"
 colored = "3.1.1"
-reqwest = { version = "0.13.2", features = ["json"] }
-ratatui = "0.30.0"
+url = "2.5.8"
+ratatui = "0.30.2"
 crossterm = "0.29.0"
-rustyline = "17.0.2"
+rustyline = "18.0.1"
 csv = "1.4"
-oxiarc-archive = "0.2.6"
+oxiarc-archive = "0.3.5"
+dialoguer = "0.12.0"
 dirs = "6.0.0"
 urlencoding = "2.1"
 futures-util = "0.3.32"
@@ -121,26 +167,26 @@ prometheus = "0.14.0"
 lazy_static = "1.5.0"
 
 # Observability
-opentelemetry = { version = "0.31.0", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31.0", features = ["trace", "rt-tokio"] }
-tracing-opentelemetry = "0.32.1"
+opentelemetry = { version = "0.32.0", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"] }
+tracing-opentelemetry = "0.33.0"
 
 # Testing
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
 proptest = "1.11"
 tokio-test = "0.4"
 tempfile = "3.27.0"
-serial_test = "3.4.0"
+serial_test = "3.5.0"
 futures = "0.3"
 
 # Macro dependencies
-quote = "1.0.45"
-syn = { version = "2.0.117", features = ["full"] }
+quote = "1.0.46"
+syn = { version = "2.0.118", features = ["full"] }
 proc-macro2 = "1.0.106"
 
 # Other utilities
 crc32fast = "1.5"
-rust_decimal = "1.40"
+rust_decimal = "1.42"
 
 [profile.release]
 # Enable link-time optimization for smaller binaries

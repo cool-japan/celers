@@ -2,13 +2,34 @@
 
 use celers_core::{CelersError, Result};
 use chrono::Utc;
-use sqlx::Row;
+use oxisql_core::Connection;
 use uuid::Uuid;
 
+use crate::row_ext::{json_param, uuid_param, RowExt};
 use crate::types::{
-    ConnectionPoolHealth, PeriodicTaskSchedule, QueueSnapshot, TaskRetentionPolicy,
+    ConnectionPoolHealth, DbTaskState, PeriodicTaskSchedule, QueueSnapshot, TaskRetentionPolicy,
 };
 use crate::PostgresBroker;
+
+/// Validate that `s` is safe to interpolate into SQL as a bare identifier
+/// (e.g. a table name), since sqlx cannot bind identifiers as parameters.
+/// Only ASCII letters, digits, and underscores are permitted, and the first
+/// character must not be a digit — i.e. `^[A-Za-z_][A-Za-z0-9_]*$`.
+pub(crate) fn validate_sql_identifier(s: &str) -> Result<()> {
+    let starts_ok = matches!(s.chars().next(), Some(c) if c.is_ascii_alphabetic() || c == '_');
+    let rest_ok = s
+        .chars()
+        .skip(1)
+        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if starts_ok && rest_ok {
+        Ok(())
+    } else {
+        Err(CelersError::Other(format!(
+            "Invalid SQL identifier {:?}: must match ^[A-Za-z_][A-Za-z0-9_]*$",
+            s
+        )))
+    }
+}
 
 impl PostgresBroker {
     /// Schedule a periodic task with cron-like expression
@@ -67,20 +88,30 @@ impl PostgresBroker {
         let schedule_json = serde_json::to_value(&schedule)
             .map_err(|e| CelersError::Other(format!("Failed to serialize schedule: {}", e)))?;
 
-        sqlx::query(&format!(
+        let query_str = format!(
             "INSERT INTO {} (id, name, payload, state, priority, created_at, metadata)
-             VALUES ($1, $2, $3, 'pending', $4, $5, $6)",
+             VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::timestamptz)",
             self.queue_name
-        ))
-        .bind(Uuid::new_v4())
-        .bind(format!("__periodic_schedule_{}", task_name))
-        .bind(&schedule_json)
-        .bind(priority)
-        .bind(now)
-        .bind(serde_json::json!({"periodic_schedule": schedule_json}))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to schedule periodic task: {}", e)))?;
+        );
+        let id_param = uuid_param(&Uuid::new_v4());
+        let name_param = format!("__periodic_schedule_{}", task_name);
+        let payload_param = json_param(&schedule_json);
+        let created_at_param = now.to_rfc3339();
+        let metadata_param = json_param(&serde_json::json!({"periodic_schedule": schedule_json}));
+        self.conn
+            .execute(
+                &query_str,
+                &[
+                    &id_param,
+                    &name_param,
+                    &payload_param,
+                    &priority,
+                    &created_at_param,
+                    &metadata_param,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to schedule periodic task: {}", e)))?;
 
         Ok(schedule_id)
     }
@@ -101,19 +132,22 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn list_periodic_schedules(&self) -> Result<Vec<PeriodicTaskSchedule>> {
-        let rows = sqlx::query(&format!(
+        let query_str = format!(
             "SELECT payload FROM {} WHERE name LIKE '__periodic_schedule_%' AND state = 'pending'",
             self.queue_name
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to list periodic schedules: {}", e)))?;
+        );
+        let rows =
+            self.conn.query(&query_str, &[]).await.map_err(|e| {
+                CelersError::Other(format!("Failed to list periodic schedules: {}", e))
+            })?;
 
         let mut schedules = Vec::new();
-        for row in rows {
-            let payload: serde_json::Value = row
-                .try_get("payload")
+        for row in &rows {
+            let payload_str: String = row
+                .col("payload")
                 .map_err(|e| CelersError::Other(format!("Failed to get payload: {}", e)))?;
+            let payload: serde_json::Value = serde_json::from_str(&payload_str)
+                .map_err(|e| CelersError::Other(format!("Failed to parse payload JSON: {}", e)))?;
             if let Ok(schedule) = serde_json::from_value::<PeriodicTaskSchedule>(payload) {
                 schedules.push(schedule);
             }
@@ -136,17 +170,20 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn cancel_periodic_schedule(&self, schedule_id: &str) -> Result<bool> {
-        let result = sqlx::query(&format!(
+        let query_str = format!(
             "DELETE FROM {} WHERE name LIKE '__periodic_schedule_%'
              AND payload->>'schedule_id' = $1",
             self.queue_name
-        ))
-        .bind(schedule_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to cancel periodic schedule: {}", e)))?;
+        );
+        let affected = self
+            .conn
+            .execute(&query_str, &[&schedule_id])
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to cancel periodic schedule: {}", e))
+            })?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Create a snapshot of the current queue state
@@ -170,33 +207,61 @@ impl PostgresBroker {
         let now = Utc::now();
 
         // Count tasks
-        let count: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {}", self.queue_name))
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                CelersError::Other(format!("Failed to count tasks for snapshot: {}", e))
-            })?;
+        let count_query = format!("SELECT COUNT(*) FROM {}", self.queue_name);
+        let count_rows = self.conn.query(&count_query, &[]).await.map_err(|e| {
+            CelersError::Other(format!("Failed to count tasks for snapshot: {}", e))
+        })?;
+        let count_row = count_rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to count tasks for snapshot: no rows returned".to_string())
+        })?;
+        let task_count: i64 = count_row
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read task count: {}", e)))?;
 
         // Estimate size
-        let size: (Option<i64>,) = sqlx::query_as(&format!(
-            "SELECT pg_total_relation_size('{}')",
-            self.queue_name
-        ))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get table size: {}", e)))?;
+        let size_query = format!("SELECT pg_total_relation_size('{}')", self.queue_name);
+        let size_rows = self
+            .conn
+            .query(&size_query, &[])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get table size: {}", e)))?;
+        let size_row = size_rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get table size: no rows returned".to_string())
+        })?;
+        let total_size_bytes: Option<i64> = size_row
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read table size: {}", e)))?;
 
         let snapshot = QueueSnapshot {
             snapshot_id: snapshot_id.clone(),
             queue_name: self.queue_name.clone(),
             created_at: now,
-            task_count: count.0,
-            total_size_bytes: size.0.unwrap_or(0),
+            task_count,
+            total_size_bytes: total_size_bytes.unwrap_or(0),
             includes_results: include_results,
         };
 
-        // Store snapshot metadata (would need a snapshots table in real implementation)
-        // For now, just return the snapshot info
+        // Persist snapshot metadata. `created_at` is a `DateTime<Utc>`
+        // parameter -> `.to_rfc3339()` bound through a
+        // `$3::text::timestamptz` cast, per `row_ext.rs`'s convention.
+        let created_at_param = snapshot.created_at.to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO celers_queue_snapshots \
+             (snapshot_id, queue_name, created_at, task_count, total_size_bytes, includes_results) \
+             VALUES ($1, $2, $3::text::timestamptz, $4, $5, $6)",
+                &[
+                    &snapshot.snapshot_id,
+                    &snapshot.queue_name,
+                    &created_at_param,
+                    &snapshot.task_count,
+                    &snapshot.total_size_bytes,
+                    &snapshot.includes_results,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to store snapshot metadata: {}", e)))?;
+
         Ok(snapshot)
     }
 
@@ -216,9 +281,43 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn list_queue_snapshots(&self) -> Result<Vec<QueueSnapshot>> {
-        // In a real implementation, this would query a snapshots table
-        // For now, return empty list
-        Ok(Vec::new())
+        let rows = self
+            .conn
+            .query(
+                "SELECT snapshot_id, queue_name, created_at, task_count, total_size_bytes, \
+             includes_results \
+             FROM celers_queue_snapshots \
+             WHERE queue_name = $1 \
+             ORDER BY created_at DESC",
+                &[&self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to list snapshots: {}", e)))?;
+
+        let mut snapshots = Vec::with_capacity(rows.len());
+        for row in &rows {
+            snapshots.push(QueueSnapshot {
+                snapshot_id: row.col("snapshot_id").map_err(|e| {
+                    CelersError::Other(format!("Failed to read snapshot_id: {}", e))
+                })?,
+                queue_name: row
+                    .col("queue_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read queue_name: {}", e)))?,
+                created_at: row
+                    .col("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read created_at: {}", e)))?,
+                task_count: row
+                    .col("task_count")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_count: {}", e)))?,
+                total_size_bytes: row.col("total_size_bytes").map_err(|e| {
+                    CelersError::Other(format!("Failed to read total_size_bytes: {}", e))
+                })?,
+                includes_results: row.col("includes_results").map_err(|e| {
+                    CelersError::Other(format!("Failed to read includes_results: {}", e))
+                })?,
+            });
+        }
+        Ok(snapshots)
     }
 
     /// Archive tasks based on custom criteria
@@ -240,27 +339,38 @@ impl PostgresBroker {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Security
+    ///
+    /// `where_clause` is interpolated directly into the generated SQL as a
+    /// raw predicate fragment — it cannot be a bind parameter because it is
+    /// a whole piece of SQL syntax, not a single value. Callers MUST pass
+    /// only trusted, non-attacker-derived strings (e.g. a hardcoded literal,
+    /// or a value assembled exclusively from internally-validated,
+    /// closed-vocabulary pieces, the way `apply_retention_policies` does).
+    /// Never forward user-supplied or otherwise untrusted input as
+    /// `where_clause`. This method validates `self.queue_name` (the table
+    /// name) but has no way to validate the semantic safety of an arbitrary
+    /// predicate string.
     pub async fn archive_by_criteria(&self, where_clause: &str) -> Result<i64> {
+        validate_sql_identifier(&self.queue_name)?;
+
         // Move tasks to history table
-        let result = sqlx::query(&format!(
+        let archive_query = format!(
             "INSERT INTO celers_task_history
              SELECT * FROM {} WHERE {}",
             self.queue_name, where_clause
-        ))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to archive tasks to history: {}", e)))?;
-
-        let archived_count = result.rows_affected();
+        );
+        let archived_count = self.conn.execute(&archive_query, &[]).await.map_err(|e| {
+            CelersError::Other(format!("Failed to archive tasks to history: {}", e))
+        })?;
 
         // Delete from main table
-        sqlx::query(&format!(
-            "DELETE FROM {} WHERE {}",
-            self.queue_name, where_clause
-        ))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to delete archived tasks: {}", e)))?;
+        let delete_query = format!("DELETE FROM {} WHERE {}", self.queue_name, where_clause);
+        self.conn
+            .execute(&delete_query, &[])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to delete archived tasks: {}", e)))?;
 
         Ok(archived_count as i64)
     }
@@ -298,6 +408,8 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn apply_retention_policies(&self, policies: &[TaskRetentionPolicy]) -> Result<i64> {
+        validate_sql_identifier(&self.queue_name)?;
+
         let mut total_affected = 0i64;
 
         for policy in policies {
@@ -305,25 +417,27 @@ impl PostgresBroker {
                 continue;
             }
 
+            // Closed-vocabulary validation: only a genuine DbTaskState
+            // variant (rendered via its canonical Display string) can reach
+            // the SQL text below, regardless of what `policy.task_state`
+            // originally contained.
+            let validated_state: DbTaskState = policy.task_state.parse()?;
+
             let where_clause = format!(
                 "state = '{}' AND created_at < NOW() - INTERVAL '{} days'",
-                policy.task_state, policy.retention_days
+                validated_state, policy.retention_days
             );
 
             if policy.archive_before_delete {
                 let archived = self.archive_by_criteria(&where_clause).await?;
                 total_affected += archived;
             } else {
-                let result = sqlx::query(&format!(
-                    "DELETE FROM {} WHERE {}",
-                    self.queue_name, where_clause
-                ))
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
+                let delete_query =
+                    format!("DELETE FROM {} WHERE {}", self.queue_name, where_clause);
+                let affected = self.conn.execute(&delete_query, &[]).await.map_err(|e| {
                     CelersError::Other(format!("Failed to delete tasks by retention policy: {}", e))
                 })?;
-                total_affected += result.rows_affected() as i64;
+                total_affected += affected as i64;
             }
         }
 
@@ -453,5 +567,30 @@ impl PostgresBroker {
         );
 
         self.archive_by_criteria(&where_clause).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_sql_identifier;
+
+    #[test]
+    fn validate_sql_identifier_accepts_valid_identifiers() {
+        assert!(validate_sql_identifier("tasks").is_ok());
+        assert!(validate_sql_identifier("_tasks").is_ok());
+        assert!(validate_sql_identifier("tasks_2").is_ok());
+        assert!(validate_sql_identifier("Tasks_Table").is_ok());
+        assert!(validate_sql_identifier("celers_default_queue").is_ok());
+    }
+
+    #[test]
+    fn validate_sql_identifier_rejects_invalid_identifiers() {
+        assert!(validate_sql_identifier("").is_err());
+        assert!(validate_sql_identifier("2tasks").is_err());
+        assert!(validate_sql_identifier("tasks-table").is_err());
+        assert!(validate_sql_identifier("tasks.table").is_err());
+        assert!(validate_sql_identifier("tasks; DROP TABLE users;--").is_err());
+        assert!(validate_sql_identifier("tasks WHERE 1=1").is_err());
+        assert!(validate_sql_identifier("tasks'").is_err());
     }
 }

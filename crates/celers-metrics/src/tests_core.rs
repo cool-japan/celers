@@ -153,31 +153,31 @@ fn test_slo_compliance() {
     // Test compliant case
     assert_eq!(
         check_slo_compliance(0.995, 4.5, 120.0, &target),
-        SloStatus::Compliant
+        SloComplianceStatus::Compliant
     );
 
     // Test non-compliant success rate
     assert_eq!(
         check_slo_compliance(0.98, 4.5, 120.0, &target),
-        SloStatus::NonCompliant
+        SloComplianceStatus::NonCompliant
     );
 
     // Test non-compliant latency
     assert_eq!(
         check_slo_compliance(0.995, 6.0, 120.0, &target),
-        SloStatus::NonCompliant
+        SloComplianceStatus::NonCompliant
     );
 
     // Test non-compliant throughput
     assert_eq!(
         check_slo_compliance(0.995, 4.5, 90.0, &target),
-        SloStatus::NonCompliant
+        SloComplianceStatus::NonCompliant
     );
 
     // Test unknown (negative values)
     assert_eq!(
         check_slo_compliance(-1.0, 4.5, 120.0, &target),
-        SloStatus::Unknown
+        SloComplianceStatus::Unknown
     );
 }
 
@@ -560,7 +560,7 @@ fn test_distributed_aggregator_cleanup() {
     // Set timestamp to 2 minutes ago
     old_snapshot.timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime should be after UNIX_EPOCH")
         .as_secs()
         - 120;
 
@@ -1057,6 +1057,7 @@ fn test_metric_comparison() {
         processing_queue_size: 20.0,
         dlq_size: 5.0,
         active_workers: 10.0,
+        total_payload_bytes: 0.0,
     };
 
     let improved = CurrentMetrics {
@@ -1069,6 +1070,7 @@ fn test_metric_comparison() {
         processing_queue_size: 18.0,
         dlq_size: 4.0,
         active_workers: 12.0,
+        total_payload_bytes: 0.0,
     };
 
     let comparison = MetricComparison::compare(&baseline, &improved);
@@ -1094,6 +1096,7 @@ fn test_metric_comparison_degradation() {
         processing_queue_size: 10.0,
         dlq_size: 2.0,
         active_workers: 10.0,
+        total_payload_bytes: 0.0,
     };
 
     let degraded = CurrentMetrics {
@@ -1106,6 +1109,7 @@ fn test_metric_comparison_degradation() {
         processing_queue_size: 30.0,
         dlq_size: 10.0,
         active_workers: 8.0,
+        total_payload_bytes: 0.0,
     };
 
     let comparison = MetricComparison::compare(&baseline, &degraded);
@@ -1129,6 +1133,7 @@ fn test_metric_comparison_significance() {
         processing_queue_size: 20.0,
         dlq_size: 5.0,
         active_workers: 10.0,
+        total_payload_bytes: 0.0,
     };
 
     let slightly_different = CurrentMetrics {
@@ -1141,6 +1146,7 @@ fn test_metric_comparison_significance() {
         processing_queue_size: 20.0,
         dlq_size: 5.0,
         active_workers: 10.0,
+        total_payload_bytes: 0.0,
     };
 
     let comparison = MetricComparison::compare(&baseline, &slightly_different);

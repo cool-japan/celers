@@ -26,7 +26,7 @@
 //! ```
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, Generate, KeyInit},
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -47,9 +47,9 @@ pub struct EncryptionKey {
 impl EncryptionKey {
     /// Generate a random encryption key
     pub fn generate() -> Self {
-        use aes_gcm::aead::rand_core::RngCore;
-        let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
+        // 32 random bytes from the OS CSPRNG via the AEAD `Generate` trait
+        // (backed by getrandom). Infallible, matching the prior OsRng path.
+        let bytes = <[u8; 32]>::generate();
         Self { bytes }
     }
 
@@ -162,15 +162,15 @@ pub fn encrypt(data: &[u8], config: &EncryptionConfig) -> Result<Vec<u8>, Encryp
     // Create cipher
     let cipher = Aes256Gcm::new(config.key().as_bytes().into());
 
-    // Generate random nonce
-    use aes_gcm::aead::rand_core::RngCore;
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    // Generate a fresh random nonce from the OS CSPRNG for every encryption
+    let nonce_bytes = <[u8; NONCE_SIZE]>::try_generate()
+        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
+    let nonce = Nonce::try_from(&nonce_bytes[..])
+        .map_err(|_| EncryptionError::EncryptionFailed("invalid nonce length".to_string()))?;
 
     // Encrypt
     let ciphertext = cipher
-        .encrypt(nonce, data)
+        .encrypt(&nonce, data)
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
 
     // Combine nonce + ciphertext
@@ -215,13 +215,14 @@ pub fn decrypt(data: &[u8], config: &EncryptionConfig) -> Result<Vec<u8>, Encryp
         return Err(EncryptionError::InvalidFormat);
     }
 
-    let nonce = Nonce::from_slice(&combined[..NONCE_SIZE]);
+    let nonce =
+        Nonce::try_from(&combined[..NONCE_SIZE]).map_err(|_| EncryptionError::InvalidFormat)?;
     let ciphertext = &combined[NONCE_SIZE..];
 
     // Create cipher and decrypt
     let cipher = Aes256Gcm::new(config.key().as_bytes().into());
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| EncryptionError::DecryptionFailed(e.to_string()))?;
 
     Ok(plaintext)

@@ -2,7 +2,7 @@
 
 MySQL database broker implementation for CeleRS - a high-performance Celery-compatible task queue framework for Rust.
 
-**Version: 0.2.0 | Status: [Alpha] | Tests: 68 | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Alpha] | Tests: 106 passing, 20 skipped (require live DB) | Updated: 2026-07-13**
 
 ## Features
 
@@ -13,7 +13,7 @@ MySQL database broker implementation for CeleRS - a high-performance Celery-comp
 - **Batch Operations**: High-throughput batch enqueue/dequeue/ack operations
 - **Queue Control**: Pause/resume queue processing at runtime
 - **Task Inspection**: Query task status, statistics, and worker assignments
-- **Result Storage**: Store and retrieve task execution results
+- **Result Storage**: Store and retrieve task execution results (not yet backed by a shipped migration — see TODO.md's schema-drift audit)
 - **Worker Tracking**: Monitor which workers are processing which tasks
 - **Health Monitoring**: Database health checks and table size monitoring
 - **Maintenance Tools**: Task archiving, stuck task recovery, and selective purging
@@ -30,11 +30,11 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-broker-sql = "0.2"
-celers-core = "0.2"
+celers-broker-sql = "0.3"
+celers-core = "0.3"
 
 # Optional: Enable Prometheus metrics
-# celers-broker-sql = { version = "0.2", features = ["metrics"] }
+# celers-broker-sql = { version = "0.3", features = ["metrics"] }
 ```
 
 ## Quick Start
@@ -191,6 +191,8 @@ let worker_tasks = broker.get_tasks_by_worker(worker_id).await?;
 
 ### Task Result Storage
 
+> **Known gap**: the `celers_task_results` table used by `store_result()`/`get_result()` below is referenced by this code but is not created by any shipped migration yet, so these calls fail against a freshly-migrated database. See TODO.md's "queue_name schema drift audit (2026-07)" for tracked details; the example remains a valid API reference for once the table exists.
+
 ```rust
 use celers_broker_sql::TaskResultStatus;
 use serde_json::json;
@@ -320,9 +322,10 @@ queue_b.enqueue(task_b).await?;
 ### Connection Pool
 
 ```rust
-// Default: 20 connections, 5s timeout
-// For high throughput, increase max_connections:
-// Edit MysqlBroker::new() or MysqlBroker::with_queue()
+// As of 0.3.0, MysqlBroker wraps a single multiplexed connection via
+// oxisql-mysql — not a real N-connection pool. PoolConfig::max_connections
+// (via with_config()) is still accepted for source compatibility and
+// diagnostics reporting, but no longer sizes a literal pool.
 ```
 
 ### Batch Operations

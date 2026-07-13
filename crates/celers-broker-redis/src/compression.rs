@@ -106,10 +106,15 @@ impl Compressor {
             ProtocolCompressionType::None => Ok((data.to_vec(), false)),
             ProtocolCompressionType::Gzip => self.compress_gzip(data),
             ProtocolCompressionType::Zlib => self.compress_zlib(data),
-            _ => Err(CelersError::Serialization(format!(
-                "Unsupported compression algorithm for Redis broker: {}",
-                self.config.algorithm
-            ))),
+            #[cfg(feature = "zstd-compression")]
+            ProtocolCompressionType::Zstd => self.compress_zstd(data),
+            // Catches Zstd when celers-protocol enables it via feature unification but
+            // this crate's own zstd-compression feature is not active.
+            #[cfg(not(feature = "zstd-compression"))]
+            #[allow(unreachable_patterns)]
+            _ => Err(CelersError::Serialization(
+                "Zstd compression requires the 'zstd-compression' feature".to_string(),
+            )),
         }
     }
 
@@ -142,10 +147,13 @@ impl Compressor {
             ProtocolCompressionType::None => Ok(compressed_data.to_vec()),
             ProtocolCompressionType::Gzip => self.decompress_gzip(compressed_data),
             ProtocolCompressionType::Zlib => self.decompress_zlib(compressed_data),
-            _ => Err(CelersError::Deserialization(format!(
-                "Unsupported decompression algorithm for Redis broker: {}",
-                algorithm
-            ))),
+            #[cfg(feature = "zstd-compression")]
+            ProtocolCompressionType::Zstd => self.decompress_zstd(compressed_data),
+            #[cfg(not(feature = "zstd-compression"))]
+            #[allow(unreachable_patterns)]
+            _ => Err(CelersError::Deserialization(
+                "Zstd decompression requires the 'zstd-compression' feature".to_string(),
+            )),
         }
     }
 
@@ -188,6 +196,29 @@ impl Compressor {
     fn decompress_zlib(&self, data: &[u8]) -> Result<Vec<u8>> {
         oxiarc_deflate::zlib_decompress(data).map_err(|e| {
             CelersError::Deserialization(format!("Failed to decompress with zlib: {}", e))
+        })
+    }
+
+    /// Compress using zstd
+    #[cfg(feature = "zstd-compression")]
+    fn compress_zstd(&self, data: &[u8]) -> Result<(Vec<u8>, bool)> {
+        let level = self.config.level.min(22) as i32;
+        let mut compressed = oxiarc_zstd::encode_all(data, level).map_err(|e| {
+            CelersError::Serialization(format!("Failed to compress with zstd: {}", e))
+        })?;
+
+        // Prepend algorithm ID
+        let mut result = vec![ProtocolCompressionType::Zstd.id()];
+        result.append(&mut compressed);
+
+        Ok((result, true))
+    }
+
+    /// Decompress using zstd
+    #[cfg(feature = "zstd-compression")]
+    fn decompress_zstd(&self, data: &[u8]) -> Result<Vec<u8>> {
+        oxiarc_zstd::decode_all(data).map_err(|e| {
+            CelersError::Deserialization(format!("Failed to decompress with zstd: {}", e))
         })
     }
 

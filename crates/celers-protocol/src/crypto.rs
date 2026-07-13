@@ -24,7 +24,7 @@
 
 #[cfg(feature = "encryption")]
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, Generate, KeyInit},
     Aes256Gcm, Nonce,
 };
 
@@ -108,8 +108,8 @@ impl MessageEncryptor {
     ///
     /// A tuple of (ciphertext, nonce) on success, or `EncryptionError` on failure
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
-        // Generate a random nonce
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        // Generate a fresh random 12-byte nonce from the OS CSPRNG
+        let nonce = Nonce::try_generate().map_err(|_| EncryptionError::EncryptionFailed)?;
 
         // Encrypt
         let ciphertext = self
@@ -135,11 +135,11 @@ impl MessageEncryptor {
             return Err(EncryptionError::InvalidNonceLength);
         }
 
-        let nonce = Nonce::from_slice(nonce);
+        let nonce = Nonce::try_from(nonce).map_err(|_| EncryptionError::InvalidNonceLength)?;
 
         let plaintext = self
             .cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| EncryptionError::DecryptionFailed)?;
 
         Ok(plaintext)

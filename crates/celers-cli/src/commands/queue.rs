@@ -1,9 +1,91 @@
 //! Queue operations command implementations.
 
+use crate::cache::{CacheStats, TtlCache};
+use crate::config::CacheConfig;
+use crate::pool::pooled_redis_connection;
 use celers_broker_redis::RedisBroker;
 use celers_core::Broker;
 use colored::Colorize;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use tabled::{settings::Style, Table, Tabled};
+
+/// A single row of [`list_queues`]'s output; cached as plain data (as
+/// opposed to a `Tabled` display type) so a cache hit can be rendered
+/// without importing any presentation concerns into [`TtlCache`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueueListEntry {
+    name: String,
+    queue_type: String,
+    size: String,
+}
+
+/// Cached snapshot of [`queue_stats`]'s computed metrics for one queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueueStatsSnapshot {
+    queue_type: String,
+    queue_size: usize,
+    processing_size: usize,
+    dlq_size: usize,
+    delayed_size: usize,
+    task_names: HashMap<String, usize>,
+}
+
+/// Process-wide TTL cache of [`list_queues`] results, keyed by broker URL.
+fn queue_list_cache() -> &'static TtlCache<String, Vec<QueueListEntry>> {
+    static CACHE: OnceLock<TtlCache<String, Vec<QueueListEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| TtlCache::new(CacheConfig::from_env_or_default().ttl()))
+}
+
+/// Process-wide TTL cache of [`queue_stats`] results, keyed by
+/// `(broker_url, queue)`.
+fn queue_stats_cache() -> &'static TtlCache<(String, String), QueueStatsSnapshot> {
+    static CACHE: OnceLock<TtlCache<(String, String), QueueStatsSnapshot>> = OnceLock::new();
+    CACHE.get_or_init(|| TtlCache::new(CacheConfig::from_env_or_default().ttl()))
+}
+
+/// Live hit/reuse statistics for [`queue_list_cache`] and
+/// [`queue_stats_cache`], in that order.
+///
+/// `pub(crate)` (not bare private) so `crate::interactive`'s REPL `stats`
+/// command can read them: a normal one-shot `celers <command>` invocation
+/// runs a single command and exits long before these process-wide
+/// [`OnceLock`] counters could accumulate anything meaningful, so the REPL
+/// (which keeps one process alive across many commands) is the one place
+/// they are worth surfacing live. The top-level `celers cache-stats`
+/// snapshot command intentionally does not call this: it only reports
+/// configured capacity/TTL, never live ratios.
+#[must_use]
+pub(crate) fn queue_cache_stats() -> (CacheStats, CacheStats) {
+    (queue_list_cache().stats(), queue_stats_cache().stats())
+}
+
+/// Re-export of [`crate::commands::worker::worker_cache_stats`] so it is
+/// reachable from outside the `commands` module tree.
+///
+/// `commands::worker`'s module declaration in `commands/mod.rs` is a bare
+/// private `mod worker;`, so `commands::worker::*` is visible only within
+/// the `commands` module tree (module-privacy in Rust extends to the
+/// current module and its descendants, and `crate::interactive` is a
+/// sibling of `commands`, not a descendant of it) -- unlike this module,
+/// which was made `pub(crate) mod queue;` in an earlier cleanup pass
+/// specifically so `queue_names` could be called from `crate::interactive`.
+/// Rather than touch `commands/mod.rs` a second time, this already-
+/// `pub(crate)` module re-exposes the one function the REPL's `stats`
+/// command needs from `commands::worker`.
+pub(crate) use crate::commands::worker::worker_cache_stats;
+
+/// Drop any cached [`queue_stats`]/[`list_queues`] entries touching `queue`
+/// on `broker_url`.
+///
+/// Called after a command mutates queue state (purge, move, pause, resume,
+/// import) so the next read reflects the change instead of a stale cached
+/// snapshot, per the read/invalidate contract documented on
+/// [`crate::cache::TtlCache`].
+fn invalidate_queue_caches(broker_url: &str, queue: &str) {
+    queue_stats_cache().invalidate(&(broker_url.to_string(), queue.to_string()));
+    queue_list_cache().invalidate(&broker_url.to_string());
+}
 
 /// Display queue status and statistics.
 ///
@@ -35,8 +117,12 @@ pub async fn show_status(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     println!("{}", "=== Queue Status ===".bold().cyan());
     println!();
 
-    let queue_size = broker.queue_size().await?;
-    let dlq_size = broker.dlq_size().await?;
+    // `queue_size`/`dlq_size` are independent broker round trips; running
+    // them concurrently instead of one after the other halves the wait on
+    // networks where each call has non-trivial latency.
+    let (queue_size, dlq_size) = tokio::join!(broker.queue_size(), broker.dlq_size());
+    let queue_size = queue_size?;
+    let dlq_size = dlq_size?;
 
     #[derive(Tabled)]
     struct QueueStats {
@@ -84,14 +170,72 @@ pub async fn show_status(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 
 /// List all queues (Redis only)
 pub async fn list_queues(broker_url: &str) -> anyhow::Result<()> {
-    // Connect to Redis
-    let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
-
     println!("{}", "=== Redis Queues ===".bold().cyan());
     println!();
 
-    // Scan for keys matching queue patterns
+    let cache_cfg = CacheConfig::from_env_or_default();
+    let cache_key = broker_url.to_string();
+
+    let (entries, served_from_cache) = if cache_cfg.enabled {
+        if let Some(cached) = queue_list_cache().get(&cache_key) {
+            (cached, true)
+        } else {
+            let fetched = fetch_queue_list(broker_url).await?;
+            queue_list_cache().insert(cache_key, fetched.clone());
+            (fetched, false)
+        }
+    } else {
+        (fetch_queue_list(broker_url).await?, false)
+    };
+
+    if entries.is_empty() {
+        println!("{}", "No queues found".yellow());
+        return Ok(());
+    }
+
+    #[derive(Tabled)]
+    struct QueueInfo {
+        #[tabled(rename = "Queue")]
+        name: String,
+        #[tabled(rename = "Type")]
+        queue_type: String,
+        #[tabled(rename = "Size")]
+        size: String,
+    }
+
+    let queue_infos: Vec<QueueInfo> = entries
+        .into_iter()
+        .map(|e| QueueInfo {
+            name: e.name,
+            queue_type: e.queue_type,
+            size: e.size,
+        })
+        .collect();
+
+    let table = Table::new(queue_infos).with(Style::rounded()).to_string();
+    println!("{table}");
+    if served_from_cache {
+        println!();
+        println!(
+            "{}",
+            format!("(cached; ttl {}s)", cache_cfg.ttl_secs).dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+/// Fetch the live queue list from Redis.
+///
+/// Discovering the candidate keys via `SCAN` is inherently sequential (each
+/// page depends on the previous page's cursor), but once every key is known,
+/// looking up each key's `TYPE` and size is completely independent across
+/// keys — those lookups run concurrently via [`futures::future::join_all`]
+/// over cloned handles from the shared connection pool, rather than one
+/// round trip at a time.
+async fn fetch_queue_list(broker_url: &str) -> anyhow::Result<Vec<QueueListEntry>> {
+    let mut conn = pooled_redis_connection(broker_url).await?;
+
     let mut cursor = 0;
     let mut queue_keys: Vec<String> = Vec::new();
 
@@ -113,53 +257,93 @@ pub async fn list_queues(broker_url: &str) -> anyhow::Result<()> {
         }
     }
 
-    if queue_keys.is_empty() {
-        println!("{}", "No queues found".yellow());
-        return Ok(());
+    let fetches = queue_keys.into_iter().map(|key| {
+        let mut task_conn = conn.clone();
+        async move { fetch_queue_list_entry(&mut task_conn, key).await }
+    });
+
+    futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .collect()
+}
+
+/// Fetch the `TYPE` and size of a single queue-like key.
+async fn fetch_queue_list_entry(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: String,
+) -> anyhow::Result<QueueListEntry> {
+    let key_type: String = redis::cmd("TYPE").arg(&key).query_async(conn).await?;
+
+    let size: isize = match key_type.as_str() {
+        "list" => redis::cmd("LLEN").arg(&key).query_async(conn).await?,
+        "zset" => redis::cmd("ZCARD").arg(&key).query_async(conn).await?,
+        _ => 0,
+    };
+
+    let queue_type = if key.contains(":dlq") {
+        "DLQ".to_string()
+    } else if key.contains(":delayed") {
+        "Delayed".to_string()
+    } else if key_type == "zset" {
+        "Priority".to_string()
+    } else {
+        "FIFO".to_string()
+    };
+
+    Ok(QueueListEntry {
+        name: key,
+        queue_type,
+        size: size.to_string(),
+    })
+}
+
+/// Discover the primary queue names currently known to the broker.
+///
+/// Scans `celers:*` keys the same way [`fetch_queue_list`] does, then
+/// filters them down to primary queue keys via
+/// [`crate::commands::monitoring::report::base_queue_name`] — the exact
+/// same filter [`crate::commands::monitoring::report::report_queues`] uses
+/// to enumerate queues for its metrics report — so this reuses that single
+/// source of truth for "what counts as a queue" rather than duplicating the
+/// key-scan/filter logic a third time.
+///
+/// Returns a sorted, deduplicated list of queue names (no type/size
+/// information, unlike [`list_queues`]/[`fetch_queue_list`]). Used by the
+/// interactive REPL's `use <queue>` command to offer a "did you mean"
+/// suggestion when the requested queue doesn't already exist.
+pub async fn queue_names(broker_url: &str) -> anyhow::Result<Vec<String>> {
+    let mut conn = pooled_redis_connection(broker_url).await?;
+
+    let mut cursor = 0u64;
+    let mut keys: Vec<String> = Vec::new();
+
+    loop {
+        let (new_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("celers:*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut conn)
+            .await?;
+
+        keys.extend(batch);
+        cursor = new_cursor;
+
+        if cursor == 0 {
+            break;
+        }
     }
 
-    #[derive(Tabled)]
-    struct QueueInfo {
-        #[tabled(rename = "Queue")]
-        name: String,
-        #[tabled(rename = "Type")]
-        queue_type: String,
-        #[tabled(rename = "Size")]
-        size: String,
-    }
+    let mut names: Vec<String> = keys
+        .iter()
+        .filter_map(|key| crate::commands::monitoring::report::base_queue_name(key))
+        .collect();
+    names.sort();
+    names.dedup();
 
-    let mut queue_infos = Vec::new();
-
-    for key in queue_keys {
-        let key_type: String = redis::cmd("TYPE").arg(&key).query_async(&mut conn).await?;
-
-        let size: isize = match key_type.as_str() {
-            "list" => redis::cmd("LLEN").arg(&key).query_async(&mut conn).await?,
-            "zset" => redis::cmd("ZCARD").arg(&key).query_async(&mut conn).await?,
-            _ => 0,
-        };
-
-        let queue_type = if key.contains(":dlq") {
-            "DLQ".to_string()
-        } else if key.contains(":delayed") {
-            "Delayed".to_string()
-        } else if key_type == "zset" {
-            "Priority".to_string()
-        } else {
-            "FIFO".to_string()
-        };
-
-        queue_infos.push(QueueInfo {
-            name: key,
-            queue_type,
-            size: size.to_string(),
-        });
-    }
-
-    let table = Table::new(queue_infos).with(Style::rounded()).to_string();
-    println!("{table}");
-
-    Ok(())
+    Ok(names)
 }
 
 /// Purge all tasks from a queue
@@ -193,6 +377,7 @@ pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow
         .arg(&queue_key)
         .query_async::<()>(&mut conn)
         .await?;
+    invalidate_queue_caches(broker_url, queue);
 
     println!(
         "{}",
@@ -204,85 +389,155 @@ pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow
 
 /// Show detailed queue statistics
 pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
-    let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let cache_cfg = CacheConfig::from_env_or_default();
+    let cache_key = (broker_url.to_string(), queue.to_string());
 
-    // Construct queue keys
+    let (snapshot, served_from_cache) = if cache_cfg.enabled {
+        if let Some(cached) = queue_stats_cache().get(&cache_key) {
+            (cached, true)
+        } else {
+            let fetched = fetch_queue_stats(broker_url, queue).await?;
+            queue_stats_cache().insert(cache_key, fetched.clone());
+            (fetched, false)
+        }
+    } else {
+        (fetch_queue_stats(broker_url, queue).await?, false)
+    };
+
+    render_queue_stats(queue, &snapshot);
+    if served_from_cache {
+        println!();
+        println!(
+            "{}",
+            format!("(cached; ttl {}s)", cache_cfg.ttl_secs).dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+/// Fetch the live statistics for `queue` from Redis.
+///
+/// `processing_size`, `dlq_size`, and `delayed_size` are independent of each
+/// other and of the main queue's type/size/sample lookup, so all four run
+/// concurrently via `tokio::join!` over cloned handles from the shared
+/// connection pool instead of four round trips in sequence. The main queue's
+/// type must still be resolved before its size (a list uses `LLEN`, a sorted
+/// set uses `ZCARD`) and, in turn, before the task-name sample, so that chain
+/// stays sequential internally.
+async fn fetch_queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<QueueStatsSnapshot> {
+    let conn = pooled_redis_connection(broker_url).await?;
+
     let queue_key = format!("celers:{queue}");
     let processing_key = format!("{queue_key}:processing");
     let dlq_key = format!("{queue_key}:dlq");
     let delayed_key = format!("{queue_key}:delayed");
 
-    // Get queue type
-    let queue_type: String = redis::cmd("TYPE")
-        .arg(&queue_key)
-        .query_async(&mut conn)
-        .await?;
+    let mut main_conn = conn.clone();
+    let mut processing_conn = conn.clone();
+    let mut dlq_conn = conn.clone();
+    let mut delayed_conn = conn.clone();
 
-    // Get queue sizes
-    let queue_size: usize = if queue_type == "list" {
-        redis::cmd("LLEN")
+    let main = async move {
+        let queue_type: String = redis::cmd("TYPE")
             .arg(&queue_key)
-            .query_async(&mut conn)
-            .await?
-    } else if queue_type == "zset" {
-        redis::cmd("ZCARD")
-            .arg(&queue_key)
-            .query_async(&mut conn)
-            .await?
-    } else {
-        0
-    };
+            .query_async(&mut main_conn)
+            .await?;
 
-    let processing_size: usize = redis::cmd("LLEN")
-        .arg(&processing_key)
-        .query_async(&mut conn)
-        .await
-        .unwrap_or(0);
-
-    let dlq_size: usize = redis::cmd("LLEN")
-        .arg(&dlq_key)
-        .query_async(&mut conn)
-        .await
-        .unwrap_or(0);
-
-    let delayed_size: usize = redis::cmd("ZCARD")
-        .arg(&delayed_key)
-        .query_async(&mut conn)
-        .await
-        .unwrap_or(0);
-
-    // Sample tasks to get task type distribution
-    let mut task_names = std::collections::HashMap::new();
-
-    if queue_size > 0 {
-        let sample_size = std::cmp::min(queue_size, 100);
-        let tasks: Vec<String> = if queue_type == "list" {
-            redis::cmd("LRANGE")
+        let queue_size: usize = if queue_type == "list" {
+            redis::cmd("LLEN")
                 .arg(&queue_key)
-                .arg(0)
-                .arg(sample_size as isize - 1)
-                .query_async(&mut conn)
+                .query_async(&mut main_conn)
                 .await?
         } else if queue_type == "zset" {
-            redis::cmd("ZRANGE")
+            redis::cmd("ZCARD")
                 .arg(&queue_key)
-                .arg(0)
-                .arg(sample_size as isize - 1)
-                .query_async(&mut conn)
+                .query_async(&mut main_conn)
                 .await?
         } else {
-            vec![]
+            0
         };
 
-        for task_str in tasks {
-            if let Ok(task) = serde_json::from_str::<celers_core::SerializedTask>(&task_str) {
-                *task_names.entry(task.metadata.name.clone()).or_insert(0) += 1;
+        let mut task_names: HashMap<String, usize> = HashMap::new();
+        if queue_size > 0 {
+            let sample_size = std::cmp::min(queue_size, 100);
+            let tasks: Vec<String> = if queue_type == "list" {
+                redis::cmd("LRANGE")
+                    .arg(&queue_key)
+                    .arg(0)
+                    .arg(sample_size as isize - 1)
+                    .query_async(&mut main_conn)
+                    .await?
+            } else if queue_type == "zset" {
+                redis::cmd("ZRANGE")
+                    .arg(&queue_key)
+                    .arg(0)
+                    .arg(sample_size as isize - 1)
+                    .query_async(&mut main_conn)
+                    .await?
+            } else {
+                vec![]
+            };
+
+            for task_str in tasks {
+                if let Ok(task) = serde_json::from_str::<celers_core::SerializedTask>(&task_str) {
+                    *task_names.entry(task.metadata.name.clone()).or_insert(0) += 1;
+                }
             }
         }
-    }
 
-    // Display statistics
+        Ok::<_, anyhow::Error>((queue_type, queue_size, task_names))
+    };
+
+    let processing = async move {
+        redis::cmd("LLEN")
+            .arg(&processing_key)
+            .query_async::<usize>(&mut processing_conn)
+            .await
+            .unwrap_or(0)
+    };
+    let dlq = async move {
+        redis::cmd("LLEN")
+            .arg(&dlq_key)
+            .query_async::<usize>(&mut dlq_conn)
+            .await
+            .unwrap_or(0)
+    };
+    let delayed = async move {
+        redis::cmd("ZCARD")
+            .arg(&delayed_key)
+            .query_async::<usize>(&mut delayed_conn)
+            .await
+            .unwrap_or(0)
+    };
+
+    let (main_result, processing_size, dlq_size, delayed_size) =
+        tokio::join!(main, processing, dlq, delayed);
+    let (queue_type, queue_size, task_names) = main_result?;
+
+    Ok(QueueStatsSnapshot {
+        queue_type,
+        queue_size,
+        processing_size,
+        dlq_size,
+        delayed_size,
+        task_names,
+    })
+}
+
+/// Render a [`QueueStatsSnapshot`] as the `queue_stats` table/health report.
+fn render_queue_stats(queue: &str, snapshot: &QueueStatsSnapshot) {
+    let QueueStatsSnapshot {
+        queue_type,
+        queue_size,
+        processing_size,
+        dlq_size,
+        delayed_size,
+        task_names,
+    } = snapshot;
+    let (queue_size, processing_size, dlq_size, delayed_size) =
+        (*queue_size, *processing_size, *dlq_size, *delayed_size);
+
     println!("{}", format!("Queue Statistics: {queue}").cyan().bold());
     println!();
 
@@ -345,10 +600,10 @@ pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
         }
 
         let mut task_types: Vec<TaskTypeRow> = task_names
-            .into_iter()
+            .iter()
             .map(|(name, count)| TaskTypeRow {
-                task_name: name,
-                count,
+                task_name: name.clone(),
+                count: *count,
             })
             .collect();
 
@@ -374,8 +629,6 @@ pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     if queue_size == 0 && processing_size == 0 && dlq_size == 0 {
         println!("{}", "✓ Queue is empty and healthy".green());
     }
-
-    Ok(())
 }
 
 /// Move all tasks from one queue to another
@@ -548,6 +801,9 @@ pub async fn move_queue(
             }
         }
     }
+
+    invalidate_queue_caches(broker_url, from_queue);
+    invalidate_queue_caches(broker_url, to_queue);
 
     println!();
     println!(
@@ -757,6 +1013,8 @@ pub async fn import_queue(
         }
     }
 
+    invalidate_queue_caches(broker_url, queue);
+
     println!();
     println!(
         "{}",
@@ -782,6 +1040,7 @@ pub async fn pause_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
         .arg(&timestamp)
         .query_async(&mut conn)
         .await?;
+    invalidate_queue_caches(broker_url, queue);
 
     println!(
         "{}",
@@ -821,6 +1080,7 @@ pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
         .arg(&pause_key)
         .query_async(&mut conn)
         .await?;
+    invalidate_queue_caches(broker_url, queue);
 
     println!(
         "{}",
@@ -834,4 +1094,143 @@ pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stand-in for a per-key broker round trip (e.g. `TYPE` + `LLEN`):
+    /// deterministic and independent of every other call, exactly the shape
+    /// `fetch_queue_list_entry` has for real Redis keys.
+    async fn stub_fetch(x: i32) -> i32 {
+        x * 2 + 1
+    }
+
+    /// The parallel-fetch pattern used throughout this module's read paths:
+    /// run an async operation for every item in a `Vec` via
+    /// `futures::future::join_all` instead of a `for` loop that awaits one
+    /// item at a time. This proves that pattern returns the same,
+    /// order-preserving result set as the equivalent serial loop, using a
+    /// stub async closure so no live broker is involved — matching how
+    /// `fetch_queue_list`'s per-key `TYPE`/`LLEN`/`ZCARD` lookups are
+    /// parallelized in production.
+    #[tokio::test]
+    async fn parallel_join_all_matches_equivalent_serial_loop() {
+        let items: Vec<i32> = (0..25).collect();
+
+        let mut serial = Vec::with_capacity(items.len());
+        for item in items.clone() {
+            serial.push(stub_fetch(item).await);
+        }
+
+        let parallel: Vec<i32> = futures::future::join_all(items.into_iter().map(stub_fetch)).await;
+
+        assert_eq!(
+            parallel, serial,
+            "join_all must preserve input order and match the serial result set"
+        );
+    }
+
+    #[test]
+    fn queue_stats_cache_hit_after_insert_then_miss_after_invalidate() {
+        let key = (
+            "test://queue-rs-cache-1".to_string(),
+            "q-cache-1".to_string(),
+        );
+        let snapshot = QueueStatsSnapshot {
+            queue_type: "list".to_string(),
+            queue_size: 3,
+            processing_size: 1,
+            dlq_size: 0,
+            delayed_size: 0,
+            task_names: HashMap::new(),
+        };
+
+        queue_stats_cache().insert(key.clone(), snapshot.clone());
+        assert_eq!(queue_stats_cache().get(&key), Some(snapshot));
+
+        queue_stats_cache().invalidate(&key);
+        assert_eq!(queue_stats_cache().get(&key), None);
+    }
+
+    #[test]
+    fn queue_list_cache_hit_after_insert_then_miss_after_invalidate() {
+        let key = "test://queue-rs-cache-2".to_string();
+        let entries = vec![QueueListEntry {
+            name: "celers:q-cache-2".to_string(),
+            queue_type: "FIFO".to_string(),
+            size: "5".to_string(),
+        }];
+
+        queue_list_cache().insert(key.clone(), entries.clone());
+        assert_eq!(queue_list_cache().get(&key), Some(entries));
+
+        queue_list_cache().invalidate(&key);
+        assert_eq!(queue_list_cache().get(&key), None);
+    }
+
+    #[test]
+    fn invalidate_queue_caches_clears_both_caches() {
+        let broker = "test://queue-rs-cache-3";
+        let queue = "q-cache-3";
+
+        queue_stats_cache().insert(
+            (broker.to_string(), queue.to_string()),
+            QueueStatsSnapshot {
+                queue_type: "list".to_string(),
+                queue_size: 0,
+                processing_size: 0,
+                dlq_size: 0,
+                delayed_size: 0,
+                task_names: HashMap::new(),
+            },
+        );
+        queue_list_cache().insert(broker.to_string(), vec![]);
+
+        invalidate_queue_caches(broker, queue);
+
+        assert_eq!(
+            queue_stats_cache().get(&(broker.to_string(), queue.to_string())),
+            None
+        );
+        assert_eq!(queue_list_cache().get(&broker.to_string()), None);
+    }
+
+    #[test]
+    fn queue_cache_stats_reflects_underlying_cache_activity() {
+        let key = "test://queue-rs-cache-stats-accessor".to_string();
+
+        let (list_before, stats_before) = queue_cache_stats();
+
+        queue_list_cache().insert(key.clone(), vec![]);
+        queue_list_cache().get(&key); // guaranteed hit
+
+        let (list_after, stats_after) = queue_cache_stats();
+
+        assert!(
+            list_after.len >= list_before.len,
+            "list-cache entry count must never decrease from an insert alone"
+        );
+        assert!(
+            list_after.hits > list_before.hits,
+            "queue_cache_stats must observe the hit just recorded on queue_list_cache"
+        );
+        // The stats-cache side is untouched by this test; other tests may
+        // run concurrently against it (this module's tests share one
+        // process-wide static), but its counters only ever increase.
+        assert!(stats_after.hits >= stats_before.hits);
+        assert!(stats_after.misses >= stats_before.misses);
+    }
+
+    #[test]
+    fn worker_cache_stats_is_reachable_via_queue_module() {
+        // `worker_cache_stats` is re-exported here (see its doc comment)
+        // specifically so `crate::interactive` can reach it despite
+        // `commands::worker` being a private submodule of `commands`; this
+        // proves the re-export actually compiles and forwards correctly.
+        let (list_stats, stats_stats) = worker_cache_stats();
+        assert!(list_stats.hit_ratio() <= 1.0);
+        assert!(stats_stats.hit_ratio() <= 1.0);
+    }
 }

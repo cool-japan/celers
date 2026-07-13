@@ -1,6 +1,6 @@
 # celers-backend-redis
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Tests: 208 | Updated: 2026-07-13**
 
 Redis-based result backend for CeleRS task result storage and workflow state management. Provides atomic operations for Chord barrier synchronization.
 
@@ -577,7 +577,9 @@ Task metadata format matches Celery's backend structure:
 
 ## Testing
 
-**208 tests passing** (unit + doc tests + integration tests)
+**208 unit/library tests passing** (`cargo nextest run`) plus **41 doc tests passing** (1 additional
+doc test `ignore`d). A further **18 tests are marked `#[ignore]`** (chord/backend/lock integration
+tests that require a live Redis instance) — run them with `cargo test -- --ignored`.
 
 ```rust
 #[cfg(test)]

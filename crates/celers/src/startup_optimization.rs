@@ -90,20 +90,28 @@ fn _cached_pattern_example() {
 
 /// Parallel initialization helper for running multiple initialization tasks concurrently
 ///
+/// # Errors
+///
+/// Returns an error if any spawned task panics or is cancelled (i.e. a `tokio::task::JoinError`
+/// occurs). Individual task errors are propagated as `Err` variants inside the returned `Vec`.
+///
 /// # Example
 ///
 /// ```rust,no_run
 /// use celers::startup_optimization::parallel_init;
 ///
-/// # async fn example() {
+/// # async fn example() -> anyhow::Result<()> {
 /// let results = parallel_init(vec![
 ///     Box::new(|| Box::pin(async { /* Initialize DB */ Ok::<(), String>(()) })),
 ///     Box::new(|| Box::pin(async { /* Connect to broker */ Ok::<(), String>(()) })),
 ///     Box::new(|| Box::pin(async { /* Load config */ Ok::<(), String>(()) })),
-/// ]).await;
+/// ]).await?;
+/// # Ok(())
 /// # }
 /// ```
-pub async fn parallel_init<T, E>(tasks: Vec<AsyncInitTask<T, E>>) -> Vec<Result<T, E>>
+pub async fn parallel_init<T, E>(
+    tasks: Vec<AsyncInitTask<T, E>>,
+) -> anyhow::Result<Vec<Result<T, E>>>
 where
     T: Send + 'static,
     E: Send + 'static,
@@ -118,13 +126,11 @@ where
         match handle.await {
             Ok(result) => results.push(result),
             Err(e) => {
-                // Handle join error - convert to result type
-                // For now, we'll panic as this indicates a serious issue
-                panic!("Task panicked: {:?}", e);
+                return Err(anyhow::anyhow!("Task join error: {:?}", e));
             }
         }
     }
-    results
+    Ok(results)
 }
 
 /// Startup performance metrics

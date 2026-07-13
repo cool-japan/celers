@@ -132,10 +132,10 @@ impl PoisonMessageDetector {
     pub fn record_failure(&self, task_id: uuid::Uuid) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
-        let mut failures = self.failures.lock().unwrap();
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
 
         let entry = failures.entry(task_id).or_insert((0, now));
 
@@ -152,10 +152,10 @@ impl PoisonMessageDetector {
     pub fn is_poison(&self, task_id: uuid::Uuid) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
-        let failures = self.failures.lock().unwrap();
+        let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some((count, last_failure)) = failures.get(&task_id) {
             if now - last_failure <= self.failure_window.as_secs() {
@@ -170,10 +170,10 @@ impl PoisonMessageDetector {
     pub fn failure_count(&self, task_id: uuid::Uuid) -> u32 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
-        let failures = self.failures.lock().unwrap();
+        let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some((count, last_failure)) = failures.get(&task_id) {
             if now - last_failure <= self.failure_window.as_secs() {
@@ -186,13 +186,13 @@ impl PoisonMessageDetector {
 
     /// Clear failure history for a message
     pub fn clear_failures(&self, task_id: uuid::Uuid) {
-        let mut failures = self.failures.lock().unwrap();
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         failures.remove(&task_id);
     }
 
     /// Clear all failure history
     pub fn clear_all(&self) {
-        let mut failures = self.failures.lock().unwrap();
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         failures.clear();
     }
 }

@@ -300,6 +300,154 @@ pub fn negotiate_protocol(
     negotiator.negotiate(remote)
 }
 
+/// Header/property key under which the protocol version is advertised and
+/// parsed on the wire. The stored value is the version's numeric string
+/// (e.g. `"2"` or `"5"`), matching [`ProtocolVersion::as_number_str`] and the
+/// `protocol_version` stamp used by [`crate::migration`] and [`crate::v5`].
+pub const PROTOCOL_VERSION_KEY: &str = "protocol_version";
+
+/// Advertise the protocol versions supported locally by this CeleRS build.
+///
+/// The list is returned in descending preference order (highest version first),
+/// which is also the order honoured by [`negotiate_version`]. Use this when
+/// announcing capabilities to a remote party (e.g. in a handshake header).
+///
+/// # Example
+///
+/// ```
+/// use celers_protocol::negotiation::locally_supported_versions;
+/// use celers_protocol::ProtocolVersion;
+///
+/// let advertised = locally_supported_versions();
+/// assert_eq!(advertised, vec![ProtocolVersion::V5, ProtocolVersion::V2]);
+/// ```
+pub fn locally_supported_versions() -> Vec<ProtocolVersion> {
+    // Highest first so that the preference order is explicit and stable.
+    vec![ProtocolVersion::V5, ProtocolVersion::V2]
+}
+
+/// Negotiate the highest mutually-supported protocol version.
+///
+/// Given the versions supported by the local party and those supported by the
+/// remote party, returns the **highest** version present in both sets, or
+/// [`None`] when there is no overlap at all. Ordering relies on the `Ord`
+/// implementation of [`ProtocolVersion`] (`V2 < V5`).
+///
+/// This is a pure, allocation-light function that does not depend on a
+/// [`ProtocolNegotiator`] instance, making it convenient for simple handshakes.
+///
+/// # Examples
+///
+/// ```
+/// use celers_protocol::negotiation::negotiate_version;
+/// use celers_protocol::ProtocolVersion;
+///
+/// // Both support v2 and v5 -> the highest common version (v5) wins.
+/// let agreed = negotiate_version(
+///     &[ProtocolVersion::V2, ProtocolVersion::V5],
+///     &[ProtocolVersion::V2, ProtocolVersion::V5],
+/// );
+/// assert_eq!(agreed, Some(ProtocolVersion::V5));
+///
+/// // Only v2 is common.
+/// let agreed = negotiate_version(
+///     &[ProtocolVersion::V2, ProtocolVersion::V5],
+///     &[ProtocolVersion::V2],
+/// );
+/// assert_eq!(agreed, Some(ProtocolVersion::V2));
+///
+/// // No overlap.
+/// let agreed = negotiate_version(&[ProtocolVersion::V2], &[ProtocolVersion::V5]);
+/// assert_eq!(agreed, None);
+/// ```
+pub fn negotiate_version(
+    local_supported: &[ProtocolVersion],
+    remote_supported: &[ProtocolVersion],
+) -> Option<ProtocolVersion> {
+    let remote_set: HashSet<ProtocolVersion> = remote_supported.iter().copied().collect();
+    local_supported
+        .iter()
+        .copied()
+        .filter(|version| remote_set.contains(version))
+        .max()
+}
+
+/// Parse a [`ProtocolVersion`] from a header/property string value.
+///
+/// Accepts both the numeric form (`"2"`, `"5"`) and the prefixed form
+/// (`"v2"`, `"V5"`), delegating to [`ProtocolVersion`]'s `FromStr`. Returns
+/// [`None`] for any unrecognised value.
+///
+/// # Example
+///
+/// ```
+/// use celers_protocol::negotiation::parse_version;
+/// use celers_protocol::ProtocolVersion;
+///
+/// assert_eq!(parse_version("5"), Some(ProtocolVersion::V5));
+/// assert_eq!(parse_version("v2"), Some(ProtocolVersion::V2));
+/// assert_eq!(parse_version("nope"), None);
+/// ```
+pub fn parse_version(value: &str) -> Option<ProtocolVersion> {
+    value.parse::<ProtocolVersion>().ok()
+}
+
+/// Encode a [`ProtocolVersion`] into its canonical header/property string.
+///
+/// This is the numeric form (`"2"` / `"5"`) used for the `protocol_version`
+/// header, matching [`ProtocolVersion::as_number_str`].
+///
+/// # Example
+///
+/// ```
+/// use celers_protocol::negotiation::encode_version;
+/// use celers_protocol::ProtocolVersion;
+///
+/// assert_eq!(encode_version(ProtocolVersion::V5), "5");
+/// ```
+#[inline]
+pub fn encode_version(version: ProtocolVersion) -> &'static str {
+    version.as_number_str()
+}
+
+/// Extract a [`ProtocolVersion`] from a map of message headers.
+///
+/// Looks up [`PROTOCOL_VERSION_KEY`] and, if present and parseable (as either a
+/// JSON string like `"5"` or a JSON number like `5`), returns the corresponding
+/// version. Returns [`None`] when the header is absent or unrecognised.
+///
+/// This understands the same stamp written by [`crate::v5::build_v5_message`]
+/// and [`crate::migration::ProtocolMigrator::migrate`].
+pub fn parse_version_from_headers(
+    headers: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<ProtocolVersion> {
+    let value = headers.get(PROTOCOL_VERSION_KEY)?;
+    match value {
+        serde_json::Value::String(s) => parse_version(s),
+        serde_json::Value::Number(n) => n.as_u64().and_then(|num| match num {
+            2 => Some(ProtocolVersion::V2),
+            5 => Some(ProtocolVersion::V5),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// Encode a [`ProtocolVersion`] into a map of message headers.
+///
+/// Inserts (or overwrites) [`PROTOCOL_VERSION_KEY`] with the canonical numeric
+/// string value (`"2"` / `"5"`), so the stamp is consistent with the rest of
+/// the crate.
+pub fn encode_version_into_headers(
+    headers: &mut std::collections::HashMap<String, serde_json::Value>,
+    version: ProtocolVersion,
+) {
+    headers.insert(
+        PROTOCOL_VERSION_KEY.to_string(),
+        serde_json::Value::String(encode_version(version).to_string()),
+    );
+}
+
 /// Protocol capabilities
 #[derive(Debug, Clone, Default)]
 pub struct ProtocolCapabilities {
@@ -509,5 +657,126 @@ mod tests {
         let versions = negotiator.supported_versions();
         assert!(versions.contains(&ProtocolVersion::V2));
         assert!(versions.contains(&ProtocolVersion::V5));
+    }
+
+    #[test]
+    fn test_locally_supported_versions_descending_preference() {
+        let advertised = locally_supported_versions();
+        assert_eq!(advertised, vec![ProtocolVersion::V5, ProtocolVersion::V2]);
+    }
+
+    #[test]
+    fn test_negotiate_version_full_matrix() {
+        use ProtocolVersion::{V2, V5};
+
+        // Both support everything -> highest common (v5).
+        assert_eq!(negotiate_version(&[V2, V5], &[V2, V5]), Some(V5));
+        // Order of inputs must not matter.
+        assert_eq!(negotiate_version(&[V5, V2], &[V2, V5]), Some(V5));
+
+        // Single common version: v2 only.
+        assert_eq!(negotiate_version(&[V2, V5], &[V2]), Some(V2));
+        assert_eq!(negotiate_version(&[V2], &[V2, V5]), Some(V2));
+
+        // Single common version: v5 only.
+        assert_eq!(negotiate_version(&[V2, V5], &[V5]), Some(V5));
+        assert_eq!(negotiate_version(&[V5], &[V2, V5]), Some(V5));
+
+        // Exact single-version match on both sides.
+        assert_eq!(negotiate_version(&[V2], &[V2]), Some(V2));
+        assert_eq!(negotiate_version(&[V5], &[V5]), Some(V5));
+
+        // No overlap -> None.
+        assert_eq!(negotiate_version(&[V2], &[V5]), None);
+        assert_eq!(negotiate_version(&[V5], &[V2]), None);
+
+        // Empty inputs -> None.
+        assert_eq!(negotiate_version(&[], &[V2, V5]), None);
+        assert_eq!(negotiate_version(&[V2, V5], &[]), None);
+        assert_eq!(negotiate_version(&[], &[]), None);
+    }
+
+    #[test]
+    fn test_negotiate_version_picks_highest_common() {
+        // Even if the local list prefers v2 first, the *highest* common version
+        // is chosen.
+        assert_eq!(
+            negotiate_version(
+                &[ProtocolVersion::V2, ProtocolVersion::V5],
+                &[ProtocolVersion::V5, ProtocolVersion::V2],
+            ),
+            Some(ProtocolVersion::V5)
+        );
+    }
+
+    #[test]
+    fn test_parse_and_encode_version() {
+        assert_eq!(parse_version("2"), Some(ProtocolVersion::V2));
+        assert_eq!(parse_version("v2"), Some(ProtocolVersion::V2));
+        assert_eq!(parse_version("5"), Some(ProtocolVersion::V5));
+        assert_eq!(parse_version("V5"), Some(ProtocolVersion::V5));
+        assert_eq!(parse_version("7"), None);
+        assert_eq!(parse_version(""), None);
+
+        assert_eq!(encode_version(ProtocolVersion::V2), "2");
+        assert_eq!(encode_version(ProtocolVersion::V5), "5");
+
+        // Round-trip.
+        for v in [ProtocolVersion::V2, ProtocolVersion::V5] {
+            assert_eq!(parse_version(encode_version(v)), Some(v));
+        }
+    }
+
+    #[test]
+    fn test_version_header_round_trip() {
+        let mut headers = std::collections::HashMap::new();
+
+        // Absent header -> None.
+        assert_eq!(parse_version_from_headers(&headers), None);
+
+        encode_version_into_headers(&mut headers, ProtocolVersion::V5);
+        assert_eq!(
+            headers.get(PROTOCOL_VERSION_KEY),
+            Some(&serde_json::Value::String("5".to_string()))
+        );
+        assert_eq!(
+            parse_version_from_headers(&headers),
+            Some(ProtocolVersion::V5)
+        );
+
+        // Overwrite with v2.
+        encode_version_into_headers(&mut headers, ProtocolVersion::V2);
+        assert_eq!(
+            parse_version_from_headers(&headers),
+            Some(ProtocolVersion::V2)
+        );
+    }
+
+    #[test]
+    fn test_parse_version_from_headers_numeric_and_invalid() {
+        // Numeric JSON value is accepted.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            PROTOCOL_VERSION_KEY.to_string(),
+            serde_json::Value::Number(5u8.into()),
+        );
+        assert_eq!(
+            parse_version_from_headers(&headers),
+            Some(ProtocolVersion::V5)
+        );
+
+        // Unknown numeric value -> None.
+        headers.insert(
+            PROTOCOL_VERSION_KEY.to_string(),
+            serde_json::Value::Number(9u8.into()),
+        );
+        assert_eq!(parse_version_from_headers(&headers), None);
+
+        // Wrong JSON type -> None.
+        headers.insert(
+            PROTOCOL_VERSION_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        assert_eq!(parse_version_from_headers(&headers), None);
     }
 }

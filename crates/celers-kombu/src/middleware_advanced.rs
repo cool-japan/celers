@@ -117,7 +117,7 @@ impl AuditMiddleware {
     fn create_audit_entry(&self, message: &Message, operation: &str) -> String {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let body_info = if self.log_body {
@@ -213,7 +213,7 @@ impl MessageMiddleware for DeadlineMiddleware {
         // Calculate absolute deadline timestamp
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         let deadline = now + self.deadline_duration.as_secs();
 
@@ -231,7 +231,7 @@ impl MessageMiddleware for DeadlineMiddleware {
             if let Some(deadline) = deadline_value.as_u64() {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("SystemTime should be after UNIX_EPOCH")
                     .as_secs();
 
                 if now > deadline {
@@ -442,12 +442,15 @@ impl IdempotencyMiddleware {
 
     /// Check if a message ID has been processed
     pub fn is_processed(&self, message_id: &str) -> bool {
-        self.processed_ids.lock().unwrap().contains(message_id)
+        self.processed_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(message_id)
     }
 
     /// Mark a message ID as processed
     pub fn mark_processed(&self, message_id: String) {
-        let mut cache = self.processed_ids.lock().unwrap();
+        let mut cache = self.processed_ids.lock().unwrap_or_else(|e| e.into_inner());
 
         // Simple cache eviction: if we exceed max size, clear oldest 20%
         if cache.len() >= self.max_cache_size {
@@ -463,12 +466,18 @@ impl IdempotencyMiddleware {
 
     /// Clear all processed message IDs
     pub fn clear(&self) {
-        self.processed_ids.lock().unwrap().clear();
+        self.processed_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Get the number of tracked message IDs
     pub fn cache_size(&self) -> usize {
-        self.processed_ids.lock().unwrap().len()
+        self.processed_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -607,7 +616,7 @@ impl MessageMiddleware for BackoffMiddleware {
             "x-next-retry-at".to_string(),
             serde_json::json!((std::time::SystemTime::now() + backoff_delay)
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs()),
         );
 
@@ -673,7 +682,7 @@ impl CachingMiddleware {
     /// Check if a cached result exists and is still valid
     pub fn get_cached(&self, message: &Message) -> Option<Vec<u8>> {
         let key = self.cache_key(message);
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some((result, timestamp)) = cache.get(&key) {
             if timestamp.elapsed() < self.ttl {
@@ -688,7 +697,7 @@ impl CachingMiddleware {
     /// Store a result in the cache
     pub fn store_result(&self, message: &Message, result: Vec<u8>) {
         let key = self.cache_key(message);
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
 
         // Evict oldest entries if cache is full
         if cache.len() >= self.max_entries {
@@ -706,12 +715,12 @@ impl CachingMiddleware {
 
     /// Clear all cached results
     pub fn clear(&self) {
-        self.cache.lock().unwrap().clear();
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Get the number of cached entries
     pub fn cache_size(&self) -> usize {
-        self.cache.lock().unwrap().len()
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -806,7 +815,7 @@ impl BulkheadMiddleware {
 
     /// Try to acquire a permit for the given partition
     pub fn try_acquire(&self, partition: &str) -> bool {
-        let mut permits = self.permits.lock().unwrap();
+        let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
         let current = permits.entry(partition.to_string()).or_insert(0);
         if *current < self.max_concurrent {
             *current += 1;
@@ -818,7 +827,7 @@ impl BulkheadMiddleware {
 
     /// Release a permit for the given partition
     pub fn release(&self, partition: &str) {
-        let mut permits = self.permits.lock().unwrap();
+        let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(current) = permits.get_mut(partition) {
             if *current > 0 {
                 *current -= 1;
@@ -830,7 +839,7 @@ impl BulkheadMiddleware {
     pub fn current_operations(&self, partition: &str) -> usize {
         self.permits
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(partition)
             .copied()
             .unwrap_or(0)
@@ -838,7 +847,11 @@ impl BulkheadMiddleware {
 
     /// Get total concurrent operations across all partitions
     pub fn total_operations(&self) -> usize {
-        self.permits.lock().unwrap().values().sum()
+        self.permits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .sum()
     }
 }
 
@@ -976,7 +989,7 @@ impl PriorityBoostMiddleware {
                 if let Some(timestamp_secs) = timestamp_value.as_f64() {
                     let msg_age = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .expect("SystemTime should be after UNIX_EPOCH")
                         .as_secs_f64()
                         - timestamp_secs;
                     if msg_age > age_threshold.as_secs_f64() {

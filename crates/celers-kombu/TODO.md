@@ -2,9 +2,14 @@
 
 > Broker abstraction layer (Kombu-style)
 
-## Status: ✅ STABLE — v0.2.0 (2026-03-27) — 323 tests
+## Status: ✅ STABLE — v0.3.0 (2026-07-13) — 343 tests (+ 145 doc tests, 1 ignored)
 
 All core abstractions implemented with advanced production features: DLQ, transactions, scheduling, consumer groups, message replay, quota management, comprehensive middleware, flow control, poison message detection, utilities, benchmarks, and examples.
+
+### Fixed in v0.3.0 (Messaging Correctness — verified against source 2026-07-13)
+- [x] `CompressionMiddleware` now records the codec in a `content-encoding` header on publish and actually decompresses on consume — previously compressed bodies were never restored on the consumer side (silent data corruption)
+- [x] `SigningMiddleware` now stores the HMAC signature on publish and verifies it on consume, rejecting tampered or unsigned messages — previously the signature was never checked on consume
+- [x] `HealthCheckMiddleware` now performs a real (throttled) health evaluation (`run_health_check()`, driven by `mark_healthy()`/`mark_unhealthy()`) and injects status + timestamp headers, instead of an unconditional stub status
 
 ### Latest Enhancements (v0.4.16 - 2026-01-07)
 - ✅ **Production Operations Middleware**: **3 new middleware types** (NEW)
@@ -510,9 +515,10 @@ All core abstractions implemented with advanced production features: DLQ, transa
   - [x] **SigningMiddleware** - Message signing (NEW, feature-gated) ✅
     - [x] HMAC-SHA256 via celers-protocol
     - [x] Message integrity verification
-  - [x] **EncryptionMiddleware** - Message encryption (NEW, feature-gated) ✅
-    - [x] AES-256-GCM via celers-protocol
-    - [x] Automatic nonce handling
+  - [x] **EncryptionMiddleware** - Message encryption at rest and in transit (NEW, feature-gated) ✅
+    - [x] AES-256-GCM (AEAD) via celers-protocol crypto
+    - [x] `content-encryption` scheme header + `content-encryption-nonce` header, set on publish and cleared on consume (mirrors Compression/Signing round-trip)
+    - [x] Rejects missing key / missing nonce / tampered ciphertext / wrong key (GCM tag failure)
   - [x] **TimeoutMiddleware** - Processing timeout enforcement (NEW - v0.4.0) ✅
     - [x] Configurable timeout duration
     - [x] Timeout metadata in message headers
@@ -789,9 +795,10 @@ All core abstractions implemented with advanced production features: DLQ, transa
   - [x] HMAC-SHA256 signing ✅
   - [x] Message integrity verification ✅
 - [x] Encryption middleware (integration with celers-protocol crypto) ✅ (NEW)
-  - [x] AES-256-GCM encryption ✅
-  - [x] Automatic nonce generation ✅
-  - [x] Secure message decryption ✅
+  - [x] AES-256-GCM authenticated encryption ✅
+  - [x] Per-message nonce generation, carried in `content-encryption-nonce` header ✅
+  - [x] `content-encryption` scheme marker set on publish, cleared on consume ✅
+  - [x] Authenticated decryption rejecting tampered/forged ciphertext ✅
 - [x] Timeout middleware ✅ (NEW - v0.4.0)
   - [x] Configurable timeout duration ✅
   - [x] Timeout metadata injection ✅
@@ -846,11 +853,11 @@ All core abstractions implemented with advanced production features: DLQ, transa
 - **Load Shedding Middleware** for graceful degradation under pressure ✅ (v0.4.15)
 - **Priority Escalation Middleware** for preventing message starvation ✅ (v0.4.15)
 - **Observability Middleware** for structured logging and metrics ✅ (v0.4.15)
-- **Utilities Module** with 72 helper functions for optimization, analysis, and operational excellence ✅ (v0.4.0, v0.4.2, v0.4.3, v0.4.6, v0.4.7, v0.4.8, v0.4.9, v0.4.10, v0.4.12, v0.4.13, v0.4.14, v0.4.15, v0.4.16)
-- **Performance Benchmarks** - 86 comprehensive Criterion-based benchmarks covering all critical code paths and utilities ✅ (v0.2.0, v0.4.4, v0.4.5, v0.4.6, v0.4.7, v0.4.8, v0.4.9, v0.4.10, v0.4.11, v0.4.12, v0.4.16)
+- **Utilities Module** with 75 helper functions for optimization, analysis, and operational excellence ✅ (v0.4.0, v0.4.2, v0.4.3, v0.4.6, v0.4.7, v0.4.8, v0.4.9, v0.4.10, v0.4.12, v0.4.13, v0.4.14, v0.4.15, v0.4.16)
+- **Performance Benchmarks** - 109 comprehensive Criterion-based benchmarks covering all critical code paths and utilities ✅ (v0.2.0, v0.4.4, v0.4.5, v0.4.6, v0.4.7, v0.4.8, v0.4.9, v0.4.10, v0.4.11, v0.4.12, v0.4.16)
 - **11 Comprehensive Examples** covering all features: basics, middleware, DLQ, batch, advanced features, flow control, circuit breaker, transactions, utilities, monitoring, operational excellence ✅ (v0.2.0, v0.4.1, v0.4.5, v0.4.6, v0.4.7)
-- **459 total tests** (323 unit tests + 136 doc tests with all features), 0 warnings, 0 clippy warnings ✅
+- **488 total tests** (343 unit tests + 145 doc tests with all features, 1 doc test ignored), 0 warnings, 0 clippy warnings ✅ (re-verified via `cargo nextest run --all-features` / `cargo test --doc --all-features` on 2026-07-13)
 - **Doc tests validate API examples** ensuring documentation is always correct and compilable ✅
-- **136 doc tests cover all major public types, middleware, and utilities** for comprehensive API validation ✅
-- **Complete middleware documentation** with examples for all 41 built-in and feature-gated middleware ✅
+- **145 doc tests cover all major public types, middleware, and utilities** for comprehensive API validation ✅
+- **Complete middleware documentation** with examples for all 44 built-in and feature-gated middleware types (41 built-in + 3 feature-gated: Compression, Signing, Encryption) ✅ — 3 middleware are not yet mentioned elsewhere in this file: `SLAMonitoringMiddleware`, `MessageVersioningMiddleware`, `ResourceQuotaMiddleware` (all in `src/middleware_monitoring.rs`, real implementations with builder methods, not stubs)
 - Feature flags: `compression`, `signing`, `encryption`, `full` (enables all)

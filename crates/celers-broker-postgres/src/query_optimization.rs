@@ -2,8 +2,10 @@
 
 use celers_core::{CelersError, Result};
 use chrono::{DateTime, Utc};
-use sqlx::Row;
+use oxisql_core::Connection;
 
+use crate::row_ext::RowExt;
+use crate::scheduling::validate_sql_identifier;
 use crate::PostgresBroker;
 
 // Query Optimization Methods
@@ -24,6 +26,8 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn explain_dequeue_query(&self) -> Result<String> {
+        validate_sql_identifier(&self.queue_name)?;
+
         let explain_query = format!(
             r#"
             EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
@@ -37,12 +41,21 @@ impl PostgresBroker {
             self.queue_name
         );
 
-        let rows = sqlx::query_scalar::<_, String>(&explain_query)
-            .fetch_all(&self.pool)
+        let rows = self
+            .conn
+            .query(&explain_query, &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
 
-        Ok(rows.join("\n"))
+        let mut lines = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let line: String = row
+                .col_idx(0)
+                .map_err(|e| CelersError::Other(format!("Failed to read explain line: {}", e)))?;
+            lines.push(line);
+        }
+
+        Ok(lines.join("\n"))
     }
 
     /// Get query statistics for tasks table
@@ -85,10 +98,33 @@ impl PostgresBroker {
             self.queue_name.trim_start_matches("public.")
         );
 
-        let row = sqlx::query(&query)
-            .fetch_one(&self.pool)
+        let rows = self
+            .conn
+            .query(&query, &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get query stats: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get query stats: no rows returned".to_string())
+        })?;
+
+        let idx_scan: Option<i64> = row
+            .col("idx_scan")
+            .map_err(|e| CelersError::Other(format!("Failed to read idx_scan: {}", e)))?;
+        let idx_tup_fetch: Option<i64> = row
+            .col("idx_tup_fetch")
+            .map_err(|e| CelersError::Other(format!("Failed to read idx_tup_fetch: {}", e)))?;
+        let last_vacuum: Option<DateTime<Utc>> = row
+            .col("last_vacuum")
+            .map_err(|e| CelersError::Other(format!("Failed to read last_vacuum: {}", e)))?;
+        let last_autovacuum: Option<DateTime<Utc>> = row
+            .col("last_autovacuum")
+            .map_err(|e| CelersError::Other(format!("Failed to read last_autovacuum: {}", e)))?;
+        let last_analyze: Option<DateTime<Utc>> = row
+            .col("last_analyze")
+            .map_err(|e| CelersError::Other(format!("Failed to read last_analyze: {}", e)))?;
+        let last_autoanalyze: Option<DateTime<Utc>> = row
+            .col("last_autoanalyze")
+            .map_err(|e| CelersError::Other(format!("Failed to read last_autoanalyze: {}", e)))?;
 
         let stats = format!(
             "Table: {}.{}\n\
@@ -105,21 +141,30 @@ impl PostgresBroker {
              Last Autovacuum: {:?}\n\
              Last Analyze: {:?}\n\
              Last Autoanalyze: {:?}",
-            row.get::<String, _>("schemaname"),
-            row.get::<String, _>("relname"),
-            row.get::<i64, _>("seq_scan"),
-            row.get::<i64, _>("seq_tup_read"),
-            row.get::<Option<i64>, _>("idx_scan").unwrap_or(0),
-            row.get::<Option<i64>, _>("idx_tup_fetch").unwrap_or(0),
-            row.get::<i64, _>("n_tup_ins"),
-            row.get::<i64, _>("n_tup_upd"),
-            row.get::<i64, _>("n_tup_del"),
-            row.get::<i64, _>("n_live_tup"),
-            row.get::<i64, _>("n_dead_tup"),
-            row.get::<Option<DateTime<Utc>>, _>("last_vacuum"),
-            row.get::<Option<DateTime<Utc>>, _>("last_autovacuum"),
-            row.get::<Option<DateTime<Utc>>, _>("last_analyze"),
-            row.get::<Option<DateTime<Utc>>, _>("last_autoanalyze")
+            row.col::<String>("schemaname")
+                .map_err(|e| CelersError::Other(format!("Failed to read schemaname: {}", e)))?,
+            row.col::<String>("relname")
+                .map_err(|e| CelersError::Other(format!("Failed to read relname: {}", e)))?,
+            row.col::<i64>("seq_scan")
+                .map_err(|e| CelersError::Other(format!("Failed to read seq_scan: {}", e)))?,
+            row.col::<i64>("seq_tup_read")
+                .map_err(|e| CelersError::Other(format!("Failed to read seq_tup_read: {}", e)))?,
+            idx_scan.unwrap_or(0),
+            idx_tup_fetch.unwrap_or(0),
+            row.col::<i64>("n_tup_ins")
+                .map_err(|e| CelersError::Other(format!("Failed to read n_tup_ins: {}", e)))?,
+            row.col::<i64>("n_tup_upd")
+                .map_err(|e| CelersError::Other(format!("Failed to read n_tup_upd: {}", e)))?,
+            row.col::<i64>("n_tup_del")
+                .map_err(|e| CelersError::Other(format!("Failed to read n_tup_del: {}", e)))?,
+            row.col::<i64>("n_live_tup")
+                .map_err(|e| CelersError::Other(format!("Failed to read n_live_tup: {}", e)))?,
+            row.col::<i64>("n_dead_tup")
+                .map_err(|e| CelersError::Other(format!("Failed to read n_dead_tup: {}", e)))?,
+            last_vacuum,
+            last_autovacuum,
+            last_analyze,
+            last_autoanalyze
         );
 
         Ok(stats)
@@ -146,26 +191,33 @@ impl PostgresBroker {
         max_parallel_workers: i32,
     ) -> Result<()> {
         if enable_parallel {
-            sqlx::query(&format!(
+            // Postgres `SET` statements do not accept `$n` bind parameters
+            // on the right-hand side, so `max_parallel_workers` (a typed
+            // `i32`, not attacker-controlled text) must still be
+            // interpolated as literal SQL text here — same as the
+            // pre-migration `sqlx::AssertSqlSafe` version, minus the
+            // now-dropped wrapper.
+            let set_workers_query = format!(
                 "SET max_parallel_workers_per_gather = {}",
                 max_parallel_workers
-            ))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
-
-            sqlx::query("SET parallel_setup_cost = 100")
-                .execute(&self.pool)
+            );
+            self.conn
+                .execute(&set_workers_query, &[])
                 .await
                 .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
 
-            sqlx::query("SET parallel_tuple_cost = 0.01")
-                .execute(&self.pool)
+            self.conn
+                .execute("SET parallel_setup_cost = 100", &[])
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
+
+            self.conn
+                .execute("SET parallel_tuple_cost = 0.01", &[])
                 .await
                 .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
         } else {
-            sqlx::query("SET max_parallel_workers_per_gather = 0")
-                .execute(&self.pool)
+            self.conn
+                .execute("SET max_parallel_workers_per_gather = 0", &[])
                 .await
                 .map_err(|e| CelersError::Other(format!("Failed to set query hints: {}", e)))?;
         }

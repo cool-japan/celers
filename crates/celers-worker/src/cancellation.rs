@@ -45,13 +45,17 @@ use celers_core::TaskId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info};
 
 /// Cancellation token for cooperative task cancellation
+///
+/// Cloning is cheap: clones share the same underlying cancellation flag and
+/// notification primitive, so cancelling any clone is observed by all of them.
 #[derive(Clone)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
     task_id: TaskId,
 }
 
@@ -60,19 +64,31 @@ impl CancellationToken {
     pub fn new(task_id: TaskId) -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
             task_id,
         }
     }
 
     /// Check if cancellation has been requested
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.cancelled.load(Ordering::Acquire)
     }
 
     /// Request cancellation
+    ///
+    /// Idempotent: calling this multiple times has the same effect as calling it
+    /// once. All current and future waiters on [`cancelled`](Self::cancelled) are
+    /// woken.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-        debug!("Cancellation requested for task {}", self.task_id);
+        // `swap` returns the previous value; only log/notify on the first trip so
+        // repeated cancellations stay quiet but still wake any late waiters.
+        let was_cancelled = self.cancelled.swap(true, Ordering::Release);
+        if !was_cancelled {
+            debug!("Cancellation requested for task {}", self.task_id);
+        }
+        // `notify_waiters` only wakes *currently registered* waiters, so combine
+        // it with the flag check inside `cancelled()` to avoid lost wakeups.
+        self.notify.notify_waiters();
     }
 
     /// Get the task ID
@@ -83,11 +99,24 @@ impl CancellationToken {
     /// Wait for cancellation signal
     ///
     /// This is an async method that completes when cancellation is requested.
-    /// Useful for tasks that want to await cancellation rather than polling.
+    /// Useful for tasks that want to await cancellation rather than polling, e.g.
+    /// inside a [`tokio::select!`] alongside the task's own work.
+    ///
+    /// The implementation is notification-based (no busy polling): it returns
+    /// immediately if cancellation already happened, otherwise it parks until
+    /// [`cancel`](Self::cancel) wakes it.
     pub async fn cancelled(&self) {
-        // Poll-based implementation (could be improved with notification)
-        while !self.is_cancelled() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            // Register interest *before* re-checking the flag to close the race
+            // where `cancel()` fires between the check and the await.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -369,5 +398,39 @@ mod tests {
 
         token1.cancel();
         assert!(token2.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_returns_immediately_when_already_cancelled() {
+        let token = CancellationToken::new(uuid::Uuid::new_v4());
+        token.cancel();
+        // Must complete promptly (notification-based, not a 100ms poll).
+        tokio::time::timeout(std::time::Duration::from_millis(50), token.cancelled())
+            .await
+            .expect("cancelled() should return immediately when already cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_wakes_on_cancel() {
+        let token = CancellationToken::new(uuid::Uuid::new_v4());
+        let waiter = token.clone();
+        let handle = tokio::spawn(async move {
+            waiter.cancelled().await;
+        });
+        // Give the waiter a moment to park on `notified()`.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(200), handle)
+            .await
+            .expect("waiter should wake quickly after cancel")
+            .expect("waiter task should not panic");
+    }
+
+    #[test]
+    fn test_cancel_is_idempotent() {
+        let token = CancellationToken::new(uuid::Uuid::new_v4());
+        token.cancel();
+        token.cancel();
+        assert!(token.is_cancelled());
     }
 }

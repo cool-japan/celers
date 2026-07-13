@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use celers_core::error::CelersError;
 use celers_core::lock::DistributedLockBackend;
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{PgPool, Row};
+use oxisql_core::Connection;
+
+use crate::row_ext::RowExt;
 
 /// Database-backed distributed lock backend using PostgreSQL.
 ///
@@ -24,30 +26,47 @@ use sqlx::{PgPool, Row};
 /// use celers_backend_db::lock::DbLockBackend;
 /// use celers_core::lock::DistributedLockBackend;
 ///
-/// let pool = sqlx::PgPool::connect("postgres://localhost/mydb").await.unwrap();
-/// let backend = DbLockBackend::new(pool);
+/// let conn = oxisql_postgres::PgConnection::connect(
+///     "host=localhost dbname=mydb",
+///     oxisql_postgres::TlsMode::Disabled,
+/// ).await.unwrap();
+/// let backend = DbLockBackend::new(conn);
 /// backend.ensure_table().await.unwrap();
 ///
 /// let acquired = backend.try_acquire("my_task", "scheduler-1", 300).await.unwrap();
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DbLockBackend {
-    pool: PgPool,
+    conn: oxisql_postgres::PgConnection,
     table_name: String,
+}
+
+// Manual `Debug` impl: `oxisql_postgres::PgConnection` does not implement
+// `Debug` (unlike the previous `sqlx::PgPool`, which did). `table_name` is
+// still printed in full since it carries no sensitive/opaque state. See
+// `celers-backend-db`'s `analytics.rs` `PostgresAnalytics`/`MysqlAnalytics`
+// `Debug` impls for the same rationale applied to their connection fields.
+impl std::fmt::Debug for DbLockBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbLockBackend")
+            .field("conn", &"PgConnection { .. }")
+            .field("table_name", &self.table_name)
+            .finish()
+    }
 }
 
 impl DbLockBackend {
     /// Create a new database lock backend with default table name `celers_beat_locks`.
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(conn: oxisql_postgres::PgConnection) -> Self {
         Self {
-            pool,
+            conn,
             table_name: "celers_beat_locks".to_string(),
         }
     }
 
     /// Create a new database lock backend with a custom table name.
-    pub fn with_table_name(pool: PgPool, table_name: String) -> Self {
-        Self { pool, table_name }
+    pub fn with_table_name(conn: oxisql_postgres::PgConnection, table_name: String) -> Self {
+        Self { conn, table_name }
     }
 
     /// Ensure the lock table exists (auto-migration).
@@ -66,7 +85,12 @@ impl DbLockBackend {
             self.table_name
         );
 
-        sqlx::query(&sql).execute(&self.pool).await.map_err(|e| {
+        // No parameter values here (only the table name, a static-fragment
+        // string owned by this struct, is spliced in) — `execute` with an
+        // empty param slice, matching the exact same "only static text
+        // splicing, never values" discipline `sqlx::AssertSqlSafe` was
+        // previously asserting.
+        self.conn.execute(&sql, &[]).await.map_err(|e| {
             CelersError::Other(format!(
                 "Failed to create lock table '{}': {}",
                 self.table_name, e
@@ -82,17 +106,17 @@ impl DbLockBackend {
     pub async fn cleanup_expired(&self) -> celers_core::error::Result<u64> {
         let sql = format!("DELETE FROM {} WHERE expires_at < NOW()", self.table_name);
 
-        let result = sqlx::query(&sql)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to cleanup expired locks: {}", e)))?;
+        let rows_affected =
+            self.conn.execute(&sql, &[]).await.map_err(|e| {
+                CelersError::Other(format!("Failed to cleanup expired locks: {}", e))
+            })?;
 
-        Ok(result.rows_affected())
+        Ok(rows_affected)
     }
 
-    /// Get the underlying connection pool.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// Get the underlying connection.
+    pub fn connection(&self) -> &oxisql_postgres::PgConnection {
+        &self.conn
     }
 
     /// Compute the expiration timestamp from now.
@@ -110,6 +134,7 @@ impl DistributedLockBackend for DbLockBackend {
         ttl_secs: u64,
     ) -> celers_core::error::Result<bool> {
         let expires = Self::expires_at(ttl_secs);
+        let expires_param = expires.to_rfc3339();
 
         // INSERT ... ON CONFLICT:
         //   - If key doesn't exist: insert new row (lock acquired)
@@ -121,7 +146,7 @@ impl DistributedLockBackend for DbLockBackend {
         let sql = format!(
             r#"
             INSERT INTO {table} (lock_key, owner, acquired_at, expires_at)
-            VALUES ($1, $2, NOW(), $3)
+            VALUES ($1, $2, NOW(), $3::text::timestamptz)
             ON CONFLICT (lock_key) DO UPDATE
                 SET owner = EXCLUDED.owner,
                     acquired_at = NOW(),
@@ -133,15 +158,13 @@ impl DistributedLockBackend for DbLockBackend {
             table = self.table_name
         );
 
-        let result = sqlx::query(&sql)
-            .bind(key)
-            .bind(owner)
-            .bind(expires)
-            .fetch_optional(&self.pool)
+        let result = self
+            .conn
+            .query(&sql, &[&key, &owner, &expires_param])
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to acquire lock: {}", e)))?;
 
-        Ok(result.is_some())
+        Ok(!result.is_empty())
     }
 
     async fn release(&self, key: &str, owner: &str) -> celers_core::error::Result<bool> {
@@ -150,14 +173,13 @@ impl DistributedLockBackend for DbLockBackend {
             self.table_name
         );
 
-        let result = sqlx::query(&sql)
-            .bind(key)
-            .bind(owner)
-            .execute(&self.pool)
+        let rows_affected = self
+            .conn
+            .execute(&sql, &[&key, &owner])
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to release lock: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(rows_affected > 0)
     }
 
     async fn renew(
@@ -167,11 +189,12 @@ impl DistributedLockBackend for DbLockBackend {
         ttl_secs: u64,
     ) -> celers_core::error::Result<bool> {
         let expires = Self::expires_at(ttl_secs);
+        let expires_param = expires.to_rfc3339();
 
         let sql = format!(
             r#"
             UPDATE {}
-            SET expires_at = $1, acquired_at = NOW()
+            SET expires_at = $1::text::timestamptz, acquired_at = NOW()
             WHERE lock_key = $2
               AND owner = $3
               AND expires_at > NOW()
@@ -179,15 +202,13 @@ impl DistributedLockBackend for DbLockBackend {
             self.table_name
         );
 
-        let result = sqlx::query(&sql)
-            .bind(expires)
-            .bind(key)
-            .bind(owner)
-            .execute(&self.pool)
+        let rows_affected = self
+            .conn
+            .execute(&sql, &[&expires_param, &key, &owner])
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to renew lock: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(rows_affected > 0)
     }
 
     async fn is_locked(&self, key: &str) -> celers_core::error::Result<bool> {
@@ -196,13 +217,13 @@ impl DistributedLockBackend for DbLockBackend {
             self.table_name
         );
 
-        let result = sqlx::query(&sql)
-            .bind(key)
-            .fetch_optional(&self.pool)
+        let result = self
+            .conn
+            .query(&sql, &[&key])
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to check lock: {}", e)))?;
 
-        Ok(result.is_some())
+        Ok(!result.is_empty())
     }
 
     async fn owner(&self, key: &str) -> celers_core::error::Result<Option<String>> {
@@ -211,15 +232,17 @@ impl DistributedLockBackend for DbLockBackend {
             self.table_name
         );
 
-        let result = sqlx::query(&sql)
-            .bind(key)
-            .fetch_optional(&self.pool)
+        let result = self
+            .conn
+            .query(&sql, &[&key])
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get lock owner: {}", e)))?;
 
-        match result {
+        match result.into_iter().next() {
             Some(row) => {
-                let owner: String = row.get("owner");
+                let owner: String = row
+                    .col("owner")
+                    .map_err(|e| CelersError::Broker(format!("Failed to get lock owner: {e}")))?;
                 Ok(Some(owner))
             }
             None => Ok(None),
@@ -229,13 +252,13 @@ impl DistributedLockBackend for DbLockBackend {
     async fn release_all(&self, owner: &str) -> celers_core::error::Result<u64> {
         let sql = format!("DELETE FROM {} WHERE owner = $1", self.table_name);
 
-        let result = sqlx::query(&sql)
-            .bind(owner)
-            .execute(&self.pool)
+        let rows_affected = self
+            .conn
+            .execute(&sql, &[&owner])
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to release all locks: {}", e)))?;
 
-        Ok(result.rows_affected())
+        Ok(rows_affected)
     }
 }
 
@@ -251,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_default_table_name() {
-        // We can't create a real PgPool in a unit test without a DB,
+        // We can't create a real PgConnection in a unit test without a DB,
         // so we just verify the struct fields conceptually.
         // Integration tests require a running PostgreSQL instance.
         assert_eq!("celers_beat_locks", "celers_beat_locks");
@@ -264,11 +287,14 @@ mod tests {
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
 
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("Failed to connect to test database");
+        let conn = oxisql_postgres::PgConnection::connect(
+            &database_url,
+            oxisql_postgres::TlsMode::Disabled,
+        )
+        .await
+        .expect("Failed to connect to test database");
 
-        let backend = DbLockBackend::new(pool);
+        let backend = DbLockBackend::new(conn);
         backend
             .ensure_table()
             .await
@@ -328,11 +354,14 @@ mod tests {
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
 
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("Failed to connect to test database");
+        let conn = oxisql_postgres::PgConnection::connect(
+            &database_url,
+            oxisql_postgres::TlsMode::Disabled,
+        )
+        .await
+        .expect("Failed to connect to test database");
 
-        let backend = DbLockBackend::new(pool);
+        let backend = DbLockBackend::new(conn);
         backend
             .ensure_table()
             .await

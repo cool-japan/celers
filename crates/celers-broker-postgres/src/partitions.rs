@@ -2,8 +2,9 @@
 
 use celers_core::{CelersError, Result};
 use chrono::{DateTime, Utc};
-use sqlx::Row;
+use oxisql_core::Connection;
 
+use crate::row_ext::RowExt;
 use crate::types::PartitionInfo;
 use crate::PostgresBroker;
 
@@ -30,13 +31,29 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn create_partition(&self, partition_date: chrono::NaiveDate) -> Result<String> {
-        let result: String = sqlx::query_scalar("SELECT create_tasks_partition($1)")
-            .bind(partition_date)
-            .fetch_one(&self.pool)
+        // `chrono::NaiveDate` has no `oxisql_core::ToSqlValue` impl (only the
+        // read-side `FromValue` exists — same asymmetric read/write gap
+        // `row_ext.rs` documents for `DateTime<Utc>`). Bound as its ISO 8601
+        // text form through a `$1::text::date` cast, the `NaiveDate`
+        // analogue of the crate's `DateTime<Utc>` -> `$n::text::timestamptz`
+        // convention (`TEXT`'s binary wire format is raw UTF-8 for both
+        // cases, so the bind round-trips regardless of the client always
+        // using Postgres binary format).
+        let date_param = partition_date.to_string();
+        let rows = self
+            .conn
+            .query(
+                "SELECT create_tasks_partition($1::text::date)",
+                &[&date_param],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to create partition: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to create partition: no rows returned".to_string())
+        })?;
 
-        Ok(result)
+        row.col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read partition result: {}", e)))
     }
 
     /// Create partitions for a date range (monthly partitions)
@@ -67,24 +84,31 @@ impl PostgresBroker {
         start_date: chrono::NaiveDate,
         end_date: chrono::NaiveDate,
     ) -> Result<Vec<(String, String)>> {
-        let rows =
-            sqlx::query("SELECT partition_name, status FROM create_tasks_partitions_range($1, $2)")
-                .bind(start_date)
-                .bind(end_date)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| {
-                    CelersError::Other(format!("Failed to create partitions range: {}", e))
-                })?;
+        // Same `NaiveDate` -> `$n::text::date` cast convention as
+        // `create_partition` above.
+        let start_param = start_date.to_string();
+        let end_param = end_date.to_string();
+        let rows = self
+            .conn
+            .query(
+                "SELECT partition_name, status FROM create_tasks_partitions_range($1::text::date, $2::text::date)",
+                &[&start_param, &end_param],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to create partitions range: {}", e))
+            })?;
 
-        let results: Vec<(String, String)> = rows
-            .into_iter()
-            .map(|row| {
-                let name: String = row.get("partition_name");
-                let status: String = row.get("status");
-                (name, status)
-            })
-            .collect();
+        let mut results = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let name: String = row
+                .col("partition_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read partition_name: {}", e)))?;
+            let status: String = row
+                .col("status")
+                .map_err(|e| CelersError::Other(format!("Failed to read status: {}", e)))?;
+            results.push((name, status));
+        }
 
         Ok(results)
     }
@@ -110,13 +134,21 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn drop_partition(&self, partition_date: chrono::NaiveDate) -> Result<String> {
-        let result: String = sqlx::query_scalar("SELECT drop_tasks_partition($1)")
-            .bind(partition_date)
-            .fetch_one(&self.pool)
+        let date_param = partition_date.to_string();
+        let rows = self
+            .conn
+            .query(
+                "SELECT drop_tasks_partition($1::text::date)",
+                &[&date_param],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to drop partition: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to drop partition: no rows returned".to_string())
+        })?;
 
-        Ok(result)
+        row.col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read drop partition result: {}", e)))
     }
 
     /// List all task partitions with their statistics
@@ -139,38 +171,53 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn list_partitions(&self) -> Result<Vec<PartitionInfo>> {
-        let rows = sqlx::query(
-            "SELECT partition_name, partition_start, partition_end, row_count, size_bytes
+        let rows = self
+            .conn
+            .query(
+                "SELECT partition_name, partition_start, partition_end, row_count, size_bytes
              FROM list_tasks_partitions()",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to list partitions: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to list partitions: {}", e)))?;
 
-        let partitions: Vec<PartitionInfo> = rows
-            .into_iter()
-            .map(|row| {
-                let name: String = row.get("partition_name");
-                let start: chrono::NaiveDate = row.get("partition_start");
-                let end: chrono::NaiveDate = row.get("partition_end");
-                let row_count: i64 = row.get("row_count");
-                let size_bytes: i64 = row.get("size_bytes");
+        let mut partitions = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let name: String = row
+                .col("partition_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read partition_name: {}", e)))?;
+            // `chrono::NaiveDate` DOES have `oxisql_core::FromValue` on the
+            // read side (unlike the write side used above for parameters).
+            let start: chrono::NaiveDate = row.col("partition_start").map_err(|e| {
+                CelersError::Other(format!("Failed to read partition_start: {}", e))
+            })?;
+            let end: chrono::NaiveDate = row
+                .col("partition_end")
+                .map_err(|e| CelersError::Other(format!("Failed to read partition_end: {}", e)))?;
+            let row_count: i64 = row
+                .col("row_count")
+                .map_err(|e| CelersError::Other(format!("Failed to read row_count: {}", e)))?;
+            let size_bytes: i64 = row
+                .col("size_bytes")
+                .map_err(|e| CelersError::Other(format!("Failed to read size_bytes: {}", e)))?;
 
-                PartitionInfo {
-                    partition_name: name,
-                    partition_start: DateTime::from_naive_utc_and_offset(
-                        start.and_hms_opt(0, 0, 0).unwrap(),
-                        Utc,
-                    ),
-                    partition_end: DateTime::from_naive_utc_and_offset(
-                        end.and_hms_opt(0, 0, 0).unwrap(),
-                        Utc,
-                    ),
-                    row_count,
-                    size_bytes,
-                }
-            })
-            .collect();
+            partitions.push(PartitionInfo {
+                partition_name: name,
+                partition_start: DateTime::from_naive_utc_and_offset(
+                    start
+                        .and_hms_opt(0, 0, 0)
+                        .expect("midnight 00:00:00 is always valid"),
+                    Utc,
+                ),
+                partition_end: DateTime::from_naive_utc_and_offset(
+                    end.and_hms_opt(0, 0, 0)
+                        .expect("midnight 00:00:00 is always valid"),
+                    Utc,
+                ),
+                row_count,
+                size_bytes,
+            });
+        }
 
         Ok(partitions)
     }
@@ -195,13 +242,18 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn maintain_partitions(&self, months_ahead: i32) -> Result<String> {
-        let result: String = sqlx::query_scalar("SELECT maintain_tasks_partitions($1)")
-            .bind(months_ahead)
-            .fetch_one(&self.pool)
+        let rows = self
+            .conn
+            .query("SELECT maintain_tasks_partitions($1)", &[&months_ahead])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to maintain partitions: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to maintain partitions: no rows returned".to_string())
+        })?;
 
-        Ok(result)
+        row.col_idx(0).map_err(|e| {
+            CelersError::Other(format!("Failed to read maintain partitions result: {}", e))
+        })
     }
 
     /// Get the partition name for a specific date
@@ -223,13 +275,21 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_partition_name(&self, task_date: chrono::NaiveDate) -> Result<String> {
-        let result: String = sqlx::query_scalar("SELECT get_tasks_partition_name($1)")
-            .bind(task_date)
-            .fetch_one(&self.pool)
+        let date_param = task_date.to_string();
+        let rows = self
+            .conn
+            .query(
+                "SELECT get_tasks_partition_name($1::text::date)",
+                &[&date_param],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get partition name: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get partition name: no rows returned".to_string())
+        })?;
 
-        Ok(result)
+        row.col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read partition name: {}", e)))
     }
 
     /// Detach a partition for archiving without deleting data
@@ -256,13 +316,14 @@ impl PostgresBroker {
     pub async fn detach_partition(&self, partition_date: chrono::NaiveDate) -> Result<String> {
         let partition_name = self.get_partition_name(partition_date).await?;
 
-        sqlx::query(&format!(
+        let query_str = format!(
             "ALTER TABLE celers_tasks DETACH PARTITION {}",
             partition_name
-        ))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to detach partition: {}", e)))?;
+        );
+        self.conn
+            .execute(&query_str, &[])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to detach partition: {}", e)))?;
 
         Ok(format!("Detached partition: {}", partition_name))
     }

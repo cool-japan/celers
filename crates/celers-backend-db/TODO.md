@@ -2,11 +2,13 @@
 
 > Database (PostgreSQL/MySQL) result backend for CeleRS
 
-**Version: 0.2.0 | Status: [Alpha] | Updated: 2026-03-27 | Tests: 7**
+**Version: 0.3.0 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 55**
 
-## Status: ✅ FEATURE COMPLETE + v0.2.0 ENHANCED
+## Status: ✅ FEATURE COMPLETE + v0.2.0 ENHANCED + v0.3.0 PURE-RUST MIGRATION + ANALYTICS
 
-Full database result backend implementation with PostgreSQL and MySQL support for durable task result storage and chord synchronization. v0.2.0 adds distributed lock support.
+Full database result backend implementation with PostgreSQL and MySQL support for durable task result storage and chord synchronization. v0.2.0 adds distributed lock support. v0.3.0 migrates the
+SQL client from `sqlx` to OxiSQL (`oxisql-postgres`/`oxisql-mysql`, Pure Rust), fixes a TLS-downgrade
+security bug found during that migration, and adds a database analytics module.
 
 ## Completed Features
 
@@ -15,14 +17,15 @@ Full database result backend implementation with PostgreSQL and MySQL support fo
 - [x] `get_result()` - Retrieve task results
 - [x] `delete_result()` - Delete task results
 - [x] `set_expiration()` - Set TTL for results
-- [x] Connection pooling (20 connections)
-- [x] Async query execution
+- [x] Async query execution over a single multiplexed connection (`connection()` accessor; see
+      "Real N-connection pooling" under Future Enhancements — this is not a real N-connection pool)
 
 ### Batch Operations ✅
 - [x] `store_results_batch()` - Batch store with transactions
 - [x] `get_results_batch()` - Batch retrieve with single query
 - [x] `delete_results_batch()` - Batch delete with single query
-- [x] PostgreSQL: Array parameter queries (= ANY($1))
+- [x] PostgreSQL: Dynamic `IN ($1, $2, ...)` clause with one placeholder per element (changed from
+      `= ANY($1)` in the v0.3.0 migration — `oxisql-core` has no array-parameter bridge for `Vec<Uuid>`)
 - [x] MySQL: Dynamic IN clause generation
 
 ### Chord Synchronization ✅
@@ -212,9 +215,38 @@ let state = backend.chord_get_state(chord_id).await?;
 - [x] SQL migration for celers_events table with indexes
 - [x] EventPersister trait implementation (query, count, cleanup)
 
+### v0.3.0: Pure-Rust Migration ✅
+- [x] Replaced `sqlx` with `oxisql-postgres`/`oxisql-mysql`/`oxisql-core` — zero `sqlx` dependency
+      remains in this crate
+- [x] `pool()` getters renamed to `connection()` (reflects that each now wraps a single multiplexed
+      connection, not a real connection pool — see Known Limitations below): `PostgresResultBackend`,
+      `MysqlResultBackend` (both in `lib.rs`), `DbEventPersister` (`event_persistence.rs`),
+      `DbLockBackend` (`lock.rs`)
+- [x] `uuid_param`/`json_param`/`uuid_from_row`/`json_from_row` bridging helpers (internal, `row_ext.rs`)
+      since `oxisql-core` has no built-in `ToSqlValue`/`FromValue` impl for `uuid::Uuid`/`serde_json::Value`
+- [x] `DateTime<Utc>` binding fixed per backend: PostgreSQL binds the RFC3339 string via an explicit
+      `$n::text::timestamptz` SQL-side cast; MySQL formats as `%Y-%m-%d %H:%M:%S%.6f` (RFC3339 is
+      rejected by MySQL's `DATETIME` grammar)
+- [x] **Security fix**: connections no longer hardcode `TlsMode::Disabled` — `tls_mode.rs` parses
+      `sslmode` (PostgreSQL) / `ssl-mode`+`tls` (MySQL) from the connection URL and resolves the
+      matching `TlsMode`, so `sslmode=require` (etc.) is actually honored
+
+### v0.3.0: Database Analytics ✅ NEW
+- [x] `PostgresAnalytics` / `MysqlAnalytics` (`analytics.rs`), returned via `.analytics()` on either
+      backend, sharing the same five async methods:
+  - [x] `task_stats()` → `TaskStats` (total/success/failure/retry/pending counts + success/failure rate)
+  - [x] `percentile_latencies()` → `PercentileLatencies` (mean/p50/p95/p99/min/max task duration)
+  - [x] `worker_stats()` → `Vec<WorkerStat>` (per-worker task counts + `tasks_per_hour`)
+  - [x] `storage_stats()` → `StorageStats` (row counts by state, estimated result bytes, active/completed chords)
+  - [x] `chord_completion_rate()` → `f64`
+
 ## Future Enhancements
 
 ### Performance
+- [ ] Real N-connection pooling — `PostgresResultBackend`/`MysqlResultBackend` currently wrap a single
+      multiplexed `oxisql_postgres::PgConnection`/`oxisql_mysql::MyConnection` (renamed `pool()` →
+      `connection()` in v0.3.0 to reflect this), not a real connection pool; functional but
+      lower-concurrency, tracked as a v0.3.0 Pure-Rust migration follow-up
 - [ ] Prepared statement caching
 - [ ] Read replica support
 - [ ] Result data compression
@@ -229,24 +261,32 @@ let state = backend.chord_get_state(chord_id).await?;
 
 ### Monitoring
 - [ ] Query performance metrics
-- [ ] Result storage size tracking
-- [ ] Chord completion rate metrics
+- [x] Result storage size tracking (`StorageStats` via `PostgresAnalytics`/`MysqlAnalytics`)
+- [x] Chord completion rate metrics (`chord_completion_rate()`)
 - [ ] Expiration efficiency metrics
 
 ### Analytics
-- [ ] Task success/failure rate queries
-- [ ] Average task duration calculations
-- [ ] Worker performance analytics
-- [ ] Result data statistics
+- [x] Task success/failure rate queries (`task_stats()` — `TaskStats.success_rate`/`failure_rate`)
+- [x] Average task duration calculations (`percentile_latencies()` — mean/p50/p95/p99)
+- [x] Worker performance analytics (`worker_stats()` — `WorkerStat` with `tasks_per_hour`)
+- [x] Result data statistics (`storage_stats()` — `StorageStats.estimated_result_bytes`)
 
 ## Testing Status
 
 - [x] Compilation tests
-- [x] Unit tests (7 passing: backend creation, ResultStore conversions, event persister)
-- [ ] Integration tests with PostgreSQL
-- [ ] Integration tests with MySQL
-- [ ] Chord synchronization tests
-- [ ] Expiration tests
+- [x] Unit tests (55 passing via `cargo nextest run --all-features`, 6 skipped/`#[ignore]`d):
+  - 25 in `tls_mode.rs` (URL TLS-mode resolution — PostgreSQL `sslmode`, MySQL `ssl-mode`/`tls`)
+  - 13 in `row_ext.rs` (UUID/JSON param + row-extraction bridging helpers)
+  - 10 in `analytics.rs` (+ 2 `#[ignore]`d, require a live PostgreSQL instance)
+  - 3 in `result_store.rs` (`ResultStore` trait conversions)
+  - 2 in `event_persistence.rs`
+  - 2 in `lock.rs` (+ 2 `#[ignore]`d, require a live PostgreSQL instance)
+  - 0 in `lib.rs` (both its tests — Postgres/MySQL backend creation — are `#[ignore]`d)
+- [x] Doc tests (1 passing; 5 more intentionally `ignore`d as illustrative-only, require a live DB)
+- [ ] Integration tests with PostgreSQL (unit-level coverage only; all live-DB tests are `#[ignore]`d)
+- [ ] Integration tests with MySQL (unit-level coverage only; all live-DB tests are `#[ignore]`d)
+- [ ] Chord synchronization tests (against a live database)
+- [ ] Expiration tests (against a live database)
 - [ ] Concurrency tests
 
 ## Documentation
@@ -262,7 +302,9 @@ let state = backend.chord_get_state(chord_id).await?;
 ## Dependencies
 
 - `celers-backend-redis`: Trait definitions and types
-- `sqlx`: PostgreSQL/MySQL async driver
+- `oxisql-postgres` / `oxisql-mysql` / `oxisql-core`: Pure-Rust PostgreSQL/MySQL async driver (replaced `sqlx` in v0.3.0)
+- `oxitls` / `rustls`: TLS support for database connections
+- `anyhow` / `url`: TLS-mode URL parsing (`tls_mode.rs`)
 - `serde_json`: Result serialization
 - `chrono`: Timestamp handling
 - `uuid`: Task ID type

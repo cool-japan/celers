@@ -2,11 +2,14 @@
 
 > Periodic task scheduler (Celery Beat equivalent)
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 312**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 501 (425 unit/integration + 76 doc)**
 
-## Status: ✅ FEATURE COMPLETE + v0.2.0 ENHANCED
+## Status: ✅ FEATURE COMPLETE + v0.3.0 ENHANCED
 
-All schedule types implemented and production-ready. v0.2.0 adds distributed locks and modular file structure.
+All schedule types implemented and production-ready. v0.2.0 added distributed locks and modular
+file structure; v0.3.0 adds real webhook delivery, holiday/business-day calendars, schedule
+conflict detection with catch-up policies, timezone-aware dynamic schedules, per-entry jitter with
+distributed dispatch locking, and a crontab day-of-week correctness fix (see below).
 
 ## Completed Features
 
@@ -94,7 +97,22 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
 
 ## Recently Completed Enhancements
 
-### Schedule Builders and Templates ✅ (Latest - 2026-01-06)
+### v0.3.0 Release Hardening ✅ (Latest - 2026-07-12)
+- [x] Crontab `day_of_week` correctness fix (`schedule.rs`) — now honors the documented Unix
+      convention (0-6, 0=Sunday) by translating to the `cron` crate's Quartz numbering (1-7,
+      1=Sunday) via `translate_day_of_week`/`translate_day_of_week_term`. Previously `"1-5"` fired
+      Sun-Thu instead of Mon-Fri and `"0"` (Sunday) was rejected as out of range
+- [x] Webhook alert delivery migrated from `reqwest` to `oxihttp-client` (Pure Rust policy)
+- [x] Continued `unwrap()`-removal sweep: lock acquisition recovers from poisoned mutexes
+      (`unwrap_or_else(|e| e.into_inner())`) instead of panicking
+
+### Rustdoc Link Fixes ✅ (2026-07-11)
+- [x] Fixed 5 rustdoc redundant-link issues (QA/hardening pass) across `src/calendar.rs`, `src/conflict.rs`, `src/catchup.rs`, and `src/timezone_schedule.rs`
+- [x] Added `readme = "README.md"` to `Cargo.toml` package metadata
+- [x] Removed unused dependency `celers-protocol`
+- [x] Fixed a pre-existing `{ path, version }` → `{ workspace = true }` consistency issue in the root facade crate's (`crates/celers`) dependency declaration on this crate
+
+### Schedule Builders and Templates ✅ (2026-01-06)
 - [x] Fluent Schedule Builder API
   - [x] `ScheduleBuilder` - Chainable builder for creating schedules
   - [x] `every_n_seconds()`, `every_n_minutes()`, `every_n_hours()`, `every_n_days()` - Time interval methods
@@ -283,6 +301,9 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
   - [x] Alert level filtering - Send only specific alert levels to webhooks
   - [x] JSON payload generation - Structured alert data for external systems
   - [x] Integration with AlertManager callbacks
+  - [x] Real HTTP POST delivery via `oxihttp-client` (Pure Rust; migrated from `reqwest` in
+        v0.3.0) - sync alert callback spawns the request onto the current Tokio runtime,
+        applies custom headers and timeout, logs success/failure via `tracing`, never panics
 - [x] Business day calendar support
   - [x] `DayOfWeek` enum with weekend/weekday detection
   - [x] `BusinessHours` - Configure business hours (default 9 AM - 5 PM)
@@ -569,7 +590,8 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
 - [x] Zero warnings in cargo test
 - [x] Zero warnings in cargo build
 - [x] Zero warnings in cargo clippy
-- [x] All tests passing (312 total: unit + doc tests across 12 focused modules)
+- [x] All tests passing (501 total: 425 unit/integration via `cargo nextest --all-features` + 76
+      doc tests, across focused modules)
 - [x] Comprehensive test coverage
 
 ### Phase 9: Heartbeat & Failover ✅ COMPLETE
@@ -597,6 +619,14 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
   - [x] `crontab_tz()` constructor for timezone-aware schedules
   - [x] Comprehensive tests (4 new tests)
   - [x] Serialization support with timezone preservation
+  - [x] `Schedule::with_timezone(chrono_tz::Tz)` additive builder ✅ (`timezone_schedule.rs`)
+    - [x] Stores tz (default UTC); no-op for absolute Interval/OneTime schedules
+    - [x] `next_run_in_tz`, `timezone_tz`, `timezone_name`, `has_timezone` accessors
+    - [x] Next-run honours local wall-clock + DST transitions for crontab
+    - [x] Spring-forward gap skipped (e.g. America/New_York 2026-03-08 02:30 → 03-09)
+    - [x] Fall-back overlap resolves deterministically and always advances
+    - [x] UTC behaviour byte-for-byte unchanged when no tz set (additive)
+    - [x] 13 module unit tests + 4 scheduled-task/DST integration tests
 - [x] Solar schedules enhancements ✅
   - [x] Twilight schedules (civil, nautical, astronomical)
   - [x] Golden hour calculations
@@ -609,8 +639,28 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
 ### Scheduler Features
 - [x] Persistent schedule state (file-based JSON) ✅
 - [x] Dynamic schedule updates (add/remove at runtime) ✅
+  - [x] Thread-safe `ScheduleRegistry` (`Arc<RwLock<…>>`, cloneable handles) ✅ (`registry.rs`)
+    - [x] `add_entry` / `remove_entry` / `update_entry` / `list_entries` runtime API
+    - [x] `add_entry_if_absent`, `update_schedule` (version-tracked), `due_entries_at`,
+          `mark_run_at`, `get_entry`, `contains`, `len`, `clear`, `from_tasks`
+    - [x] Poisoned-lock errors surfaced (no panics) per no-unwrap policy
+    - [x] Running beat loop picks up changes between ticks (snapshot reads)
+    - [x] Scheduler-level `add_entry`/`remove_entry`/`update_entry`/`list_entries`
+          + `to_registry()` bridge (`scheduler_ext.rs`)
+    - [x] 12 registry unit tests (incl. concurrent reader/writer) + 4 integration tests
 - [x] Schedule jitter (avoid thundering herd) ✅
+  - [x] Deterministic bounded jitter in next-run computation ✅ (`jitter.rs`)
+    - [x] `bounded_jitter_offset(name, fire_time, window)` — stable FNV-1a hash of
+          entry name + target fire time, scaled into ±window (no clock/RNG)
+    - [x] `apply_jitter(fire_time, name, window)` additive wrapper
+    - [x] `ScheduledTask::with_jitter_window(window_secs)` builder (zero = no-op)
+    - [x] Within-window, identical-across-repeats, differs-across-entries tests
 - [x] Catch-up logic (run missed schedules) ✅
+  - [x] Occurrence-level missed-task catch-up ✅ (v0.3.0, `catchup.rs`)
+    - [x] `compute_missed` / `compute_missed_occurrences` over `(last_run, now]`
+    - [x] `CatchupPolicy` { FireAll, FireLatestOnly, Skip }
+    - [x] `catch_up()` one-shot helper combining compute + policy
+    - [x] Shares `enumerate_next_occurrences` with conflict detection
 - [x] Schedule groups and tags ✅
 - [x] Schedule versioning ✅
   - [x] Track schedule modifications
@@ -627,6 +677,15 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
   - [x] Serialization support
   - [x] Lock cleanup for expired locks
   - [x] Custom instance ID support
+  - [x] Distributed lock backend integration in dispatch loop ✅ (`dispatch_lock.rs`)
+    - [x] `dispatch_lock_key(name, scheduled_instant)` — per-fire key (RFC 3339 instant)
+    - [x] `try_acquire_dispatch_lock` / `release_dispatch_lock` via
+          `DistributedLockBackend` (falls back to local `LockManager`)
+    - [x] `tick_with_locks(ttl)` — duplicate-safe dispatch; per-fire claim held
+          for TTL so siblings cannot re-fire the same instant; advances on win
+    - [x] Cross-instance dedup tests using `InMemoryLockBackend`
+          (concurrent same-instant blocked; released lock allows next instant;
+          exactly-one-of-N dispatches a shared fire; standby dispatches nothing)
   - [ ] Distributed lock backend (Redis/etcd) - requires external state
 - [x] Schedule conflict detection ✅
   - [x] Overlapping schedule detection
@@ -640,6 +699,11 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
     - [x] Equal priority handling: Symmetric jitter applied to both tasks
     - [x] High severity handling: Manual review recommendation
   - [ ] Resource conflict resolution (requires resource tracking)
+  - [x] Exact-instant schedule-vs-schedule conflict detection ✅ (v0.3.0, `conflict.rs`)
+    - [x] `enumerate_next_occurrences(schedule, after, count)` shared helper
+    - [x] `enumerate_occurrences_in_window`
+    - [x] `detect_schedule_conflicts` / `detect_named_schedule_conflicts` (N schedules, look-ahead window)
+    - [x] `has_schedule_conflicts`, `OccurrenceConflict` report type
 
 ### Task Management
 - [x] Task dependency tracking ✅
@@ -665,11 +729,14 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
   - [x] Success/failure analytics
 
 ### Advanced Features
-- [ ] Multiple schedulers with leader election
-  - [ ] Raft consensus
-  - [ ] Etcd-based election
-  - [ ] Redis-based election
-  - [ ] Automatic failover
+- [x] Multiple schedulers with leader election ✅ (Phase 9, `heartbeat.rs`) — lease/heartbeat-based
+      over a pluggable `DistributedLockBackend`, not a consensus protocol
+  - [ ] Raft consensus (not implemented; no `raft` dependency in the workspace)
+  - [ ] Etcd-based election (not implemented; no `etcd` client dependency in the workspace)
+  - [x] Redis-based election ✅ (`BeatHeartbeat` accepts any `Arc<dyn DistributedLockBackend>`,
+        including the Redis-backed implementation in `celers-backend-redis`)
+  - [x] Automatic failover ✅ (`BeatHeartbeat` detects an expired leader lease and promotes a
+        standby; see `HeartbeatStats::failovers_detected`)
 - [ ] Distributed scheduling
   - [ ] Shard schedules across instances
   - [ ] Consistent hashing
@@ -776,6 +843,12 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
   - [x] Canada statutory holidays preset (9 federal holidays) ✅
   - [x] Custom holiday addition
   - [x] Serialization support
+  - [x] `WorkingCalendar` with fixed + recurring (annual) holidays ✅ (v0.3.0, `calendar.rs`)
+    - [x] `add_fixed_holiday`, `add_recurring_holiday`, `add_holiday`
+    - [x] `remove_holiday_by_name`, `remove_holiday_on`
+    - [x] `is_holiday`, `holiday_name`, `holidays_in_year` (materialises recurring)
+    - [x] Named holidays via `CalendarHoliday::name()`
+    - [x] Configurable weekend definition (`with_weekend`, `set_weekend`)
 - [x] Business day calculations ✅
   - [x] DayOfWeek enum (Monday-Sunday)
   - [x] Weekend/weekday detection
@@ -785,6 +858,11 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
   - [x] Next business time calculation
   - [x] Standard business hours (9 AM - 5 PM, Mon-Fri)
   - [x] Custom business hours and working days
+  - [x] Date-based business-day arithmetic on `WorkingCalendar` ✅ (v0.3.0, `calendar.rs`)
+    - [x] `is_business_day`, `next_business_day`, `previous_business_day`
+    - [x] `business_day_on_or_after`, `business_day_on_or_before`
+    - [x] `add_business_days` (negative counts supported)
+    - [x] `business_days_between` (signed, honours weekends + holidays)
 - [x] Advanced calendar features ✅
   - [x] Execute on holidays only (holidays_only mode)
   - [x] Blackout periods with recurring patterns
@@ -880,7 +958,10 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
 
 ## Known Issues
 
-- No leader election (must run single instance)
+- Leader election (`heartbeat.rs`'s `BeatHeartbeat`) is lease/heartbeat-based over a pluggable
+  `DistributedLockBackend` (`InMemoryLockBackend` in this crate; Redis/PostgreSQL-backed via
+  `celers-backend-redis`/`celers-backend-db`), not a full consensus protocol — no Raft/etcd-style
+  election is implemented (see "Multiple schedulers with leader election" below)
 - Solar calculations use deprecated API (accepted with #[allow(deprecated)])
 
 ## Dependencies
@@ -896,7 +977,8 @@ All schedule types implemented and production-ready. v0.2.0 adds distributed loc
 
 ## Notes
 
-- Only run ONE scheduler instance (no built-in leader election)
-- Interval schedules are production-ready
-- Crontab and Solar require additional implementation
+- Multi-instance deployments should wire up `BeatScheduler::with_heartbeat`
+  (`heartbeat::BeatHeartbeat`) over a shared `DistributedLockBackend` for lease-based leader
+  election + automatic failover; without it, run only one scheduler instance
+- Interval, Crontab, and Solar schedules are all production-ready
 - Compatible with Python Celery Beat schedule format

@@ -372,6 +372,8 @@ pub struct CurrentMetrics {
     pub dlq_size: f64,
     /// Number of active workers
     pub active_workers: f64,
+    /// Total payload bytes processed (enqueued + results), in bytes
+    pub total_payload_bytes: f64,
 }
 
 impl CurrentMetrics {
@@ -397,6 +399,7 @@ impl CurrentMetrics {
             processing_queue_size: PROCESSING_QUEUE_SIZE.get(),
             dlq_size: DLQ_SIZE.get(),
             active_workers: ACTIVE_WORKERS.get(),
+            total_payload_bytes: TOTAL_PAYLOAD_BYTES_PROCESSED.get(),
         }
     }
 
@@ -453,6 +456,7 @@ impl MetricComparison {
     ///     processing_queue_size: 20.0,
     ///     dlq_size: 5.0,
     ///     active_workers: 10.0,
+    ///     total_payload_bytes: 0.0,
     /// };
     ///
     /// let current = CurrentMetrics {
@@ -465,6 +469,7 @@ impl MetricComparison {
     ///     processing_queue_size: 18.0,
     ///     dlq_size: 4.0,
     ///     active_workers: 12.0,
+    ///     total_payload_bytes: 0.0,
     /// };
     ///
     /// let comparison = MetricComparison::compare(&baseline, &current);

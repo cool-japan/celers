@@ -2,7 +2,7 @@
 
 > Facade crate providing unified API for CeleRS
 
-## Status: ✅ STABLE — v0.2.0 (2026-03-27) — 145 tests
+## Status: ✅ STABLE — v0.3.0 (2026-07-13) — 145 tests
 
 All core features implemented and production-ready.
 

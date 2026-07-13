@@ -44,6 +44,67 @@ pub async fn init_config(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Interactively assemble and write a validated configuration file.
+///
+/// This is the `--wizard` counterpart to [`init_config`]: instead of
+/// writing static defaults, it walks the user through broker selection, a
+/// live connection test, queue configuration (with validation), worker
+/// settings (with recommended defaults), auto-scaling/alert setup, and
+/// profile selection via [`crate::commands::wizard::run_wizard`], then
+/// writes the assembled configuration with [`crate::config::Config::to_file`].
+///
+/// The actual file written may differ from `path` when a non-baseline
+/// profile is selected: [`crate::commands::wizard::resolve_wizard_output_path`]
+/// redirects `staging`/`prod` (or any profile other than `dev`) to a
+/// `{stem}.{profile}.{ext}` overlay file alongside `path`, matching the
+/// naming convention `config_layer::load_profile_overlay` looks for. This
+/// mirrors how the non-interactive path writes one config file, but keeps
+/// wizard-generated profile configs layerable via `--profile`.
+///
+/// # Arguments
+///
+/// * `path` - Requested output file path (default: "celers.toml"). Used
+///   as-is for the `dev` profile; used as the base name for the
+///   profile-specific overlay file otherwise.
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success, or an error if a prompt fails, the
+/// collected answers are structurally invalid, or the file cannot be
+/// written.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use celers_cli::commands::init_config_wizard;
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// init_config_wizard("celers.toml").await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn init_config_wizard(path: &str) -> anyhow::Result<()> {
+    let config = crate::commands::wizard::run_wizard().await?;
+
+    let profile = config.profile.clone().unwrap_or_else(|| "dev".to_string());
+    let output_path = crate::commands::wizard::resolve_wizard_output_path(path, &profile);
+
+    config.to_file(&output_path)?;
+
+    println!();
+    println!("{}", "✓ Configuration file created".green().bold());
+    println!("  Location: {}", output_path.display().to_string().cyan());
+    println!("  Profile: {}", profile.cyan());
+    println!();
+    println!("Edit the file and run:");
+    println!(
+        "  celers worker --config {} --profile {profile}",
+        output_path.display()
+    );
+
+    Ok(())
+}
+
 /// Validate configuration file
 pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow::Result<()> {
     use std::path::Path;
@@ -187,25 +248,50 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
                 }
             }
             "postgres" | "postgresql" => {
-                // Test PostgreSQL connection
-                match sqlx::postgres::PgPool::connect(&config.broker.url).await {
-                    Ok(pool) => {
+                // Test PostgreSQL connection. TLS mode is derived from the
+                // broker URL's `sslmode` query parameter (see
+                // `crate::tls_mode`) rather than hardcoded, so a caller who
+                // wrote `sslmode=require` actually gets an encrypted
+                // connection instead of a silent downgrade to plain-text.
+                let tls_mode = match crate::tls_mode::pg_tls_mode_for_url(&config.broker.url) {
+                    Ok(mode) => mode,
+                    Err(e) => {
+                        println!(
+                            "{}",
+                            "✗ Failed to build TLS config for PostgreSQL broker:"
+                                .red()
+                                .bold()
+                        );
+                        println!("  {}", format!("{e}").red());
+                        println!();
+                        return Ok(());
+                    }
+                };
+                match oxisql_postgres::PgConnection::connect(&config.broker.url, tls_mode).await {
+                    Ok(conn) => {
                         // Test with a simple query
-                        match sqlx::query("SELECT 1").fetch_one(&pool).await {
-                            Ok(_) => {
-                                println!(
-                                    "{}",
-                                    "✓ Successfully connected to PostgreSQL broker"
-                                        .green()
-                                        .bold()
-                                );
+                        match oxisql_core::Connection::query(&conn, "SELECT 1", &[]).await {
+                            Ok(rows) => {
+                                if rows.into_iter().next().is_some() {
+                                    println!(
+                                        "{}",
+                                        "✓ Successfully connected to PostgreSQL broker"
+                                            .green()
+                                            .bold()
+                                    );
+                                } else {
+                                    println!(
+                                        "{}",
+                                        "✗ Failed to query PostgreSQL broker:".red().bold()
+                                    );
+                                    println!("  {}", "SELECT 1 returned no rows".red());
+                                }
                             }
                             Err(e) => {
                                 println!("{}", "✗ Failed to query PostgreSQL broker:".red().bold());
                                 println!("  {}", format!("{e}").red());
                             }
                         }
-                        pool.close().await;
                     }
                     Err(e) => {
                         println!(

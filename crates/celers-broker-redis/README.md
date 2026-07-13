@@ -2,7 +2,7 @@
 
 High-performance Redis broker implementation for CeleRS with batch operations, priority queues, and comprehensive monitoring.
 
-**Version: 0.2.0 | Status: [Stable] | Tests: 454 | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Tests: 478 (+ 68 doc tests) | Updated: 2026-07-13**
 
 ## Overview
 
@@ -22,6 +22,7 @@ Production-ready message broker using Redis with:
 - ✅ **Result Backend Adapter**: Store and retrieve task execution results with compression
 - ✅ **Topic/Priority Routing**: Redis-based routing with priority management
 - ✅ **Advanced Connection Pooling**: Adaptive pooling, Sentinel and cluster support
+- ✅ **Envelope Encryption**: Field-level AES-256-GCM / ChaCha20-Poly1305 AEAD encryption with KEK-wrapped DEKs (genuine authenticated encryption as of 0.3.0 — previously a mock XOR "cipher" with no integrity check)
 
 ## Features
 
@@ -141,8 +142,9 @@ let task = SerializedTask::new("risky_task", args)
 let dlq_size = broker.dlq_size().await?;
 let failed_tasks = broker.inspect_dlq(10).await?;
 
-// Replay tasks from DLQ
-broker.replay_dlq(vec![task_id1, task_id2]).await?;
+// Replay a task from DLQ (one task id at a time)
+broker.replay_from_dlq(&task_id1).await?;
+broker.replay_from_dlq(&task_id2).await?;
 
 // Clear entire DLQ
 broker.clear_dlq().await?;
@@ -182,10 +184,13 @@ let broker = RedisBroker::new("redis://localhost:6379", "celery")?
 
 ```toml
 [dependencies]
-celers-broker-redis = "0.2"
+celers-broker-redis = "0.3"
 
 # Enable Prometheus metrics (optional)
-# celers-broker-redis = { version = "0.2", features = ["metrics"] }
+# celers-broker-redis = { version = "0.3", features = ["metrics"] }
+
+# Enable Zstd compression via OxiARC, in addition to the always-available Gzip/Zlib (optional)
+# celers-broker-redis = { version = "0.3", features = ["zstd-compression"] }
 ```
 
 ## Prometheus Metrics
@@ -193,7 +198,7 @@ celers-broker-redis = "0.2"
 When `metrics` feature is enabled:
 
 ```toml
-celers-broker-redis = { version = "0.2", features = ["metrics"] }
+celers-broker-redis = { version = "0.3", features = ["metrics"] }
 ```
 
 **Available Metrics:**
@@ -242,9 +247,14 @@ Priority Queue (ZSET)          Processing Queue (LIST)
 ```rust
 use celers_broker_redis::{RedisBroker, QueueMode};
 
-let broker = RedisBroker::new("redis://localhost:6379", "celery")?
-    .with_visibility_timeout(300)  // 5 minutes
-    .with_mode(QueueMode::Priority);
+// `with_mode` is a constructor (it takes the URL and queue name), not a
+// builder method — chain `.with_visibility_timeout()` after it if needed.
+let broker = RedisBroker::with_mode(
+    "redis://localhost:6379",
+    "celery",
+    QueueMode::Priority,
+)?
+    .with_visibility_timeout(300);  // 5 minutes
 
 // Redis URL formats
 "redis://localhost:6379"           // Default
@@ -448,14 +458,14 @@ let (conn_timeout, op_timeout) = calculate_redis_timeout_values(
 
 ## Examples
 
-See `examples/` directory:
-- `basic_usage.rs` - Basic usage
-- `advanced_features.rs` - Advanced features
-- `resilience_features.rs` - Resilience patterns with circuit breaker, bulkhead
-- `geo_distribution.rs` - Geo-distribution
-- `monitoring_performance.rs` - Monitoring and performance tuning
-- `dlq_analytics.rs` - DLQ analytics, archival, and replay policies
-- `otel_integration.rs` - OpenTelemetry distributed tracing integration
+See `examples/` directory (verified against `crates/celers-broker-redis/examples/` on 2026-07-13 —
+run with `cargo run --example <name>`, using the filename without `.rs` as `<name>`):
+- `redis_basic_usage.rs` - Basic usage (creating a broker, enqueuing/dequeuing tasks)
+- `redis_advanced_features.rs` - DLQ handling, task replay from DLQ, delayed task execution
+- `resilience_features.rs` - Resilience patterns: circuit breaker, rate limiting, deduplication, bulkhead
+- `geo_distribution.rs` - Multi-region replication, regional read routing, conflict resolution
+- `redis_monitoring_performance.rs` - Consumer lag analysis, autoscaling, message velocity, worker scaling
+- `redis_cost_optimization.rs` - Cost estimation, alert thresholds, health reporting, performance trend analysis
 
 ## License
 

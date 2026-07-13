@@ -401,9 +401,12 @@ fn test_content_encoding_from_str() {
 #[test]
 fn test_message_headers_equality() {
     let id = Uuid::new_v4();
-    let headers1 = MessageHeaders::new("tasks.add".to_string(), id);
-    let headers2 = MessageHeaders::new("tasks.add".to_string(), id);
-    let headers3 = MessageHeaders::new("tasks.sub".to_string(), id);
+    // `created_at` is a per-instance timestamp captured at construction time,
+    // so pin it to a fixed value to compare the rest of the logical content.
+    let ts = chrono::Utc::now();
+    let headers1 = MessageHeaders::new("tasks.add".to_string(), id).with_created_at(ts);
+    let headers2 = MessageHeaders::new("tasks.add".to_string(), id).with_created_at(ts);
+    let headers3 = MessageHeaders::new("tasks.sub".to_string(), id).with_created_at(ts);
 
     assert_eq!(headers1, headers2);
     assert_ne!(headers1, headers3);
@@ -426,9 +429,15 @@ fn test_message_properties_equality() {
 fn test_message_equality() {
     let id = Uuid::new_v4();
     let body = vec![1, 2, 3];
-    let msg1 = Message::new("tasks.add".to_string(), id, body.clone());
-    let msg2 = Message::new("tasks.add".to_string(), id, body.clone());
-    let msg3 = Message::new("tasks.add".to_string(), id, vec![4, 5, 6]);
+    // `created_at` is captured per-instance at construction time; pin it so the
+    // comparison exercises the rest of the message content.
+    let ts = chrono::Utc::now();
+    let mut msg1 = Message::new("tasks.add".to_string(), id, body.clone());
+    msg1.headers.created_at = Some(ts);
+    let mut msg2 = Message::new("tasks.add".to_string(), id, body.clone());
+    msg2.headers.created_at = Some(ts);
+    let mut msg3 = Message::new("tasks.add".to_string(), id, vec![4, 5, 6]);
+    msg3.headers.created_at = Some(ts);
 
     assert_eq!(msg1, msg2);
     assert_ne!(msg1, msg3);
@@ -440,15 +449,21 @@ fn test_message_equality_with_options() {
     let parent_id = Uuid::new_v4();
     let body = vec![1, 2, 3];
 
-    let msg1 = Message::new("tasks.add".to_string(), id, body.clone())
+    // `created_at` is captured per-instance at construction time; pin it so the
+    // comparison exercises priority/parent and the rest of the content.
+    let ts = chrono::Utc::now();
+    let mut msg1 = Message::new("tasks.add".to_string(), id, body.clone())
         .with_priority(5)
         .with_parent(parent_id);
-    let msg2 = Message::new("tasks.add".to_string(), id, body.clone())
+    msg1.headers.created_at = Some(ts);
+    let mut msg2 = Message::new("tasks.add".to_string(), id, body.clone())
         .with_priority(5)
         .with_parent(parent_id);
-    let msg3 = Message::new("tasks.add".to_string(), id, body.clone())
+    msg2.headers.created_at = Some(ts);
+    let mut msg3 = Message::new("tasks.add".to_string(), id, body.clone())
         .with_priority(3)
         .with_parent(parent_id);
+    msg3.headers.created_at = Some(ts);
 
     assert_eq!(msg1, msg2);
     assert_ne!(msg1, msg3);

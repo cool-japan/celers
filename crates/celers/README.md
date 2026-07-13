@@ -2,7 +2,7 @@
 
 Production-ready, Celery-compatible distributed task queue library for Rust. Binary-level protocol compatibility with Python Celery while delivering superior performance, type safety, and reliability.
 
-**Status: [Stable] — v0.2.0 (2026-03-27) — 145 tests**
+**Status: [Stable] — v0.3.0 (2026-07-13) — 145 tests**
 
 ## Overview
 
@@ -23,7 +23,7 @@ Production-ready, Celery-compatible distributed task queue library for Rust. Bin
 
 ```toml
 [dependencies]
-celers = { version = "0.2", features = ["redis"] }
+celers = { version = "0.3", features = ["redis"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -51,11 +51,11 @@ async fn main() -> anyhow::Result<()> {
     // Create broker
     let broker = RedisBroker::new("redis://localhost:6379", "celery")?;
 
-    // Create task registry
-    let mut registry = celers_core::TaskRegistry::new();
-    registry.register("tasks.add", |args: AddArgs| async move {
-        Ok(args.x + args.y)
-    });
+    // Create task registry and register the generated task.
+    // The #[celers::task] macro expands `add` into an `AddTask` struct
+    // implementing `celers_core::Task`, registered by value (not by closure).
+    let registry = celers_core::TaskRegistry::new();
+    registry.register(AddTask).await;
 
     // Configure worker
     let config = WorkerConfig {
@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create task
     let args = serde_json::json!({"x": 10, "y": 20});
-    let task = SerializedTask::new("tasks.add", serde_json::to_vec(&args)?);
+    let task = SerializedTask::new("tasks.add".to_string(), serde_json::to_vec(&args)?);
 
     // Enqueue
     let task_id = broker.enqueue(task).await?;
@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
 
 ```toml
 [dependencies]
-celers = { version = "0.2", features = [
+celers = { version = "0.3", features = [
     "redis",           # Redis broker support
     "postgres",        # PostgreSQL broker support
     "backend-redis",   # Redis result backend
@@ -229,7 +229,7 @@ let broker = RedisBroker::with_mode(
 ```rust
 use celers::PostgresBroker;
 
-let broker = PostgresBroker::new("postgresql://localhost/celery", "celery").await?;
+let broker = PostgresBroker::with_queue("postgresql://localhost/celery", "celery").await?;
 ```
 
 **Pros:**
@@ -275,7 +275,7 @@ let broker = PostgresBroker::new("postgresql://localhost/celery", "celery").awai
 3. **Use Redis for High Throughput**
    ```toml
    [dependencies]
-   celers = { version = "0.2", features = ["redis"] }
+   celers = { version = "0.3", features = ["redis"] }
    ```
 
 ## Monitoring
@@ -386,8 +386,11 @@ let config = WorkerConfig {
 // Inspect DLQ
 let dlq_size = broker.dlq_size().await?;
 
-// Replay failed tasks
-broker.replay_dlq(vec![task_id1, task_id2]).await?;
+// Replay a single failed task
+broker.replay_from_dlq(&task_id1).await?;
+
+// Or bulk-replay up to N tasks from the DLQ
+broker.bulk_replay_from_dlq(Some(10)).await?;
 
 // Clear DLQ
 broker.clear_dlq().await?;

@@ -108,7 +108,10 @@
 //! - **Routing**: Pattern-based task routing to queues
 //! - **Rate Limiting**: Token bucket and sliding window algorithms
 
+pub mod alerting;
 pub mod broker;
+pub mod caching_backend;
+pub mod circuit_breaker_registry;
 pub mod config;
 pub mod control;
 pub mod dag;
@@ -118,17 +121,35 @@ pub mod event_filter;
 pub mod event_persistence;
 pub mod exception;
 pub mod executor;
+pub mod in_memory_broker;
 pub mod lock;
+pub mod pii;
 pub mod rate_limit;
+pub mod rate_limit_distributed;
 pub mod result;
+pub mod result_groups;
+pub mod result_tombstone;
+pub mod result_ttl;
 pub mod retry;
 pub mod revocation;
 pub mod router;
+pub mod sanitize;
 pub mod state;
 pub mod task;
+pub mod task_signature;
+pub mod tenant_rate_limit;
 pub mod time_limit;
 
+pub use alerting::{
+    AlertEvaluator, AlertRule, AlertRuleKind, AlertStatus, EventSnapshot, EventSnapshotBuilder,
+    RuleAlert,
+};
 pub use broker::{Broker, BrokerMessage};
+pub use caching_backend::CachingResultBackend;
+pub use circuit_breaker_registry::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitSnapshot, CircuitState,
+    TaskTypeCircuitBreakers,
+};
 pub use config::{
     BackendTransport, BeatSchedule, BrokerTransport, CeleryConfig, ConfigError, ConfigValidation,
     ConfigWarning, ScheduleDefinition, TaskConfig, TaskRoute,
@@ -159,16 +180,29 @@ pub use exception::{
     LoggingExceptionHandler, PolicyExceptionHandler, TaskException, TracebackFrame,
 };
 pub use executor::TaskRegistry;
+pub use in_memory_broker::{InMemoryBroker, InMemoryResultBackend};
 pub use lock::DistributedLockBackend;
+pub use pii::{PiiConfig, PiiDetector, PiiKind, PiiMatch, PiiReport};
 pub use rate_limit::{
     create_rate_limiter, DistributedRateLimiter, DistributedRateLimiterCoordinator,
     DistributedRateLimiterState, DistributedSlidingWindowSpec, DistributedTokenBucketSpec,
     RateLimitConfig, RateLimiter, SlidingWindow, TaskRateLimiter, TokenBucket, WorkerRateLimiter,
 };
+// Note: `rate_limit_distributed::DistributedRateLimiter` is intentionally NOT
+// re-exported at the crate root to avoid clashing with the existing
+// `rate_limit::DistributedRateLimiter` trait above. Access the cluster-wide
+// limiter struct via `celers_core::rate_limit_distributed::DistributedRateLimiter`.
+pub use rate_limit_distributed::{
+    AcquireOutcome, DistributedAlgorithm, DistributedRateLimitBackend, InMemoryDistributedBackend,
+    RateLimitParams,
+};
 pub use result::{
     AsyncResult, ExtendedResultStore, ResultChunk, ResultChunker, ResultCompressor, ResultMetadata,
     ResultStore, ResultTombstone, TaskResultValue,
 };
+pub use result_groups::{GroupChild, GroupStatus, ResultGroup};
+pub use result_tombstone::{ResultExistence, TombstoneExt, TombstoneRegistry};
+pub use result_ttl::{ResolvedResultTtl, ResultTtlConfig};
 pub use retry::{RetryPolicy, RetryStrategy};
 pub use revocation::{
     PatternRevocation, RevocationManager, RevocationMode, RevocationRequest, RevocationResult,
@@ -178,8 +212,15 @@ pub use router::{
     ArgumentCondition, GlobPattern, PatternMatcher, RegexPattern, RouteResult, RouteRule, Router,
     RouterBuilder, RoutingConfig,
 };
+pub use sanitize::{
+    OversizeAction, SanitizeError, SanitizeReport, Sanitizer, SanitizerConfig, TaskValue, ValueKind,
+};
 pub use state::{StateHistory, StateTransition, TaskState};
 pub use task::{SerializedTask, Task, TaskId, TaskMetadata};
+pub use task_signature::{
+    HmacSha256, Sha256, SignatureAlgorithm, SignatureError, SignedFields, TaskSignature, TaskSigner,
+};
+pub use tenant_rate_limit::{TenantRateLimit, TenantRateLimiter, TenantUsage};
 pub use time_limit::{
     TaskTimeLimits, TimeLimit, TimeLimitConfig, TimeLimitExceeded, TimeLimitSettings,
     TimeLimitStatus, WorkerTimeLimits,

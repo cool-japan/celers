@@ -307,7 +307,12 @@ pub fn forecast_queue_capacity_ml(
         .iter()
         .map(|&s| {
             let predicted = y_mean
-                + slope * (historical_sizes.iter().position(|&x| x == s).unwrap() as f64 - x_mean);
+                + slope
+                    * (historical_sizes
+                        .iter()
+                        .position(|&x| x == s)
+                        .expect("s came from this iterator") as f64
+                        - x_mean);
             (s as f64 - predicted).powi(2)
         })
         .sum::<f64>()

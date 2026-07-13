@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Redis result backend for CeleRS"
+readme = "README.md"
 keywords = ["celery", "redis", "backend", "results", "async"]
 categories = ["asynchronous", "network-programming", "caching"]
 
@@ -28,8 +29,8 @@ hex = { workspace = true }
 crc32fast = { workspace = true }
 
 # Core protocol
-celers-core = { path = "../celers-core", version = "0.2.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+celers-core = { workspace = true }
+celers-protocol = { workspace = true }
 
 [features]
 default = []

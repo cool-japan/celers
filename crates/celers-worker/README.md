@@ -1,6 +1,6 @@
 # celers-worker
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13**
 
 Production-ready worker runtime for consuming and executing CeleRS tasks with comprehensive monitoring, memory optimization, and workflow support.
 
@@ -9,11 +9,17 @@ Production-ready worker runtime for consuming and executing CeleRS tasks with co
 High-performance worker runtime with:
 
 - ✅ **Concurrent Execution**: Configurable parallelism (default: 4 workers)
+- ✅ **Autoscaling Worker Pool**: Real work-stealing job execution (`WorkerPool::submit_task`) with queue-depth/CPU/memory-driven scaling policies
 - ✅ **Batch Dequeue**: Fetch multiple tasks per round-trip (10-100x faster)
 - ✅ **Memory Optimization**: Result size limits and tracking
 - ✅ **Retry Logic**: Exponential backoff with configurable limits
 - ✅ **Graceful Shutdown**: Complete in-flight tasks before termination
 - ✅ **Timeout Enforcement**: Per-task execution timeouts
+- ✅ **Cooperative Cancellation**: Broker-driven revocation trips a task-local cancellation token mid-execution
+- ✅ **Self-Healing**: Poison-pill detection & quarantine, exponential-backoff restart supervisor
+- ✅ **Adaptive Polling & Batching**: Load-aware poll backoff plus task batching/coalescing with dedup
+- ✅ **Task Affinity**: Label-based worker-to-task matching (required/preferred/anti-affinity)
+- ✅ **Distributed Rate Limiting**: Cross-worker rate-limit coordination via a shared backend
 - ✅ **Workflow Support**: Canvas workflow integration (Chain, Chord, Group)
 - ✅ **Prometheus Metrics**: Comprehensive monitoring (optional)
 - ✅ **Health Checks**: HTTP health endpoint
@@ -23,21 +29,46 @@ High-performance worker runtime with:
 
 ### Basic Worker
 
+Tasks implement the `celers_core::Task` trait; `TaskRegistry::register` takes an
+instance of the task (not a name + closure pair) and is `async`:
+
 ```rust
+use async_trait::async_trait;
 use celers_broker_redis::RedisBroker;
+use celers_core::{Task, TaskRegistry};
 use celers_worker::{Worker, WorkerConfig};
-use celers_core::TaskRegistry;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct AddArgs {
+    a: i32,
+    b: i32,
+}
+
+struct AddTask;
+
+#[async_trait]
+impl Task for AddTask {
+    type Input = AddArgs;
+    type Output = i32;
+
+    async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
+        Ok(input.a + input.b)
+    }
+
+    fn name(&self) -> &str {
+        "tasks.add"
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create broker
     let broker = RedisBroker::new("redis://localhost:6379", "celery")?;
 
-    // Create task registry
-    let mut registry = TaskRegistry::new();
-    registry.register("tasks.add", |args: Vec<i32>| async move {
-        Ok(args[0] + args[1])
-    });
+    // Create task registry and register the task
+    let registry = TaskRegistry::new();
+    registry.register(AddTask).await;
 
     // Configure worker
     let config = WorkerConfig {
@@ -299,7 +330,7 @@ Support for Canvas workflows (requires `workflows` feature):
 
 ```toml
 [dependencies]
-celers-worker = { version = "0.1", features = ["workflows"] }
+celers-worker = { version = "0.3", features = ["workflows"] }
 ```
 
 ```rust
@@ -361,7 +392,7 @@ let mut backend = RedisResultBackend::new("redis://localhost:6379")?;
 
 ```toml
 [dependencies]
-celers-worker = { version = "0.1", features = ["metrics"] }
+celers-worker = { version = "0.3", features = ["metrics"] }
 ```
 
 **Metrics emitted:**
@@ -408,15 +439,15 @@ tracing_subscriber::fmt::init();
 ### Health Checks
 
 ```rust
-use celers_worker::health::HealthCheck;
+use celers_worker::health::HealthChecker;
 
-let health = HealthCheck::new();
+let checker = HealthChecker::new();
 
 // HTTP endpoint
 let listener = TcpListener::bind("0.0.0.0:8080").await?;
 loop {
     let (mut socket, _) = listener.accept().await?;
-    let status = if health.is_healthy() { "OK" } else { "UNHEALTHY" };
+    let status = if checker.get_health().is_healthy() { "OK" } else { "UNHEALTHY" };
     let response = format!("HTTP/1.1 200 OK\r\n\r\n{}", status);
     socket.write_all(response.as_bytes()).await.unwrap();
 }
@@ -525,38 +556,49 @@ for concurrency in [1, 2, 4, 8, 16, 32] {
 ```rust
 use celers_core::CelersError;
 
-// Worker handles errors automatically, but you can customize:
-registry.register("my_task", |args: Vec<i32>| async move {
-    match risky_operation(args).await {
-        Ok(result) => Ok(result),
-        Err(e) => {
-            // Log error
-            eprintln!("Task failed: {}", e);
+// Worker handles retries/DLQ automatically based on what execute() returns;
+// return an Err to trigger retry logic (see Retry Logic above):
+#[async_trait::async_trait]
+impl Task for MyTask {
+    type Input = MyArgs;
+    type Output = String;
 
-            // Return error (triggers retry logic)
-            Err(CelersError::Other(e.to_string()))
+    async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
+        match risky_operation(input).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Log error
+                eprintln!("Task failed: {}", e);
+
+                // Return error (triggers retry logic)
+                Err(CelersError::Other(e.to_string()))
+            }
         }
     }
-});
+
+    fn name(&self) -> &str {
+        "my_task"
+    }
+}
 ```
 
 ## Examples
 
 See `examples/` directory:
-- `phase1_complete.rs` - Basic worker setup
-- `graceful_shutdown.rs` - Shutdown handling
-- `prometheus_metrics.rs` - Metrics integration
-- `health_checks.rs` - Health check endpoint
-- `canvas_workflows.rs` - Workflow support
+- `worker_advanced_features.rs` - Priority queues, priority inheritance, sliding-window rate limiting, lock-free queues
+- `dependency_example.rs` - Task dependency graphs and execution ordering
+- `distributed_rate_limit_example.rs` - Multi-worker distributed rate-limit coordination
+- `dlq_storage_example.rs` - Dead letter queue storage backends (memory, Redis, PostgreSQL)
+- `streaming_example.rs` - Chunked result streaming with backpressure
 
 ## Troubleshooting
 
 ### Worker not processing tasks
 
 **Check:**
-1. Broker connection: `broker.is_connected()`
-2. Queue has tasks: `broker.queue_size().await`
-3. Tasks registered: `registry.list()`
+1. Queue has tasks: `broker.queue_size().await`
+2. Tasks registered: `registry.list_tasks().await`
+3. Task is actually reachable by name: `registry.has_task("tasks.add").await`
 
 ### High memory usage
 
@@ -593,7 +635,8 @@ let config = WorkerConfig {
 
 ## Testing
 
-**486 tests passing** (unit + doc + integration + load tests)
+**703 tests passing** (655 unit/integration via `cargo nextest` + 48 doc tests; 6 additional
+doc tests are `ignore`d because they require a live Postgres/Redis instance)
 
 ## See Also
 

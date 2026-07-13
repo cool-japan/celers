@@ -240,11 +240,11 @@ mod integration {
         }
 
         fn enqueued_tasks(&self) -> Vec<String> {
-            self.tasks.lock().unwrap().clone()
+            self.tasks.lock().unwrap_or_else(|e| e.into_inner()).clone()
         }
 
         fn task_count(&self) -> usize {
-            self.tasks.lock().unwrap().len()
+            self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len()
         }
     }
 
@@ -256,7 +256,10 @@ mod integration {
         ) -> celers_core::Result<celers_core::TaskId> {
             let task_name = task.metadata.name.clone();
             let task_id = task.metadata.id;
-            self.tasks.lock().unwrap().push(task_name);
+            self.tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(task_name);
             Ok(task_id)
         }
 
@@ -282,7 +285,7 @@ mod integration {
         }
 
         async fn queue_size(&self) -> celers_core::Result<usize> {
-            Ok(self.tasks.lock().unwrap().len())
+            Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len())
         }
 
         async fn cancel(&self, _task_id: &celers_core::TaskId) -> celers_core::Result<bool> {
@@ -1278,7 +1281,7 @@ mod integration {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         std::thread::sleep(std::time::Duration::from_millis(10));

@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Core traits and types for CeleRS distributed task queue"
+readme = "README.md"
 keywords = ["celery", "task-queue", "distributed", "async", "traits"]
 categories = ["asynchronous", "network-programming"]
 
@@ -13,7 +14,6 @@ categories = ["asynchronous", "network-programming"]
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-oxicode = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

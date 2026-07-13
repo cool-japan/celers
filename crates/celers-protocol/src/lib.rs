@@ -32,6 +32,7 @@
 //! - [`crypto`] - Message encryption (AES-256-GCM)
 //! - [`extensions`] - Message extensions and utility helpers
 //! - [`migration`] - Protocol version migration helpers
+//! - [`v5`] - Native Celery protocol v5 wire-format builder
 //! - [`middleware`] - Message transformation middleware
 //! - [`zerocopy`] - Zero-copy deserialization for performance
 //! - [`lazy`] - Lazy deserialization for large messages
@@ -70,6 +71,7 @@ pub mod security;
 pub mod serializer;
 mod types;
 pub mod utils;
+pub mod v5;
 pub mod workflow;
 pub mod zerocopy;
 

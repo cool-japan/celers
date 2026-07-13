@@ -1000,8 +1000,14 @@ pub fn analyze_message_patterns(message_sizes: &[usize]) -> (usize, usize, f64, 
         return (0, 0, 0.0, 0.0);
     }
 
-    let min = *message_sizes.iter().min().unwrap();
-    let max = *message_sizes.iter().max().unwrap();
+    let min = *message_sizes
+        .iter()
+        .min()
+        .expect("message_sizes validated to be non-empty");
+    let max = *message_sizes
+        .iter()
+        .max()
+        .expect("message_sizes validated to be non-empty");
 
     let sum: usize = message_sizes.iter().sum();
     let avg = sum as f64 / message_sizes.len() as f64;
@@ -1687,7 +1693,9 @@ pub fn predict_queue_saturation(
         return (f64::INFINITY, 0.0);
     }
 
-    let current_size = *historical_sizes.last().unwrap();
+    let current_size = *historical_sizes
+        .last()
+        .expect("historical_sizes validated to have at least 2 elements");
     if current_size >= max_capacity {
         return (0.0, 0.0);
     }

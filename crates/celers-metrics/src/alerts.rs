@@ -87,6 +87,7 @@ impl AlertRule {
     ///     processing_queue_size: 10.0,
     ///     dlq_size: 3.0,
     ///     active_workers: 5.0,
+    ///     total_payload_bytes: 0.0,
     /// };
     ///
     /// if rule.should_fire(&metrics) {
@@ -307,7 +308,10 @@ impl AlertDebouncer {
     /// assert!(!debouncer.should_fire("high_error_rate"));
     /// ```
     pub fn should_fire(&self, alert_name: &str) -> bool {
-        let mut times = self.last_alert_times.lock().unwrap();
+        let mut times = self
+            .last_alert_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
         if let Some(last_time) = times.get(alert_name) {
@@ -323,17 +327,26 @@ impl AlertDebouncer {
 
     /// Reset debounce state for an alert
     pub fn reset(&self, alert_name: &str) {
-        self.last_alert_times.lock().unwrap().remove(alert_name);
+        self.last_alert_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(alert_name);
     }
 
     /// Reset all debounce state
     pub fn reset_all(&self) {
-        self.last_alert_times.lock().unwrap().clear();
+        self.last_alert_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Get time until next alert can fire (in seconds)
     pub fn time_until_next(&self, alert_name: &str) -> Option<u64> {
-        let times = self.last_alert_times.lock().unwrap();
+        let times = self
+            .last_alert_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(last_time) = times.get(alert_name) {
             let elapsed = Instant::now().duration_since(*last_time).as_secs();
             if elapsed < self.debounce_period {
@@ -449,7 +462,7 @@ impl AlertHistory {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .expect("SystemTime should be after UNIX_EPOCH")
                     .as_secs();
                 now.saturating_sub(e.timestamp)
             })

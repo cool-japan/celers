@@ -317,7 +317,7 @@ impl WorkflowBatch {
             timeout: None,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock before UNIX epoch")
                 .as_secs(),
         }
     }
@@ -352,7 +352,7 @@ impl WorkflowBatch {
         if let Some(timeout) = self.timeout {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock before UNIX epoch")
                 .as_secs();
             let age = now.saturating_sub(self.created_at);
             age >= timeout

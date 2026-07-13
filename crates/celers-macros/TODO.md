@@ -2,11 +2,15 @@
 
 > Procedural macros for simplified CeleRS task definition
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 221**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 221**
 
 ## Status: ✅ FEATURE COMPLETE
 
 Provides ergonomic macros for defining tasks without boilerplate.
+
+_Verified against `CHANGELOG.md`'s `## [0.3.0]` entry: this crate has no functional changes in the
+0.3.0 release cycle (no `celers-macros` mentions in that entry). The version bump is the
+workspace-wide release version only._
 
 ## Completed Features
 
@@ -78,11 +82,14 @@ async fn process_data(id: u64, name: String) -> celers_core::Result<String> {
 
 ## Testing
 
-- 221 total tests passing
+- 221 total tests passing (verified via `cargo nextest run -p celers-macros --all-features`, 2026-07-13)
 - 21 unit tests
-- 200 integration tests (task_attr, task_macro, derive_macro, validation modules)
-- 23 doc tests
-- 3 runnable examples (basic_task, derive_task, validation)
+- 200 integration tests (task_attr, task_macro, derive_macro, validation modules; all in
+  `tests/integration_test.rs` — see Deferred section below for its file size)
+- 23 doc examples, all marked `` ```ignore `` (not compiled/run by `cargo test --doc`; they
+  illustrate macro-generated code that only exists after expansion in a real crate)
+- 3 runnable examples (basic_task, derive_task, validation) — all verified to run successfully
+  (`cargo run --example <name>`, exit code 0)
 
 ## Dependencies
 
@@ -101,6 +108,13 @@ async fn process_data(id: u64, name: String) -> celers_core::Result<String> {
 - Complex return types may not parse correctly
 - No support for `impl Trait` return types
 - Pattern validation requires the `regex` crate in user's dependencies
+
+## Deferred / Known Follow-Ups (OPEN)
+
+- **[OPEN — deferred by user]** `tests/integration_test.rs` is 3038 lines, over the workspace's
+  2000-line-per-file refactor-policy threshold. Found during the 0.3.0 release-check; splitting was
+  explicitly deferred to a dedicated follow-up session rather than bundled into this docs refresh.
+  Recommended tool: `splitrs` (SMT-solver-assisted Rust file splitter).
 
 ## Notes
 

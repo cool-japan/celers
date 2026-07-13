@@ -151,7 +151,7 @@ impl PerformanceProfiler {
     pub fn new() -> Self {
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         Self {
@@ -211,7 +211,7 @@ impl PerformanceProfiler {
     fn record_sample(samples: &mut VecDeque<LatencySample>, latency: Duration) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let sample = LatencySample {
@@ -253,7 +253,7 @@ impl PerformanceProfiler {
         // Calculate throughput (ops per second)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         let elapsed = now.saturating_sub(self.start_time).max(1);
         let throughput = count as f64 / elapsed as f64;
@@ -337,7 +337,7 @@ impl PerformanceProfiler {
         self.queue_size_samples.clear();
         self.start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
     }
 

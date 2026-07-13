@@ -1,9 +1,10 @@
 //! Queue control and task inspection operations
 
 use celers_core::{CelersError, Result, TaskId};
-use sqlx::Row;
+use oxisql_core::{Connection, ToSqlValue};
 use std::sync::atomic::Ordering;
 
+use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};
 use crate::types::{DbTaskState, QueueStatistics, TaskInfo};
 use crate::PostgresBroker;
 
@@ -29,39 +30,69 @@ impl PostgresBroker {
 
     // ========== Task Inspection ==========
 
+    /// Map a `TaskInfo`-shaped row. Shared by every method in this file that
+    /// selects the same 12-column `TaskInfo` projection, so the
+    /// UUID/DateTime/Option handling is written exactly once.
+    fn row_to_task_info(row: &oxisql_core::Row) -> Result<TaskInfo> {
+        let state_str: String = row
+            .col("state")
+            .map_err(|e| CelersError::Other(format!("Failed to read state: {}", e)))?;
+        Ok(TaskInfo {
+            id: uuid_from_row(row, "id")
+                .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+            task_name: row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
+            state: state_str.parse()?,
+            priority: row
+                .col("priority")
+                .map_err(|e| CelersError::Other(format!("Failed to read priority: {}", e)))?,
+            retry_count: row
+                .col("retry_count")
+                .map_err(|e| CelersError::Other(format!("Failed to read retry_count: {}", e)))?,
+            max_retries: row
+                .col("max_retries")
+                .map_err(|e| CelersError::Other(format!("Failed to read max_retries: {}", e)))?,
+            created_at: row
+                .col("created_at")
+                .map_err(|e| CelersError::Other(format!("Failed to read created_at: {}", e)))?,
+            scheduled_at: row
+                .col("scheduled_at")
+                .map_err(|e| CelersError::Other(format!("Failed to read scheduled_at: {}", e)))?,
+            started_at: row
+                .col("started_at")
+                .map_err(|e| CelersError::Other(format!("Failed to read started_at: {}", e)))?,
+            completed_at: row
+                .col("completed_at")
+                .map_err(|e| CelersError::Other(format!("Failed to read completed_at: {}", e)))?,
+            worker_id: row
+                .col("worker_id")
+                .map_err(|e| CelersError::Other(format!("Failed to read worker_id: {}", e)))?,
+            error_message: row
+                .col("error_message")
+                .map_err(|e| CelersError::Other(format!("Failed to read error_message: {}", e)))?,
+        })
+    }
+
     /// Get detailed information about a specific task
     pub async fn get_task(&self, task_id: &TaskId) -> Result<Option<TaskInfo>> {
-        let row = sqlx::query(
-            r#"
+        let task_id_param = uuid_param(task_id);
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT id, task_name, state, priority, retry_count, max_retries,
                    created_at, scheduled_at, started_at, completed_at, worker_id, error_message
             FROM celers_tasks
             WHERE id = $1
             "#,
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task: {}", e)))?;
+                &[&task_id_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get task: {}", e)))?;
 
-        match row {
-            Some(row) => {
-                let state_str: String = row.get("state");
-                Ok(Some(TaskInfo {
-                    id: row.get("id"),
-                    task_name: row.get("task_name"),
-                    state: state_str.parse()?,
-                    priority: row.get("priority"),
-                    retry_count: row.get("retry_count"),
-                    max_retries: row.get("max_retries"),
-                    created_at: row.get("created_at"),
-                    scheduled_at: row.get("scheduled_at"),
-                    started_at: row.get("started_at"),
-                    completed_at: row.get("completed_at"),
-                    worker_id: row.get("worker_id"),
-                    error_message: row.get("error_message"),
-                }))
-            }
+        match rows.into_iter().next() {
+            Some(row) => Ok(Some(Self::row_to_task_info(&row)?)),
             None => Ok(None),
         }
     }
@@ -75,8 +106,10 @@ impl PostgresBroker {
     ) -> Result<Vec<TaskInfo>> {
         let rows = match state {
             Some(s) => {
-                sqlx::query(
-                    r#"
+                let state_param = s.to_string();
+                self.conn
+                    .query(
+                        r#"
                     SELECT id, task_name, state, priority, retry_count, max_retries,
                            created_at, scheduled_at, started_at, completed_at, worker_id, error_message
                     FROM celers_tasks
@@ -84,48 +117,30 @@ impl PostgresBroker {
                     ORDER BY created_at DESC
                     LIMIT $2 OFFSET $3
                     "#,
-                )
-                .bind(s.to_string())
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
+                        &[&state_param, &limit, &offset],
+                    )
+                    .await
             }
             None => {
-                sqlx::query(
-                    r#"
+                self.conn
+                    .query(
+                        r#"
                     SELECT id, task_name, state, priority, retry_count, max_retries,
                            created_at, scheduled_at, started_at, completed_at, worker_id, error_message
                     FROM celers_tasks
                     ORDER BY created_at DESC
                     LIMIT $1 OFFSET $2
                     "#,
-                )
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
+                        &[&limit, &offset],
+                    )
+                    .await
             }
         }
         .map_err(|e| CelersError::Other(format!("Failed to list tasks: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
-        for row in rows {
-            let state_str: String = row.get("state");
-            tasks.push(TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
-                state: state_str.parse()?,
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
-            });
+        for row in &rows {
+            tasks.push(Self::row_to_task_info(row)?);
         }
         Ok(tasks)
     }
@@ -150,8 +165,11 @@ impl PostgresBroker {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TaskInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let value_param = json_param(value);
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT id, task_name, state, priority, retry_count, max_retries,
                    created_at, scheduled_at, started_at, completed_at, worker_id, error_message
             FROM celers_tasks
@@ -159,32 +177,14 @@ impl PostgresBroker {
             ORDER BY created_at DESC
             LIMIT $3 OFFSET $4
             "#,
-        )
-        .bind(json_path)
-        .bind(value)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to find tasks by metadata: {}", e)))?;
+                &[&json_path, &value_param, &limit, &offset],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to find tasks by metadata: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
-        for row in rows {
-            let state_str: String = row.get("state");
-            tasks.push(TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
-                state: state_str.parse()?,
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
-            });
+        for row in &rows {
+            tasks.push(Self::row_to_task_info(row)?);
         }
         Ok(tasks)
     }
@@ -202,20 +202,26 @@ impl PostgresBroker {
         json_path: &str,
         value: &serde_json::Value,
     ) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
+        let value_param = json_param(value);
+        let rows = self
+            .conn
+            .query(
+                r#"
+            SELECT COUNT(*) as count
             FROM celers_tasks
             WHERE metadata->$1 = $2
             "#,
-        )
-        .bind(json_path)
-        .bind(value)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to count tasks by metadata: {}", e)))?;
+                &[&json_path, &value_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to count tasks by metadata: {}", e)))?;
 
-        Ok(count)
+        // .fetch_one (via query_scalar in the original): error if no row.
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to count tasks by metadata: no rows returned".to_string())
+        })?;
+        row.col("count")
+            .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))
     }
 
     /// Find tasks by task name with pagination
@@ -230,8 +236,10 @@ impl PostgresBroker {
     ) -> Result<Vec<TaskInfo>> {
         let rows = match state {
             Some(s) => {
-                sqlx::query(
-                    r#"
+                let state_param = s.to_string();
+                self.conn
+                    .query(
+                        r#"
                     SELECT id, task_name, state, priority, retry_count, max_retries,
                            created_at, scheduled_at, started_at, completed_at, worker_id, error_message
                     FROM celers_tasks
@@ -239,17 +247,14 @@ impl PostgresBroker {
                     ORDER BY created_at DESC
                     LIMIT $3 OFFSET $4
                     "#,
-                )
-                .bind(task_name)
-                .bind(s.to_string())
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
+                        &[&task_name, &state_param, &limit, &offset],
+                    )
+                    .await
             }
             None => {
-                sqlx::query(
-                    r#"
+                self.conn
+                    .query(
+                        r#"
                     SELECT id, task_name, state, priority, retry_count, max_retries,
                            created_at, scheduled_at, started_at, completed_at, worker_id, error_message
                     FROM celers_tasks
@@ -257,33 +262,16 @@ impl PostgresBroker {
                     ORDER BY created_at DESC
                     LIMIT $2 OFFSET $3
                     "#,
-                )
-                .bind(task_name)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
+                        &[&task_name, &limit, &offset],
+                    )
+                    .await
             }
         }
         .map_err(|e| CelersError::Other(format!("Failed to find tasks by name: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
-        for row in rows {
-            let state_str: String = row.get("state");
-            tasks.push(TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
-                state: state_str.parse()?,
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
-            });
+        for row in &rows {
+            tasks.push(Self::row_to_task_info(row)?);
         }
         Ok(tasks)
     }
@@ -324,8 +312,13 @@ impl PostgresBroker {
         value: &serde_json::Value,
         limit: i64,
     ) -> Result<Vec<TaskInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let jsonpath_expr = format!("$.{}", jsonpath.trim_start_matches("$."));
+        let jsonpath_field = jsonpath.trim_start_matches("$.").to_string();
+        let value_str = value.as_str().unwrap_or("").to_string();
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT id, task_name, state, priority, retry_count, max_retries,
                    created_at, scheduled_at, started_at, completed_at, worker_id, error_message
             FROM celers_tasks
@@ -335,34 +328,59 @@ impl PostgresBroker {
             ORDER BY created_at DESC
             LIMIT $5
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(format!("$.{}", jsonpath.trim_start_matches("$.")))
-        .bind([jsonpath.trim_start_matches("$.")])
-        .bind(value.as_str().unwrap_or(""))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to search tasks by JSONPath: {}", e)))?;
+                &[
+                    &self.queue_name,
+                    &jsonpath_expr,
+                    &jsonpath_field,
+                    &value_str,
+                    &limit,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to search tasks by JSONPath: {}", e))
+            })?;
 
         let mut tasks = Vec::with_capacity(rows.len());
-        for row in rows {
+        for row in &rows {
             tasks.push(TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
+                id: uuid_from_row(row, "id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
                 state: row
-                    .get::<String, _>("state")
+                    .col::<String>("state")
+                    .map_err(|e| CelersError::Other(format!("Failed to read state: {}", e)))?
                     .parse()
                     .unwrap_or(DbTaskState::Pending),
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
+                priority: row
+                    .col("priority")
+                    .map_err(|e| CelersError::Other(format!("Failed to read priority: {}", e)))?,
+                retry_count: row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to read retry_count: {}", e))
+                })?,
+                max_retries: row.col("max_retries").map_err(|e| {
+                    CelersError::Other(format!("Failed to read max_retries: {}", e))
+                })?,
+                created_at: row
+                    .col("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read created_at: {}", e)))?,
+                scheduled_at: row.col("scheduled_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to read scheduled_at: {}", e))
+                })?,
+                started_at: row
+                    .col("started_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read started_at: {}", e)))?,
+                completed_at: row.col("completed_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to read completed_at: {}", e))
+                })?,
+                worker_id: row
+                    .col("worker_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read worker_id: {}", e)))?,
+                error_message: row.col("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to read error_message: {}", e))
+                })?,
             });
         }
 
@@ -402,13 +420,21 @@ impl PostgresBroker {
             return Ok(Vec::new());
         }
 
-        // Build dynamic WHERE clause
-        let mut where_clauses = Vec::new();
-        let mut bind_idx = 2; // Start at 2 because $1 is queue_name
+        // Collect once so clause-building order and bind order are provably
+        // derived from the same data (never re-iterate `filters.keys()`).
+        let filter_pairs: Vec<(&String, &serde_json::Value)> = filters.iter().collect();
 
-        for key in filters.keys() {
-            where_clauses.push(format!("metadata->'{}' = ${}", key, bind_idx));
-            bind_idx += 1;
+        // Every filter contributes TWO binds: the JSON key via `metadata->$n`
+        // and the value via `$n+1`. Nothing is spliced as text, so the
+        // assembled string below contains only `$n` placeholders. Byte-for-byte
+        // preserved from the pre-migration `sqlx::AssertSqlSafe` version;
+        // oxisql's `execute`/`query` take `&str` directly so `AssertSqlSafe`
+        // simply drops away.
+        let mut where_clauses = Vec::with_capacity(filter_pairs.len());
+        let mut bind_idx = 2; // $1 is queue_name
+        for _ in &filter_pairs {
+            where_clauses.push(format!("metadata->${} = ${}", bind_idx, bind_idx + 1));
+            bind_idx += 2;
         }
 
         let query_str = format!(
@@ -425,37 +451,69 @@ impl PostgresBroker {
             bind_idx
         );
 
-        let mut query = sqlx::query(&query_str).bind(&self.queue_name);
-
-        // Bind all filter values in order
-        for key in filters.keys() {
-            query = query.bind(&filters[key]);
+        // Build the owned param values first (String for the queue name and
+        // every JSON key/value, matching what `json_param` produces), then a
+        // `Vec<&dyn ToSqlValue>` of references into them — mirrors the
+        // dynamic-placeholder-count array-binding rewrite pattern used in
+        // `broker_trait.rs`'s `dequeue_batch`/`ack_batch`.
+        let mut owned_params: Vec<String> = Vec::with_capacity(1 + filter_pairs.len() * 2);
+        owned_params.push(self.queue_name.clone());
+        for (key, value) in &filter_pairs {
+            owned_params.push((*key).clone());
+            owned_params.push(json_param(value));
         }
+        let mut param_refs: Vec<&dyn ToSqlValue> =
+            owned_params.iter().map(|p| p as &dyn ToSqlValue).collect();
+        param_refs.push(&limit);
 
-        query = query.bind(limit);
-
-        let rows = query.fetch_all(&self.pool).await.map_err(|e| {
-            CelersError::Other(format!("Failed to find tasks by metadata filters: {}", e))
-        })?;
+        let rows = self
+            .conn
+            .query(&query_str, &param_refs)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to find tasks by metadata filters: {}", e))
+            })?;
 
         let mut tasks = Vec::with_capacity(rows.len());
-        for row in rows {
+        for row in &rows {
             tasks.push(TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
+                id: uuid_from_row(row, "id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
                 state: row
-                    .get::<String, _>("state")
+                    .col::<String>("state")
+                    .map_err(|e| CelersError::Other(format!("Failed to read state: {}", e)))?
                     .parse()
                     .unwrap_or(DbTaskState::Pending),
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
+                priority: row
+                    .col("priority")
+                    .map_err(|e| CelersError::Other(format!("Failed to read priority: {}", e)))?,
+                retry_count: row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to read retry_count: {}", e))
+                })?,
+                max_retries: row.col("max_retries").map_err(|e| {
+                    CelersError::Other(format!("Failed to read max_retries: {}", e))
+                })?,
+                created_at: row
+                    .col("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read created_at: {}", e)))?,
+                scheduled_at: row.col("scheduled_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to read scheduled_at: {}", e))
+                })?,
+                started_at: row
+                    .col("started_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read started_at: {}", e)))?,
+                completed_at: row.col("completed_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to read completed_at: {}", e))
+                })?,
+                worker_id: row
+                    .col("worker_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read worker_id: {}", e)))?,
+                error_message: row.col("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to read error_message: {}", e))
+                })?,
             });
         }
 
@@ -469,8 +527,10 @@ impl PostgresBroker {
 
     /// Get queue statistics
     pub async fn get_statistics(&self) -> Result<QueueStatistics> {
-        let row = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 COUNT(*) FILTER (WHERE state = 'pending') as pending,
                 COUNT(*) FILTER (WHERE state = 'processing') as processing,
@@ -480,24 +540,54 @@ impl PostgresBroker {
                 COUNT(*) as total
             FROM celers_tasks
             "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get statistics: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get statistics: {}", e)))?;
 
-        let dlq_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_dead_letter_queue")
-            .fetch_one(&self.pool)
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get statistics: no rows returned".to_string())
+        })?;
+
+        let dlq_rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM celers_dead_letter_queue", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {}", e)))?;
+        let dlq_row = dlq_rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get DLQ count: no rows returned".to_string())
+        })?;
+        // Unaliased `COUNT(*)` (no `AS` clause): use positional access per
+        // the RowExt convention documented in `row_ext.rs` (the driver
+        // assigns an implicit column name — `"count"` here, since Postgres
+        // does special-case a single unadorned aggregate/function call as
+        // its own name — but `col_idx` is used to avoid relying on that
+        // guess, matching how `find_tasks_by_metadata`'s sibling
+        // `count_tasks_by_metadata` above uses the aliased form instead).
+        let dlq_count: i64 = dlq_row
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read DLQ count: {}", e)))?;
 
         Ok(QueueStatistics {
-            pending: row.get("pending"),
-            processing: row.get("processing"),
-            completed: row.get("completed"),
-            failed: row.get("failed"),
-            cancelled: row.get("cancelled"),
+            pending: row
+                .col("pending")
+                .map_err(|e| CelersError::Other(format!("Failed to read pending: {}", e)))?,
+            processing: row
+                .col("processing")
+                .map_err(|e| CelersError::Other(format!("Failed to read processing: {}", e)))?,
+            completed: row
+                .col("completed")
+                .map_err(|e| CelersError::Other(format!("Failed to read completed: {}", e)))?,
+            failed: row
+                .col("failed")
+                .map_err(|e| CelersError::Other(format!("Failed to read failed: {}", e)))?,
+            cancelled: row
+                .col("cancelled")
+                .map_err(|e| CelersError::Other(format!("Failed to read cancelled: {}", e)))?,
             dlq: dlq_count,
-            total: row.get("total"),
+            total: row
+                .col("total")
+                .map_err(|e| CelersError::Other(format!("Failed to read total: {}", e)))?,
         })
     }
 }

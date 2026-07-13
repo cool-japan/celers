@@ -69,7 +69,7 @@ impl ScheduleConfig {
     pub fn is_ready(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         if let Some(timestamp) = self.scheduled_at {
@@ -89,7 +89,7 @@ impl ScheduleConfig {
         if let Some(delay) = self.delay {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs();
             return Some(now + delay.as_secs());
         }
@@ -305,7 +305,7 @@ impl ReplayConfig {
         if let Some(duration) = self.from_duration {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs();
             return now.saturating_sub(duration.as_secs());
         }

@@ -1,6 +1,6 @@
 # celers-backend-rpc
 
-**Version: 0.2.0 | Status: [Alpha] | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Alpha] | Tests: 18 passing, 1 skipped (requires a live gRPC server) | Updated: 2026-07-13**
 
 gRPC/RPC result backend for CeleRS. Enables remote task result storage and retrieval over gRPC, suitable for distributed microservices architectures and service mesh deployments.
 
@@ -10,6 +10,7 @@ gRPC/RPC result backend for CeleRS. Enables remote task result storage and retri
 - Protobuf-based wire format for efficient serialization
 - Full `ResultBackend` trait implementation (store, get, delete, expire)
 - Chord barrier synchronization over gRPC
+- Client-side metrics: per-operation request/error counts and p50/p95/p99 latency (`RpcMetrics`, new in v0.3.0)
 - Service mesh and load balancer compatible
 - Lazy and eager connection modes
 
@@ -19,7 +20,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-backend-rpc = "0.2"
+celers-backend-rpc = "0.3"
 ```
 
 ### Connect and Store Results
@@ -57,6 +58,25 @@ let channel = Endpoint::from_static("http://localhost:50051").connect_lazy();
 let backend = GrpcResultBackend::from_channel(channel);
 ```
 
+### Client-Side Metrics
+
+Every `GrpcResultBackend` tracks per-operation request/error counts and latency percentiles
+(p50/p95/p99, computed from a 1,000-sample ring buffer per operation):
+
+```rust
+let backend = GrpcResultBackend::connect("http://localhost:50051").await?;
+
+// ... perform some store_result / get_result / chord_* calls ...
+
+let snapshot = backend.metrics();
+println!("total requests: {}", snapshot.total_requests);
+println!("total errors: {}", snapshot.total_errors);
+
+// Share a handle with e.g. a Prometheus exporter task, and reset counters if needed.
+let handle = backend.metrics_handle();
+backend.reset_metrics();
+```
+
 ## Supported Operations
 
 | Operation | Method | Description |
@@ -75,7 +95,9 @@ This crate is part of the [CeleRS](https://github.com/cool-japan/celers) project
 
 ## Testing
 
-**8 tests passing** (unit tests; integration tests require a gRPC server)
+**18 tests passing** (`cargo nextest run`; type conversions, chord operations, connection modes,
+and the metrics ring-buffer/percentile logic), **1 skipped** (marked `#[ignore]`, requires a live
+gRPC server).
 
 ## License
 

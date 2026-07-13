@@ -97,7 +97,7 @@ impl TraceContext {
     pub fn new() -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         Self {
@@ -216,7 +216,7 @@ impl TraceContext {
             service_name: self.service_name.clone(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64,
             metadata: self.metadata.clone(),
         }
@@ -226,7 +226,7 @@ impl TraceContext {
     pub fn elapsed_ms(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
         now.saturating_sub(self.timestamp)
     }
@@ -252,7 +252,7 @@ impl MessageFlowTracker {
     pub fn new(correlation_id: &str, initial_queue: &str, operation: &str) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         Self {
@@ -267,7 +267,7 @@ impl MessageFlowTracker {
     pub fn record_transition(&mut self, queue_name: &str, operation: &str) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         self.queue_flow.push(queue_name.to_string());
@@ -280,7 +280,13 @@ impl MessageFlowTracker {
         if self.timestamps.len() < 2 {
             return 0;
         }
-        self.timestamps.last().unwrap() - self.timestamps.first().unwrap()
+        self.timestamps
+            .last()
+            .expect("timestamps validated to have at least 2 elements")
+            - self
+                .timestamps
+                .first()
+                .expect("timestamps validated to have at least 2 elements")
     }
 
     /// Get duration between two queue transitions

@@ -29,7 +29,7 @@ impl TaskMonitor {
                 total_execution_time_ms: 0,
                 start_time: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .expect("SystemTime should be after UNIX_EPOCH")
                     .as_secs(),
             })),
         }
@@ -104,7 +104,7 @@ impl TaskMonitor {
         metrics.total_execution_time_ms = 0;
         metrics.start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
     }
 
@@ -138,7 +138,7 @@ impl TaskMonitor {
             },
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs()
                 - metrics.start_time
         )

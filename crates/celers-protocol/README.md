@@ -2,7 +2,7 @@
 
 Celery protocol v2/v5 implementation for CeleRS. Ensures wire-level compatibility with Python Celery workers and brokers.
 
-**Status: [Stable] — v0.2.0 (2026-03-27) — 461 tests**
+**Status: [Stable] — v0.3.0 (2026-07-13) — 503 tests**
 
 ## Overview
 
@@ -14,13 +14,17 @@ Production-ready protocol implementation with:
 - ✅ **MessagePack**: Optional high-performance binary format
 - ✅ **BSON Serialization**: Optional `bson-format` feature
 - ✅ **YAML Serialization**: Optional `yaml` feature
+- ✅ **Custom Serializers**: Runtime-registrable `CustomSerializer` trait + `CustomSerializerRegistry` for user-defined formats
 - ✅ **HMAC Signing**: HMAC-SHA256 message authentication
 - ✅ **AES-256-GCM Encryption**: Authenticated message encryption
 - ✅ **AMQP Properties**: Correlation ID, reply-to, delivery mode
 - ✅ **Workflow Headers**: Parent ID, root ID, group ID
 - ✅ **Base64 Encoding**: Binary-safe message bodies
 - ✅ **Full Metadata**: ETA, expiration, retries, priority
+- ✅ **Message Timestamps**: Creation-time tracking (`MessageHeaders.created_at`) with `Message::created_at()` / `MessageExt::get_age_seconds()` age helpers
 - ✅ **Protocol Negotiation**: Auto-detect protocol from message
+- ✅ **Version Negotiation**: Mutual-version agreement (`negotiate_version`) and a native Celery v5 wire-format builder (`build_v5_message` / `to_v5_wire`)
+- ✅ **Protocol Migration**: Real v2↔v5 migration — version stamping, AMQP priority mirroring on upgrade, non-destructive legacy-field mirroring on downgrade
 - ✅ **Compression**: Gzip, Zstd, Zlib with auto-detection
 - ✅ **Message Builder**: Fluent API for message construction
 - ✅ **Result Messages**: Celery-compatible task result format
@@ -117,6 +121,9 @@ pub struct MessageHeaders {
 
     /// Task expiration timestamp
     pub expires: Option<DateTime<Utc>>,
+
+    /// Message creation timestamp (set automatically, used for age tracking)
+    pub created_at: Option<DateTime<Utc>>,
 
     /// Additional custom headers
     pub extra: HashMap<String, serde_json::Value>,
@@ -304,6 +311,7 @@ let version = ProtocolVersion::V5;  // Celery 5.x+
 - Extended workflow metadata
 - Improved error handling
 - Enhanced tracing
+- Native wire-format builder (`celers_protocol::v5::build_v5_message` / `to_v5_wire`) and mutual version negotiation (`negotiate_version`)
 
 ## Content Types
 
@@ -329,7 +337,7 @@ assert_eq!(content_type.as_str(), "application/json");
 
 ```toml
 [dependencies]
-celers-protocol = { version = "0.2", features = ["msgpack"] }
+celers-protocol = { version = "0.3", features = ["msgpack"] }
 ```
 
 ```rust
@@ -352,7 +360,7 @@ assert_eq!(content_type.as_str(), "application/x-msgpack");
 
 ```toml
 [dependencies]
-celers-protocol = { version = "0.2", features = ["binary"] }
+celers-protocol = { version = "0.3", features = ["binary"] }
 ```
 
 ```rust

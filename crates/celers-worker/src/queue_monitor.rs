@@ -121,7 +121,7 @@ impl QueueSample {
             depth,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs(),
         }
     }
@@ -344,8 +344,12 @@ impl QueueMonitor {
             return 0.0;
         }
 
-        let first = history.front().unwrap();
-        let last = history.back().unwrap();
+        let first = history
+            .front()
+            .expect("history validated to have at least 2 elements");
+        let last = history
+            .back()
+            .expect("history validated to have at least 2 elements");
 
         let depth_change = last.depth as i64 - first.depth as i64;
         let time_change = last.timestamp.saturating_sub(first.timestamp) as f64;

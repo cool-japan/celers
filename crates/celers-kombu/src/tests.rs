@@ -1081,7 +1081,7 @@ async fn test_middleware_chain_with_multiple_builtin() {
     let result = chain.process_before_publish(&mut message).await;
     assert!(result.is_ok());
 
-    let snapshot = metrics.lock().unwrap().clone();
+    let snapshot = metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(snapshot.messages_published, 1);
 }
 
@@ -1251,7 +1251,7 @@ fn test_dlq_stats_is_empty() {
 fn test_dlq_stats_oldest_age() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime should be after UNIX_EPOCH")
         .as_secs();
 
     let stats = DlqStats {

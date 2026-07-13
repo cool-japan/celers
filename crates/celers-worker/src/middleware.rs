@@ -192,7 +192,7 @@ impl Middleware for MetricsMiddleware {
             "start_time".to_string(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs()
                 .to_string(),
         );
@@ -220,7 +220,7 @@ impl Middleware for MetricsMiddleware {
             if let Ok(start) = start_time.parse::<u64>() {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("SystemTime should be after UNIX_EPOCH")
                     .as_secs();
                 let duration = now - start;
                 TASK_EXECUTION_TIME.observe(duration as f64);

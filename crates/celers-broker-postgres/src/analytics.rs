@@ -2,10 +2,11 @@
 
 use celers_core::{CelersError, Result};
 use chrono::{DateTime, Utc};
+use oxisql_core::Connection;
 use serde_json::json;
-use sqlx::Row;
 use uuid::Uuid;
 
+use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};
 use crate::types::{
     DbTaskState, PriorityStrategy, PriorityStrategyResult, StateTransitionStats, TaskInfo,
     TaskLifecycle, TaskResult,
@@ -62,14 +63,17 @@ impl PostgresBroker {
         }
 
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
         let mut stored = 0i64;
         for result in results {
-            sqlx::query(
+            let task_id_param = uuid_param(&result.task_id);
+            let status_param = result.status.to_string();
+            let result_param: Option<String> = result.result.as_ref().map(json_param);
+            tx.execute(
                 r#"
                 INSERT INTO celers_task_results (task_id, status, result, error, traceback)
                 VALUES ($1, $2, $3, $4, $5)
@@ -80,13 +84,14 @@ impl PostgresBroker {
                     traceback = EXCLUDED.traceback,
                     updated_at = NOW()
                 "#,
+                &[
+                    &task_id_param,
+                    &status_param,
+                    &result_param,
+                    &result.error,
+                    &result.traceback,
+                ],
             )
-            .bind(result.task_id)
-            .bind(result.status.to_string())
-            .bind(&result.result)
-            .bind(&result.error)
-            .bind(&result.traceback)
-            .execute(&mut *tx)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to store result: {}", e)))?;
 
@@ -127,8 +132,10 @@ impl PostgresBroker {
         error_pattern: &str,
         limit: i64,
     ) -> Result<Vec<TaskInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT id, task_name, state, priority, retry_count, max_retries,
                    created_at, scheduled_at, started_at, completed_at, worker_id, error_message
             FROM celers_tasks
@@ -138,34 +145,53 @@ impl PostgresBroker {
             ORDER BY created_at DESC
             LIMIT $3
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(error_pattern)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to find tasks by error: {}", e)))?;
+                &[&self.queue_name, &error_pattern, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to find tasks by error: {}", e)))?;
 
-        let tasks: Vec<TaskInfo> = rows
-            .iter()
-            .map(|row| TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in &rows {
+            tasks.push(TaskInfo {
+                id: uuid_from_row(row, "id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
                 state: row
-                    .get::<String, _>("state")
+                    .col::<String>("state")
+                    .map_err(|e| CelersError::Other(format!("Failed to read state: {}", e)))?
                     .parse()
                     .unwrap_or(DbTaskState::Failed),
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
-            })
-            .collect();
+                priority: row
+                    .col("priority")
+                    .map_err(|e| CelersError::Other(format!("Failed to read priority: {}", e)))?,
+                retry_count: row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to read retry_count: {}", e))
+                })?,
+                max_retries: row.col("max_retries").map_err(|e| {
+                    CelersError::Other(format!("Failed to read max_retries: {}", e))
+                })?,
+                created_at: row
+                    .col("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read created_at: {}", e)))?,
+                scheduled_at: row.col("scheduled_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to read scheduled_at: {}", e))
+                })?,
+                started_at: row
+                    .col("started_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read started_at: {}", e)))?,
+                completed_at: row.col("completed_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to read completed_at: {}", e))
+                })?,
+                worker_id: row
+                    .col("worker_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read worker_id: {}", e)))?,
+                error_message: row.col("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to read error_message: {}", e))
+                })?,
+            });
+        }
 
         Ok(tasks)
     }
@@ -194,32 +220,46 @@ impl PostgresBroker {
     /// ```
     pub async fn estimate_wait_time(&self) -> Result<Option<i64>> {
         // Get completed tasks in last hour
-        let completed_last_hour: i64 = sqlx::query_scalar(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT COUNT(*)
             FROM celers_tasks
             WHERE queue_name = $1
               AND state = 'completed'
               AND completed_at > NOW() - INTERVAL '1 hour'
             "#,
-        )
-        .bind(&self.queue_name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get completion rate: {}", e)))?;
+                &[&self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get completion rate: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get completion rate: no rows returned".to_string())
+        })?;
+        let completed_last_hour: i64 = row
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
 
         if completed_last_hour == 0 {
             return Ok(None);
         }
 
         // Get current pending count
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM celers_tasks WHERE queue_name = $1 AND state = 'pending'",
-        )
-        .bind(&self.queue_name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM celers_tasks WHERE queue_name = $1 AND state = 'pending'",
+                &[&self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get pending count: no rows returned".to_string())
+        })?;
+        let pending: i64 = row
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
 
         // Calculate tasks per second
         let tasks_per_second = completed_last_hour as f64 / 3600.0;
@@ -262,8 +302,10 @@ impl PostgresBroker {
         &self,
         limit: i64,
     ) -> Result<Vec<(Option<String>, i64, Option<f64>, Option<f64>)>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 worker_id,
                 COUNT(*) as processed,
@@ -278,23 +320,27 @@ impl PostgresBroker {
             ORDER BY processed DESC
             LIMIT $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get worker stats: {}", e)))?;
+                &[&self.queue_name, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get worker stats: {}", e)))?;
 
-        let stats = rows
-            .iter()
-            .map(|row| {
-                let worker_id: Option<String> = row.get("worker_id");
-                let processed: i64 = row.get("processed");
-                let avg_time_ms: Option<f64> = row.get("avg_time_ms");
-                let success_rate: Option<f64> = row.get("success_rate");
-                (worker_id, processed, avg_time_ms, success_rate)
-            })
-            .collect();
+        let mut stats = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let worker_id: Option<String> = row
+                .col("worker_id")
+                .map_err(|e| CelersError::Other(format!("Failed to read worker_id: {}", e)))?;
+            let processed: i64 = row
+                .col("processed")
+                .map_err(|e| CelersError::Other(format!("Failed to read processed: {}", e)))?;
+            let avg_time_ms: Option<f64> = row
+                .col("avg_time_ms")
+                .map_err(|e| CelersError::Other(format!("Failed to read avg_time_ms: {}", e)))?;
+            let success_rate: Option<f64> = row
+                .col("success_rate")
+                .map_err(|e| CelersError::Other(format!("Failed to read success_rate: {}", e)))?;
+            stats.push((worker_id, processed, avg_time_ms, success_rate));
+        }
 
         Ok(stats)
     }
@@ -322,8 +368,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_task_age_distribution(&self) -> Result<(i64, i64, i64, i64, i64)> {
-        let row = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 COUNT(*) FILTER (WHERE age_secs < 60) as under_1min,
                 COUNT(*) FILTER (WHERE age_secs >= 60 AND age_secs < 300) as between_1_5min,
@@ -336,18 +384,30 @@ impl PostgresBroker {
                 WHERE queue_name = $1 AND state = 'pending'
             ) as ages
             "#,
-        )
-        .bind(&self.queue_name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task age distribution: {}", e)))?;
+                &[&self.queue_name],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to get task age distribution: {}", e))
+            })?;
+
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get task age distribution: no rows returned".to_string())
+        })?;
 
         Ok((
-            row.get("under_1min"),
-            row.get("between_1_5min"),
-            row.get("between_5_15min"),
-            row.get("between_15_60min"),
-            row.get("over_1hour"),
+            row.col("under_1min")
+                .map_err(|e| CelersError::Other(format!("Failed to read under_1min: {}", e)))?,
+            row.col("between_1_5min")
+                .map_err(|e| CelersError::Other(format!("Failed to read between_1_5min: {}", e)))?,
+            row.col("between_5_15min").map_err(|e| {
+                CelersError::Other(format!("Failed to read between_5_15min: {}", e))
+            })?,
+            row.col("between_15_60min").map_err(|e| {
+                CelersError::Other(format!("Failed to read between_15_60min: {}", e))
+            })?,
+            row.col("over_1hour")
+                .map_err(|e| CelersError::Other(format!("Failed to read over_1hour: {}", e)))?,
         ))
     }
 
@@ -371,8 +431,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn copy_tasks_from_queue(&self, source_queue: &str, limit: i64) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             INSERT INTO celers_tasks
                 (task_name, payload, queue_name, state, priority, retry_count, max_retries,
                  timeout_secs, scheduled_at, metadata)
@@ -384,15 +446,12 @@ impl PostgresBroker {
               AND state = 'pending'
             LIMIT $3
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(source_queue)
-        .bind(limit)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to copy tasks: {}", e)))?;
+                &[&self.queue_name, &source_queue, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to copy tasks: {}", e)))?;
 
-        let copied = result.rows_affected() as i64;
+        let copied = rows_affected as i64;
 
         tracing::info!(
             source = source_queue,
@@ -424,8 +483,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn move_tasks_from_queue(&self, source_queue: &str, limit: i64) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET queue_name = $1
             WHERE id IN (
@@ -434,15 +495,12 @@ impl PostgresBroker {
                 LIMIT $3
             )
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(source_queue)
-        .bind(limit)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to move tasks: {}", e)))?;
+                &[&self.queue_name, &source_queue, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to move tasks: {}", e)))?;
 
-        let moved = result.rows_affected() as i64;
+        let moved = rows_affected as i64;
 
         tracing::info!(
             source = source_queue,
@@ -475,8 +533,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_hourly_task_counts(&self) -> Result<Vec<(i32, i64)>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 EXTRACT(HOUR FROM created_at)::INTEGER as hour,
                 COUNT(*) as count
@@ -486,20 +546,21 @@ impl PostgresBroker {
             GROUP BY hour
             ORDER BY hour
             "#,
-        )
-        .bind(&self.queue_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get hourly task counts: {}", e)))?;
+                &[&self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get hourly task counts: {}", e)))?;
 
-        let hourly = rows
-            .iter()
-            .map(|row| {
-                let hour: i32 = row.get("hour");
-                let count: i64 = row.get("count");
-                (hour, count)
-            })
-            .collect();
+        let mut hourly = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let hour: i32 = row
+                .col("hour")
+                .map_err(|e| CelersError::Other(format!("Failed to read hour: {}", e)))?;
+            let count: i64 = row
+                .col("count")
+                .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
+            hourly.push((hour, count));
+        }
 
         Ok(hourly)
     }
@@ -527,8 +588,11 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn replay_tasks(&self, source_state: DbTaskState, limit: i64) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
+        let source_state_param = source_state.to_string();
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             INSERT INTO celers_tasks
                 (task_name, payload, queue_name, state, priority, retry_count, max_retries,
                  timeout_secs, scheduled_at, metadata)
@@ -541,15 +605,12 @@ impl PostgresBroker {
             ORDER BY created_at DESC
             LIMIT $3
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(source_state.to_string())
-        .bind(limit)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to replay tasks: {}", e)))?;
+                &[&self.queue_name, &source_state_param, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to replay tasks: {}", e)))?;
 
-        let replayed = result.rows_affected() as i64;
+        let replayed = rows_affected as i64;
 
         tracing::info!(
             state = %source_state,
@@ -739,8 +800,11 @@ impl PostgresBroker {
         state: DbTaskState,
         sample_size: i64,
     ) -> Result<Vec<TaskInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let state_param = state.to_string();
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT id, task_name, state, priority, retry_count, max_retries,
                    created_at, scheduled_at, started_at, completed_at, worker_id, error_message
             FROM celers_tasks
@@ -748,34 +812,53 @@ impl PostgresBroker {
             ORDER BY RANDOM()
             LIMIT $3
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(state.to_string())
-        .bind(sample_size)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to sample tasks: {}", e)))?;
+                &[&self.queue_name, &state_param, &sample_size],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to sample tasks: {}", e)))?;
 
-        let tasks: Vec<TaskInfo> = rows
-            .iter()
-            .map(|row| TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in &rows {
+            tasks.push(TaskInfo {
+                id: uuid_from_row(row, "id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
                 state: row
-                    .get::<String, _>("state")
+                    .col::<String>("state")
+                    .map_err(|e| CelersError::Other(format!("Failed to read state: {}", e)))?
                     .parse()
                     .unwrap_or(DbTaskState::Pending),
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
-            })
-            .collect();
+                priority: row
+                    .col("priority")
+                    .map_err(|e| CelersError::Other(format!("Failed to read priority: {}", e)))?,
+                retry_count: row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to read retry_count: {}", e))
+                })?,
+                max_retries: row.col("max_retries").map_err(|e| {
+                    CelersError::Other(format!("Failed to read max_retries: {}", e))
+                })?,
+                created_at: row
+                    .col("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read created_at: {}", e)))?,
+                scheduled_at: row.col("scheduled_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to read scheduled_at: {}", e))
+                })?,
+                started_at: row
+                    .col("started_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read started_at: {}", e)))?,
+                completed_at: row.col("completed_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to read completed_at: {}", e))
+                })?,
+                worker_id: row
+                    .col("worker_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read worker_id: {}", e)))?,
+                error_message: row.col("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to read error_message: {}", e))
+                })?,
+            });
+        }
 
         Ok(tasks)
     }
@@ -806,8 +889,10 @@ impl PostgresBroker {
         key: &str,
         limit: i64,
     ) -> Result<Vec<(Option<String>, i64)>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 metadata->$2 as value,
                 COUNT(*) as count
@@ -819,23 +904,29 @@ impl PostgresBroker {
             ORDER BY count DESC
             LIMIT $3
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(key)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to aggregate metadata: {}", e)))?;
+                &[&self.queue_name, &key, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to aggregate metadata: {}", e)))?;
 
-        let aggregated = rows
-            .iter()
-            .map(|row| {
-                let value: Option<serde_json::Value> = row.get("value");
-                let value_str = value.map(|v| v.to_string().trim_matches('"').to_string());
-                let count: i64 = row.get("count");
-                (value_str, count)
-            })
-            .collect();
+        let mut aggregated = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // `value` is a JSONB expression result (`metadata->$2`), read via
+            // `json_from_row` (row_ext.rs) and stringified/quote-trimmed
+            // exactly as the original `Option<serde_json::Value>` ->
+            // `.to_string().trim_matches('"')` did.
+            let value = crate::row_ext::json_from_row(row, "value")
+                .map_err(|e| CelersError::Other(format!("Failed to read value: {}", e)))?;
+            let value_str = if value.is_null() {
+                None
+            } else {
+                Some(value.to_string().trim_matches('"').to_string())
+            };
+            let count: i64 = row
+                .col("count")
+                .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
+            aggregated.push((value_str, count));
+        }
 
         Ok(aggregated)
     }
@@ -880,18 +971,18 @@ impl PostgresBroker {
         });
 
         // Store in metadata of a special marker task
-        sqlx::query(
-            r#"
+        let baseline_data_param = json_param(&baseline_data);
+        self.conn
+            .execute(
+                r#"
             INSERT INTO celers_tasks
                 (task_name, payload, queue_name, state, metadata)
             VALUES ('__baseline__', '[]'::jsonb, $1, 'completed', $2)
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(baseline_data)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to store baseline: {}", e)))?;
+                &[&self.queue_name, &baseline_data_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to store baseline: {}", e)))?;
 
         tracing::info!(
             baseline = baseline_name,
@@ -928,8 +1019,10 @@ impl PostgresBroker {
         baseline_name: &str,
     ) -> Result<Option<std::collections::HashMap<String, f64>>> {
         // Fetch baseline
-        let baseline_row = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT metadata
             FROM celers_tasks
             WHERE queue_name = $1
@@ -938,20 +1031,18 @@ impl PostgresBroker {
             ORDER BY created_at DESC
             LIMIT 1
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(baseline_name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch baseline: {}", e)))?;
+                &[&self.queue_name, &baseline_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch baseline: {}", e)))?;
 
-        if baseline_row.is_none() {
-            return Ok(None);
-        }
+        let baseline_row = match rows.into_iter().next() {
+            Some(row) => row,
+            None => return Ok(None),
+        };
 
-        let baseline_meta: serde_json::Value = baseline_row
-            .expect("baseline row checked to be Some")
-            .get("metadata");
+        let baseline_meta = crate::row_ext::json_from_row(&baseline_row, "metadata")
+            .map_err(|e| CelersError::Other(format!("Failed to read metadata: {}", e)))?;
 
         // Get current metrics
         let current_stats = self.get_statistics().await?;
@@ -1002,20 +1093,27 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_distinct_task_names(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT DISTINCT task_name
             FROM celers_tasks
             WHERE queue_name = $1
             ORDER BY task_name
             "#,
-        )
-        .bind(&self.queue_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get distinct task names: {}", e)))?;
+                &[&self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get distinct task names: {}", e)))?;
 
-        let task_names = rows.iter().map(|row| row.get("task_name")).collect();
+        let mut task_names = Vec::with_capacity(rows.len());
+        for row in &rows {
+            task_names.push(
+                row.col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
+            );
+        }
 
         Ok(task_names)
     }
@@ -1044,8 +1142,10 @@ impl PostgresBroker {
         &self,
         limit: i64,
     ) -> Result<Vec<(String, i64, i64, i64, i64)>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 task_name,
                 COUNT(*) FILTER (WHERE state = 'pending') as pending,
@@ -1058,24 +1158,30 @@ impl PostgresBroker {
             ORDER BY COUNT(*) DESC
             LIMIT $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task breakdown: {}", e)))?;
+                &[&self.queue_name, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get task breakdown: {}", e)))?;
 
-        let breakdown = rows
-            .iter()
-            .map(|row| {
-                let task_name: String = row.get("task_name");
-                let pending: i64 = row.get("pending");
-                let processing: i64 = row.get("processing");
-                let completed: i64 = row.get("completed");
-                let failed: i64 = row.get("failed");
-                (task_name, pending, processing, completed, failed)
-            })
-            .collect();
+        let mut breakdown = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let pending: i64 = row
+                .col("pending")
+                .map_err(|e| CelersError::Other(format!("Failed to read pending: {}", e)))?;
+            let processing: i64 = row
+                .col("processing")
+                .map_err(|e| CelersError::Other(format!("Failed to read processing: {}", e)))?;
+            let completed: i64 = row
+                .col("completed")
+                .map_err(|e| CelersError::Other(format!("Failed to read completed: {}", e)))?;
+            let failed: i64 = row
+                .col("failed")
+                .map_err(|e| CelersError::Other(format!("Failed to read failed: {}", e)))?;
+            breakdown.push((task_name, pending, processing, completed, failed));
+        }
 
         Ok(breakdown)
     }
@@ -1119,79 +1225,80 @@ impl PostgresBroker {
         hours: i64,
         limit: i64,
     ) -> Result<Vec<(Uuid, String, String, String, DateTime<Utc>, Option<i64>)>> {
-        let query = if task_id.is_some() {
-            r#"
-            SELECT
-                id,
-                task_name,
-                COALESCE(LAG(state) OVER (PARTITION BY id ORDER BY updated_at), 'created') as from_state,
-                state as to_state,
-                updated_at,
-                EXTRACT(EPOCH FROM (updated_at - LAG(updated_at) OVER (PARTITION BY id ORDER BY updated_at))) * 1000 as duration_ms
-            FROM celers_tasks
-            WHERE queue_name = $1
-              AND id = $2
-              AND updated_at >= NOW() - INTERVAL '1 hour' * $3
-            ORDER BY updated_at DESC
-            LIMIT $4
-            "#
-        } else {
-            r#"
-            SELECT
-                id,
-                task_name,
-                COALESCE(LAG(state) OVER (PARTITION BY id ORDER BY updated_at), 'created') as from_state,
-                state as to_state,
-                updated_at,
-                EXTRACT(EPOCH FROM (updated_at - LAG(updated_at) OVER (PARTITION BY id ORDER BY updated_at))) * 1000 as duration_ms
-            FROM celers_tasks
-            WHERE queue_name = $1
-              AND updated_at >= NOW() - INTERVAL '1 hour' * $2
-            ORDER BY updated_at DESC
-            LIMIT $3
-            "#
-        };
-
         let rows = if let Some(tid) = task_id {
-            sqlx::query(query)
-                .bind(&self.queue_name)
-                .bind(tid)
-                .bind(hours)
-                .bind(limit)
-                .fetch_all(&self.pool)
+            let tid_param = uuid_param(&tid);
+            self.conn
+                .query(
+                    r#"
+                SELECT
+                    id,
+                    task_name,
+                    COALESCE(LAG(state) OVER (PARTITION BY id ORDER BY updated_at), 'created') as from_state,
+                    state as to_state,
+                    updated_at,
+                    EXTRACT(EPOCH FROM (updated_at - LAG(updated_at) OVER (PARTITION BY id ORDER BY updated_at))) * 1000 as duration_ms
+                FROM celers_tasks
+                WHERE queue_name = $1
+                  AND id = $2
+                  AND updated_at >= NOW() - INTERVAL '1 hour' * $3
+                ORDER BY updated_at DESC
+                LIMIT $4
+                "#,
+                    &[&self.queue_name, &tid_param, &hours, &limit],
+                )
                 .await
         } else {
-            sqlx::query(query)
-                .bind(&self.queue_name)
-                .bind(hours)
-                .bind(limit)
-                .fetch_all(&self.pool)
+            self.conn
+                .query(
+                    r#"
+                SELECT
+                    id,
+                    task_name,
+                    COALESCE(LAG(state) OVER (PARTITION BY id ORDER BY updated_at), 'created') as from_state,
+                    state as to_state,
+                    updated_at,
+                    EXTRACT(EPOCH FROM (updated_at - LAG(updated_at) OVER (PARTITION BY id ORDER BY updated_at))) * 1000 as duration_ms
+                FROM celers_tasks
+                WHERE queue_name = $1
+                  AND updated_at >= NOW() - INTERVAL '1 hour' * $2
+                ORDER BY updated_at DESC
+                LIMIT $3
+                "#,
+                    &[&self.queue_name, &hours, &limit],
+                )
                 .await
         }
         .map_err(|e| {
             CelersError::Other(format!("Failed to get state transition history: {}", e))
         })?;
 
-        let transitions = rows
-            .iter()
-            .map(|row| {
-                let id: Uuid = row.get("id");
-                let task_name: String = row.get("task_name");
-                let from_state: String = row.get("from_state");
-                let to_state: String = row.get("to_state");
-                let transition_time: DateTime<Utc> = row.get("updated_at");
-                let duration_ms: Option<f64> = row.try_get("duration_ms").ok();
-                let duration_ms = duration_ms.map(|d| d as i64);
-                (
-                    id,
-                    task_name,
-                    from_state,
-                    to_state,
-                    transition_time,
-                    duration_ms,
-                )
-            })
-            .collect();
+        let mut transitions = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: Uuid = uuid_from_row(row, "id")
+                .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?;
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let from_state: String = row
+                .col("from_state")
+                .map_err(|e| CelersError::Other(format!("Failed to read from_state: {}", e)))?;
+            let to_state: String = row
+                .col("to_state")
+                .map_err(|e| CelersError::Other(format!("Failed to read to_state: {}", e)))?;
+            let transition_time: DateTime<Utc> = row
+                .col("updated_at")
+                .map_err(|e| CelersError::Other(format!("Failed to read updated_at: {}", e)))?;
+            let duration_ms: Option<f64> = row.col("duration_ms").ok();
+            let duration_ms = duration_ms.map(|d| d as i64);
+            transitions.push((
+                id,
+                task_name,
+                from_state,
+                to_state,
+                transition_time,
+                duration_ms,
+            ));
+        }
 
         Ok(transitions)
     }
@@ -1223,8 +1330,11 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_task_lifecycle(&self, task_id: &Uuid) -> Result<Option<TaskLifecycle>> {
-        let row = sqlx::query(
-            r#"
+        let task_id_param = uuid_param(task_id);
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 id,
                 task_name,
@@ -1240,32 +1350,38 @@ impl PostgresBroker {
             FROM celers_tasks
             WHERE queue_name = $1 AND id = $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task lifecycle: {}", e)))?;
+                &[&self.queue_name, &task_id_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get task lifecycle: {}", e)))?;
 
-        if let Some(row) = row {
+        if let Some(row) = rows.into_iter().next() {
             let lifecycle = TaskLifecycle {
-                task_id: row.get("id"),
-                task_name: row.get("task_name"),
-                current_state: row.get::<String, _>("state"),
-                created_at: row.get("created_at"),
-                started_at: row.try_get("started_at").ok(),
-                completed_at: row.try_get("completed_at").ok(),
-                retry_count: row.get("retry_count"),
-                total_lifetime_secs: row.get::<f64, _>("total_lifetime_secs") as i64,
-                time_pending_secs: row
-                    .try_get::<f64, _>("time_pending_secs")
-                    .ok()
-                    .map(|v| v as i64),
+                task_id: uuid_from_row(&row, "id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
+                current_state: row
+                    .col::<String>("state")
+                    .map_err(|e| CelersError::Other(format!("Failed to read state: {}", e)))?,
+                created_at: row
+                    .col("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read created_at: {}", e)))?,
+                started_at: row.col("started_at").ok(),
+                completed_at: row.col("completed_at").ok(),
+                retry_count: row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to read retry_count: {}", e))
+                })?,
+                total_lifetime_secs: row.col::<f64>("total_lifetime_secs").map_err(|e| {
+                    CelersError::Other(format!("Failed to read total_lifetime_secs: {}", e))
+                })? as i64,
+                time_pending_secs: row.col::<f64>("time_pending_secs").ok().map(|v| v as i64),
                 time_processing_secs: row
-                    .try_get::<f64, _>("time_processing_secs")
+                    .col::<f64>("time_processing_secs")
                     .ok()
                     .map(|v| v as i64),
-                error_message: row.try_get("error_message").ok(),
+                error_message: row.col("error_message").ok(),
             };
             Ok(Some(lifecycle))
         } else {
@@ -1346,26 +1462,29 @@ impl PostgresBroker {
             }
         };
 
-        let rows = sqlx::query(query)
-            .bind(&self.queue_name)
-            .bind(threshold_secs)
-            .bind(limit)
-            .fetch_all(&self.pool)
+        let rows = self
+            .conn
+            .query(query, &[&self.queue_name, &threshold_secs, &limit])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to detect abnormal state duration: {}", e))
             })?;
 
-        let tasks = rows
-            .iter()
-            .map(|row| {
-                let id: Uuid = row.get("id");
-                let task_name: String = row.get("task_name");
-                let duration_secs: i64 = row.get("duration_secs");
-                let retry_count: i32 = row.get("retry_count");
-                (id, task_name, duration_secs, retry_count)
-            })
-            .collect();
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: Uuid = uuid_from_row(row, "id")
+                .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?;
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let duration_secs: i64 = row
+                .col("duration_secs")
+                .map_err(|e| CelersError::Other(format!("Failed to read duration_secs: {}", e)))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| CelersError::Other(format!("Failed to read retry_count: {}", e)))?;
+            tasks.push((id, task_name, duration_secs, retry_count));
+        }
 
         Ok(tasks)
     }
@@ -1393,8 +1512,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_state_transition_stats(&self, hours: i64) -> Result<StateTransitionStats> {
-        let row = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             WITH recent_tasks AS (
                 SELECT *
                 FROM celers_tasks
@@ -1412,21 +1533,40 @@ impl PostgresBroker {
                 COUNT(*) FILTER (WHERE state = 'cancelled') as cancelled_count
             FROM recent_tasks
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(hours)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get state transition stats: {}", e)))?;
+                &[&self.queue_name, &hours],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get state transition stats: {}", e)))?;
 
-        let avg_time_pending_secs: Option<f64> = row.try_get("avg_time_pending_secs").ok();
-        let avg_time_processing_secs: Option<f64> = row.try_get("avg_time_processing_secs").ok();
-        let total_finished: i64 = row.get("total_finished");
-        let completed_count: i64 = row.get("completed_count");
-        let failed_count: i64 = row.get("failed_count");
-        let pending_to_processing_count: i64 = row.get("pending_to_processing_count");
-        let processing_to_completed_count: i64 = row.get("processing_to_completed_count");
-        let cancelled_count: i64 = row.get("cancelled_count");
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get state transition stats: no rows returned".to_string())
+        })?;
+
+        let avg_time_pending_secs: Option<f64> = row.col("avg_time_pending_secs").ok();
+        let avg_time_processing_secs: Option<f64> = row.col("avg_time_processing_secs").ok();
+        let total_finished: i64 = row
+            .col("total_finished")
+            .map_err(|e| CelersError::Other(format!("Failed to read total_finished: {}", e)))?;
+        let completed_count: i64 = row
+            .col("completed_count")
+            .map_err(|e| CelersError::Other(format!("Failed to read completed_count: {}", e)))?;
+        let failed_count: i64 = row
+            .col("failed_count")
+            .map_err(|e| CelersError::Other(format!("Failed to read failed_count: {}", e)))?;
+        let pending_to_processing_count: i64 =
+            row.col("pending_to_processing_count").map_err(|e| {
+                CelersError::Other(format!("Failed to read pending_to_processing_count: {}", e))
+            })?;
+        let processing_to_completed_count: i64 =
+            row.col("processing_to_completed_count").map_err(|e| {
+                CelersError::Other(format!(
+                    "Failed to read processing_to_completed_count: {}",
+                    e
+                ))
+            })?;
+        let cancelled_count: i64 = row
+            .col("cancelled_count")
+            .map_err(|e| CelersError::Other(format!("Failed to read cancelled_count: {}", e)))?;
 
         let success_rate = if total_finished > 0 {
             completed_count as f64 / total_finished as f64
@@ -1479,23 +1619,24 @@ impl PostgresBroker {
         age_threshold_secs: i64,
         priority_increment: i32,
     ) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET priority = priority + $3
             WHERE queue_name = $1
               AND state = 'pending'
               AND EXTRACT(EPOCH FROM (NOW() - created_at)) > $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(age_threshold_secs)
-        .bind(priority_increment)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to auto-adjust priority by age: {}", e)))?;
+                &[&self.queue_name, &age_threshold_secs, &priority_increment],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to auto-adjust priority by age: {}", e))
+            })?;
 
-        let count = result.rows_affected() as i64;
+        let count = rows_affected as i64;
         tracing::info!(
             count = count,
             age_threshold_secs = age_threshold_secs,
@@ -1539,25 +1680,24 @@ impl PostgresBroker {
         retry_threshold: i32,
         priority_increment: i32,
     ) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET priority = priority + $3
             WHERE queue_name = $1
               AND state IN ('pending', 'processing')
               AND retry_count >= $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(retry_threshold)
-        .bind(priority_increment)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            CelersError::Other(format!("Failed to auto-adjust priority by retries: {}", e))
-        })?;
+                &[&self.queue_name, &retry_threshold, &priority_increment],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to auto-adjust priority by retries: {}", e))
+            })?;
 
-        let count = result.rows_affected() as i64;
+        let count = rows_affected as i64;
         tracing::info!(
             count = count,
             retry_threshold = retry_threshold,
@@ -1630,25 +1770,24 @@ impl PostgresBroker {
 
         // Apply task type-specific priority boosts
         for (task_name, priority_boost) in &strategy.task_type_boosts {
-            let result = sqlx::query(
-                r#"
+            let rows_affected = self
+                .conn
+                .execute(
+                    r#"
                 UPDATE celers_tasks
                 SET priority = priority + $3
                 WHERE queue_name = $1
                   AND task_name = $2
                   AND state = 'pending'
                 "#,
-            )
-            .bind(&self.queue_name)
-            .bind(task_name)
-            .bind(priority_boost)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
-                CelersError::Other(format!("Failed to apply task type priority boost: {}", e))
-            })?;
+                    &[&self.queue_name, task_name, priority_boost],
+                )
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to apply task type priority boost: {}", e))
+                })?;
 
-            type_adjusted_count += result.rows_affected() as i64;
+            type_adjusted_count += rows_affected as i64;
         }
 
         tracing::info!(

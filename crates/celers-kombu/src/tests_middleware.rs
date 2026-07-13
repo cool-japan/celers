@@ -338,7 +338,7 @@ async fn test_deadline_middleware_sets_deadline() {
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime should be after UNIX_EPOCH")
         .as_secs();
 
     // Deadline should be in the future
@@ -359,7 +359,7 @@ async fn test_deadline_middleware_detects_exceeded() {
     // Set a deadline in the past
     let past_deadline = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime should be after UNIX_EPOCH")
         .as_secs()
         - 10;
 
@@ -834,7 +834,7 @@ fn test_priority_boost_middleware_age_boost() {
     // Message with old timestamp (600 seconds ago)
     let old_timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime should be after UNIX_EPOCH")
         .as_secs_f64()
         - 600.0;
 
@@ -1347,5 +1347,357 @@ async fn test_message_enrichment_middleware_custom_metadata() {
     assert_eq!(
         msg.headers.extra.get("x-enrichment-datacenter").unwrap(),
         &serde_json::json!("dc-01")
+    );
+}
+
+// =============================================================================
+// CompressionMiddleware round-trip tests (feature = "compression")
+// =============================================================================
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_compression_middleware_round_trip_restores_body() {
+    use celers_protocol::compression::CompressionType;
+
+    let middleware = CompressionMiddleware::new(CompressionType::Gzip).with_min_size(16);
+
+    // Highly compressible payload above the min-size threshold.
+    let original = b"compress me ".repeat(64);
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), original.clone());
+
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    // Body must have been compressed (smaller) and the encoding header set.
+    assert!(msg.body.len() < original.len());
+    assert_eq!(
+        msg.headers.extra.get("content-encoding"),
+        Some(&serde_json::Value::String("gzip".to_string()))
+    );
+
+    // Consuming must restore the exact original body and clean up the header.
+    middleware.after_consume(&mut msg).await.unwrap();
+    assert_eq!(msg.body, original);
+    assert!(!msg.headers.extra.contains_key("content-encoding"));
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_compression_middleware_skips_small_body() {
+    use celers_protocol::compression::CompressionType;
+
+    let middleware = CompressionMiddleware::new(CompressionType::Gzip).with_min_size(1024);
+
+    let original = b"tiny".to_vec();
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), original.clone());
+
+    middleware.before_publish(&mut msg).await.unwrap();
+    // Below threshold: no compression, no header.
+    assert_eq!(msg.body, original);
+    assert!(!msg.headers.extra.contains_key("content-encoding"));
+
+    // after_consume leaves an uncompressed body untouched.
+    middleware.after_consume(&mut msg).await.unwrap();
+    assert_eq!(msg.body, original);
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_compression_middleware_after_consume_no_header_is_noop() {
+    use celers_protocol::compression::CompressionType;
+
+    let middleware = CompressionMiddleware::new(CompressionType::Gzip);
+
+    let original = b"plain body that was never compressed".to_vec();
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), original.clone());
+
+    // No compression header present -> body must be left exactly as-is.
+    middleware.after_consume(&mut msg).await.unwrap();
+    assert_eq!(msg.body, original);
+}
+
+// =============================================================================
+// SigningMiddleware round-trip tests (feature = "signing")
+// =============================================================================
+
+#[cfg(feature = "signing")]
+#[tokio::test]
+async fn test_signing_middleware_round_trip_verifies() {
+    let middleware = SigningMiddleware::new(b"super-secret-key-for-tests");
+
+    let mut msg = Message::new(
+        "test".to_string(),
+        Uuid::new_v4(),
+        b"authentic payload".to_vec(),
+    );
+
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    // A signature header must be present after publishing.
+    assert!(msg.headers.extra.contains_key("signature"));
+
+    // Verification succeeds and the signature header is removed.
+    middleware.after_consume(&mut msg).await.unwrap();
+    assert!(!msg.headers.extra.contains_key("signature"));
+}
+
+#[cfg(feature = "signing")]
+#[tokio::test]
+async fn test_signing_middleware_tampered_body_fails() {
+    let middleware = SigningMiddleware::new(b"super-secret-key-for-tests");
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"original".to_vec());
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    // Tamper with the body after signing.
+    msg.body = b"tampered".to_vec();
+
+    // Verification must fail for a tampered body.
+    assert!(middleware.after_consume(&mut msg).await.is_err());
+}
+
+#[cfg(feature = "signing")]
+#[tokio::test]
+async fn test_signing_middleware_missing_signature_fails() {
+    let middleware = SigningMiddleware::new(b"super-secret-key-for-tests");
+
+    // No before_publish -> no signature header present.
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"unsigned".to_vec());
+
+    assert!(middleware.after_consume(&mut msg).await.is_err());
+}
+
+#[cfg(feature = "signing")]
+#[tokio::test]
+async fn test_signing_middleware_wrong_key_fails() {
+    let signer = SigningMiddleware::new(b"key-used-to-sign");
+    let verifier = SigningMiddleware::new(b"different-key-to-verify");
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"payload".to_vec());
+    signer.before_publish(&mut msg).await.unwrap();
+
+    // A different key must reject the otherwise-valid signature.
+    assert!(verifier.after_consume(&mut msg).await.is_err());
+}
+
+// =============================================================================
+// EncryptionMiddleware round-trip tests (feature = "encryption")
+// =============================================================================
+
+#[cfg(feature = "encryption")]
+const TEST_ENCRYPTION_KEY: &[u8] = b"32-byte-secret-key-for-aes-256!!";
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_round_trip_restores_body() {
+    let middleware = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+
+    let original = b"top secret task payload".to_vec();
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), original.clone());
+
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    // Body must be ciphertext (different from the plaintext) and the scheme +
+    // nonce markers must be recorded in the headers.
+    assert_ne!(msg.body, original);
+    assert_eq!(
+        msg.headers.extra.get("content-encryption"),
+        Some(&serde_json::Value::String("aes-256-gcm".to_string()))
+    );
+    assert!(msg.headers.extra.contains_key("content-encryption-nonce"));
+
+    // Consuming must restore the exact original body and clear both markers.
+    middleware.after_consume(&mut msg).await.unwrap();
+    assert_eq!(msg.body, original);
+    assert!(!msg.headers.extra.contains_key("content-encryption"));
+    assert!(!msg.headers.extra.contains_key("content-encryption-nonce"));
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_empty_body_round_trip() {
+    let middleware = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), Vec::new());
+
+    middleware.before_publish(&mut msg).await.unwrap();
+    // Even an empty plaintext yields a non-empty ciphertext (the GCM tag).
+    assert!(!msg.body.is_empty());
+
+    middleware.after_consume(&mut msg).await.unwrap();
+    assert!(msg.body.is_empty());
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_after_consume_no_header_is_noop() {
+    let middleware = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+
+    let original = b"plain body that was never encrypted".to_vec();
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), original.clone());
+
+    // No encryption header present -> body must be left exactly as-is.
+    middleware.after_consume(&mut msg).await.unwrap();
+    assert_eq!(msg.body, original);
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_wrong_key_fails() {
+    let encryptor = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+    let decryptor = EncryptionMiddleware::new(b"another-32-byte-key-for-aes256!!").unwrap();
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"confidential".to_vec());
+    encryptor.before_publish(&mut msg).await.unwrap();
+
+    // A different key must fail the AEAD tag check, not return plaintext.
+    assert!(decryptor.after_consume(&mut msg).await.is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_tampered_ciphertext_fails() {
+    let middleware = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"payload".to_vec());
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    // Flip a bit in the ciphertext; the GCM tag check must reject it.
+    assert!(!msg.body.is_empty());
+    msg.body[0] ^= 0x01;
+
+    assert!(middleware.after_consume(&mut msg).await.is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_missing_nonce_fails() {
+    let middleware = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"payload".to_vec());
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    // Drop the nonce header while keeping the scheme marker: an encrypted body
+    // without its nonce is malformed and must be rejected.
+    msg.headers.extra.remove("content-encryption-nonce");
+
+    assert!(middleware.after_consume(&mut msg).await.is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_tampered_nonce_fails() {
+    let middleware = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"payload".to_vec());
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    // Replace the nonce with a valid-length but wrong nonce; decryption must
+    // fail the authentication tag check.
+    msg.headers.extra.insert(
+        "content-encryption-nonce".to_string(),
+        serde_json::Value::String(hex::encode([0u8; 12])),
+    );
+
+    assert!(middleware.after_consume(&mut msg).await.is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_unsupported_scheme_fails() {
+    let middleware = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), b"payload".to_vec());
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    // An unknown scheme name must be rejected rather than silently ignored.
+    msg.headers.extra.insert(
+        "content-encryption".to_string(),
+        serde_json::Value::String("rot13".to_string()),
+    );
+
+    assert!(middleware.after_consume(&mut msg).await.is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn test_encryption_middleware_invalid_key_length() {
+    // A key that is not 32 bytes must be rejected at construction time.
+    assert!(EncryptionMiddleware::new(b"too-short").is_err());
+    assert!(EncryptionMiddleware::new(b"this-key-is-far-too-long-for-aes-256-gcm-usage").is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_through_chain() {
+    use crate::MiddlewareChain;
+
+    let original = b"chain payload".to_vec();
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), original.clone());
+
+    let publish_chain = MiddlewareChain::new().with_middleware(Box::new(
+        EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap(),
+    ));
+    publish_chain
+        .process_before_publish(&mut msg)
+        .await
+        .unwrap();
+    assert_ne!(msg.body, original);
+
+    let consume_chain = MiddlewareChain::new().with_middleware(Box::new(
+        EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap(),
+    ));
+    consume_chain.process_after_consume(&mut msg).await.unwrap();
+    assert_eq!(msg.body, original);
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_encryption_middleware_nonce_is_per_message() {
+    let middleware = EncryptionMiddleware::new(TEST_ENCRYPTION_KEY).unwrap();
+
+    let payload = b"same payload".to_vec();
+    let mut msg1 = Message::new("test".to_string(), Uuid::new_v4(), payload.clone());
+    let mut msg2 = Message::new("test".to_string(), Uuid::new_v4(), payload.clone());
+
+    middleware.before_publish(&mut msg1).await.unwrap();
+    middleware.before_publish(&mut msg2).await.unwrap();
+
+    // Distinct nonces (and therefore distinct ciphertexts) per message.
+    assert_ne!(
+        msg1.headers.extra.get("content-encryption-nonce"),
+        msg2.headers.extra.get("content-encryption-nonce")
+    );
+    assert_ne!(msg1.body, msg2.body);
+}
+
+// =============================================================================
+// HealthCheckMiddleware header-injection tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_health_check_middleware_injects_status() {
+    let middleware = HealthCheckMiddleware::new();
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), vec![]);
+
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    assert_eq!(
+        msg.headers.extra.get("x-health-status"),
+        Some(&serde_json::json!("healthy"))
+    );
+    assert!(msg.headers.extra.contains_key("x-health-checked-at"));
+}
+
+#[tokio::test]
+async fn test_health_check_middleware_reflects_unhealthy() {
+    let middleware = HealthCheckMiddleware::new();
+    middleware.mark_unhealthy();
+
+    let mut msg = Message::new("test".to_string(), Uuid::new_v4(), vec![]);
+    middleware.before_publish(&mut msg).await.unwrap();
+
+    assert_eq!(
+        msg.headers.extra.get("x-health-status"),
+        Some(&serde_json::json!("unhealthy"))
     );
 }

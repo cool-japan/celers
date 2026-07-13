@@ -133,7 +133,7 @@ impl DlqStats {
         self.oldest_message_time.map(|ts| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs()
                 .saturating_sub(ts)
         })

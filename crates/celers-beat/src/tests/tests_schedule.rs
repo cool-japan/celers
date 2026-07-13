@@ -3,7 +3,7 @@
 use crate::*;
 #[cfg(feature = "cron")]
 use chrono::Timelike;
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
@@ -850,6 +850,77 @@ fn test_scheduled_task_with_jitter_serialization() {
     let j = deserialized.jitter.unwrap();
     assert_eq!(j.min_seconds, 0);
     assert_eq!(j.max_seconds, 15);
+}
+
+#[test]
+fn test_with_jitter_window_sets_symmetric_jitter() {
+    let task = ScheduledTask::new("t".to_string(), Schedule::interval(60)).with_jitter_window(45);
+    let j = task.jitter.expect("window builder sets jitter");
+    assert_eq!(j.min_seconds, -45);
+    assert_eq!(j.max_seconds, 45);
+}
+
+#[test]
+fn test_with_jitter_window_zero_is_no_op() {
+    // A zero window must leave the next-run time identical to the un-jittered
+    // entry (additive: opting out changes nothing).
+    let last_run = Utc.with_ymd_and_hms(2026, 6, 13, 0, 0, 0).unwrap();
+
+    let mut plain = ScheduledTask::new("t".to_string(), Schedule::interval(60));
+    plain.last_run_at = Some(last_run);
+
+    let mut jittered =
+        ScheduledTask::new("t".to_string(), Schedule::interval(60)).with_jitter_window(0);
+    jittered.last_run_at = Some(last_run);
+
+    assert_eq!(
+        plain.next_run_time().expect("plain"),
+        jittered.next_run_time().expect("jittered"),
+    );
+}
+
+#[test]
+fn test_with_jitter_window_is_bounded_and_deterministic() {
+    // Fixed last_run => fixed base fire time => fully deterministic jitter.
+    let last_run = Utc.with_ymd_and_hms(2026, 6, 13, 0, 0, 0).unwrap();
+    let mut task = ScheduledTask::new("herd_member".to_string(), Schedule::interval(60))
+        .with_jitter_window(30);
+    task.last_run_at = Some(last_run);
+
+    let base = last_run + Duration::seconds(60);
+    let first = task.next_run_time().expect("first");
+    let delta = (first - base).num_seconds();
+    assert!(
+        (-30..=30).contains(&delta),
+        "jittered delta {delta} outside +/-30"
+    );
+
+    // Identical across repeated calls for the same entry.
+    for _ in 0..50 {
+        assert_eq!(task.next_run_time().expect("repeat"), first);
+    }
+}
+
+#[test]
+fn test_with_jitter_window_differs_across_entries() {
+    // Different entry names at the same base fire time should not all collapse to
+    // the same jittered instant (that is the whole point of jitter).
+    let last_run = Utc.with_ymd_and_hms(2026, 6, 13, 0, 0, 0).unwrap();
+
+    let instants: HashSet<i64> = ["alpha", "beta", "gamma", "delta", "epsilon"]
+        .iter()
+        .map(|name| {
+            let mut task = ScheduledTask::new((*name).to_string(), Schedule::interval(60))
+                .with_jitter_window(600);
+            task.last_run_at = Some(last_run);
+            task.next_run_time().expect("next run").timestamp()
+        })
+        .collect();
+
+    assert!(
+        instants.len() > 1,
+        "expected distinct jittered instants across entries"
+    );
 }
 
 // ===== Catch-up Policy Tests =====

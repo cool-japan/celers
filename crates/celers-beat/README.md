@@ -1,6 +1,6 @@
 # celers-beat
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13**
 
 Periodic task scheduler for CeleRS, equivalent to Celery Beat. Schedule tasks to run at regular intervals or specific times using interval or crontab expressions.
 
@@ -45,11 +45,14 @@ Production-ready task scheduler with comprehensive features:
 
 ```toml
 [dependencies]
-celers-beat = "0.1"
-celers = { version = "0.1", features = ["redis"] }
+celers-beat = "0.3"
+celers = { version = "0.3", features = ["redis"] }
 ```
 
 ### Basic Example
+
+`add_task` takes only the `ScheduledTask` itself (the task's own `name` field is the key) and
+returns a `Result`:
 
 ```rust
 use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
@@ -68,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "send_report".to_string(),
         Schedule::interval(60)
     );
-    scheduler.add_task("report", task);
+    scheduler.add_task(task)?;
 
     // Run scheduler
     scheduler.run(&broker).await?;
@@ -105,7 +108,7 @@ Unix cron-style scheduling:
 
 ```toml
 [dependencies]
-celers-beat = { version = "0.1", features = ["cron"] }
+celers-beat = { version = "0.3", features = ["cron"] }
 ```
 
 ```rust
@@ -150,7 +153,7 @@ Execute tasks at sunrise/sunset:
 
 ```toml
 [dependencies]
-celers-beat = { version = "0.1", features = ["solar"] }
+celers-beat = { version = "0.3", features = ["solar"] }
 ```
 
 ```rust
@@ -257,16 +260,16 @@ use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
 
 let mut scheduler = BeatScheduler::new();
 
-// Add tasks
-scheduler.add_task("report", ScheduledTask::new(
+// Add tasks (the name comes from ScheduledTask::new's first argument)
+scheduler.add_task(ScheduledTask::new(
     "generate_report".to_string(),
     Schedule::interval(3600)
-));
+))?;
 
-scheduler.add_task("cleanup", ScheduledTask::new(
+scheduler.add_task(ScheduledTask::new(
     "cleanup_temp_files".to_string(),
     Schedule::interval(86400)
-));
+))?;
 
 // Run scheduler (blocks until shutdown)
 scheduler.run(&broker).await?;
@@ -276,14 +279,15 @@ scheduler.run(&broker).await?;
 
 ```rust
 // Add task
-scheduler.add_task("my_task", task);
+scheduler.add_task(task)?;
 
 // Remove task
-scheduler.remove_task("my_task");
+scheduler.remove_task("my_task")?;
 
-// Enable/disable task
-scheduler.enable_task("my_task");
-scheduler.disable_task("my_task");
+// There is no scheduler.enable_task()/disable_task(): create the task disabled
+// up front with ScheduledTask::new(...).disabled(), or remove_task() then
+// add_task() a clone with `enabled` flipped. Bulk toggling by group/tag is
+// available directly: scheduler.enable_group("reports")?; scheduler.disable_tag("cleanup")?;
 
 // Get task info
 if let Some(task) = scheduler.get_task("my_task") {
@@ -554,7 +558,7 @@ scheduler.add_task(load)?;
 scheduler.validate_dependencies()?;
 
 // Get dependency chain
-let chain = scheduler.resolve_dependency_chain("load_data")?;
+let chain = scheduler.get_dependency_chain("load_data")?;
 ```
 
 ### Schedule Locking
@@ -654,8 +658,8 @@ let reports = scheduler.get_tasks_by_group("reports");
 let daily = scheduler.get_tasks_by_tag("daily");
 
 // Bulk operations
-scheduler.enable_group("reports");
-scheduler.disable_tag("cleanup");
+scheduler.enable_group("reports")?;
+scheduler.disable_tag("cleanup")?;
 ```
 
 ### Batch Operations
@@ -953,20 +957,33 @@ loop {
 
 ### 5. Task Idempotency
 
+Beat only enqueues tasks; the worker-side `celers_core::TaskRegistry` executes them by
+registering a `Task` trait implementation (not a name + closure pair):
+
 ```rust
 // Ensure tasks are idempotent (safe to run multiple times)
-registry.register("generate_report", |args| async move {
-    let report_id = generate_unique_id();
+#[async_trait::async_trait]
+impl celers_core::Task for GenerateReportTask {
+    type Input = ();
+    type Output = String;
 
-    // Check if already generated
-    if report_exists(report_id).await? {
-        return Ok("Already generated".to_string());
+    async fn execute(&self, _input: Self::Input) -> celers_core::Result<Self::Output> {
+        let report_id = generate_unique_id();
+
+        // Check if already generated
+        if report_exists(report_id).await? {
+            return Ok("Already generated".to_string());
+        }
+
+        // Generate report
+        generate_report(report_id).await?;
+        Ok(format!("Generated report {}", report_id))
     }
 
-    // Generate report
-    generate_report(report_id).await?;
-    Ok(format!("Generated report {}", report_id))
-});
+    fn name(&self) -> &str {
+        "generate_report"
+    }
+}
 ```
 
 ## Troubleshooting
@@ -1038,7 +1055,8 @@ registry.register("generate_report", |args| async move {
 
 ## Testing
 
-**312 tests passing** (unit + doc tests across 12 focused modules)
+**501 tests passing** (425 unit/integration via `cargo nextest --all-features` + 76 doc tests;
+2 further unit tests and 2 doc tests are `ignore`d) across focused modules
 
 ## License
 

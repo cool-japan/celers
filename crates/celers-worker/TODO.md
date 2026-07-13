@@ -2,7 +2,7 @@
 
 > Worker runtime for processing CeleRS tasks
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 486**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 703 (655 unit/integration + 48 doc)**
 
 ## Status: ✅ FEATURE COMPLETE
 
@@ -222,6 +222,9 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
     - [x] Token bucket with automatic refill ✅
     - [x] Statistics tracking across workers ✅
     - [x] Example demonstrating multi-worker coordination ✅
+    - [x] Worker-side coordinator wrapping celers-core's `DistributedRateLimiter`/`DistributedRateLimitBackend`, keyed by task name/queue/global with per-key config overrides ✅
+    - [x] Pre-execution gate in the worker loop: acquire from the shared limiter before running; defer (requeue) when denied, fail-open on backend error, count via `WorkerStats::rate_limited` ✅
+    - [x] `Worker::with_rate_limit_coordinator` integration + end-to-end tests (denies past cap then allows after refill, gating execution) ✅
 - [x] Worker coordination for distributed systems ✅
   - [x] Leader election for singleton tasks ✅
   - [x] Distributed locks for exclusive execution ✅
@@ -231,9 +234,32 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
   - [x] InMemoryCoordinator for testing ✅
   - [x] Worker metadata with capabilities and load tracking ✅
   - [x] Heartbeat mechanism for worker liveness ✅
+- [x] Task affinity (worker-to-task matching) ✅
+  - [x] Flat label model: workers advertise `WorkerLabels` (e.g. `{"gpu","region:eu","mem:high"}`) ✅
+  - [x] `TaskAffinity` with REQUIRED (must all match), PREFERRED (weighted, scored), and anti-affinity (must NOT have) labels ✅
+  - [x] `can_run(worker_labels, task_affinity) -> bool` matcher (required + anti-affinity satisfied) ✅
+  - [x] `match_score(worker_labels, task_affinity) -> i64` deterministic preference score (integer weights, stable ordering) ✅
+  - [x] `AffinityRegistry` mapping task name → requirements; `decide()` -> `AffinityDecision` (NoAffinity/Admit/Defer) ✅
+  - [x] Admission check wired into the worker dequeue loop (defers/requeues unservable tasks); off by default / no-op when unconfigured ✅
+  - [x] `WorkerConfig::worker_labels` + builder method and `Worker::with_affinity` integration ✅
 
 ### Performance
 - [x] Batch task processing ✅
+- [x] Adaptive polling intervals ✅
+  - [x] Deterministic poll-interval controller (`adaptive_poll::AdaptivePoll`) — clock-free decision math ✅
+  - [x] Back off (grow interval, bounded by max) on consecutive empty/error polls ✅
+  - [x] Speed up (shrink toward min) on hits; snap straight to min when queue depth is high ✅
+  - [x] Integer rational back-off factor (`numerator/denominator`) for cross-platform determinism ✅
+  - [x] `empty_streak_before_backoff` threshold to ignore short idle blips ✅
+  - [x] `WorkerConfig::enable_adaptive_poll` / `adaptive_poll_config` + builder methods ✅
+  - [x] Wired into the worker dequeue/poll loop (empty and error branches) ✅
+- [x] Task batching & coalescing ✅
+  - [x] Pure, generic `batching::BatchAccumulator<T, K, F>` — flush on size (exact N) or deadline ✅
+  - [x] Deterministic deadline check (`deadline_reached(elapsed)`); caller owns the clock ✅
+  - [x] Coalesce duplicate coalescing-keys within the window (KeepFirst / KeepLast) ✅
+  - [x] One-shot `batching::coalesce()` helper + `broker_message_coalesce_key()` (name + payload hash) ✅
+  - [x] `WorkerConfig::enable_coalescing` / `coalescing_config` + builder methods ✅
+  - [x] Wired into the loop: dequeued-batch duplicates dropped and acked (no redelivery) ✅
 - [x] Task prefetching to reduce latency ✅
   - [x] Configurable prefetch count ✅
   - [x] Adaptive prefetching based on processing speed ✅
@@ -300,6 +326,14 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
   - [x] Restart strategies (Always, Never, Exponential/Linear Backoff) ✅
   - [x] Maximum restart limits and time windows ✅
   - [x] Restart statistics tracking ✅
+- [x] Self-healing worker restarts (SelfHealingSupervisor) ✅
+  - [x] RestartTrigger taxonomy (Panic, MemoryExceeded, MissedHeartbeat, Unhealthy, Manual) with severity mapping ✅
+  - [x] SupervisorState machine (Healthy → Restarting/BackingOff → Terminal) ✅
+  - [x] Exponential/linear backoff sequence driven by attempt count ✅
+  - [x] Max-restart circuit breaker that opens after N restarts within a window ✅
+  - [x] Terminal (give-up) state surfaced via RestartDecision::GiveUp and SupervisorStats ✅
+  - [x] confirm_restart / on_recovered / reset lifecycle hooks ✅
+  - [x] Per-trigger restart breakdown in statistics ✅
 - [x] Task-level timeout with cleanup hooks ✅
   - [x] TimeoutManager with per-task timeout tracking ✅
   - [x] Cleanup hooks for resource cleanup ✅
@@ -337,12 +371,24 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
   - [x] Jitter support ✅
   - [x] RetryConfig with validation ✅
 - [x] DLQ integration for poison messages ✅
+- [x] Poison-pill detection & quarantine (PoisonPillDetector) ✅
+  - [x] Per-task-id failure / redelivery counters with configurable threshold ✅
+  - [x] record_failure / record_redelivery / record_success / is_poison API ✅
+  - [x] Quarantine holding set with ordered listing and drain-to-DLQ support ✅
+  - [x] Optional decay / reset window so sporadic failures do not accumulate ✅
+  - [x] Optional bounded quarantine set with oldest-first eviction ✅
+  - [x] Release and statistics (tracked, quarantined, cumulative counters) ✅
 
 ### Task Execution
 - [x] Task cancellation during execution ✅
   - [x] Cancellation tokens/contexts ✅
   - [x] Cooperative cancellation checkpoints ✅
   - [x] Forced termination for unresponsive tasks ✅
+  - [x] Cancellation token threaded into the execution context (task-local) so running tasks can call `is_cancelled()`/`check_cancelled()` ✅
+  - [x] Notification-based `CancellationToken::cancelled()` (no busy polling) for `tokio::select!` racing ✅
+  - [x] RevocationWatcher subscribes to the broker's revocation Pub/Sub and trips the matching in-flight task's token ✅
+  - [x] Execution loop races the task future against cancellation; revoked tasks transition to Revoked (acked, not retried) and increment `WorkerStats::revoked` ✅
+  - [x] `Worker::with_revocation_watcher` integration + end-to-end tests (running task revoked; unrelated id is a no-op) ✅
 - [x] Task dependencies and execution ordering ✅
   - [x] DependencyGraph for managing task dependencies ✅
   - [x] Dependency status tracking (Ready, Waiting, Blocked, Running, Completed, Failed) ✅
@@ -456,6 +502,9 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
 - [x] Queue monitoring tests (13 tests)
 - [x] Performance metrics tests (9 tests)
 - [x] Prefetch tests (10 tests)
+- [x] Adaptive poll tests (16 tests) ✅
+- [x] Batching & coalescing tests (17 tests) ✅
+- [x] Adaptive-poll / coalescing loop integration tests (2 tests) ✅
 - [x] DLQ tests (19 tests) ✅
 - [x] Routing tests (18 tests) ✅
 - [x] Retry strategy tests (12 tests) ✅
@@ -468,6 +517,8 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
 - [x] Task timeout tests (15 tests) ✅
 - [x] Memory leak detection tests (10 tests) ✅
 - [x] Restart manager tests (15 tests) ✅
+- [x] Self-healing supervisor tests (13 tests) ✅
+- [x] Poison-pill detection & quarantine tests (20 tests) ✅
 - [x] Scheduler tests (21 tests) ✅
   - [x] Multi-level queue tests (3 tests) ✅
   - [x] Priority inheritance tests (4 tests) ✅
@@ -494,7 +545,38 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
   - Long-running worker, allocation cycles, queue overflow tests
   - Connection pool exhaustion, cascading failures, fragmentation tests
 
-**Total Tests**: 486 passing (unit + doc + integration + load tests)
+**Total Tests**: 703 passing (655 unit/integration via `cargo nextest --all-features` + 48 doc tests;
+6 further doc tests are `ignore`d, requiring a live Postgres/Redis instance)
+
+## v0.3.0 Stub Elimination (2026-05-29)
+
+### Real System Metrics ✅
+- [x] `crate::sysinfo` module — real /proc readers for memory and CPU time (Linux); conservative fallbacks on other platforms
+  - [x] `read_process_memory_bytes()` — VmRSS from /proc/self/status
+  - [x] `read_total_memory_bytes()` — MemTotal from /proc/meminfo
+  - [x] `read_process_cpu_time()` — cumulative utime+stime from /proc/self/stat
+  - [x] `clock_ticks_per_sec()` — SC_CLK_TCK via libc::sysconf
+- [x] `task_resources::TaskResourceTracker::get_current_memory()` — replaced mock-0 with `sysinfo::read_process_memory_bytes()`
+- [x] `task_resources::TaskResourceTracker` — added `initial_cpu: Option<Duration>` field; `stop()` now reports real process CPU time delta consumed during the task window; removed dead `cpu_samples: Vec<Duration>` field
+- [x] `resource_tracker::ResourceTracker::get_memory_usage_mb()` — replaced duplicated /proc reader with `sysinfo` delegation
+- [x] `resource_tracker::ResourceTracker::get_cpu_usage_percent_async()` — replaced 0.0 placeholder with delta-sampled CPU% (`Arc<Mutex<Option<(Duration, Instant)>>>` interior state); multi-core aware (may exceed 100%)
+
+### Real Autoscaling Inputs ✅
+- [x] `WorkerPool::queue_depth: Arc<AtomicUsize>` — shared counter; `set_queue_depth(usize)` API for broker-layer integration; `queue_depth_handle() -> Arc<AtomicUsize>` for direct handle sharing
+- [x] `start_scaling_monitor()` — replaced hardcoded `queue_depth=0, cpu=0.0, memory=0.0` with live readings from `sysinfo` and the `queue_depth` atomic
+- [x] `compute_scaling_decision()` free function — extracted single canonical implementation replacing two duplicated methods; both `WorkerPool::make_scaling_decision` and `WorkerPoolMonitor::make_scaling_decision` delegate to it
+
+### All Scaling Policies Implemented ✅
+- [x] `ScalingPolicy::LoadBased` — scale up when CPU or memory exceeds target; scale down when both fall below 50% of target (hysteresis band prevents thrashing)
+- [x] `ScalingPolicy::Hybrid` — scale up when queue is deep *or* load is high; scale down only when queue is shallow *and* load is low
+- [x] Unit tests for all new policy branches: `test_load_based_scale_up_on_high_cpu`, `test_load_based_scale_up_on_high_memory`, `test_load_based_scale_down_when_idle`, `test_load_based_no_scale_in_band`, `test_hybrid_scale_up_on_queue_depth`, `test_hybrid_scale_up_on_high_load`, `test_hybrid_scale_down_when_quiet`, `test_hybrid_no_scale_mixed_signals`, `test_set_queue_depth_and_handle`
+
+## Bug Fixes (2026-07-11)
+
+### Lock-Free Queue Correctness (QA/Hardening Pass)
+- [x] `src/lockfree_queue.rs` `try_pop()` — fixed a real logic bug where a spurious `Steal::Retry` signal from `crossbeam_deque::Injector` was treated the same as a genuinely empty queue, which could make a worker see a false-empty queue under contention; found via Miri testing (not a data race — Miri confirmed the queue's `unsafe impl Send/Sync` is sound). Fixed by delegating to the already-correct `pop()`.
+- Added `readme = "README.md"` to `Cargo.toml` package metadata
+- Removed 2 unused dependencies: `anyhow`, `tempfile` (dev-dependency)
 
 ## Documentation
 

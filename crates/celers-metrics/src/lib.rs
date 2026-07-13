@@ -11,24 +11,40 @@
 
 pub mod aggregation;
 pub mod alerts;
+pub mod anomaly;
+pub mod audit;
 pub mod backends;
+pub mod exposition;
 pub mod health;
 pub mod history;
+pub mod native_histogram;
 pub mod prometheus_metrics;
 pub mod slo;
+pub mod slo_tracker;
+pub mod statsd;
+pub mod summary;
 pub mod tooling;
 
 #[cfg(test)]
 mod tests_advanced;
 #[cfg(test)]
 mod tests_core;
+#[cfg(test)]
+mod tests_enhanced;
 
 // Re-export everything for backward compatibility
 pub use aggregation::*;
 pub use alerts::*;
+pub use anomaly::*;
+pub use audit::*;
 pub use backends::*;
+pub use exposition::*;
 pub use health::*;
 pub use history::*;
+pub use native_histogram::*;
 pub use prometheus_metrics::*;
 pub use slo::*;
+pub use slo_tracker::*;
+pub use statsd::*;
+pub use summary::*;
 pub use tooling::*;

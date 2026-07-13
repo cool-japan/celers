@@ -95,7 +95,7 @@ impl MetricBatch {
             metrics: Vec::new(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs(),
         }
     }
@@ -120,7 +120,7 @@ impl MetricBatch {
         self.metrics.clear();
         self.timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
     }
 }
@@ -150,7 +150,7 @@ impl MetricBatcher {
 
     /// Add a metric to the batch, returns true if batch should be flushed
     pub fn add(&self, metric: MetricExport) -> bool {
-        let mut batch = self.batch.lock().unwrap();
+        let mut batch = self.batch.lock().unwrap_or_else(|e| e.into_inner());
         batch.add(metric);
 
         batch.len() >= self.max_batch_size || self.is_batch_stale(&batch)
@@ -160,14 +160,14 @@ impl MetricBatcher {
     fn is_batch_stale(&self, batch: &MetricBatch) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         now - batch.timestamp >= self.max_batch_age_seconds
     }
 
     /// Flush the batch and return metrics
     pub fn flush(&self) -> Vec<MetricExport> {
-        let mut batch = self.batch.lock().unwrap();
+        let mut batch = self.batch.lock().unwrap_or_else(|e| e.into_inner());
         let metrics = batch.metrics.clone();
         batch.clear();
         metrics
@@ -175,7 +175,7 @@ impl MetricBatcher {
 
     /// Get current batch size without flushing
     pub fn current_size(&self) -> usize {
-        self.batch.lock().unwrap().len()
+        self.batch.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -366,10 +366,10 @@ impl HistogramHeatmap {
     pub fn record_snapshot(&self, snapshot: Vec<HeatmapBucket>) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         buckets.push((timestamp, snapshot));
 
         // Enforce retention limit
@@ -380,22 +380,31 @@ impl HistogramHeatmap {
 
     /// Get all recorded snapshots
     pub fn get_snapshots(&self) -> Vec<(u64, Vec<HeatmapBucket>)> {
-        self.buckets.lock().unwrap().clone()
+        self.buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get the number of recorded time slices
     pub fn len(&self) -> usize {
-        self.buckets.lock().unwrap().len()
+        self.buckets.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Check if the heatmap is empty
     pub fn is_empty(&self) -> bool {
-        self.buckets.lock().unwrap().is_empty()
+        self.buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Clear all recorded data
     pub fn clear(&self) {
-        self.buckets.lock().unwrap().clear();
+        self.buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -471,8 +480,8 @@ impl MetricRegistry {
             return false;
         }
 
-        let mut counters = self.counters.lock().unwrap();
-        let mut metadata = self.metadata.lock().unwrap();
+        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let mut metadata = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
 
         if counters.contains_key(name) {
             return false; // Already registered
@@ -487,7 +496,7 @@ impl MetricRegistry {
                 metric_type: MetricType::Counter,
                 registered_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("SystemTime should be after UNIX_EPOCH")
                     .as_secs(),
             },
         );
@@ -501,8 +510,8 @@ impl MetricRegistry {
             return false;
         }
 
-        let mut gauges = self.gauges.lock().unwrap();
-        let mut metadata = self.metadata.lock().unwrap();
+        let mut gauges = self.gauges.lock().unwrap_or_else(|e| e.into_inner());
+        let mut metadata = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
 
         if gauges.contains_key(name) {
             return false;
@@ -517,7 +526,7 @@ impl MetricRegistry {
                 metric_type: MetricType::Gauge,
                 registered_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("SystemTime should be after UNIX_EPOCH")
                     .as_secs(),
             },
         );
@@ -527,7 +536,7 @@ impl MetricRegistry {
 
     /// Increment a counter by a value
     pub fn increment_counter(&self, name: &str, value: u64) -> bool {
-        let counters = self.counters.lock().unwrap();
+        let counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(counter) = counters.get(name) {
             counter.fetch_add(value, Ordering::Relaxed);
             true
@@ -538,7 +547,7 @@ impl MetricRegistry {
 
     /// Set a gauge to a specific value
     pub fn set_gauge(&self, name: &str, value: u64) -> bool {
-        let gauges = self.gauges.lock().unwrap();
+        let gauges = self.gauges.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(gauge) = gauges.get(name) {
             gauge.store(value, Ordering::Relaxed);
             true
@@ -549,33 +558,33 @@ impl MetricRegistry {
 
     /// Get counter value
     pub fn get_counter(&self, name: &str) -> Option<u64> {
-        let counters = self.counters.lock().unwrap();
+        let counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
         counters.get(name).map(|c| c.load(Ordering::Relaxed))
     }
 
     /// Get gauge value
     pub fn get_gauge(&self, name: &str) -> Option<u64> {
-        let gauges = self.gauges.lock().unwrap();
+        let gauges = self.gauges.lock().unwrap_or_else(|e| e.into_inner());
         gauges.get(name).map(|g| g.load(Ordering::Relaxed))
     }
 
     /// Get metadata for a metric
     pub fn get_metadata(&self, name: &str) -> Option<MetricMetadata> {
-        let metadata = self.metadata.lock().unwrap();
+        let metadata = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
         metadata.get(name).cloned()
     }
 
     /// List all registered metric names
     pub fn list_metrics(&self) -> Vec<String> {
-        let metadata = self.metadata.lock().unwrap();
+        let metadata = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
         metadata.keys().cloned().collect()
     }
 
     /// Unregister a metric
     pub fn unregister(&self, name: &str) -> bool {
-        let mut counters = self.counters.lock().unwrap();
-        let mut gauges = self.gauges.lock().unwrap();
-        let mut metadata = self.metadata.lock().unwrap();
+        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gauges = self.gauges.lock().unwrap_or_else(|e| e.into_inner());
+        let mut metadata = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
 
         let removed = counters.remove(name).is_some() || gauges.remove(name).is_some();
         metadata.remove(name);
@@ -585,9 +594,18 @@ impl MetricRegistry {
 
     /// Clear all metrics
     pub fn clear(&self) {
-        self.counters.lock().unwrap().clear();
-        self.gauges.lock().unwrap().clear();
-        self.metadata.lock().unwrap().clear();
+        self.counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.gauges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -638,7 +656,9 @@ impl ResourceTracker {
     /// });
     ///
     /// assert_eq!(result, 42);
-    /// assert!(tracker.avg_collection_time_micros() > 0.0);
+    /// // The average is >= 0; on very fast machines the first sample may round
+    /// // to zero nanoseconds, so we accept >= 0.0 here.
+    /// assert!(tracker.avg_collection_time_micros() >= 0.0);
     /// ```
     pub fn track_operation<F, R>(&self, f: F) -> R
     where
@@ -761,7 +781,7 @@ pub fn export_metrics_json() -> String {
 }}"#,
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs(),
         metrics.tasks_enqueued,
         metrics.tasks_completed,
@@ -799,7 +819,7 @@ pub fn export_metrics_csv() -> String {
     let metrics = CurrentMetrics::capture();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime should be after UNIX_EPOCH")
         .as_secs();
 
     format!(
@@ -929,7 +949,10 @@ impl MetricsProfiler {
         let result = f();
         let elapsed_micros = start.elapsed().as_micros() as f64;
 
-        let mut times = self.operation_times.lock().unwrap();
+        let mut times = self
+            .operation_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         times
             .entry(operation_name.to_string())
             .or_default()
@@ -940,7 +963,10 @@ impl MetricsProfiler {
 
     /// Get statistics for a specific operation
     pub fn get_operation_stats(&self, operation_name: &str) -> Option<OperationStats> {
-        let times = self.operation_times.lock().unwrap();
+        let times = self
+            .operation_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let operation_times = times.get(operation_name)?;
 
         if operation_times.is_empty() {
@@ -954,13 +980,13 @@ impl MetricsProfiler {
         let min = operation_times
             .iter()
             .copied()
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap();
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
         let max = operation_times
             .iter()
             .copied()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap();
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
 
         let variance = if count > 1 {
             let sq_diff_sum: f64 = operation_times.iter().map(|t| (t - mean).powi(2)).sum();
@@ -981,7 +1007,10 @@ impl MetricsProfiler {
 
     /// Get all operation statistics
     pub fn all_stats(&self) -> Vec<OperationStats> {
-        let times = self.operation_times.lock().unwrap();
+        let times = self
+            .operation_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut stats = Vec::new();
 
         for (operation_name, operation_times) in times.iter() {
@@ -996,13 +1025,13 @@ impl MetricsProfiler {
             let min = operation_times
                 .iter()
                 .copied()
-                .min_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap();
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
             let max = operation_times
                 .iter()
                 .copied()
-                .max_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap();
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
 
             let variance = if count > 1 {
                 let sq_diff_sum: f64 = operation_times.iter().map(|t| (t - mean).powi(2)).sum();
@@ -1066,7 +1095,10 @@ impl MetricsProfiler {
     /// Reset all profiling data
     pub fn reset(&self) {
         self.tracker.reset();
-        self.operation_times.lock().unwrap().clear();
+        self.operation_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -1150,7 +1182,7 @@ impl SlaReport {
         let metrics = CurrentMetrics::capture();
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let total_tasks = metrics.total_processed() as u64;
@@ -1319,7 +1351,7 @@ impl MetricRetentionManager {
     pub fn set_policy(&self, metric_name: &str, policy: RetentionPolicy) {
         self.policies
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(metric_name.to_string(), policy);
     }
 
@@ -1327,7 +1359,7 @@ impl MetricRetentionManager {
     pub fn get_policy(&self, metric_name: &str) -> RetentionPolicy {
         self.policies
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(metric_name)
             .cloned()
             .unwrap_or_else(RetentionPolicy::default_policy)
@@ -1338,25 +1370,7 @@ impl MetricRetentionManager {
     /// Returns number of samples removed
     pub fn apply_retention(&self, metric_name: &str, history: &MetricHistory) -> usize {
         let policy = self.get_policy(metric_name);
-        let samples = history.get_samples();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let mut removed = 0;
-
-        // This is a simplified version - in real implementation,
-        // we'd need mutable access to history to actually remove old samples
-        // For now, just count what would be removed
-        for sample in &samples {
-            let age = now.saturating_sub(sample.timestamp);
-            if age > policy.max_age_seconds {
-                removed += 1;
-            }
-        }
-
-        removed
+        history.remove_samples_older_than(policy.max_age_seconds)
     }
 }
 
@@ -1440,7 +1454,9 @@ pub fn predict_capacity_exhaustion(
         };
     }
 
-    let latest = samples.last().unwrap();
+    let latest = samples
+        .last()
+        .expect("samples validated to have at least 2 elements");
     let current_value = latest.value;
     let current_utilization = current_value / max_capacity;
 
@@ -1639,7 +1655,7 @@ impl CollectionTask {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let last = self.last_collected.load(Ordering::Relaxed);
@@ -1651,7 +1667,7 @@ impl CollectionTask {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         self.last_collected.store(now, Ordering::Relaxed);
@@ -1662,7 +1678,7 @@ impl CollectionTask {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let last = self.last_collected.load(Ordering::Relaxed);

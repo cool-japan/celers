@@ -1,7 +1,9 @@
 #![cfg(test)]
 
 use crate::*;
-use chrono::{Duration, Timelike, Utc};
+#[cfg(feature = "cron")]
+use chrono::Timelike;
+use chrono::{Duration, Utc};
 use tempfile::NamedTempFile;
 
 // ===== Lock Manager Tests =====
@@ -1413,4 +1415,432 @@ async fn test_update_heartbeat_info_noop_without_heartbeat() {
     let scheduler = BeatScheduler::new();
     // Should not panic
     scheduler.update_heartbeat_info().await;
+}
+
+// ===== Dynamic Registry & Timezone Schedule Tests =====
+//
+// These tests cover the runtime add/remove/update story (both the dedicated
+// thread-safe `ScheduleRegistry` and the scheduler-level `*_entry` API) and the
+// timezone-aware crontab evaluation including a DST spring-forward case. All
+// assertions use fixed dates so they are deterministic.
+
+use chrono::TimeZone;
+
+#[test]
+fn test_scheduler_entry_api_add_list_update_remove() {
+    let mut scheduler = BeatScheduler::new();
+
+    scheduler
+        .add_entry(ScheduledTask::new(
+            "alpha".to_string(),
+            Schedule::interval(60),
+        ))
+        .unwrap();
+    scheduler
+        .add_entry(ScheduledTask::new(
+            "beta".to_string(),
+            Schedule::interval(120),
+        ))
+        .unwrap();
+
+    let mut names: Vec<String> = scheduler
+        .list_entries()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+
+    // Update in place.
+    let updated = scheduler
+        .update_entry("alpha", |task| {
+            task.options.priority = Some(9);
+            task.enabled = false;
+        })
+        .unwrap();
+    assert!(updated);
+    let alpha = scheduler.get_task("alpha").unwrap();
+    assert_eq!(alpha.options.priority, Some(9));
+    assert!(!alpha.enabled);
+
+    // Updating a missing entry returns false.
+    assert!(!scheduler.update_entry("ghost", |_| {}).unwrap());
+
+    // Remove.
+    let removed = scheduler.remove_entry("beta").unwrap();
+    assert!(removed.is_some());
+    assert_eq!(scheduler.list_entries().len(), 1);
+}
+
+#[test]
+fn test_scheduler_to_registry_bridge_is_independent() {
+    let mut scheduler = BeatScheduler::new();
+    scheduler
+        .add_entry(ScheduledTask::new(
+            "seed".to_string(),
+            Schedule::interval(60),
+        ))
+        .unwrap();
+
+    let registry = scheduler.to_registry();
+    assert_eq!(registry.len().unwrap(), 1);
+
+    // Mutating the registry must not affect the scheduler (snapshot semantics).
+    registry
+        .add_entry(ScheduledTask::new(
+            "registry_only".to_string(),
+            Schedule::interval(60),
+        ))
+        .unwrap();
+    assert_eq!(registry.len().unwrap(), 2);
+    assert_eq!(scheduler.list_entries().len(), 1);
+}
+
+#[test]
+fn test_registry_runtime_update_picked_up_between_ticks() {
+    // Model a beat loop: snapshot due entries, "execute" them by marking run,
+    // and verify that a runtime schedule change made between ticks takes effect.
+    let registry = ScheduleRegistry::new();
+    let base = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+
+    let mut task = ScheduledTask::new("hourly".to_string(), Schedule::interval(3600));
+    task.last_run_at = Some(base);
+    registry.add_entry(task).unwrap();
+
+    // Tick 1 at +30s: not due yet (interval 3600s).
+    let tick1 = base + Duration::seconds(30);
+    assert!(registry.due_entries_at(tick1).unwrap().is_empty());
+
+    // Between ticks, a control plane shortens the interval to 10s.
+    assert!(registry
+        .update_schedule("hourly", Schedule::interval(10))
+        .unwrap());
+
+    // Tick 2 at +30s: now due because the new interval (10s) has elapsed.
+    let due = registry.due_entries_at(tick1).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].name, "hourly");
+
+    // Execute it (advance last_run), then it is no longer due at the same tick.
+    assert!(registry.mark_run_at("hourly", tick1).unwrap());
+    assert!(registry.due_entries_at(tick1).unwrap().is_empty());
+
+    // Due again 11s later.
+    let tick3 = tick1 + Duration::seconds(11);
+    assert_eq!(registry.due_entries_at(tick3).unwrap().len(), 1);
+}
+
+#[test]
+fn test_registry_add_remove_at_runtime_changes_due_set() {
+    let registry = ScheduleRegistry::new();
+    let now = Utc.with_ymd_and_hms(2026, 2, 1, 12, 0, 0).unwrap();
+
+    // Add two never-run (immediately due) tasks.
+    registry
+        .add_entry(ScheduledTask::new("a".to_string(), Schedule::interval(60)))
+        .unwrap();
+    registry
+        .add_entry(ScheduledTask::new("b".to_string(), Schedule::interval(60)))
+        .unwrap();
+    assert_eq!(registry.due_entries_at(now).unwrap().len(), 2);
+
+    // Remove one at runtime; due set shrinks.
+    registry.remove_entry("a").unwrap();
+    let due: Vec<String> = registry
+        .due_entries_at(now)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(due, vec!["b".to_string()]);
+
+    // Add a third at runtime; due set grows.
+    registry
+        .add_entry(ScheduledTask::new("c".to_string(), Schedule::interval(60)))
+        .unwrap();
+    assert_eq!(registry.due_entries_at(now).unwrap().len(), 2);
+}
+
+#[cfg(feature = "cron")]
+#[test]
+fn test_task_with_timezone_schedule_next_run() {
+    // A ScheduledTask carrying a timezone-aware crontab computes next_run in
+    // local wall-clock terms. 09:00 Tokyo (UTC+9) maps to 00:00 UTC.
+    use chrono_tz::Asia::Tokyo;
+    let schedule = Schedule::crontab("0", "9", "*", "*", "*").with_timezone(Tokyo);
+    let mut task = ScheduledTask::new("tokyo_job".to_string(), schedule);
+    task.last_run_at = Some(Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap());
+
+    let next = task.next_run_time().unwrap();
+    let local = next.with_timezone(&Tokyo);
+    assert_eq!(local.hour(), 9);
+    assert_eq!(local.minute(), 0);
+}
+
+#[cfg(feature = "cron")]
+#[test]
+fn test_task_timezone_dst_spring_forward_gap() {
+    // 2026-03-08 New York spring-forward: 02:00 -> 03:00, so the 02:30 daily
+    // run cannot occur that day and must roll to 2026-03-09 02:30 EDT == 06:30
+    // UTC. This is the DST gap case requested by the roadmap.
+    use chrono::Datelike;
+    use chrono_tz::America::New_York;
+
+    let schedule = Schedule::crontab("30", "2", "*", "*", "*").with_timezone(New_York);
+    let mut task = ScheduledTask::new("dst_job".to_string(), schedule);
+    // last_run = 2026-03-08 01:00 New York (EST, UTC-5) == 06:00 UTC.
+    task.last_run_at = Some(
+        New_York
+            .with_ymd_and_hms(2026, 3, 8, 1, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc),
+    );
+
+    let next = task.next_run_time().unwrap();
+    let local = next.with_timezone(&New_York);
+    assert_ne!(
+        local.day(),
+        8,
+        "02:30 does not exist on the spring-forward day"
+    );
+    assert_eq!(local.day(), 9);
+    assert_eq!(local.hour(), 2);
+    assert_eq!(local.minute(), 30);
+    assert_eq!(next, Utc.with_ymd_and_hms(2026, 3, 9, 6, 30, 0).unwrap());
+}
+
+#[cfg(feature = "cron")]
+#[test]
+fn test_task_timezone_persists_through_scheduler() {
+    // Adding a timezone-aware task to the scheduler preserves the timezone and
+    // it survives a JSON round-trip via the entry API.
+    use chrono_tz::America::New_York;
+
+    let mut scheduler = BeatScheduler::new();
+    let schedule = Schedule::crontab("0", "9", "1-5", "*", "*").with_timezone(New_York);
+    scheduler
+        .add_entry(ScheduledTask::new("tz_task".to_string(), schedule))
+        .unwrap();
+
+    let json = scheduler.export_state().unwrap();
+    assert!(json.contains("America/New_York"));
+
+    let stored = scheduler.get_task("tz_task").unwrap();
+    assert_eq!(stored.schedule.timezone_name(), Some("America/New_York"));
+}
+
+// ===== Dispatch Lock Tests (duplicate-execution prevention) =====
+
+// `chrono::TimeZone` is already imported above for the timezone tests.
+
+/// A fixed, deterministic scheduled instant used for lock-key assertions so the
+/// tests never depend on the wall clock.
+fn fixed_instant(second: u32) -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, second)
+        .single()
+        .expect("fixed instant is valid")
+}
+
+#[test]
+fn test_dispatch_lock_key_is_deterministic_and_distinct() {
+    let i0 = fixed_instant(0);
+    let i1 = fixed_instant(1);
+
+    // Same (entry, instant) => identical key.
+    assert_eq!(
+        dispatch_lock_key("entry", i0),
+        dispatch_lock_key("entry", i0)
+    );
+    // Different instant => different key.
+    assert_ne!(
+        dispatch_lock_key("entry", i0),
+        dispatch_lock_key("entry", i1)
+    );
+    // Different entry => different key.
+    assert_ne!(dispatch_lock_key("a", i0), dispatch_lock_key("b", i0));
+    // Exact key shape is stable (RFC 3339, timezone-explicit).
+    assert_eq!(
+        dispatch_lock_key("entry", i0),
+        "celers-beat:dispatch:entry@2026-06-13T12:00:00+00:00"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatch_lock_blocks_second_instance_same_instant() {
+    // Two schedulers share one in-memory lock backend; the per-fire lock must
+    // be mutually exclusive for the same (entry, instant).
+    let backend = Arc::new(InMemoryLockBackend::new());
+
+    let mut beat_a = BeatScheduler::new();
+    beat_a.with_lock_backend(backend.clone());
+    let mut beat_b = BeatScheduler::new();
+    beat_b.with_lock_backend(backend.clone());
+
+    let instant = fixed_instant(0);
+
+    // First instance acquires the fire.
+    let a = beat_a
+        .try_acquire_dispatch_lock("shared_entry", instant, DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("acquire should not error");
+    assert!(a, "first instance must win the fire lock");
+
+    // Second instance is blocked on the same fire.
+    let b = beat_b
+        .try_acquire_dispatch_lock("shared_entry", instant, DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("acquire should not error");
+    assert!(!b, "second instance must be blocked for the same instant");
+}
+
+#[tokio::test]
+async fn test_dispatch_lock_release_allows_next_instant() {
+    let backend = Arc::new(InMemoryLockBackend::new());
+
+    let mut beat_a = BeatScheduler::new();
+    beat_a.with_lock_backend(backend.clone());
+    let mut beat_b = BeatScheduler::new();
+    beat_b.with_lock_backend(backend.clone());
+
+    let instant0 = fixed_instant(0);
+    let instant1 = fixed_instant(1);
+
+    // A wins instant0.
+    assert!(beat_a
+        .try_acquire_dispatch_lock("entry", instant0, DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("acquire"));
+
+    // While A holds instant0, B cannot dispatch instant0...
+    assert!(!beat_b
+        .try_acquire_dispatch_lock("entry", instant0, DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("acquire"));
+    // ...but the *next* instant is a different key, so B can take it.
+    assert!(beat_b
+        .try_acquire_dispatch_lock("entry", instant1, DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("acquire"));
+
+    // A releases instant0; a fresh attempt on instant0 now succeeds.
+    let released = beat_a
+        .release_dispatch_lock("entry", instant0)
+        .await
+        .expect("release");
+    assert!(released, "owner should release its own fire lock");
+
+    assert!(beat_b
+        .try_acquire_dispatch_lock("entry", instant0, DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("acquire after release"));
+}
+
+#[tokio::test]
+async fn test_tick_with_locks_single_instance_dispatches() {
+    // Without a shared backend a single instance dispatches its due entry.
+    let mut scheduler = BeatScheduler::new();
+    scheduler.with_lock_backend(Arc::new(InMemoryLockBackend::new()));
+    scheduler
+        .add_task(ScheduledTask::new(
+            "solo".to_string(),
+            Schedule::interval(1),
+        ))
+        .expect("add task");
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let dispatched = scheduler
+        .tick_with_locks(DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("tick_with_locks");
+    assert_eq!(dispatched, vec!["solo".to_string()]);
+}
+
+#[tokio::test]
+async fn test_tick_with_locks_dedupes_across_instances() {
+    // Two instances sharing a lock backend each consider the same entry due for
+    // the same fire instant; exactly one of them dispatches it.
+    let backend = Arc::new(InMemoryLockBackend::new());
+
+    let mut beat_a = BeatScheduler::new();
+    beat_a.with_lock_backend(backend.clone());
+    beat_a
+        .add_task(ScheduledTask::new("dup".to_string(), Schedule::interval(1)))
+        .expect("add to a");
+
+    let mut beat_b = BeatScheduler::new();
+    beat_b.with_lock_backend(backend.clone());
+    beat_b
+        .add_task(ScheduledTask::new("dup".to_string(), Schedule::interval(1)))
+        .expect("add to b");
+
+    // Make both consider the entry due for the SAME instant by pinning an
+    // identical last_run_at, then waiting until that fire is in the past.
+    let last = Utc::now() - chrono::Duration::seconds(5);
+    if let Some(task) = beat_a.tasks.get_mut("dup") {
+        task.last_run_at = Some(last);
+        task.update_next_run_cache();
+    }
+    if let Some(task) = beat_b.tasks.get_mut("dup") {
+        task.last_run_at = Some(last);
+        task.update_next_run_cache();
+    }
+
+    let from_a = beat_a
+        .tick_with_locks(DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("a tick");
+    let from_b = beat_b
+        .tick_with_locks(DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("b tick");
+
+    let total = from_a.len() + from_b.len();
+    assert_eq!(
+        total, 1,
+        "exactly one instance should dispatch the shared fire (a={from_a:?}, b={from_b:?})"
+    );
+}
+
+#[tokio::test]
+async fn test_tick_with_locks_standby_dispatches_nothing() {
+    use crate::heartbeat::{BeatHeartbeat, HeartbeatConfig};
+
+    let lock_backend = Arc::new(InMemoryLockBackend::new());
+
+    // Instance 1 becomes leader.
+    let hb1 = BeatHeartbeat::new(
+        "leader".to_string(),
+        lock_backend.clone(),
+        HeartbeatConfig::new(),
+    );
+    assert!(hb1.try_become_leader().await.expect("election"));
+
+    // Instance 2 is standby.
+    let hb2 = BeatHeartbeat::new(
+        "standby".to_string(),
+        lock_backend.clone(),
+        HeartbeatConfig::new(),
+    );
+    assert!(!hb2.try_become_leader().await.expect("election"));
+
+    let mut standby = BeatScheduler::new();
+    standby.with_heartbeat(hb2);
+    standby.with_lock_backend(lock_backend);
+    standby
+        .add_task(ScheduledTask::new(
+            "should_not_run".to_string(),
+            Schedule::interval(1),
+        ))
+        .expect("add task");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let dispatched = standby
+        .tick_with_locks(DEFAULT_DISPATCH_LOCK_TTL_SECS)
+        .await
+        .expect("standby tick");
+    assert!(
+        dispatched.is_empty(),
+        "standby instance must not dispatch any fire"
+    );
 }

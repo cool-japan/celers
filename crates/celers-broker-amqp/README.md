@@ -2,7 +2,7 @@
 
 RabbitMQ/AMQP broker implementation for CeleRS, providing a full-featured message broker with exchange/queue topology management, publisher confirms, and advanced features like priority queues, dead letter exchanges, and transactions.
 
-**Version: 0.2.0 | Status: [Stable] | Tests: 244 | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Tests: 244 | Updated: 2026-07-13**
 
 ## Features
 
@@ -57,9 +57,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-broker-amqp = "0.2"
-celers-protocol = "0.2"
-celers-kombu = "0.2"
+celers-broker-amqp = "0.3"
+celers-protocol = "0.3"
+celers-kombu = "0.3"
 ```
 
 ## Quick Start
@@ -499,9 +499,9 @@ Monitor broker connection health:
 
 ```rust
 async fn monitor_health(broker: &AmqpBroker) {
-    let status = broker.health_status();
+    let status = broker.health_status().await;
 
-    if !status.is_healthy() {
+    if !broker.is_healthy() {
         println!("Broker unhealthy!");
         println!("Connected: {}", status.connected);
         println!("Channel open: {}", status.channel_open);
@@ -571,19 +571,20 @@ async fn with_circuit_breaker() -> Result<(), Box<dyn std::error::Error>> {
         half_open_max_calls: 3,    // Test with 3 calls in half-open state
     };
 
-    let mut circuit = CircuitBreaker::new(config);
+    let circuit = CircuitBreaker::new(config);
 
-    // Execute operation with circuit breaker protection
-    match circuit.call(|| async {
+    // Execute operation with circuit breaker protection (pass the future directly,
+    // not a closure - `call()` takes `impl Future<Output = Result<T, E>>`)
+    match circuit.call(async {
         // Your operation here
-        Ok(())
+        Ok::<(), String>(())
     }).await {
         Ok(result) => println!("Success: {:?}", result),
         Err(e) => println!("Circuit open or operation failed: {:?}", e),
     }
 
     // Monitor circuit state
-    let metrics = circuit.metrics();
+    let metrics = circuit.get_metrics().await;
     println!("State: {:?}", metrics.state);
     println!("Failures: {}", metrics.failure_count);
 
@@ -686,26 +687,24 @@ fn validate_topology() -> Result<(), Box<dyn std::error::Error>> {
     };
     validator.add_exchange(exchange)?;
 
-    // Define queues
+    // Define queues with their bindings
+    let binding = BindingDefinition {
+        exchange: "tasks".to_string(),
+        routing_key: "tasks.high.*".to_string(),
+    };
     let queue = QueueDefinition {
         name: "tasks.high".to_string(),
         durable: true,
         auto_delete: false,
-        arguments: Default::default(),
+        bindings: vec![binding],
     };
     validator.add_queue(queue)?;
 
-    // Define bindings
-    let binding = BindingDefinition {
-        source: "tasks".to_string(),
-        destination: "tasks.high".to_string(),
-        routing_key: "tasks.high.*".to_string(),
-        arguments: Default::default(),
-    };
-    validator.add_binding(binding)?;
+    // Validate topology (returns Err on the first structural problem found)
+    validator.validate()?;
 
-    // Validate topology
-    let issues = validator.validate()?;
+    // Analyze for non-fatal issues (unbound queues, unused exchanges, etc.)
+    let issues = analyze_topology_issues(&validator);
     if !issues.is_empty() {
         println!("Topology issues found:");
         for issue in issues {
@@ -716,9 +715,9 @@ fn validate_topology() -> Result<(), Box<dyn std::error::Error>> {
     // Analyze complexity
     let summary = validator.summary();
     let complexity = calculate_topology_complexity(
-        summary.exchanges,
-        summary.queues,
-        summary.bindings
+        summary.total_exchanges,
+        summary.total_queues,
+        summary.total_bindings
     );
     println!("Topology complexity score: {:.1}", complexity);
 
@@ -737,23 +736,25 @@ use celers_broker_amqp::tracing_util::{
 use uuid::Uuid;
 
 async fn message_tracing() -> Result<(), Box<dyn std::error::Error>> {
-    let mut recorder = TraceRecorder::new(10000);  // Track up to 10k messages
+    let mut analyzer = MessageFlowAnalyzer::new();  // internally tracks up to 10k messages
 
-    // Record message lifecycle
+    // Record message lifecycle (TraceEvent variants carry queue/timestamp payloads)
     let msg_id = Uuid::new_v4().to_string();
-    recorder.record_event(&msg_id, TraceEvent::Published);
-    recorder.record_event(&msg_id, TraceEvent::Consumed);
-    recorder.record_event(&msg_id, TraceEvent::Acknowledged);
+    let queue = "my_queue".to_string();
+    analyzer.record_event(msg_id.clone(), TraceEvent::Published { queue: queue.clone(), timestamp: std::time::Instant::now() });
+    analyzer.record_event(msg_id.clone(), TraceEvent::Consumed { queue, timestamp: std::time::Instant::now() });
+    analyzer.record_event(msg_id, TraceEvent::Acknowledged { timestamp: std::time::Instant::now() });
 
     // Analyze message flow
-    let analyzer = MessageFlowAnalyzer::new(recorder);
     let insights = analyzer.analyze();
 
     println!("Total messages: {}", insights.total_messages);
-    println!("Success rate: {:.2}%", insights.success_rate * 100.0);
-    println!("Rejection rate: {:.2}%", insights.rejection_rate * 100.0);
-    println!("Avg processing time: {:.2}ms", insights.avg_processing_time_ms);
-    println!("Health status: {:?}", insights.health_status);
+    println!("Success rate: {:.2}%", insights.success_rate);      // already 0-100
+    println!("Rejection rate: {:.2}%", insights.rejection_rate);  // already 0-100
+    if let Some(avg) = insights.average_processing_time {
+        println!("Avg processing time: {:.2}ms", avg.as_secs_f64() * 1000.0);
+    }
+    println!("Health status: {}", insights.health_status());
 
     Ok(())
 }
@@ -789,16 +790,17 @@ fn consumer_groups_example() -> Result<(), Box<dyn std::error::Error>> {
         println!("Routing to consumer: {}", consumer_id);
 
         // Track message processing
-        group.mark_processing_started(&consumer_id);
         // ... process message ...
-        group.mark_processing_completed(&consumer_id, true);
+        if let Some(consumer) = group.get_consumer_mut(&consumer_id) {
+            consumer.record_message_processed();
+        }
     }
 
     // Get group statistics
     let stats = group.get_statistics();
     println!("Active consumers: {}", stats.active_consumers);
     println!("Total processed: {}", stats.total_messages_processed);
-    println!("Avg utilization: {:.2}%", stats.avg_utilization * 100.0);
+    println!("Avg utilization: {:.2}%", stats.utilization());
 
     Ok(())
 }
@@ -924,8 +926,7 @@ queue_mode = lazy
 3. **Set queue length limits**:
 ```rust
 let config = QueueConfig::new()
-    .with_max_length(10000)
-    .with_max_length_bytes(1_000_000_000);  // 1GB
+    .with_max_length(10000);  // Limit to 10,000 messages
 ```
 
 #### Problem: Publisher confirm timeouts
@@ -947,9 +948,9 @@ broker.publish_batch(queue, messages).await?;
 
 **Checks**:
 ```rust
-// 1. Check queue size
-let size = broker.queue_size(queue).await?;
-println!("Queue has {} messages", size);
+// 1. Check queue size (requires Management API configuration)
+let stats = broker.get_queue_stats(queue).await?;
+println!("Queue has {} messages", stats.messages);
 
 // 2. Check consumer count
 // Use RabbitMQ management API or CLI:
@@ -1089,6 +1090,8 @@ This implementation is 100% compatible with Python Celery:
 - `list_queues()` requires RabbitMQ Management API (not available via AMQP protocol)
 - Connection and channel pools require explicit configuration
 - Maximum message size limited by RabbitMQ (default: 128MB)
+- The RabbitMQ Management API HTTP client now uses `oxihttp-client` (Pure Rust), replacing the former `reqwest`-based implementation
+- This crate still carries `ring`/`aws-lc-sys` transitively via `lapin` (the AMQP protocol client). This is an accepted, tracked, upstream-blocked limitation rather than a regression — no drop-in Pure-Rust AMQP client exists yet in the COOLJAPAN ecosystem
 
 ## Resources
 

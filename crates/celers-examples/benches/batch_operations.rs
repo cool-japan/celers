@@ -26,12 +26,12 @@ impl MockBroker {
 impl Broker for MockBroker {
     async fn enqueue(&self, task: SerializedTask) -> celers_core::Result<celers_core::TaskId> {
         let task_id = task.metadata.id;
-        self.tasks.lock().unwrap().push(task);
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).push(task);
         Ok(task_id)
     }
 
     async fn dequeue(&self) -> celers_core::Result<Option<celers_core::BrokerMessage>> {
-        let task = self.tasks.lock().unwrap().pop();
+        let task = self.tasks.lock().unwrap_or_else(|e| e.into_inner()).pop();
         Ok(task.map(|t| celers_core::BrokerMessage {
             task: t.clone(),
             receipt_handle: None,
@@ -56,7 +56,7 @@ impl Broker for MockBroker {
     }
 
     async fn queue_size(&self) -> celers_core::Result<usize> {
-        Ok(self.tasks.lock().unwrap().len())
+        Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len())
     }
 
     async fn cancel(&self, _task_id: &celers_core::TaskId) -> celers_core::Result<bool> {
@@ -69,7 +69,7 @@ impl Broker for MockBroker {
         tasks: Vec<SerializedTask>,
     ) -> celers_core::Result<Vec<celers_core::TaskId>> {
         let task_ids: Vec<_> = tasks.iter().map(|t| t.metadata.id).collect();
-        self.tasks.lock().unwrap().extend(tasks);
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).extend(tasks);
         Ok(task_ids)
     }
 
@@ -77,7 +77,7 @@ impl Broker for MockBroker {
         &self,
         count: usize,
     ) -> celers_core::Result<Vec<celers_core::BrokerMessage>> {
-        let mut tasks_lock = self.tasks.lock().unwrap();
+        let mut tasks_lock = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let available = tasks_lock.len().min(count);
         let len = tasks_lock.len();
         let tasks: Vec<_> = tasks_lock.drain(len - available..).collect();

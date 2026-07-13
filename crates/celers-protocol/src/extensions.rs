@@ -135,9 +135,14 @@ impl MessageExt for Message {
     }
 
     fn get_age_seconds(&self) -> Option<i64> {
-        // In a real implementation, you'd track message creation time
-        // For now, return None as we don't store creation timestamp
-        None
+        // The creation timestamp is recorded on the message headers when the
+        // message is constructed (see `MessageHeaders::new`). Compute the age
+        // as the number of whole seconds elapsed since then. Messages
+        // deserialized from older producers that omit `created_at` will
+        // (correctly) report `None`.
+        self.headers
+            .created_at
+            .map(|created| (chrono::Utc::now() - created).num_seconds())
     }
 
     #[cfg(feature = "signing")]
@@ -349,6 +354,33 @@ mod tests {
         // Set expiration in the future
         msg.headers.expires = Some(chrono::Utc::now() + chrono::Duration::hours(1));
         assert!(!msg.is_expired());
+    }
+
+    #[test]
+    fn test_message_get_age_seconds() {
+        let task_id = Uuid::new_v4();
+        let body = vec![1, 2, 3];
+
+        // A freshly created message has a creation timestamp and a small,
+        // non-negative age.
+        let msg = Message::new("tasks.test".to_string(), task_id, body.clone());
+        let age = msg.get_age_seconds();
+        assert!(age.is_some());
+        let age = age.expect("freshly created message must have an age");
+        assert!((0..5).contains(&age));
+
+        // A message created in the past reports a larger age.
+        let mut old_msg = Message::new("tasks.test".to_string(), task_id, body.clone());
+        old_msg.headers.created_at = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        let old_age = old_msg
+            .get_age_seconds()
+            .expect("message with creation timestamp must have an age");
+        assert!(old_age >= 119);
+
+        // A message without a recorded creation timestamp reports no age.
+        let mut no_ts = Message::new("tasks.test".to_string(), task_id, body);
+        no_ts.headers.created_at = None;
+        assert!(no_ts.get_age_seconds().is_none());
     }
 
     #[test]

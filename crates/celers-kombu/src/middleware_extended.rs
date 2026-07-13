@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 use celers_protocol::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use uuid::Uuid;
@@ -294,8 +295,11 @@ impl ThrottlingMiddleware {
     }
 
     fn refill_tokens(&self) {
-        let mut last_refill = self.last_refill.lock().unwrap();
-        let mut tokens = self.available_tokens.lock().unwrap();
+        let mut last_refill = self.last_refill.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tokens = self
+            .available_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(*last_refill).as_secs_f64();
@@ -307,7 +311,10 @@ impl ThrottlingMiddleware {
 
     fn calculate_delay(&self) -> Duration {
         self.refill_tokens();
-        let tokens = self.available_tokens.lock().unwrap();
+        let tokens = self
+            .available_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         if *tokens >= 1.0 {
             Duration::from_millis(0)
@@ -319,7 +326,10 @@ impl ThrottlingMiddleware {
 
     fn should_apply_backpressure(&self) -> bool {
         self.refill_tokens();
-        let tokens = self.available_tokens.lock().unwrap();
+        let tokens = self
+            .available_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         (*tokens / self.burst_size as f64) < (1.0 - self.backpressure_threshold)
     }
 }
@@ -344,7 +354,10 @@ impl MessageMiddleware for ThrottlingMiddleware {
         }
 
         // Consume a token
-        let mut tokens = self.available_tokens.lock().unwrap();
+        let mut tokens = self
+            .available_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if *tokens >= 1.0 {
             *tokens -= 1.0;
         }
@@ -393,7 +406,7 @@ impl CircuitBreakerMiddleware {
     }
 
     fn record_failure(&self) {
-        let mut failures = self.failures.lock().unwrap();
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
 
         // Remove old failures outside the window
@@ -404,7 +417,7 @@ impl CircuitBreakerMiddleware {
     }
 
     fn is_circuit_open(&self) -> bool {
-        let mut failures = self.failures.lock().unwrap();
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
 
         // Clean up old failures
@@ -414,7 +427,7 @@ impl CircuitBreakerMiddleware {
     }
 
     fn get_failure_count(&self) -> usize {
-        let mut failures = self.failures.lock().unwrap();
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         failures.retain(|&f| now.duration_since(f) < self.window);
         failures.len()
@@ -683,7 +696,7 @@ impl MessageEnrichmentMiddleware {
         if self.add_timestamp {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs();
             message.headers.extra.insert(
                 "x-enrichment-timestamp".to_string(),
@@ -1120,8 +1133,7 @@ pub struct AdaptiveTimeoutMiddleware {
     base_timeout: Duration,
     min_timeout: Duration,
     max_timeout: Duration,
-    samples: Vec<u64>, // Processing times in milliseconds
-    #[allow(dead_code)]
+    samples: Arc<Mutex<VecDeque<u64>>>, // Processing times in milliseconds
     max_samples: usize,
     percentile: f64, // Use this percentile for timeout calculation (e.g., 0.95 for p95)
 }
@@ -1133,7 +1145,7 @@ impl AdaptiveTimeoutMiddleware {
             base_timeout,
             min_timeout: Duration::from_secs(1),
             max_timeout: base_timeout.mul_f64(5.0), // Max 5x base timeout
-            samples: Vec::new(),
+            samples: Arc::new(Mutex::new(VecDeque::new())),
             max_samples: 100,
             percentile: 0.95, // Default to p95
         }
@@ -1159,16 +1171,45 @@ impl AdaptiveTimeoutMiddleware {
 
     /// Check if we have collected samples
     pub fn has_samples(&self) -> bool {
-        !self.samples.is_empty()
+        !self
+            .samples
+            .lock()
+            .expect("adaptive timeout samples lock should not be poisoned")
+            .is_empty()
+    }
+
+    /// Add a processing time sample (milliseconds), evicting the oldest when at capacity
+    pub fn add_sample(&self, ms: u64) {
+        let mut guard = self
+            .samples
+            .lock()
+            .expect("adaptive timeout samples lock should not be poisoned");
+        if guard.len() >= self.max_samples {
+            guard.pop_front();
+        }
+        guard.push_back(ms);
+    }
+
+    /// Return the current number of collected samples
+    pub fn sample_count(&self) -> usize {
+        self.samples
+            .lock()
+            .expect("adaptive timeout samples lock should not be poisoned")
+            .len()
     }
 
     /// Calculate adaptive timeout based on collected samples
     pub fn calculate_adaptive_timeout(&self) -> Duration {
-        if self.samples.is_empty() {
+        let guard = self
+            .samples
+            .lock()
+            .expect("adaptive timeout samples lock should not be poisoned");
+        if guard.is_empty() {
             return self.base_timeout;
         }
+        let mut sorted_samples: Vec<u64> = guard.iter().copied().collect();
+        drop(guard); // release lock before sorting
 
-        let mut sorted_samples = self.samples.clone();
         sorted_samples.sort_unstable();
 
         let index = ((sorted_samples.len() as f64 * self.percentile) as usize)
@@ -1208,12 +1249,34 @@ impl MessageMiddleware for AdaptiveTimeoutMiddleware {
             serde_json::json!(self.percentile),
         );
 
+        // Record dispatch timestamp so after_consume can measure round-trip latency
+        let dispatch_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        message.headers.extra.insert(
+            "x-dispatch-at".to_string(),
+            serde_json::json!(dispatch_at_ms),
+        );
+
         Ok(())
     }
 
-    async fn after_consume(&self, _message: &mut Message) -> Result<()> {
-        // In a real implementation, we would record the actual processing time here
-        // For now, this is a placeholder
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        if let Some(dispatch_at) = message
+            .headers
+            .extra
+            .get("x-dispatch-at")
+            .and_then(|v| v.as_u64())
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if now_ms >= dispatch_at {
+                self.add_sample(now_ms - dispatch_at);
+            }
+        }
         Ok(())
     }
 

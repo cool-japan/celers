@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Periodic task scheduler for CeleRS (Celery Beat equivalent)"
+readme = "README.md"
 keywords = ["celery", "scheduler", "cron", "periodic", "beat"]
 categories = ["asynchronous", "date-and-time"]
 
@@ -13,14 +14,16 @@ categories = ["asynchronous", "date-and-time"]
 async-trait = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+http = { workspace = true }
+oxihttp-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 # Core dependencies
-celers-core = { path = "../celers-core", version = "0.2.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+celers-core = { workspace = true }
 
 # Optional: Cron expression parsing
 cron = { workspace = true, optional = true }

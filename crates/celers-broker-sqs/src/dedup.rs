@@ -129,7 +129,7 @@ impl DeduplicationCache {
     pub fn is_duplicate(&mut self, key: &str, _strategy: DeduplicationStrategy) -> bool {
         self.cleanup_expired();
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cache.get_mut(key) {
             entry.seen_count += 1;
             true
@@ -146,7 +146,7 @@ impl DeduplicationCache {
     ///
     /// * `key` - Deduplication key to mark as processed
     pub fn mark_processed(&mut self, key: &str) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
 
         // Enforce max size by removing oldest entries
         if cache.len() >= self.max_size {
@@ -164,7 +164,7 @@ impl DeduplicationCache {
 
     /// Remove expired entries from the cache
     fn cleanup_expired(&mut self) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let now = SystemTime::now();
 
         cache.retain(|_, entry| {
@@ -194,12 +194,12 @@ impl DeduplicationCache {
 
     /// Get the current cache size
     pub fn size(&self) -> usize {
-        self.cache.lock().unwrap().len()
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Clear all entries from the cache
     pub fn clear(&mut self) {
-        self.cache.lock().unwrap().clear();
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Get statistics about duplicate detections
@@ -208,7 +208,7 @@ impl DeduplicationCache {
     pub fn duplicate_count(&self) -> usize {
         self.cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|entry| entry.seen_count > 1)
             .count()
@@ -408,7 +408,7 @@ mod tests {
         cache.is_duplicate("msg-1", DeduplicationStrategy::MessageId);
 
         // Verify seen count is tracked (3 times: 1 mark + 2 is_duplicate)
-        let cache_data = cache.cache.lock().unwrap();
+        let cache_data = cache.cache.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(cache_data.get("msg-1").unwrap().seen_count, 3);
     }
 }

@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Broker abstraction layer for CeleRS (inspired by Python Kombu)"
+readme = "README.md"
 keywords = ["celery", "kombu", "messaging", "amqp", "queue"]
 categories = ["network-programming", "asynchronous"]
 
@@ -17,8 +18,11 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 
+# Optional: hex encoding for the encryption middleware nonce header
+hex = { workspace = true, optional = true }
+
 # Core protocol
-celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+celers-protocol = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -35,6 +39,6 @@ compression = ["celers-protocol/gzip"]
 # Message signing middleware (requires celers-protocol signing feature)
 signing = ["celers-protocol/signing"]
 # Message encryption middleware (requires celers-protocol encryption feature)
-encryption = ["celers-protocol/encryption"]
+encryption = ["celers-protocol/encryption", "dep:hex"]
 # Enable all middleware features
 full = ["compression", "signing", "encryption"]

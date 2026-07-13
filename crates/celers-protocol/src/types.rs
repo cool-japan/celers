@@ -328,6 +328,15 @@ pub struct MessageHeaders {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<DateTime<Utc>>,
 
+    /// Message creation timestamp (UTC).
+    ///
+    /// Set automatically when a message is created via
+    /// [`MessageHeaders::new`]. Used to compute the message age. This field is
+    /// optional and `#[serde(default)]` so that messages produced by other
+    /// (older) protocol implementations that omit it deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+
     /// Additional custom headers
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -349,6 +358,7 @@ impl MessageHeaders {
             retries: None,
             eta: None,
             expires: None,
+            created_at: Some(Utc::now()),
             extra: HashMap::new(),
         }
     }
@@ -399,6 +409,13 @@ impl MessageHeaders {
     #[must_use]
     pub fn with_expires(mut self, expires: DateTime<Utc>) -> Self {
         self.expires = Some(expires);
+        self
+    }
+
+    /// Set the creation timestamp field (builder pattern)
+    #[must_use]
+    pub fn with_created_at(mut self, created_at: DateTime<Utc>) -> Self {
+        self.created_at = Some(created_at);
         self
     }
 

@@ -173,7 +173,7 @@ impl MetricsAggregator {
     pub fn task_count(&self, task_name: &str) -> usize {
         self.task_counts
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(task_name)
             .copied()
             .unwrap_or(0)
@@ -183,7 +183,7 @@ impl MetricsAggregator {
     pub fn error_count(&self, task_name: &str) -> usize {
         self.task_errors
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(task_name)
             .copied()
             .unwrap_or(0)
@@ -203,7 +203,7 @@ impl MetricsAggregator {
     pub fn mean_duration(&self, task_name: &str) -> f64 {
         self.task_durations
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(task_name)
             .map(|h| h.mean())
             .unwrap_or(0.0)
@@ -213,7 +213,7 @@ impl MetricsAggregator {
     pub fn percentile_duration(&self, task_name: &str, percentile: f64) -> f64 {
         self.task_durations
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(task_name)
             .map(|h| h.percentile(percentile))
             .unwrap_or(0.0)

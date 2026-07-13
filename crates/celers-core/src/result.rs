@@ -75,6 +75,116 @@ pub trait ResultStore: Send + Sync {
 
     /// Check if a result exists
     async fn has_result(&self, task_id: TaskId) -> crate::Result<bool>;
+
+    // ------------------------------------------------------------------
+    // Result tombstones (default no-op / "unsupported" implementations)
+    //
+    // These DEFAULT methods let a backend distinguish a *forgotten* result
+    // (one with a tombstone marker) from one that simply never existed.
+    // Backends that do not support tombstones inherit the defaults below
+    // unchanged, so existing implementations keep compiling.
+    // ------------------------------------------------------------------
+
+    /// Record a tombstone marking a result as explicitly deleted/forgotten.
+    ///
+    /// The default implementation is a no-op for backends that do not support
+    /// tombstones. Backends that do support them should override this to
+    /// persist the marker so it can later be distinguished from a result that
+    /// never existed.
+    async fn store_tombstone(&self, _tombstone: crate::ResultTombstone) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// Fetch the tombstone marker for a task, if one was recorded.
+    ///
+    /// The default implementation returns `Ok(None)` ("unsupported / not
+    /// recorded"). Backends that support tombstones should override this.
+    async fn get_tombstone(
+        &self,
+        _task_id: TaskId,
+    ) -> crate::Result<Option<crate::ResultTombstone>> {
+        Ok(None)
+    }
+
+    /// Returns `true` if a tombstone marker is recorded for the task.
+    ///
+    /// The default implementation derives the answer from [`Self::get_tombstone`],
+    /// so backends only need to override `get_tombstone`.
+    async fn has_tombstone(&self, task_id: TaskId) -> crate::Result<bool> {
+        Ok(self.get_tombstone(task_id).await?.is_some())
+    }
+
+    /// Resolve the tri-state existence of a result: present, tombstoned
+    /// (explicitly deleted), or absent (never existed).
+    ///
+    /// The default implementation combines [`Self::has_result`] and
+    /// [`Self::get_tombstone`]: a live result reports
+    /// [`crate::result_tombstone::ResultExistence::Present`], otherwise a
+    /// recorded tombstone reports
+    /// [`crate::result_tombstone::ResultExistence::Tombstoned`], otherwise
+    /// [`crate::result_tombstone::ResultExistence::Absent`]. Because the
+    /// default `get_tombstone` returns `None`, backends without tombstone
+    /// support will only ever distinguish present vs absent — which preserves
+    /// their previous behaviour.
+    async fn result_existence(
+        &self,
+        task_id: TaskId,
+    ) -> crate::Result<crate::result_tombstone::ResultExistence> {
+        if self.has_result(task_id).await? {
+            return Ok(crate::result_tombstone::ResultExistence::Present);
+        }
+        match self.get_tombstone(task_id).await? {
+            Some(tombstone) => Ok(crate::result_tombstone::ResultExistence::Tombstoned(
+                tombstone,
+            )),
+            None => Ok(crate::result_tombstone::ResultExistence::Absent),
+        }
+    }
+
+    /// Forget a result and simultaneously record a tombstone for it.
+    ///
+    /// The default implementation calls [`Self::forget`] followed by
+    /// [`Self::store_tombstone`]. Backends that need this to be atomic should
+    /// override it.
+    async fn forget_with_tombstone(&self, tombstone: crate::ResultTombstone) -> crate::Result<()> {
+        let task_id = tombstone.task_id;
+        self.forget(task_id).await?;
+        self.store_tombstone(tombstone).await
+    }
+
+    // ------------------------------------------------------------------
+    // Per-task-type result TTL (default "unsupported" hook)
+    // ------------------------------------------------------------------
+
+    /// Query the effective result TTL for a task type, given a per-task-type
+    /// TTL configuration.
+    ///
+    /// The default implementation simply resolves the TTL from the supplied
+    /// [`crate::result_ttl::ResultTtlConfig`] (per-task override, else default
+    /// fallback) without touching the backend. Backends that store their own
+    /// per-task TTL policy may override this to consult that policy instead.
+    async fn result_ttl_for(
+        &self,
+        config: &crate::result_ttl::ResultTtlConfig,
+        task_name: &str,
+    ) -> crate::Result<Option<Duration>> {
+        Ok(config.ttl_for(task_name))
+    }
+
+    /// Apply a per-task-type TTL to an already-stored result.
+    ///
+    /// The default implementation is a no-op returning `Ok(false)` to signal
+    /// that the backend did not apply any expiry ("unsupported"). Backends
+    /// with native key-expiry (e.g. Redis) should override this to set the
+    /// expiry derived from `config` for `task_name` and return `Ok(true)`.
+    async fn apply_result_ttl(
+        &self,
+        _task_id: TaskId,
+        _config: &crate::result_ttl::ResultTtlConfig,
+        _task_name: &str,
+    ) -> crate::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Task result value stored in backend
@@ -641,7 +751,7 @@ impl ResultChunk {
 }
 
 /// Result tombstone marker for deleted tasks
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultTombstone {
     /// Task ID
     pub task_id: TaskId,
@@ -728,7 +838,11 @@ pub trait ExtendedResultStore: ResultStore {
 
     /// Check if a task has a tombstone
     async fn has_tombstone(&self, task_id: TaskId) -> crate::Result<bool> {
-        Ok(self.get_tombstone(task_id).await?.is_some())
+        // Disambiguate from the `ResultStore::get_tombstone` default method,
+        // which is also in scope because `ExtendedResultStore: ResultStore`.
+        Ok(ExtendedResultStore::get_tombstone(self, task_id)
+            .await?
+            .is_some())
     }
 
     /// Cleanup expired results
@@ -866,8 +980,14 @@ mod tests {
         }
 
         fn set_result(&self, task_id: TaskId, result: TaskResultValue, state: TaskState) {
-            self.results.lock().unwrap().insert(task_id, result);
-            self.states.lock().unwrap().insert(task_id, state);
+            self.results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(task_id, result);
+            self.states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(task_id, state);
         }
     }
 
@@ -878,32 +998,50 @@ mod tests {
             task_id: TaskId,
             result: TaskResultValue,
         ) -> crate::Result<()> {
-            self.results.lock().unwrap().insert(task_id, result);
+            self.results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(task_id, result);
             Ok(())
         }
 
         async fn get_result(&self, task_id: TaskId) -> crate::Result<Option<TaskResultValue>> {
-            Ok(self.results.lock().unwrap().get(&task_id).cloned())
+            Ok(self
+                .results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&task_id)
+                .cloned())
         }
 
         async fn get_state(&self, task_id: TaskId) -> crate::Result<TaskState> {
             Ok(self
                 .states
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(&task_id)
                 .cloned()
                 .unwrap_or(TaskState::Pending))
         }
 
         async fn forget(&self, task_id: TaskId) -> crate::Result<()> {
-            self.results.lock().unwrap().remove(&task_id);
-            self.states.lock().unwrap().remove(&task_id);
+            self.results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&task_id);
+            self.states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&task_id);
             Ok(())
         }
 
         async fn has_result(&self, task_id: TaskId) -> crate::Result<bool> {
-            Ok(self.results.lock().unwrap().contains_key(&task_id))
+            Ok(self
+                .results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&task_id))
         }
     }
 

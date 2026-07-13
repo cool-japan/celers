@@ -35,11 +35,80 @@
 //! # }
 //! ```
 
-use celers_core::{CelersError, Result, SerializedTask};
+use celers_core::{CelersError, Result, SerializedTask, TaskState};
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::debug;
+
+/// Extract the failure reason recorded on a task, if present.
+///
+/// Tasks that reach the DLQ carry their failure information in their state.
+/// `TaskState::Failed(message)` holds the actual error message produced by the
+/// worker (the "task result"), which is what analytics should classify on.
+fn failure_reason(task: &SerializedTask) -> Option<String> {
+    match &task.metadata.state {
+        TaskState::Failed(message) => Some(message.clone()),
+        TaskState::Retrying(attempts) => {
+            Some(format!("retry attempts exhausted after {attempts} tries"))
+        }
+        TaskState::Rejected => Some("task rejected".to_string()),
+        TaskState::Revoked => Some("task revoked".to_string()),
+        TaskState::Custom {
+            name,
+            metadata: Some(meta),
+        } => Some(format!("{name}: {}", String::from_utf8_lossy(meta))),
+        TaskState::Custom {
+            name,
+            metadata: None,
+        } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Normalize an error message into a stable signature for clustering.
+///
+/// Variable substrings (numbers, hex IDs, quoted literals, file paths) are
+/// replaced with placeholders so that, e.g.,
+/// `Connection refused (os error 111)` and `Connection refused (os error 104)`
+/// collapse to the same signature. The result is lowercased and whitespace is
+/// collapsed.
+fn normalize_error_signature(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    let mut last_was_space = false;
+
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            // Collapse any run of digits into a single placeholder.
+            while matches!(chars.peek(), Some(d) if d.is_ascii_digit()) {
+                chars.next();
+            }
+            out.push('#');
+            last_was_space = false;
+        } else if c == '\'' || c == '"' {
+            // Drop quoted literals (typically variable identifiers/values).
+            while let Some(&n) = chars.peek() {
+                chars.next();
+                if n == c {
+                    break;
+                }
+            }
+            out.push('?');
+            last_was_space = false;
+        } else if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.extend(c.to_lowercase());
+            last_was_space = false;
+        }
+    }
+
+    out.trim().to_string()
+}
 
 /// DLQ failure pattern detection and analysis
 #[derive(Debug, Clone)]
@@ -425,18 +494,77 @@ impl DLQAnalyzer {
         })
     }
 
-    /// Classify error from task metadata
+    /// Classify a task's error type from its recorded failure result.
+    ///
+    /// The primary source of truth is the error message captured on the task
+    /// state (`TaskState::Failed`). When the message names an explicit exception
+    /// type (e.g. `ConnectionError: ...`, `TimeoutError`) that type is used
+    /// verbatim; otherwise the message keywords are mapped to a canonical error
+    /// name. The task name is only used as a last-resort hint when no failure
+    /// reason is recorded.
     fn classify_error(&self, task: &SerializedTask) -> String {
-        // Extract error type from task name or metadata
-        // This is a simplified implementation - in production, you'd extract from task result
-        if task.metadata.name.contains("timeout") {
+        let reason = failure_reason(task);
+
+        // Prefer an explicit exception type embedded in the message, e.g.
+        // "ValueError: bad input" or "redis.ConnectionError: ...".
+        if let Some(message) = &reason {
+            if let Some(explicit) = Self::extract_exception_name(message) {
+                return explicit;
+            }
+        }
+
+        // Fall back to keyword classification over the error message (or the
+        // task name if no failure reason is present).
+        let haystack = reason
+            .unwrap_or_else(|| task.metadata.name.clone())
+            .to_lowercase();
+
+        if haystack.contains("timeout") || haystack.contains("timed out") {
             "TimeoutError".to_string()
-        } else if task.metadata.name.contains("network") {
+        } else if haystack.contains("network")
+            || haystack.contains("connection")
+            || haystack.contains("unreachable")
+            || haystack.contains("refused")
+        {
             "NetworkError".to_string()
-        } else if task.metadata.name.contains("validation") {
+        } else if haystack.contains("validation")
+            || haystack.contains("invalid")
+            || haystack.contains("parse")
+        {
             "ValidationError".to_string()
+        } else if haystack.contains("memory") || haystack.contains("resource") {
+            "ResourceError".to_string()
+        } else if haystack.contains("corrupt") || haystack.contains("checksum") {
+            "DataCorruptionError".to_string()
         } else {
             "UnknownError".to_string()
+        }
+    }
+
+    /// Pull an explicit exception type name from the start of an error message.
+    ///
+    /// Recognizes the common `SomeError: details` / `module.SomeError: details`
+    /// convention. Returns the (unqualified) exception name when it looks like a
+    /// real error type (ends in `Error`/`Exception` or is CamelCase), otherwise
+    /// `None`.
+    fn extract_exception_name(message: &str) -> Option<String> {
+        let head = message.split(':').next()?.trim();
+        if head.is_empty() || head.contains(char::is_whitespace) {
+            return None;
+        }
+
+        // Use the last path segment so "redis.exceptions.ConnectionError" -> "ConnectionError".
+        let name = head.rsplit('.').next().unwrap_or(head);
+
+        let looks_like_error = name.ends_with("Error")
+            || name.ends_with("Exception")
+            || (name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && name.chars().any(|c| c.is_ascii_lowercase()));
+
+        if looks_like_error {
+            Some(name.to_string())
+        } else {
+            None
         }
     }
 
@@ -461,11 +589,25 @@ impl DLQAnalyzer {
         }
     }
 
-    /// Extract error signature for clustering
+    /// Extract a normalized error signature for clustering similar failures.
+    ///
+    /// Uses the recorded failure message and strips variable substrings
+    /// (numbers, quoted identifiers, …) so that semantically identical failures
+    /// with differing details collapse to one cluster. The task name is
+    /// prepended as a namespace so the same error from different task types is
+    /// not conflated. Falls back to the task name when no failure reason exists.
     fn extract_error_signature(&self, task: &SerializedTask) -> String {
-        // Simplified: use task name as signature
-        // In production, extract from error message and normalize
-        task.metadata.name.clone()
+        match failure_reason(task) {
+            Some(message) => {
+                let normalized = normalize_error_signature(&message);
+                if normalized.is_empty() {
+                    task.metadata.name.clone()
+                } else {
+                    format!("{}::{}", task.metadata.name, normalized)
+                }
+            }
+            None => task.metadata.name.clone(),
+        }
     }
 }
 
@@ -498,5 +640,115 @@ mod tests {
     fn test_failure_trend_values() {
         assert_eq!(FailureTrend::Increasing, FailureTrend::Increasing);
         assert_ne!(FailureTrend::Increasing, FailureTrend::Decreasing);
+    }
+
+    /// Build a failed task whose state carries a specific error message.
+    fn failed_task(name: &str, error: &str) -> SerializedTask {
+        let mut task = SerializedTask::new(name.to_string(), vec![]);
+        task.metadata.state = TaskState::Failed(error.to_string());
+        task
+    }
+
+    /// `Client::open` only parses the URL; it does not open a connection, so
+    /// this is safe to build in unit tests without a live Redis.
+    fn test_analyzer() -> DLQAnalyzer {
+        let client =
+            Client::open("redis://localhost:6379").expect("valid redis url should parse in tests");
+        DLQAnalyzer {
+            client,
+            queue_name: "test_queue".to_string(),
+            dlq_key: "test_queue:dlq".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_failure_reason_from_state() {
+        let task = failed_task("send", "TimeoutError: deadline exceeded");
+        assert_eq!(
+            failure_reason(&task).as_deref(),
+            Some("TimeoutError: deadline exceeded")
+        );
+
+        let pending = SerializedTask::new("noop".to_string(), vec![]);
+        assert!(failure_reason(&pending).is_none());
+    }
+
+    #[test]
+    fn test_classify_error_uses_recorded_message() {
+        let analyzer = test_analyzer();
+
+        // The task name is generic, but the error message identifies the type.
+        let task = failed_task("run_job", "Connection refused (os error 111)");
+        assert_eq!(analyzer.classify_error(&task), "NetworkError");
+
+        // Explicit exception type, even with a module path, is used verbatim.
+        let task = failed_task("run_job", "redis.exceptions.ConnectionError: down");
+        assert_eq!(analyzer.classify_error(&task), "ConnectionError");
+
+        let task = failed_task("run_job", "ValueError: bad payload");
+        assert_eq!(analyzer.classify_error(&task), "ValueError");
+
+        // Keyword fallback when no explicit exception name is present.
+        let task = failed_task("run_job", "request timed out after waiting");
+        assert_eq!(analyzer.classify_error(&task), "TimeoutError");
+
+        // No recorded failure -> falls back to the task name hint.
+        let task = SerializedTask::new("network_sync".to_string(), vec![]);
+        assert_eq!(analyzer.classify_error(&task), "NetworkError");
+    }
+
+    #[test]
+    fn test_extract_exception_name() {
+        assert_eq!(
+            DLQAnalyzer::extract_exception_name("ValueError: x"),
+            Some("ValueError".to_string())
+        );
+        assert_eq!(
+            DLQAnalyzer::extract_exception_name("pkg.mod.CustomException: boom"),
+            Some("CustomException".to_string())
+        );
+        // A plain sentence is not an exception name.
+        assert_eq!(
+            DLQAnalyzer::extract_exception_name("something went wrong"),
+            None
+        );
+        // Single lowercase token is not an error type.
+        assert_eq!(DLQAnalyzer::extract_exception_name("oops: details"), None);
+    }
+
+    #[test]
+    fn test_normalize_error_signature_collapses_variables() {
+        // Differing numeric codes collapse to the same signature.
+        let a = normalize_error_signature("Connection refused (os error 111)");
+        let b = normalize_error_signature("Connection refused (os error 104)");
+        assert_eq!(a, b);
+        assert_eq!(a, "connection refused (os error #)");
+
+        // Quoted identifiers are replaced.
+        let s = normalize_error_signature("KeyError: 'user_id' not found");
+        assert_eq!(s, "keyerror: ? not found");
+    }
+
+    #[test]
+    fn test_extract_error_signature_clusters_similar_failures() {
+        let analyzer = test_analyzer();
+
+        let t1 = failed_task("fetch", "Connection refused (os error 111)");
+        let t2 = failed_task("fetch", "Connection refused (os error 104)");
+        // Same task + same normalized error => identical signature (clusters).
+        assert_eq!(
+            analyzer.extract_error_signature(&t1),
+            analyzer.extract_error_signature(&t2)
+        );
+
+        // Same error but a different task type must not be conflated.
+        let t3 = failed_task("store", "Connection refused (os error 111)");
+        assert_ne!(
+            analyzer.extract_error_signature(&t1),
+            analyzer.extract_error_signature(&t3)
+        );
+
+        // Signature is namespaced by task name.
+        assert!(analyzer.extract_error_signature(&t1).starts_with("fetch::"));
     }
 }

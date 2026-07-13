@@ -27,7 +27,7 @@ impl ResourceUtilization {
             network_io: network_io.clamp(0.0, 1.0),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs(),
         }
     }
@@ -132,7 +132,7 @@ impl WorkflowResourceMonitor {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         let cutoff = now.saturating_sub(window_seconds);
 
@@ -262,7 +262,7 @@ impl MockTaskExecutor {
     pub fn execute(&mut self, task_name: &str) -> Result<serde_json::Value, String> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         self.execution_history
             .push((task_name.to_string(), timestamp));

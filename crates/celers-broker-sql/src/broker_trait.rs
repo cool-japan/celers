@@ -3,10 +3,11 @@
 //! Implements the core `Broker` trait from celers-core.
 
 use crate::broker_core::MysqlBroker;
+use crate::row_ext::RowExt;
 use async_trait::async_trait;
 use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
+use oxisql_core::Connection;
 use serde_json::json;
-use sqlx::Row;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
@@ -32,23 +33,29 @@ impl Broker for MysqlBroker {
                 }
             }
         }
+        let db_metadata_str =
+            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
 
-        sqlx::query(
-            r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
-            "#,
-        )
-        .bind(task_id.to_string())
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string()))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                "#,
+                &[
+                    &task_id.to_string(),
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &db_metadata_str,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
+
+        self.enqueue_count.fetch_add(1, Ordering::Relaxed);
 
         #[cfg(feature = "metrics")]
         {
@@ -70,36 +77,45 @@ impl Broker for MysqlBroker {
         // Use FOR UPDATE SKIP LOCKED to atomically claim a task
         // This is the magic that makes distributed workers work without contention
         let mut tx = self
-            .pool
-            .begin()
+            .connection()
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
-        let row = sqlx::query(
-            r#"
-            SELECT id, task_name, payload, retry_count
-            FROM celers_tasks
-            WHERE state = 'pending'
-              AND scheduled_at <= NOW()
-            ORDER BY priority DESC, created_at ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
+        let rows = tx
+            .query(
+                r#"
+                SELECT id, task_name, payload, retry_count
+                FROM celers_tasks
+                WHERE state = 'pending'
+                  AND scheduled_at <= NOW()
+                ORDER BY priority DESC, created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
 
-        if let Some(row) = row {
-            let task_id_str: String = row.get("id");
+        if let Some(row) = rows.into_iter().next() {
+            let task_id_str: String = row
+                .col("id")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
             let _task_id = Uuid::parse_str(&task_id_str)
                 .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
-            let task_name: String = row.get("task_name");
-            let payload: Vec<u8> = row.get("payload");
-            let retry_count: i32 = row.get("retry_count");
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
+            let payload: Vec<u8> = row
+                .col("payload")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
 
             // Mark as processing
-            sqlx::query(
+            tx.execute(
                 r#"
                 UPDATE celers_tasks
                 SET state = 'processing',
@@ -107,9 +123,8 @@ impl Broker for MysqlBroker {
                     retry_count = retry_count + 1
                 WHERE id = ?
                 "#,
+                &[&task_id_str],
             )
-            .bind(&task_id_str)
-            .execute(&mut *tx)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to mark task as processing: {}", e)))?;
 
@@ -130,18 +145,18 @@ impl Broker for MysqlBroker {
     }
 
     async fn ack(&self, task_id: &TaskId, _receipt_handle: Option<&str>) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'completed',
-                completed_at = NOW()
-            WHERE id = ?
-            "#,
-        )
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to ack task: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'completed',
+                    completed_at = NOW()
+                WHERE id = ?
+                "#,
+                &[&task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to ack task: {}", e)))?;
 
         // Optionally delete completed tasks after a retention period
         // For now, we keep them for auditing
@@ -157,20 +172,29 @@ impl Broker for MysqlBroker {
     ) -> Result<()> {
         if requeue {
             // Check if task has exceeded max retries
-            let row = sqlx::query(
-                r#"
-                SELECT retry_count, max_retries
-                FROM celers_tasks
-                WHERE id = ?
-                "#,
-            )
-            .bind(task_id.to_string())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to fetch task: {}", e)))?;
+            let rows = self
+                .connection()
+                .query(
+                    r#"
+                    SELECT retry_count, max_retries
+                    FROM celers_tasks
+                    WHERE id = ?
+                    "#,
+                    &[&task_id.to_string()],
+                )
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to fetch task: {}", e)))?;
+            let row = rows
+                .into_iter()
+                .next()
+                .ok_or_else(|| CelersError::Other(format!("Task {task_id} not found")))?;
 
-            let retry_count: i32 = row.get("retry_count");
-            let max_retries: i32 = row.get("max_retries");
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| CelersError::Other(format!("Failed to fetch task: {e}")))?;
+            let max_retries: i32 = row
+                .col("max_retries")
+                .map_err(|e| CelersError::Other(format!("Failed to fetch task: {e}")))?;
 
             if retry_count >= max_retries {
                 // Move to DLQ
@@ -179,72 +203,80 @@ impl Broker for MysqlBroker {
                 // Requeue with exponential backoff
                 let backoff_seconds = 2_i64.pow(retry_count as u32).min(3600); // Max 1 hour
 
-                sqlx::query(
-                    r#"
-                    UPDATE celers_tasks
-                    SET state = 'pending',
-                        scheduled_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
-                        started_at = NULL,
-                        worker_id = NULL
-                    WHERE id = ?
-                    "#,
-                )
-                .bind(backoff_seconds)
-                .bind(task_id.to_string())
-                .execute(&self.pool)
-                .await
-                .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
+                self.connection()
+                    .execute(
+                        r#"
+                        UPDATE celers_tasks
+                        SET state = 'pending',
+                            scheduled_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
+                            started_at = NULL,
+                            worker_id = NULL
+                        WHERE id = ?
+                        "#,
+                        &[&backoff_seconds, &task_id.to_string()],
+                    )
+                    .await
+                    .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
             }
         } else {
             // Mark as failed permanently
-            sqlx::query(
-                r#"
-                UPDATE celers_tasks
-                SET state = 'failed',
-                    completed_at = NOW()
-                WHERE id = ?
-                "#,
-            )
-            .bind(task_id.to_string())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to mark task as failed: {}", e)))?;
+            self.connection()
+                .execute(
+                    r#"
+                    UPDATE celers_tasks
+                    SET state = 'failed',
+                        completed_at = NOW()
+                    WHERE id = ?
+                    "#,
+                    &[&task_id.to_string()],
+                )
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to mark task as failed: {}", e)))?;
         }
 
         Ok(())
     }
 
     async fn queue_size(&self) -> Result<usize> {
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(*) as count
-            FROM celers_tasks
-            WHERE state = 'pending'
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get queue size: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT COUNT(*) as count
+                FROM celers_tasks
+                WHERE state = 'pending'
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get queue size: {}", e)))?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| CelersError::Other("queue_size: query returned no rows".into()))?;
 
-        let count: i64 = row.get("count");
+        let count: i64 = row
+            .col("count")
+            .map_err(|e| CelersError::Other(format!("Failed to get queue size: {e}")))?;
         Ok(count as usize)
     }
 
     async fn cancel(&self, task_id: &TaskId) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'cancelled',
-                completed_at = NOW()
-            WHERE id = ? AND state IN ('pending', 'processing')
-            "#,
-        )
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to cancel task: {}", e)))?;
+        let affected = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'cancelled',
+                    completed_at = NOW()
+                WHERE id = ? AND state IN ('pending', 'processing')
+                "#,
+                &[&task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to cancel task: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Schedule a task for execution at a specific Unix timestamp (seconds)
@@ -266,30 +298,36 @@ impl Broker for MysqlBroker {
                 }
             }
         }
+        let db_metadata_str =
+            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
 
-        // Convert Unix timestamp to MySQL TIMESTAMP
+        // Convert Unix timestamp to MySQL DATETIME text form — see
+        // `row_ext.rs`'s "DateTime<Utc> parameter convention (MySQL)"
+        // section (`%Y-%m-%d %H:%M:%S`, no `T`/timezone suffix).
         let scheduled_at = chrono::DateTime::from_timestamp(execute_at, 0)
             .ok_or_else(|| CelersError::Other("Invalid timestamp".to_string()))?
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
 
-        sqlx::query(
-            r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), ?)
-            "#,
-        )
-        .bind(task_id.to_string())
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string()))
-        .bind(scheduled_at)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue delayed task: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), ?)
+                "#,
+                &[
+                    &task_id.to_string(),
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &db_metadata_str,
+                    &scheduled_at,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue delayed task: {}", e)))?;
 
         #[cfg(feature = "metrics")]
         {
@@ -321,24 +359,28 @@ impl Broker for MysqlBroker {
                 }
             }
         }
+        let db_metadata_str =
+            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
 
-        sqlx::query(
-            r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? SECOND))
-            "#,
-        )
-        .bind(task_id.to_string())
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string()))
-        .bind(delay_secs as i64)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue delayed task: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? SECOND))
+                "#,
+                &[
+                    &task_id.to_string(),
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &db_metadata_str,
+                    &(delay_secs as i64),
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue delayed task: {}", e)))?;
 
         #[cfg(feature = "metrics")]
         {
@@ -382,13 +424,13 @@ impl Broker for MysqlBroker {
             placeholders
         );
 
-        let mut query = sqlx::query(&query_str);
-        for task_id in task_ids {
-            query = query.bind(task_id);
-        }
+        let param_refs: Vec<&dyn oxisql_core::ToSqlValue> = task_ids
+            .iter()
+            .map(|s| s as &dyn oxisql_core::ToSqlValue)
+            .collect();
 
-        query
-            .execute(&self.pool)
+        self.connection()
+            .execute(&query_str, &param_refs)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to batch ack tasks: {}", e)))?;
 

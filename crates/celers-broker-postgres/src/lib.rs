@@ -97,6 +97,8 @@
 // Core modules
 mod broker_core;
 mod broker_trait;
+pub mod row_ext;
+pub mod tls_mode;
 pub mod types;
 
 // Feature modules

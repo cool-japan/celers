@@ -164,7 +164,10 @@ impl ObservabilityHooks {
     where
         F: Fn(&OperationEvent) + Send + Sync + 'static,
     {
-        self.hooks.lock().unwrap().push(Arc::new(hook));
+        self.hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(hook));
     }
 
     /// Register a hook for publish events
@@ -172,11 +175,14 @@ impl ObservabilityHooks {
     where
         F: Fn(&OperationEvent) + Send + Sync + 'static,
     {
-        self.hooks.lock().unwrap().push(Arc::new(move |event| {
-            if event.event_type == EventType::Publish {
-                hook(event);
-            }
-        }));
+        self.hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(move |event| {
+                if event.event_type == EventType::Publish {
+                    hook(event);
+                }
+            }));
     }
 
     /// Register a hook for consume events
@@ -184,11 +190,14 @@ impl ObservabilityHooks {
     where
         F: Fn(&OperationEvent) + Send + Sync + 'static,
     {
-        self.hooks.lock().unwrap().push(Arc::new(move |event| {
-            if event.event_type == EventType::Consume {
-                hook(event);
-            }
-        }));
+        self.hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(move |event| {
+                if event.event_type == EventType::Consume {
+                    hook(event);
+                }
+            }));
     }
 
     /// Register a hook for acknowledgment events
@@ -196,11 +205,14 @@ impl ObservabilityHooks {
     where
         F: Fn(&OperationEvent) + Send + Sync + 'static,
     {
-        self.hooks.lock().unwrap().push(Arc::new(move |event| {
-            if event.event_type == EventType::Ack {
-                hook(event);
-            }
-        }));
+        self.hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(move |event| {
+                if event.event_type == EventType::Ack {
+                    hook(event);
+                }
+            }));
     }
 
     /// Register a hook for error events
@@ -208,11 +220,14 @@ impl ObservabilityHooks {
     where
         F: Fn(&OperationEvent) + Send + Sync + 'static,
     {
-        self.hooks.lock().unwrap().push(Arc::new(move |event| {
-            if event.event_type == EventType::Error {
-                hook(event);
-            }
-        }));
+        self.hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(move |event| {
+                if event.event_type == EventType::Error {
+                    hook(event);
+                }
+            }));
     }
 
     /// Trigger all registered hooks
@@ -221,7 +236,7 @@ impl ObservabilityHooks {
     ///
     /// * `event` - Event to trigger hooks for
     pub fn trigger(&self, event: &OperationEvent) {
-        let hooks = self.hooks.lock().unwrap();
+        let hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
         for hook in hooks.iter() {
             hook(event);
         }
@@ -257,12 +272,12 @@ impl ObservabilityHooks {
 
     /// Get number of registered hooks
     pub fn hook_count(&self) -> usize {
-        self.hooks.lock().unwrap().len()
+        self.hooks.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Clear all registered hooks
     pub fn clear(&mut self) {
-        self.hooks.lock().unwrap().clear();
+        self.hooks.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -323,64 +338,100 @@ impl MetricsCollector {
 
     /// Record a publish operation
     pub fn record_publish(&self, message_count: usize) {
-        *self.total_publishes.lock().unwrap() += 1;
-        *self.total_messages_published.lock().unwrap() += message_count as u64;
+        *self
+            .total_publishes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .total_messages_published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += message_count as u64;
     }
 
     /// Record a consume operation
     pub fn record_consume(&self, message_count: usize) {
-        *self.total_consumes.lock().unwrap() += 1;
-        *self.total_messages_consumed.lock().unwrap() += message_count as u64;
+        *self
+            .total_consumes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .total_messages_consumed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) += message_count as u64;
     }
 
     /// Record an acknowledgment
     pub fn record_ack(&self, _message_count: usize) {
-        *self.total_acks.lock().unwrap() += 1;
+        *self.total_acks.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
 
     /// Record an error
     pub fn record_error(&self) {
-        *self.total_errors.lock().unwrap() += 1;
+        *self.total_errors.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }
 
     /// Get total publish operations
     pub fn total_publishes(&self) -> u64 {
-        *self.total_publishes.lock().unwrap()
+        *self
+            .total_publishes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get total consume operations
     pub fn total_consumes(&self) -> u64 {
-        *self.total_consumes.lock().unwrap()
+        *self
+            .total_consumes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get total acknowledgments
     pub fn total_acks(&self) -> u64 {
-        *self.total_acks.lock().unwrap()
+        *self.total_acks.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get total errors
     pub fn total_errors(&self) -> u64 {
-        *self.total_errors.lock().unwrap()
+        *self.total_errors.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get total messages published
     pub fn total_messages_published(&self) -> u64 {
-        *self.total_messages_published.lock().unwrap()
+        *self
+            .total_messages_published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get total messages consumed
     pub fn total_messages_consumed(&self) -> u64 {
-        *self.total_messages_consumed.lock().unwrap()
+        *self
+            .total_messages_consumed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Reset all metrics
     pub fn reset(&self) {
-        *self.total_publishes.lock().unwrap() = 0;
-        *self.total_consumes.lock().unwrap() = 0;
-        *self.total_acks.lock().unwrap() = 0;
-        *self.total_errors.lock().unwrap() = 0;
-        *self.total_messages_published.lock().unwrap() = 0;
-        *self.total_messages_consumed.lock().unwrap() = 0;
+        *self
+            .total_publishes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 0;
+        *self
+            .total_consumes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 0;
+        *self.total_acks.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        *self.total_errors.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        *self
+            .total_messages_published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 0;
+        *self
+            .total_messages_consumed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = 0;
     }
 
     /// Create observability hooks that update this collector
@@ -441,11 +492,11 @@ mod tests {
         let called_clone = called.clone();
 
         hooks.on_publish(move |_event| {
-            *called_clone.lock().unwrap() = true;
+            *called_clone.lock().unwrap_or_else(|e| e.into_inner()) = true;
         });
 
         hooks.trigger_publish("test-queue", 1, true);
-        assert!(*called.lock().unwrap());
+        assert!(*called.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     #[test]
@@ -455,11 +506,11 @@ mod tests {
         let called_clone = called.clone();
 
         hooks.on_consume(move |_event| {
-            *called_clone.lock().unwrap() = true;
+            *called_clone.lock().unwrap_or_else(|e| e.into_inner()) = true;
         });
 
         hooks.trigger_consume("test-queue", 5, Duration::from_millis(100));
-        assert!(*called.lock().unwrap());
+        assert!(*called.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     #[test]
@@ -469,11 +520,11 @@ mod tests {
         let called_clone = called.clone();
 
         hooks.on_error(move |_event| {
-            *called_clone.lock().unwrap() = true;
+            *called_clone.lock().unwrap_or_else(|e| e.into_inner()) = true;
         });
 
         hooks.trigger_error("test-queue", "Test error");
-        assert!(*called.lock().unwrap());
+        assert!(*called.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     #[test]

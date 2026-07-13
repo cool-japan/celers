@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Command-line interface for CeleRS worker and queue management"
+readme = "README.md"
 keywords = ["celery", "cli", "worker", "queue", "management"]
 categories = ["asynchronous", "command-line-utilities"]
 
@@ -14,35 +15,49 @@ name = "celers"
 path = "src/main.rs"
 
 [dependencies]
-celers-core = { path = "../celers-core", version = "0.2.0" }
-celers-worker = { path = "../celers-worker", version = "0.2.0" }
-celers-broker-redis = { path = "../celers-broker-redis", version = "0.2.0" }
-celers-broker-postgres = { path = "../celers-broker-postgres", version = "0.2.0" }
-celers-metrics = { path = "../celers-metrics", version = "0.2.0" }
+celers-beat.workspace = true
+celers-core = { workspace = true }
+celers-worker = { workspace = true }
+celers-broker-redis = { workspace = true }
+celers-broker-postgres = { workspace = true }
+celers-metrics = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 clap_mangen = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 uuid = { workspace = true }
 redis = { workspace = true }
 chrono = { workspace = true }
-sqlx = { workspace = true }
+oxisql-core = { workspace = true }
+oxisql-postgres = { workspace = true }
+oxisql-mysql = { workspace = true }
+oxitls = { workspace = true }
+rustls = { workspace = true }
 toml = { workspace = true }
 tabled = { workspace = true }
 colored = { workspace = true }
-reqwest = { workspace = true }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
+oxihttp-client = { workspace = true }
+url = { workspace = true }
 rustyline = { workspace = true }
 csv = { workspace = true }
 oxiarc-deflate = { workspace = true }
 oxiarc-archive = { workspace = true }
+dialoguer = { workspace = true }
 dirs = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "serialization"
+harness = false

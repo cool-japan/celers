@@ -1,8 +1,11 @@
 //! LISTEN/NOTIFY support for real-time task event notifications
 
 use celers_core::{CelersError, Result};
+use oxisql_core::Connection;
+use oxisql_postgres::{NotificationStream, PgConnection};
 use std::time::Duration;
 
+use crate::tls_mode;
 use crate::types::TaskNotification;
 use crate::PostgresBroker;
 
@@ -51,7 +54,22 @@ use crate::PostgresBroker;
 /// # }
 /// ```
 pub struct TaskNotificationListener {
-    listener: sqlx::postgres::PgListener,
+    /// The dedicated `PgConnection` this listener owns.
+    ///
+    /// Kept alive for the listener's whole lifetime (dropping it would tear
+    /// down the underlying `tokio_postgres::Connection` driver task that
+    /// forwards notifications into `stream`). Not read directly after
+    /// construction — `stream` is what's actually polled — but must stay
+    /// alive as long as `stream` does.
+    _conn: PgConnection,
+    /// The live subscription obtained from `PgConnection::listen`.
+    ///
+    /// `oxisql_postgres::notify::NotificationStream::recv_timeout` has a
+    /// built-in timeout (it loops internally against a deadline computed
+    /// from the passed `Duration`), so the manual `tokio::time::timeout`
+    /// wrapper the pre-migration `sqlx::postgres::PgListener`-based version
+    /// needed is dropped here — it would be redundant double-timeout logic.
+    stream: NotificationStream,
     channel: String,
 }
 
@@ -66,36 +84,57 @@ impl TaskNotificationListener {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<TaskNotification>> {
-        use tokio::time::timeout as tokio_timeout;
-
-        match tokio_timeout(timeout, self.listener.recv()).await {
-            Ok(Ok(notification)) => {
-                let payload: TaskNotification = serde_json::from_str(notification.payload())
+        // `recv_timeout` returns `None` on BOTH "timeout elapsed" and
+        // "the broadcast channel was closed" (the underlying connection
+        // driver task exited) — oxisql-postgres's `NotificationStream`
+        // does not distinguish these two cases in its return type (see
+        // `recv_timeout`'s doc comment in `oxisql-postgres/src/notify.rs`:
+        // "Returns `Some(notification)` if a matching notification arrives
+        // within the timeout, or `None` if the timeout elapses" — no
+        // separate error variant for a closed channel). This means a
+        // dropped/broken connection surfaces identically to a normal
+        // timeout (`Ok(None)`) rather than as an `Err(..)` here, which is a
+        // real (if narrow) observability gap versus the pre-migration
+        // `sqlx::postgres::PgListener`-based version — that version's
+        // `self.listener.recv()` returned a distinguishable `Err` from
+        // `sqlx` on a lost connection, which this rewrite's manual
+        // `tokio_timeout(...).await` mapped to `Err(CelersError::Other(...))`
+        // via its `Ok(Err(e))` arm (see the old code's second match arm).
+        // Flagged explicitly in the migration report; not silently
+        // downgraded to a TODO comment because it changes what callers can
+        // observe when the listener connection dies (a caller looping on
+        // `Ok(None)` "just keep waiting" will now loop forever on a dead
+        // connection instead of seeing an error break the loop, exactly the
+        // pattern this struct's own doc example above uses:
+        // `Err(e) => { eprintln!(...); break; }` never fires in that case).
+        match self.stream.recv_timeout(timeout).await {
+            Some(notification) => {
+                let payload: TaskNotification = serde_json::from_str(&notification.payload)
                     .map_err(|e| {
                         CelersError::Other(format!("Failed to parse notification: {}", e))
                     })?;
                 Ok(Some(payload))
             }
-            Ok(Err(e)) => Err(CelersError::Other(format!("Listener error: {}", e))),
-            Err(_) => Ok(None), // Timeout
+            None => Ok(None), // Timeout (or, per the caveat above, a closed connection)
         }
     }
 
     /// Try to receive a notification without blocking
     ///
     /// Returns immediately with either a notification or None.
+    ///
+    /// `oxisql_postgres::notify::NotificationStream` has no dedicated
+    /// non-blocking `try_recv` (unlike `sqlx::postgres::PgListener`, which
+    /// this method's pre-migration implementation called directly) — the
+    /// closest equivalent is `recv_timeout` with a zero duration, which
+    /// polls the underlying `tokio::sync::broadcast::Receiver` once and
+    /// returns immediately if nothing is queued (see `recv_timeout`'s
+    /// implementation: it computes a deadline `Instant::now() + timeout`
+    /// and returns `None` the instant `remaining` reaches zero, which for
+    /// `timeout = Duration::ZERO` is immediately on the first loop
+    /// iteration after, at most, one non-blocking poll).
     pub async fn try_recv_notification(&mut self) -> Result<Option<TaskNotification>> {
-        match self.listener.try_recv().await {
-            Ok(Some(notification)) => {
-                let payload: TaskNotification = serde_json::from_str(notification.payload())
-                    .map_err(|e| {
-                        CelersError::Other(format!("Failed to parse notification: {}", e))
-                    })?;
-                Ok(Some(payload))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(CelersError::Other(format!("Listener error: {}", e))),
-        }
+        self.wait_for_notification(Duration::ZERO).await
     }
 
     /// Get the channel name this listener is subscribed to
@@ -109,6 +148,14 @@ impl PostgresBroker {
     ///
     /// The listener will receive notifications when tasks are enqueued.
     /// Call `enable_notifications(true)` to start sending notifications.
+    ///
+    /// Opens a DEDICATED `PgConnection` (via `PostgresBroker::database_url`)
+    /// rather than reusing `PostgresBroker::conn` (the shared query
+    /// connection) — a long-lived LISTEN connection should not share the
+    /// query connection, per Postgres best practice, and this matches the
+    /// pre-migration `sqlx::postgres::PgListener::connect_with(&self.pool)`
+    /// behavior, which drew a fresh connection from the pool for the
+    /// listener rather than reusing a specific already-checked-out one.
     ///
     /// # Example
     ///
@@ -129,17 +176,38 @@ impl PostgresBroker {
     /// ```
     pub async fn create_notification_listener(&self) -> Result<TaskNotificationListener> {
         let channel = format!("celers_tasks_{}", self.queue_name);
-        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to create listener: {}", e)))?;
 
-        listener.listen(&channel).await.map_err(|e| {
+        // See `broker_core.rs`'s constructors for how the TLS mode is
+        // derived from `self.database_url`'s `sslmode` query parameter —
+        // same helper, same rationale: this dedicated LISTEN connection
+        // must not silently downgrade to plain-text when the broker's
+        // connection URL explicitly requested TLS.
+        let tls_mode = tls_mode::pg_tls_mode_for_url(&self.database_url).map_err(|e| {
+            CelersError::Other(format!(
+                "Failed to resolve TLS mode for LISTEN connection: {}",
+                e
+            ))
+        })?;
+        let conn = PgConnection::connect(&self.database_url, tls_mode)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!(
+                    "Failed to create dedicated LISTEN connection: {}",
+                    e
+                ))
+            })?;
+
+        let stream = conn.listen(&channel).await.map_err(|e| {
             CelersError::Other(format!("Failed to listen on channel {}: {}", channel, e))
         })?;
 
         tracing::info!(channel = %channel, "Created task notification listener");
 
-        Ok(TaskNotificationListener { listener, channel })
+        Ok(TaskNotificationListener {
+            _conn: conn,
+            stream,
+            channel,
+        })
     }
 
     /// Enable or disable NOTIFY on task enqueue
@@ -166,7 +234,18 @@ impl PostgresBroker {
         let channel = format!("celers_tasks_{}", self.queue_name);
 
         if enabled {
-            // Create trigger function if it doesn't exist
+            // Create trigger function if it doesn't exist.
+            //
+            // `channel` is interpolated directly into `pg_notify('{}', ...)`
+            // via `format!`, exactly as the pre-migration `sqlx::AssertSqlSafe`
+            // version did — this is a pre-existing, unchanged discipline
+            // question (not introduced by this migration): `channel` is
+            // built from `self.queue_name`, which is caller-supplied at
+            // `PostgresBroker::with_queue(..)` construction time, not a
+            // request-time value, and is never itself parameterized as a
+            // `$n` anywhere in this file either before or after this
+            // migration. Preserved byte-for-byte; not a new
+            // value-interpolation site introduced by this task.
             let function_sql = format!(
                 r#"
                 CREATE OR REPLACE FUNCTION notify_task_enqueued()
@@ -189,12 +268,9 @@ impl PostgresBroker {
                 channel
             );
 
-            sqlx::query(&function_sql)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    CelersError::Other(format!("Failed to create notification function: {}", e))
-                })?;
+            self.conn.execute(&function_sql, &[]).await.map_err(|e| {
+                CelersError::Other(format!("Failed to create notification function: {}", e))
+            })?;
 
             // Create trigger
             let trigger_sql = r#"
@@ -205,12 +281,9 @@ impl PostgresBroker {
                     EXECUTE FUNCTION notify_task_enqueued();
                 "#;
 
-            sqlx::query(trigger_sql)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    CelersError::Other(format!("Failed to create notification trigger: {}", e))
-                })?;
+            self.conn.execute(trigger_sql, &[]).await.map_err(|e| {
+                CelersError::Other(format!("Failed to create notification trigger: {}", e))
+            })?;
 
             tracing::info!(channel = %channel, "Enabled task notifications");
         } else {
@@ -219,12 +292,9 @@ impl PostgresBroker {
                 DROP TRIGGER IF EXISTS trigger_notify_task_enqueued ON celers_tasks;
                 "#;
 
-            sqlx::query(drop_sql)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    CelersError::Other(format!("Failed to disable notification trigger: {}", e))
-                })?;
+            self.conn.execute(drop_sql, &[]).await.map_err(|e| {
+                CelersError::Other(format!("Failed to disable notification trigger: {}", e))
+            })?;
 
             tracing::info!(channel = %channel, "Disabled task notifications");
         }
@@ -236,8 +306,12 @@ impl PostgresBroker {
     ///
     /// Returns true if the notification trigger exists, false otherwise.
     pub async fn notifications_enabled(&self) -> Result<bool> {
-        let exists: bool = sqlx::query_scalar(
-            r#"
+        use crate::row_ext::RowExt;
+
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT EXISTS (
                 SELECT 1
                 FROM pg_trigger
@@ -245,11 +319,25 @@ impl PostgresBroker {
                   AND tgrelid = 'celers_tasks'::regclass
             )
             "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to check notification status: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to check notification status: {}", e))
+            })?;
 
-        Ok(exists)
+        // .fetch_one (via query_scalar in the original): error if no row.
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to check notification status: no rows returned".to_string())
+        })?;
+        // Unaliased `EXISTS (...)` expression -> positional access, per the
+        // RowExt convention documented in `row_ext.rs` (Postgres assigns the
+        // implicit name `"exists"` to a bare `EXISTS(...)` subquery, which
+        // IS well-defined and stable, but `col_idx` is used here to avoid
+        // depending on that driver-assigned name at all, matching this
+        // crate's convention of only using `col` for genuinely
+        // aliased/named columns or single unadorned function calls).
+        row.col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to read exists: {}", e)))
     }
 }

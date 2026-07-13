@@ -1,10 +1,82 @@
 //! Worker management command implementations.
 
+use crate::cache::{CacheStats, TtlCache};
+use crate::config::CacheConfig;
+use crate::pool::pooled_redis_connection;
 use celers_broker_redis::{QueueMode, RedisBroker};
 use celers_worker::{wait_for_signal, Worker, WorkerConfig};
 use chrono::Utc;
 use colored::Colorize;
+use std::sync::OnceLock;
 use tabled::{settings::Style, Table, Tabled};
+
+/// A single row of [`list_workers`]'s output; cached as plain data (as
+/// opposed to a `Tabled` display type) so a cache hit can be rendered
+/// without importing any presentation concerns into [`TtlCache`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerListEntry {
+    id: String,
+    status: String,
+    last_heartbeat: String,
+}
+
+/// Cached snapshot of [`worker_stats`]'s computed metrics for one worker.
+/// Fields already carry their rendered `to_string()` form (matching the
+/// original inline rendering exactly), so caching never re-interprets a
+/// `serde_json::Value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerStatsSnapshot {
+    heartbeat: String,
+    tasks_processed: Option<String>,
+    tasks_failed: Option<String>,
+    uptime_seconds: Option<String>,
+}
+
+/// Process-wide TTL cache of [`list_workers`] results, keyed by broker URL.
+fn worker_list_cache() -> &'static TtlCache<String, Vec<WorkerListEntry>> {
+    static CACHE: OnceLock<TtlCache<String, Vec<WorkerListEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| TtlCache::new(CacheConfig::from_env_or_default().ttl()))
+}
+
+/// Process-wide TTL cache of [`worker_stats`] results, keyed by
+/// `(broker_url, worker_id)`.
+fn worker_stats_cache() -> &'static TtlCache<(String, String), WorkerStatsSnapshot> {
+    static CACHE: OnceLock<TtlCache<(String, String), WorkerStatsSnapshot>> = OnceLock::new();
+    CACHE.get_or_init(|| TtlCache::new(CacheConfig::from_env_or_default().ttl()))
+}
+
+/// Live hit/reuse statistics for [`worker_list_cache`] and
+/// [`worker_stats_cache`], in that order.
+///
+/// `pub(crate)` (not bare private) so this is reachable from outside the
+/// `commands` module tree. `commands::worker`'s own module declaration in
+/// `commands/mod.rs` stays a bare private `mod worker;` (out of scope for
+/// this change), so `crate::interactive` cannot name
+/// `crate::commands::worker::worker_cache_stats` directly; it instead goes
+/// through a re-export at `crate::commands::queue::worker_cache_stats` (see
+/// that re-export's doc comment for the full rationale).
+///
+/// As with `commands::queue`'s equivalent accessor, a normal one-shot
+/// `celers <command>` invocation exits long before these process-wide
+/// [`OnceLock`] counters could accumulate anything meaningful; the REPL's
+/// `stats` command (the one place a process stays alive across many
+/// commands) is where they are worth surfacing live.
+#[must_use]
+pub(crate) fn worker_cache_stats() -> (CacheStats, CacheStats) {
+    (worker_list_cache().stats(), worker_stats_cache().stats())
+}
+
+/// Drop any cached [`worker_stats`]/[`list_workers`] entries touching
+/// `worker_id` on `broker_url`.
+///
+/// Called after a command mutates worker state (stop, pause, resume, scale,
+/// drain) so the next read reflects the change instead of a stale cached
+/// snapshot, per the read/invalidate contract documented on
+/// [`crate::cache::TtlCache`].
+fn invalidate_worker_caches(broker_url: &str, worker_id: &str) {
+    worker_stats_cache().invalidate(&(broker_url.to_string(), worker_id.to_string()));
+    worker_list_cache().invalidate(&broker_url.to_string());
+}
 
 /// Start a worker with the given configuration.
 ///
@@ -111,11 +183,79 @@ pub async fn start_worker(
 
 /// List all running workers
 pub async fn list_workers(broker_url: &str) -> anyhow::Result<()> {
-    let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
-
     println!("{}", "=== Active Workers ===".bold().cyan());
     println!();
+
+    let cache_cfg = CacheConfig::from_env_or_default();
+    let cache_key = broker_url.to_string();
+
+    let (entries, served_from_cache) = if cache_cfg.enabled {
+        if let Some(cached) = worker_list_cache().get(&cache_key) {
+            (cached, true)
+        } else {
+            let fetched = fetch_worker_list(broker_url).await?;
+            worker_list_cache().insert(cache_key, fetched.clone());
+            (fetched, false)
+        }
+    } else {
+        (fetch_worker_list(broker_url).await?, false)
+    };
+
+    if entries.is_empty() {
+        println!("{}", "No active workers found".yellow());
+        println!();
+        println!("Workers register themselves when they start processing tasks.");
+        return Ok(());
+    }
+
+    #[derive(Tabled)]
+    struct WorkerInfo {
+        #[tabled(rename = "Worker ID")]
+        id: String,
+        #[tabled(rename = "Status")]
+        status: String,
+        #[tabled(rename = "Last Heartbeat")]
+        last_heartbeat: String,
+    }
+
+    let worker_count = entries.len();
+    let workers: Vec<WorkerInfo> = entries
+        .into_iter()
+        .map(|e| WorkerInfo {
+            id: e.id,
+            status: e.status,
+            last_heartbeat: e.last_heartbeat,
+        })
+        .collect();
+
+    let table = Table::new(workers).with(Style::rounded()).to_string();
+    println!("{table}");
+    println!();
+    println!(
+        "{}",
+        format!("Total active workers: {worker_count}")
+            .cyan()
+            .bold()
+    );
+    if served_from_cache {
+        println!(
+            "{}",
+            format!("(cached; ttl {}s)", cache_cfg.ttl_secs).dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+/// Fetch the live worker list from Redis.
+///
+/// Discovering candidate keys via `SCAN` is inherently sequential (each page
+/// depends on the previous page's cursor), but each worker's heartbeat
+/// lookup is completely independent of every other worker's — those lookups
+/// run concurrently via [`futures::future::join_all`] over cloned handles
+/// from the shared connection pool, rather than one round trip at a time.
+async fn fetch_worker_list(broker_url: &str) -> anyhow::Result<Vec<WorkerListEntry>> {
+    let mut conn = pooled_redis_connection(broker_url).await?;
 
     // Workers register themselves with a heartbeat key
     let worker_pattern = "celers:worker:*:heartbeat";
@@ -140,70 +280,43 @@ pub async fn list_workers(broker_url: &str) -> anyhow::Result<()> {
         }
     }
 
-    if worker_keys.is_empty() {
-        println!("{}", "No active workers found".yellow());
-        println!();
-        println!("Workers register themselves when they start processing tasks.");
-        return Ok(());
-    }
-
-    #[derive(Tabled)]
-    struct WorkerInfo {
-        #[tabled(rename = "Worker ID")]
-        id: String,
-        #[tabled(rename = "Status")]
-        status: String,
-        #[tabled(rename = "Last Heartbeat")]
-        last_heartbeat: String,
-    }
-
-    let mut workers = Vec::new();
-    let worker_count = worker_keys.len();
-
-    for key in &worker_keys {
+    let fetches = worker_keys.into_iter().filter_map(|key| {
         // Extract worker ID from key: celers:worker:<id>:heartbeat
-        let parts: Vec<&str> = key.split(':').collect();
-        if parts.len() >= 3 {
-            let worker_id = parts[2].to_string();
+        let worker_id = key.split(':').nth(2)?.to_string();
+        let mut task_conn = conn.clone();
+        Some(async move { fetch_worker_list_entry(&mut task_conn, key, worker_id).await })
+    });
 
-            // Get heartbeat timestamp
-            let heartbeat: Option<String> =
-                redis::cmd("GET").arg(key).query_async(&mut conn).await?;
+    futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .collect()
+}
 
-            let status = if heartbeat.is_some() {
-                "Active".to_string()
-            } else {
-                "Unknown".to_string()
-            };
+/// Fetch a single worker's heartbeat and derive its list-row entry.
+async fn fetch_worker_list_entry(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: String,
+    worker_id: String,
+) -> anyhow::Result<WorkerListEntry> {
+    let heartbeat: Option<String> = redis::cmd("GET").arg(&key).query_async(conn).await?;
 
-            let last_heartbeat = heartbeat.unwrap_or_else(|| "N/A".to_string());
+    let status = if heartbeat.is_some() {
+        "Active".to_string()
+    } else {
+        "Unknown".to_string()
+    };
+    let last_heartbeat = heartbeat.unwrap_or_else(|| "N/A".to_string());
 
-            workers.push(WorkerInfo {
-                id: worker_id,
-                status,
-                last_heartbeat,
-            });
-        }
-    }
-
-    let table = Table::new(workers).with(Style::rounded()).to_string();
-    println!("{table}");
-    println!();
-    println!(
-        "{}",
-        format!("Total active workers: {worker_count}")
-            .cyan()
-            .bold()
-    );
-
-    Ok(())
+    Ok(WorkerListEntry {
+        id: worker_id,
+        status,
+        last_heartbeat,
+    })
 }
 
 /// Show detailed statistics for a worker
 pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
-    let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
-
     println!(
         "{}",
         format!("=== Worker Statistics: {worker_id} ===")
@@ -212,14 +325,24 @@ pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<(
     );
     println!();
 
-    // Check if worker exists
-    let heartbeat_key = format!("celers:worker:{worker_id}:heartbeat");
-    let heartbeat: Option<String> = redis::cmd("GET")
-        .arg(&heartbeat_key)
-        .query_async(&mut conn)
-        .await?;
+    let cache_cfg = CacheConfig::from_env_or_default();
+    let cache_key = (broker_url.to_string(), worker_id.to_string());
 
-    if heartbeat.is_none() {
+    let (snapshot, served_from_cache) = if cache_cfg.enabled {
+        if let Some(cached) = worker_stats_cache().get(&cache_key) {
+            (Some(cached), true)
+        } else {
+            let fetched = fetch_worker_stats(broker_url, worker_id).await?;
+            if let Some(ref snapshot) = fetched {
+                worker_stats_cache().insert(cache_key, snapshot.clone());
+            }
+            (fetched, false)
+        }
+    } else {
+        (fetch_worker_stats(broker_url, worker_id).await?, false)
+    };
+
+    let Some(snapshot) = snapshot else {
         println!("{}", format!("✗ Worker '{worker_id}' not found").red());
         println!();
         println!("Possible reasons:");
@@ -227,8 +350,79 @@ pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         println!("  • Worker ID is incorrect");
         println!("  • Worker hasn't sent a heartbeat yet");
         return Ok(());
+    };
+
+    render_worker_stats(worker_id, &snapshot);
+    if served_from_cache {
+        println!(
+            "{}",
+            format!("(cached; ttl {}s)", cache_cfg.ttl_secs).dimmed()
+        );
     }
 
+    Ok(())
+}
+
+/// Fetch the live heartbeat + stats blob for `worker_id` from Redis, or
+/// `None` if the worker has never sent a heartbeat.
+///
+/// The heartbeat existence check and the stats blob lookup are independent
+/// reads, so both run concurrently via `tokio::join!` over cloned handles
+/// from the shared connection pool instead of the stats lookup waiting on
+/// the heartbeat check to finish first.
+async fn fetch_worker_stats(
+    broker_url: &str,
+    worker_id: &str,
+) -> anyhow::Result<Option<WorkerStatsSnapshot>> {
+    let conn = pooled_redis_connection(broker_url).await?;
+
+    let heartbeat_key = format!("celers:worker:{worker_id}:heartbeat");
+    let stats_key = format!("celers:worker:{worker_id}:stats");
+
+    let mut heartbeat_conn = conn.clone();
+    let mut stats_conn = conn.clone();
+
+    let heartbeat_fut = async move {
+        redis::cmd("GET")
+            .arg(&heartbeat_key)
+            .query_async::<Option<String>>(&mut heartbeat_conn)
+            .await
+    };
+    let stats_fut = async move {
+        redis::cmd("GET")
+            .arg(&stats_key)
+            .query_async::<Option<String>>(&mut stats_conn)
+            .await
+    };
+
+    let (heartbeat, stats) = tokio::join!(heartbeat_fut, stats_fut);
+    let Some(heartbeat) = heartbeat? else {
+        return Ok(None);
+    };
+    let stats = stats?;
+
+    let mut tasks_processed = None;
+    let mut tasks_failed = None;
+    let mut uptime_seconds = None;
+
+    if let Some(stats_json) = stats {
+        if let Ok(stats_data) = serde_json::from_str::<serde_json::Value>(&stats_json) {
+            tasks_processed = stats_data.get("tasks_processed").map(ToString::to_string);
+            tasks_failed = stats_data.get("tasks_failed").map(ToString::to_string);
+            uptime_seconds = stats_data.get("uptime_seconds").map(ToString::to_string);
+        }
+    }
+
+    Ok(Some(WorkerStatsSnapshot {
+        heartbeat,
+        tasks_processed,
+        tasks_failed,
+        uptime_seconds,
+    }))
+}
+
+/// Render a [`WorkerStatsSnapshot`] as the `worker_stats` table.
+fn render_worker_stats(worker_id: &str, snapshot: &WorkerStatsSnapshot) {
     #[derive(Tabled)]
     struct StatRow {
         #[tabled(rename = "Metric")]
@@ -236,13 +430,6 @@ pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         #[tabled(rename = "Value")]
         value: String,
     }
-
-    // Gather worker statistics
-    let stats_key = format!("celers:worker:{worker_id}:stats");
-    let stats: Option<String> = redis::cmd("GET")
-        .arg(&stats_key)
-        .query_async(&mut conn)
-        .await?;
 
     let mut stat_rows = vec![
         StatRow {
@@ -255,37 +442,31 @@ pub async fn worker_stats(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         },
         StatRow {
             metric: "Last Heartbeat".to_string(),
-            value: heartbeat.unwrap_or_else(|| "N/A".to_string()),
+            value: snapshot.heartbeat.clone(),
         },
     ];
 
-    if let Some(stats_json) = stats {
-        if let Ok(stats_data) = serde_json::from_str::<serde_json::Value>(&stats_json) {
-            if let Some(tasks_processed) = stats_data.get("tasks_processed") {
-                stat_rows.push(StatRow {
-                    metric: "Tasks Processed".to_string(),
-                    value: tasks_processed.to_string(),
-                });
-            }
-            if let Some(tasks_failed) = stats_data.get("tasks_failed") {
-                stat_rows.push(StatRow {
-                    metric: "Tasks Failed".to_string(),
-                    value: tasks_failed.to_string(),
-                });
-            }
-            if let Some(uptime) = stats_data.get("uptime_seconds") {
-                stat_rows.push(StatRow {
-                    metric: "Uptime".to_string(),
-                    value: format!("{uptime} seconds"),
-                });
-            }
-        }
+    if let Some(ref tasks_processed) = snapshot.tasks_processed {
+        stat_rows.push(StatRow {
+            metric: "Tasks Processed".to_string(),
+            value: tasks_processed.clone(),
+        });
+    }
+    if let Some(ref tasks_failed) = snapshot.tasks_failed {
+        stat_rows.push(StatRow {
+            metric: "Tasks Failed".to_string(),
+            value: tasks_failed.clone(),
+        });
+    }
+    if let Some(ref uptime) = snapshot.uptime_seconds {
+        stat_rows.push(StatRow {
+            metric: "Uptime".to_string(),
+            value: format!("{uptime} seconds"),
+        });
     }
 
     let table = Table::new(stat_rows).with(Style::rounded()).to_string();
     println!("{table}");
-
-    Ok(())
 }
 
 /// Stop a specific worker
@@ -323,6 +504,7 @@ pub async fn stop_worker(broker_url: &str, worker_id: &str, graceful: bool) -> a
         .arg("STOP")
         .query_async(&mut conn)
         .await?;
+    invalidate_worker_caches(broker_url, worker_id);
 
     if subscribers > 0 {
         println!(
@@ -373,6 +555,7 @@ pub async fn pause_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         .arg(&timestamp)
         .query_async(&mut conn)
         .await?;
+    invalidate_worker_caches(broker_url, worker_id);
 
     println!(
         "{}",
@@ -417,6 +600,7 @@ pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<
         .arg(&pause_key)
         .query_async(&mut conn)
         .await?;
+    invalidate_worker_caches(broker_url, worker_id);
 
     println!(
         "{}",
@@ -493,6 +677,8 @@ pub async fn scale_workers(broker_url: &str, target_count: usize) -> anyhow::Res
         println!("  celers worker-mgmt stop <worker-id> --graceful");
     }
 
+    worker_list_cache().invalidate(&broker_url.to_string());
+
     Ok(())
 }
 
@@ -534,6 +720,7 @@ pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         .arg(86400)
         .query_async::<()>(&mut conn)
         .await?;
+    invalidate_worker_caches(broker_url, worker_id);
 
     println!(
         "{}",
@@ -551,4 +738,129 @@ pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
     println!("  celers worker-mgmt resume {worker_id}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stand-in for a per-worker broker round trip (e.g. heartbeat `GET`):
+    /// deterministic and independent of every other call, exactly the shape
+    /// `fetch_worker_list_entry` has for real Redis keys.
+    async fn stub_fetch(worker_index: usize) -> String {
+        format!("worker-{worker_index}")
+    }
+
+    /// The parallel-fetch pattern used throughout this module's read paths:
+    /// run an async operation for every item in a `Vec` via
+    /// `futures::future::join_all` instead of a `for` loop that awaits one
+    /// item at a time. This proves that pattern returns the same,
+    /// order-preserving result set as the equivalent serial loop, using a
+    /// stub async closure so no live broker is involved — matching how
+    /// `fetch_worker_list`'s per-worker heartbeat lookups are parallelized in
+    /// production.
+    #[tokio::test]
+    async fn parallel_join_all_matches_equivalent_serial_loop() {
+        let indices: Vec<usize> = (0..30).collect();
+
+        let mut serial = Vec::with_capacity(indices.len());
+        for i in indices.clone() {
+            serial.push(stub_fetch(i).await);
+        }
+
+        let parallel: Vec<String> =
+            futures::future::join_all(indices.into_iter().map(stub_fetch)).await;
+
+        assert_eq!(
+            parallel, serial,
+            "join_all must preserve input order and match the serial result set"
+        );
+    }
+
+    #[test]
+    fn worker_stats_cache_hit_after_insert_then_miss_after_invalidate() {
+        let key = (
+            "test://worker-rs-cache-1".to_string(),
+            "w-cache-1".to_string(),
+        );
+        let snapshot = WorkerStatsSnapshot {
+            heartbeat: "2026-01-01T00:00:00Z".to_string(),
+            tasks_processed: Some("10".to_string()),
+            tasks_failed: Some("1".to_string()),
+            uptime_seconds: Some("3600".to_string()),
+        };
+
+        worker_stats_cache().insert(key.clone(), snapshot.clone());
+        assert_eq!(worker_stats_cache().get(&key), Some(snapshot));
+
+        worker_stats_cache().invalidate(&key);
+        assert_eq!(worker_stats_cache().get(&key), None);
+    }
+
+    #[test]
+    fn worker_list_cache_hit_after_insert_then_miss_after_invalidate() {
+        let key = "test://worker-rs-cache-2".to_string();
+        let entries = vec![WorkerListEntry {
+            id: "w-cache-2".to_string(),
+            status: "Active".to_string(),
+            last_heartbeat: "2026-01-01T00:00:00Z".to_string(),
+        }];
+
+        worker_list_cache().insert(key.clone(), entries.clone());
+        assert_eq!(worker_list_cache().get(&key), Some(entries));
+
+        worker_list_cache().invalidate(&key);
+        assert_eq!(worker_list_cache().get(&key), None);
+    }
+
+    #[test]
+    fn invalidate_worker_caches_clears_both_caches() {
+        let broker = "test://worker-rs-cache-3";
+        let worker_id = "w-cache-3";
+
+        worker_stats_cache().insert(
+            (broker.to_string(), worker_id.to_string()),
+            WorkerStatsSnapshot {
+                heartbeat: "2026-01-01T00:00:00Z".to_string(),
+                tasks_processed: None,
+                tasks_failed: None,
+                uptime_seconds: None,
+            },
+        );
+        worker_list_cache().insert(broker.to_string(), vec![]);
+
+        invalidate_worker_caches(broker, worker_id);
+
+        assert_eq!(
+            worker_stats_cache().get(&(broker.to_string(), worker_id.to_string())),
+            None
+        );
+        assert_eq!(worker_list_cache().get(&broker.to_string()), None);
+    }
+
+    #[test]
+    fn worker_cache_stats_reflects_underlying_cache_activity() {
+        let key = "test://worker-rs-cache-stats-accessor".to_string();
+
+        let (list_before, stats_before) = worker_cache_stats();
+
+        worker_list_cache().insert(key.clone(), vec![]);
+        worker_list_cache().get(&key); // guaranteed hit
+
+        let (list_after, stats_after) = worker_cache_stats();
+
+        assert!(
+            list_after.len >= list_before.len,
+            "list-cache entry count must never decrease from an insert alone"
+        );
+        assert!(
+            list_after.hits > list_before.hits,
+            "worker_cache_stats must observe the hit just recorded on worker_list_cache"
+        );
+        // The stats-cache side is untouched by this test; other tests may
+        // run concurrently against it (this module's tests share one
+        // process-wide static), but its counters only ever increase.
+        assert!(stats_after.hits >= stats_before.hits);
+        assert!(stats_after.misses >= stats_before.misses);
+    }
 }

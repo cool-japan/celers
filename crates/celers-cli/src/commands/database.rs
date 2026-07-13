@@ -1,8 +1,13 @@
 //! Database operations command implementations.
 
 use super::utils::mask_password;
+use crate::row_ext::RowExt;
+use crate::tls_mode::{mysql_tls_mode_for_url, pg_tls_mode_for_url};
 use celers_core::Broker;
 use colored::Colorize;
+use oxisql_core::Connection;
+use oxisql_mysql::MyConnection;
+use oxisql_postgres::PgConnection;
 
 /// Test database connection
 pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()> {
@@ -28,7 +33,8 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
     // Test connection based on database type
     match db_type {
         "PostgreSQL" => {
-            let pool = sqlx::postgres::PgPool::connect(url).await?;
+            let tls_mode = pg_tls_mode_for_url(url)?;
+            let conn = PgConnection::connect(url, tls_mode).await?;
             let elapsed = start.elapsed();
             println!(
                 "{}",
@@ -36,14 +42,22 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
             );
 
             // Get database version
-            let row: (String,) = sqlx::query_as("SELECT version()").fetch_one(&pool).await?;
-            println!("  {} {}", "Version:".cyan(), row.0);
+            let rows = conn.query("SELECT version()", &[]).await?;
+            let row = rows
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("SELECT version() returned no rows"))?;
+            let version: String = row.col("version")?;
+            println!("  {} {}", "Version:".cyan(), version);
 
             // Get current database name
-            let row: (String,) = sqlx::query_as("SELECT current_database()")
-                .fetch_one(&pool)
-                .await?;
-            println!("  {} {}", "Database:".cyan(), row.0);
+            let rows = conn.query("SELECT current_database()", &[]).await?;
+            let row = rows
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("SELECT current_database() returned no rows"))?;
+            let database: String = row.col("current_database")?;
+            println!("  {} {}", "Database:".cyan(), database);
 
             if benchmark {
                 println!();
@@ -51,7 +65,10 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
                 let mut times = Vec::new();
                 for _ in 0..10 {
                     let query_start = std::time::Instant::now();
-                    let _: (i32,) = sqlx::query_as("SELECT 1").fetch_one(&pool).await?;
+                    let rows = conn.query("SELECT 1", &[]).await?;
+                    rows.into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("SELECT 1 returned no rows"))?;
                     times.push(query_start.elapsed());
                 }
 
@@ -63,19 +80,23 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
                 println!("  {} {min}µs", "Min query time:".yellow());
                 println!("  {} {max}µs", "Max query time:".yellow());
             }
-
-            pool.close().await;
         }
         "MySQL" => {
-            let pool = sqlx::mysql::MySqlPool::connect(url).await?;
+            let tls_mode = mysql_tls_mode_for_url(url)?;
+            let conn = MyConnection::connect(url, tls_mode).await?;
             let elapsed = start.elapsed();
             println!(
                 "{}",
                 format!("✓ Connected successfully in {elapsed:?}").green()
             );
 
-            let row: (String,) = sqlx::query_as("SELECT VERSION()").fetch_one(&pool).await?;
-            println!("  {} {}", "Version:".cyan(), row.0);
+            let rows = conn.query("SELECT VERSION()", &[]).await?;
+            let row = rows
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("SELECT VERSION() returned no rows"))?;
+            let version: String = row.col("VERSION()")?;
+            println!("  {} {}", "Version:".cyan(), version);
 
             if benchmark {
                 println!();
@@ -83,7 +104,10 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
                 let mut times = Vec::new();
                 for _ in 0..10 {
                     let query_start = std::time::Instant::now();
-                    let _: (i32,) = sqlx::query_as("SELECT 1").fetch_one(&pool).await?;
+                    let rows = conn.query("SELECT 1", &[]).await?;
+                    rows.into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("SELECT 1 returned no rows"))?;
                     times.push(query_start.elapsed());
                 }
 
@@ -95,8 +119,6 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
                 println!("  {} {min}µs", "Min query time:".yellow());
                 println!("  {} {max}µs", "Max query time:".yellow());
             }
-
-            pool.close().await;
         }
         _ => {
             println!(
@@ -105,6 +127,7 @@ pub async fn db_test_connection(url: &str, benchmark: bool) -> anyhow::Result<()
                     .red()
                     .bold()
             );
+            anyhow::bail!("unsupported database type");
         }
     }
 
@@ -119,39 +142,62 @@ pub async fn db_health(url: &str) -> anyhow::Result<()> {
     println!();
 
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        let pool = sqlx::postgres::PgPool::connect(url).await?;
+        let tls_mode = pg_tls_mode_for_url(url)?;
+        let conn = PgConnection::connect(url, tls_mode).await?;
 
         // Check connection count
-        let row: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()",
-        )
-        .fetch_one(&pool)
-        .await?;
-        println!("  {} {}", "Active connections:".cyan(), row.0);
+        let rows = conn
+            .query(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()",
+                &[],
+            )
+            .await?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("SELECT count(*) FROM pg_stat_activity ... returned no rows")
+        })?;
+        let active_connections: i64 = row.col("count")?;
+        println!("  {} {}", "Active connections:".cyan(), active_connections);
 
         // Check database size
-        let row: (String,) =
-            sqlx::query_as("SELECT pg_size_pretty(pg_database_size(current_database()))")
-                .fetch_one(&pool)
-                .await?;
-        println!("  {} {}", "Database size:".cyan(), row.0);
+        let rows = conn
+            .query(
+                "SELECT pg_size_pretty(pg_database_size(current_database()))",
+                &[],
+            )
+            .await?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("SELECT pg_size_pretty(pg_database_size(...)) returned no rows")
+        })?;
+        let database_size: String = row.col("pg_size_pretty")?;
+        println!("  {} {}", "Database size:".cyan(), database_size);
 
         // Check uptime
-        let row: (String,) = sqlx::query_as("SELECT now() - pg_postmaster_start_time()::text")
-            .fetch_one(&pool)
+        let uptime: String = match conn
+            .query("SELECT now() - pg_postmaster_start_time()::text", &[])
             .await
-            .unwrap_or(("N/A".to_string(),));
-        println!("  {} {}", "Uptime:".cyan(), row.0);
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|row| row.col_idx::<String>(0).ok())
+        {
+            Some(v) => v,
+            None => "N/A".to_string(),
+        };
+        println!("  {} {}", "Uptime:".cyan(), uptime);
 
         // Check for locks
-        let row: (i64,) = sqlx::query_as("SELECT count(*) FROM pg_locks WHERE NOT granted")
-            .fetch_one(&pool)
+        let rows = conn
+            .query("SELECT count(*) FROM pg_locks WHERE NOT granted", &[])
             .await?;
-        if row.0 > 0 {
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("SELECT count(*) FROM pg_locks ... returned no rows"))?;
+        let waiting_locks: i64 = row.col("count")?;
+        if waiting_locks > 0 {
             println!(
                 "  {} {} waiting locks",
                 "⚠".yellow(),
-                row.0.to_string().yellow()
+                waiting_locks.to_string().yellow()
             );
         } else {
             println!("  {} No waiting locks", "✓".green());
@@ -159,20 +205,23 @@ pub async fn db_health(url: &str) -> anyhow::Result<()> {
 
         println!();
         println!("{}", "✓ Database health check complete".green().bold());
-
-        pool.close().await;
     } else if url.starts_with("mysql://") {
-        let pool = sqlx::mysql::MySqlPool::connect(url).await?;
+        let tls_mode = mysql_tls_mode_for_url(url)?;
+        let conn = MyConnection::connect(url, tls_mode).await?;
 
-        let row: (String,) = sqlx::query_as("SELECT VERSION()").fetch_one(&pool).await?;
-        println!("  {} {}", "Version:".cyan(), row.0);
+        let rows = conn.query("SELECT VERSION()", &[]).await?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("SELECT VERSION() returned no rows"))?;
+        let version: String = row.col("VERSION()")?;
+        println!("  {} {}", "Version:".cyan(), version);
 
         println!();
         println!("{}", "✓ Database health check complete".green().bold());
-
-        pool.close().await;
     } else {
         println!("{}", "✗ Unsupported database URL format".red().bold());
+        anyhow::bail!("unsupported database URL format");
     }
 
     Ok(())
@@ -186,25 +235,29 @@ pub async fn db_pool_stats(url: &str) -> anyhow::Result<()> {
     println!();
 
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
-            .connect(url)
-            .await?;
+        // NOTE: `oxisql_postgres::PgConnection` is a single mutex-serialized
+        // connection (`Arc<Mutex<tokio_postgres::Client>>`), not a real
+        // multi-connection pool like the previous SQL toolkit's
+        // `PgPoolOptions` — there is no `oxisql-pool` wiring in this crate.
+        // `PgConnection` is `Clone` (the clone shares the same underlying
+        // connection), which lets the concurrent-query throughput shape of
+        // this probe survive the migration, but the "Max connections" /
+        // "Current size" pool metrics the old toolkit exposed have no
+        // equivalent here and are intentionally dropped rather than
+        // fabricated.
+        let tls_mode = pg_tls_mode_for_url(url)?;
+        let conn = PgConnection::connect(url, tls_mode).await?;
 
-        println!("Pool Configuration:");
-        println!("  {} {}", "Max connections:".cyan(), 5);
-        println!("  {} {}", "Current size:".cyan(), pool.size());
-
-        // Test pool performance
-        println!();
-        println!("{}", "Pool Performance Test:".cyan().bold());
+        // Test concurrent query performance
+        println!("{}", "Concurrent Query Test:".cyan().bold());
 
         let start = std::time::Instant::now();
         let mut handles = vec![];
         for _ in 0..10 {
-            let pool = pool.clone();
+            let conn = conn.clone();
             handles.push(tokio::spawn(async move {
-                let _: (i32,) = sqlx::query_as("SELECT 1").fetch_one(&pool).await.ok()?;
+                let rows = conn.query("SELECT 1", &[]).await.ok()?;
+                rows.into_iter().next()?;
                 Some(())
             }));
         }
@@ -216,13 +269,12 @@ pub async fn db_pool_stats(url: &str) -> anyhow::Result<()> {
         let elapsed = start.elapsed();
         println!("  {} {elapsed:?}", "10 concurrent queries:".yellow());
         println!("  {} {:?}", "Avg per query:".yellow(), elapsed / 10);
-
-        pool.close().await;
     } else {
         println!(
             "{}",
             "✗ Pool statistics only available for PostgreSQL".red()
         );
+        anyhow::bail!("pool statistics only available for PostgreSQL");
     }
 
     Ok(())
@@ -270,6 +322,7 @@ pub async fn db_migrate(url: &str, action: &str, steps: usize) -> anyhow::Result
         _ => {
             println!("{}", format!("✗ Unknown migration action: {action}").red());
             println!("  Available actions: status, up, down");
+            anyhow::bail!("unknown migration action: {action}");
         }
     }
 

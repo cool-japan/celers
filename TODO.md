@@ -15,6 +15,167 @@
 
 **🎉 100% PROJECT COMPLETION - ALL 18/18 CRATES IMPLEMENTED! 🎉**
 
+### v0.3.0 Hardening (in progress — 2026-06-13)
+
+Ongoing stub-elimination / correctness round (branch `0.3.0`). Latest sweep:
+
+- **Canvas/Worker**: real nested chord execution (callback no longer dropped); chord callback now
+  receives the aggregated, ordered list of header results.
+- **Protocol**: message `created_at` timestamp + age tracking; real v2↔v5 migration (version
+  stamping, priority/legacy field mirroring, feature-aware strict compatibility).
+- **Kombu**: compression middleware now round-trips (header + decompress on consume — fixed silent
+  data corruption); signing middleware now stores + verifies HMAC; health-check middleware real.
+- **Beat**: real `reqwest` webhook alert delivery; **fixed** crontab `day_of_week` Unix→Quartz
+  off-by-one (`"1-5"` now means Mon–Fri, `"0"` = Sunday accepted).
+- **Redis broker**: real cron parsing for `CronScheduler` (arbitrary 5-field expressions);
+  adaptive failure-classified DLQ replay; real DLQ error classification/signatures.
+- **Feature expansion (round 1)**: Canvas DAG viz export (Mermaid/DOT); Beat holiday calendar +
+  business-day calc + schedule conflict detection + missed-task catch-up; Protocol v5 wire builder +
+  version negotiation; Core distributed rate limiting + event snapshots/alerting; Metrics native
+  histograms + summary quantiles (P²).
+- **Feature expansion (rounds 2–3)**: Canvas loops/sub-workflows/templates/dynamic-edit + workflow
+  versioning; Beat timezone-aware + dynamic updates + jitter + dispatch-locking; Protocol YAML +
+  custom serializers; Core result tombstones/groups/TTL + task security (HMAC sig, sanitization,
+  PII); Worker poison-pill + self-healing; CLI layered config; Metrics StatsD backend.
+- **Feature expansion (round 4)**: Worker cooperative cancellation + distributed rate-limit
+  coordination; Kombu AES-256-GCM encryption middleware; CLI Prometheus metrics/monitor commands;
+  Canvas workflow rate-limit integration. (Also hardened flaky facade timing tests.)
+- **Feature expansion (rounds 5–6)**: Core in-memory broker/backend + result caching + per-type
+  circuit breakers + per-tenant rate limiting; Worker adaptive polling + batching/coalescing + task
+  affinity; Metrics SLO tracking + anomaly detection + audit log; CLI task replay + load testing.
+- All 18 crates: `cargo build`/`clippy -D warnings` clean, **5073 tests pass** (0 failures).
+
+### v0.3.0 Hardening — QA/release-prep pass (2026-07-11)
+
+`/nagare` QA/hardening sweep (branch `0.3.0`). All fixes independently verified with zero
+regressions — workspace builds clean, clippy clean, **5068/5068 tests passing**:
+
+- **Fixed (CLI)**: `celers` CLI `health` and `db test-connection`/`health`/`pool-stats`/`migrate`
+  commands reported failure in their printed output but incorrectly exited 0 (would silently mask
+  failures in any script checking the exit code) — now exit nonzero correctly.
+- **Fixed (Worker)**: the lock-free queue's `try_pop()` treated a spurious `Steal::Retry` signal
+  from the underlying `crossbeam_deque::Injector` the same as a genuinely empty queue — found via
+  Miri testing, not a data race (Miri confirmed the `unsafe impl Send/Sync` on the queue is sound)
+  but a real logic bug that could make a worker see a false-empty queue under contention. Now
+  delegates to the already-correct `pop()`.
+- **Fixed (Docs)**: 17 rustdoc broken/redundant/private intra-doc links across `celers-metrics`,
+  `celers-core`, `celers-canvas`, `celers-beat`, `celers-cli`, `celers-worker` —
+  `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps` now passes clean.
+- **Fixed (Dependencies)**: 12 genuinely-unused dependencies removed across 12 crates (verified
+  individually, not just from the static-analysis tool's raw output — one flagged candidate,
+  `celers-canvas` in `celers-worker`, was confirmed to be a real feature-gate-only usage and
+  correctly kept).
+- **Fixed (Metadata)**: `readme = "README.md"` metadata field was missing from 17 of 18 crates'
+  `Cargo.toml` despite each having a real README.md on disk (crates.io wouldn't have rendered
+  them) — added to all 17.
+- **Fixed (Workspace)**: 2 `celers-beat` dependency declarations used
+  `{ path = "...", version = "..." }` instead of `{ workspace = true }` — corrected for
+  consistency (zero semantic change).
+- **New tracked finding (not fixed this pass — needs an architectural decision)**: `ring` and
+  `aws-lc-sys`/`aws-lc-rs` are pulled transitively into 9 crates via `sqlx`'s explicit
+  `tls-rustls-ring` feature plus `reqwest`/`lapin`/`aws-sdk-*`'s default rustls provider
+  selection — a Pure-Rust policy violation. `cargo audit` additionally found 3 real RUSTSEC
+  vulnerabilities in this exact same dependency chain (`rustls-webpki` 0.101.7: a reachable panic
+  in CRL parsing, plus 2 certificate name-constraint validation bypasses), confirming this isn't
+  just a purity concern. Fixing this means either finding TLS-provider-selection flags on
+  `sqlx`/`reqwest`/`lapin`/`aws-sdk-*`, or migrating onto `oxisql-postgres`/`oxisql-mysql` and
+  `oxihttp-client` (both already production-ready per COOLJAPAN governance).
+- **New tracked finding**: 3 files exceed the workspace's 2000-line policy
+  (`celers-cli/src/main.rs` at 2153, `celers-metrics/src/tests_core.rs` at exactly 2000,
+  `celers-macros/tests/integration_test.rs` at 3038) — candidates for a future `splitrs` pass.
+
+### sqlx → oxisql-\* / reqwest → oxihttp-client migration complete (2026-07-11)
+
+Follow-up to this same day's "not fixed this pass" finding above: `sqlx`/`reqwest` removed from
+every crate (`celers-broker-postgres`, `celers-broker-sql`, `celers-backend-db`, `celers-cli`,
+`celers-worker`, plus the non-member `celers-examples`) and from the workspace root
+`[workspace.dependencies]` entirely. Zero `sqlx`/`reqwest` dependency declarations remain
+anywhere in the workspace.
+
+- **Fixed (real bugs, not just mechanical port)**: `oxisql-core` has no `ToSqlValue`/`FromValue`
+  bridge for `uuid::Uuid`/`serde_json::Value`, only for the raw `Value::Uuid(u128)`/
+  `Value::Json(String)` representations — binding a bare `u128` doesn't compile
+  (`ToSqlValue` isn't implemented for it); every call site now goes through a `uuid_param`/
+  `json_param`/`uuid_from_row`/`json_from_row` helper (`row_ext.rs`, one per migrated crate)
+  instead of hand-rolling the conversion.
+  `DateTime<Utc>` binding was a genuine, previously-undetected corruption risk on **both**
+  backends, each needing a different fix: Postgres's `oxisql-postgres` always sends parameters in
+  binary wire format, so a `.timestamp()` (raw `i64`) or bare RFC3339 `String` bind against a
+  `TIMESTAMPTZ` column is rejected by the server's binary decoder — fixed via `.to_rfc3339()` text
+  bound through an explicit `$n::text::timestamptz` SQL-side cast. MySQL's `mysql_async`/
+  `mysql_common` wire layer instead requires its own strict `DATETIME` grammar
+  (`YYYY-MM-DD HH:MM:SS.ffffff`, space separator, no `T`, no timezone suffix) — RFC3339 fails
+  `mysql_common`'s parser outright, so MySQL binds use `.format("%Y-%m-%d %H:%M:%S%.6f")` instead,
+  with a regression test pinned to `mysql_common`'s actual accepted grammar.
+- **Fixed (security regression)**: the initial oxisql port hardcoded `TlsMode::Disabled` at every
+  `PgConnection`/MySQL connect call site, silently downgrading to plain-text even when the
+  caller's URL said `sslmode=require` — a MEDIUM-severity regression (credentials/queries sent in
+  the clear while the caller believes they're encrypted). Fixed in all 5 migrated crates via a
+  `tls_mode.rs` helper that parses `sslmode` from the connection URL and resolves the matching
+  `TlsMode` (Rustls via `oxitls`, or Disabled only when the URL actually says so).
+- **Deferred (perf, tracked not fixed)**: `celers-broker-postgres`'s connection changed from
+  `sqlx::PgPool` (a real pool, up to `max_connections`) to `oxisql_postgres::PgConnection`, which
+  is `Clone` but internally one shared `Arc<Mutex<tokio_postgres::Client>>` — all clones now
+  multiplex a single underlying connection instead of drawing from a pool. Documented in-code as
+  accepted for now; revisit if this becomes a throughput bottleneck.
+- **Deferred (out of scope, no clean pure-Rust path)**: `celers-broker-amqp` (via `lapin`) and
+  `celers-broker-sqs` (via the AWS SDK: `aws-config`/`aws-sdk-sqs`/`aws-sdk-cloudwatch`) still pull
+  in `ring`/`aws-lc-sys` — confirmed via `cargo tree -i ring`/`-i aws-lc-sys`: every path now goes
+  through exactly these two chains and nothing else. Replacing either is a separate, larger effort
+  (no drop-in pure-Rust AMQP client or AWS SDK exists yet in the COOLJAPAN ecosystem).
+- **Verified**: of the 3 previously-found `rustls-webpki` 0.101.7 RUSTSEC advisories
+  (RUSTSEC-2026-0098/0099/0104), `cargo tree -i rustls-webpki@0.101.7` now shows a single root —
+  entirely the AWS SDK chain (`aws-smithy-http-client` → old `hyper-rustls`/`tokio-rustls`/
+  `rustls` 0.21.12) via `celers-broker-sqs`. `sqlx`'s own independent `tls-rustls-ring` TLS edge
+  (a separate contributor pre-migration) is gone along with the crate itself, so this advisory's
+  exposure is narrower now, not just relabeled — though not fully eliminated, since the deferred
+  AWS SDK chain still carries it. `cargo audit` also surfaces 4 more `rustls-webpki` 0.102.8
+  findings and an `rsa` advisory rooted in `rustls-rustcrypto` (a dependency of `oxitls` itself,
+  unrelated to this migration) — tracked separately, not actionable from this workspace.
+- Workspace-wide: `cargo build`/`clippy -D warnings --all-targets` clean, **5278 tests pass** (up
+  from the 5068 pre-migration baseline — each migrated crate's `row_ext.rs`/`tls_mode.rs` added
+  its own test module), 1030 doc tests pass, 0 failures.
+
+### v0.3.0 Release-Prep — final `/runall` pipeline pass (2026-07-13)
+
+Final release-readiness sweep before 0.3.0 ships (branch `0.3.0`). Full workspace re-verified
+clean: `cargo build --workspace --all-features` and
+`cargo clippy --workspace --all-features --all-targets -- -D warnings` both clean (0 errors,
+0 warnings), **5676/5676 tests passing with `--all-features`, 5495/5495 with default features**
+(0 failures, 0 flaky).
+
+- **Fixed (Docs)**: 3 broken rustdoc private-intra-doc-links in `celers-broker-postgres`.
+- **Fixed (Test speed)**: 2 slow (>30s) tests in `celers-cli`'s `depgraph.rs` — shrank the test
+  fanout size so both run at normal speed with no loss of coverage.
+- **Fixed (Dependencies)**: removed a genuinely-unused `rust_decimal` dependency from
+  `celers-broker-sql`; bumped `aws-config`/`aws-sdk-sqs`/`aws-sdk-cloudwatch`/`regex`/`rand` to
+  latest compatible versions.
+- **Fixed (Workspace)**: consolidated 13 internal crate dependencies (`celers-core`,
+  `celers-protocol`, `celers-metrics`, `celers-backend-redis`, `celers-kombu`, `celers-worker`,
+  `celers-canvas`, `celers-broker-redis`, `celers-broker-postgres`, `celers-macros`,
+  `celers-broker-sqs`, `celers-broker-sql`, `celers-broker-amqp`) into root
+  `[workspace.dependencies]`, updating 14 consumer crates to `{ workspace = true }` — zero semantic
+  change, consistency only.
+- **Cleanup**: deleted a stray empty leftover directory (`crates/broker-redis/`, superseded long
+  ago by `crates/celers-broker-redis/`); fixed a stale `VERSION="0.2.0"` in the external publish
+  script (`~/work/pub_celers.sh`) to `0.3.0`.
+- **New tracked finding (accepted caveat, not fixed this pass)**: `proc-macro-error2` 2.0.1
+  (transitively via `tabled_derive` → `tabled` → `celers-cli`) is flagged unmaintained upstream
+  (RUSTSEC-2026-0173). No CVE/known exploit; documented in `CHANGELOG.md` as accepted for this
+  release rather than swapping `tabled` this close to publish, since that crate's call sites in
+  `celers-cli` were already extensively touched this same cycle (report/error-codes/cache-stats
+  table rendering).
+- **Deferred (open, tracked — do not attempt without a dedicated follow-up session)**: 3 files now
+  exceed the workspace's 2000-line refactor policy — `celers-broker-sql/src/broker_core.rs`
+  (2051 lines, production code), `celers-macros/tests/integration_test.rs` (3038 lines), and
+  `celers-metrics/src/tests_core.rs` (exactly 2000 lines). This supersedes the file list in the
+  2026-07-11 entry above: that pass's offender, `celers-cli/src/main.rs` (then 2153 lines), has
+  since been split down to 210 lines by the CLI module reorganization documented in
+  `CHANGELOG.md`'s 0.3.0 CLI section (`cli/types.rs`, `cli/dispatch.rs`, `commands/*.rs`);
+  `broker_core.rs` newly crossed the threshold during the sqlx→oxisql migration above. Splitting
+  all 3 is explicitly deferred to a dedicated follow-up session rather than risked during release
+  prep — `splitrs` is the recommended tool per project policy.
+
 ## Quick Stats
 
 - **Crates**: 18/18 (100% COMPLETE) - core, worker, protocol, kombu, canvas, beat, macros, CLI, metrics, 5 brokers, 3 backends
@@ -22,7 +183,8 @@
 - **Backends**: Redis, PostgreSQL/MySQL (Database), gRPC - ALL with ResultStore adapters
 - **Examples**: 15 working examples (including Canvas workflows, web scraper, image processing, AsyncResult API)
 - **Benchmarks**: 3 comprehensive benchmark suites
-- **Unit Tests**: 4075 tests passing across all crates (Phase 9 features included)
+- **Unit Tests**: 5676 tests passing with `--all-features` / 5495 with default features, 0 failures
+  (v0.3.0 hardening + feature expansion + release-prep pass, verified 2026-07-13)
 - **Build Status**: ✅ 0 errors, 0 warnings, 0 clippy warnings, 0 doc warnings
 - **Documentation**: 1500+ lines of guides + 18 TODO.md files
 - **Monitoring**: Full Prometheus + Grafana + OpenTelemetry support
@@ -71,7 +233,7 @@ Simple tasks can be enqueued to Redis, and Rust workers can pick them up and exe
 - [x] `celers-broker-redis`: Implement Pub/Sub for cancellation signals
 - [x] `celers-broker-redis`: Add PubSub connection helper methods
 - [x] Create task cancellation example (task_cancellation.rs)
-- [ ] `celers-worker`: Handle cancellation during execution (pattern demonstrated)
+- [x] `celers-worker`: Handle cancellation during execution (cooperative token, broker-signal driven)
 
 ### Dead Letter Queue ✅ COMPLETE
 - [x] `celers-core`: Define DLQ behavior
@@ -98,7 +260,7 @@ Simple tasks can be enqueued to Redis, and Rust workers can pick them up and exe
 - [x] `celers-cli`: Add colored output and formatted tables
 - [x] `celers-cli`: Create comprehensive CLI documentation
 - [x] `celers-cli`: Add task cancel command
-- [ ] `celers-cli`: Add metrics and monitoring commands (future enhancement)
+- [x] `celers-cli`: Add metrics and monitoring commands (`metrics` + `monitor`, Prometheus scrape)
 
 ### Monitoring & Observability ✅ COMPLETE
 - [x] Add Prometheus metrics exporter
@@ -120,7 +282,7 @@ Simple tasks can be enqueued to Redis, and Rust workers can pick them up and exe
 ### Horizontal Scaling
 - [ ] Test multiple worker instances (ready for testing)
 - [x] Implement worker heartbeat mechanism (WorkerStats, heartbeat events)
-- [ ] Add worker coordination for distributed rate limiting (future)
+- [x] Add worker coordination for distributed rate limiting
 - [x] Document scaling best practices (included in performance guide)
 
 ### Benchmarking Infrastructure
@@ -244,10 +406,10 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [ ] Test with Python Celery 4.x workers (integration tests pending)
 
 - [ ] **Full Protocol v5 Wire Compatibility**
-  - [ ] Implement Celery v5 message format changes
+  - [x] Implement Celery v5 message format changes
   - [ ] Test with Python Celery 5.x workers
-  - [ ] Support protocol version negotiation
-  - [ ] Handle backward compatibility with v2
+  - [x] Support protocol version negotiation
+  - [x] Handle backward compatibility with v2
 
 - [ ] **Bidirectional Task Exchange**
   - [ ] Rust worker can execute tasks sent from Python Celery
@@ -279,8 +441,8 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [x] Per-worker rate limiting
   - [x] Token bucket algorithm
   - [x] Sliding window rate limiting
-  - [ ] Distributed rate limiting across workers
-  - [ ] Rate limit integration with Canvas workflows
+  - [x] Distributed rate limiting across workers
+  - [x] Rate limit integration with Canvas workflows
 
 ### Task Execution & Control
 - [x] **Time Limits** ✅ (Implemented in celers-core/src/time_limit.rs)
@@ -345,8 +507,8 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [x] Event filtering and routing
   - [x] Event persistence (database, file)
   - [ ] Event streaming (WebSocket, SSE)
-  - [ ] Snapshot events for monitoring
-  - [ ] Event-based alerting
+  - [x] Snapshot events for monitoring
+  - [x] Event-based alerting
 
 ### Remote Control & Inspection
 - [x] **Worker Control Commands** ✅ (Protocol defined in celers-core/src/control.rs)
@@ -396,12 +558,12 @@ Each crate has its own detailed TODO.md with implementation status and future en
 ### Result Backend Enhancements
 - [ ] **Advanced Result Features**
   - [x] Result metadata (task_id, name, args, kwargs, worker, etc.)
-  - [ ] Result TTL per task type
+  - [x] Result TTL per task type
   - [x] Result compression (gzip, lz4, zstd)
   - [x] Result chunking for large payloads
   - [ ] Result streaming for long-running tasks
-  - [ ] Result tombstones (mark deleted results)
-  - [ ] Result groups (grouped results for Chord)
+  - [x] Result tombstones (mark deleted results)
+  - [x] Result groups (grouped results for Chord)
 
 - [x] **AsyncResult API** ✅
   - [x] `result.get()` - Block until result ready
@@ -421,9 +583,9 @@ Each crate has its own detailed TODO.md with implementation status and future en
 - [ ] **Full Serializer Support**
   - [ ] JSON (default) ✅
   - [ ] MessagePack ✅
-  - [ ] YAML serializer
+  - [x] YAML serializer
   - [ ] Pickle serializer (Python compat - security warning)
-  - [ ] Custom serializers
+  - [x] Custom serializers
   - [x] Compression support (gzip, brotli, zstd)
   - [x] Serializer auto-detection
 
@@ -431,21 +593,21 @@ Each crate has its own detailed TODO.md with implementation status and future en
 - [ ] **Celery-Compatible Configuration**
   - [ ] Support celeryconfig.py-style configuration
   - [x] Environment variable configuration (CELERY_*)
-  - [ ] Configuration via CLI arguments
-  - [ ] Configuration via YAML/TOML files ✅ (partial)
-  - [ ] Dynamic configuration updates
+  - [x] Configuration via CLI arguments ✅ (celers-cli: `CliConfigArgs`, precedence CLI > env > file > defaults)
+  - [x] Configuration via YAML/TOML files ✅ (celers-cli: format auto-detected by extension)
+  - [x] Dynamic configuration updates ✅ (celers-cli: `config reload` + `ReloadableConfig`/`ConfigDiff`)
   - [x] Configuration validation and defaults
 
 ### Beat Scheduler Enhancements
 - [ ] **Advanced Scheduling**
   - [ ] Persistent schedule (database-backed)
-  - [ ] Dynamic schedule updates (add/remove at runtime)
-  - [ ] Schedule conflict detection
-  - [ ] Missed task catch-up logic
-  - [ ] Schedule locking (prevent duplicate execution)
-  - [ ] Timezone-aware schedules
-  - [ ] Holiday calendar support
-  - [ ] Business day calculations
+  - [x] Dynamic schedule updates (add/remove at runtime)
+  - [x] Schedule conflict detection
+  - [x] Missed task catch-up logic
+  - [x] Schedule locking (prevent duplicate execution)
+  - [x] Timezone-aware schedules
+  - [x] Holiday calendar support
+  - [x] Business day calculations
 
 - [x] **Beat Synchronization**
   - [x] Leader election for multi-beat deployments
@@ -484,9 +646,9 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [ ] IP whitelisting
 
 - [ ] **Task Security**
-  - [ ] Task signature verification
-  - [ ] Message encryption (at rest and in transit)
-  - [ ] Task argument sanitization
+  - [x] Task signature verification
+  - [x] Message encryption (at rest and in transit)
+  - [x] Task argument sanitization
   - [ ] Secure pickle (prevent arbitrary code execution)
 
 ### Developer Experience
@@ -499,7 +661,7 @@ Each crate has its own detailed TODO.md with implementation status and future en
 - [ ] **Debugging Tools**
   - [ ] Task execution tracing
   - [ ] Step-through debugger integration
-  - [ ] Task replay (re-execute failed tasks)
+  - [x] Task replay (re-execute failed tasks)
   - [ ] Time-travel debugging
   - [ ] Performance profiler
 
@@ -612,35 +774,35 @@ Each crate has its own detailed TODO.md with implementation status and future en
 - [x] Implement task workflows/DAGs ✅ (celers-canvas complete)
 - [x] Add batch operations for brokers ✅ (SQS, AMQP, Worker)
 - [x] Add task progress tracking ✅ (Redis backend)
-- [ ] Dynamic workflow modification (add/remove tasks at runtime)
-- [ ] Workflow versioning and migration
+- [x] Dynamic workflow modification (add/remove tasks at runtime)
+- [x] Workflow versioning and migration
 - [x] Conditional workflow branching (if/else logic) ✅ - Branch, Maybe, Switch primitives
-- [ ] Workflow loops and iteration
-- [ ] Sub-workflows and nested composition
-- [ ] Workflow templates and macros
-- [ ] Workflow DAG visualization export (GraphViz, Mermaid)
+- [x] Workflow loops and iteration
+- [x] Sub-workflows and nested composition
+- [x] Workflow templates and macros
+- [x] Workflow DAG visualization export (GraphViz, Mermaid)
 
 ### Scheduling & Beat
 - [x] Add persistent state for beat scheduler ✅ (JSON file-based persistence)
 - [x] Add leader election for beat scheduler ✅ (implemented in celers-beat/src/heartbeat.rs — BeatHeartbeat with BeatRole enum, Phase 9)
-- [ ] Timezone-aware cron schedules
-- [ ] Dynamic schedule updates via API
-- [ ] Schedule conflict detection
-- [ ] Missed task catch-up logic
-- [ ] Schedule jitter to prevent thundering herd
-- [ ] Holiday calendar support
-- [ ] Business day calculations
+- [x] Timezone-aware cron schedules
+- [x] Dynamic schedule updates via API
+- [x] Schedule conflict detection
+- [x] Missed task catch-up logic
+- [x] Schedule jitter to prevent thundering herd
+- [x] Holiday calendar support
+- [x] Business day calculations
 
 ### Monitoring & Observability
-- [ ] Enhanced Prometheus metrics (percentiles, histograms)
-- [ ] StatsD metrics backend
+- [x] Enhanced Prometheus metrics (percentiles, histograms)
+- [x] StatsD metrics backend
 - [ ] OpenTelemetry metrics (full integration)
 - [ ] CloudWatch metrics integration
 - [ ] Datadog APM integration
 - [ ] Distributed tracing (span propagation)
 - [ ] Structured logging with correlation IDs
 - [ ] Real-time event streaming (WebSocket, SSE)
-- [ ] Audit log for task lifecycle events
+- [x] Audit log for task lifecycle events
 - [ ] Performance profiling integration
 
 ### Administration & Management
@@ -658,18 +820,18 @@ Each crate has its own detailed TODO.md with implementation status and future en
 ### Performance & Scalability
 - [ ] Connection pooling for all brokers
 - [ ] Task prefetching and pipelining
-- [ ] Result caching layer
+- [x] Result caching layer (celers-core `CachingResultBackend<B>`: bounded native LRU + per-entry TTL fronting any `ResultStore`)
 - [ ] Lazy task deserialization
 - [ ] Zero-copy message passing
 - [ ] SIMD optimizations for serialization
-- [ ] Task batching and coalescing
-- [ ] Adaptive polling intervals
+- [x] Task batching and coalescing
+- [x] Adaptive polling intervals
 - [ ] Memory-mapped queue storage
 - [ ] Lock-free data structures
 
 ### Developer Experience
 - [ ] Task testing framework and mocks
-- [ ] Local development mode (in-memory broker)
+- [x] Local development mode (in-memory broker) (celers-core `InMemoryBroker` + `InMemoryResultBackend`, no external services)
 - [ ] Task debugging and step-through execution
 - [ ] Task replay and time-travel debugging
 - [ ] Hot reload for task definitions
@@ -677,26 +839,26 @@ Each crate has its own detailed TODO.md with implementation status and future en
 - [ ] Code generation from schemas
 - [ ] Migration tools from Celery/Sidekiq/Bull
 - [ ] Benchmark suite and profiling tools
-- [ ] Task simulation and load testing
+- [x] Task simulation and load testing
 
 ### Security & Compliance
-- [ ] Task encryption at rest and in transit
+- [x] Task encryption at rest and in transit
 - [ ] mTLS for broker connections
 - [ ] RBAC for task execution permissions
 - [ ] Secrets management integration (Vault, AWS Secrets)
 - [ ] Audit logging for compliance (SOC2, HIPAA)
-- [ ] Task signature verification
-- [ ] Rate limiting per user/tenant
+- [x] Task signature verification
+- [x] Rate limiting per user/tenant
 - [ ] IP whitelisting for workers
 - [ ] Data residency controls
-- [ ] PII detection and masking
+- [x] PII detection and masking
 
 ### Resilience & Reliability
-- [ ] Circuit breaker per task type
+- [x] Circuit breaker per task type
 - [ ] Automatic retry with backoff strategies
 - [ ] Task timeout with graceful degradation
-- [ ] Poison pill detection and quarantine
-- [ ] Self-healing worker restarts
+- [x] Poison pill detection and quarantine
+- [x] Self-healing worker restarts
 - [ ] Automatic queue rebalancing
 - [ ] Data corruption detection
 - [ ] Split-brain prevention
@@ -719,10 +881,10 @@ Each crate has its own detailed TODO.md with implementation status and future en
 - [ ] Task dependencies and DAG scheduling
 - [ ] Resource allocation and scheduling (CPU, memory)
 - [ ] Priority-based task queuing improvements
-- [ ] Task affinity (worker-to-task matching)
+- [x] Task affinity (worker-to-task matching)
 - [ ] Speculative execution for critical tasks
 - [ ] Machine learning for task optimization
 - [ ] Predictive scaling based on patterns
-- [ ] Anomaly detection for task failures
+- [x] Anomaly detection for task failures
 - [ ] Cost optimization recommendations
-- [ ] SLA/SLO tracking and alerting
+- [x] SLA/SLO tracking and alerting

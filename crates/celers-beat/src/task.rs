@@ -1016,7 +1016,10 @@ impl ScheduledTask {
         if self.wfq_state.is_none() {
             self.wfq_state = Some(WFQState::default());
         }
-        self.wfq_state.as_mut().unwrap().weight = TaskWeight::new(weight)?;
+        self.wfq_state
+            .as_mut()
+            .expect("wfq_state initialized just above if None")
+            .weight = TaskWeight::new(weight)?;
         Ok(self)
     }
 

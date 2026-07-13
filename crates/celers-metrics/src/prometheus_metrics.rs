@@ -16,47 +16,47 @@ lazy_static! {
     /// Total number of tasks enqueued
     pub static ref TASKS_ENQUEUED_TOTAL: Counter =
         register_counter!("celers_tasks_enqueued_total", "Total number of tasks enqueued")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of tasks completed successfully
     pub static ref TASKS_COMPLETED_TOTAL: Counter =
         register_counter!("celers_tasks_completed_total", "Total number of tasks completed successfully")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of tasks failed
     pub static ref TASKS_FAILED_TOTAL: Counter =
         register_counter!("celers_tasks_failed_total", "Total number of tasks failed")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of tasks retried
     pub static ref TASKS_RETRIED_TOTAL: Counter =
         register_counter!("celers_tasks_retried_total", "Total number of tasks retried")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of tasks cancelled
     pub static ref TASKS_CANCELLED_TOTAL: Counter =
         register_counter!("celers_tasks_cancelled_total", "Total number of tasks cancelled")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Current queue size
     pub static ref QUEUE_SIZE: Gauge =
         register_gauge!("celers_queue_size", "Current number of tasks in queue")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Current processing queue size
     pub static ref PROCESSING_QUEUE_SIZE: Gauge =
         register_gauge!("celers_processing_queue_size", "Current number of tasks being processed")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Current dead letter queue size
     pub static ref DLQ_SIZE: Gauge =
         register_gauge!("celers_dlq_size", "Current number of tasks in dead letter queue")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Number of active workers
     pub static ref ACTIVE_WORKERS: Gauge =
         register_gauge!("celers_active_workers", "Number of active workers")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Task execution time histogram (in seconds)
     pub static ref TASK_EXECUTION_TIME: Histogram =
@@ -65,7 +65,7 @@ lazy_static! {
             "Task execution time in seconds",
             vec![0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     // Per-Task-Type Metrics (with labels)
 
@@ -76,7 +76,7 @@ lazy_static! {
             "Total number of tasks enqueued by task type",
             &["task_name"]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Total number of tasks completed by task type
     pub static ref TASKS_COMPLETED_BY_TYPE: CounterVec =
@@ -85,7 +85,7 @@ lazy_static! {
             "Total number of tasks completed by task type",
             &["task_name"]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Total number of tasks failed by task type
     pub static ref TASKS_FAILED_BY_TYPE: CounterVec =
@@ -94,7 +94,7 @@ lazy_static! {
             "Total number of tasks failed by task type",
             &["task_name"]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Total number of tasks retried by task type
     pub static ref TASKS_RETRIED_BY_TYPE: CounterVec =
@@ -103,7 +103,7 @@ lazy_static! {
             "Total number of tasks retried by task type",
             &["task_name"]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Total number of tasks cancelled by task type
     pub static ref TASKS_CANCELLED_BY_TYPE: CounterVec =
@@ -112,7 +112,7 @@ lazy_static! {
             "Total number of tasks cancelled by task type",
             &["task_name"]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Task execution time histogram by task type (in seconds)
     pub static ref TASK_EXECUTION_TIME_BY_TYPE: HistogramVec =
@@ -122,7 +122,7 @@ lazy_static! {
             &["task_name"],
             vec![0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Task result size by task type (in bytes)
     pub static ref TASK_RESULT_SIZE_BY_TYPE: HistogramVec =
@@ -132,24 +132,24 @@ lazy_static! {
             &["task_name"],
             vec![100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     // Connection Pooling Metrics
 
     /// Total number of Redis connections acquired
     pub static ref REDIS_CONNECTIONS_ACQUIRED_TOTAL: Counter =
         register_counter!("celers_redis_connections_acquired_total", "Total number of Redis connections acquired")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of Redis connection errors
     pub static ref REDIS_CONNECTION_ERRORS_TOTAL: Counter =
         register_counter!("celers_redis_connection_errors_total", "Total number of Redis connection errors")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Current number of active Redis connections
     pub static ref REDIS_CONNECTIONS_ACTIVE: Gauge =
         register_gauge!("celers_redis_connections_active", "Current number of active Redis connections")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Redis connection acquisition time histogram (in seconds)
     pub static ref REDIS_CONNECTION_ACQUIRE_TIME: Histogram =
@@ -158,39 +158,39 @@ lazy_static! {
             "Redis connection acquisition time in seconds",
             vec![0.0001, 0.001, 0.01, 0.1, 0.5, 1.0, 5.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     // PostgreSQL Connection Pool Metrics
 
     /// Maximum number of PostgreSQL connections in the pool
     pub static ref POSTGRES_POOL_MAX_SIZE: Gauge =
         register_gauge!("celers_postgres_pool_max_size", "Maximum number of PostgreSQL connections in the pool")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Current number of PostgreSQL connections in the pool
     pub static ref POSTGRES_POOL_SIZE: Gauge =
         register_gauge!("celers_postgres_pool_size", "Current number of PostgreSQL connections in the pool")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Current number of idle PostgreSQL connections
     pub static ref POSTGRES_POOL_IDLE: Gauge =
         register_gauge!("celers_postgres_pool_idle", "Current number of idle PostgreSQL connections")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Current number of in-use PostgreSQL connections
     pub static ref POSTGRES_POOL_IN_USE: Gauge =
         register_gauge!("celers_postgres_pool_in_use", "Current number of in-use PostgreSQL connections")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of batch enqueue operations
     pub static ref BATCH_ENQUEUE_TOTAL: Counter =
         register_counter!("celers_batch_enqueue_total", "Total number of batch enqueue operations")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of batch dequeue operations
     pub static ref BATCH_DEQUEUE_TOTAL: Counter =
         register_counter!("celers_batch_dequeue_total", "Total number of batch dequeue operations")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Batch size histogram (number of tasks per batch)
     pub static ref BATCH_SIZE: Histogram =
@@ -199,14 +199,14 @@ lazy_static! {
             "Number of tasks per batch operation",
             vec![1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     // Memory Usage Metrics
 
     /// Worker memory usage in bytes
     pub static ref WORKER_MEMORY_USAGE_BYTES: Gauge =
         register_gauge!("celers_worker_memory_usage_bytes", "Worker memory usage in bytes")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Task result size histogram (in bytes)
     pub static ref TASK_RESULT_SIZE_BYTES: Histogram =
@@ -215,17 +215,17 @@ lazy_static! {
             "Task result size in bytes",
             vec![100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Total number of tasks with oversized results (exceeded limit)
     pub static ref OVERSIZED_RESULTS_TOTAL: Counter =
         register_counter!("celers_oversized_results_total", "Total number of tasks with oversized results")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of garbage collection recommendations
     pub static ref GC_RECOMMENDATIONS_TOTAL: Counter =
         register_counter!("celers_gc_recommendations_total", "Total number of garbage collection recommendations")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     // Task Age Metrics
 
@@ -236,7 +236,7 @@ lazy_static! {
             "Task age (time from creation to execution) in seconds",
             vec![1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Task queue wait time histogram (time in queue before processing in seconds)
     pub static ref TASK_QUEUE_WAIT_TIME_SECONDS: Histogram =
@@ -245,24 +245,24 @@ lazy_static! {
             "Task wait time in queue before processing in seconds",
             vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     // Worker Utilization Metrics
 
     /// Worker utilization percentage (0-100)
     pub static ref WORKER_UTILIZATION_PERCENT: Gauge =
         register_gauge!("celers_worker_utilization_percent", "Worker utilization percentage (0-100)")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Number of idle workers
     pub static ref IDLE_WORKERS: Gauge =
         register_gauge!("celers_idle_workers", "Number of idle workers")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Number of busy workers
     pub static ref BUSY_WORKERS: Gauge =
         register_gauge!("celers_busy_workers", "Number of busy workers")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     // Broker Operation Latency Metrics
 
@@ -273,7 +273,7 @@ lazy_static! {
             "Broker enqueue operation latency in seconds",
             vec![0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Broker dequeue operation latency (in seconds)
     pub static ref BROKER_DEQUEUE_LATENCY_SECONDS: Histogram =
@@ -282,7 +282,7 @@ lazy_static! {
             "Broker dequeue operation latency in seconds",
             vec![0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Broker ack operation latency (in seconds)
     pub static ref BROKER_ACK_LATENCY_SECONDS: Histogram =
@@ -291,7 +291,7 @@ lazy_static! {
             "Broker ack operation latency in seconds",
             vec![0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Broker reject operation latency (in seconds)
     pub static ref BROKER_REJECT_LATENCY_SECONDS: Histogram =
@@ -300,7 +300,7 @@ lazy_static! {
             "Broker reject operation latency in seconds",
             vec![0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     /// Broker queue_size operation latency (in seconds)
     pub static ref BROKER_QUEUE_SIZE_LATENCY_SECONDS: Histogram =
@@ -309,24 +309,32 @@ lazy_static! {
             "Broker queue_size operation latency in seconds",
             vec![0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0]
         )
-        .unwrap();
+        .expect("Prometheus metric registration failed");
 
     // Delayed Task Metrics
 
     /// Number of delayed tasks currently scheduled
     pub static ref DELAYED_TASKS_SCHEDULED: Gauge =
         register_gauge!("celers_delayed_tasks_scheduled", "Number of delayed tasks currently scheduled")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of delayed tasks enqueued
     pub static ref DELAYED_TASKS_ENQUEUED_TOTAL: Counter =
         register_counter!("celers_delayed_tasks_enqueued_total", "Total number of delayed tasks enqueued")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
 
     /// Total number of delayed tasks executed
     pub static ref DELAYED_TASKS_EXECUTED_TOTAL: Counter =
         register_counter!("celers_delayed_tasks_executed_total", "Total number of delayed tasks executed")
-            .unwrap();
+            .expect("Prometheus metric registration failed");
+
+    /// Total bytes of task payloads processed (enqueued + results)
+    pub static ref TOTAL_PAYLOAD_BYTES_PROCESSED: Counter =
+        register_counter!(
+            "celers_total_payload_bytes_processed",
+            "Total bytes of task payloads processed (enqueued + results)"
+        )
+        .expect("Failed to create metric");
 }
 
 /// Get metrics in Prometheus text format
@@ -339,8 +347,10 @@ pub fn gather_metrics() -> String {
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .expect("Prometheus encoder should never fail encoding gathered metrics");
+    String::from_utf8(buffer).expect("Prometheus metrics buffer should be valid UTF-8")
 }
 
 /// Reset all metrics (useful for testing)
@@ -379,6 +389,20 @@ pub fn reset_metrics() {
     DELAYED_TASKS_SCHEDULED.set(0.0);
     DELAYED_TASKS_ENQUEUED_TOTAL.reset();
     DELAYED_TASKS_EXECUTED_TOTAL.reset();
+}
+
+/// Record bytes of payload processed (call when enqueuing tasks or storing results)
+///
+/// # Examples
+///
+/// ```
+/// use celers_metrics::record_payload_bytes;
+///
+/// // Record 1024 bytes of payload processed
+/// record_payload_bytes(1024);
+/// ```
+pub fn record_payload_bytes(bytes: usize) {
+    TOTAL_PAYLOAD_BYTES_PROCESSED.inc_by(bytes as f64);
 }
 
 /// Record a successful task execution with timing

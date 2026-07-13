@@ -548,32 +548,31 @@ impl RedisBroker {
     }
 
     /// Clean up old tasks from DLQ (older than specified age in seconds)
-    pub async fn cleanup_dlq(&self, _max_age_secs: u64) -> Result<usize> {
+    pub async fn cleanup_dlq(&self, max_age_secs: u64) -> Result<usize> {
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
-        // Get all DLQ items
         let items: Vec<String> = conn
             .lrange(&self.dlq_name, 0, -1)
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get DLQ items: {}", e)))?;
 
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(max_age_secs as i64);
         let mut removed_count = 0;
 
         for item in items {
-            // Try to parse task to validate it's a proper task
-            if serde_json::from_str::<SerializedTask>(&item).is_ok() {
-                // This is a simplified version - in real use, you'd track DLQ entry time
-                // and only remove tasks older than max_age_secs
-                conn.lrem::<_, _, ()>(&self.dlq_name, 1, &item)
-                    .await
-                    .map_err(|e| {
-                        CelersError::Broker(format!("Failed to remove from DLQ: {}", e))
-                    })?;
-                removed_count += 1;
+            if let Ok(task) = serde_json::from_str::<SerializedTask>(&item) {
+                if task.metadata.created_at < cutoff {
+                    conn.lrem::<_, _, ()>(&self.dlq_name, 1, &item)
+                        .await
+                        .map_err(|e| {
+                            CelersError::Broker(format!("Failed to remove from DLQ: {}", e))
+                        })?;
+                    removed_count += 1;
+                }
             }
         }
 
@@ -1509,5 +1508,29 @@ mod tests {
     fn test_invalid_redis_url() {
         let result = RedisBroker::new("invalid://not-a-redis-url", "test_queue");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cleanup_dlq_age_logic() {
+        // Verify the age-filtering logic: only items older than cutoff should be removed.
+        // We test the filtering math rather than full async Redis integration.
+        use chrono::{Duration, Utc};
+
+        let now = Utc::now();
+        let old_created = now - Duration::seconds(3700); // older than 1 hour
+        let new_created = now - Duration::seconds(30); // very recent
+
+        let cutoff = now - Duration::seconds(3600); // 1-hour max age
+
+        // Old task should be removed
+        assert!(
+            old_created < cutoff,
+            "Old task created before cutoff should be removed"
+        );
+        // Recent task should be kept
+        assert!(
+            new_created >= cutoff,
+            "Recent task created after cutoff should be kept"
+        );
     }
 }

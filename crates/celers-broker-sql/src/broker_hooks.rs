@@ -4,12 +4,13 @@
 //! managing task lifecycle hooks.
 
 use crate::broker_core::MysqlBroker;
+use crate::row_ext::RowExt;
 use crate::tracing::TraceContext;
 use crate::workflow::{HookContext, TaskHook};
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use chrono::Utc;
+use oxisql_core::Connection;
 use serde_json::json;
-use sqlx::Row;
 
 #[cfg(feature = "metrics")]
 use celers_metrics::{TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL};
@@ -85,23 +86,31 @@ impl MysqlBroker {
                 }
             }
         }
+        // oxisql-core has no `ToSqlValue` impl for `serde_json::Value`
+        // itself (unlike sqlx's `json` feature, which allowed binding
+        // `db_metadata` directly) — serialize to text first, matching the
+        // `json_param` convention documented in `row_ext.rs`.
+        let db_metadata_str =
+            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
 
-        sqlx::query(
-            r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
-            "#,
-        )
-        .bind(task_id)
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(db_metadata)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue task with trace: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                "#,
+                &[
+                    &task_id.to_string(),
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &db_metadata_str,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue task with trace: {}", e)))?;
 
         #[cfg(feature = "metrics")]
         {
@@ -151,20 +160,30 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn extract_trace_context(&self, task_id: &TaskId) -> Result<Option<TraceContext>> {
-        let row = sqlx::query(
-            r#"
-            SELECT metadata
-            FROM celers_tasks
-            WHERE id = ?
-            "#,
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch task metadata: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT metadata
+                FROM celers_tasks
+                WHERE id = ?
+                "#,
+                &[&task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch task metadata: {}", e)))?;
 
-        if let Some(row) = row {
-            let metadata: serde_json::Value = row.get("metadata");
+        if let Some(row) = rows.into_iter().next() {
+            // `celers_tasks.metadata` is a MySQL `JSON` column, which
+            // oxisql-mysql decodes to `Value::Json`/`Value::Text` (a text
+            // representation) rather than a native `serde_json::Value` —
+            // read as `String` then parse, matching the `json_from_row`
+            // convention in `row_ext.rs`.
+            let metadata_str: String = row
+                .col("metadata")
+                .map_err(|e| CelersError::Other(format!("Failed to fetch task metadata: {e}")))?;
+            let metadata: serde_json::Value = serde_json::from_str(&metadata_str)
+                .map_err(|e| CelersError::Other(format!("Failed to parse task metadata: {e}")))?;
             if let Some(trace_value) = metadata.get("trace_context") {
                 let trace_ctx: TraceContext =
                     serde_json::from_value(trace_value.clone()).map_err(|e| {

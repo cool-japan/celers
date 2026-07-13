@@ -159,6 +159,15 @@ impl Message {
         self.headers.expires.is_some()
     }
 
+    /// Get the message creation timestamp, if recorded.
+    ///
+    /// Messages created via [`Message::new`] have this set automatically.
+    /// Messages deserialized from producers that omit the field return `None`.
+    #[inline(always)]
+    pub fn created_at(&self) -> Option<DateTime<Utc>> {
+        self.headers.created_at
+    }
+
     /// Check if the message is part of a group
     #[inline(always)]
     pub fn has_group(&self) -> bool {

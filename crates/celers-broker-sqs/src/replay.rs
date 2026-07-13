@@ -153,7 +153,7 @@ impl ReplayFilter {
     pub fn with_time_range_hours(mut self, hours: u64) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         self.min_timestamp = Some(now - (hours * 3600));
         self
@@ -468,7 +468,7 @@ mod tests {
     fn test_replay_filter_matches_time_range() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let filter = ReplayFilter::new().with_time_range(now - 3600, now);

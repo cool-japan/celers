@@ -215,6 +215,7 @@ fn bench_metric_comparison(c: &mut Criterion) {
         processing_queue_size: 20.0,
         dlq_size: 5.0,
         active_workers: 10.0,
+        total_payload_bytes: 0.0,
     };
 
     let current = CurrentMetrics {
@@ -227,6 +228,7 @@ fn bench_metric_comparison(c: &mut Criterion) {
         processing_queue_size: 25.0,
         dlq_size: 8.0,
         active_workers: 12.0,
+        total_payload_bytes: 0.0,
     };
 
     c.bench_function("metric_comparison", |b| {
@@ -245,6 +247,7 @@ fn bench_alert_rules(c: &mut Criterion) {
         processing_queue_size: 20.0,
         dlq_size: 5.0,
         active_workers: 3.0,
+        total_payload_bytes: 0.0,
     };
 
     let rule = AlertRule::new(

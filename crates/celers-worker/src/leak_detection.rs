@@ -152,7 +152,10 @@ impl TaskMemoryTracker {
         }
 
         let first = &self.samples[0];
-        let last = self.samples.last().unwrap();
+        let last = self
+            .samples
+            .last()
+            .expect("samples validated to have at least 2 elements");
         let duration_secs = (last.timestamp - first.timestamp).as_secs_f64();
 
         if duration_secs <= 0.0 {

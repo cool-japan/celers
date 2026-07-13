@@ -99,15 +99,15 @@ impl<T> LockFreeQueue<T> {
         &self.injector
     }
 
-    /// Try to pop without retrying on contention
+    /// Try to pop a task from the queue
+    ///
+    /// This retries internally on spurious contention (`Steal::Retry`), which
+    /// `crossbeam_deque::Injector::steal` can return even when the queue is
+    /// non-empty. It is currently equivalent to [`Self::pop`]; the separate
+    /// name is kept for API stability and to allow future divergence (e.g. a
+    /// bounded retry count) without changing the call signature.
     pub fn try_pop(&self) -> Option<T> {
-        match self.injector.steal() {
-            Steal::Success(task) => {
-                self.count.fetch_sub(1, Ordering::Relaxed);
-                Some(task)
-            }
-            Steal::Empty | Steal::Retry => None,
-        }
+        self.pop()
     }
 }
 

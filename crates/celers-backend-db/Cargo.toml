@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Database (PostgreSQL/MySQL) result backend for CeleRS"
+readme = "README.md"
 keywords = ["celery", "database", "backend", "postgresql", "mysql"]
 categories = ["asynchronous", "database"]
 
@@ -19,15 +20,39 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 
-# SQL client supporting both PostgreSQL and MySQL
-sqlx = { workspace = true }
+# SQL clients (OxiSQL, Pure Rust) supporting both PostgreSQL and MySQL.
+#
+# NOTE on feature gating: this crate's `postgres`/`mysql` Cargo features
+# (see [features] below) are NOT wired to any `#[cfg(feature = ...)]` in the
+# source — `PostgresResultBackend`/`PostgresAnalytics` and
+# `MysqlResultBackend`/`MysqlAnalytics` are both compiled unconditionally
+# today (confirmed: `grep -n "cfg(feature" src/*.rs` shows only the
+# unrelated `distributed-locks` gate on the `lock` module). That was already
+# true pre-migration — `sqlx = { workspace = true }` pulled in the
+# workspace's `sqlx` with both its `postgres` and `mysql` sqlx-features
+# always enabled, regardless of which of *this crate's* `postgres`/`mysql`
+# features were selected. `oxisql-postgres`/`oxisql-mysql` are therefore
+# kept as required (non-optional) dependencies here too, matching that same
+# "always both, unconditionally" shape — making them `optional = true` and
+# tying them to `dep:oxisql-postgres`/`dep:oxisql-mysql` would break the
+# build the moment only one of `postgres`/`mysql` is selected, since the
+# unconditional source code references both crates either way. Introducing
+# real `#[cfg(feature = ...)]` gating on the Postgres-only/MySQL-only code
+# blocks is a separate, larger change outside this migration's scope.
+oxisql-core = { workspace = true }
+oxisql-postgres = { workspace = true }
+oxisql-mysql = { workspace = true }
+oxitls = { workspace = true }
+rustls = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
 
 # Core protocol
-celers-core = { path = "../celers-core", version = "0.2.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+celers-core = { workspace = true }
+celers-protocol = { workspace = true }
 
 # Re-export types from backend-redis for trait compatibility
-celers-backend-redis = { path = "../celers-backend-redis", version = "0.2.0" }
+celers-backend-redis = { workspace = true }
 
 [features]
 default = ["postgres"]
@@ -36,4 +61,3 @@ mysql = []
 distributed-locks = []
 
 [dev-dependencies]
-tokio-test = { workspace = true }

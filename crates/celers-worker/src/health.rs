@@ -91,7 +91,7 @@ impl HealthInfo {
         if let Some(last_success) = self.last_success_timestamp {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs();
             (now - last_success) <= 300 // 5 minutes
         } else {
@@ -125,7 +125,7 @@ impl HealthChecker {
     pub fn new() -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         Self {
@@ -144,7 +144,7 @@ impl HealthChecker {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         self.last_success_timestamp.store(now, Ordering::Relaxed);
     }
@@ -163,7 +163,7 @@ impl HealthChecker {
     pub fn get_health(&self) -> HealthInfo {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let uptime_seconds = now - self.start_time;
@@ -264,7 +264,7 @@ impl HealthChecker {
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         now.saturating_sub(last_success)

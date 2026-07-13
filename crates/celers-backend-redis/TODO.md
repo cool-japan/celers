@@ -2,7 +2,7 @@
 
 > Redis result backend for task results and workflow state
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 208**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 208**
 
 ## Status: ✅ FEATURE COMPLETE + ENHANCED + PRODUCTION-READY + UTILITIES & MONITORING + BATCH ANALYTICS + ADVANCED OPERATIONS + TRANSACTIONS & DEPENDENCIES + QUERYING & ARCHIVAL + TAGS & CUSTOM METADATA + TAG-BASED BULK OPS + DETAILED BATCH TRACKING + TELEMETRY & OBSERVABILITY + CONNECTION RETRY + BATCH STREAMING + PIPELINE OPTIMIZATION + PERFORMANCE PROFILING + v0.2.0 ENHANCEMENTS
 
@@ -459,7 +459,8 @@ All core result backend features implemented plus advanced features:
 - [x] Connection failure tests ✅ (included in integration tests)
 
 ### Test Summary
-- Unit tests: 173 passing (includes comprehensive tests for all features) ✨ UPDATED
+- Unit tests: 208 passing (verified via `cargo nextest run --all-features`; category breakdown
+  below is representative, not an exhaustive/reconciled sum)
   - 10 encryption tests
   - 3 chord retry tests
   - 2 lazy loading tests
@@ -477,14 +478,14 @@ All core result backend features implemented plus advanced features:
   - 12 batch streaming tests ✨ NEW
   - 17 pipeline optimization tests ✨ NEW
   - 19 performance profiling tests ✨ NEW
-- Doc tests: 40 passing (includes all utility examples + convenience methods + new features) ✨ UPDATED
+- Doc tests: 41 passing, 1 ignored (includes all utility examples + convenience methods + new features)
   - TTL constants example
   - Batch size recommendations example
   - 10 convenience method examples
   - 3 builder examples (BackendBuilder, TaskMetaBuilder, ChordBuilder)
   - 8 feature examples (transactions, Lua, patterns, dependencies, monitoring)
-  - 1 retry executor example ✨ NEW
-- Integration tests: 14 tests (marked with `#[ignore]`, run with `cargo test -- --ignored`)
+  - 1 retry executor example
+- Integration tests: 18 tests (marked with `#[ignore]`, run with `cargo test -- --ignored`)
   - Basic store/retrieve
   - Compression with large data
   - Encryption with sensitive data
@@ -499,7 +500,7 @@ All core result backend features implemented plus advanced features:
   - Get statistics
   - Cleanup old results
   - Cleanup completed chords
-- **Total: 208 tests passing with 0 warnings (+ 14 integration tests available)**
+- **Total: 208 unit/library tests + 41 doc tests passing with 0 warnings (+ 18 integration tests available)**
   - unit tests (telemetry, retry, batch_stream, pipeline, profiler modules)
   - doc tests (all public APIs)
 

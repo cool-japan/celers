@@ -57,6 +57,68 @@ pub enum Schedule {
     },
 }
 
+/// Translate a standard Unix cron day-of-week field into the Quartz numbering
+/// used by the `cron` crate.
+///
+/// Standard Unix cron numbers days `0-6` with `0 = Sunday` (and accepts `7`
+/// as an alternative for Sunday). The `cron` crate (Quartz style) numbers days
+/// `1-7` with `1 = Sunday`. The numeric mapping is therefore
+/// `quartz = (unix % 7) + 1`.
+///
+/// Wildcards (`*`, `?`), comma lists, ranges, `/step` suffixes and named days
+/// (`mon`, `fri`, … — already understood by the `cron` crate) are preserved.
+/// Tokens that are not a recognized numeric form pass through unchanged.
+#[cfg(feature = "cron")]
+fn translate_day_of_week(field: &str) -> String {
+    if field == "*" || field == "?" {
+        return field.to_string();
+    }
+    field
+        .split(',')
+        .map(translate_day_of_week_term)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Translate a single comma-separated day-of-week term (which may carry a
+/// `/step` suffix and may itself be a range).
+#[cfg(feature = "cron")]
+fn translate_day_of_week_term(term: &str) -> String {
+    let (base, step) = match term.split_once('/') {
+        Some((base, step)) => (base, Some(step)),
+        None => (term, None),
+    };
+
+    let translated_base = if let Some((start, end)) = base.split_once('-') {
+        match (map_unix_dow(start), map_unix_dow(end)) {
+            (Some(s), Some(e)) => format!("{s}-{e}"),
+            _ => base.to_string(),
+        }
+    } else {
+        match map_unix_dow(base) {
+            Some(v) => v.to_string(),
+            None => base.to_string(),
+        }
+    };
+
+    match step {
+        Some(step) => format!("{translated_base}/{step}"),
+        None => translated_base,
+    }
+}
+
+/// Map a single Unix day-of-week ordinal (`0..=7`, `0`/`7` = Sunday) to the
+/// Quartz ordinal used by the `cron` crate (`1..=7`, `1` = Sunday). Returns
+/// `None` for non-numeric or out-of-range tokens so callers leave them intact.
+#[cfg(feature = "cron")]
+fn map_unix_dow(token: &str) -> Option<u32> {
+    let value: u32 = token.trim().parse().ok()?;
+    if value > 7 {
+        return None;
+    }
+    Some((value % 7) + 1)
+}
+
 impl Schedule {
     /// Create interval schedule
     pub fn interval(seconds: u64) -> Self {
@@ -165,6 +227,12 @@ impl Schedule {
                 // Build cron expression from fields
                 // Cron format: sec min hour day month day_of_week year
                 // We use "0" for seconds and "*" for year
+                // The `cron` crate uses the Quartz day-of-week convention
+                // (1 = Sunday .. 7 = Saturday); this API documents and accepts
+                // standard Unix numbering (0 = Sunday .. 6 = Saturday, 7 = Sunday).
+                // Translate the numeric day-of-week tokens so the documented
+                // semantics hold (e.g. "1-5" really means Mon-Fri, not Sun-Thu).
+                let day_of_week = translate_day_of_week(day_of_week);
                 let cron_expr = format!(
                     "0 {} {} {} {} {} *",
                     minute, hour, day_of_month, month_of_year, day_of_week
@@ -618,11 +686,11 @@ impl BusinessCalendar {
                     // Before business hours - move to start of business hours today
                     current = current
                         .with_hour(self.business_hours.start_hour)
-                        .unwrap()
+                        .expect("business hours start_hour should be valid (0-23)")
                         .with_minute(0)
-                        .unwrap()
+                        .expect("minute 0 is always valid")
                         .with_second(0)
-                        .unwrap();
+                        .expect("second 0 is always valid");
                     return current;
                 } else if hour < self.business_hours.end_hour {
                     // Within business hours - this is valid
@@ -634,11 +702,11 @@ impl BusinessCalendar {
             // Move to start of next day
             current = (current + Duration::days(1))
                 .with_hour(self.business_hours.start_hour)
-                .unwrap()
+                .expect("business hours start_hour should be valid (0-23)")
                 .with_minute(0)
-                .unwrap()
+                .expect("minute 0 is always valid")
                 .with_second(0)
-                .unwrap();
+                .expect("second 0 is always valid");
         }
 
         current
@@ -955,24 +1023,25 @@ impl HolidayCalendar {
     /// - Christmas Day (December 25)
     /// - Boxing Day (December 26)
     ///
-    /// Note: Easter-dependent holidays use a simplified approximation.
-    /// For exact dates, use a proper Easter calculation algorithm.
+    /// Easter-dependent holidays are computed using the Anonymous Gregorian
+    /// (Meeus/Jones/Butcher) algorithm, valid for years 1583–4099.
     pub fn uk(year: i32) -> Self {
         let mut calendar = Self::new();
 
         // New Year's Day (January 1)
         calendar.add("New Year's Day", year, 1, 1);
 
-        // Easter calculation (simplified - using a fixed date approximation)
-        // In a production system, you would use a proper Easter algorithm
-        // For now, we'll use common approximate dates
-
-        // Good Friday (approximate - varies between March 20 and April 23)
-        // Using April 15 as a typical date
-        calendar.add("Good Friday", year, 4, 15);
-
-        // Easter Monday (Good Friday + 3 days)
-        calendar.add("Easter Monday", year, 4, 18);
+        // Easter-dependent holidays computed via the Anonymous Gregorian algorithm
+        let easter = Self::compute_easter(year);
+        let good_friday = easter - chrono::Days::new(2);
+        let easter_monday = easter + chrono::Days::new(1);
+        calendar.add("Good Friday", year, good_friday.month(), good_friday.day());
+        calendar.add(
+            "Easter Monday",
+            year,
+            easter_monday.month(),
+            easter_monday.day(),
+        );
 
         // Early May Bank Holiday (1st Monday in May)
         if let Some((_, day)) = Self::nth_weekday(year, 5, 1, 1) {
@@ -1018,8 +1087,10 @@ impl HolidayCalendar {
         // New Year's Day (January 1)
         calendar.add("New Year's Day", year, 1, 1);
 
-        // Good Friday (approximate - using April 15 as typical date)
-        calendar.add("Good Friday", year, 4, 15);
+        // Good Friday computed via the Anonymous Gregorian algorithm
+        let easter = Self::compute_easter(year);
+        let good_friday = easter - chrono::Days::new(2);
+        calendar.add("Good Friday", year, good_friday.month(), good_friday.day());
 
         // Victoria Day (Monday before May 25)
         // This is the last Monday on or before May 24
@@ -1052,6 +1123,28 @@ impl HolidayCalendar {
         calendar
     }
 
+    /// Compute Easter Sunday for a given year using the Anonymous Gregorian
+    /// (Meeus/Jones/Butcher) algorithm.
+    ///
+    /// Valid for years 1583–4099 (proleptic Gregorian calendar).
+    fn compute_easter(year: i32) -> chrono::NaiveDate {
+        let a = year % 19;
+        let b = year / 100;
+        let c = year % 100;
+        let d = b / 4;
+        let e = b % 4;
+        let f = (b + 8) / 25;
+        let g = (b - f + 1) / 3;
+        let h = (19 * a + b - d - g + 15) % 30;
+        let i = c / 4;
+        let k = c % 4;
+        let l = (32 + 2 * e + 2 * i - h - k) % 7;
+        let m = (a + 11 * h + 22 * l) / 451;
+        let month = (h + l - 7 * m + 114) / 31; // 3 = March, 4 = April
+        let day = (h + l - 7 * m + 114) % 31 + 1;
+        chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32).expect("valid Easter date")
+    }
+
     /// Find the Monday on or before a specific date
     ///
     /// # Arguments
@@ -1077,6 +1170,126 @@ impl HolidayCalendar {
 
         let target = date.checked_sub_signed(Duration::days(days_back as i64))?;
         Some((target.month(), target.day()))
+    }
+}
+
+#[cfg(test)]
+mod easter_tests {
+    use super::HolidayCalendar;
+
+    #[test]
+    fn test_compute_easter_known_dates() {
+        // Known Easter Sundays (Gregorian)
+        assert_eq!(
+            HolidayCalendar::compute_easter(2024),
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 31).unwrap()
+        );
+        assert_eq!(
+            HolidayCalendar::compute_easter(2025),
+            chrono::NaiveDate::from_ymd_opt(2025, 4, 20).unwrap()
+        );
+        assert_eq!(
+            HolidayCalendar::compute_easter(2026),
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 5).unwrap()
+        );
+        assert_eq!(
+            HolidayCalendar::compute_easter(2000),
+            chrono::NaiveDate::from_ymd_opt(2000, 4, 23).unwrap()
+        );
+        // Earliest possible Easter Sunday in the Gregorian calendar
+        assert_eq!(
+            HolidayCalendar::compute_easter(1818),
+            chrono::NaiveDate::from_ymd_opt(1818, 3, 22).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_uk_good_friday_is_2_days_before_easter() {
+        let calendar = HolidayCalendar::uk(2024);
+        // Easter 2024 = March 31, so Good Friday = March 29
+        let gf = calendar
+            .holidays
+            .iter()
+            .find(|h| h.name == "Good Friday")
+            .unwrap();
+        assert_eq!(gf.date.1, 3);
+        assert_eq!(gf.date.2, 29);
+        let em = calendar
+            .holidays
+            .iter()
+            .find(|h| h.name == "Easter Monday")
+            .unwrap();
+        assert_eq!(em.date.1, 4);
+        assert_eq!(em.date.2, 1);
+    }
+
+    #[test]
+    fn test_canada_good_friday_matches_easter() {
+        let calendar = HolidayCalendar::canada(2025);
+        // Easter 2025 = April 20, so Good Friday = April 18
+        let gf = calendar
+            .holidays
+            .iter()
+            .find(|h| h.name == "Good Friday")
+            .unwrap();
+        assert_eq!(gf.date.1, 4);
+        assert_eq!(gf.date.2, 18);
+    }
+}
+
+#[cfg(all(test, feature = "cron"))]
+mod cron_dow_tests {
+    use super::{translate_day_of_week, Schedule};
+    use chrono::{Datelike, TimeZone, Timelike, Utc, Weekday};
+
+    #[test]
+    fn translate_day_of_week_unix_to_quartz() {
+        assert_eq!(translate_day_of_week("0"), "1"); // Sunday
+        assert_eq!(translate_day_of_week("1"), "2"); // Monday
+        assert_eq!(translate_day_of_week("6"), "7"); // Saturday
+        assert_eq!(translate_day_of_week("7"), "1"); // Sunday (alt form)
+        assert_eq!(translate_day_of_week("1-5"), "2-6"); // Mon-Fri
+        assert_eq!(translate_day_of_week("0,6"), "1,7"); // weekend
+        assert_eq!(translate_day_of_week("1-5/2"), "2-6/2"); // step preserved
+        assert_eq!(translate_day_of_week("*"), "*");
+        assert_eq!(translate_day_of_week("mon-fri"), "mon-fri"); // names untouched
+    }
+
+    #[test]
+    fn weekday_schedule_fires_monday_to_friday() {
+        // Regression: "1-5" must mean Mon-Fri (Unix), not Sun-Thu (Quartz).
+        let schedule = Schedule::crontab("0", "9", "1-5", "*", "*");
+        // 2024-06-01 is a Saturday; start the search there.
+        let mut at = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+        assert_eq!(at.weekday(), Weekday::Sat);
+        for _ in 0..5 {
+            let next = schedule.next_run(Some(at)).expect("weekday cron parses");
+            let wd = next.weekday();
+            assert!(
+                matches!(
+                    wd,
+                    Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
+                ),
+                "weekday cron fired on {:?} ({})",
+                wd,
+                next
+            );
+            assert_eq!(next.hour(), 9);
+            at = next;
+        }
+    }
+
+    #[test]
+    fn sunday_schedule_is_accepted_and_fires_on_sunday() {
+        // Unix "0" = Sunday must be accepted (the cron crate range is 1-7)
+        // and actually fire on a Sunday.
+        let schedule = Schedule::crontab("0", "12", "0", "*", "*");
+        let at = Utc.with_ymd_and_hms(2024, 6, 3, 0, 0, 0).unwrap(); // Monday
+        let next = schedule
+            .next_run(Some(at))
+            .expect("Sunday schedule should parse");
+        assert_eq!(next.weekday(), Weekday::Sun);
+        assert_eq!(next.hour(), 12);
     }
 }
 

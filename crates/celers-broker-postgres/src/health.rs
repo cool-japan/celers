@@ -1,8 +1,10 @@
 //! Connection health, resilience, and metrics update methods
 
 use celers_core::{CelersError, Result};
+use oxisql_core::Connection;
 use std::time::Duration;
 
+use crate::row_ext::RowExt;
 use crate::types::{BatchSizeRecommendation, DetailedHealthStatus};
 use crate::PostgresBroker;
 
@@ -41,9 +43,20 @@ impl PostgresBroker {
         let start = std::time::Instant::now();
 
         // Test connection and get version
-        let version_result = sqlx::query_scalar::<_, String>("SELECT version()")
-            .fetch_one(&self.pool)
-            .await;
+        let version_result: std::result::Result<String, CelersError> = async {
+            let rows = self
+                .conn
+                .query("SELECT version()", &[])
+                .await
+                .map_err(|e| CelersError::Other(format!("{}", e)))?;
+            let row = rows
+                .into_iter()
+                .next()
+                .ok_or_else(|| CelersError::Other("no rows returned".to_string()))?;
+            row.col_idx(0)
+                .map_err(|e| CelersError::Other(format!("{}", e)))
+        }
+        .await;
 
         let (connection_ok, database_version) = match version_result {
             Ok(v) => (true, v),
@@ -150,13 +163,24 @@ impl PostgresBroker {
         max_retries: u32,
         initial_delay_ms: u64,
     ) -> Result<String> {
-        let mut last_error = None;
+        let mut last_error: Option<String> = None;
 
         for attempt in 0..=max_retries {
-            match sqlx::query_scalar::<_, String>("SELECT version()")
-                .fetch_one(&self.pool)
-                .await
-            {
+            let attempt_result: std::result::Result<String, String> = async {
+                let rows = self
+                    .conn
+                    .query("SELECT version()", &[])
+                    .await
+                    .map_err(|e| format!("{}", e))?;
+                let row = rows
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "no rows returned".to_string())?;
+                row.col_idx(0).map_err(|e| format!("{}", e))
+            }
+            .await;
+
+            match attempt_result {
                 Ok(version) => {
                     if attempt > 0 {
                         tracing::info!("Connection successful after {} attempt(s)", attempt + 1);
@@ -164,18 +188,17 @@ impl PostgresBroker {
                     return Ok(version);
                 }
                 Err(e) => {
-                    last_error = Some(e);
-
                     if attempt < max_retries {
                         let delay_ms = initial_delay_ms * 2_u64.pow(attempt);
                         tracing::warn!(
                             "Connection attempt {} failed, retrying in {}ms: {}",
                             attempt + 1,
                             delay_ms,
-                            last_error.as_ref().expect("error just set in Err branch")
+                            e
                         );
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
+                    last_error = Some(e);
                 }
             }
         }
@@ -183,7 +206,7 @@ impl PostgresBroker {
         Err(CelersError::Other(format!(
             "Connection failed after {} retries: {}",
             max_retries,
-            last_error.expect("error occurred during retries")
+            last_error.unwrap_or_else(|| "unknown error".to_string())
         )))
     }
 
@@ -209,60 +232,82 @@ impl PostgresBroker {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Pool-introspection / multi-connection gap (oxisql migration)
+    ///
+    /// The pre-migration `sqlx`-backed version spawned up to
+    /// `target_connections` concurrent tasks, each acquiring a *distinct*
+    /// connection from `sqlx::PgPool` via `pool.clone()` (cloning a
+    /// `sqlx::Pool` shares the pool's internal connection-acquisition queue,
+    /// not a single connection) — genuinely pre-establishing up to
+    /// `max_size` live TCP connections.
+    ///
+    /// `oxisql_postgres::PgConnection` is also `Clone`, but cloning it
+    /// clones an `Arc<Mutex<tokio_postgres::Client>>` — every clone shares
+    /// the SAME single underlying connection (confirmed by reading
+    /// `oxisql-postgres` 0.3.2's `connection.rs`: `PgConnection { inner:
+    /// Arc<Mutex<tokio_postgres::Client>>, .. }`). Spawning N tasks each
+    /// holding a clone would therefore serialize N queries through one
+    /// connection (via the shared `Mutex`), not establish N independent
+    /// ones, and — combined with [`PostgresBroker::get_pool_metrics`]
+    /// reporting `max_size` as `0` (unknown; see that method's doc comment)
+    /// — `target_connections.min(pool_metrics.max_size)` would always
+    /// evaluate to `0`, making the original loop-based implementation
+    /// permanently dead code under this migration.
+    ///
+    /// Rather than leave that silently-dead code in place, or spawn N
+    /// `PgConnection::connect` calls that open genuinely-distinct
+    /// connections but are then immediately dropped (providing no lasting
+    /// warmup benefit, since nothing pools them), this issues ONE
+    /// lightweight round-trip query on `self.conn`, which is sufficient to
+    /// validate connectivity and avoid the specific cold-start penalty of
+    /// "first real query pays the TCP+auth handshake cost" for this
+    /// connection. This is the same approach and rationale already
+    /// established for the sibling MySQL migration's
+    /// `celers-broker-sql::MysqlBroker::warmup_connection_pool`.
+    ///
+    /// Returns `1` on success (one connection warmed) or `0` if the warmup
+    /// query fails, rather than propagating the error — matching the
+    /// original's "best-effort, count how many succeeded" semantics as
+    /// closely as possible given the single-connection reality.
     pub async fn warmup_connection_pool(&self, target_connections: u32) -> Result<u32> {
-        let pool_metrics = self.get_pool_metrics();
-        let max_warmup = target_connections.min(pool_metrics.max_size);
-
-        if max_warmup == 0 {
+        if target_connections == 0 {
             return Ok(0);
         }
 
         tracing::info!(
             target_connections,
-            max_warmup,
-            current_size = pool_metrics.size,
-            "Starting connection pool warmup"
+            "Starting connection pool warmup (single multiplexed connection)"
         );
 
-        let mut warmed = 0u32;
-        let mut tasks = Vec::new();
-
-        for i in 0..max_warmup {
-            let pool = self.pool.clone();
-            let task = tokio::spawn(async move {
-                match sqlx::query_scalar::<_, i32>("SELECT 1")
-                    .fetch_one(&pool)
-                    .await
-                {
+        let rows = self.conn.query("SELECT 1", &[]).await;
+        let warmed = match rows {
+            Ok(rows) => {
+                let value: std::result::Result<i32, _> = rows
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "no rows returned".to_string())
+                    .and_then(|row| row.col_idx::<i32>(0).map_err(|e| format!("{}", e)));
+                match value {
                     Ok(_) => {
-                        tracing::debug!(connection = i + 1, "Connection warmed up");
-                        Ok(())
+                        tracing::debug!(connection = 1, "Connection warmed up");
+                        1
                     }
                     Err(e) => {
-                        tracing::warn!(connection = i + 1, error = %e, "Failed to warm up connection");
-                        Err(e)
+                        tracing::warn!(connection = 1, error = %e, "Failed to warm up connection");
+                        0
                     }
                 }
-            });
-            tasks.push(task);
-        }
-
-        // Wait for all warmup tasks to complete
-        for task in tasks {
-            match task.await {
-                Ok(Ok(())) => warmed += 1,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "Warmup connection failed");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Warmup task panicked");
-                }
             }
-        }
+            Err(e) => {
+                tracing::warn!(connection = 1, error = %e, "Failed to warm up connection");
+                0
+            }
+        };
 
         tracing::info!(
             warmed,
-            target = max_warmup,
+            target = target_connections,
             "Connection pool warmup complete"
         );
 
@@ -441,25 +486,54 @@ impl PostgresBroker {
     #[cfg(feature = "metrics")]
     pub async fn update_metrics(&self) -> Result<()> {
         // Get pending tasks count
-        let pending_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE state = 'pending'")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+        let pending_rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM celers_tasks WHERE state = 'pending'",
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+        let pending_count: i64 = pending_rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                CelersError::Other("Failed to get pending count: no rows returned".to_string())
+            })?
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
 
         // Get processing tasks count
-        let processing_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE state = 'processing'")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| {
-                    CelersError::Other(format!("Failed to get processing count: {}", e))
-                })?;
+        let processing_rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM celers_tasks WHERE state = 'processing'",
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get processing count: {}", e)))?;
+        let processing_count: i64 = processing_rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                CelersError::Other("Failed to get processing count: no rows returned".to_string())
+            })?
+            .col_idx(0)
+            .map_err(|e| CelersError::Other(format!("Failed to get processing count: {}", e)))?;
 
         // Get DLQ count
-        let dlq_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_dead_letter_queue")
-            .fetch_one(&self.pool)
+        let dlq_rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM celers_dead_letter_queue", &[])
             .await
+            .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {}", e)))?;
+        let dlq_count: i64 = dlq_rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                CelersError::Other("Failed to get DLQ count: no rows returned".to_string())
+            })?
+            .col_idx(0)
             .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {}", e)))?;
 
         // Update queue gauges

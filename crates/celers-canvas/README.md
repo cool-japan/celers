@@ -1,6 +1,6 @@
 # celers-canvas
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13**
 
 Distributed workflow primitives for CeleRS task orchestration. Build complex task dependencies with Chain, Group, Chord, Map, and Starmap patterns.
 
@@ -16,6 +16,11 @@ Production-ready workflow patterns inspired by Celery's Canvas:
 - ✅ **Signature**: Reusable task definitions with arguments
 - ✅ **Priority Support**: Task prioritization in workflows
 - ✅ **Immutability**: Prevent argument replacement in chains
+- ✅ **Nested Workflows**: Real nested chain/group/chord execution (`NestedChain`, `NestedGroup`) — chord callbacks are enqueued even when nested inside a chain or group
+- ✅ **DAG Visualization**: Export any workflow to Mermaid or GraphViz DOT (`DagExport`/`DagVisualize`)
+- ✅ **Loops, Templates & Sub-Workflows**: Bounded loops, map-style iteration, parameterized templates, sub-workflow composition
+- ✅ **Versioning**: Schema-versioned serialization with a migration registry for upgrading older payloads
+- ✅ **Rate-Limit-Aware Dispatch**: Derive per-member staggered countdowns from a token-bucket `RateLimitConfig`
 
 ## Quick Start
 
@@ -234,20 +239,34 @@ let sig = Signature::new("critical_task".to_string())
 
 ### Nested Workflows
 
-Combine workflows for complex patterns:
+`NestedChain` and `NestedGroup` (`celers_canvas::{NestedChain, NestedGroup, CanvasElement}`)
+combine Chain/Group/Chord/Map/Branch/Switch elements into one workflow tree and execute it for
+real — including a chord nested inside a chain, whose header fans out and whose callback is
+enqueued once the header completes (previously this was silently dropped):
 
 ```rust
-// Process groups in sequence
-let group1 = Group::new()
-    .add("task_a", vec![])
-    .add("task_b", vec![]);
+use celers_canvas::{Group, NestedChain, Signature};
 
-let group2 = Group::new()
-    .add("task_c", vec![])
-    .add("task_d", vec![]);
+let workflow = NestedChain::new()
+    .then("step1", vec![])
+    .then_group(
+        Group::new()
+            .add("parallel_a", vec![])
+            .add("parallel_b", vec![]),
+    )
+    .then_chord(
+        Group::new()
+            .add("compute_partial", vec![serde_json::json!(1)])
+            .add("compute_partial", vec![serde_json::json!(2)]),
+        Signature::new("aggregate_results".to_string()),
+    )
+    .then("step2", vec![]);
 
-// Execute groups sequentially (not directly supported, use manual coordination)
+let task_id = workflow.apply(&broker).await?;
 ```
+
+`NestedGroup` is the parallel equivalent, running its members (which may themselves be
+chains/groups/chords) concurrently via the same `apply_chord_element` execution path.
 
 ### Priority Workflows
 
@@ -398,11 +417,45 @@ if count >= state.total {
 - **Exactly Once**: Callback enqueued exactly once
 - **No Lost Updates**: Atomic operations prevent race conditions
 
+## Workflow Visualization
+
+Export any workflow as a Mermaid flowchart or GraphViz DOT graph for inspection or documentation.
+
+`DagExport` covers the base primitives (`Chain`, `Group`, `Chord`) and additionally offers
+`to_json()` / `to_svg()` (the latter shells out to a local `dot` binary):
+
+```rust
+use celers_canvas::{Chain, DagExport};
+
+let chain = Chain::new()
+    .then("download_data", vec![])
+    .then("process_data", vec![])
+    .then("upload_result", vec![]);
+
+println!("{}", chain.to_mermaid());
+println!("{}", chain.to_dot());
+```
+
+`DagVisualize` (`to_mermaid()` / `to_dot()`) covers `CanvasElement`, `NestedChain`, `NestedGroup`,
+and the advanced primitives (`Map`, `Starmap`, `Chunks`, `Branch`, `Switch`), with deterministic
+node ids and labelled fan-out/fan-in/chord/decision edges — including chords nested inside a
+chain or group:
+
+```rust
+use celers_canvas::{CanvasElement, DagVisualize, NestedChain};
+
+let workflow = NestedChain::new()
+    .then("step1", vec![])
+    .then("step2", vec![]);
+
+println!("{}", workflow.to_mermaid());
+```
+
 ## Feature Flags
 
 ```toml
 [dependencies]
-celers-canvas = { version = "0.1", features = ["backend-redis"] }
+celers-canvas = { version = "0.3", features = ["backend-redis"] }
 ```
 
 **Available features:**
@@ -441,7 +494,7 @@ match Chain::new().then("task", vec![]).apply(&broker).await {
 | Starmap | ✅ | ✅ |
 | Immutability | ✅ | ✅ |
 | Priority | ✅ | ✅ |
-| Nested Workflows | ⚠️ Manual | ✅ Automatic |
+| Nested Workflows | ✅ `NestedChain`/`NestedGroup` | ✅ Automatic |
 | Result Backend Required | Chord only | All (optional) |
 
 **Compatibility:**
@@ -569,7 +622,8 @@ urgent.apply(&broker).await?;
 
 ## Testing
 
-**196 tests passing** (194 unit tests + 66 doc tests)
+**396 tests passing** (318 unit/integration via `cargo nextest --all-features` + 78 doc tests;
+2 further unit tests and 3 doc tests are `ignore`d)
 
 ```rust
 #[cfg(test)]
@@ -583,15 +637,15 @@ mod tests {
             .then("task1", vec![])
             .then("task2", vec![]);
 
-        let task_id = chain.apply(&broker).await.unwrap();
-        assert!(broker.has_task(task_id));
+        let _task_id = chain.apply(&broker).await.unwrap();
+        assert_eq!(broker.task_count(), 1); // first chain step enqueued
     }
 }
 ```
 
 ## See Also
 
-- **Examples**: `examples/canvas_workflows.rs` - Comprehensive workflow examples
+- **Examples**: `examples/basic_workflows.rs`, `examples/advanced_patterns.rs`, `examples/integration_example.rs` - Workflow examples
 - **Core**: `celers-core` - Task registry and execution
 - **Worker**: `celers-worker` - Worker runtime with workflow support
 - **Backend**: `celers-backend-redis` - Result backend for Chord

@@ -285,7 +285,7 @@ impl MetricsHook {
     pub fn operation_count(&self, operation: OperationType) -> u64 {
         self.operation_counts
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(operation.as_str())
             .copied()
             .unwrap_or(0)
@@ -295,7 +295,7 @@ impl MetricsHook {
     pub fn error_count(&self, operation: OperationType) -> u64 {
         self.error_counts
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(operation.as_str())
             .copied()
             .unwrap_or(0)
@@ -305,7 +305,7 @@ impl MetricsHook {
     pub fn total_duration(&self, operation: OperationType) -> Duration {
         self.duration_totals
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(operation.as_str())
             .copied()
             .unwrap_or(Duration::ZERO)

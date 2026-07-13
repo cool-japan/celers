@@ -30,7 +30,7 @@ impl WorkflowSnapshot {
             workflow_id,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs(),
             state,
             completed_tasks: Vec::new(),
@@ -519,7 +519,7 @@ impl ExecutionTimeline {
             entries: Vec::new(),
             workflow_start: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64,
             workflow_end: None,
         }
@@ -534,7 +534,7 @@ impl ExecutionTimeline {
     pub fn start_task(&mut self, task_id: Uuid, task_name: String) -> usize {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
         let entry = TimelineEntry::new(task_id, task_name, now);
         self.entries.push(entry);
@@ -546,7 +546,7 @@ impl ExecutionTimeline {
         if let Some(entry) = self.entries.get_mut(index) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64;
             entry.complete(now);
         }
@@ -557,7 +557,7 @@ impl ExecutionTimeline {
         if let Some(entry) = self.entries.get_mut(index) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64;
             entry.fail(now);
         }
@@ -568,7 +568,7 @@ impl ExecutionTimeline {
         self.workflow_end = Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64,
         );
     }
@@ -631,7 +631,7 @@ impl AnimationFrame {
             frame_number,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64,
             workflow_state,
             task_states: HashMap::new(),

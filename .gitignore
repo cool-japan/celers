@@ -64,7 +64,7 @@ wheels/
 .installed.cfg
 *.egg
 **/.claude/settings.local.json
-**/,claude/
+**/.claude/
 **/CLAUDE.local.md
 **/CLAUDE.md
 
@@ -78,3 +78,5 @@ wheels/
 
 # Rustc ICE dumps
 rustc-ice-*.txt
+
+target

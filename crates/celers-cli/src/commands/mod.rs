@@ -39,12 +39,23 @@
 
 mod config_cmds;
 mod database;
+pub mod depgraph;
 mod dlq;
+pub mod loadtest_cmds;
+pub mod metrics_cmds;
 mod monitoring;
-mod queue;
+// `pub(crate)` (rather than a bare private `mod`), matching the existing
+// `task`/`utils` modules below: `queue::queue_names` needs to be callable
+// from `crate::interactive` (outside this module tree) for the REPL's
+// `use <queue>` "did you mean" suggestion, while everything else in `queue`
+// stays reachable only through the curated `pub use queue::{...}`
+// re-exports right below.
+pub(crate) mod queue;
+pub mod replay_cmds;
 mod schedule;
 pub(crate) mod task;
 pub(crate) mod utils;
+pub mod wizard;
 mod worker;
 
 // Re-export all public functions to preserve the flat API
@@ -67,6 +78,22 @@ pub use task::{cancel_task, inspect_task, requeue_task, retry_task, show_task_re
 // DLQ operations
 pub use dlq::{clear_dlq, inspect_dlq, replay_task};
 
+// Task replay (re-execute failed / DLQ tasks).
+//
+// The thin broker-facing entry point and its selector enum are re-exported at
+// the `commands` root for convenience (the binary uses these). The pure
+// planning API (`plan_replay`, `glob_match`, `ReplayCandidate`, `ReplayPlan`)
+// remains available via the public `commands::replay_cmds` module.
+pub use replay_cmds::{replay_dlq, ReplayFilter};
+
+// Task simulation / load testing.
+//
+// The thin broker-facing entry point (`run_loadtest`) is re-exported at the
+// `commands` root for the binary. The pure planning API (`plan_loadtest`,
+// `LoadTestConfig`, `LoadPlan`, `ArrivalPattern`, ...) remains available via
+// the public `commands::loadtest_cmds` module.
+pub use loadtest_cmds::{run_loadtest, ArrivalPattern, LoadTestConfig};
+
 // Scheduling
 pub use schedule::{
     add_schedule, list_schedules, pause_schedule, remove_schedule, resume_schedule,
@@ -74,17 +101,66 @@ pub use schedule::{
 };
 
 // Monitoring, diagnostics, and reporting
+//
+// `report_weekly` (the original table-only, stdout-only sibling of
+// `report_weekly_formatted`) had no caller anywhere in the crate and was
+// removed; only `report_weekly_formatted` remains. `report_history`/
+// `report_workers`/`report_queues` and `profile_task`/`profile_worker`/
+// `profile_resources` are new report/profiling subcommands not yet wired
+// into `cli::types`/`cli::dispatch`.
 pub use monitoring::{
     alert_start, alert_test, analyze_bottlenecks, analyze_failures, autoscale_start,
-    autoscale_status, debug_task, debug_worker, doctor, health_check, report_daily, report_weekly,
-    show_metrics, show_task_logs, worker_logs,
+    autoscale_status, debug_task, debug_worker, doctor, health_check, profile_resources,
+    profile_task, profile_worker, report_daily_formatted, report_history, report_queues,
+    report_weekly_formatted, report_workers, show_metrics, show_task_logs, worker_logs,
 };
+
+// `report_daily` keeps its original table-only, stdout-only signature (see
+// `commands::monitoring::report` for why the function itself is
+// `#[allow(dead_code)]`: `cli::dispatch`'s `Report::Daily` arm calls only
+// `report_daily_formatted`, re-exported above). This re-export is likewise
+// unreachable from this crate's own `bin`/test targets -- hence
+// `#[allow(unused_imports)]` here too -- but it is genuine public library
+// API, called directly by `examples/monitoring_and_diagnostics.rs` as
+// `commands::report_daily`.
+#[allow(unused_imports)]
+pub use monitoring::report_daily;
+
+// Remote Prometheus scraping and live monitoring
+pub use metrics_cmds::{run_metrics, run_monitor};
 
 // Database operations
 pub use database::{db_health, db_migrate, db_pool_stats, db_test_connection, run_dashboard};
 
 // Configuration
 pub use config_cmds::{init_config, validate_config};
+
+// Interactive configuration wizard (`celers init --wizard`).
+//
+// `init_config_wizard` lives in `config_cmds` (it is the wizard's
+// counterpart to `init_config`, both writing a `Config` to disk) and is
+// re-exported here on its own line so the pre-existing `config_cmds`
+// re-export above stays untouched. The thin, I/O-performing entry point
+// (`run_wizard`) has no caller of its own at the `commands` root -- unlike
+// `loadtest_cmds::run_loadtest`/`replay_cmds::replay_dlq` above, `celers
+// init --wizard` drives the wizard through `init_config_wizard` (which
+// calls `wizard::run_wizard` internally), not a top-level `run_wizard`
+// re-export -- so that redundant re-export was removed. `run_wizard` itself
+// is not deleted: it remains available, along with the pure, fully
+// unit-tested assembly API (`WizardAnswers`, `build_config`,
+// `resolve_wizard_output_path`), via the public `commands::wizard` module.
+pub use config_cmds::init_config_wizard;
+
+// Task dependency graph visualization (`celers deps`).
+//
+// The thin, file-facing entry point (`run_deps`) is re-exported at the
+// `commands` root, matching the `loadtest_cmds`/`replay_cmds` pattern
+// above (see the `wizard`/`init_config_wizard` note above for a case where
+// this pattern does *not* apply, since `run_wizard` has no root re-export).
+// The pure, fully unit-tested rendering/graph-building API (`render_ascii`,
+// `render_dot`, `dag_from_tasks`, `InteractiveSession`, ...) remains
+// available via the public `commands::depgraph` module.
+pub use depgraph::run_deps;
 
 #[cfg(test)]
 mod tests {

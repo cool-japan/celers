@@ -2,7 +2,7 @@
 
 Production-ready AWS SQS broker implementation for CeleRS with batch operations, FIFO queues, CloudWatch integration, and comprehensive cost optimization.
 
-**Version: 0.2.0 | Status: [Stable] | Tests: 294 | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Tests: 294 | Updated: 2026-07-13**
 
 ## Overview
 
@@ -445,6 +445,8 @@ The broker uses AWS SDK's credential chain:
 
 **Recommendation**: Use IAM roles in production for enhanced security.
 
+**Dependency note**: This crate depends on the AWS SDK (`aws-config`/`aws-sdk-sqs`/`aws-sdk-cloudwatch`), which still pulls in `ring`/`aws-lc-sys`. This is an accepted, tracked, upstream-blocked limitation (no drop-in Pure-Rust AWS SDK exists yet in the COOLJAPAN ecosystem) rather than a functional defect.
+
 ## Production Features
 
 ### Circuit Breaker
@@ -791,18 +793,19 @@ if results.has_failures() {
 See the `examples/` directory for comprehensive examples:
 
 ### Core Features
-- **`basic_usage.rs`** - Basic operations (publish, consume, batch, queue management)
-- **`advanced_features.rs`** - FIFO, DLQ, SSE, CloudWatch, adaptive polling, parallel processing
-- **`cost_optimization.rs`** - Cost reduction strategies and comparisons
+- **`sqs_basic_usage.rs`** - Basic operations (publish, consume, batch, queue management)
+- **`sqs_advanced_features.rs`** - FIFO, DLQ, SSE, CloudWatch, adaptive polling, parallel processing
+- **`sqs_cost_optimization.rs`** - Cost reduction strategies and comparisons
 - **`monitoring_alarms.rs`** - CloudWatch metrics and alarms setup
 
 ### Production Features
-- **`monitoring_utilities.rs`** - Monitoring utilities (lag analysis, velocity, health assessment)
+- **`sqs_monitoring_utilities.rs`** - Monitoring utilities (lag analysis, velocity, health assessment)
+- **`sqs_advanced_utilities.rs`** - Message deduplication, DLQ analytics, and observability hooks
 - **`production_optimization.rs`** - Auto-tuning and optimization for different workloads
 - **`production_suite.rs`** - Complete production setup with all features
 - **`quota_management.rs`** - API quota and budget management
 - **`routing_patterns.rs`** - Multi-queue routing and message distribution
-- **`distributed_tracing.rs`** - Distributed tracing with correlation IDs
+- **`sqs_distributed_tracing.rs`** - Distributed tracing with correlation IDs
 - **`advanced_production_features.rs`** - Backpressure, poison detection, cost alerts integration ✨ NEW
 - **`lambda_sqs_handler.rs`** - AWS Lambda SQS event processing example ✨ NEW
 - **`replay_and_sla.rs`** - Message replay and SLA monitoring examples ✨ NEW
@@ -810,18 +813,19 @@ See the `examples/` directory for comprehensive examples:
 Run examples:
 ```bash
 # Core features
-cargo run --example basic_usage
-cargo run --example advanced_features
-cargo run --example cost_optimization
+cargo run --example sqs_basic_usage
+cargo run --example sqs_advanced_features
+cargo run --example sqs_cost_optimization
 cargo run --example monitoring_alarms
 
 # Production features
-cargo run --example monitoring_utilities
+cargo run --example sqs_monitoring_utilities
+cargo run --example sqs_advanced_utilities
 cargo run --example production_optimization
 cargo run --example production_suite
 cargo run --example quota_management
 cargo run --example routing_patterns
-cargo run --example distributed_tracing
+cargo run --example sqs_distributed_tracing
 cargo run --example advanced_production_features  # NEW
 cargo run --example lambda_sqs_handler  # NEW
 cargo run --example replay_and_sla  # NEW

@@ -3,11 +3,12 @@
 use async_trait::async_trait;
 use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
 use chrono::Utc;
+use oxisql_core::Connection;
 use serde_json::json;
-use sqlx::Row;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
+use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};
 use crate::types::HookContext;
 use crate::PostgresBroker;
 
@@ -47,22 +48,29 @@ impl Broker for PostgresBroker {
             }
         }
 
-        sqlx::query(
-            r#"
+        // Byte-for-byte identical SQL text to the pre-migration sqlx version.
+        // UUID -> uuid_param, JSON metadata -> json_param, everything else is
+        // an already-primitive ToSqlValue (String, Vec<u8>, i32).
+        let task_id_param = uuid_param(&task_id);
+        let metadata_param = json_param(&db_metadata);
+        self.conn
+            .execute(
+                r#"
             INSERT INTO celers_tasks
                 (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
             VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW())
             "#,
-        )
-        .bind(task_id)
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority) // Use task's priority
-        .bind(task.metadata.max_retries as i32) // Use task's max retries
-        .bind(db_metadata)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
+                &[
+                    &task_id_param,
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &metadata_param,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
 
         #[cfg(feature = "metrics")]
         {
@@ -90,13 +98,14 @@ impl Broker for PostgresBroker {
         // Use FOR UPDATE SKIP LOCKED to atomically claim a task
         // This is the magic that makes distributed workers work without contention
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
-        let row = sqlx::query(
-            r#"
+        let rows = tx
+            .query(
+                r#"
             SELECT id, task_name, payload, retry_count
             FROM celers_tasks
             WHERE state = 'pending'
@@ -105,19 +114,28 @@ impl Broker for PostgresBroker {
             FOR UPDATE SKIP LOCKED
             LIMIT 1
             "#,
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
 
-        if let Some(row) = row {
-            let task_id: Uuid = row.get("id");
-            let task_name: String = row.get("task_name");
-            let payload: Vec<u8> = row.get("payload");
-            let retry_count: i32 = row.get("retry_count");
+        // .fetch_optional semantics: take the first row if present, else None.
+        if let Some(row) = rows.into_iter().next() {
+            let task_id: Uuid = uuid_from_row(&row, "id")
+                .map_err(|e| CelersError::Other(format!("Failed to read task id: {}", e)))?;
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let payload: Vec<u8> = row
+                .col("payload")
+                .map_err(|e| CelersError::Other(format!("Failed to read payload: {}", e)))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| CelersError::Other(format!("Failed to read retry_count: {}", e)))?;
 
             // Mark as processing
-            sqlx::query(
+            let task_id_param = uuid_param(&task_id);
+            tx.execute(
                 r#"
                 UPDATE celers_tasks
                 SET state = 'processing',
@@ -125,9 +143,8 @@ impl Broker for PostgresBroker {
                     retry_count = retry_count + 1
                 WHERE id = $1
                 "#,
+                &[&task_id_param],
             )
-            .bind(task_id)
-            .execute(&mut *tx)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to mark task as processing: {}", e)))?;
 
@@ -163,21 +180,27 @@ impl Broker for PostgresBroker {
 
     async fn ack(&self, task_id: &TaskId, _receipt_handle: Option<&str>) -> Result<()> {
         // Fetch task info for hooks
-        let row = sqlx::query(
-            r#"
+        let task_id_param = uuid_param(task_id);
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT task_name, payload
             FROM celers_tasks
             WHERE id = $1
             "#,
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch task for ack: {}", e)))?;
+                &[&task_id_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch task for ack: {}", e)))?;
 
-        if let Some(row) = row {
-            let task_name: String = row.get("task_name");
-            let payload: Vec<u8> = row.get("payload");
+        if let Some(row) = rows.into_iter().next() {
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let payload: Vec<u8> = row
+                .col("payload")
+                .map_err(|e| CelersError::Other(format!("Failed to read payload: {}", e)))?;
             let task = SerializedTask::new(task_name, payload);
 
             // Run before_ack hooks
@@ -192,18 +215,18 @@ impl Broker for PostgresBroker {
                 hooks.run_before_ack(&ctx, &task).await?;
             }
 
-            sqlx::query(
-                r#"
+            self.conn
+                .execute(
+                    r#"
                 UPDATE celers_tasks
                 SET state = 'completed',
                     completed_at = NOW()
                 WHERE id = $1
                 "#,
-            )
-            .bind(task_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to ack task: {}", e)))?;
+                    &[&task_id_param],
+                )
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to ack task: {}", e)))?;
 
             // Run after_ack hooks
             {
@@ -225,21 +248,27 @@ impl Broker for PostgresBroker {
         requeue: bool,
     ) -> Result<()> {
         // Fetch task info for hooks
-        let task_row = sqlx::query(
-            r#"
+        let task_id_param = uuid_param(task_id);
+        let task_rows = self
+            .conn
+            .query(
+                r#"
             SELECT task_name, payload, retry_count, max_retries
             FROM celers_tasks
             WHERE id = $1
             "#,
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch task for reject: {}", e)))?;
+                &[&task_id_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch task for reject: {}", e)))?;
 
-        if let Some(row) = task_row {
-            let task_name: String = row.get("task_name");
-            let payload: Vec<u8> = row.get("payload");
+        if let Some(row) = task_rows.into_iter().next() {
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let payload: Vec<u8> = row
+                .col("payload")
+                .map_err(|e| CelersError::Other(format!("Failed to read payload: {}", e)))?;
             let task = SerializedTask::new(task_name, payload);
 
             // Run before_reject hooks
@@ -255,8 +284,12 @@ impl Broker for PostgresBroker {
             }
 
             if requeue {
-                let retry_count: i32 = row.get("retry_count");
-                let max_retries: i32 = row.get("max_retries");
+                let retry_count: i32 = row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to read retry_count: {}", e))
+                })?;
+                let max_retries: i32 = row.col("max_retries").map_err(|e| {
+                    CelersError::Other(format!("Failed to read max_retries: {}", e))
+                })?;
 
                 if retry_count >= max_retries {
                     // Move to DLQ
@@ -265,8 +298,19 @@ impl Broker for PostgresBroker {
                     // Requeue with configured retry strategy
                     let backoff_seconds = self.retry_strategy.calculate_backoff(retry_count);
 
-                    sqlx::query(
-                        r#"
+                    // `backoff_seconds || ' seconds')::INTERVAL` — the interval
+                    // text-concatenation trick, byte-for-byte preserved from the
+                    // pre-migration SQL. `backoff_seconds` is bound as `i64`
+                    // (a ToSqlValue primitive) since it feeds a `|| ' seconds'`
+                    // *text* concatenation, not a direct DATE/TIMESTAMP cast —
+                    // Postgres infers `$1` as `text`-compatible from the `||`
+                    // operator context, so this is NOT the same binary-mismatch
+                    // hazard as binding a `DateTime<Utc>` (see `row_ext.rs`'s
+                    // `DateTime<Utc>` parameter convention doc comment for the
+                    // full explanation of that hazard).
+                    self.conn
+                        .execute(
+                            r#"
                     UPDATE celers_tasks
                     SET state = 'pending',
                         scheduled_at = NOW() + ($1 || ' seconds')::INTERVAL,
@@ -274,12 +318,12 @@ impl Broker for PostgresBroker {
                         worker_id = NULL
                     WHERE id = $2
                     "#,
-                    )
-                    .bind(backoff_seconds)
-                    .bind(task_id)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
+                            &[&backoff_seconds, &task_id_param],
+                        )
+                        .await
+                        .map_err(|e| {
+                            CelersError::Other(format!("Failed to requeue task: {}", e))
+                        })?;
 
                     tracing::info!(
                         task_id = %task_id,
@@ -291,18 +335,20 @@ impl Broker for PostgresBroker {
                 }
             } else {
                 // Mark as failed permanently
-                sqlx::query(
-                    r#"
+                self.conn
+                    .execute(
+                        r#"
                     UPDATE celers_tasks
                     SET state = 'failed',
                         completed_at = NOW()
                     WHERE id = $1
                     "#,
-                )
-                .bind(task_id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| CelersError::Other(format!("Failed to mark task as failed: {}", e)))?;
+                        &[&task_id_param],
+                    )
+                    .await
+                    .map_err(|e| {
+                        CelersError::Other(format!("Failed to mark task as failed: {}", e))
+                    })?;
             }
 
             // Run after_reject hooks
@@ -316,36 +362,49 @@ impl Broker for PostgresBroker {
     }
 
     async fn queue_size(&self) -> Result<usize> {
-        let row = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT COUNT(*) as count
             FROM celers_tasks
             WHERE state = 'pending'
             "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get queue size: {}", e)))?;
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get queue size: {}", e)))?;
 
-        let count: i64 = row.get("count");
+        // .fetch_one semantics: error (not a silent default) if no row came
+        // back, preserving sqlx's `fetch_one` behavior exactly. `COUNT(*)`
+        // always returns exactly one row, so this should never actually
+        // trigger — the check exists purely to avoid silently defaulting.
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get queue size: no rows returned".to_string())
+        })?;
+        let count: i64 = row
+            .col("count")
+            .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
         Ok(count as usize)
     }
 
     async fn cancel(&self, task_id: &TaskId) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
+        let task_id_param = uuid_param(task_id);
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW()
             WHERE id = $1 AND state IN ('pending', 'processing')
             "#,
-        )
-        .bind(task_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to cancel task: {}", e)))?;
+                &[&task_id_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to cancel task: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(rows_affected > 0)
     }
 
     /// Schedule a task for execution at a specific Unix timestamp (seconds)
@@ -372,23 +431,38 @@ impl Broker for PostgresBroker {
         let scheduled_at = chrono::DateTime::from_timestamp(execute_at, 0)
             .ok_or_else(|| CelersError::Other("Invalid timestamp".to_string()))?;
 
-        sqlx::query(
-            r#"
+        // `scheduled_at` is a `DateTime<Utc>` bound as a query parameter — see
+        // `row_ext.rs`'s `DateTime<Utc>` parameter convention doc comment.
+        // Bind as an RFC3339 string through a `$7::text::timestamptz` cast,
+        // NOT as `.timestamp()` (`i64`) — binding a raw `i64` against a
+        // server-inferred `TIMESTAMPTZ` parameter sends malformed binary
+        // bytes (oxisql-postgres always uses Postgres binary wire format,
+        // and `i64`'s binary encoding is not a valid `TIMESTAMPTZ` binary
+        // payload). The `::text` cast makes Postgres infer the parameter as
+        // `TEXT`, for which `String`'s binary format IS just raw UTF-8 bytes,
+        // so the bind round-trips correctly.
+        let task_id_param = uuid_param(&task_id);
+        let metadata_param = json_param(&db_metadata);
+        let scheduled_at_param = scheduled_at.to_rfc3339();
+        self.conn
+            .execute(
+                r#"
             INSERT INTO celers_tasks
                 (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), $7)
+            VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), $7::text::timestamptz)
             "#,
-        )
-        .bind(task_id)
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(db_metadata)
-        .bind(scheduled_at)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue delayed task: {}", e)))?;
+                &[
+                    &task_id_param,
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &metadata_param,
+                    &scheduled_at_param,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue delayed task: {}", e)))?;
 
         #[cfg(feature = "metrics")]
         {
@@ -421,23 +495,32 @@ impl Broker for PostgresBroker {
             }
         }
 
-        sqlx::query(
-            r#"
+        // `delay_secs` feeds the same `|| ' seconds')::INTERVAL` text-concat
+        // pattern as `reject()`'s requeue path above — bound as `i64`
+        // (ToSqlValue primitive), not a DateTime, so no timestamptz-binary
+        // hazard applies here.
+        let task_id_param = uuid_param(&task_id);
+        let metadata_param = json_param(&db_metadata);
+        let delay_secs_param = delay_secs as i64;
+        self.conn
+            .execute(
+                r#"
             INSERT INTO celers_tasks
                 (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
             VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW() + ($7 || ' seconds')::INTERVAL)
             "#,
-        )
-        .bind(task_id)
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(db_metadata)
-        .bind(delay_secs as i64)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue delayed task: {}", e)))?;
+                &[
+                    &task_id_param,
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &metadata_param,
+                    &delay_secs_param,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue delayed task: {}", e)))?;
 
         #[cfg(feature = "metrics")]
         {
@@ -459,8 +542,8 @@ impl Broker for PostgresBroker {
         }
 
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
@@ -483,20 +566,23 @@ impl Broker for PostgresBroker {
                 }
             }
 
-            sqlx::query(
+            let task_id_param = uuid_param(&task_id);
+            let metadata_param = json_param(&db_metadata);
+            tx.execute(
                 r#"
                 INSERT INTO celers_tasks
                     (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
                 VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW())
                 "#,
+                &[
+                    &task_id_param,
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &metadata_param,
+                ],
             )
-            .bind(task_id)
-            .bind(&task.metadata.name)
-            .bind(&task.payload)
-            .bind(task.metadata.priority)
-            .bind(task.metadata.max_retries as i32)
-            .bind(db_metadata)
-            .execute(&mut *tx)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to enqueue task in batch: {}", e)))?;
 
@@ -527,13 +613,15 @@ impl Broker for PostgresBroker {
         }
 
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
-        let rows = sqlx::query(
-            r#"
+        let count_param = count as i64;
+        let rows = tx
+            .query(
+                r#"
             SELECT id, task_name, payload, retry_count
             FROM celers_tasks
             WHERE state = 'pending'
@@ -542,11 +630,10 @@ impl Broker for PostgresBroker {
             FOR UPDATE SKIP LOCKED
             LIMIT $1
             "#,
-        )
-        .bind(count as i64)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {}", e)))?;
+                &[&count_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {}", e)))?;
 
         if rows.is_empty() {
             tx.rollback().await.map_err(|e| {
@@ -558,11 +645,18 @@ impl Broker for PostgresBroker {
         let mut messages = Vec::with_capacity(rows.len());
         let mut task_ids = Vec::with_capacity(rows.len());
 
-        for row in rows {
-            let task_id: Uuid = row.get("id");
-            let task_name: String = row.get("task_name");
-            let payload: Vec<u8> = row.get("payload");
-            let retry_count: i32 = row.get("retry_count");
+        for row in &rows {
+            let task_id: Uuid = uuid_from_row(row, "id")
+                .map_err(|e| CelersError::Other(format!("Failed to read task id: {}", e)))?;
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let payload: Vec<u8> = row
+                .col("payload")
+                .map_err(|e| CelersError::Other(format!("Failed to read payload: {}", e)))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| CelersError::Other(format!("Failed to read retry_count: {}", e)))?;
 
             messages.push(BrokerMessage {
                 task: SerializedTask::new(task_name, payload),
@@ -572,19 +666,33 @@ impl Broker for PostgresBroker {
             task_ids.push(task_id);
         }
 
-        sqlx::query(
+        // `WHERE id = ANY($1)` -> oxisql has no array/slice `ToSqlValue`, so
+        // this is rewritten to a dynamically sized `IN ($1, $2, ..., $N)`
+        // placeholder list, one `$n` per task id, each bound individually.
+        // Only the *count* of placeholders is generated from `task_ids.len()`
+        // — no value is ever spliced into the SQL text, so this remains
+        // fully injection-safe. Flagged explicitly in the migration report
+        // as a genuine (small) semantic rewrite, not a pure mechanical
+        // translation.
+        let placeholders: Vec<String> = (1..=task_ids.len()).map(|i| format!("${i}")).collect();
+        let update_sql = format!(
             r#"
             UPDATE celers_tasks
             SET state = 'processing',
                 started_at = NOW(),
                 retry_count = retry_count + 1
-            WHERE id = ANY($1)
+            WHERE id IN ({})
             "#,
-        )
-        .bind(&task_ids)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to mark batch as processing: {}", e)))?;
+            placeholders.join(", ")
+        );
+        let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
+        let param_refs: Vec<&dyn oxisql_core::ToSqlValue> = task_id_params
+            .iter()
+            .map(|p| p as &dyn oxisql_core::ToSqlValue)
+            .collect();
+        tx.execute(&update_sql, &param_refs).await.map_err(|e| {
+            CelersError::Other(format!("Failed to mark batch as processing: {}", e))
+        })?;
 
         tx.commit()
             .await
@@ -593,7 +701,7 @@ impl Broker for PostgresBroker {
         Ok(messages)
     }
 
-    /// Optimized batch ack using a single query with ANY()
+    /// Optimized batch ack using a single query with an IN (...) list
     async fn ack_batch(&self, tasks: &[(TaskId, Option<String>)]) -> Result<()> {
         if tasks.is_empty() {
             return Ok(());
@@ -601,18 +709,27 @@ impl Broker for PostgresBroker {
 
         let task_ids: Vec<Uuid> = tasks.iter().map(|(id, _)| *id).collect();
 
-        sqlx::query(
+        // `WHERE id = ANY($1)` -> `IN ($1, .., $N)` rewrite, same pattern and
+        // same injection-safety rationale as `dequeue_batch` above.
+        let placeholders: Vec<String> = (1..=task_ids.len()).map(|i| format!("${i}")).collect();
+        let update_sql = format!(
             r#"
             UPDATE celers_tasks
             SET state = 'completed',
                 completed_at = NOW()
-            WHERE id = ANY($1)
+            WHERE id IN ({})
             "#,
-        )
-        .bind(&task_ids)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to batch ack tasks: {}", e)))?;
+            placeholders.join(", ")
+        );
+        let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
+        let param_refs: Vec<&dyn oxisql_core::ToSqlValue> = task_id_params
+            .iter()
+            .map(|p| p as &dyn oxisql_core::ToSqlValue)
+            .collect();
+        self.conn
+            .execute(&update_sql, &param_refs)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to batch ack tasks: {}", e)))?;
 
         Ok(())
     }

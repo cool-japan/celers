@@ -100,7 +100,7 @@ impl<T: Clone> Observable<T> {
     pub fn set(&mut self, value: T) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         self.history.push((self.value.clone(), timestamp));
         self.value = value;

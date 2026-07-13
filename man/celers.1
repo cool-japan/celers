@@ -1,0 +1,139 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH celers 1  "celers 0.3.0" 
+.SH NAME
+celers \- CeleRS \- Distributed task queue management CLI
+.SH SYNOPSIS
+\fBcelers\fR [\fB\-\-log\-level\fR] [\fB\-\-log\-format\fR] [\fB\-\-log\-sink\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+CeleRS \- Distributed task queue management CLI
+.SH OPTIONS
+.TP
+\fB\-\-log\-level\fR \fI<LEVEL>\fR
+Log level for the CLI (error, warn, info, debug, trace).
+
+Takes precedence over the `RUST_LOG` environment variable.
+.TP
+\fB\-\-log\-format\fR \fI<LOG_FORMAT>\fR [default: text]
+Log output format: `text` (human\-readable) or `json` (newline\-delimited JSON)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+text: Human\-readable text: no target, no level tag (the CLI\*(Aqs historical default output)
+.IP \(bu 2
+json: Newline\-delimited JSON, one object per log event
+.RE
+.TP
+\fB\-\-log\-sink\fR \fI<SINK>\fR [default: stdout]
+Log destination: `stdout` (default), `file:<path>`, or `tcp:<host:port>`
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+celers\-worker(1)
+Start a worker to process tasks
+.TP
+celers\-status(1)
+Check queue status
+.TP
+celers\-dlq(1)
+Dead Letter Queue management
+.TP
+celers\-replay(1)
+Replay (re\-execute) failed tasks from the Dead Letter Queue
+.TP
+celers\-loadtest(1)
+Simulate synthetic task load against a queue (load testing)
+.TP
+celers\-queue(1)
+Queue management operations
+.TP
+celers\-task(1)
+Task operations
+.TP
+celers\-init(1)
+Initialize a configuration file
+.TP
+celers\-config(1)
+Inspect and reload the resolved configuration
+.TP
+celers\-metrics(1)
+Display Prometheus metrics
+.TP
+celers\-monitor(1)
+Live (top\-like) monitor of a Prometheus metrics endpoint
+.TP
+celers\-validate(1)
+Validate configuration file
+.TP
+celers\-completions(1)
+Generate shell completion scripts
+.TP
+celers\-manpages(1)
+Generate man pages
+.TP
+celers\-health(1)
+Run system health diagnostics
+.TP
+celers\-worker\-mgmt(1)
+Worker management operations
+.TP
+celers\-doctor(1)
+Automatic problem detection and diagnostics
+.TP
+celers\-schedule(1)
+Scheduled task management
+.TP
+celers\-debug(1)
+Debug commands for troubleshooting
+.TP
+celers\-report(1)
+Generate execution reports
+.TP
+celers\-analyze(1)
+Analyze system performance and failures
+.TP
+celers\-autoscale(1)
+Auto\-scaling operations
+.TP
+celers\-alert(1)
+Alert monitoring operations
+.TP
+celers\-db(1)
+Database operations
+.TP
+celers\-dashboard(1)
+Live dashboard for real\-time monitoring
+.TP
+celers\-interactive(1)
+Interactive REPL mode for running multiple commands
+.TP
+celers\-backup(1)
+Create a backup of broker state
+.TP
+celers\-restore(1)
+Restore broker state from backup
+.TP
+celers\-deps(1)
+Visualize task dependencies as an ASCII tree or GraphViz DOT graph
+.TP
+celers\-alias(1)
+User\-defined command alias management
+.TP
+celers\-error\-codes(1)
+Print the reference table of structured CLI error codes and their suggested fixes
+.TP
+celers\-cache\-stats(1)
+Print configured capacity/TTL for the Redis connection pool and `queue`/`worker` read\-path caches (not live hit/reuse ratios)
+.TP
+celers\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.3.0

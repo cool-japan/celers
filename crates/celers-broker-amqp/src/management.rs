@@ -1,6 +1,7 @@
 //! RabbitMQ Management API client and data types.
 
 use celers_kombu::{BrokerError, Result};
+use oxihttp_client::{Client, HttpsClient};
 
 /// RabbitMQ Management API client
 #[derive(Clone)]
@@ -8,18 +9,31 @@ pub(crate) struct ManagementApiClient {
     pub(crate) base_url: String,
     pub(crate) username: String,
     pub(crate) password: String,
-    pub(crate) client: reqwest::Client,
+    pub(crate) client: HttpsClient,
 }
 
 impl ManagementApiClient {
-    /// Create a new Management API client
-    pub(crate) fn new(base_url: String, username: String, password: String) -> Self {
-        Self {
+    /// Create a new Management API client.
+    ///
+    /// Builds a TLS-capable `oxihttp-client` up front so that connector/trust-store
+    /// construction errors surface immediately at broker-startup time (via `?`)
+    /// rather than being deferred to the first Management API call.
+    pub(crate) fn new(base_url: String, username: String, password: String) -> Result<Self> {
+        let client = Client::builder()
+            .with_webpki_roots()
+            .build_https()
+            .map_err(|e| {
+                BrokerError::Connection(format!(
+                    "Failed to build Management API HTTP client: {}",
+                    e
+                ))
+            })?;
+        Ok(Self {
             base_url,
             username,
             password,
-            client: reqwest::Client::new(),
-        }
+            client,
+        })
     }
 
     /// List all queues
@@ -28,7 +42,10 @@ impl ManagementApiClient {
         let response = self
             .client
             .get(&url)
-            .basic_auth(&self.username, Some(&self.password))
+            .and_then(|b| b.basic_auth(&self.username, Some(&self.password)))
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request build failed: {}", e))
+            })?
             .send()
             .await
             .map_err(|e| {
@@ -43,7 +60,7 @@ impl ManagementApiClient {
         }
 
         let queues: Vec<QueueInfo> = response
-            .json()
+            .body_json()
             .await
             .map_err(|e| BrokerError::Connection(format!("Failed to parse queue info: {}", e)))?;
 
@@ -66,7 +83,10 @@ impl ManagementApiClient {
         let response = self
             .client
             .get(&url)
-            .basic_auth(&self.username, Some(&self.password))
+            .and_then(|b| b.basic_auth(&self.username, Some(&self.password)))
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request build failed: {}", e))
+            })?
             .send()
             .await
             .map_err(|e| {
@@ -81,7 +101,7 @@ impl ManagementApiClient {
         }
 
         let stats: QueueStats = response
-            .json()
+            .body_json()
             .await
             .map_err(|e| BrokerError::Connection(format!("Failed to parse queue stats: {}", e)))?;
 
@@ -94,7 +114,10 @@ impl ManagementApiClient {
         let response = self
             .client
             .get(&url)
-            .basic_auth(&self.username, Some(&self.password))
+            .and_then(|b| b.basic_auth(&self.username, Some(&self.password)))
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request build failed: {}", e))
+            })?
             .send()
             .await
             .map_err(|e| {
@@ -108,7 +131,7 @@ impl ManagementApiClient {
             )));
         }
 
-        let overview: ServerOverview = response.json().await.map_err(|e| {
+        let overview: ServerOverview = response.body_json().await.map_err(|e| {
             BrokerError::Connection(format!("Failed to parse server overview: {}", e))
         })?;
 
@@ -121,7 +144,10 @@ impl ManagementApiClient {
         let response = self
             .client
             .get(&url)
-            .basic_auth(&self.username, Some(&self.password))
+            .and_then(|b| b.basic_auth(&self.username, Some(&self.password)))
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request build failed: {}", e))
+            })?
             .send()
             .await
             .map_err(|e| {
@@ -135,7 +161,7 @@ impl ManagementApiClient {
             )));
         }
 
-        let connections: Vec<ConnectionInfo> = response.json().await.map_err(|e| {
+        let connections: Vec<ConnectionInfo> = response.body_json().await.map_err(|e| {
             BrokerError::Connection(format!("Failed to parse connection info: {}", e))
         })?;
 
@@ -148,7 +174,10 @@ impl ManagementApiClient {
         let response = self
             .client
             .get(&url)
-            .basic_auth(&self.username, Some(&self.password))
+            .and_then(|b| b.basic_auth(&self.username, Some(&self.password)))
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request build failed: {}", e))
+            })?
             .send()
             .await
             .map_err(|e| {
@@ -163,7 +192,7 @@ impl ManagementApiClient {
         }
 
         let channels: Vec<ChannelInfo> = response
-            .json()
+            .body_json()
             .await
             .map_err(|e| BrokerError::Connection(format!("Failed to parse channel info: {}", e)))?;
 
@@ -177,7 +206,10 @@ impl ManagementApiClient {
         let response = self
             .client
             .get(&url)
-            .basic_auth(&self.username, Some(&self.password))
+            .and_then(|b| b.basic_auth(&self.username, Some(&self.password)))
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request build failed: {}", e))
+            })?
             .send()
             .await
             .map_err(|e| {
@@ -191,7 +223,7 @@ impl ManagementApiClient {
             )));
         }
 
-        let exchanges: Vec<ExchangeInfo> = response.json().await.map_err(|e| {
+        let exchanges: Vec<ExchangeInfo> = response.body_json().await.map_err(|e| {
             BrokerError::Connection(format!("Failed to parse exchange info: {}", e))
         })?;
 
@@ -213,7 +245,10 @@ impl ManagementApiClient {
         let response = self
             .client
             .get(&url)
-            .basic_auth(&self.username, Some(&self.password))
+            .and_then(|b| b.basic_auth(&self.username, Some(&self.password)))
+            .map_err(|e| {
+                BrokerError::Connection(format!("Management API request build failed: {}", e))
+            })?
             .send()
             .await
             .map_err(|e| {
@@ -228,7 +263,7 @@ impl ManagementApiClient {
         }
 
         let bindings: Vec<BindingInfo> = response
-            .json()
+            .body_json()
             .await
             .map_err(|e| BrokerError::Connection(format!("Failed to parse binding info: {}", e)))?;
 

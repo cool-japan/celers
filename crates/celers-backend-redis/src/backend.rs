@@ -1805,12 +1805,19 @@ impl RedisResultBackend {
     /// # Returns
     /// Connection pool statistics
     pub async fn get_pool_stats(&self) -> PoolStats {
-        // Note: redis-rs multiplexed connections don't expose pool stats directly
-        // This is a placeholder that returns basic info
+        let is_connected = match self.client.get_multiplexed_async_connection().await {
+            Ok(mut conn) => {
+                let pong: std::result::Result<String, _> =
+                    redis::cmd("PING").query_async(&mut conn).await;
+                pong.is_ok()
+            }
+            Err(_) => false,
+        };
+
         PoolStats {
             backend_type: "redis".to_string(),
             connection_mode: "multiplexed".to_string(),
-            is_connected: true,
+            is_connected,
         }
     }
 }

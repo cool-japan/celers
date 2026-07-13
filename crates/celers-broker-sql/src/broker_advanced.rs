@@ -6,11 +6,12 @@
 
 use crate::broker_batch::SlowQueryInfo;
 use crate::broker_core::MysqlBroker;
+use crate::row_ext::RowExt;
 use crate::types::*;
 use celers_core::{CelersError, Result, SerializedTask, TaskId};
 use chrono::{DateTime, Utc};
+use oxisql_core::Connection;
 use serde_json::json;
-use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -25,26 +26,49 @@ impl MysqlBroker {
     #[cfg(feature = "metrics")]
     pub async fn update_metrics(&self) -> Result<()> {
         // Get pending tasks count
-        let pending_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE state = 'pending'")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+        let pending_rows = self
+            .connection()
+            .query(
+                "SELECT COUNT(*) AS c FROM celers_tasks WHERE state = 'pending'",
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+        let pending_count: i64 = pending_rows
+            .first()
+            .map(|r| r.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to get pending count: {e}")))?
+            .unwrap_or(0);
 
         // Get processing tasks count
-        let processing_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE state = 'processing'")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| {
-                    CelersError::Other(format!("Failed to get processing count: {}", e))
-                })?;
+        let processing_rows = self
+            .connection()
+            .query(
+                "SELECT COUNT(*) AS c FROM celers_tasks WHERE state = 'processing'",
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get processing count: {}", e)))?;
+        let processing_count: i64 = processing_rows
+            .first()
+            .map(|r| r.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to get processing count: {e}")))?
+            .unwrap_or(0);
 
         // Get DLQ count
-        let dlq_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_dead_letter_queue")
-            .fetch_one(&self.pool)
+        let dlq_rows = self
+            .connection()
+            .query("SELECT COUNT(*) AS c FROM celers_dead_letter_queue", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {}", e)))?;
+        let dlq_count: i64 = dlq_rows
+            .first()
+            .map(|r| r.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {e}")))?
+            .unwrap_or(0);
 
         // Update gauges
         QUEUE_SIZE.set(pending_count as f64);
@@ -95,18 +119,18 @@ impl MysqlBroker {
             );
         }
 
-        let result = sqlx::query(
-            r#"
-            DELETE FROM celers_dead_letter_queue
-            WHERE TIMESTAMPDIFF(SECOND, failed_at, NOW()) > ?
-            "#,
-        )
-        .bind(retention_seconds)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to apply DLQ retention: {}", e)))?;
+        let deleted = self
+            .connection()
+            .execute(
+                r#"
+                DELETE FROM celers_dead_letter_queue
+                WHERE TIMESTAMPDIFF(SECOND, failed_at, NOW()) > ?
+                "#,
+                &[&retention_seconds],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to apply DLQ retention: {}", e)))?;
 
-        let deleted = result.rows_affected();
         if deleted > 0 {
             tracing::info!(
                 count = deleted,
@@ -163,12 +187,20 @@ impl MysqlBroker {
         let max_size = max_batch_size.unwrap_or(200);
 
         // Get current pending task count
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM celers_tasks WHERE state = 'pending' AND scheduled_at <= NOW()",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                "SELECT COUNT(*) AS c FROM celers_tasks WHERE state = 'pending' AND scheduled_at <= NOW()",
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get pending count: {}", e)))?;
+        let pending: i64 = rows
+            .first()
+            .map(|r| r.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to get pending count: {e}")))?
+            .unwrap_or(0);
 
         // Adaptive batch sizing based on queue depth
         let optimal_size = if pending < 10 {
@@ -188,10 +220,8 @@ impl MysqlBroker {
     /// Get connection pool health status with detailed metrics
     ///
     /// Returns comprehensive connection pool metrics including:
-    /// - Pool size and utilization
-    /// - Active vs idle connections
-    /// - Connection wait times (if available)
-    /// - Pool pressure indicators
+    /// - Configured maximum pool size
+    /// - Pool utilization/idle/active counts (unavailable post-migration; see below)
     ///
     /// # Returns
     /// Detailed connection diagnostics including health status
@@ -209,26 +239,16 @@ impl MysqlBroker {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// Note: `oxisql_mysql::MyConnection` exposes no pool-introspection API
+    /// (no `size()`/`num_idle()`/`options()` equivalent to the pre-migration
+    /// `sqlx::MySqlPool` — see the `configured_max_connections` field doc on
+    /// `MysqlBroker` in `broker_core.rs` for the full rationale), so this
+    /// now delegates to [`MysqlBroker::get_connection_diagnostics`], which
+    /// reports the configured ceiling with idle/active/utilization as
+    /// unknown (`0`/`0.0`) rather than a live snapshot.
     pub async fn get_pool_health(&self) -> Result<ConnectionDiagnostics> {
-        let total = self.pool.size();
-        let idle = self.pool.num_idle() as u32;
-        let active = total - idle;
-        let max = self.pool.options().get_max_connections();
-
-        let utilization = if max > 0 {
-            (total as f64 / max as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        Ok(ConnectionDiagnostics {
-            total_connections: total,
-            idle_connections: idle,
-            active_connections: active,
-            max_connections: max,
-            connection_wait_time_ms: None, // MySQL driver doesn't expose this
-            pool_utilization_percent: utilization,
-        })
+        Ok(self.get_connection_diagnostics())
     }
 
     /// Compress task payload using DEFLATE compression
@@ -304,17 +324,21 @@ impl MysqlBroker {
         let mut optimized = 0u64;
 
         for table in &tables {
-            // OPTIMIZE TABLE
-            sqlx::query(&format!("OPTIMIZE TABLE {}", table))
-                .execute(&self.pool)
+            // OPTIMIZE TABLE / ANALYZE TABLE take an unquoted identifier, not
+            // a bindable value, so `table` is interpolated into the SQL text
+            // (as it was pre-migration via `sqlx::AssertSqlSafe`) — safe
+            // here because `tables` is a fixed, hardcoded list, never
+            // attacker- or caller-derived input.
+            self.connection()
+                .execute(&format!("OPTIMIZE TABLE {}", table), &[])
                 .await
                 .map_err(|e| {
                     CelersError::Other(format!("Failed to optimize table {}: {}", table, e))
                 })?;
 
             // ANALYZE TABLE
-            sqlx::query(&format!("ANALYZE TABLE {}", table))
-                .execute(&self.pool)
+            self.connection()
+                .execute(&format!("ANALYZE TABLE {}", table), &[])
                 .await
                 .map_err(|e| {
                     CelersError::Other(format!("Failed to analyze table {}: {}", table, e))
@@ -341,45 +365,56 @@ impl MysqlBroker {
     /// Note: This requires MySQL slow_query_log to be enabled and accessible.
     pub async fn get_slow_queries(&self, limit: i64) -> Result<Vec<SlowQueryInfo>> {
         // Check if performance_schema is enabled
-        let ps_enabled: String = sqlx::query_scalar("SELECT @@performance_schema")
-            .fetch_one(&self.pool)
+        let ps_rows = self
+            .connection()
+            .query("SELECT @@performance_schema AS v", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to check performance_schema: {}", e))
             })?;
+        let ps_enabled: String = ps_rows
+            .first()
+            .map(|r| r.col("v"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to check performance_schema: {e}")))?
+            .unwrap_or_default();
 
         if ps_enabled != "1" {
             return Ok(Vec::new());
         }
 
         // Query from events_statements_summary_by_digest
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                DIGEST_TEXT as query_text,
-                COUNT_STAR as execution_count,
-                AVG_TIMER_WAIT / 1000000000 as avg_time_ms,
-                MAX_TIMER_WAIT / 1000000000 as max_time_ms,
-                SUM_TIMER_WAIT / 1000000000 as total_time_ms
-            FROM performance_schema.events_statements_summary_by_digest
-            WHERE DIGEST_TEXT LIKE '%celers_%'
-            ORDER BY SUM_TIMER_WAIT DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to query slow queries: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT
+                    DIGEST_TEXT as query_text,
+                    COUNT_STAR as execution_count,
+                    AVG_TIMER_WAIT / 1000000000 as avg_time_ms,
+                    MAX_TIMER_WAIT / 1000000000 as max_time_ms,
+                    SUM_TIMER_WAIT / 1000000000 as total_time_ms
+                FROM performance_schema.events_statements_summary_by_digest
+                WHERE DIGEST_TEXT LIKE '%celers_%'
+                ORDER BY SUM_TIMER_WAIT DESC
+                LIMIT ?
+                "#,
+                &[&limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to query slow queries: {}", e)))?;
 
         let mut slow_queries = Vec::new();
         for row in rows {
+            let avg_time_ms: Option<String> = row.col("avg_time_ms").ok();
+            let max_time_ms: Option<String> = row.col("max_time_ms").ok();
+            let total_time_ms: Option<String> = row.col("total_time_ms").ok();
             slow_queries.push(SlowQueryInfo {
-                query_text: row.try_get("query_text").unwrap_or_default(),
-                execution_count: row.try_get("execution_count").unwrap_or(0),
-                avg_time_ms: row.try_get("avg_time_ms").unwrap_or(0.0),
-                max_time_ms: row.try_get("max_time_ms").unwrap_or(0.0),
-                total_time_ms: row.try_get("total_time_ms").unwrap_or(0.0),
+                query_text: row.col("query_text").unwrap_or_default(),
+                execution_count: row.col("execution_count").unwrap_or(0),
+                avg_time_ms: avg_time_ms.and_then(|d| d.parse().ok()).unwrap_or(0.0),
+                max_time_ms: max_time_ms.and_then(|d| d.parse().ok()).unwrap_or(0.0),
+                total_time_ms: total_time_ms.and_then(|d| d.parse().ok()).unwrap_or(0.0),
             });
         }
 
@@ -434,22 +469,21 @@ impl MysqlBroker {
             );
         }
 
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET priority = priority + ?
-            WHERE state = 'pending'
-              AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
-              AND priority < 1000
-            "#,
-        )
-        .bind(priority_boost)
-        .bind(age_threshold_secs)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to apply priority aging: {}", e)))?;
+        let updated = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET priority = priority + ?
+                WHERE state = 'pending'
+                  AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+                  AND priority < 1000
+                "#,
+                &[&priority_boost, &age_threshold_secs],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to apply priority aging: {}", e)))?;
 
-        let updated = result.rows_affected();
         if updated > 0 {
             tracing::info!(
                 count = updated,
@@ -507,24 +541,26 @@ impl MysqlBroker {
             "current_step": current_step,
             "updated_at": chrono::Utc::now().to_rfc3339(),
         });
+        let progress_json_str =
+            serde_json::to_string(&progress_json).unwrap_or_else(|_| "{}".to_string());
 
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET metadata = JSON_SET(
-                metadata,
-                '$.progress', ?
+        let affected = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET metadata = JSON_SET(
+                    metadata,
+                    '$.progress', ?
+                )
+                WHERE id = ? AND state = 'processing'
+                "#,
+                &[&progress_json_str, &task_id.to_string()],
             )
-            WHERE id = ? AND state = 'processing'
-            "#,
-        )
-        .bind(serde_json::to_string(&progress_json).unwrap_or_else(|_| "{}".to_string()))
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to update task progress: {}", e)))?;
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to update task progress: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Get task progress for a specific task
@@ -535,26 +571,27 @@ impl MysqlBroker {
     /// # Returns
     /// Task progress information if available
     pub async fn get_task_progress(&self, task_id: &TaskId) -> Result<Option<TaskProgress>> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                id,
-                JSON_EXTRACT(metadata, '$.progress.progress_percent') as progress_percent,
-                JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.progress.current_step')) as current_step,
-                JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.progress.updated_at')) as updated_at
-            FROM celers_tasks
-            WHERE id = ?
-            "#,
-        )
-        .bind(task_id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task progress: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT
+                    id,
+                    JSON_EXTRACT(metadata, '$.progress.progress_percent') as progress_percent,
+                    JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.progress.current_step')) as current_step,
+                    JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.progress.updated_at')) as updated_at
+                FROM celers_tasks
+                WHERE id = ?
+                "#,
+                &[&task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get task progress: {}", e)))?;
 
-        if let Some(row) = row {
-            let progress_percent: Option<f64> = row.try_get("progress_percent").ok();
-            let current_step: Option<String> = row.try_get("current_step").ok();
-            let updated_at_str: Option<String> = row.try_get("updated_at").ok();
+        if let Some(row) = rows.into_iter().next() {
+            let progress_percent: Option<f64> = row.col("progress_percent").ok();
+            let current_step: Option<String> = row.col("current_step").ok();
+            let updated_at_str: Option<String> = row.col("updated_at").ok();
 
             if let Some(percent) = progress_percent {
                 let updated_at = updated_at_str
@@ -606,34 +643,46 @@ impl MysqlBroker {
         max_per_minute: i64,
     ) -> Result<RateLimitStatus> {
         // Count completed tasks in the last minute
-        let completed_last_minute: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM celers_tasks
-            WHERE task_name = ?
-              AND state = 'completed'
-              AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE)
-            "#,
-        )
-        .bind(task_name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to check rate limit: {}", e)))?;
+        let minute_rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT COUNT(*) AS c
+                FROM celers_tasks
+                WHERE task_name = ?
+                  AND state = 'completed'
+                  AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE)
+                "#,
+                &[&task_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to check rate limit: {}", e)))?;
+        let completed_last_minute: i64 = minute_rows
+            .first()
+            .map(|r| r.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to check rate limit: {e}")))?
+            .unwrap_or(0);
 
         // Count for last hour
-        let completed_last_hour: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM celers_tasks
-            WHERE task_name = ?
-              AND state = 'completed'
-              AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
-            "#,
-        )
-        .bind(task_name)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        let hour_rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT COUNT(*) AS c
+                FROM celers_tasks
+                WHERE task_name = ?
+                  AND state = 'completed'
+                  AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                "#,
+                &[&task_name],
+            )
+            .await
+            .ok();
+        let completed_last_hour: i64 = hour_rows
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.col::<i64>("c").ok())
+            .unwrap_or(0);
 
         let per_second = completed_last_minute as f64 / 60.0;
         let limit_exceeded = completed_last_minute >= max_per_minute;
@@ -680,23 +729,26 @@ impl MysqlBroker {
         window_secs: i64,
     ) -> Result<TaskId> {
         // Check for existing task within window
-        let existing: Option<String> = sqlx::query_scalar(
-            r#"
-            SELECT id
-            FROM celers_tasks
-            WHERE JSON_EXTRACT(metadata, '$.dedup_key') = ?
-              AND created_at >= DATE_SUB(NOW(), INTERVAL ? SECOND)
-              AND state IN ('pending', 'processing')
-            LIMIT 1
-            "#,
-        )
-        .bind(dedup_key)
-        .bind(window_secs)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to check for duplicates: {}", e)))?;
+        let existing_rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT id
+                FROM celers_tasks
+                WHERE JSON_EXTRACT(metadata, '$.dedup_key') = ?
+                  AND created_at >= DATE_SUB(NOW(), INTERVAL ? SECOND)
+                  AND state IN ('pending', 'processing')
+                LIMIT 1
+                "#,
+                &[&dedup_key, &window_secs],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to check for duplicates: {}", e)))?;
 
-        if let Some(id_str) = existing {
+        if let Some(row) = existing_rows.into_iter().next() {
+            let id_str: String = row
+                .col("id")
+                .map_err(|e| CelersError::Other(format!("Failed to check for duplicates: {e}")))?;
             // Return existing task ID
             let task_id = Uuid::parse_str(&id_str)
                 .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
@@ -726,23 +778,27 @@ impl MysqlBroker {
                 }
             }
         }
+        let db_metadata_str =
+            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
 
-        sqlx::query(
-            r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
-            "#,
-        )
-        .bind(task_id.to_string())
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string()))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                "#,
+                &[
+                    &task_id.to_string(),
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &db_metadata_str,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
 
         Ok(task_id)
     }
@@ -774,42 +830,44 @@ impl MysqlBroker {
     /// ```
     pub async fn cancel_cascade(&self, task_id: &TaskId) -> Result<u64> {
         // First cancel the parent task
-        let parent_result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'cancelled',
-                completed_at = NOW()
-            WHERE id = ?
-              AND state IN ('pending', 'processing')
-            "#,
-        )
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to cancel parent task: {}", e)))?;
+        let parent_affected = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'cancelled',
+                    completed_at = NOW()
+                WHERE id = ?
+                  AND state IN ('pending', 'processing')
+                "#,
+                &[&task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to cancel parent task: {}", e)))?;
 
-        let mut total_cancelled = parent_result.rows_affected();
+        let mut total_cancelled = parent_affected;
 
         // Cancel dependent tasks (those with parent_task_id in metadata)
-        let dependent_result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'cancelled',
-                completed_at = NOW(),
-                error_message = CONCAT(
-                    COALESCE(error_message, ''),
-                    'Cancelled due to parent task cancellation'
-                )
-            WHERE JSON_EXTRACT(metadata, '$.parent_task_id') = ?
-              AND state IN ('pending', 'processing')
-            "#,
-        )
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to cancel dependent tasks: {}", e)))?;
+        let dependent_affected = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'cancelled',
+                    completed_at = NOW(),
+                    error_message = CONCAT(
+                        COALESCE(error_message, ''),
+                        'Cancelled due to parent task cancellation'
+                    )
+                WHERE JSON_EXTRACT(metadata, '$.parent_task_id') = ?
+                  AND state IN ('pending', 'processing')
+                "#,
+                &[&task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to cancel dependent tasks: {}", e)))?;
 
-        total_cancelled += dependent_result.rows_affected();
+        total_cancelled += dependent_affected;
 
         if total_cancelled > 0 {
             tracing::info!(

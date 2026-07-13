@@ -1,6 +1,6 @@
 # celers-macros
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13**
 
 Procedural macros for simplified CeleRS task definitions.
 
@@ -9,6 +9,13 @@ Procedural macros for simplified CeleRS task definitions.
 This crate provides ergonomic procedural macros for defining CeleRS tasks without boilerplate:
 - `#[task]` - Attribute macro for converting async functions into tasks
 - `#[derive(Task)]` - Derive macro for implementing the Task trait
+
+**Public API surface**: exactly 2 exported proc-macros (`#[task]`, `#[derive(Task)]`). Everything
+else in this crate — code generation, the 37 predefined validators — is internal and reached only
+through those two entry points; there is no other public Rust API to version.
+
+_No functional changes landed in this crate during the 0.3.0 release cycle (verified against
+`CHANGELOG.md`); the version bump reflects the workspace-wide release only._
 
 ## Features
 
@@ -34,7 +41,8 @@ This crate provides ergonomic procedural macros for defining CeleRS tasks withou
 - ✅ **Performance Optimization**: LazyLock pattern caching for all regex-based validators
 
 ### Testing & Quality
-- ✅ 221 total tests (21 unit + 200 integration + 23 doc tests; see TODO for full count)
+- ✅ 221 tests passing (21 unit + 200 integration), verified via `cargo nextest run -p celers-macros --all-features`
+- ℹ️ 23 additional doc examples exist but are marked `` ```ignore `` (illustrative only — see TODO for details)
 - ✅ Zero compiler warnings, zero clippy warnings
 - ✅ Comprehensive validation examples
 - ✅ Runnable examples demonstrating all features
@@ -155,6 +163,7 @@ See the [examples directory](./examples/) for comprehensive demonstrations:
 Run examples:
 ```bash
 cargo run --example basic_task
+cargo run --example derive_task
 cargo run --example validation
 ```
 
@@ -250,10 +259,13 @@ cargo expand --example basic_task
 
 - ✅ 21 unit tests (attribute parsing, type detection, name conversion)
 - ✅ 200 integration tests (all features, validators, and custom validators)
-- ✅ 23 doc tests
+- ✅ 221/221 passing — verified via `cargo nextest run -p celers-macros --all-features` (2026-07-13)
+- ℹ️ 23 doc examples in `src/lib.rs`, all marked `` ```ignore `` — they reference macro-generated
+  types that only exist after expansion inside a real crate, so `cargo test --doc` reports them
+  `ignored` rather than compiled/run
 - ✅ Zero compiler warnings
-- ✅ Zero clippy warnings
-- ✅ All examples run successfully
+- ✅ Zero clippy warnings (`cargo clippy -p celers-macros --all-features --all-targets`)
+- ✅ All 3 examples (`basic_task`, `derive_task`, `validation`) run successfully
 
 ## See Also
 

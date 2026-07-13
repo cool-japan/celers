@@ -12,6 +12,7 @@ use crate::scheduler::{BeatScheduler, ConflictSeverity, ScheduleConflict};
 use crate::task::ScheduledTask;
 use crate::wfq::{WFQState, WFQTaskInfo};
 use chrono::{DateTime, Duration, Utc};
+use oxihttp_client::{Client, HttpsClient};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -543,6 +544,17 @@ impl BeatScheduler {
     /// # Arguments
     /// * `webhook` - Webhook configuration
     ///
+    /// The registered callback performs a real HTTP `POST` of the alert payload
+    /// to the configured webhook URL. Because alert callbacks are invoked
+    /// synchronously, the request is dispatched onto the current Tokio runtime
+    /// via [`tokio::runtime::Handle::spawn`]. If no Tokio runtime is available
+    /// when the alert fires, the delivery is skipped and a warning is logged.
+    ///
+    /// Custom headers from [`WebhookConfig::headers`] are applied to the request,
+    /// and the request honours [`WebhookConfig::timeout_seconds`]. Success and
+    /// failure are reported through `tracing`; the send result is never
+    /// `unwrap`ped, so a failing endpoint can never panic the scheduler.
+    ///
     /// # Examples
     /// ```no_run
     /// use celers_beat::{BeatScheduler, WebhookConfig};
@@ -554,13 +566,125 @@ impl BeatScheduler {
     /// ```
     pub fn register_webhook(&mut self, webhook: WebhookConfig) {
         let webhook = Arc::new(webhook);
+        // A single shared client is created once and cloned into the closure so
+        // that connection pooling is reused across every alert delivery.
+        // `HttpsClient` is cheap to clone (it wraps an `Arc`-backed connector),
+        // matching the pooled-client pattern used by other HTTP client crates.
+        let client: Option<HttpsClient> = match Client::builder().with_webpki_roots().build_https()
+        {
+            Ok(client) => Some(client),
+            Err(err) => {
+                tracing::warn!(
+                    webhook.url = %webhook.url,
+                    error = %err,
+                    "Failed to build webhook HTTP client; webhook alerts will not be sent"
+                );
+                None
+            }
+        };
+
         self.alert_manager
             .add_callback(Arc::new(move |alert: &Alert| {
-                if webhook.should_send(alert) {
-                    let payload = webhook.create_payload(alert);
-                    // In a real implementation, this would send an async HTTP request
-                    // For now, we just log it (webhook delivery requires async runtime)
-                    eprintln!("Webhook alert to {}: {}", webhook.url, payload);
+                if !webhook.should_send(alert) {
+                    return;
+                }
+
+                let Some(client) = client.clone() else {
+                    // Client construction failed at registration time; already
+                    // logged above, nothing more to do per-alert.
+                    return;
+                };
+
+                // Build all request data synchronously inside the callback so
+                // the spawned future only owns owned/`Send` values.
+                //
+                // Headers are validated into a plain `http::HeaderMap` up front
+                // rather than threaded through `RequestBuilder::header()` one at
+                // a time: that method takes `self` by value and drops it on a
+                // validation error, so a single bad header would otherwise lose
+                // the whole in-progress builder instead of just being skipped.
+                let payload = webhook.create_payload(alert);
+                let url = webhook.url.clone();
+                let timeout = std::time::Duration::from_secs(webhook.timeout_seconds);
+                let mut headers = http::HeaderMap::new();
+                for (key, value) in &webhook.headers {
+                    match (
+                        http::HeaderName::from_bytes(key.as_bytes()),
+                        http::HeaderValue::from_str(value),
+                    ) {
+                        (Ok(name), Ok(val)) => {
+                            headers.insert(name, val);
+                        }
+                        _ => {
+                            tracing::warn!(
+                                webhook.url = %url,
+                                header = %key,
+                                "Skipping invalid webhook header"
+                            );
+                        }
+                    }
+                }
+
+                // Alert callbacks are synchronous, so dispatch the async HTTP
+                // request onto the current Tokio runtime if one exists.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        handle.spawn(async move {
+                            // `create_payload` returns JSON, so send it as a
+                            // JSON body (sets the `Content-Type` header too).
+                            // oxihttp-client has no `try_clone()`, but this is a
+                            // one-shot send (no retry loop), so building the
+                            // request fresh here is sufficient.
+                            let built = client.post(&url).and_then(|req| req.json(&payload));
+
+                            let request = match built {
+                                Ok(req) => req.headers(headers).timeout(timeout),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        webhook.url = %url,
+                                        error = %err,
+                                        "Failed to build webhook alert request"
+                                    );
+                                    return;
+                                }
+                            };
+
+                            match request.send().await {
+                                Ok(resp) => {
+                                    let status = resp.status();
+                                    if status.is_success() {
+                                        tracing::debug!(
+                                            webhook.url = %url,
+                                            status = %status,
+                                            "Webhook alert delivered"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            webhook.url = %url,
+                                            status = %status,
+                                            "Webhook alert returned non-success status"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        webhook.url = %url,
+                                        error = %err,
+                                        "Failed to deliver webhook alert"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        // No async runtime available: we cannot perform the
+                        // HTTP request, so log the alert instead of dropping it.
+                        tracing::warn!(
+                            webhook.url = %url,
+                            "No Tokio runtime available; webhook alert not sent: {}",
+                            payload
+                        );
+                    }
                 }
             }));
     }
@@ -906,10 +1030,10 @@ impl BeatScheduler {
 
                 // Track oldest/newest execution
                 if let Some(exec_time) = record.completed_at {
-                    if oldest_execution.is_none() || exec_time < oldest_execution.unwrap() {
+                    if oldest_execution.is_none_or(|t| exec_time < t) {
                         oldest_execution = Some(exec_time);
                     }
-                    if newest_execution.is_none() || exec_time > newest_execution.unwrap() {
+                    if newest_execution.is_none_or(|t| exec_time > t) {
                         newest_execution = Some(exec_time);
                     }
                 }
@@ -1037,6 +1161,84 @@ impl std::fmt::Display for SchedulerStatistics {
 }
 
 impl BeatScheduler {
+    // ===== Dynamic Registry-Style Entry Management =====
+    //
+    // These methods present an `add_entry` / `remove_entry` / `update_entry` /
+    // `list_entries` vocabulary directly on the scheduler, mirroring the
+    // standalone [`ScheduleRegistry`](crate::registry::ScheduleRegistry). They
+    // operate on the scheduler's own task map (which requires `&mut self`); for
+    // a *shared* registry that a separate beat-loop thread can mutate
+    // concurrently, build a [`ScheduleRegistry`] (optionally seeded via
+    // [`BeatScheduler::to_registry`]).
+
+    /// Add (or replace) a scheduled entry, persisting state.
+    ///
+    /// Alias of [`BeatScheduler::add_task`] using registry vocabulary; the
+    /// next-run cache is initialised and the scheduler state is saved if
+    /// persistence is configured.
+    pub fn add_entry(&mut self, task: ScheduledTask) -> Result<(), ScheduleError> {
+        self.add_task(task)
+    }
+
+    /// Remove a scheduled entry by name, returning it if it existed.
+    pub fn remove_entry(&mut self, name: &str) -> Result<Option<ScheduledTask>, ScheduleError> {
+        self.remove_task(name)
+    }
+
+    /// Mutate an existing entry in place via a closure, then persist.
+    ///
+    /// Returns `Ok(true)` if the entry existed and was updated, `Ok(false)`
+    /// otherwise. The entry's next-run cache is refreshed so a schedule change
+    /// is reflected on the next tick.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::{BeatScheduler, Schedule, ScheduledTask};
+    ///
+    /// let mut scheduler = BeatScheduler::new();
+    /// scheduler
+    ///     .add_entry(ScheduledTask::new("t".into(), Schedule::interval(60)))
+    ///     .unwrap();
+    /// let updated = scheduler
+    ///     .update_entry("t", |task| task.enabled = false)
+    ///     .unwrap();
+    /// assert!(updated);
+    /// assert!(!scheduler.get_task("t").unwrap().enabled);
+    /// ```
+    pub fn update_entry<F>(&mut self, name: &str, mutate: F) -> Result<bool, ScheduleError>
+    where
+        F: FnOnce(&mut ScheduledTask),
+    {
+        let updated = match self.tasks.get_mut(name) {
+            Some(task) => {
+                mutate(task);
+                task.update_next_run_cache();
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_state()?;
+        }
+        Ok(updated)
+    }
+
+    /// List a snapshot (owned clones) of all scheduled entries.
+    pub fn list_entries(&self) -> Vec<ScheduledTask> {
+        self.tasks.values().cloned().collect()
+    }
+
+    /// Build a fresh shared [`ScheduleRegistry`](crate::registry::ScheduleRegistry)
+    /// seeded with clones of this scheduler's current entries.
+    ///
+    /// The returned registry is independent of the scheduler (mutations on one
+    /// do not affect the other); it exists so a beat loop can be driven by a
+    /// thread-safe, cloneable registry while reusing the schedules already
+    /// configured here.
+    pub fn to_registry(&self) -> crate::registry::ScheduleRegistry {
+        crate::registry::ScheduleRegistry::from_tasks(self.tasks.values().cloned())
+    }
+
     /// Get due tasks using Weighted Fair Queuing algorithm
     ///
     /// Returns tasks ordered by virtual finish time, ensuring fair execution
@@ -1196,5 +1398,126 @@ impl std::fmt::Display for WFQStats {
             self.average_weight,
             self.global_virtual_time
         )
+    }
+}
+
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+    use crate::alert::{AlertCondition, AlertLevel};
+
+    /// Build a deterministic alert for webhook delivery tests.
+    fn sample_alert() -> Alert {
+        Alert::new(
+            "nightly_report".to_string(),
+            AlertLevel::Critical,
+            AlertCondition::ConsecutiveFailures {
+                count: 5,
+                threshold: 3,
+            },
+            "Task failed 5 times in a row".to_string(),
+        )
+        .with_metadata("region".to_string(), "us-east-1".to_string())
+    }
+
+    #[test]
+    fn webhook_payload_is_constructed_correctly() {
+        let webhook = WebhookConfig::new("https://example.com/alerts");
+        let alert = sample_alert();
+
+        let payload = webhook.create_payload(&alert);
+
+        // The payload must be a JSON object carrying every alert field so the
+        // remote endpoint can act on it.
+        assert_eq!(payload["task_name"], "nightly_report");
+        assert_eq!(payload["level"], "Critical");
+        assert_eq!(payload["message"], "Task failed 5 times in a row");
+        assert_eq!(payload["metadata"]["region"], "us-east-1");
+        // Timestamp is present and RFC3339-formatted.
+        assert!(payload["timestamp"].is_string());
+        assert!(payload["timestamp"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')));
+    }
+
+    #[test]
+    fn webhook_custom_headers_are_valid_for_oxihttp() {
+        let webhook = WebhookConfig::new("https://example.com/alerts")
+            .with_header("Authorization", "Bearer token123")
+            .with_header("X-Source", "celers-beat");
+
+        // Every configured header must be convertible into `http` crate header
+        // primitives; this mirrors the conversion done in register_webhook
+        // (oxihttp-client's `RequestBuilder::headers()` takes a `http::HeaderMap`).
+        for (key, value) in &webhook.headers {
+            let name = http::HeaderName::from_bytes(key.as_bytes());
+            let val = http::HeaderValue::from_str(value);
+            assert!(name.is_ok(), "header name {key} should be valid");
+            assert!(val.is_ok(), "header value for {key} should be valid");
+        }
+
+        assert_eq!(
+            webhook.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token123")
+        );
+    }
+
+    #[test]
+    fn webhook_alert_level_filtering() {
+        // Only Critical alerts should be sent to this webhook.
+        let webhook = WebhookConfig::new("https://example.com/alerts")
+            .with_alert_levels(vec![AlertLevel::Critical]);
+
+        let critical = sample_alert();
+        assert!(webhook.should_send(&critical));
+
+        let info = Alert::new(
+            "nightly_report".to_string(),
+            AlertLevel::Info,
+            AlertCondition::TaskUnhealthy {
+                issues: vec!["slow".to_string()],
+            },
+            "informational".to_string(),
+        );
+        assert!(!webhook.should_send(&info));
+
+        // An empty level filter accepts everything.
+        let unfiltered = WebhookConfig::new("https://example.com/alerts");
+        assert!(unfiltered.should_send(&info));
+    }
+
+    #[tokio::test]
+    async fn register_webhook_does_not_panic_on_triggered_alert() {
+        // Point at an address that immediately refuses connections so the
+        // spawned request fails fast without any real network dependency.
+        let webhook = WebhookConfig::new("http://127.0.0.1:1/alerts")
+            .with_header("Authorization", "Bearer token123")
+            .with_timeout(1);
+
+        let mut scheduler = BeatScheduler::new();
+        scheduler.register_webhook(webhook);
+
+        // Triggering the alert invokes the registered (sync) callback, which
+        // spawns the async HTTP request onto the current Tokio runtime. The
+        // request failing must never panic the scheduler.
+        let recorded = scheduler.alert_manager.record_alert(sample_alert());
+        assert!(recorded, "alert should be recorded and callbacks fired");
+
+        // Yield so the spawned delivery task gets a chance to run (and fail)
+        // before the runtime shuts down; this exercises the spawn path.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn register_webhook_without_runtime_does_not_panic() {
+        // Outside any Tokio runtime, the callback must fall back to logging
+        // instead of attempting (and panicking on) a spawn.
+        let webhook = WebhookConfig::new("http://127.0.0.1:1/alerts");
+        let mut scheduler = BeatScheduler::new();
+        scheduler.register_webhook(webhook);
+
+        let recorded = scheduler.alert_manager.record_alert(sample_alert());
+        assert!(recorded);
     }
 }

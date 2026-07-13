@@ -38,6 +38,9 @@ pub use chain::*;
 mod group;
 pub use group::*;
 
+mod rate_limit;
+pub use rate_limit::*;
+
 mod chord;
 pub use chord::*;
 
@@ -85,6 +88,21 @@ pub use visualization::*;
 
 mod runtime;
 pub use runtime::*;
+
+mod loops;
+pub use loops::*;
+
+mod subworkflow;
+pub use subworkflow::*;
+
+mod templates;
+pub use templates::*;
+
+mod versioning;
+pub use versioning::*;
+
+// `dynamic` only adds inherent methods to `Chain`/`Group` (no items to re-export).
+mod dynamic;
 
 #[cfg(test)]
 mod tests_basic;

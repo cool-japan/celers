@@ -77,12 +77,15 @@ impl MetricHistory {
     pub fn record(&self, value: f64) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock should be after UNIX_EPOCH")
             .as_secs();
 
         let sample = MetricSample { timestamp, value };
 
-        let mut samples = self.samples.lock().unwrap();
+        let mut samples = self
+            .samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned");
         if samples.len() >= self.max_samples {
             samples.pop_front();
         }
@@ -91,23 +94,35 @@ impl MetricHistory {
 
     /// Get all samples as a vector
     pub fn get_samples(&self) -> Vec<MetricSample> {
-        self.samples.lock().unwrap().iter().cloned().collect()
+        self.samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Get the most recent sample
     pub fn latest(&self) -> Option<MetricSample> {
-        self.samples.lock().unwrap().back().cloned()
+        self.samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned")
+            .back()
+            .cloned()
     }
 
     /// Calculate the trend (rate of change per second)
     pub fn trend(&self) -> Option<f64> {
-        let samples = self.samples.lock().unwrap();
+        let samples = self
+            .samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned");
         if samples.len() < 2 {
             return None;
         }
 
-        let first = samples.front().unwrap();
-        let last = samples.back().unwrap();
+        let first = samples.front().expect("non-empty VecDeque has a front");
+        let last = samples.back().expect("non-empty VecDeque has a back");
 
         let time_delta = (last.timestamp - first.timestamp) as f64;
         if time_delta == 0.0 {
@@ -120,7 +135,10 @@ impl MetricHistory {
 
     /// Calculate moving average over all samples
     pub fn moving_average(&self) -> Option<f64> {
-        let samples = self.samples.lock().unwrap();
+        let samples = self
+            .samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned");
         if samples.is_empty() {
             return None;
         }
@@ -131,7 +149,10 @@ impl MetricHistory {
 
     /// Calculate moving average over a specific window size
     pub fn moving_average_window(&self, window: usize) -> Option<f64> {
-        let samples = self.samples.lock().unwrap();
+        let samples = self
+            .samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned");
         if samples.is_empty() {
             return None;
         }
@@ -144,7 +165,10 @@ impl MetricHistory {
 
     /// Record multiple samples at once (more efficient than individual records)
     pub fn record_batch(&self, values: &[(u64, f64)]) {
-        let mut samples = self.samples.lock().unwrap();
+        let mut samples = self
+            .samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned");
         for (timestamp, value) in values {
             let sample = MetricSample {
                 timestamp: *timestamp,
@@ -160,7 +184,10 @@ impl MetricHistory {
 
     /// Get a comprehensive snapshot of all statistics in a single lock acquisition
     pub fn snapshot(&self) -> MetricHistorySnapshot {
-        let samples = self.samples.lock().unwrap();
+        let samples = self
+            .samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned");
 
         if samples.is_empty() {
             return MetricHistorySnapshot::default();
@@ -174,13 +201,13 @@ impl MetricHistory {
         let min = values
             .iter()
             .copied()
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap();
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .expect("non-empty values has a minimum");
         let max = values
             .iter()
             .copied()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap();
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .expect("non-empty values has a maximum");
 
         let variance = if count > 1 {
             let sq_diff_sum: f64 = values.iter().map(|v| (v - mean).powi(2)).sum();
@@ -192,8 +219,8 @@ impl MetricHistory {
         let std_dev = variance.sqrt();
 
         let trend = if samples.len() >= 2 {
-            let first = samples.front().unwrap();
-            let last = samples.back().unwrap();
+            let first = samples.front().expect("len >= 2 means front exists");
+            let last = samples.back().expect("len >= 2 means back exists");
             let time_delta = (last.timestamp - first.timestamp) as f64;
             if time_delta > 0.0 {
                 Some((last.value - first.value) / time_delta)
@@ -218,35 +245,65 @@ impl MetricHistory {
 
     /// Get the minimum value in history
     pub fn min(&self) -> Option<f64> {
-        let samples = self.samples.lock().unwrap();
+        let samples = self
+            .samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned");
         samples
             .iter()
             .map(|s| s.value)
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
     }
 
     /// Get the maximum value in history
     pub fn max(&self) -> Option<f64> {
-        let samples = self.samples.lock().unwrap();
+        let samples = self
+            .samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned");
         samples
             .iter()
             .map(|s| s.value)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
     }
 
     /// Clear all samples
     pub fn clear(&self) {
-        self.samples.lock().unwrap().clear();
+        self.samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned")
+            .clear();
     }
 
     /// Get number of samples
     pub fn len(&self) -> usize {
-        self.samples.lock().unwrap().len()
+        self.samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned")
+            .len()
     }
 
     /// Check if history is empty
     pub fn is_empty(&self) -> bool {
-        self.samples.lock().unwrap().is_empty()
+        self.samples
+            .lock()
+            .expect("MetricHistory lock should not be poisoned")
+            .is_empty()
+    }
+
+    /// Remove samples older than the given number of seconds from the current time
+    ///
+    /// Returns the number of samples removed
+    pub fn remove_samples_older_than(&self, max_age_seconds: u64) -> usize {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff = now.saturating_sub(max_age_seconds);
+        let mut samples = self.samples.lock().expect("lock should not be poisoned");
+        let original_len = samples.len();
+        samples.retain(|s| s.timestamp >= cutoff);
+        original_len - samples.len()
     }
 }
 
@@ -494,9 +551,9 @@ pub fn estimate_costs(config: &CostConfig, time_period_hours: f64) -> CostEstima
     let total_tasks = metrics.tasks_completed + metrics.tasks_failed;
     let task_cost = total_tasks * (config.cost_per_million_tasks / 1_000_000.0);
 
-    // Data cost: Estimate from result sizes (if tracked)
-    // This is a placeholder - actual implementation would need result size tracking
-    let data_cost = 0.0;
+    // Data cost: total bytes processed in GB * cost_per_gb
+    let total_gb = metrics.total_payload_bytes / 1_073_741_824.0; // bytes to GB
+    let data_cost = total_gb * config.cost_per_gb;
 
     let total_cost = compute_cost + task_cost + data_cost;
 
@@ -610,7 +667,10 @@ impl CardinalityLimiter {
     /// Check if a label combination is allowed (within cardinality limit)
     /// Returns true if the label should be recorded, false if it would exceed the limit
     pub fn check_and_record(&self, label_key: &str) -> bool {
-        let mut seen = self.seen_labels.lock().unwrap();
+        let mut seen = self
+            .seen_labels
+            .lock()
+            .expect("CardinalityLimiter lock should not be poisoned");
 
         if seen.contains(label_key) {
             return true; // Already seen, always allowed
@@ -626,7 +686,10 @@ impl CardinalityLimiter {
 
     /// Get current cardinality (number of unique label combinations)
     pub fn current_cardinality(&self) -> usize {
-        self.seen_labels.lock().unwrap().len()
+        self.seen_labels
+            .lock()
+            .expect("CardinalityLimiter lock should not be poisoned")
+            .len()
     }
 
     /// Check if cardinality limit has been reached
@@ -636,7 +699,10 @@ impl CardinalityLimiter {
 
     /// Reset the limiter
     pub fn reset(&self) {
-        self.seen_labels.lock().unwrap().clear();
+        self.seen_labels
+            .lock()
+            .expect("CardinalityLimiter lock should not be poisoned")
+            .clear();
     }
 }
 
@@ -790,7 +856,7 @@ pub fn calculate_windowed_stats(
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock should be after UNIX_EPOCH")
         .as_secs();
 
     let window_start = now.saturating_sub(window.as_seconds());
@@ -812,12 +878,12 @@ pub fn calculate_windowed_stats(
 
     let min = windowed_samples
         .iter()
-        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .copied()?;
 
     let max = windowed_samples
         .iter()
-        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .copied()?;
 
     let variance: f64 = windowed_samples
@@ -830,7 +896,7 @@ pub fn calculate_windowed_stats(
 
     // Calculate percentiles (requires sorted data)
     let mut sorted_samples = windowed_samples.clone();
-    sorted_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let p50 = calculate_percentile(&sorted_samples, 0.50).unwrap_or(mean);
     let p95 = calculate_percentile(&sorted_samples, 0.95).unwrap_or(max);
@@ -1103,4 +1169,30 @@ pub fn recommend_cost_optimizations(config: &CostOptimizationConfig) -> Vec<Cost
     }
 
     recommendations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prometheus_metrics::TOTAL_PAYLOAD_BYTES_PROCESSED;
+
+    #[test]
+    fn test_data_cost_uses_payload_bytes() {
+        // Record 2 GB of payload bytes in the global counter
+        let two_gb = 2.0 * 1_073_741_824.0;
+        TOTAL_PAYLOAD_BYTES_PROCESSED.inc_by(two_gb);
+
+        let config = CostConfig::new().with_cost_per_gb(0.02); // $0.02/GB
+        let estimate = estimate_costs(&config, 1.0);
+        // data_cost should be at least 2GB * $0.02 = $0.04 (counter is global, may accumulate)
+        assert!(
+            estimate.data_cost >= 0.04,
+            "data_cost={} should be >= $0.04 for at least 2GB at $0.02/GB",
+            estimate.data_cost
+        );
+        assert!(
+            estimate.total_cost >= estimate.data_cost,
+            "total_cost must be >= data_cost"
+        );
+    }
 }

@@ -145,7 +145,7 @@ impl WorkerMetadata {
     pub fn new(worker_id: impl Into<String>, hostname: impl Into<String>) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         Self {
@@ -163,7 +163,7 @@ impl WorkerMetadata {
     pub fn is_alive(&self, ttl_secs: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         now.saturating_sub(self.last_heartbeat) <= ttl_secs
     }
@@ -349,7 +349,7 @@ impl Coordinator for WorkerCoordinator {
         let mut metadata = self.metadata.write().await;
         metadata.last_heartbeat = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let metadata_json = serde_json::to_string(&*metadata)
@@ -631,7 +631,7 @@ impl Coordinator for InMemoryCoordinator {
         let mut metadata = self.metadata.write().await;
         metadata.last_heartbeat = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let mut workers = self.workers.write().await;

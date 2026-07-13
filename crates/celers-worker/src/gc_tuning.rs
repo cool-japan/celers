@@ -321,9 +321,14 @@ impl GcTuner {
         let total_bytes: usize = recent_samples.iter().map(|s| s.size).sum();
         let duration = recent_samples
             .last()
-            .unwrap()
+            .expect("recent_samples validated to be non-empty")
             .timestamp
-            .duration_since(recent_samples.first().unwrap().timestamp);
+            .duration_since(
+                recent_samples
+                    .first()
+                    .expect("recent_samples validated to be non-empty")
+                    .timestamp,
+            );
 
         if duration.as_secs_f64() == 0.0 {
             return 0.0;

@@ -385,7 +385,11 @@ impl DlqStorage for RedisDlqStorage {
             return Ok(false);
         }
 
-        let task_name = entry.unwrap().task.metadata.name;
+        let task_name = entry
+            .expect("entry validated to be Some just above")
+            .task
+            .metadata
+            .name;
         let task_key = self.task_key(task_id);
         let index_key = self.index_key();
         let task_name_index = self.task_name_index_key(&task_name);
@@ -558,7 +562,7 @@ impl DlqStorage for RedisDlqStorage {
 #[cfg(feature = "postgres")]
 /// PostgreSQL-based DLQ storage with persistence and advanced querying
 pub struct PostgresDlqStorage {
-    pool: sqlx::PgPool,
+    conn: oxisql_postgres::PgConnection,
     table_name: String,
 }
 
@@ -570,13 +574,22 @@ impl PostgresDlqStorage {
     /// * `database_url` - PostgreSQL connection URL
     /// * `table_name` - Name of the DLQ table (default: "celery_dlq")
     pub async fn new(database_url: &str, table_name: Option<String>) -> Result<Self> {
-        let pool = sqlx::PgPool::connect(database_url).await.map_err(|e| {
-            celers_core::CelersError::Other(format!("PostgreSQL connection error: {}", e))
-        })?;
+        // TLS mode is resolved from `database_url`'s `sslmode` query
+        // parameter rather than hardcoded — see `crate::tls_mode` module
+        // docs for why hardcoding `TlsMode::Disabled` here would silently
+        // downgrade a caller who requested `sslmode=require` to plain-text.
+        let tls_mode = crate::tls_mode::pg_tls_mode_for_url(database_url)
+            .map_err(|e| celers_core::CelersError::Other(format!("TLS resolution error: {}", e)))?;
+
+        let conn = oxisql_postgres::PgConnection::connect(database_url, tls_mode)
+            .await
+            .map_err(|e| {
+                celers_core::CelersError::Other(format!("PostgreSQL connection error: {}", e))
+            })?;
 
         let table_name = table_name.unwrap_or_else(|| "celery_dlq".to_string());
 
-        let storage = Self { pool, table_name };
+        let storage = Self { conn, table_name };
 
         // Create table if it doesn't exist
         storage.create_table().await?;
@@ -586,6 +599,8 @@ impl PostgresDlqStorage {
 
     /// Create the DLQ table if it doesn't exist
     async fn create_table(&self) -> Result<()> {
+        use oxisql_core::Connection;
+
         let query = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
@@ -607,7 +622,17 @@ impl PostgresDlqStorage {
             self.table_name, self.table_name, self.table_name, self.table_name, self.table_name
         );
 
-        sqlx::query(&query).execute(&self.pool).await.map_err(|e| {
+        // Multi-statement DDL text (three `;`-separated statements, zero bind
+        // parameters) -> `execute_batch`, which `oxisql-postgres` overrides
+        // with the native `tokio_postgres::Client::batch_execute` simple-query
+        // path (correctly handling the embedded semicolons), rather than
+        // `execute`, which targets a single extended-protocol statement.
+        // Only the table name is interpolated into this string, and it is
+        // never user/request-controlled (a fixed caller-configured storage
+        // parameter set once at construction), so this preserves the
+        // no-value-interpolation discipline `sqlx::AssertSqlSafe` used to
+        // assert explicitly.
+        self.conn.execute_batch(&query).await.map_err(|e| {
             celers_core::CelersError::Other(format!("Failed to create DLQ table: {}", e))
         })?;
 
@@ -620,6 +645,9 @@ impl PostgresDlqStorage {
 #[async_trait]
 impl DlqStorage for PostgresDlqStorage {
     async fn add(&self, entry: DlqEntry) -> Result<()> {
+        use crate::row_ext::{json_param, uuid_param};
+        use oxisql_core::Connection;
+
         let task_json = serde_json::to_value(&entry.task)
             .map_err(|e| celers_core::CelersError::Other(format!("Serialization error: {}", e)))?;
 
@@ -642,17 +670,35 @@ impl DlqStorage for PostgresDlqStorage {
             self.table_name
         );
 
-        sqlx::query(&query)
-            .bind(entry.task_id)
-            .bind(task_json)
-            .bind(&entry.task.metadata.name)
-            .bind(entry.retry_count as i32)
-            .bind(&entry.error_message)
-            .bind(entry.dlq_timestamp as i64)
-            .bind(entry.original_timestamp as i64)
-            .bind(&entry.worker_hostname)
-            .bind(metadata_json)
-            .execute(&self.pool)
+        // Bind order preserved exactly: task_id, task_data, task_name,
+        // retry_count, error_message, dlq_timestamp, original_timestamp,
+        // worker_hostname, metadata. UUID -> uuid_param, JSONB columns ->
+        // json_param (bound as text, cast server-side by the column's
+        // declared JSONB type); dlq_timestamp/original_timestamp are BIGINT
+        // columns bound as plain `i64` (no DateTime/timestamptz binary
+        // hazard applies — see `row_ext.rs`'s DateTime<Utc> convention note).
+        let task_id_param = uuid_param(&entry.task_id);
+        let task_data_param = json_param(&task_json);
+        let retry_count_param = entry.retry_count as i32;
+        let dlq_timestamp_param = entry.dlq_timestamp as i64;
+        let original_timestamp_param = entry.original_timestamp as i64;
+        let metadata_param = json_param(&metadata_json);
+
+        self.conn
+            .execute(
+                &query,
+                &[
+                    &task_id_param,
+                    &task_data_param,
+                    &entry.task.metadata.name,
+                    &retry_count_param,
+                    &entry.error_message,
+                    &dlq_timestamp_param,
+                    &original_timestamp_param,
+                    &entry.worker_hostname,
+                    &metadata_param,
+                ],
+            )
             .await
             .map_err(|e| {
                 celers_core::CelersError::Other(format!("Failed to insert DLQ entry: {}", e))
@@ -663,39 +709,46 @@ impl DlqStorage for PostgresDlqStorage {
     }
 
     async fn get(&self, task_id: &TaskId) -> Result<Option<DlqEntry>> {
+        use crate::row_ext::{json_from_row, uuid_param, RowExt};
+        use oxisql_core::Connection;
+
         let query = format!(
             "SELECT task_id, task_data, retry_count, error_message, dlq_timestamp, original_timestamp, worker_hostname, metadata FROM {} WHERE task_id = $1",
             self.table_name
         );
 
-        let row: Option<(
-            uuid::Uuid,
-            sqlx::types::JsonValue,
-            i32,
-            String,
-            i64,
-            i64,
-            String,
-            sqlx::types::JsonValue,
-        )> = sqlx::query_as(&query)
-            .bind(task_id)
-            .fetch_optional(&self.pool)
+        let task_id_param = uuid_param(task_id);
+        let rows = self
+            .conn
+            .query(&query, &[&task_id_param])
             .await
             .map_err(|e| {
                 celers_core::CelersError::Other(format!("Failed to fetch DLQ entry: {}", e))
             })?;
 
-        match row {
-            Some((
-                task_id,
-                task_data,
-                retry_count,
-                error_message,
-                dlq_timestamp,
-                original_timestamp,
-                worker_hostname,
-                metadata,
-            )) => {
+        // .fetch_optional semantics: take the first row if present, else None.
+        match rows.into_iter().next() {
+            Some(row) => {
+                let task_data = json_from_row(&row, "task_data")
+                    .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+                let retry_count: i32 = row
+                    .col("retry_count")
+                    .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+                let error_message: String = row
+                    .col("error_message")
+                    .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+                let dlq_timestamp: i64 = row
+                    .col("dlq_timestamp")
+                    .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+                let original_timestamp: i64 = row
+                    .col("original_timestamp")
+                    .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+                let worker_hostname: String = row
+                    .col("worker_hostname")
+                    .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+                let metadata = json_from_row(&row, "metadata")
+                    .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+
                 let task: celers_core::SerializedTask =
                     serde_json::from_value(task_data).map_err(|e| {
                         celers_core::CelersError::Other(format!("Deserialization error: {}", e))
@@ -708,7 +761,7 @@ impl DlqStorage for PostgresDlqStorage {
 
                 let entry = DlqEntry {
                     task,
-                    task_id,
+                    task_id: *task_id,
                     retry_count: retry_count as u32,
                     error_message,
                     dlq_timestamp: dlq_timestamp as u64,
@@ -724,39 +777,42 @@ impl DlqStorage for PostgresDlqStorage {
     }
 
     async fn get_all(&self) -> Result<Vec<DlqEntry>> {
+        use crate::row_ext::{json_from_row, uuid_from_row, RowExt};
+        use oxisql_core::Connection;
+
         let query = format!(
             "SELECT task_id, task_data, retry_count, error_message, dlq_timestamp, original_timestamp, worker_hostname, metadata FROM {} ORDER BY dlq_timestamp DESC",
             self.table_name
         );
 
-        let rows: Vec<(
-            uuid::Uuid,
-            sqlx::types::JsonValue,
-            i32,
-            String,
-            i64,
-            i64,
-            String,
-            sqlx::types::JsonValue,
-        )> = sqlx::query_as(&query)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| {
-                celers_core::CelersError::Other(format!("Failed to fetch DLQ entries: {}", e))
-            })?;
+        let rows = self.conn.query(&query, &[]).await.map_err(|e| {
+            celers_core::CelersError::Other(format!("Failed to fetch DLQ entries: {}", e))
+        })?;
 
         let mut entries = Vec::new();
-        for (
-            task_id,
-            task_data,
-            retry_count,
-            error_message,
-            dlq_timestamp,
-            original_timestamp,
-            worker_hostname,
-            metadata,
-        ) in rows
-        {
+        for row in &rows {
+            let task_id = uuid_from_row(row, "task_id")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let task_data = json_from_row(row, "task_data")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let error_message: String = row
+                .col("error_message")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let dlq_timestamp: i64 = row
+                .col("dlq_timestamp")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let original_timestamp: i64 = row
+                .col("original_timestamp")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let worker_hostname: String = row
+                .col("worker_hostname")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let metadata = json_from_row(row, "metadata")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+
             let task: celers_core::SerializedTask = serde_json::from_value(task_data)
                 .unwrap_or_else(|_| {
                     error!("Failed to deserialize task data for {}", task_id);
@@ -785,26 +841,39 @@ impl DlqStorage for PostgresDlqStorage {
     }
 
     async fn remove(&self, task_id: &TaskId) -> Result<bool> {
+        use crate::row_ext::uuid_param;
+        use oxisql_core::Connection;
+
         let query = format!("DELETE FROM {} WHERE task_id = $1", self.table_name);
 
-        let result = sqlx::query(&query)
-            .bind(task_id)
-            .execute(&self.pool)
+        let task_id_param = uuid_param(task_id);
+        let rows_affected = self
+            .conn
+            .execute(&query, &[&task_id_param])
             .await
             .map_err(|e| {
                 celers_core::CelersError::Other(format!("Failed to delete DLQ entry: {}", e))
             })?;
 
         debug!("Removed task {} from PostgreSQL DLQ", task_id);
-        Ok(result.rows_affected() > 0)
+        Ok(rows_affected > 0)
     }
 
     async fn remove_batch(&self, task_ids: &[TaskId]) -> Result<usize> {
+        use crate::row_ext::uuid_param;
+        use oxisql_core::Connection;
+
         if task_ids.is_empty() {
             return Ok(0);
         }
 
-        // Build a query with IN clause
+        // Build a query with IN clause. oxisql-core has no array/slice
+        // `ToSqlValue`, so this stays a dynamically sized `IN ($1, .., $N)`
+        // placeholder list, one `$n` per task id, each bound individually.
+        // Only the *count* of placeholders is generated from `task_ids.len()`
+        // -- no value is ever spliced into the SQL text, preserving the
+        // no-value-interpolation discipline `sqlx::AssertSqlSafe` used to
+        // assert explicitly.
         let placeholders: Vec<String> = (1..=task_ids.len()).map(|i| format!("${}", i)).collect();
         let query = format!(
             "DELETE FROM {} WHERE task_id IN ({})",
@@ -812,52 +881,75 @@ impl DlqStorage for PostgresDlqStorage {
             placeholders.join(", ")
         );
 
-        let mut query_builder = sqlx::query(&query);
-        for task_id in task_ids {
-            query_builder = query_builder.bind(task_id);
-        }
+        let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
+        let param_refs: Vec<&dyn oxisql_core::ToSqlValue> = task_id_params
+            .iter()
+            .map(|p| p as &dyn oxisql_core::ToSqlValue)
+            .collect();
 
-        let result = query_builder.execute(&self.pool).await.map_err(|e| {
+        let rows_affected = self.conn.execute(&query, &param_refs).await.map_err(|e| {
             celers_core::CelersError::Other(format!("Failed to delete DLQ entries: {}", e))
         })?;
 
-        let removed = result.rows_affected() as usize;
+        let removed = rows_affected as usize;
         info!("Removed {} entries from PostgreSQL DLQ in batch", removed);
         Ok(removed)
     }
 
     async fn clear(&self) -> Result<usize> {
+        use oxisql_core::Connection;
+
         let query = format!("DELETE FROM {}", self.table_name);
 
-        let result = sqlx::query(&query)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| celers_core::CelersError::Other(format!("Failed to clear DLQ: {}", e)))?;
+        let rows_affected =
+            self.conn.execute(&query, &[]).await.map_err(|e| {
+                celers_core::CelersError::Other(format!("Failed to clear DLQ: {}", e))
+            })?;
 
-        let count = result.rows_affected() as usize;
+        let count = rows_affected as usize;
         info!("Cleared {} entries from PostgreSQL DLQ", count);
         Ok(count)
     }
 
     async fn size(&self) -> Result<usize> {
+        use crate::row_ext::RowExt;
+        use oxisql_core::Connection;
+
         let query = format!("SELECT COUNT(*) FROM {}", self.table_name);
 
-        let (count,): (i64,) = sqlx::query_as(&query)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                celers_core::CelersError::Other(format!("Failed to count DLQ entries: {}", e))
-            })?;
+        let rows = self.conn.query(&query, &[]).await.map_err(|e| {
+            celers_core::CelersError::Other(format!("Failed to count DLQ entries: {}", e))
+        })?;
+
+        // .fetch_one semantics: error (not a silent default) if no row came
+        // back, preserving sqlx's `fetch_one` behavior exactly. `COUNT(*)`
+        // always returns exactly one row, so this should never actually
+        // trigger.
+        let row = rows.into_iter().next().ok_or_else(|| {
+            celers_core::CelersError::Other(
+                "Failed to count DLQ entries: no rows returned".to_string(),
+            )
+        })?;
+        // Unaliased `COUNT(*)` -> Postgres's implicit column name is the
+        // bare function name "count" (a single unadorned function call is
+        // the one unaliased-expression case with a well-defined name -- see
+        // `row_ext.rs`'s `RowExt::col` doc comment), so named access is safe
+        // here; a binary/compound expression would need `col_idx` instead.
+        let count: i64 = row
+            .col("count")
+            .map_err(|e| celers_core::CelersError::Other(format!("Failed to read count: {}", e)))?;
 
         Ok(count as usize)
     }
 
     async fn get_older_than(&self, age_seconds: u64) -> Result<Vec<DlqEntry>> {
+        use crate::row_ext::{json_from_row, uuid_from_row, RowExt};
+        use oxisql_core::Connection;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         let cutoff = now.saturating_sub(age_seconds);
 
@@ -866,35 +958,39 @@ impl DlqStorage for PostgresDlqStorage {
             self.table_name
         );
 
-        let rows: Vec<(
-            uuid::Uuid,
-            sqlx::types::JsonValue,
-            i32,
-            String,
-            i64,
-            i64,
-            String,
-            sqlx::types::JsonValue,
-        )> = sqlx::query_as(&query)
-            .bind(cutoff as i64)
-            .fetch_all(&self.pool)
+        let cutoff_param = cutoff as i64;
+        let rows = self
+            .conn
+            .query(&query, &[&cutoff_param])
             .await
             .map_err(|e| {
                 celers_core::CelersError::Other(format!("Failed to fetch old DLQ entries: {}", e))
             })?;
 
         let mut entries = Vec::new();
-        for (
-            task_id,
-            task_data,
-            retry_count,
-            error_message,
-            dlq_timestamp,
-            original_timestamp,
-            worker_hostname,
-            metadata,
-        ) in rows
-        {
+        for row in &rows {
+            let task_id = uuid_from_row(row, "task_id")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let task_data = json_from_row(row, "task_data")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let error_message: String = row
+                .col("error_message")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let dlq_timestamp: i64 = row
+                .col("dlq_timestamp")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let original_timestamp: i64 = row
+                .col("original_timestamp")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let worker_hostname: String = row
+                .col("worker_hostname")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let metadata = json_from_row(row, "metadata")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+
             let task: celers_core::SerializedTask = serde_json::from_value(task_data)
                 .unwrap_or_else(|_| {
                     error!("Failed to deserialize task data for {}", task_id);
@@ -923,43 +1019,45 @@ impl DlqStorage for PostgresDlqStorage {
     }
 
     async fn get_by_task_name(&self, task_name: &str) -> Result<Vec<DlqEntry>> {
+        use crate::row_ext::{json_from_row, uuid_from_row, RowExt};
+        use oxisql_core::Connection;
+
         let query = format!(
             "SELECT task_id, task_data, retry_count, error_message, dlq_timestamp, original_timestamp, worker_hostname, metadata FROM {} WHERE task_name = $1",
             self.table_name
         );
 
-        let rows: Vec<(
-            uuid::Uuid,
-            sqlx::types::JsonValue,
-            i32,
-            String,
-            i64,
-            i64,
-            String,
-            sqlx::types::JsonValue,
-        )> = sqlx::query_as(&query)
-            .bind(task_name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| {
-                celers_core::CelersError::Other(format!(
-                    "Failed to fetch DLQ entries by task name: {}",
-                    e
-                ))
-            })?;
+        let rows = self.conn.query(&query, &[&task_name]).await.map_err(|e| {
+            celers_core::CelersError::Other(format!(
+                "Failed to fetch DLQ entries by task name: {}",
+                e
+            ))
+        })?;
 
         let mut entries = Vec::new();
-        for (
-            task_id,
-            task_data,
-            retry_count,
-            error_message,
-            dlq_timestamp,
-            original_timestamp,
-            worker_hostname,
-            metadata,
-        ) in rows
-        {
+        for row in &rows {
+            let task_id = uuid_from_row(row, "task_id")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let task_data = json_from_row(row, "task_data")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let error_message: String = row
+                .col("error_message")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let dlq_timestamp: i64 = row
+                .col("dlq_timestamp")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let original_timestamp: i64 = row
+                .col("original_timestamp")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let worker_hostname: String = row
+                .col("worker_hostname")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let metadata = json_from_row(row, "metadata")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+
             let task: celers_core::SerializedTask = serde_json::from_value(task_data)
                 .unwrap_or_else(|_| {
                     error!("Failed to deserialize task data for {}", task_id);
@@ -988,25 +1086,27 @@ impl DlqStorage for PostgresDlqStorage {
     }
 
     async fn cleanup_expired(&self, ttl_seconds: u64) -> Result<usize> {
+        use oxisql_core::Connection;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         let cutoff = now.saturating_sub(ttl_seconds);
 
         let query = format!("DELETE FROM {} WHERE dlq_timestamp < $1", self.table_name);
 
-        let result = sqlx::query(&query)
-            .bind(cutoff as i64)
-            .execute(&self.pool)
+        let cutoff_param = cutoff as i64;
+        let rows_affected = self
+            .conn
+            .execute(&query, &[&cutoff_param])
             .await
             .map_err(|e| {
                 celers_core::CelersError::Other(format!("Failed to cleanup expired entries: {}", e))
             })?;
 
-        let removed = result.rows_affected() as usize;
+        let removed = rows_affected as usize;
         if removed > 0 {
             info!("Removed {} expired entries from PostgreSQL DLQ", removed);
         }
@@ -1015,6 +1115,9 @@ impl DlqStorage for PostgresDlqStorage {
     }
 
     async fn get_stats_by_task_name(&self) -> Result<HashMap<String, TaskStats>> {
+        use crate::row_ext::RowExt;
+        use oxisql_core::Connection;
+
         let query = format!(
             r#"
             SELECT
@@ -1030,28 +1133,37 @@ impl DlqStorage for PostgresDlqStorage {
             self.table_name
         );
 
-        let rows: Vec<(
-            String,
-            i64,
-            Option<i64>,
-            Option<i32>,
-            Option<i64>,
-            Option<i64>,
-        )> = sqlx::query_as(&query)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| {
-                celers_core::CelersError::Other(format!("Failed to fetch DLQ stats: {}", e))
-            })?;
+        let rows = self.conn.query(&query, &[]).await.map_err(|e| {
+            celers_core::CelersError::Other(format!("Failed to fetch DLQ stats: {}", e))
+        })?;
 
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let mut task_stats = HashMap::new();
-        for (task_name, count, total_retries, max_retries, min_timestamp, max_timestamp) in rows {
+        for row in &rows {
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let count: i64 = row
+                .col("count")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let total_retries: Option<i64> = row
+                .col("total_retries")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let max_retries: Option<i32> = row
+                .col("max_retries")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let min_timestamp: Option<i64> = row
+                .col("min_timestamp")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+            let max_timestamp: Option<i64> = row
+                .col("max_timestamp")
+                .map_err(|e| celers_core::CelersError::Other(format!("Read error: {}", e)))?;
+
             let stats = TaskStats {
                 count: count as usize,
                 total_retries: total_retries.unwrap_or(0) as usize,
@@ -1066,8 +1178,13 @@ impl DlqStorage for PostgresDlqStorage {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        match sqlx::query("SELECT 1").fetch_one(&self.pool).await {
-            Ok(_) => Ok(true),
+        use oxisql_core::Connection;
+
+        // `ping()` is the `Connection` trait's own connectivity probe --
+        // `SELECT 1`, discarding the result -- the exact same check the
+        // pre-migration `sqlx::query("SELECT 1").fetch_one(&pool)` performed.
+        match self.conn.ping().await {
+            Ok(()) => Ok(true),
             Err(e) => {
                 warn!("PostgreSQL health check failed: {}", e);
                 Ok(false)

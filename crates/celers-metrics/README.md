@@ -1,6 +1,6 @@
 # celers-metrics
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13**
 
 Prometheus metrics integration for CeleRS distributed task queue monitoring. Comprehensive instrumentation with 25+ metrics for production observability.
 
@@ -14,7 +14,19 @@ Production-ready Prometheus metrics for monitoring:
 - ✅ **Connection Metrics**: Redis connection pooling and errors
 - ✅ **Memory Metrics**: Worker memory usage, result sizes
 - ✅ **Worker Metrics**: Active worker count
-- ✅ **Zero Overhead**: Fully optional via feature flag
+- ✅ **Native Histograms & Summaries** *(new in 0.3.0)*: dependency-free `NativeHistogram` /
+  `NativeSummary` with a self-implemented P² streaming quantile estimator (constant memory, no
+  external crate, no stored samples)
+- ✅ **StatsD Backend** *(new in 0.3.0)*: pure `std::net::UdpSocket` exporter (`StatsdExporter`)
+  with per-kind line formatting, DogStatsD tags, name sanitization, and packet batching
+- ✅ **SLA/SLO Tracking & Anomaly Detection** *(new in 0.3.0)*: stateful `SloTracker`
+  (error-budget burn rate, breach alerts, Google SRE model) and `AnomalyDetector` (online EWMA
+  mean/variance z-score)
+- ✅ **Task Lifecycle Audit Log** *(new in 0.3.0)*: `AuditSink` trait with ring-buffer and
+  JSONL-file implementations, tracking Sent/Received/Started/Succeeded/Failed/Retried/Revoked
+- ✅ **Zero Overhead**: Fully optional — downstream crates (`celers-worker`,
+  `celers-broker-redis`, `celers-examples`, ...) gate their use of this crate behind their own
+  `metrics` feature flag
 - ✅ **Thread-Safe**: Atomic operations for concurrent access
 
 ## Quick Start
@@ -192,6 +204,133 @@ rate(celers_oversized_results_total[5m])
 # Average result size
 rate(celers_task_result_size_bytes_sum[5m]) /
 rate(celers_task_result_size_bytes_count[5m])
+```
+
+## New in 0.3.0
+
+Four dependency-free additions shipped this release (see the `#### Metrics` section of
+[`CHANGELOG.md`](../../CHANGELOG.md) under `## [0.3.0]`). The snippets below are drawn directly
+from this crate's doctests (`cargo test --doc -p celers-metrics`).
+
+### Native Histograms & Summaries
+
+`NativeHistogram` and `NativeSummary` do not depend on the `prometheus` crate. Quantiles are
+estimated online with the P² (P-Square) algorithm — constant memory (5 markers per quantile), no
+samples stored.
+
+```rust
+use celers_metrics::NativeHistogram;
+
+let hist = NativeHistogram::new(
+    "request_latency_seconds",
+    "Request latency in seconds",
+    vec![0.1, 0.5, 1.0],
+)
+.expect("valid buckets");
+
+hist.observe(0.3);
+hist.observe(0.7);
+hist.observe(2.0);
+
+assert_eq!(hist.count(), 3);
+// 0.3 lands in the le="0.5" bucket; 0.7 in le="1.0"; 2.0 overflows to +Inf.
+assert_eq!(hist.cumulative_count(0.5), 1);
+assert_eq!(hist.cumulative_count(1.0), 2);
+```
+
+```rust
+use celers_metrics::NativeSummary;
+
+let summary = NativeSummary::new(
+    "request_latency_seconds",
+    "Request latency in seconds",
+    vec![0.5, 0.9, 0.99],
+)
+.expect("valid quantiles");
+
+for value in 1..=1000 {
+    summary.observe(f64::from(value));
+}
+
+assert_eq!(summary.count(), 1000);
+let p50 = summary.quantile(0.5).expect("p50 estimated");
+assert!((p50 - 500.0).abs() < 25.0, "p50 estimate was {p50}");
+```
+
+### StatsD Backend
+
+A pure-`std::net::UdpSocket` exporter — no external StatsD client dependency.
+
+```rust,no_run
+use celers_metrics::{StatsdExporter, StatsdMetric};
+
+let exporter = StatsdExporter::connect("127.0.0.1:8125")?;
+exporter.send(&StatsdMetric::counter("api.requests", 1.0))?;
+# Ok::<(), celers_metrics::StatsdError>(())
+```
+
+### SLA/SLO Tracking & Anomaly Detection
+
+`SloTracker` implements the Google SRE error-budget model over a rolling window (`SloWindow::Events`
+or `::Seconds`); `AnomalyDetector` flags statistical outliers with an online EWMA mean/variance
+z-score.
+
+```rust
+use celers_metrics::{Slo, SloKind, SloTracker, SloState};
+
+// 99% availability over a rolling window of the last 1000 events.
+let slo = Slo::availability("task-success", 0.99).with_event_window(1000);
+let mut tracker = SloTracker::new(slo);
+
+// 990 successes, 10 failures => exactly on budget (10 allowed).
+for _ in 0..990 { tracker.record_success(); }
+for _ in 0..10 { tracker.record_failure(); }
+
+let status = tracker.status();
+assert_eq!(status.attainment, 0.99);
+assert_eq!(status.budget.allowed, 10);
+assert_eq!(status.budget.consumed, 10);
+assert!(matches!(status.state, SloState::Exhausted | SloState::Breaching));
+```
+
+```rust
+use celers_metrics::{AnomalyDetector, AnomalyVerdict};
+
+// alpha 0.1, flag beyond 3 sigma, warm up over 20 samples.
+let mut detector = AnomalyDetector::new(0.1, 3.0, 20);
+
+// Feed in-distribution noise around 100.
+let noise = [100.0, 101.0, 99.0, 100.5, 99.5, 100.2, 99.8];
+for _ in 0..3 {
+    for &v in &noise {
+        detector.observe(v);
+    }
+}
+
+// A large spike is flagged as high.
+let verdict = detector.observe(180.0);
+assert!(matches!(verdict, AnomalyVerdict::High { .. }));
+```
+
+### Task Lifecycle Audit Log
+
+`AuditSink` implementations record Sent/Received/Started/Succeeded/Failed/Retried/Revoked events.
+`RingBufferAuditSink` is an in-memory bounded ring buffer; `JsonlAuditSink` is an append-only
+JSON-Lines file sink that tolerates malformed lines on reload.
+
+```rust
+use celers_metrics::{AuditEntry, AuditEventKind, AuditSink, RingBufferAuditSink};
+
+let sink = RingBufferAuditSink::new(128);
+sink.record(
+    AuditEntry::new("task-1", "send_email", AuditEventKind::Sent)
+        .with_worker("worker-a")
+        .with_metadata("queue", "default"),
+);
+sink.record(AuditEntry::new("task-1", "send_email", AuditEventKind::Succeeded));
+
+let history = sink.query_by_task_id("task-1");
+assert_eq!(history.len(), 2);
 ```
 
 ## Integration
@@ -504,7 +643,8 @@ celers_tasks_failed_total > 1000
 
 ## Testing
 
-**183 tests passing** (unit + doc tests)
+**319 unit/integration tests + 48 doc tests (367 total), all passing** — verified via
+`cargo nextest run -p celers-metrics --all-features` and `cargo test --doc -p celers-metrics --all-features`
 
 ```rust
 #[cfg(test)]
@@ -597,6 +737,44 @@ pub static ref BATCH_DEQUEUE_TOTAL: Counter
 // Memory metrics
 pub static ref WORKER_MEMORY_USAGE_BYTES: Gauge
 pub static ref OVERSIZED_RESULTS_TOTAL: Counter
+
+// --- New in 0.3.0 (dependency-free) ---
+
+// Native histograms & summaries (native_histogram.rs, summary.rs)
+pub struct NativeHistogram
+impl NativeHistogram { pub fn new(name: impl Into<String>, help: impl Into<String>, buckets: Vec<f64>) -> Result<Self, HistogramError> }
+pub struct NativeSummary
+impl NativeSummary { pub fn new(name: impl Into<String>, help: impl Into<String>, quantiles: Vec<f64>) -> Result<Self, SummaryError> }
+pub fn linear_buckets(start: f64, width: f64, count: usize) -> Result<Vec<f64>, HistogramError>
+pub fn exponential_buckets(start: f64, factor: f64, count: usize) -> Result<Vec<f64>, HistogramError>
+
+// StatsD backend (statsd.rs)
+pub struct StatsdExporter
+impl StatsdExporter { pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self, StatsdError> }
+pub struct StatsdMetric
+pub fn format_statsd_line(name: &str, value: f64, kind: StatsdMetricKind, sample_rate: Option<f64>, labels: &CustomLabels) -> String
+
+// SLA/SLO tracking (slo_tracker.rs)
+pub struct Slo
+impl Slo { pub fn availability(name: impl Into<String>, objective: f64) -> Self }
+pub struct SloTracker
+impl SloTracker { pub fn new(slo: Slo) -> Self }
+pub enum SloState // Warming | Healthy | AtRisk | Exhausted | Breaching
+
+// Anomaly detection (anomaly.rs)
+pub struct AnomalyDetector
+impl AnomalyDetector { pub fn new(alpha: f64, sigma_threshold: f64, warmup: usize) -> Self }
+pub enum AnomalyVerdict // Warmup | Normal | High | Low
+
+// Task lifecycle audit log (audit.rs)
+pub trait AuditSink
+pub struct RingBufferAuditSink
+impl RingBufferAuditSink { pub fn new(capacity: usize) -> Self }
+pub struct JsonlAuditSink
+impl JsonlAuditSink { pub fn new(path: impl Into<PathBuf>) -> Self }
+pub struct AuditEntry
+impl AuditEntry { pub fn new(task_id: impl Into<String>, task_name: impl Into<String>, event: AuditEventKind) -> Self }
+pub enum AuditEventKind // Sent | Received | Started | Succeeded | Failed | Retried | Revoked
 ```
 
 ## See Also

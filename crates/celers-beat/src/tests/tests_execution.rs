@@ -1509,7 +1509,7 @@ fn test_failure_notification_callback() {
     scheduler.on_failure(Arc::new(move |task_name, error| {
         invocations_clone
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push((task_name.to_string(), error.to_string()));
     }));
 
@@ -1519,7 +1519,7 @@ fn test_failure_notification_callback() {
         .unwrap();
 
     // Verify callback was invoked
-    let invocations = invocations.lock().unwrap();
+    let invocations = invocations.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(invocations.len(), 1);
     assert_eq!(invocations[0].0, "test_task");
     assert_eq!(invocations[0].1, "Test error");
@@ -1542,11 +1542,11 @@ fn test_failure_notification_multiple_callbacks() {
 
     // Register two callbacks
     scheduler.on_failure(Arc::new(move |_, _| {
-        *inv1_clone.lock().unwrap() += 1;
+        *inv1_clone.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }));
 
     scheduler.on_failure(Arc::new(move |_, _| {
-        *inv2_clone.lock().unwrap() += 1;
+        *inv2_clone.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }));
 
     // Trigger failure
@@ -1555,8 +1555,8 @@ fn test_failure_notification_multiple_callbacks() {
         .unwrap();
 
     // Verify both callbacks were invoked
-    assert_eq!(*invocations1.lock().unwrap(), 1);
-    assert_eq!(*invocations2.lock().unwrap(), 1);
+    assert_eq!(*invocations1.lock().unwrap_or_else(|e| e.into_inner()), 1);
+    assert_eq!(*invocations2.lock().unwrap_or_else(|e| e.into_inner()), 1);
 }
 
 #[test]
@@ -1573,7 +1573,7 @@ fn test_failure_notification_clear_callbacks() {
 
     // Register callback
     scheduler.on_failure(Arc::new(move |_, _| {
-        *inv_clone.lock().unwrap() += 1;
+        *inv_clone.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     }));
 
     // Clear callbacks
@@ -1585,7 +1585,7 @@ fn test_failure_notification_clear_callbacks() {
         .unwrap();
 
     // Verify callback was NOT invoked
-    assert_eq!(*invocations.lock().unwrap(), 0);
+    assert_eq!(*invocations.lock().unwrap_or_else(|e| e.into_inner()), 0);
 }
 
 #[test]
@@ -1604,7 +1604,7 @@ fn test_failure_notification_with_start_time() {
     scheduler.on_failure(Arc::new(move |task_name, error| {
         invocations_clone
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push((task_name.to_string(), error.to_string()));
     }));
 
@@ -1615,7 +1615,7 @@ fn test_failure_notification_with_start_time() {
         .unwrap();
 
     // Verify callback was invoked
-    let invocations = invocations.lock().unwrap();
+    let invocations = invocations.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(invocations.len(), 1);
     assert_eq!(invocations[0].0, "test_task");
     assert_eq!(invocations[0].1, "Test error");
@@ -1637,7 +1637,7 @@ fn test_failure_notification_multiple_failures() {
     scheduler.on_failure(Arc::new(move |task_name, error| {
         invocations_clone
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push((task_name.to_string(), error.to_string()));
     }));
 
@@ -1653,7 +1653,7 @@ fn test_failure_notification_multiple_failures() {
         .unwrap();
 
     // Verify callback was invoked three times
-    let invocations = invocations.lock().unwrap();
+    let invocations = invocations.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(invocations.len(), 3);
     assert_eq!(invocations[0].1, "Error 1");
     assert_eq!(invocations[1].1, "Error 2");

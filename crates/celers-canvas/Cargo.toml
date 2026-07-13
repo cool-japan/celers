@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Workflow primitives for CeleRS (Chain, Chord, Group, Map)"
+readme = "README.md"
 keywords = ["celery", "workflow", "canvas", "chain", "chord"]
 categories = ["asynchronous", "concurrency"]
 
@@ -21,10 +22,9 @@ uuid = { workspace = true }
 chrono = { workspace = true, optional = true }
 
 # Core dependencies
-celers-core = { path = "../celers-core", version = "0.2.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
-celers-kombu = { path = "../celers-kombu", version = "0.2.0" }
-celers-backend-redis = { path = "../celers-backend-redis", version = "0.2.0", optional = true }
+celers-core = { workspace = true }
+celers-protocol = { workspace = true }
+celers-backend-redis = { workspace = true, optional = true }
 
 [features]
 default = []

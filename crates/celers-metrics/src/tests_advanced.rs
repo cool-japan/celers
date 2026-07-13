@@ -1661,7 +1661,7 @@ fn test_capacity_prediction_growing() {
     // Simulate growing queue with explicit timestamps
     let base_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime should be after UNIX_EPOCH")
         .as_secs();
     let samples: Vec<(u64, f64)> = (0..50)
         .map(|i| (base_time + i as u64, (i * 10) as f64))
@@ -1697,7 +1697,7 @@ fn test_capacity_prediction_decreasing() {
     // Simulate decreasing usage with explicit timestamps
     let base_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime should be after UNIX_EPOCH")
         .as_secs();
     let samples: Vec<(u64, f64)> = (0..50)
         .map(|i| (base_time + i as u64, (50 - i) as f64))

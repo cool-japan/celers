@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "gRPC/RPC result backend for CeleRS"
+readme = "README.md"
 keywords = ["celery", "grpc", "rpc", "backend", "microservices"]
 categories = ["asynchronous", "network-programming", "web-programming"]
 
@@ -26,14 +27,13 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 
 # Core protocol
-celers-core = { path = "../celers-core", version = "0.2.0" }
-celers-protocol = { path = "../celers-protocol", version = "0.2.0" }
+celers-core = { workspace = true }
+celers-protocol = { workspace = true }
 
 # Re-export types from backend-redis for trait compatibility
-celers-backend-redis = { path = "../celers-backend-redis", version = "0.2.0" }
+celers-backend-redis = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
-tokio-test = { workspace = true }

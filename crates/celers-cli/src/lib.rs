@@ -23,12 +23,21 @@
 //! - `worker_management.rs` - Worker lifecycle management
 //! - `task_and_dlq_management.rs` - Task and DLQ operations
 
+pub mod aliases;
 pub mod backup;
+pub mod cache;
 pub mod command_utils;
 pub mod commands;
 pub mod config;
-pub mod database;
+pub mod config_layer;
+pub mod errors;
 pub mod interactive;
+pub mod logging;
+pub mod pool;
+pub mod row_ext;
+pub mod smart_defaults;
+pub mod tls_mode;
 
 // Re-export commonly used items
 pub use config::Config;
+pub use config_layer::{CliConfigArgs, ReloadableConfig};

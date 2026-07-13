@@ -4,13 +4,16 @@
 //! and core enqueue/dequeue/ack/reject operations.
 
 use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerStateInternal};
+use crate::row_ext::RowExt;
+use crate::tls_mode;
 use crate::types::*;
 use crate::workflow::TaskHooks;
 use celers_core::{BrokerMessage, CelersError, Result, SerializedTask, TaskId};
 use chrono::Utc;
+use oxisql_core::Connection;
+use oxisql_mysql::MyConnection;
 use serde_json::json;
-use sqlx::{mysql::MySqlPoolOptions, MySqlPool, Row};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
@@ -20,9 +23,33 @@ use celers_metrics::{TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL};
 
 /// MySQL-based broker implementation using SKIP LOCKED
 pub struct MysqlBroker {
-    pub(crate) pool: MySqlPool,
+    pub(crate) conn: MyConnection,
+    /// The configured maximum connection-pool size this broker was
+    /// constructed with (via [`PoolConfig::max_connections`]).
+    ///
+    /// `oxisql_mysql::MyConnection` does not expose a pool-introspection API
+    /// (no `num_idle`/`size`/`options()` equivalent to `sqlx::MySqlPool`'s —
+    /// confirmed by reading `oxisql-mysql` 0.3.2's `connection.rs` in full:
+    /// the only pool-shaped knobs live on `MyConnectionBuilder`, which are
+    /// write-only at connect time), so the diagnostics methods below
+    /// (`get_connection_diagnostics`, `get_pool_health`) report this
+    /// configured ceiling rather than a live idle/active connection count.
+    pub(crate) configured_max_connections: u32,
+    /// Logical queue label for multi-tenancy.
+    ///
+    /// This is stored as a JSON label inside task metadata at enqueue time,
+    /// NOT as a real column on the tasks table, and NOT as a table name.
+    ///
+    /// The core enqueue/dequeue spine correctly treats this as a metadata
+    /// label. Peripheral functions in this crate have NOT been exhaustively
+    /// audited yet for the same queue_name-as-column / queue_name-as-table-name
+    /// drift pattern found and partially tracked in the Postgres broker
+    /// (`celers-broker-postgres`). See `TODO.md` for known specific issues
+    /// and the outstanding audit item.
     pub(crate) queue_name: String,
     pub(crate) paused: AtomicBool,
+    pub(crate) enqueue_count: AtomicU64,
+    pub(crate) enqueue_window_start_ms: AtomicI64,
     pub(crate) circuit_breaker: Arc<RwLock<CircuitBreakerStateInternal>>,
     pub(crate) hooks: Arc<tokio::sync::RwLock<TaskHooks>>,
 }
@@ -43,33 +70,38 @@ impl MysqlBroker {
     }
 
     /// Create a new MySQL broker with custom connection pool configuration
+    ///
+    /// Note: `oxisql_mysql::MyConnection::connect` does not currently accept
+    /// per-call pool-sizing overrides the way `sqlx::MySqlPoolOptions` did
+    /// (see the `configured_max_connections` field doc for why). `config` is
+    /// still accepted (and `config.max_connections` recorded for diagnostics
+    /// reporting) for source compatibility, but its `min_connections`,
+    /// `acquire_timeout_secs`, `max_lifetime_secs`, and `idle_timeout_secs`
+    /// knobs are not wired through to the underlying pool post-migration.
     pub async fn with_config(
         database_url: &str,
         queue_name: &str,
         config: PoolConfig,
     ) -> Result<Self> {
-        let mut pool_options = MySqlPoolOptions::new()
-            .max_connections(config.max_connections)
-            .min_connections(config.min_connections)
-            .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs));
-
-        if let Some(max_lifetime) = config.max_lifetime_secs {
-            pool_options = pool_options.max_lifetime(Duration::from_secs(max_lifetime));
-        }
-
-        if let Some(idle_timeout) = config.idle_timeout_secs {
-            pool_options = pool_options.idle_timeout(Duration::from_secs(idle_timeout));
-        }
-
-        let pool = pool_options
-            .connect(database_url)
+        // TLS mode is derived from `database_url`'s `ssl-mode`/`tls` query
+        // parameters (see `tls_mode.rs`): a URL with `ssl-mode=required` (or
+        // `tls=true`) gets a real TLS connection, matching the
+        // pre-`oxisql`-migration `sqlx` behavior. Absent/`ssl-mode=disabled`
+        // still resolves to `TlsMode::Disabled`, so plain-text callers are
+        // unaffected.
+        let tls = tls_mode::mysql_tls_mode_for_url(database_url)
+            .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {e}")))?;
+        let conn = MyConnection::connect(database_url, tls)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
 
         Ok(Self {
-            pool,
+            conn,
+            configured_max_connections: config.max_connections,
             queue_name: queue_name.to_string(),
             paused: AtomicBool::new(false),
+            enqueue_count: AtomicU64::new(0),
+            enqueue_window_start_ms: AtomicI64::new(chrono::Utc::now().timestamp_millis()),
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerStateInternal::new(
                 CircuitBreakerConfig::default(),
             ))),
@@ -84,28 +116,19 @@ impl MysqlBroker {
         pool_config: PoolConfig,
         circuit_breaker_config: CircuitBreakerConfig,
     ) -> Result<Self> {
-        let mut pool_options = MySqlPoolOptions::new()
-            .max_connections(pool_config.max_connections)
-            .min_connections(pool_config.min_connections)
-            .acquire_timeout(Duration::from_secs(pool_config.acquire_timeout_secs));
-
-        if let Some(max_lifetime) = pool_config.max_lifetime_secs {
-            pool_options = pool_options.max_lifetime(Duration::from_secs(max_lifetime));
-        }
-
-        if let Some(idle_timeout) = pool_config.idle_timeout_secs {
-            pool_options = pool_options.idle_timeout(Duration::from_secs(idle_timeout));
-        }
-
-        let pool = pool_options
-            .connect(database_url)
+        let tls = tls_mode::mysql_tls_mode_for_url(database_url)
+            .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {e}")))?;
+        let conn = MyConnection::connect(database_url, tls)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
 
         Ok(Self {
-            pool,
+            conn,
+            configured_max_connections: pool_config.max_connections,
             queue_name: queue_name.to_string(),
             paused: AtomicBool::new(false),
+            enqueue_count: AtomicU64::new(0),
+            enqueue_window_start_ms: AtomicI64::new(chrono::Utc::now().timestamp_millis()),
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerStateInternal::new(
                 circuit_breaker_config,
             ))),
@@ -167,24 +190,32 @@ impl MysqlBroker {
 
     /// Check if a migration has been applied
     async fn is_migration_applied(&self, version: &str) -> Result<bool> {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM celers_migrations WHERE version = ?")
-                .bind(version)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| {
-                    CelersError::Other(format!("Failed to check migration status: {}", e))
-                })?;
+        let rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) AS c FROM celers_migrations WHERE version = ?",
+                &[&version],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to check migration status: {}", e)))?;
+
+        let count: i64 = rows
+            .first()
+            .map(|row| row.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to check migration status: {e}")))?
+            .unwrap_or(0);
 
         Ok(count > 0)
     }
 
     /// Mark a migration as applied
     async fn mark_migration_applied(&self, version: &str, name: &str) -> Result<()> {
-        sqlx::query("INSERT INTO celers_migrations (version, name) VALUES (?, ?)")
-            .bind(version)
-            .bind(name)
-            .execute(&self.pool)
+        self.conn
+            .execute(
+                "INSERT INTO celers_migrations (version, name) VALUES (?, ?)",
+                &[&version, &name],
+            )
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to mark migration as applied: {}", e))
@@ -222,9 +253,22 @@ impl MysqlBroker {
     }
 
     /// Run a single migration file
+    ///
+    /// MySQL's `COM_STMT_EXECUTE` (extended/prepared-statement) protocol —
+    /// which `oxisql_mysql::MyConnection::execute`/`query` always use —
+    /// rejects multi-statement text, and a stored-procedure body itself
+    /// contains internal `;`-separated statements that must not be split.
+    /// This mirrors the pre-migration `sqlx` approach exactly (see the
+    /// already-completed `celers-backend-db::MysqlResultBackend::migrate`
+    /// for the identical, proven shape): split on the literal `DELIMITER //`
+    /// / `DELIMITER ;` markers first, then split the *non-procedure* section
+    /// on `;` and execute each statement individually. Deliberately does
+    /// NOT use `Connection::execute_batch` here — `execute_batch`'s own
+    /// naive `;` split (see its doc comment in `oxisql-core`) would itself
+    /// break on a stored procedure body containing internal semicolons,
+    /// which is exactly the hazard this hand-rolled DELIMITER-aware split
+    /// exists to avoid.
     async fn run_migration(&self, migration_sql: &str) -> Result<()> {
-        // MySQL doesn't support multi-statement execution by default in sqlx
-        // We need to split and execute each statement separately
         let statements: Vec<&str> = migration_sql.split("DELIMITER //").collect();
 
         // Execute the main DDL statements (before DELIMITER)
@@ -232,8 +276,8 @@ impl MysqlBroker {
             for statement in main_sql.split(';') {
                 let trimmed = statement.trim();
                 if !trimmed.is_empty() && !trimmed.starts_with("--") {
-                    sqlx::query(trimmed)
-                        .execute(&self.pool)
+                    self.conn
+                        .execute(trimmed, &[])
                         .await
                         .map_err(|e| CelersError::Other(format!("Migration failed: {}", e)))?;
                 }
@@ -246,12 +290,9 @@ impl MysqlBroker {
             if let Some(proc_sql) = proc_section.split("DELIMITER ;").next() {
                 let trimmed = proc_sql.trim();
                 if !trimmed.is_empty() {
-                    sqlx::query(trimmed)
-                        .execute(&self.pool)
-                        .await
-                        .map_err(|e| {
-                            CelersError::Other(format!("Stored procedure creation failed: {}", e))
-                        })?;
+                    self.conn.execute(trimmed, &[]).await.map_err(|e| {
+                        CelersError::Other(format!("Stored procedure creation failed: {}", e))
+                    })?;
                 }
             }
         }
@@ -259,16 +300,22 @@ impl MysqlBroker {
         Ok(())
     }
 
-    /// Get the underlying connection pool
-    pub fn pool(&self) -> &MySqlPool {
-        &self.pool
+    /// Get the underlying connection
+    ///
+    /// `MyConnection` is `Clone` and internally pool-backed by
+    /// `mysql_async::Pool` (each `execute`/`query` call transparently checks
+    /// out and returns a connection from that pool) — unlike
+    /// `celers-broker-postgres`'s single-connection `PgConnection`, so this
+    /// is a direct field accessor with no shared-single-connection
+    /// concurrency caveat.
+    pub fn connection(&self) -> &MyConnection {
+        &self.conn
     }
 
     /// Move a task to the Dead Letter Queue
     pub(crate) async fn move_to_dlq(&self, task_id: &TaskId) -> Result<()> {
-        sqlx::query("CALL move_to_dlq(?)")
-            .bind(task_id.to_string())
-            .execute(&self.pool)
+        self.conn
+            .execute("CALL move_to_dlq(?)", &[&task_id.to_string()])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to move task to DLQ: {}", e)))?;
 
@@ -298,37 +345,62 @@ impl MysqlBroker {
 
     /// Get detailed information about a specific task
     pub async fn get_task(&self, task_id: &TaskId) -> Result<Option<TaskInfo>> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, task_name, state, priority, retry_count, max_retries,
-                   created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-            FROM celers_tasks
-            WHERE id = ?
-            "#,
-        )
-        .bind(task_id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT id, task_name, state, priority, retry_count, max_retries,
+                       created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                FROM celers_tasks
+                WHERE id = ?
+                "#,
+                &[&task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get task: {}", e)))?;
 
-        match row {
+        match rows.into_iter().next() {
             Some(row) => {
-                let task_id_str: String = row.get("id");
-                let state_str: String = row.get("state");
+                let task_id_str: String = row
+                    .col("id")
+                    .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?;
+                let state_str: String = row
+                    .col("state")
+                    .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?;
                 Ok(Some(TaskInfo {
                     id: Uuid::parse_str(&task_id_str)
                         .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
-                    task_name: row.get("task_name"),
+                    task_name: row
+                        .col("task_name")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
                     state: state_str.parse()?,
-                    priority: row.get("priority"),
-                    retry_count: row.get("retry_count"),
-                    max_retries: row.get("max_retries"),
-                    created_at: row.get("created_at"),
-                    scheduled_at: row.get("scheduled_at"),
-                    started_at: row.get("started_at"),
-                    completed_at: row.get("completed_at"),
-                    worker_id: row.get("worker_id"),
-                    error_message: row.get("error_message"),
+                    priority: row
+                        .col("priority")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
+                    retry_count: row
+                        .col("retry_count")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
+                    max_retries: row
+                        .col("max_retries")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
+                    created_at: row
+                        .col("created_at")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
+                    scheduled_at: row
+                        .col("scheduled_at")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
+                    started_at: row
+                        .col("started_at")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
+                    completed_at: row
+                        .col("completed_at")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
+                    worker_id: row
+                        .col("worker_id")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
+                    error_message: row
+                        .col("error_message")
+                        .map_err(|e| CelersError::Other(format!("Failed to get task: {e}")))?,
                 }))
             }
             None => Ok(None),
@@ -344,58 +416,79 @@ impl MysqlBroker {
     ) -> Result<Vec<TaskInfo>> {
         let rows = match state {
             Some(s) => {
-                sqlx::query(
-                    r#"
-                    SELECT id, task_name, state, priority, retry_count, max_retries,
-                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-                    FROM celers_tasks
-                    WHERE state = ?
-                    ORDER BY created_at DESC
-                    LIMIT ? OFFSET ?
-                    "#,
-                )
-                .bind(s.to_string())
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
+                self.conn
+                    .query(
+                        r#"
+                        SELECT id, task_name, state, priority, retry_count, max_retries,
+                               created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                        FROM celers_tasks
+                        WHERE state = ?
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        "#,
+                        &[&s.to_string(), &limit, &offset],
+                    )
+                    .await
             }
             None => {
-                sqlx::query(
-                    r#"
-                    SELECT id, task_name, state, priority, retry_count, max_retries,
-                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-                    FROM celers_tasks
-                    ORDER BY created_at DESC
-                    LIMIT ? OFFSET ?
-                    "#,
-                )
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
+                self.conn
+                    .query(
+                        r#"
+                        SELECT id, task_name, state, priority, retry_count, max_retries,
+                               created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                        FROM celers_tasks
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        "#,
+                        &[&limit, &offset],
+                    )
+                    .await
             }
         }
         .map_err(|e| CelersError::Other(format!("Failed to list tasks: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
-            let task_id_str: String = row.get("id");
-            let state_str: String = row.get("state");
+            let task_id_str: String = row
+                .col("id")
+                .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?;
+            let state_str: String = row
+                .col("state")
+                .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?;
             tasks.push(TaskInfo {
                 id: Uuid::parse_str(&task_id_str)
                     .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
-                task_name: row.get("task_name"),
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
                 state: state_str.parse()?,
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
+                priority: row
+                    .col("priority")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
+                retry_count: row
+                    .col("retry_count")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
+                max_retries: row
+                    .col("max_retries")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
+                created_at: row
+                    .col("created_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
+                scheduled_at: row
+                    .col("scheduled_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
+                started_at: row
+                    .col("started_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
+                completed_at: row
+                    .col("completed_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
+                worker_id: row
+                    .col("worker_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
+                error_message: row
+                    .col("error_message")
+                    .map_err(|e| CelersError::Other(format!("Failed to list tasks: {e}")))?,
             });
         }
         Ok(tasks)
@@ -404,51 +497,70 @@ impl MysqlBroker {
     /// Get queue statistics
     pub async fn get_statistics(&self) -> Result<QueueStatistics> {
         // MySQL doesn't have FILTER clause, so we use CASE WHEN
-        let row = sqlx::query(
-            r#"
-            SELECT
-                SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as processing,
-                SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN state = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
-                COUNT(*) as total
-            FROM celers_tasks
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get statistics: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT
+                    SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as processing,
+                    SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed,
+                    SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed,
+                    SUM(CASE WHEN state = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
+                    COUNT(*) as total
+                FROM celers_tasks
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get statistics: {}", e)))?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| CelersError::Other("get_statistics: query returned no rows".into()))?;
 
-        let dlq_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_dead_letter_queue")
-            .fetch_one(&self.pool)
+        let dlq_rows = self
+            .conn
+            .query("SELECT COUNT(*) AS c FROM celers_dead_letter_queue", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {}", e)))?;
+        let dlq_count: i64 = dlq_rows
+            .first()
+            .map(|r| r.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {e}")))?
+            .unwrap_or(0);
 
-        // MySQL returns DECIMAL for SUM, need to handle potential NULL
-        let pending: Option<rust_decimal::Decimal> = row.get("pending");
-        let processing: Option<rust_decimal::Decimal> = row.get("processing");
-        let completed: Option<rust_decimal::Decimal> = row.get("completed");
-        let failed: Option<rust_decimal::Decimal> = row.get("failed");
-        let cancelled: Option<rust_decimal::Decimal> = row.get("cancelled");
-        let total: i64 = row.get("total");
+        // MySQL returns DECIMAL for SUM, decoded here as a decimal-text
+        // string (see `row_ext.rs`: `Value::Decimal` is transparently
+        // accepted by `FromValue for Option<String>`) and parsed the same
+        // way the pre-migration `rust_decimal::Decimal::to_string().parse()`
+        // round-trip did.
+        let pending: Option<String> = row
+            .col("pending")
+            .map_err(|e| CelersError::Other(format!("Failed to get statistics: {e}")))?;
+        let processing: Option<String> = row
+            .col("processing")
+            .map_err(|e| CelersError::Other(format!("Failed to get statistics: {e}")))?;
+        let completed: Option<String> = row
+            .col("completed")
+            .map_err(|e| CelersError::Other(format!("Failed to get statistics: {e}")))?;
+        let failed: Option<String> = row
+            .col("failed")
+            .map_err(|e| CelersError::Other(format!("Failed to get statistics: {e}")))?;
+        let cancelled: Option<String> = row
+            .col("cancelled")
+            .map_err(|e| CelersError::Other(format!("Failed to get statistics: {e}")))?;
+        let total: i64 = row
+            .col("total")
+            .map_err(|e| CelersError::Other(format!("Failed to get statistics: {e}")))?;
 
         Ok(QueueStatistics {
-            pending: pending
-                .map(|d| d.to_string().parse().unwrap_or(0))
-                .unwrap_or(0),
-            processing: processing
-                .map(|d| d.to_string().parse().unwrap_or(0))
-                .unwrap_or(0),
-            completed: completed
-                .map(|d| d.to_string().parse().unwrap_or(0))
-                .unwrap_or(0),
-            failed: failed
-                .map(|d| d.to_string().parse().unwrap_or(0))
-                .unwrap_or(0),
-            cancelled: cancelled
-                .map(|d| d.to_string().parse().unwrap_or(0))
-                .unwrap_or(0),
+            pending: pending.and_then(|d| d.parse().ok()).unwrap_or(0),
+            processing: processing.and_then(|d| d.parse().ok()).unwrap_or(0),
+            completed: completed.and_then(|d| d.parse().ok()).unwrap_or(0),
+            failed: failed.and_then(|d| d.parse().ok()).unwrap_or(0),
+            cancelled: cancelled.and_then(|d| d.parse().ok()).unwrap_or(0),
             dlq: dlq_count,
             total,
         })
@@ -458,33 +570,45 @@ impl MysqlBroker {
 
     /// List tasks in the dead letter queue
     pub async fn list_dlq(&self, limit: i64, offset: i64) -> Result<Vec<DlqTaskInfo>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, task_id, task_name, retry_count, error_message, failed_at
-            FROM celers_dead_letter_queue
-            ORDER BY failed_at DESC
-            LIMIT ? OFFSET ?
-            "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT id, task_id, task_name, retry_count, error_message, failed_at
+                FROM celers_dead_letter_queue
+                ORDER BY failed_at DESC
+                LIMIT ? OFFSET ?
+                "#,
+                &[&limit, &offset],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
-            let id_str: String = row.get("id");
-            let task_id_str: String = row.get("task_id");
+            let id_str: String = row
+                .col("id")
+                .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {e}")))?;
+            let task_id_str: String = row
+                .col("task_id")
+                .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {e}")))?;
             tasks.push(DlqTaskInfo {
                 id: Uuid::parse_str(&id_str)
                     .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
                 task_id: Uuid::parse_str(&task_id_str)
                     .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
-                task_name: row.get("task_name"),
-                retry_count: row.get("retry_count"),
-                error_message: row.get("error_message"),
-                failed_at: row.get("failed_at"),
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {e}")))?,
+                retry_count: row
+                    .col("retry_count")
+                    .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {e}")))?,
+                error_message: row
+                    .col("error_message")
+                    .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {e}")))?,
+                failed_at: row
+                    .col("failed_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {e}")))?,
             });
         }
         Ok(tasks)
@@ -495,56 +619,64 @@ impl MysqlBroker {
     /// This moves the task back to the main queue with reset retry count.
     pub async fn requeue_from_dlq(&self, dlq_id: &Uuid) -> Result<TaskId> {
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
         // Get task from DLQ
-        let row = sqlx::query(
-            r#"
-            SELECT task_id, task_name, payload, metadata
-            FROM celers_dead_letter_queue
-            WHERE id = ?
-            "#,
-        )
-        .bind(dlq_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {}", e)))?;
+        let rows = tx
+            .query(
+                r#"
+                SELECT task_id, task_name, payload, metadata
+                FROM celers_dead_letter_queue
+                WHERE id = ?
+                "#,
+                &[&dlq_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {}", e)))?;
 
-        let row = row.ok_or_else(|| CelersError::Other("DLQ task not found".to_string()))?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| CelersError::Other("DLQ task not found".to_string()))?;
 
-        let task_id_str: String = row.get("task_id");
+        let task_id_str: String = row
+            .col("task_id")
+            .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {e}")))?;
         let task_id = Uuid::parse_str(&task_id_str)
             .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
-        let task_name: String = row.get("task_name");
-        let payload: Vec<u8> = row.get("payload");
-        let metadata: Option<String> = row.get("metadata");
+        let task_name: String = row
+            .col("task_name")
+            .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {e}")))?;
+        let payload: Vec<u8> = row
+            .col("payload")
+            .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {e}")))?;
+        let metadata: Option<String> = row
+            .col("metadata")
+            .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {e}")))?;
 
         // Create new task in main queue
         let new_task_id = Uuid::new_v4();
-        sqlx::query(
+        tx.execute(
             r#"
             INSERT INTO celers_tasks
                 (id, task_name, payload, state, priority, retry_count, max_retries, metadata, created_at, scheduled_at)
             VALUES (?, ?, ?, 'pending', 0, 0, 3, ?, NOW(), NOW())
             "#,
+            &[&new_task_id.to_string(), &task_name, &payload, &metadata],
         )
-        .bind(new_task_id.to_string())
-        .bind(&task_name)
-        .bind(&payload)
-        .bind(metadata)
-        .execute(&mut *tx)
         .await
         .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
 
         // Delete from DLQ
-        sqlx::query("DELETE FROM celers_dead_letter_queue WHERE id = ?")
-            .bind(dlq_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to delete from DLQ: {}", e)))?;
+        tx.execute(
+            "DELETE FROM celers_dead_letter_queue WHERE id = ?",
+            &[&dlq_id.to_string()],
+        )
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to delete from DLQ: {}", e)))?;
 
         tx.commit()
             .await
@@ -557,24 +689,28 @@ impl MysqlBroker {
 
     /// Purge (delete) a task from the dead letter queue
     pub async fn purge_dlq(&self, dlq_id: &Uuid) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM celers_dead_letter_queue WHERE id = ?")
-            .bind(dlq_id.to_string())
-            .execute(&self.pool)
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM celers_dead_letter_queue WHERE id = ?",
+                &[&dlq_id.to_string()],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge DLQ task: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Purge all tasks from the dead letter queue
     pub async fn purge_all_dlq(&self) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM celers_dead_letter_queue")
-            .execute(&self.pool)
+        let affected = self
+            .conn
+            .execute("DELETE FROM celers_dead_letter_queue", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge all DLQ: {}", e)))?;
 
-        tracing::info!(count = result.rows_affected(), "Purged all DLQ tasks");
-        Ok(result.rows_affected())
+        tracing::info!(count = affected, "Purged all DLQ tasks");
+        Ok(affected)
     }
 
     // ========== Health & Maintenance ==========
@@ -582,18 +718,25 @@ impl MysqlBroker {
     /// Check database health
     pub async fn check_health(&self) -> Result<HealthStatus> {
         // Test connection and get MySQL version
-        let version: String = sqlx::query_scalar("SELECT VERSION()")
-            .fetch_one(&self.pool)
+        let rows = self
+            .conn
+            .query("SELECT VERSION() AS v", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Health check failed: {}", e)))?;
+        let version: String = rows
+            .first()
+            .map(|r| r.col("v"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Health check failed: {e}")))?
+            .ok_or_else(|| CelersError::Other("Health check failed: no rows returned".into()))?;
 
         // Get queue counts
         let stats = self.get_statistics().await?;
 
         Ok(HealthStatus {
             healthy: true,
-            connection_pool_size: self.pool.options().get_max_connections(),
-            idle_connections: self.pool.num_idle() as u32,
+            connection_pool_size: self.configured_max_connections,
+            idle_connections: 0,
             pending_tasks: stats.pending,
             processing_tasks: stats.processing,
             dlq_tasks: stats.dlq,
@@ -606,22 +749,26 @@ impl MysqlBroker {
     /// Returns the number of tasks archived (deleted).
     pub async fn archive_completed_tasks(&self, older_than: Duration) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::seconds(older_than.as_secs() as i64);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        // MySQL DATETIME/TIMESTAMP parameter convention — see `row_ext.rs`'s
+        // "DateTime<Utc> parameter convention (MySQL)" section: bind
+        // `.format("%Y-%m-%d %H:%M:%S%.6f")`, never `.to_rfc3339()`.
+        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
 
-        let result = sqlx::query(
-            r#"
-            DELETE FROM celers_tasks
-            WHERE state IN ('completed', 'failed', 'cancelled')
-              AND completed_at < ?
-            "#,
-        )
-        .bind(cutoff_str)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to archive tasks: {}", e)))?;
+        let affected = self
+            .conn
+            .execute(
+                r#"
+                DELETE FROM celers_tasks
+                WHERE state IN ('completed', 'failed', 'cancelled')
+                  AND completed_at < ?
+                "#,
+                &[&cutoff_str],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to archive tasks: {}", e)))?;
 
-        tracing::info!(count = result.rows_affected(), cutoff = %cutoff, "Archived completed tasks");
-        Ok(result.rows_affected())
+        tracing::info!(count = affected, cutoff = %cutoff, "Archived completed tasks");
+        Ok(affected)
     }
 
     /// Clean up stuck processing tasks (tasks that have been processing too long)
@@ -629,42 +776,41 @@ impl MysqlBroker {
     /// This can happen if a worker crashes. Tasks are requeued with incremented retry count.
     pub async fn recover_stuck_tasks(&self, stuck_threshold: Duration) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::seconds(stuck_threshold.as_secs() as i64);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
 
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'pending',
-                started_at = NULL,
-                worker_id = NULL,
-                error_message = 'Recovered from stuck processing state'
-            WHERE state = 'processing'
-              AND started_at < ?
-            "#,
-        )
-        .bind(cutoff_str)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to recover stuck tasks: {}", e)))?;
+        let affected = self
+            .conn
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'pending',
+                    started_at = NULL,
+                    worker_id = NULL,
+                    error_message = 'Recovered from stuck processing state'
+                WHERE state = 'processing'
+                  AND started_at < ?
+                "#,
+                &[&cutoff_str],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to recover stuck tasks: {}", e)))?;
 
-        if result.rows_affected() > 0 {
-            tracing::warn!(
-                count = result.rows_affected(),
-                "Recovered stuck processing tasks"
-            );
+        if affected > 0 {
+            tracing::warn!(count = affected, "Recovered stuck processing tasks");
         }
-        Ok(result.rows_affected())
+        Ok(affected)
     }
 
     /// Purge all tasks (dangerous - use with caution)
     pub async fn purge_all(&self) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM celers_tasks")
-            .execute(&self.pool)
+        let affected = self
+            .conn
+            .execute("DELETE FROM celers_tasks", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge all tasks: {}", e)))?;
 
-        tracing::warn!(count = result.rows_affected(), "Purged all tasks");
-        Ok(result.rows_affected())
+        tracing::warn!(count = affected, "Purged all tasks");
+        Ok(affected)
     }
 
     // ========== Task Result Storage ==========
@@ -685,72 +831,96 @@ impl MysqlBroker {
     ) -> Result<()> {
         let completed_at = match status {
             TaskResultStatus::Success | TaskResultStatus::Failure | TaskResultStatus::Revoked => {
-                Some(Utc::now().format("%Y-%m-%d %H:%M:%S").to_string())
+                Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
             }
             _ => None,
         };
+        let result_str =
+            result.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string()));
+        let status_str = status.to_string();
 
         // MySQL uses INSERT ... ON DUPLICATE KEY UPDATE instead of ON CONFLICT
-        sqlx::query(
-            r#"
-            INSERT INTO celers_task_results
-                (task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms)
-            VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?)
-            ON DUPLICATE KEY UPDATE
-                status = VALUES(status),
-                result = VALUES(result),
-                error = VALUES(error),
-                traceback = VALUES(traceback),
-                completed_at = VALUES(completed_at),
-                runtime_ms = VALUES(runtime_ms)
-            "#,
-        )
-        .bind(task_id.to_string())
-        .bind(task_name)
-        .bind(status.to_string())
-        .bind(result.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string())))
-        .bind(error)
-        .bind(traceback)
-        .bind(completed_at)
-        .bind(runtime_ms)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to store result: {}", e)))?;
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO celers_task_results
+                    (task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms)
+                VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    status = VALUES(status),
+                    result = VALUES(result),
+                    error = VALUES(error),
+                    traceback = VALUES(traceback),
+                    completed_at = VALUES(completed_at),
+                    runtime_ms = VALUES(runtime_ms)
+                "#,
+                &[
+                    &task_id.to_string(),
+                    &task_name,
+                    &status_str,
+                    &result_str,
+                    &error,
+                    &traceback,
+                    &completed_at,
+                    &runtime_ms,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to store result: {}", e)))?;
 
         Ok(())
     }
 
     /// Get a task result from the database
     pub async fn get_result(&self, task_id: &TaskId) -> Result<Option<TaskResult>> {
-        let row = sqlx::query(
-            r#"
-            SELECT task_id, task_name, status, result, error, traceback,
-                   created_at, completed_at, runtime_ms
-            FROM celers_task_results
-            WHERE task_id = ?
-            "#,
-        )
-        .bind(task_id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get result: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT task_id, task_name, status, result, error, traceback,
+                       created_at, completed_at, runtime_ms
+                FROM celers_task_results
+                WHERE task_id = ?
+                "#,
+                &[&task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get result: {}", e)))?;
 
-        match row {
+        match rows.into_iter().next() {
             Some(row) => {
-                let task_id_str: String = row.get("task_id");
-                let status_str: String = row.get("status");
-                let result_str: Option<String> = row.get("result");
+                let task_id_str: String = row
+                    .col("task_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?;
+                let status_str: String = row
+                    .col("status")
+                    .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?;
+                let result_str: Option<String> = row
+                    .col("result")
+                    .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?;
                 Ok(Some(TaskResult {
                     task_id: Uuid::parse_str(&task_id_str)
                         .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
-                    task_name: row.get("task_name"),
+                    task_name: row
+                        .col("task_name")
+                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
                     status: status_str.parse()?,
                     result: result_str.and_then(|s| serde_json::from_str(&s).ok()),
-                    error: row.get("error"),
-                    traceback: row.get("traceback"),
-                    created_at: row.get("created_at"),
-                    completed_at: row.get("completed_at"),
-                    runtime_ms: row.get("runtime_ms"),
+                    error: row
+                        .col("error")
+                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
+                    traceback: row
+                        .col("traceback")
+                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
+                    created_at: row
+                        .col("created_at")
+                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
+                    completed_at: row
+                        .col("completed_at")
+                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
+                    runtime_ms: row
+                        .col("runtime_ms")
+                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
                 }))
             }
             None => Ok(None),
@@ -759,13 +929,16 @@ impl MysqlBroker {
 
     /// Delete a task result from the database
     pub async fn delete_result(&self, task_id: &TaskId) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM celers_task_results WHERE task_id = ?")
-            .bind(task_id.to_string())
-            .execute(&self.pool)
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM celers_task_results WHERE task_id = ?",
+                &[&task_id.to_string()],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to delete result: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Archive old task results
@@ -773,51 +946,62 @@ impl MysqlBroker {
     /// Deletes results older than the specified duration.
     pub async fn archive_results(&self, older_than: Duration) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::seconds(older_than.as_secs() as i64);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
 
-        let result = sqlx::query(
-            r#"
-            DELETE FROM celers_task_results
-            WHERE completed_at < ?
-            "#,
-        )
-        .bind(cutoff_str)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to archive results: {}", e)))?;
+        let affected = self
+            .conn
+            .execute(
+                r#"
+                DELETE FROM celers_task_results
+                WHERE completed_at < ?
+                "#,
+                &[&cutoff_str],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to archive results: {}", e)))?;
 
-        tracing::info!(count = result.rows_affected(), cutoff = %cutoff, "Archived old results");
-        Ok(result.rows_affected())
+        tracing::info!(count = affected, cutoff = %cutoff, "Archived old results");
+        Ok(affected)
     }
 
     // ========== Database Monitoring ==========
 
     /// Get table size information for CeleRS tables
     pub async fn get_table_sizes(&self) -> Result<Vec<TableSizeInfo>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                TABLE_NAME as table_name,
-                TABLE_ROWS as row_count,
-                DATA_LENGTH as data_size_bytes,
-                INDEX_LENGTH as index_size_bytes
-            FROM information_schema.TABLES
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME LIKE 'celers_%'
-            ORDER BY DATA_LENGTH DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT
+                    TABLE_NAME as table_name,
+                    TABLE_ROWS as row_count,
+                    DATA_LENGTH as data_size_bytes,
+                    INDEX_LENGTH as index_size_bytes
+                FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME LIKE 'celers_%'
+                ORDER BY DATA_LENGTH DESC
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {}", e)))?;
 
         let mut tables = Vec::with_capacity(rows.len());
         for row in rows {
-            let row_count: Option<i64> = row.get("row_count");
-            let data_size: Option<i64> = row.get("data_size_bytes");
-            let index_size: Option<i64> = row.get("index_size_bytes");
+            let row_count: Option<i64> = row
+                .col("row_count")
+                .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {e}")))?;
+            let data_size: Option<i64> = row
+                .col("data_size_bytes")
+                .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {e}")))?;
+            let index_size: Option<i64> = row
+                .col("index_size_bytes")
+                .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {e}")))?;
             tables.push(TableSizeInfo {
-                table_name: row.get("table_name"),
+                table_name: row
+                    .col("table_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to get table sizes: {e}")))?,
                 row_count: row_count.unwrap_or(0),
                 data_size_bytes: data_size.unwrap_or(0),
                 index_size_bytes: index_size.unwrap_or(0),
@@ -830,13 +1014,13 @@ impl MysqlBroker {
     ///
     /// This should be run periodically for optimal performance.
     pub async fn optimize_tables(&self) -> Result<()> {
-        sqlx::query("OPTIMIZE TABLE celers_tasks")
-            .execute(&self.pool)
+        self.conn
+            .execute("OPTIMIZE TABLE celers_tasks", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to optimize celers_tasks: {}", e)))?;
 
-        sqlx::query("OPTIMIZE TABLE celers_dead_letter_queue")
-            .execute(&self.pool)
+        self.conn
+            .execute("OPTIMIZE TABLE celers_dead_letter_queue", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!(
@@ -845,8 +1029,8 @@ impl MysqlBroker {
                 ))
             })?;
 
-        sqlx::query("OPTIMIZE TABLE celers_task_results")
-            .execute(&self.pool)
+        self.conn
+            .execute("OPTIMIZE TABLE celers_task_results", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to optimize celers_task_results: {}", e))
@@ -858,20 +1042,20 @@ impl MysqlBroker {
 
     /// Analyze CeleRS tables for query optimization
     pub async fn analyze_tables(&self) -> Result<()> {
-        sqlx::query("ANALYZE TABLE celers_tasks")
-            .execute(&self.pool)
+        self.conn
+            .execute("ANALYZE TABLE celers_tasks", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to analyze celers_tasks: {}", e)))?;
 
-        sqlx::query("ANALYZE TABLE celers_dead_letter_queue")
-            .execute(&self.pool)
+        self.conn
+            .execute("ANALYZE TABLE celers_dead_letter_queue", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to analyze celers_dead_letter_queue: {}", e))
             })?;
 
-        sqlx::query("ANALYZE TABLE celers_task_results")
-            .execute(&self.pool)
+        self.conn
+            .execute("ANALYZE TABLE celers_task_results", &[])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to analyze celers_task_results: {}", e))
@@ -887,46 +1071,52 @@ impl MysqlBroker {
     ///
     /// Returns statistics for each unique task name including counts by state.
     pub async fn count_by_task_name(&self) -> Result<Vec<TaskNameCount>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                task_name,
-                SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as processing,
-                SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed,
-                COUNT(*) as total
-            FROM celers_tasks
-            GROUP BY task_name
-            ORDER BY total DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to count by task name: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT
+                    task_name,
+                    SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as processing,
+                    SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed,
+                    SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed,
+                    COUNT(*) as total
+                FROM celers_tasks
+                GROUP BY task_name
+                ORDER BY total DESC
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to count by task name: {}", e)))?;
 
         let mut counts = Vec::with_capacity(rows.len());
         for row in rows {
-            let pending: Option<rust_decimal::Decimal> = row.get("pending");
-            let processing: Option<rust_decimal::Decimal> = row.get("processing");
-            let completed: Option<rust_decimal::Decimal> = row.get("completed");
-            let failed: Option<rust_decimal::Decimal> = row.get("failed");
-            let total: i64 = row.get("total");
+            let pending: Option<String> = row
+                .col("pending")
+                .map_err(|e| CelersError::Other(format!("Failed to count by task name: {e}")))?;
+            let processing: Option<String> = row
+                .col("processing")
+                .map_err(|e| CelersError::Other(format!("Failed to count by task name: {e}")))?;
+            let completed: Option<String> = row
+                .col("completed")
+                .map_err(|e| CelersError::Other(format!("Failed to count by task name: {e}")))?;
+            let failed: Option<String> = row
+                .col("failed")
+                .map_err(|e| CelersError::Other(format!("Failed to count by task name: {e}")))?;
+            let total: i64 = row
+                .col("total")
+                .map_err(|e| CelersError::Other(format!("Failed to count by task name: {e}")))?;
 
             counts.push(TaskNameCount {
-                task_name: row.get("task_name"),
-                pending: pending
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
-                processing: processing
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
-                completed: completed
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
-                failed: failed
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
+                task_name: row.col("task_name").map_err(|e| {
+                    CelersError::Other(format!("Failed to count by task name: {e}"))
+                })?,
+                pending: pending.and_then(|d| d.parse().ok()).unwrap_or(0),
+                processing: processing.and_then(|d| d.parse().ok()).unwrap_or(0),
+                completed: completed.and_then(|d| d.parse().ok()).unwrap_or(0),
+                failed: failed.and_then(|d| d.parse().ok()).unwrap_or(0),
                 total,
             });
         }
@@ -943,38 +1133,63 @@ impl MysqlBroker {
 
     /// Get tasks currently being processed by a specific worker
     pub async fn get_tasks_by_worker(&self, worker_id: &str) -> Result<Vec<TaskInfo>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, task_name, state, priority, retry_count, max_retries,
-                   created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-            FROM celers_tasks
-            WHERE worker_id = ?
-            ORDER BY started_at DESC
-            "#,
-        )
-        .bind(worker_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get tasks by worker: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT id, task_name, state, priority, retry_count, max_retries,
+                       created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                FROM celers_tasks
+                WHERE worker_id = ?
+                ORDER BY started_at DESC
+                "#,
+                &[&worker_id],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get tasks by worker: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
-            let task_id_str: String = row.get("id");
-            let state_str: String = row.get("state");
+            let task_id_str: String = row
+                .col("id")
+                .map_err(|e| CelersError::Other(format!("Failed to get tasks by worker: {e}")))?;
+            let state_str: String = row
+                .col("state")
+                .map_err(|e| CelersError::Other(format!("Failed to get tasks by worker: {e}")))?;
             tasks.push(TaskInfo {
                 id: Uuid::parse_str(&task_id_str)
                     .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
-                task_name: row.get("task_name"),
+                task_name: row.col("task_name").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
                 state: state_str.parse()?,
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
+                priority: row.col("priority").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
+                retry_count: row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
+                max_retries: row.col("max_retries").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
+                created_at: row.col("created_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
+                scheduled_at: row.col("scheduled_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
+                started_at: row.col("started_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
+                completed_at: row.col("completed_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
+                worker_id: row.col("worker_id").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
+                error_message: row.col("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to get tasks by worker: {e}"))
+                })?,
             });
         }
         Ok(tasks)
@@ -986,34 +1201,46 @@ impl MysqlBroker {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<ScheduledTaskInfo>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, task_name, priority, scheduled_at, created_at,
-                   TIMESTAMPDIFF(SECOND, NOW(), scheduled_at) as delay_remaining_secs
-            FROM celers_tasks
-            WHERE state = 'pending'
-              AND scheduled_at > NOW()
-            ORDER BY scheduled_at ASC
-            LIMIT ? OFFSET ?
-            "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to list scheduled tasks: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT id, task_name, priority, scheduled_at, created_at,
+                       TIMESTAMPDIFF(SECOND, NOW(), scheduled_at) as delay_remaining_secs
+                FROM celers_tasks
+                WHERE state = 'pending'
+                  AND scheduled_at > NOW()
+                ORDER BY scheduled_at ASC
+                LIMIT ? OFFSET ?
+                "#,
+                &[&limit, &offset],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to list scheduled tasks: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
-            let task_id_str: String = row.get("id");
-            let delay: Option<i64> = row.get("delay_remaining_secs");
+            let task_id_str: String = row
+                .col("id")
+                .map_err(|e| CelersError::Other(format!("Failed to list scheduled tasks: {e}")))?;
+            let delay: Option<i64> = row
+                .col("delay_remaining_secs")
+                .map_err(|e| CelersError::Other(format!("Failed to list scheduled tasks: {e}")))?;
             tasks.push(ScheduledTaskInfo {
                 id: Uuid::parse_str(&task_id_str)
                     .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
-                task_name: row.get("task_name"),
-                priority: row.get("priority"),
-                scheduled_at: row.get("scheduled_at"),
-                created_at: row.get("created_at"),
+                task_name: row.col("task_name").map_err(|e| {
+                    CelersError::Other(format!("Failed to list scheduled tasks: {e}"))
+                })?,
+                priority: row.col("priority").map_err(|e| {
+                    CelersError::Other(format!("Failed to list scheduled tasks: {e}"))
+                })?,
+                scheduled_at: row.col("scheduled_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to list scheduled tasks: {e}"))
+                })?,
+                created_at: row.col("created_at").map_err(|e| {
+                    CelersError::Other(format!("Failed to list scheduled tasks: {e}"))
+                })?,
                 delay_remaining_secs: delay.unwrap_or(0),
             });
         }
@@ -1022,16 +1249,24 @@ impl MysqlBroker {
 
     /// Count scheduled tasks (tasks with scheduled_at in the future)
     pub async fn count_scheduled_tasks(&self) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM celers_tasks
-            WHERE state = 'pending' AND scheduled_at > NOW()
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to count scheduled tasks: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT COUNT(*) AS c FROM celers_tasks
+                WHERE state = 'pending' AND scheduled_at > NOW()
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to count scheduled tasks: {}", e)))?;
 
+        let count: i64 = rows
+            .first()
+            .map(|r| r.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to count scheduled tasks: {e}")))?
+            .unwrap_or(0);
         Ok(count)
     }
 
@@ -1045,40 +1280,40 @@ impl MysqlBroker {
         task_id: &TaskId,
         error_message: &str,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET error_message = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(error_message)
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to update error message: {}", e)))?;
+        let affected = self
+            .conn
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET error_message = ?
+                WHERE id = ?
+                "#,
+                &[&error_message, &task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to update error message: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Set the worker ID on a processing task
     ///
     /// This allows tracking which worker is processing which task.
     pub async fn set_worker_id(&self, task_id: &TaskId, worker_id: &str) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET worker_id = ?
-            WHERE id = ? AND state = 'processing'
-            "#,
-        )
-        .bind(worker_id)
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to set worker ID: {}", e)))?;
+        let affected = self
+            .conn
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET worker_id = ?
+                WHERE id = ? AND state = 'processing'
+                "#,
+                &[&worker_id, &task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to set worker ID: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Dequeue a task and set the worker ID atomically
@@ -1092,36 +1327,45 @@ impl MysqlBroker {
         }
 
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
-        let row = sqlx::query(
-            r#"
-            SELECT id, task_name, payload, retry_count
-            FROM celers_tasks
-            WHERE state = 'pending'
-              AND scheduled_at <= NOW()
-            ORDER BY priority DESC, created_at ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
+        let rows = tx
+            .query(
+                r#"
+                SELECT id, task_name, payload, retry_count
+                FROM celers_tasks
+                WHERE state = 'pending'
+                  AND scheduled_at <= NOW()
+                ORDER BY priority DESC, created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
 
-        if let Some(row) = row {
-            let task_id_str: String = row.get("id");
+        if let Some(row) = rows.into_iter().next() {
+            let task_id_str: String = row
+                .col("id")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
             let _task_id = Uuid::parse_str(&task_id_str)
                 .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
-            let task_name: String = row.get("task_name");
-            let payload: Vec<u8> = row.get("payload");
-            let retry_count: i32 = row.get("retry_count");
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
+            let payload: Vec<u8> = row
+                .col("payload")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
 
             // Mark as processing with worker ID
-            sqlx::query(
+            tx.execute(
                 r#"
                 UPDATE celers_tasks
                 SET state = 'processing',
@@ -1130,10 +1374,8 @@ impl MysqlBroker {
                     worker_id = ?
                 WHERE id = ?
                 "#,
+                &[&worker_id, &task_id_str],
             )
-            .bind(worker_id)
-            .bind(&task_id_str)
-            .execute(&mut *tx)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to mark task as processing: {}", e)))?;
 
@@ -1159,14 +1401,17 @@ impl MysqlBroker {
     ///
     /// Deletes all tasks with the specified state. Use with caution.
     pub async fn purge_by_state(&self, state: DbTaskState) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM celers_tasks WHERE state = ?")
-            .bind(state.to_string())
-            .execute(&self.pool)
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM celers_tasks WHERE state = ?",
+                &[&state.to_string()],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge tasks by state: {}", e)))?;
 
-        tracing::info!(state = %state, count = result.rows_affected(), "Purged tasks by state");
-        Ok(result.rows_affected())
+        tracing::info!(state = %state, count = affected, "Purged tasks by state");
+        Ok(affected)
     }
 
     /// Purge completed tasks only
@@ -1188,37 +1433,48 @@ impl MysqlBroker {
     ///
     /// Deletes all tasks with the specified task name. Use with caution.
     pub async fn purge_by_task_name(&self, task_name: &str) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM celers_tasks WHERE task_name = ?")
-            .bind(task_name)
-            .execute(&self.pool)
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM celers_tasks WHERE task_name = ?",
+                &[&task_name],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge tasks by name: {}", e)))?;
 
-        tracing::info!(task_name = %task_name, count = result.rows_affected(), "Purged tasks by name");
-        Ok(result.rows_affected())
+        tracing::info!(task_name = %task_name, count = affected, "Purged tasks by name");
+        Ok(affected)
     }
 
     // ========== Migration Management ==========
 
     /// List all applied migrations
     pub async fn list_migrations(&self) -> Result<Vec<MigrationInfo>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT version, name, applied_at
-            FROM celers_migrations
-            ORDER BY applied_at ASC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to list migrations: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT version, name, applied_at
+                FROM celers_migrations
+                ORDER BY applied_at ASC
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to list migrations: {}", e)))?;
 
         let mut migrations = Vec::with_capacity(rows.len());
         for row in rows {
             migrations.push(MigrationInfo {
-                version: row.get("version"),
-                name: row.get("name"),
-                applied_at: row.get("applied_at"),
+                version: row
+                    .col("version")
+                    .map_err(|e| CelersError::Other(format!("Failed to list migrations: {e}")))?,
+                name: row
+                    .col("name")
+                    .map_err(|e| CelersError::Other(format!("Failed to list migrations: {e}")))?,
+                applied_at: row
+                    .col("applied_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to list migrations: {e}")))?,
             });
         }
         Ok(migrations)
@@ -1230,50 +1486,56 @@ impl MysqlBroker {
     ///
     /// Note: This requires performance_schema to be enabled in MySQL configuration.
     pub async fn get_query_stats(&self) -> Result<Vec<QueryStats>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                DIGEST_TEXT as query_name,
-                COUNT_STAR as execution_count,
-                SUM_TIMER_WAIT / 1000000000 as total_time_ms,
-                AVG_TIMER_WAIT / 1000000000 as avg_time_ms,
-                MIN_TIMER_WAIT / 1000000000 as min_time_ms,
-                MAX_TIMER_WAIT / 1000000000 as max_time_ms
-            FROM performance_schema.events_statements_summary_by_digest
-            WHERE SCHEMA_NAME = DATABASE()
-              AND DIGEST_TEXT LIKE '%celers%'
-            ORDER BY SUM_TIMER_WAIT DESC
-            LIMIT 50
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get query stats: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT
+                    DIGEST_TEXT as query_name,
+                    COUNT_STAR as execution_count,
+                    SUM_TIMER_WAIT / 1000000000 as total_time_ms,
+                    AVG_TIMER_WAIT / 1000000000 as avg_time_ms,
+                    MIN_TIMER_WAIT / 1000000000 as min_time_ms,
+                    MAX_TIMER_WAIT / 1000000000 as max_time_ms
+                FROM performance_schema.events_statements_summary_by_digest
+                WHERE SCHEMA_NAME = DATABASE()
+                  AND DIGEST_TEXT LIKE '%celers%'
+                ORDER BY SUM_TIMER_WAIT DESC
+                LIMIT 50
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get query stats: {}", e)))?;
 
         let mut stats = Vec::with_capacity(rows.len());
         for row in rows {
-            let query_name: String = row.get("query_name");
-            let execution_count: i64 = row.get("execution_count");
-            let total_time: Option<rust_decimal::Decimal> = row.get("total_time_ms");
-            let avg_time: Option<rust_decimal::Decimal> = row.get("avg_time_ms");
-            let min_time: Option<rust_decimal::Decimal> = row.get("min_time_ms");
-            let max_time: Option<rust_decimal::Decimal> = row.get("max_time_ms");
+            let query_name: String = row
+                .col("query_name")
+                .map_err(|e| CelersError::Other(format!("Failed to get query stats: {e}")))?;
+            let execution_count: i64 = row
+                .col("execution_count")
+                .map_err(|e| CelersError::Other(format!("Failed to get query stats: {e}")))?;
+            let total_time: Option<String> = row
+                .col("total_time_ms")
+                .map_err(|e| CelersError::Other(format!("Failed to get query stats: {e}")))?;
+            let avg_time: Option<String> = row
+                .col("avg_time_ms")
+                .map_err(|e| CelersError::Other(format!("Failed to get query stats: {e}")))?;
+            let min_time: Option<String> = row
+                .col("min_time_ms")
+                .map_err(|e| CelersError::Other(format!("Failed to get query stats: {e}")))?;
+            let max_time: Option<String> = row
+                .col("max_time_ms")
+                .map_err(|e| CelersError::Other(format!("Failed to get query stats: {e}")))?;
 
             stats.push(QueryStats {
                 query_name,
                 execution_count,
-                total_time_ms: total_time
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
-                avg_time_ms: avg_time
-                    .map(|d| d.to_string().parse().unwrap_or(0.0))
-                    .unwrap_or(0.0),
-                min_time_ms: min_time
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
-                max_time_ms: max_time
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
+                total_time_ms: total_time.and_then(|d| d.parse().ok()).unwrap_or(0),
+                avg_time_ms: avg_time.and_then(|d| d.parse().ok()).unwrap_or(0.0),
+                min_time_ms: min_time.and_then(|d| d.parse().ok()).unwrap_or(0),
+                max_time_ms: max_time.and_then(|d| d.parse().ok()).unwrap_or(0),
             });
         }
         Ok(stats)
@@ -1283,14 +1545,10 @@ impl MysqlBroker {
     ///
     /// Clears the performance_schema statistics. Useful for benchmarking.
     pub async fn reset_query_stats(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CALL sys.ps_truncate_all_tables(FALSE)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to reset query stats: {}", e)))?;
+        self.conn
+            .execute("CALL sys.ps_truncate_all_tables(FALSE)", &[])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to reset query stats: {}", e)))?;
 
         tracing::info!("Reset query performance statistics");
         Ok(())
@@ -1303,30 +1561,40 @@ impl MysqlBroker {
     /// Returns information about all indexes on CeleRS tables including cardinality
     /// and whether they are unique.
     pub async fn get_index_stats(&self) -> Result<Vec<IndexStats>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                TABLE_NAME as table_name,
-                INDEX_NAME as index_name,
-                CARDINALITY as cardinality,
-                NON_UNIQUE as non_unique
-            FROM information_schema.STATISTICS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME LIKE 'celers_%'
-            ORDER BY TABLE_NAME, INDEX_NAME
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get index stats: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SELECT
+                    TABLE_NAME as table_name,
+                    INDEX_NAME as index_name,
+                    CARDINALITY as cardinality,
+                    NON_UNIQUE as non_unique
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME LIKE 'celers_%'
+                ORDER BY TABLE_NAME, INDEX_NAME
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get index stats: {}", e)))?;
 
         let mut stats = Vec::with_capacity(rows.len());
         for row in rows {
-            let cardinality: Option<i64> = row.get("cardinality");
-            let non_unique: i32 = row.get("non_unique");
+            let cardinality: Option<i64> = row
+                .col("cardinality")
+                .map_err(|e| CelersError::Other(format!("Failed to get index stats: {e}")))?;
+            let non_unique: i32 = row
+                .col("non_unique")
+                .map_err(|e| CelersError::Other(format!("Failed to get index stats: {e}")))?;
             stats.push(IndexStats {
-                table_name: row.get("table_name"),
-                index_name: row.get("index_name"),
+                table_name: row
+                    .col("table_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to get index stats: {e}")))?,
+                index_name: row
+                    .col("index_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to get index stats: {e}")))?,
                 cardinality: cardinality.unwrap_or(0),
                 unique_values: non_unique == 0,
             });
@@ -1339,67 +1607,89 @@ impl MysqlBroker {
     /// Returns the MySQL EXPLAIN output for the dequeue query.
     /// Useful for query optimization and performance tuning.
     pub async fn explain_dequeue(&self) -> Result<Vec<QueryPlan>> {
-        let rows = sqlx::query(
-            r#"
-            EXPLAIN
-            SELECT id, task_name, payload, retry_count
-            FROM celers_tasks
-            WHERE state = 'pending'
-              AND scheduled_at <= NOW()
-            ORDER BY priority DESC, created_at ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
+        let rows = self
+            .conn
+            .query(
+                r#"
+                EXPLAIN
+                SELECT id, task_name, payload, retry_count
+                FROM celers_tasks
+                WHERE state = 'pending'
+                  AND scheduled_at <= NOW()
+                ORDER BY priority DESC, created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
 
-        let mut plans = Vec::with_capacity(rows.len());
-        for row in rows {
-            let rows_examined: Option<i64> = row.try_get("rows").ok();
-            let filtered: Option<rust_decimal::Decimal> = row.try_get("filtered").ok();
-            plans.push(QueryPlan {
-                id: row.get("id"),
-                select_type: row.get("select_type"),
-                table: row.try_get("table").ok(),
-                query_type: row.try_get("type").ok(),
-                possible_keys: row.try_get("possible_keys").ok(),
-                key_used: row.try_get("key").ok(),
-                key_length: row.try_get("key_len").ok(),
-                rows_examined,
-                filtered: filtered.map(|d| d.to_string().parse().unwrap_or(0.0)),
-                extra: row.try_get("Extra").ok(),
-            });
-        }
-        Ok(plans)
+        Self::rows_to_query_plans(rows)
     }
 
     /// Explain a custom query plan
     ///
     /// Returns the MySQL EXPLAIN output for any SELECT query.
+    ///
+    /// # Safety
+    ///
+    /// `query` is interpolated directly into the `EXPLAIN <query>` SQL text
+    /// because EXPLAIN takes a whole statement, not a single bindable value,
+    /// so there is no way to express this as a parameterized query. As
+    /// defense-in-depth, this method rejects any input that (after
+    /// trimming) does not case-insensitively start with `SELECT`, and
+    /// rejects any input containing a `;` (blocking simple statement
+    /// stacking). This guard reduces but does not eliminate risk; callers
+    /// must still treat `query` as trusted, non-attacker-derived input.
     pub async fn explain_query(&self, query: &str) -> Result<Vec<QueryPlan>> {
+        let trimmed = query.trim();
+        let starts_with_select = trimmed
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SELECT"));
+        if !starts_with_select {
+            return Err(CelersError::Other(
+                "explain_query: input must start with SELECT".to_string(),
+            ));
+        }
+        if trimmed.contains(';') {
+            return Err(CelersError::Other(
+                "explain_query: input must not contain ';'".to_string(),
+            ));
+        }
+
         let explain_query = format!("EXPLAIN {}", query);
-        let rows = sqlx::query(&explain_query)
-            .fetch_all(&self.pool)
+        let rows = self
+            .conn
+            .query(&explain_query, &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
 
+        Self::rows_to_query_plans(rows)
+    }
+
+    /// Shared row-to-`QueryPlan` mapping for [`explain_dequeue`](Self::explain_dequeue)
+    /// and [`explain_query`](Self::explain_query).
+    fn rows_to_query_plans(rows: Vec<oxisql_core::Row>) -> Result<Vec<QueryPlan>> {
         let mut plans = Vec::with_capacity(rows.len());
         for row in rows {
-            let rows_examined: Option<i64> = row.try_get("rows").ok();
-            let filtered: Option<rust_decimal::Decimal> = row.try_get("filtered").ok();
+            let rows_examined: Option<i64> = row.col("rows").ok();
+            let filtered: Option<String> = row.col("filtered").ok();
             plans.push(QueryPlan {
-                id: row.get("id"),
-                select_type: row.get("select_type"),
-                table: row.try_get("table").ok(),
-                query_type: row.try_get("type").ok(),
-                possible_keys: row.try_get("possible_keys").ok(),
-                key_used: row.try_get("key").ok(),
-                key_length: row.try_get("key_len").ok(),
+                id: row
+                    .col("id")
+                    .map_err(|e| CelersError::Other(format!("Failed to explain query: {e}")))?,
+                select_type: row
+                    .col("select_type")
+                    .map_err(|e| CelersError::Other(format!("Failed to explain query: {e}")))?,
+                table: row.col("table").ok(),
+                query_type: row.col("type").ok(),
+                possible_keys: row.col("possible_keys").ok(),
+                key_used: row.col("key").ok(),
+                key_length: row.col("key_len").ok(),
                 rows_examined,
-                filtered: filtered.map(|d| d.to_string().parse().unwrap_or(0.0)),
-                extra: row.try_get("Extra").ok(),
+                filtered: filtered.and_then(|d| d.parse().ok()),
+                extra: row.col("Extra").ok(),
             });
         }
         Ok(plans)
@@ -1447,28 +1737,20 @@ impl MysqlBroker {
     /// Get connection pool diagnostics
     ///
     /// Returns detailed information about the connection pool state.
+    ///
+    /// `oxisql_mysql::MyConnection` exposes no pool-introspection API (see
+    /// the `configured_max_connections` field doc), so unlike the
+    /// pre-migration `sqlx`-backed version this reports the configured
+    /// ceiling with idle/active counts as unknown (`0`) rather than a live
+    /// snapshot.
     pub fn get_connection_diagnostics(&self) -> ConnectionDiagnostics {
-        let max_conns = self.pool.options().get_max_connections();
-        let idle_conns = self.pool.num_idle() as u32;
-        let min_conns = self.pool.options().get_min_connections();
-
-        // Total connections is at least idle, but could be up to max
-        let total_conns = idle_conns.max(min_conns);
-        let active_conns = total_conns.saturating_sub(idle_conns);
-
-        let utilization = if max_conns > 0 {
-            (total_conns as f64 / max_conns as f64) * 100.0
-        } else {
-            0.0
-        };
-
         ConnectionDiagnostics {
-            total_connections: total_conns,
-            idle_connections: idle_conns,
-            active_connections: active_conns,
-            max_connections: max_conns,
+            total_connections: 0,
+            idle_connections: 0,
+            active_connections: 0,
+            max_connections: self.configured_max_connections,
             connection_wait_time_ms: None, // MySQL doesn't expose this easily
-            pool_utilization_percent: utilization,
+            pool_utilization_percent: 0.0,
         }
     }
 
@@ -1480,9 +1762,14 @@ impl MysqlBroker {
         let stats = self.get_statistics().await?;
         let conn_diag = self.get_connection_diagnostics();
 
-        // Calculate tasks per second (requires historical data, placeholder for now)
-        // In production, this would track enqueue/dequeue rates over time
-        let tasks_per_second = 0.0;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let window_start_ms = self.enqueue_window_start_ms.load(Ordering::Relaxed);
+        let elapsed_ms = (now_ms - window_start_ms).max(1);
+        let count = self.enqueue_count.swap(0, Ordering::Relaxed);
+        // Reset window start to now for the next measurement period
+        self.enqueue_window_start_ms
+            .store(now_ms, Ordering::Relaxed);
+        let tasks_per_second = (count as f64 / elapsed_ms as f64) * 1000.0;
 
         // Get average query times from performance schema (if available)
         let (avg_dequeue_ms, avg_enqueue_ms) = match self.get_query_stats().await {
@@ -1524,58 +1811,50 @@ impl MysqlBroker {
     ///
     /// Returns true if:
     /// - Database connection is active
-    /// - Connection pool has idle connections available
     /// - No critical errors detected
+    ///
+    /// Note: the pre-migration `sqlx`-backed version also checked live
+    /// connection-pool idle/saturation state; `oxisql_mysql::MyConnection`
+    /// exposes no equivalent introspection (see the
+    /// `configured_max_connections` field doc), so that check is no longer
+    /// possible and has been dropped from this method.
     pub async fn is_ready(&self) -> bool {
-        // Try a simple query
-        let version_check = sqlx::query_scalar::<_, String>("SELECT VERSION()")
-            .fetch_one(&self.pool)
-            .await;
-
-        if version_check.is_err() {
-            return false;
-        }
-
-        // Check connection pool has capacity
-        let idle = self.pool.num_idle();
-        if idle == 0 {
-            let max_conns = self.pool.options().get_max_connections();
-            // If pool is at max and no idle connections, might be saturated
-            if max_conns > 0 && self.pool.size() >= max_conns {
-                return false;
-            }
-        }
-
-        true
+        self.conn.query("SELECT VERSION()", &[]).await.is_ok()
     }
 
     /// Get detailed database server variables
     ///
     /// Returns key MySQL server configuration variables that affect performance.
     pub async fn get_server_variables(&self) -> Result<std::collections::HashMap<String, String>> {
-        let rows = sqlx::query(
-            r#"
-            SHOW VARIABLES WHERE Variable_name IN (
-                'max_connections',
-                'innodb_buffer_pool_size',
-                'innodb_log_file_size',
-                'query_cache_size',
-                'query_cache_type',
-                'innodb_flush_log_at_trx_commit',
-                'innodb_flush_method',
-                'binlog_format',
-                'expire_logs_days'
+        let rows = self
+            .conn
+            .query(
+                r#"
+                SHOW VARIABLES WHERE Variable_name IN (
+                    'max_connections',
+                    'innodb_buffer_pool_size',
+                    'innodb_log_file_size',
+                    'query_cache_size',
+                    'query_cache_type',
+                    'innodb_flush_log_at_trx_commit',
+                    'innodb_flush_method',
+                    'binlog_format',
+                    'expire_logs_days'
+                )
+                "#,
+                &[],
             )
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get server variables: {}", e)))?;
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get server variables: {}", e)))?;
 
         let mut variables = std::collections::HashMap::new();
         for row in rows {
-            let var_name: String = row.get("Variable_name");
-            let var_value: String = row.get("Value");
+            let var_name: String = row
+                .col("Variable_name")
+                .map_err(|e| CelersError::Other(format!("Failed to get server variables: {e}")))?;
+            let var_value: String = row
+                .col("Value")
+                .map_err(|e| CelersError::Other(format!("Failed to get server variables: {e}")))?;
             variables.insert(var_name, var_value);
         }
 
@@ -1595,8 +1874,8 @@ impl MysqlBroker {
         }
 
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
@@ -1619,21 +1898,24 @@ impl MysqlBroker {
                     }
                 }
             }
+            let db_metadata_str =
+                serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
 
-            sqlx::query(
+            tx.execute(
                 r#"
                 INSERT INTO celers_tasks
                     (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
                 VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
                 "#,
+                &[
+                    &task_id.to_string(),
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &db_metadata_str,
+                ],
             )
-            .bind(task_id.to_string())
-            .bind(&task.metadata.name)
-            .bind(&task.payload)
-            .bind(task.metadata.priority)
-            .bind(task.metadata.max_retries as i32)
-            .bind(serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string()))
-            .execute(&mut *tx)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to enqueue task in batch: {}", e)))?;
 
@@ -1675,26 +1957,26 @@ impl MysqlBroker {
         }
 
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
-        let rows = sqlx::query(
-            r#"
-            SELECT id, task_name, payload, retry_count
-            FROM celers_tasks
-            WHERE state = 'pending'
-              AND scheduled_at <= NOW()
-            ORDER BY priority DESC, created_at ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT ?
-            "#,
-        )
-        .bind(limit as i64)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {}", e)))?;
+        let rows = tx
+            .query(
+                r#"
+                SELECT id, task_name, payload, retry_count
+                FROM celers_tasks
+                WHERE state = 'pending'
+                  AND scheduled_at <= NOW()
+                ORDER BY priority DESC, created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT ?
+                "#,
+                &[&(limit as i64)],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {}", e)))?;
 
         if rows.is_empty() {
             tx.rollback().await.map_err(|e| {
@@ -1707,12 +1989,20 @@ impl MysqlBroker {
         let mut task_id_strings = Vec::with_capacity(rows.len());
 
         for row in rows {
-            let task_id_str: String = row.get("id");
+            let task_id_str: String = row
+                .col("id")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {e}")))?;
             let _task_id = Uuid::parse_str(&task_id_str)
                 .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
-            let task_name: String = row.get("task_name");
-            let payload: Vec<u8> = row.get("payload");
-            let retry_count: i32 = row.get("retry_count");
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {e}")))?;
+            let payload: Vec<u8> = row
+                .col("payload")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {e}")))?;
+            let retry_count: i32 = row
+                .col("retry_count")
+                .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {e}")))?;
 
             messages.push(BrokerMessage {
                 task: SerializedTask::new(task_name, payload),
@@ -1742,12 +2032,12 @@ impl MysqlBroker {
                 placeholders
             );
 
-            let mut query = sqlx::query(&update_query);
-            for task_id in task_id_strings {
-                query = query.bind(task_id);
-            }
+            let param_refs: Vec<&dyn oxisql_core::ToSqlValue> = task_id_strings
+                .iter()
+                .map(|s| s as &dyn oxisql_core::ToSqlValue)
+                .collect();
 
-            query.execute(&mut *tx).await.map_err(|e| {
+            tx.execute(&update_query, &param_refs).await.map_err(|e| {
                 CelersError::Other(format!("Failed to mark batch as processing: {}", e))
             })?;
         }

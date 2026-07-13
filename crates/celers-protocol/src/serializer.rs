@@ -553,6 +553,264 @@ impl SerializerRegistry {
     }
 }
 
+/// Object-safe trait for user-provided (custom) serializers.
+///
+/// The built-in [`Serializer`] trait uses generic methods
+/// (`serialize<T: Serialize>`) and therefore cannot be turned into a trait
+/// object (`dyn Serializer`). To support a *runtime* registry of user-supplied
+/// serializers, this trait operates on the universal serde intermediate
+/// [`serde_json::Value`] instead, which keeps it object-safe so implementations
+/// can be stored as `Box<dyn CustomSerializer>`.
+///
+/// Implementors convert a [`serde_json::Value`] to/from bytes using whatever
+/// encoding they wish (a domain-specific text format, a third-party binary
+/// codec, an encrypted envelope, etc.) and advertise their content type and
+/// name so the [`CustomSerializerRegistry`] can dispatch by either.
+///
+/// # Note on Pickle
+///
+/// A Python-`pickle` serializer is *intentionally* not provided here, and
+/// callers are strongly discouraged from implementing one: unpickling executes
+/// arbitrary code embedded in the payload and is a remote-code-execution risk.
+/// Use a safe format (JSON, MessagePack, YAML, ...) instead.
+///
+/// # Example
+///
+/// ```
+/// use celers_protocol::serializer::{CustomSerializer, CustomSerializerRegistry, SerializerError};
+/// use serde_json::Value;
+///
+/// /// A trivial "uppercase JSON" serializer for demonstration.
+/// struct UpperJson;
+///
+/// impl CustomSerializer for UpperJson {
+///     fn name(&self) -> &str {
+///         "upper-json"
+///     }
+///
+///     fn content_type(&self) -> &str {
+///         "application/x-upper-json"
+///     }
+///
+///     fn serialize_value(&self, value: &Value) -> Result<Vec<u8>, SerializerError> {
+///         let s = serde_json::to_string(value)
+///             .map_err(|e| SerializerError::Serialize(e.to_string()))?;
+///         Ok(s.to_uppercase().into_bytes())
+///     }
+///
+///     fn deserialize_value(&self, bytes: &[u8]) -> Result<Value, SerializerError> {
+///         let s = std::str::from_utf8(bytes)
+///             .map_err(|e| SerializerError::Deserialize(e.to_string()))?;
+///         serde_json::from_str(&s.to_lowercase())
+///             .map_err(|e| SerializerError::Deserialize(e.to_string()))
+///     }
+/// }
+///
+/// let mut registry = CustomSerializerRegistry::new();
+/// registry.register(Box::new(UpperJson));
+///
+/// let value = serde_json::json!({"ok": true});
+/// let bytes = registry
+///     .serialize_by_name("upper-json", &value)
+///     .expect("serializer registered");
+/// let decoded: Value = registry
+///     .deserialize_by_content_type("application/x-upper-json", &bytes)
+///     .expect("serializer registered");
+/// assert_eq!(value, decoded);
+/// ```
+pub trait CustomSerializer: Send + Sync {
+    /// Unique name of this serializer (used for name-based dispatch).
+    fn name(&self) -> &str;
+
+    /// Content type advertised by this serializer (used for content-type
+    /// dispatch and auto-detection wiring).
+    fn content_type(&self) -> &str;
+
+    /// Content encoding produced by this serializer.
+    ///
+    /// Defaults to [`ContentEncoding::Binary`] because custom formats are
+    /// frequently binary. Text-based implementations should override this to
+    /// return [`ContentEncoding::Utf8`].
+    fn content_encoding(&self) -> ContentEncoding {
+        ContentEncoding::Binary
+    }
+
+    /// Serialize a [`serde_json::Value`] to bytes.
+    fn serialize_value(&self, value: &serde_json::Value) -> SerializerResult<Vec<u8>>;
+
+    /// Deserialize bytes into a [`serde_json::Value`].
+    fn deserialize_value(&self, bytes: &[u8]) -> SerializerResult<serde_json::Value>;
+}
+
+/// Registry of user-provided [`CustomSerializer`] implementations.
+///
+/// Serializers are stored as trait objects and can be looked up by either their
+/// [`CustomSerializer::name`] or [`CustomSerializer::content_type`]. This
+/// complements [`SerializerType`] (which handles the built-in, statically-known
+/// formats) by allowing applications to plug in additional formats at runtime
+/// without modifying this crate.
+///
+/// Registering a serializer whose name or content type collides with an
+/// existing entry replaces that mapping (last registration wins), which makes
+/// it possible to override a previously installed serializer.
+#[derive(Default)]
+pub struct CustomSerializerRegistry {
+    by_name: std::collections::HashMap<String, std::sync::Arc<dyn CustomSerializer>>,
+    by_content_type: std::collections::HashMap<String, std::sync::Arc<dyn CustomSerializer>>,
+}
+
+impl CustomSerializerRegistry {
+    /// Create a new, empty custom serializer registry.
+    pub fn new() -> Self {
+        Self {
+            by_name: std::collections::HashMap::new(),
+            by_content_type: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a custom serializer.
+    ///
+    /// The serializer is indexed by both its [`CustomSerializer::name`] and its
+    /// [`CustomSerializer::content_type`]. Any existing entry under either key
+    /// is replaced.
+    pub fn register(&mut self, serializer: Box<dyn CustomSerializer>) {
+        let serializer: std::sync::Arc<dyn CustomSerializer> = serializer.into();
+        let name = serializer.name().to_string();
+        let content_type = serializer.content_type().to_string();
+        self.by_name
+            .insert(name, std::sync::Arc::clone(&serializer));
+        self.by_content_type.insert(content_type, serializer);
+    }
+
+    /// Remove a serializer by name.
+    ///
+    /// Also removes the corresponding content-type mapping. Returns `true` if a
+    /// serializer was found and removed.
+    pub fn unregister(&mut self, name: &str) -> bool {
+        if let Some(serializer) = self.by_name.remove(name) {
+            let content_type = serializer.content_type().to_string();
+            // Only drop the content-type mapping if it still points at the same
+            // serializer (a later registration under that content type wins).
+            if let Some(existing) = self.by_content_type.get(&content_type) {
+                if std::sync::Arc::ptr_eq(existing, &serializer) {
+                    self.by_content_type.remove(&content_type);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Look up a registered serializer by name.
+    #[inline]
+    pub fn get_by_name(&self, name: &str) -> Option<&dyn CustomSerializer> {
+        self.by_name.get(name).map(|s| s.as_ref())
+    }
+
+    /// Look up a registered serializer by content type.
+    #[inline]
+    pub fn get_by_content_type(&self, content_type: &str) -> Option<&dyn CustomSerializer> {
+        self.by_content_type.get(content_type).map(|s| s.as_ref())
+    }
+
+    /// Returns `true` if a serializer with the given name is registered.
+    #[inline]
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    /// Returns `true` if a serializer for the given content type is registered.
+    #[inline]
+    pub fn contains_content_type(&self, content_type: &str) -> bool {
+        self.by_content_type.contains_key(content_type)
+    }
+
+    /// Number of registered serializers (counted by unique name).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    /// Returns `true` if no serializers are registered.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    /// List the names of all registered serializers.
+    pub fn names(&self) -> Vec<&str> {
+        self.by_name.keys().map(String::as_str).collect()
+    }
+
+    /// List the content types of all registered serializers.
+    pub fn content_types(&self) -> Vec<&str> {
+        self.by_content_type.keys().map(String::as_str).collect()
+    }
+
+    /// Serialize a value using the serializer registered under `name`.
+    ///
+    /// The value is first converted to a [`serde_json::Value`] (the universal
+    /// serde intermediate) and then handed to the custom serializer. Returns an
+    /// [`SerializerError::UnsupportedContentType`] if no serializer is
+    /// registered under that name.
+    pub fn serialize_by_name<T: Serialize>(
+        &self,
+        name: &str,
+        value: &T,
+    ) -> SerializerResult<Vec<u8>> {
+        let serializer = self
+            .get_by_name(name)
+            .ok_or_else(|| SerializerError::UnsupportedContentType(name.to_string()))?;
+        let value =
+            serde_json::to_value(value).map_err(|e| SerializerError::Serialize(e.to_string()))?;
+        serializer.serialize_value(&value)
+    }
+
+    /// Serialize a value using the serializer registered for `content_type`.
+    pub fn serialize_by_content_type<T: Serialize>(
+        &self,
+        content_type: &str,
+        value: &T,
+    ) -> SerializerResult<Vec<u8>> {
+        let serializer = self
+            .get_by_content_type(content_type)
+            .ok_or_else(|| SerializerError::UnsupportedContentType(content_type.to_string()))?;
+        let value =
+            serde_json::to_value(value).map_err(|e| SerializerError::Serialize(e.to_string()))?;
+        serializer.serialize_value(&value)
+    }
+
+    /// Deserialize bytes using the serializer registered under `name`.
+    ///
+    /// The custom serializer produces a [`serde_json::Value`] which is then
+    /// converted into the requested type `T`.
+    pub fn deserialize_by_name<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> SerializerResult<T> {
+        let serializer = self
+            .get_by_name(name)
+            .ok_or_else(|| SerializerError::UnsupportedContentType(name.to_string()))?;
+        let value = serializer.deserialize_value(bytes)?;
+        serde_json::from_value(value).map_err(|e| SerializerError::Deserialize(e.to_string()))
+    }
+
+    /// Deserialize bytes using the serializer registered for `content_type`.
+    pub fn deserialize_by_content_type<T: DeserializeOwned>(
+        &self,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> SerializerResult<T> {
+        let serializer = self
+            .get_by_content_type(content_type)
+            .ok_or_else(|| SerializerError::UnsupportedContentType(content_type.to_string()))?;
+        let value = serializer.deserialize_value(bytes)?;
+        serde_json::from_value(value).map_err(|e| SerializerError::Deserialize(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,7 +1273,8 @@ mod tests {
     #[test]
     fn test_available_types_count() {
         let types = SerializerRegistry::available_types();
-        let mut expected = 1; // Json always
+        #[allow(unused_mut)]
+        let mut expected = 1; // Json always; incremented below if optional serializers are enabled
 
         #[cfg(feature = "msgpack")]
         {
@@ -1050,5 +1309,353 @@ mod tests {
             SerializerType::Protobuf.content_type(),
             ContentType::Custom("application/protobuf".to_string())
         );
+    }
+
+    // ---- YAML serializer tests ----
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_yaml_serializer_round_trip() {
+        let serializer = YamlSerializer;
+        let data = TestData {
+            name: "yaml_test".to_string(),
+            value: 314,
+        };
+
+        let bytes = serializer.serialize(&data).unwrap();
+        // YAML is a text format: the encoded payload must be valid UTF-8.
+        let text = std::str::from_utf8(&bytes).expect("YAML output should be UTF-8");
+        assert!(text.contains("yaml_test"));
+        assert!(text.contains("314"));
+
+        let decoded: TestData = serializer.deserialize(&bytes).unwrap();
+        assert_eq!(data, decoded);
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_yaml_serializer_content_type() {
+        let serializer = YamlSerializer;
+        assert_eq!(
+            serializer.content_type(),
+            ContentType::Custom("application/x-yaml".to_string())
+        );
+        assert_eq!(serializer.content_encoding(), ContentEncoding::Utf8);
+        assert_eq!(serializer.name(), "yaml");
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_yaml_serializer_value_round_trip() {
+        // Round-trip a representative dynamic serde value (a message-like map).
+        let serializer = YamlSerializer;
+        let value = serde_json::json!({
+            "task": "tasks.add",
+            "args": [2, 3],
+            "kwargs": {"factor": 10},
+            "retries": 0,
+            "persistent": true,
+        });
+
+        let bytes = serializer.serialize(&value).unwrap();
+        let decoded: serde_json::Value = serializer.deserialize(&bytes).unwrap();
+        assert_eq!(value, decoded);
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_yaml_content_type_aliases_detect() {
+        // Both the primary and alias content types must resolve to YAML.
+        for ct in ["application/x-yaml", "application/yaml", "text/yaml"] {
+            let serializer = get_serializer(ct).unwrap();
+            assert_eq!(serializer.name(), "yaml", "content type {ct}");
+        }
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_yaml_serializer_type_dispatch_round_trip() {
+        // Exercise the SerializerType dispatch arm (not just the concrete type).
+        let data = TestData {
+            name: "dispatch".to_string(),
+            value: 7,
+        };
+        let bytes = SerializerType::Yaml.serialize(&data).unwrap();
+        let decoded: TestData = SerializerType::Yaml.deserialize(&bytes).unwrap();
+        assert_eq!(data, decoded);
+        assert_eq!(
+            SerializerType::Yaml.content_encoding(),
+            ContentEncoding::Utf8
+        );
+    }
+
+    // ---- Custom serializer registry tests ----
+
+    /// A demonstration custom serializer that wraps JSON bytes with a fixed
+    /// magic prefix. Round-trips through `serde_json::Value`.
+    struct PrefixedJson;
+
+    const PREFIX: &[u8] = b"PJSN:";
+
+    impl CustomSerializer for PrefixedJson {
+        fn name(&self) -> &str {
+            "prefixed-json"
+        }
+
+        fn content_type(&self) -> &str {
+            "application/x-prefixed-json"
+        }
+
+        fn content_encoding(&self) -> ContentEncoding {
+            ContentEncoding::Utf8
+        }
+
+        fn serialize_value(&self, value: &serde_json::Value) -> SerializerResult<Vec<u8>> {
+            let json =
+                serde_json::to_vec(value).map_err(|e| SerializerError::Serialize(e.to_string()))?;
+            let mut out = Vec::with_capacity(PREFIX.len() + json.len());
+            out.extend_from_slice(PREFIX);
+            out.extend_from_slice(&json);
+            Ok(out)
+        }
+
+        fn deserialize_value(&self, bytes: &[u8]) -> SerializerResult<serde_json::Value> {
+            let payload = bytes.strip_prefix(PREFIX).ok_or_else(|| {
+                SerializerError::Deserialize("missing PJSN: magic prefix".to_string())
+            })?;
+            serde_json::from_slice(payload).map_err(|e| SerializerError::Deserialize(e.to_string()))
+        }
+    }
+
+    #[test]
+    fn test_custom_serializer_default_encoding() {
+        // A serializer that does not override content_encoding should default to
+        // Binary.
+        struct BinaryCustom;
+        impl CustomSerializer for BinaryCustom {
+            fn name(&self) -> &str {
+                "binary-custom"
+            }
+            fn content_type(&self) -> &str {
+                "application/x-binary-custom"
+            }
+            fn serialize_value(&self, value: &serde_json::Value) -> SerializerResult<Vec<u8>> {
+                serde_json::to_vec(value).map_err(|e| SerializerError::Serialize(e.to_string()))
+            }
+            fn deserialize_value(&self, bytes: &[u8]) -> SerializerResult<serde_json::Value> {
+                serde_json::from_slice(bytes)
+                    .map_err(|e| SerializerError::Deserialize(e.to_string()))
+            }
+        }
+        assert_eq!(BinaryCustom.content_encoding(), ContentEncoding::Binary);
+    }
+
+    #[test]
+    fn test_custom_registry_empty() {
+        let registry = CustomSerializerRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert!(!registry.contains_name("prefixed-json"));
+        assert!(!registry.contains_content_type("application/x-prefixed-json"));
+        assert!(registry.get_by_name("prefixed-json").is_none());
+        assert!(registry
+            .get_by_content_type("application/x-prefixed-json")
+            .is_none());
+    }
+
+    #[test]
+    fn test_custom_registry_register_and_lookup() {
+        let mut registry = CustomSerializerRegistry::new();
+        registry.register(Box::new(PrefixedJson));
+
+        assert!(!registry.is_empty());
+        assert_eq!(registry.len(), 1);
+        assert!(registry.contains_name("prefixed-json"));
+        assert!(registry.contains_content_type("application/x-prefixed-json"));
+
+        let by_name = registry.get_by_name("prefixed-json").unwrap();
+        assert_eq!(by_name.content_type(), "application/x-prefixed-json");
+        assert_eq!(by_name.content_encoding(), ContentEncoding::Utf8);
+
+        let by_ct = registry
+            .get_by_content_type("application/x-prefixed-json")
+            .unwrap();
+        assert_eq!(by_ct.name(), "prefixed-json");
+    }
+
+    #[test]
+    fn test_custom_registry_round_trip_by_name() {
+        let mut registry = CustomSerializerRegistry::new();
+        registry.register(Box::new(PrefixedJson));
+
+        let data = TestData {
+            name: "custom".to_string(),
+            value: 99,
+        };
+
+        let bytes = registry.serialize_by_name("prefixed-json", &data).unwrap();
+        assert!(bytes.starts_with(PREFIX));
+
+        let decoded: TestData = registry
+            .deserialize_by_name("prefixed-json", &bytes)
+            .unwrap();
+        assert_eq!(data, decoded);
+    }
+
+    #[test]
+    fn test_custom_registry_round_trip_by_content_type() {
+        let mut registry = CustomSerializerRegistry::new();
+        registry.register(Box::new(PrefixedJson));
+
+        // Serialize a dynamic serde Value and recover it via content-type dispatch.
+        let value = serde_json::json!({"a": 1, "b": [true, null, "x"]});
+
+        let bytes = registry
+            .serialize_by_content_type("application/x-prefixed-json", &value)
+            .unwrap();
+        let decoded: serde_json::Value = registry
+            .deserialize_by_content_type("application/x-prefixed-json", &bytes)
+            .unwrap();
+        assert_eq!(value, decoded);
+    }
+
+    #[test]
+    fn test_custom_registry_cross_dispatch_equivalent() {
+        // Serializing by name and by content type must yield identical bytes.
+        let mut registry = CustomSerializerRegistry::new();
+        registry.register(Box::new(PrefixedJson));
+
+        let value = serde_json::json!({"k": "v"});
+        let by_name = registry.serialize_by_name("prefixed-json", &value).unwrap();
+        let by_ct = registry
+            .serialize_by_content_type("application/x-prefixed-json", &value)
+            .unwrap();
+        assert_eq!(by_name, by_ct);
+    }
+
+    #[test]
+    fn test_custom_registry_unknown_returns_error() {
+        let registry = CustomSerializerRegistry::new();
+        let value = serde_json::json!({"x": 1});
+
+        let err = registry.serialize_by_name("nope", &value).unwrap_err();
+        assert!(matches!(err, SerializerError::UnsupportedContentType(ct) if ct == "nope"));
+
+        let err = registry
+            .serialize_by_content_type("application/x-nope", &value)
+            .unwrap_err();
+        assert!(
+            matches!(err, SerializerError::UnsupportedContentType(ct) if ct == "application/x-nope")
+        );
+
+        let err = registry
+            .deserialize_by_name::<serde_json::Value>("nope", b"data")
+            .unwrap_err();
+        assert!(matches!(err, SerializerError::UnsupportedContentType(_)));
+    }
+
+    #[test]
+    fn test_custom_registry_deserialize_propagates_error() {
+        // The custom serializer rejects payloads without the magic prefix; that
+        // error must surface from the registry as a Deserialize error.
+        let mut registry = CustomSerializerRegistry::new();
+        registry.register(Box::new(PrefixedJson));
+
+        let err = registry
+            .deserialize_by_name::<TestData>("prefixed-json", b"not-prefixed")
+            .unwrap_err();
+        assert!(matches!(err, SerializerError::Deserialize(_)));
+    }
+
+    #[test]
+    fn test_custom_registry_unregister() {
+        let mut registry = CustomSerializerRegistry::new();
+        registry.register(Box::new(PrefixedJson));
+        assert!(registry.contains_name("prefixed-json"));
+        assert!(registry.contains_content_type("application/x-prefixed-json"));
+
+        assert!(registry.unregister("prefixed-json"));
+        assert!(!registry.contains_name("prefixed-json"));
+        // The content-type mapping is dropped alongside the name mapping.
+        assert!(!registry.contains_content_type("application/x-prefixed-json"));
+        assert!(registry.is_empty());
+
+        // Unregistering a missing serializer reports false.
+        assert!(!registry.unregister("prefixed-json"));
+    }
+
+    #[test]
+    fn test_custom_registry_re_register_overrides() {
+        // A second serializer sharing the same name replaces the first.
+        struct PrefixedJsonV2;
+        impl CustomSerializer for PrefixedJsonV2 {
+            fn name(&self) -> &str {
+                "prefixed-json"
+            }
+            fn content_type(&self) -> &str {
+                "application/x-prefixed-json"
+            }
+            fn serialize_value(&self, _value: &serde_json::Value) -> SerializerResult<Vec<u8>> {
+                Ok(b"V2".to_vec())
+            }
+            fn deserialize_value(&self, _bytes: &[u8]) -> SerializerResult<serde_json::Value> {
+                Ok(serde_json::json!("v2"))
+            }
+        }
+
+        let mut registry = CustomSerializerRegistry::new();
+        registry.register(Box::new(PrefixedJson));
+        registry.register(Box::new(PrefixedJsonV2));
+
+        // Still exactly one entry under that name.
+        assert_eq!(registry.len(), 1);
+        let bytes = registry
+            .serialize_by_name("prefixed-json", &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(bytes, b"V2");
+    }
+
+    #[test]
+    fn test_custom_registry_names_and_content_types() {
+        struct Other;
+        impl CustomSerializer for Other {
+            fn name(&self) -> &str {
+                "other"
+            }
+            fn content_type(&self) -> &str {
+                "application/x-other"
+            }
+            fn serialize_value(&self, value: &serde_json::Value) -> SerializerResult<Vec<u8>> {
+                serde_json::to_vec(value).map_err(|e| SerializerError::Serialize(e.to_string()))
+            }
+            fn deserialize_value(&self, bytes: &[u8]) -> SerializerResult<serde_json::Value> {
+                serde_json::from_slice(bytes)
+                    .map_err(|e| SerializerError::Deserialize(e.to_string()))
+            }
+        }
+
+        let mut registry = CustomSerializerRegistry::new();
+        registry.register(Box::new(PrefixedJson));
+        registry.register(Box::new(Other));
+
+        let mut names = registry.names();
+        names.sort_unstable();
+        assert_eq!(names, vec!["other", "prefixed-json"]);
+
+        let mut cts = registry.content_types();
+        cts.sort_unstable();
+        assert_eq!(
+            cts,
+            vec!["application/x-other", "application/x-prefixed-json"]
+        );
+    }
+
+    #[test]
+    fn test_custom_registry_is_object_safe_and_default() {
+        // Confirm the trait is object-safe (stored as Box<dyn ...>) and that the
+        // registry has a working Default impl.
+        let registry = CustomSerializerRegistry::default();
+        assert!(registry.is_empty());
+        let _boxed: Box<dyn CustomSerializer> = Box::new(PrefixedJson);
     }
 }

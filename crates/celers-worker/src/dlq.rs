@@ -145,7 +145,7 @@ impl DlqEntry {
     ) -> Self {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         Self {
@@ -170,7 +170,7 @@ impl DlqEntry {
     pub fn age_seconds(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         now.saturating_sub(self.dlq_timestamp)
     }

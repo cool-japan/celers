@@ -7,11 +7,12 @@ use async_trait::async_trait;
 use celers_core::event::{Event, EventEmitter};
 use celers_core::event_persistence::EventPersister;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use oxisql_core::Connection;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use crate::row_ext::{json_from_row, json_param, uuid_param, RowExt};
 use crate::{BackendError, Result};
 
 /// Configuration for [`DbEventPersister`]
@@ -63,16 +64,19 @@ impl DbEventPersisterConfig {
 /// Buffers events in memory and flushes them to PostgreSQL in batches.
 /// The `celers_events` table is created via the [`migrate`](DbEventPersister::migrate) method.
 pub struct DbEventPersister {
-    pool: PgPool,
+    conn: oxisql_postgres::PgConnection,
     config: DbEventPersisterConfig,
     buffer: Arc<Mutex<Vec<Event>>>,
 }
 
 impl DbEventPersister {
     /// Create a new database event persister
-    pub async fn new(pool: PgPool, config: DbEventPersisterConfig) -> Result<Self> {
+    pub async fn new(
+        conn: oxisql_postgres::PgConnection,
+        config: DbEventPersisterConfig,
+    ) -> Result<Self> {
         Ok(Self {
-            pool,
+            conn,
             config,
             buffer: Arc::new(Mutex::new(Vec::new())),
         })
@@ -95,7 +99,11 @@ impl DbEventPersister {
             CREATE INDEX IF NOT EXISTS idx_celers_events_timestamp ON celers_events(timestamp);
         "#;
 
-        sqlx::query(sql).execute(&self.pool).await.map_err(|e| {
+        // `execute_batch` (simple-query protocol) is required here, same as
+        // `PostgresResultBackend::migrate` in lib.rs — this SQL text has
+        // multiple `;`-separated statements, which the extended/prepared-
+        // statement protocol `execute`/`query` use rejects.
+        self.conn.execute_batch(sql).await.map_err(|e| {
             BackendError::Connection(format!("Failed to run event migrations: {}", e))
         })?;
 
@@ -114,31 +122,34 @@ impl DbEventPersister {
 
         // Batch insert using a transaction
         let mut tx =
-            self.pool.begin().await.map_err(|e| {
+            self.conn.transaction().await.map_err(|e| {
                 BackendError::Connection(format!("Failed to begin transaction: {}", e))
             })?;
 
         for event in &events {
             let event_type = event.event_type();
-            let task_id = event.task_id();
+            let task_id_param = event.task_id().map(|id| uuid_param(&id));
             let worker = event.hostname().map(|s| s.to_string());
-            let timestamp = event.timestamp();
+            // See row_ext.rs's "DateTime<Utc> parameter convention (PostgreSQL)"
+            // section: bind the RFC3339 string, cast server-side via `::text::timestamptz`.
+            let timestamp_param = event.timestamp().to_rfc3339();
             let payload = serde_json::to_value(event).map_err(|e| {
                 BackendError::Serialization(format!("Failed to serialize event: {}", e))
             })?;
 
-            sqlx::query(
+            tx.execute(
                 r#"
                 INSERT INTO celers_events (event_type, task_id, worker, timestamp, payload)
-                VALUES ($1, $2, $3, $4, $5)
+                VALUES ($1, $2, $3, $4::text::timestamptz, $5)
                 "#,
+                &[
+                    &event_type,
+                    &task_id_param,
+                    &worker,
+                    &timestamp_param,
+                    &json_param(&payload),
+                ],
             )
-            .bind(event_type)
-            .bind(task_id)
-            .bind(&worker)
-            .bind(timestamp)
-            .bind(&payload)
-            .execute(&mut *tx)
             .await
             .map_err(|e| BackendError::Connection(format!("Failed to insert event: {}", e)))?;
         }
@@ -150,9 +161,9 @@ impl DbEventPersister {
         Ok(())
     }
 
-    /// Get a reference to the underlying connection pool
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// Get a reference to the underlying connection
+    pub fn connection(&self) -> &oxisql_postgres::PgConnection {
+        &self.conn
     }
 
     /// Get the current buffer size
@@ -221,37 +232,41 @@ impl EventPersister for DbEventPersister {
             celers_core::CelersError::Other(format!("DB event flush failed: {}", e))
         })?;
 
+        // See row_ext.rs's DateTime<Utc> parameter convention (PostgreSQL):
+        // RFC3339 string bound + `::text::timestamptz` cast at every
+        // placeholder targeting a `TIMESTAMPTZ` column.
+        let from_param = from.to_rfc3339();
+        let to_param = to.to_rfc3339();
         let rows = if let Some(et) = event_type_filter {
-            sqlx::query(
-                r#"
-                SELECT payload FROM celers_events
-                WHERE timestamp >= $1 AND timestamp <= $2 AND event_type = $3
-                ORDER BY timestamp ASC
-                "#,
-            )
-            .bind(from)
-            .bind(to)
-            .bind(et)
-            .fetch_all(&self.pool)
-            .await
+            self.conn
+                .query(
+                    r#"
+                    SELECT payload FROM celers_events
+                    WHERE timestamp >= $1::text::timestamptz AND timestamp <= $2::text::timestamptz AND event_type = $3
+                    ORDER BY timestamp ASC
+                    "#,
+                    &[&from_param, &to_param, &et],
+                )
+                .await
         } else {
-            sqlx::query(
-                r#"
-                SELECT payload FROM celers_events
-                WHERE timestamp >= $1 AND timestamp <= $2
-                ORDER BY timestamp ASC
-                "#,
-            )
-            .bind(from)
-            .bind(to)
-            .fetch_all(&self.pool)
-            .await
+            self.conn
+                .query(
+                    r#"
+                    SELECT payload FROM celers_events
+                    WHERE timestamp >= $1::text::timestamptz AND timestamp <= $2::text::timestamptz
+                    ORDER BY timestamp ASC
+                    "#,
+                    &[&from_param, &to_param],
+                )
+                .await
         }
         .map_err(|e| celers_core::CelersError::Other(format!("Failed to query events: {}", e)))?;
 
         let mut events = Vec::with_capacity(rows.len());
         for row in &rows {
-            let payload: serde_json::Value = row.get("payload");
+            let payload = json_from_row(row, "payload").map_err(|e| {
+                celers_core::CelersError::Other(format!("Failed to query events: {e}"))
+            })?;
             match serde_json::from_value::<Event>(payload) {
                 Ok(event) => events.push(event),
                 Err(e) => {
@@ -269,22 +284,36 @@ impl EventPersister for DbEventPersister {
         })?;
 
         let count: i64 = if let Some(et) = event_type {
-            let row = sqlx::query("SELECT COUNT(*) FROM celers_events WHERE event_type = $1")
-                .bind(et)
-                .fetch_one(&self.pool)
+            let rows = self
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM celers_events WHERE event_type = $1",
+                    &[&et],
+                )
                 .await
                 .map_err(|e| {
                     celers_core::CelersError::Other(format!("Failed to count events: {}", e))
                 })?;
-            row.get(0)
+            let row = rows.into_iter().next().ok_or_else(|| {
+                celers_core::CelersError::Other("count_events query returned no rows".to_string())
+            })?;
+            row.col_idx(0).map_err(|e| {
+                celers_core::CelersError::Other(format!("Failed to count events: {e}"))
+            })?
         } else {
-            let row = sqlx::query("SELECT COUNT(*) FROM celers_events")
-                .fetch_one(&self.pool)
+            let rows = self
+                .conn
+                .query("SELECT COUNT(*) FROM celers_events", &[])
                 .await
                 .map_err(|e| {
                     celers_core::CelersError::Other(format!("Failed to count events: {}", e))
                 })?;
-            row.get(0)
+            let row = rows.into_iter().next().ok_or_else(|| {
+                celers_core::CelersError::Other("count_events query returned no rows".to_string())
+            })?;
+            row.col_idx(0).map_err(|e| {
+                celers_core::CelersError::Other(format!("Failed to count events: {e}"))
+            })?
         };
 
         Ok(count as u64)
@@ -294,16 +323,20 @@ impl EventPersister for DbEventPersister {
         let cutoff = Utc::now().checked_sub_signed(older_than).ok_or_else(|| {
             celers_core::CelersError::Other("Invalid duration for cleanup cutoff".to_string())
         })?;
+        let cutoff_param = cutoff.to_rfc3339();
 
-        let result = sqlx::query("DELETE FROM celers_events WHERE timestamp < $1")
-            .bind(cutoff)
-            .execute(&self.pool)
+        let rows_affected = self
+            .conn
+            .execute(
+                "DELETE FROM celers_events WHERE timestamp < $1::text::timestamptz",
+                &[&cutoff_param],
+            )
             .await
             .map_err(|e| {
                 celers_core::CelersError::Other(format!("Failed to cleanup events: {}", e))
             })?;
 
-        Ok(result.rows_affected())
+        Ok(rows_affected)
     }
 
     async fn flush(&self) -> celers_core::Result<()> {
@@ -333,7 +366,7 @@ mod tests {
             .with_batch_size(1000)
             .with_enabled(true);
 
-        // We cannot create a real DbEventPersister without a PgPool,
+        // We cannot create a real DbEventPersister without a live PgConnection,
         // so we test config builder logic and buffer behavior indirectly.
         assert_eq!(config.batch_size, 1000);
         assert!(config.enabled);

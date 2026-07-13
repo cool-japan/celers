@@ -4,9 +4,10 @@
 //! batch reject operations.
 
 use crate::broker_core::MysqlBroker;
+use crate::row_ext::RowExt;
 use crate::types::TaskChain;
 use celers_core::{Broker, CelersError, Result, TaskId};
-use sqlx::Row;
+use oxisql_core::Connection;
 
 impl MysqlBroker {
     // ========== Task Chain Support ==========
@@ -81,8 +82,8 @@ impl MysqlBroker {
         }
 
         let mut tx = self
-            .pool
-            .begin()
+            .connection()
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
@@ -91,27 +92,30 @@ impl MysqlBroker {
         for (task_id, _receipt_handle, requeue) in tasks {
             if *requeue {
                 // Check if task has exceeded max retries
-                let row = sqlx::query(
-                    r#"
-                    SELECT retry_count, max_retries
-                    FROM celers_tasks
-                    WHERE id = ?
-                    "#,
-                )
-                .bind(task_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| CelersError::Other(format!("Failed to fetch task: {}", e)))?;
+                let rows = tx
+                    .query(
+                        r#"
+                        SELECT retry_count, max_retries
+                        FROM celers_tasks
+                        WHERE id = ?
+                        "#,
+                        &[&task_id.to_string()],
+                    )
+                    .await
+                    .map_err(|e| CelersError::Other(format!("Failed to fetch task: {}", e)))?;
 
-                if let Some(row) = row {
-                    let retry_count: i32 = row.get("retry_count");
-                    let max_retries: i32 = row.get("max_retries");
+                if let Some(row) = rows.into_iter().next() {
+                    let retry_count: i32 = row
+                        .col("retry_count")
+                        .map_err(|e| CelersError::Other(format!("Failed to fetch task: {e}")))?;
+                    let max_retries: i32 = row
+                        .col("max_retries")
+                        .map_err(|e| CelersError::Other(format!("Failed to fetch task: {e}")))?;
 
                     if retry_count >= max_retries {
-                        // Move to DLQ
-                        sqlx::query("CALL move_to_dlq(?)")
-                            .bind(task_id.to_string())
-                            .execute(&mut *tx)
+                        // Move to DLQ — plain `CALL move_to_dlq(?)` with a `?`
+                        // parameter, translated like any other MySQL statement.
+                        tx.execute("CALL move_to_dlq(?)", &[&task_id.to_string()])
                             .await
                             .map_err(|e| {
                                 CelersError::Other(format!("Failed to move task to DLQ: {}", e))
@@ -120,7 +124,7 @@ impl MysqlBroker {
                         // Requeue with exponential backoff
                         let backoff_seconds = 2_i64.pow(retry_count as u32).min(3600); // Max 1 hour
 
-                        sqlx::query(
+                        tx.execute(
                             r#"
                             UPDATE celers_tasks
                             SET state = 'pending',
@@ -129,10 +133,8 @@ impl MysqlBroker {
                                 worker_id = NULL
                             WHERE id = ?
                             "#,
+                            &[&backoff_seconds, &task_id.to_string()],
                         )
-                        .bind(backoff_seconds)
-                        .bind(task_id.to_string())
-                        .execute(&mut *tx)
                         .await
                         .map_err(|e| {
                             CelersError::Other(format!("Failed to requeue task: {}", e))
@@ -142,20 +144,22 @@ impl MysqlBroker {
                 }
             } else {
                 // Mark as failed permanently
-                let result = sqlx::query(
-                    r#"
-                    UPDATE celers_tasks
-                    SET state = 'failed',
-                        completed_at = NOW()
-                    WHERE id = ?
-                    "#,
-                )
-                .bind(task_id.to_string())
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| CelersError::Other(format!("Failed to mark task as failed: {}", e)))?;
+                let affected = tx
+                    .execute(
+                        r#"
+                        UPDATE celers_tasks
+                        SET state = 'failed',
+                            completed_at = NOW()
+                        WHERE id = ?
+                        "#,
+                        &[&task_id.to_string()],
+                    )
+                    .await
+                    .map_err(|e| {
+                        CelersError::Other(format!("Failed to mark task as failed: {}", e))
+                    })?;
 
-                rejected_count += result.rows_affected();
+                rejected_count += affected;
             }
         }
 

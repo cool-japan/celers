@@ -2,7 +2,7 @@
 
 > Celery protocol v2/v5 implementation
 
-## Status: ✅ STABLE — v0.2.0 (2026-03-27) — 461 tests
+## Status: ✅ STABLE — v0.3.0 (2026-07-13) — 503 tests
 
 Full Celery protocol compatibility with advanced utilities and performance optimizations.
 
@@ -46,6 +46,25 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - [x] `JsonSerializer` implementation
 - [x] `MessagePackSerializer` implementation (optional)
 - [x] `YamlSerializer` implementation (optional `yaml` feature)
+  - [x] Content type `application/x-yaml` (+ `application/yaml`, `text/yaml` aliases)
+  - [x] UTF-8 text encoding, wired into the content-type registry, auto-detection
+        (`---` document marker) and `SerializerType::Yaml` dispatch
+  - [x] Round-trip tests for a representative message struct and a dynamic
+        `serde_json::Value` (message-like map)
+- [x] Custom serializers (runtime registration) ✅ (NEW)
+  - [x] `CustomSerializer` trait — object-safe, operates on `serde_json::Value`
+        (`name`, `content_type`, `content_encoding`, `serialize_value`,
+        `deserialize_value`)
+  - [x] `CustomSerializerRegistry` — register/unregister user serializers and
+        dispatch by name or content type (`serialize_by_name`,
+        `serialize_by_content_type`, `deserialize_by_name`,
+        `deserialize_by_content_type`, plus `get_by_*`/`contains_*`/`names`/
+        `content_types`/`len`/`is_empty`)
+  - [x] Additive to the existing `Serializer`/`SerializerType` API (no existing
+        public signatures changed or removed)
+- [x] Pickle serializer — INTENTIONALLY OUT OF SCOPE (Python `pickle` executes
+      arbitrary code on load; remote-code-execution risk). Use JSON, MessagePack,
+      YAML, BSON, or a safe `CustomSerializer` instead.
 - [x] `SerializerType` enum for dynamic dispatch
 - [x] `SerializerRegistry` for managing serializers
 - [x] Auto-detection by content type
@@ -113,6 +132,29 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - [x] `detect_protocol_from_bytes()` - Detect from raw bytes
 - [x] `negotiate_protocol()` - Helper for version agreement
 
+### Full Protocol v5 Wire Compatibility ✅ (NEW)
+- [x] Protocol version negotiation (pure helpers)
+  - [x] `negotiate_version(local, remote)` - Highest mutually-supported version
+        (returns `Option<ProtocolVersion>`, `None` on no overlap)
+  - [x] `locally_supported_versions()` - Advertise local versions (highest first)
+  - [x] `parse_version()` / `encode_version()` - String <-> `ProtocolVersion`
+  - [x] `parse_version_from_headers()` / `encode_version_into_headers()` -
+        Parse/encode the `protocol_version` header (string or numeric value)
+  - [x] `PROTOCOL_VERSION_KEY` constant for the header/property key
+  - [x] Full negotiation matrix tests (overlap, no-overlap, single common, empty)
+- [x] Native v5 wire-format builder (`v5` module)
+  - [x] `V5MessageSpec` - Declarative builder for a v5 message
+  - [x] `build_v5_message()` - Produce the v5 headers+properties+body envelope
+  - [x] `V5MessageSpec::build()` - Builder-style entry point
+  - [x] `to_v5_wire()` - Re-stamp an existing `Message` as v5 (no compat gating)
+  - [x] `V5Message::to_wire_value()` / `to_wire_bytes()` - Canonical envelope
+  - [x] `V5Message::into_message()` / `as_message()` - Lower to shared `Message`
+  - [x] `is_v5_wire()` - Detect the v5 protocol stamp on a `Message`
+  - [x] `DELIVERY_PRIORITY_HEADER` constant (header-surfaced priority)
+  - [x] Mirrors real v5-vs-v2 differences from `migration.rs`:
+        protocol-version stamp, header-surfaced priority, inline workflow ids
+  - [x] v5 build + round-trip tests (body `[args, kwargs, embed]`, wire shape)
+
 ### Security ✅ (NEW)
 - [x] `ContentTypeWhitelist` - Allow/block content types
   - [x] safe() - JSON, MessagePack (block pickle)
@@ -162,6 +204,7 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - [x] `MessageExt` trait - Extension methods for Message
   - [x] `validate_basic()` - Basic validation
   - [x] `is_expired()` / `is_scheduled()` - Time-based checks
+  - [x] `get_age_seconds()` - Real age tracking via `MessageHeaders.created_at`
   - [x] `sign_body()` / `verify_body()` - Message signing integration
   - [x] `encrypt_body()` / `decrypt_body()` - Encryption integration
 - [x] `SignedMessage` - Wrapper for signed messages
@@ -171,7 +214,9 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 ### Protocol Migration ✅ (NEW)
 - [x] `ProtocolMigrator` - Version migration helpers
   - [x] `check_compatibility()` - Compatibility checking
-  - [x] `migrate()` - Protocol version migration
+  - [x] `migrate()` - Real version-aware migration (stamps target version in
+        `headers.extra`, mirrors v5 priority / v2 workflow ids)
+  - [x] `check_strict_compatibility()` - Real feature inspection per target
   - [x] Multiple strategies (Conservative, Permissive, Strict)
 - [x] `CompatibilityInfo` - Detailed compatibility information
 - [x] `MigrationStrategy` - Configurable migration behavior
@@ -299,7 +344,7 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 ### Protocol Extensions
 - [ ] Celery Protocol v6 (when released)
 
-## Testing (Total: 461 tests) ✅
+## Testing (Total: 503 tests, verified via `cargo nextest run -p celers-protocol --all-features`) ✅
 
 - [x] Message serialization tests (27 tests)
 - [x] Builder pattern tests (22 tests)
@@ -312,8 +357,8 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - [x] Security tests (15 tests)
 - [x] Authentication tests (8 tests) - HMAC signing ✅
 - [x] Encryption tests (11 tests) - AES-256-GCM ✅
-- [x] Extensions tests (9 tests) - Message utilities ✅
-- [x] Migration tests (10 tests) - Protocol migration ✅
+- [x] Extensions tests (10 tests) - Message utilities (incl. age tracking) ✅
+- [x] Migration tests (17 tests) - Protocol migration (version stamping, strict compat) ✅
 - [x] Middleware tests (18 tests) - Transformation pipeline ✅
 - [x] Zero-copy tests (6 tests) - MessageRef and TaskArgsRef ✅
 - [x] Lazy deserialization tests (8 tests) - LazyMessage and LazyTaskArgs ✅
@@ -367,8 +412,8 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - `serde_yaml` - YAML (optional)
 - `bson` - BSON serialization (optional)
 - `prost` - Protobuf serialization (optional)
-- `flate2` - Gzip compression (optional)
-- `zstd` - Zstandard compression (optional)
+- `oxiarc-deflate` - Gzip/deflate compression (optional, Pure Rust)
+- `oxiarc-zstd` - Zstandard compression (optional, Pure Rust)
 - `hmac` - HMAC for message signing (optional)
 - `sha2` - SHA-256 for HMAC (optional)
 - `aes-gcm` - AES-256-GCM encryption (optional)
@@ -393,8 +438,8 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - Pickle serialization NOT supported (security risk)
 - All timestamps use UTC
 - UUIDs are v4 (random)
-- **257 unit tests** (default features), all passing ✅
-- **419 unit tests** (all features), all passing ✅ (UPDATED v0.1.19)
+- **449 unit tests** (default features), all passing ✅
+- **503 unit tests** (all features), all passing ✅ (verified via `cargo nextest run -p celers-protocol`)
 - **18 doc tests**, all passing ✅ (1 ignored)
 - **6 integration examples**, fully documented ✅
 - **2 automation scripts** for testing and benchmarking ✅

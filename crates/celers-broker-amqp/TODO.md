@@ -2,7 +2,7 @@
 
 > RabbitMQ/AMQP broker implementation for CeleRS
 
-## Status: ✅ STABLE (v0.2.0) — 244 tests passing | Updated: 2026-03-27
+## Status: ✅ STABLE (v0.3.0) — 244 tests passing | Updated: 2026-07-13
 
 Enterprise-ready AMQP broker with comprehensive production patterns including backpressure management, poison message detection, advanced routing, performance optimization, lifecycle hooks, DLX analytics, adaptive batching, performance profiling, rate limiting, bulkhead isolation, message scheduling, metrics export, circuit breaker pattern, advanced retry strategies, message compression, topology validation, observability enhancements, consumer group management, and comprehensive monitoring/utility modules.
 
@@ -613,21 +613,21 @@ Enterprise-ready AMQP broker with comprehensive production patterns including ba
 ## Dependencies
 
 **Production Dependencies:**
-- `lapin` - RabbitMQ/AMQP client (v2.5)
-- `reqwest` - HTTP client for Management API (v0.12)
+- `lapin` - RabbitMQ/AMQP client (v4.10.0)
+- `oxihttp-client` - Pure-Rust HTTP client for Management API, TLS via `webpki-roots` (v0.2.0)
 - `urlencoding` - URL encoding for Management API (v2.1)
 - `celers-protocol` - Message types
 - `celers-kombu` - Broker traits
 - `async-trait` - Async trait support
-- `tokio` - Async runtime (v1.42)
+- `tokio` - Async runtime (v1.52.3)
 - `tracing` - Logging
 - `serde_json` - JSON serialization
 
 **Development Dependencies:**
-- `tokio-test` - Testing utilities (v0.4)
+- `celers-core` - Core types (required by the `amqp-events` feature during tests/benches)
 - `tracing-subscriber` - Logging for examples (v0.3)
 - `futures` - Stream utilities for examples (v0.3)
-- `criterion` - Benchmarking framework (v0.5)
+- `criterion` - Benchmarking framework (v0.8.2)
 
 ## RabbitMQ Configuration
 
@@ -732,3 +732,5 @@ The examples include built-in throughput measurements and timing information.
 - Management API requires HTTP access to RabbitMQ (default port: 15672)
 - Connection pool is disabled by default (connection_pool_size: 0)
 - Channel pool is enabled by default (channel_pool_size: 10)
+- The Management API HTTP client now uses `oxihttp-client` (Pure Rust), replacing the former `reqwest`-based implementation
+- Still depends on `ring`/`aws-lc-sys` transitively via `lapin`; tracked as an accepted, upstream-blocked limitation pending a Pure-Rust AMQP client in the COOLJAPAN ecosystem — not a regression

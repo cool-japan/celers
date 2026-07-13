@@ -4,7 +4,7 @@
 
 **CeleRS** (Celery + Rust) is a production-ready, Celery-compatible distributed task queue library for Rust. Built from the ground up to provide binary-level protocol compatibility with Python Celery while delivering superior performance, type safety, and reliability.
 
-**Status**: ✅ Production-Ready | ✅ 0 Errors | ✅ 0 Warnings | ✅ 5 Brokers | ✅ 3 Backends
+**Status**: ✅ Production-Ready | ✅ 0 Errors | ✅ 0 Warnings | ✅ 5 Brokers | ✅ 3 Backends | ✅ 5,676 Tests Passing (`--all-features`)
 
 ## 🎯 Vision
 
@@ -26,6 +26,8 @@ CeleRS aims to be the definitive task queue solution for Rust, offering:
 - ✅ **Retry Logic**: Exponential backoff with configurable max retries
 - ✅ **Timeout Enforcement**: Task-level and worker-level timeout controls
 - ✅ **Graceful Shutdown**: Clean worker termination with in-flight task completion
+- ✅ **Task Security**: HMAC-SHA256 signature verification, argument sanitization, PII detection & masking
+- ✅ **Local Development Mode**: In-memory broker/backend (`InMemoryBroker`, `InMemoryResultBackend`) — no external services required
 
 ### Broker Support (5 Types)
 - ✅ **Redis**: High-throughput with Lua scripts and pipelining
@@ -48,15 +50,26 @@ CeleRS aims to be the definitive task queue solution for Rust, offering:
 - ✅ **Signature**: Task signatures for workflow composition
 
 ### Observability
-- ✅ **Prometheus Metrics**: Task throughput, latency, queue depth
+- ✅ **Prometheus Metrics**: Task throughput, latency, queue depth (native histograms + P² streaming quantile summaries)
+- ✅ **StatsD Backend**: Pure-`std::net::UdpSocket` exporter (counters, gauges, timers, DogStatsD tags) alongside Prometheus
+- ✅ **SLA/SLO Tracking & Anomaly Detection**: Error-budget burn alerts plus EWMA-based statistical anomaly detection
+- ✅ **Audit Log**: Task lifecycle audit trail (ring-buffer + JSONL file sinks, queryable)
 - ✅ **Health Checks**: Kubernetes-compatible liveness/readiness probes
 - ✅ **OpenTelemetry**: Distributed tracing integration
 - ✅ **Grafana Dashboards**: Pre-built visualization templates
 
 ### Developer Experience
 - ✅ **Procedural Macros**: `#[celers::task]` for automatic task registration
-- ✅ **CLI Tooling**: Worker management, queue inspection, DLQ operations
-- ✅ **Configuration Management**: TOML/YAML files + environment variables
+- ✅ **CLI Tooling**: Worker management, queue inspection, DLQ operations, dependency-graph visualization (`deps`)
+- ✅ **CLI Connection Pooling & Caching**: `ClientPool`/`TtlCache` front queue/worker reads with concurrent lookups; `cache-stats` command and REPL `stats` reporting live hit/reuse ratios
+- ✅ **Structured CLI Errors**: Classified `CliError`s with decorated `error[E_CODE]:` output and actionable `suggestion:` lines; `error-codes` reference command
+- ✅ **Structured Logging**: `--log-format text|json` plus `--log-sink stdout|file:<path>|tcp:<host:port>` for CLI log output
+- ✅ **Smart Defaults**: Broker URL auto-detection (`CELERY_BROKER_URL`/`CELERS_BROKER_URL`/`REDIS_URL`/`AMQP_URL`) and Levenshtein-based "did you mean" suggestions in the `interactive` REPL
+- ✅ **User-Defined Aliases**: `alias add/remove/list` for custom command shortcuts, expanded before argument parsing
+- ✅ **Incremental Backup/Restore**: `backup --previous <archive>`/`--since <timestamp>` plus `restore --conflict-policy skip|overwrite|merge`
+- ✅ **Setup Wizard**: `init --wizard` interactive broker/queue/worker/alerting configuration with live connection testing
+- ✅ **Reporting & Profiling**: `report daily/weekly/history/queues/workers` and `analyze profile task/resources/worker`, with `table`/`csv`/`html` output (HTML includes an inline SVG chart)
+- ✅ **Configuration Management**: TOML/YAML files + environment variables + runtime `config reload`
 - ✅ **Comprehensive Documentation**: API docs, guides, and examples
 
 ## 🏗️ Architecture
@@ -115,29 +128,35 @@ CeleRS follows a **layered architecture** inspired by Python Celery's design:
 - **celers-cli**: Command-line worker and queue management
 - **celers-metrics**: Prometheus metrics and observability
 
-### Crate Status (v0.2.0)
+### Crate Status (v0.3.0)
 
 | Crate | Status | Tests |
 |-------|--------|-------|
-| celers-worker | [Stable] | 486 |
-| celers-protocol | [Stable] | 461 |
-| celers-broker-redis | [Stable] | 454 |
-| celers-kombu | [Stable] | 323 |
-| celers-beat | [Stable] | 312 |
+| celers-cli | [Alpha] | 757 |
+| celers-worker | [Stable] | 655 |
+| celers-protocol | [Stable] | 503 |
+| celers-broker-redis | [Stable] | 478 |
+| celers-core | [Stable] | 438 |
+| celers-beat | [Stable] | 427 |
+| celers-kombu | [Stable] | 343 |
+| celers-canvas | [Stable] | 320 |
+| celers-metrics | [Stable] | 319 |
 | celers-broker-sqs | [Stable] | 294 |
-| celers-core | [Stable] | 247 |
-| celers-broker-amqp | [Stable] | 244 |
+| celers-broker-amqp | [Stable] | 265 |
+| celers-backend-redis | [Stable] | 226 |
 | celers-macros | [Stable] | 221 |
-| celers-backend-redis | [Stable] | 208 |
-| celers-canvas | [Stable] | 196 |
-| celers-metrics | [Stable] | 183 |
-| celers (facade) | [Stable] | 145 |
-| celers-broker-postgres | [Stable] | 117 |
-| celers-cli | [Stable] | 101 |
-| celers-broker-sql | [Stable] | 68 |
-| celers-backend-rpc | [Stable] | 8 |
-| celers-backend-db | [Stable] | 7 |
-| **Total** | **18/18** | **4075** |
+| celers-broker-postgres | [Stable] | 175 |
+| celers (facade) | [Stable] | 154 |
+| celers-broker-sql | [Alpha] | 126 |
+| celers-backend-db | [Alpha] | 61 |
+| celers-backend-rpc | [Alpha] | 19 |
+| **Total** | **14 Stable, 4 Alpha** | **5781** |
+
+Per-crate counts are defined test cases (`cargo nextest list --workspace --all-features`). The
+verified *executed* result is **5,676 passing / 0 failed with `--all-features`** (**5,495 passing /
+0 failed** with default features) — the ~105-test gap versus the table total is tests gated behind
+live external services (Redis/PostgreSQL/MySQL/RabbitMQ/SQS) marked `#[ignore]` by default (106
+such tests in the workspace), not a discrepancy.
 
 ## 🚀 Quick Start
 
@@ -147,11 +166,11 @@ Add CeleRS to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-celers-core = "0.2"
-celers-protocol = "0.2"
-celers-broker-redis = "0.2"
-celers-worker = "0.2"
-celers-macros = "0.2"
+celers-core = "0.3"
+celers-protocol = "0.3"
+celers-broker-redis = "0.3"
+celers-worker = "0.3"
+celers-macros = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -159,24 +178,22 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use celers_macros::task;
-use serde::{Deserialize, Serialize};
-
-#[derive(Deserialize)]
-struct AddArgs {
-    x: i32,
-    y: i32,
-}
+use celers_core::Result;
 
 #[task]
-async fn add(args: AddArgs) -> i32 {
-    args.x + args.y
+async fn add(x: i32, y: i32) -> Result<i32> {
+    Ok(x + y)
 }
+
+// The macro generates `AddTask` (implements the `Task` trait) and an
+// `AddTaskInput { x: i32, y: i32 }` struct from the function signature.
 ```
 
 ### Start a Worker
 
 ```rust
 use celers_broker_redis::RedisBroker;
+use celers_core::TaskRegistry;
 use celers_worker::{Worker, WorkerConfig};
 
 #[tokio::main]
@@ -184,19 +201,20 @@ async fn main() -> anyhow::Result<()> {
     // Create broker
     let broker = RedisBroker::new("redis://localhost:6379", "celers")?;
 
+    // Register tasks (registry is handed to the worker at construction time)
+    let registry = TaskRegistry::new();
+    registry.register(AddTask).await;
+
     // Configure worker
     let config = WorkerConfig {
         concurrency: 4,
         max_retries: 3,
-        default_timeout: Duration::from_secs(300),
+        default_timeout_secs: 300,
         ..Default::default()
     };
 
-    // Register tasks
-    let mut worker = Worker::new(broker, config);
-    worker.register_task("add", add);
-
-    // Start processing
+    // Create and start the worker
+    let worker = Worker::new(broker, registry, config);
     worker.run().await?;
 
     Ok(())
@@ -206,12 +224,12 @@ async fn main() -> anyhow::Result<()> {
 ### Enqueue Tasks
 
 ```rust
-use celers_core::SerializedTask;
+use celers_core::{Broker, SerializedTask};
 use celers_broker_redis::RedisBroker;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut broker = RedisBroker::new("redis://localhost:6379", "celers")?;
+    let broker = RedisBroker::new("redis://localhost:6379", "celers")?;
 
     let task = SerializedTask::new(
         "add".to_string(),
@@ -244,8 +262,27 @@ celers dlq inspect
 # Replay failed task
 celers dlq replay <task-id>
 
-# Generate configuration file
+# Generate configuration file (or launch the interactive setup wizard)
 celers init > celers.toml
+celers init --wizard
+
+# Visualize task dependencies from a queue export
+celers deps --from queue-export.json --format dot
+
+# Manage user-defined command aliases
+celers alias add up "worker --broker redis://localhost:6379"
+
+# Connection-pool / cache stats and structured error reference
+celers cache-stats
+celers error-codes
+
+# Incremental backup, restore with conflict handling
+celers backup --previous last-backup.json
+celers restore --conflict-policy skip
+
+# Reports and profiling (table/csv/html, HTML embeds an SVG chart)
+celers report weekly --format html --output weekly.html
+celers analyze profile task --queue default
 ```
 
 ## 📊 Monitoring
@@ -277,10 +314,12 @@ celers_task_execution_seconds
 Kubernetes-compatible health endpoints:
 
 ```rust
+use celers_worker::health::HealthChecker;
+
 let checker = HealthChecker::new();
 
-// Liveness probe: Is the worker alive?
-let health = checker.is_alive();
+// Liveness probe: Is the worker healthy?
+let healthy = checker.is_healthy();
 
 // Readiness probe: Can the worker accept tasks?
 let ready = checker.is_ready();
@@ -291,7 +330,7 @@ let info = checker.get_health();
 
 ## 🗺️ Roadmap
 
-### Current Status (v0.2.0) — Released 2026-03-28
+### Current Status (v0.3.0) — Released 2026-07-12
 
 - ✅ **Phase 1**: The Backbone (Core runtime)
 - ✅ **Phase 2**: Advanced Features (Priorities, DLQ, Cancellation)
@@ -305,7 +344,7 @@ let info = checker.get_health();
 
 ### Upcoming Milestones
 
-- **v0.3.0**: Full Python Celery interoperability (bidirectional task exchange, Protocol v5)
+- **Next**: Full Python Celery interoperability (bidirectional task exchange, integration tests against real Python Celery workers)
 - **v1.0.0**: Stable API, Kafka/NATS brokers, web admin dashboard, security hardening
 
 ## 📖 Documentation
@@ -315,7 +354,7 @@ let info = checker.get_health();
 
 ## 🔬 Examples
 
-The repository includes 8+ working examples:
+The repository includes 15 working examples (in `crates/celers-examples/examples/`):
 
 - `phase1_complete` - Basic task execution
 - `graceful_shutdown` - Clean worker termination
@@ -325,6 +364,13 @@ The repository includes 8+ working examples:
 - `macro_tasks` - Procedural macro usage
 - `prometheus_metrics` - Metrics HTTP server
 - `health_checks` - Health check endpoints
+- `async_result` - AsyncResult API usage
+- `canvas_workflows` - Chain/Group/Chord workflow composition
+- `facade_usage` - Using the `celers` facade crate
+- `basic_processing` - Minimal end-to-end processing example
+- `postgres_broker_example` - PostgreSQL broker walkthrough
+- `web_scraper` - Real-world web scraping workload
+- `image_processing` - Real-world image processing workload
 
 Run examples with:
 
@@ -333,6 +379,9 @@ cargo run --example prometheus_metrics
 ```
 
 ## 🧪 Testing
+
+Verified workspace-wide with `cargo nextest run --workspace`: **5,676 tests passing, 0 failed**
+with `--all-features` (**5,495 passing, 0 failed** with default features).
 
 ```bash
 # Run all tests
@@ -345,7 +394,7 @@ cargo test --all-features
 cargo bench
 
 # Check for warnings
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 ```
 
 ## 🏆 Performance
@@ -417,6 +466,6 @@ Licensed under Apache-2.0
 
 ---
 
-**Status**: Active Development | **Version**: 0.2.0 | **Rust**: 1.70+ (MSRV)
+**Status**: Active Development | **Version**: 0.3.0 | **Rust**: 1.70+ (MSRV)
 
 Built with ❤️ for the Rust community

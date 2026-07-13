@@ -41,7 +41,12 @@
 //! # }
 //! ```
 
+use aes_gcm::{
+    aead::{Aead, Generate, KeyInit},
+    Aes256Gcm, Nonce as AesNonce,
+};
 use celers_core::{CelersError, Result};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -186,39 +191,29 @@ impl EncryptionManager {
         Ok(())
     }
 
-    /// Encrypt data
+    /// Encrypt data using real AEAD cipher (AES-256-GCM or ChaCha20-Poly1305)
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<EncryptedData> {
         let key_version = self.config.current_key_version;
-
         let keys = self.keys.blocking_read();
         let key = keys
             .get(&key_version)
             .ok_or_else(|| CelersError::Broker(format!("Key version {} not found", key_version)))?;
 
-        // For simplicity, this is a mock implementation
-        // In production, you would use a proper crypto library like `aes-gcm` or `chacha20poly1305`
-
-        // Generate random IV (12 bytes for GCM)
-        let iv = self.generate_iv();
-
-        // Mock encryption (in production, use actual AES-GCM)
-        let mut ciphertext = plaintext.to_vec();
-        for (i, byte) in ciphertext.iter_mut().enumerate() {
-            *byte ^= key[i % key.len()];
-        }
-
-        // Mock authentication tag (16 bytes for GCM)
-        let tag = self.generate_tag(key, &iv, &ciphertext);
+        let (iv, ciphertext, tag) = match self.config.algorithm {
+            EncryptionAlgorithm::Aes256Gcm => self.encrypt_aes256gcm(key, plaintext)?,
+            EncryptionAlgorithm::ChaCha20Poly1305 => self.encrypt_chacha20(key, plaintext)?,
+        };
 
         let encrypted_dek = if self.config.enable_envelope_encryption {
             let kek_guard = self.kek.blocking_read();
             if let Some(kek) = kek_guard.as_ref() {
-                // Encrypt the DEK with KEK
-                let mut encrypted_dek = key.clone();
-                for (i, byte) in encrypted_dek.iter_mut().enumerate() {
-                    *byte ^= kek[i % kek.len()];
-                }
-                Some(encrypted_dek)
+                let (dek_iv, dek_ct, dek_tag) = self.encrypt_aes256gcm(kek, key)?;
+                // Encode as: [12-byte IV][16-byte tag][ciphertext]
+                let mut encoded = Vec::with_capacity(dek_iv.len() + dek_tag.len() + dek_ct.len());
+                encoded.extend_from_slice(&dek_iv);
+                encoded.extend_from_slice(&dek_tag);
+                encoded.extend_from_slice(&dek_ct);
+                Some(encoded)
             } else {
                 return Err(CelersError::Broker(
                     "KEK not set for envelope encryption".to_string(),
@@ -238,46 +233,47 @@ impl EncryptionManager {
         })
     }
 
-    /// Decrypt data
+    /// Decrypt data using real AEAD cipher (AES-256-GCM or ChaCha20-Poly1305)
     pub fn decrypt(&self, encrypted: &EncryptedData) -> Result<Vec<u8>> {
         let keys = self.keys.blocking_read();
-        let mut key = keys
-            .get(&encrypted.key_version)
-            .ok_or_else(|| {
-                CelersError::Broker(format!("Key version {} not found", encrypted.key_version))
-            })?
-            .clone();
+        let stored_key = keys.get(&encrypted.key_version).ok_or_else(|| {
+            CelersError::Broker(format!("Key version {} not found", encrypted.key_version))
+        })?;
 
-        // If envelope encryption was used, decrypt the DEK first
-        if let Some(ref _encrypted_dek) = encrypted.encrypted_dek {
+        let effective_key: Vec<u8> = if let Some(ref enc_dek) = encrypted.encrypted_dek {
+            // Decode envelope: [12-byte IV][16-byte tag][DEK ciphertext]
+            if enc_dek.len() < 28 {
+                return Err(CelersError::Broker("Malformed encrypted DEK".to_string()));
+            }
+            let dek_iv = &enc_dek[..12];
+            let dek_tag = &enc_dek[12..28];
+            let dek_ct = &enc_dek[28..];
             let kek_guard = self.kek.blocking_read();
             if let Some(kek) = kek_guard.as_ref() {
-                // Decrypt DEK with KEK
-                for (i, byte) in key.iter_mut().enumerate() {
-                    *byte ^= kek[i % kek.len()];
-                }
+                self.decrypt_aes256gcm(kek, dek_iv, dek_ct, dek_tag)?
             } else {
                 return Err(CelersError::Broker(
                     "KEK not set for decryption".to_string(),
                 ));
             }
-        }
+        } else {
+            stored_key.clone()
+        };
 
-        // Verify tag (in production, use actual AEAD verification)
-        let expected_tag = self.generate_tag(&key, &encrypted.iv, &encrypted.ciphertext);
-        if expected_tag != encrypted.tag {
-            return Err(CelersError::Broker(
-                "Authentication tag verification failed".to_string(),
-            ));
+        match encrypted.algorithm {
+            EncryptionAlgorithm::Aes256Gcm => self.decrypt_aes256gcm(
+                &effective_key,
+                &encrypted.iv,
+                &encrypted.ciphertext,
+                &encrypted.tag,
+            ),
+            EncryptionAlgorithm::ChaCha20Poly1305 => self.decrypt_chacha20(
+                &effective_key,
+                &encrypted.iv,
+                &encrypted.ciphertext,
+                &encrypted.tag,
+            ),
         }
-
-        // Mock decryption (in production, use actual AES-GCM)
-        let mut plaintext = encrypted.ciphertext.clone();
-        for (i, byte) in plaintext.iter_mut().enumerate() {
-            *byte ^= key[i % key.len()];
-        }
-
-        Ok(plaintext)
     }
 
     /// Encrypt specific fields in a JSON object
@@ -341,23 +337,92 @@ impl EncryptionManager {
         self.config.current_key_version
     }
 
-    /// Generate initialization vector (mock implementation)
-    fn generate_iv(&self) -> Vec<u8> {
-        use rand::RngExt;
-        let mut rng = rand::rng();
-        let mut iv = vec![0u8; 12]; // 12 bytes for GCM
-        rng.fill(&mut iv[..]);
-        iv
+    // -------------------------------------------------------------------------
+    // Private AEAD cipher helpers
+    // -------------------------------------------------------------------------
+
+    /// Encrypt plaintext with AES-256-GCM.
+    ///
+    /// Returns `(nonce_bytes, ciphertext, tag)`.  The GCM tag (16 bytes) is
+    /// appended by the `aes-gcm` crate to the end of the encrypt output; we
+    /// split it off so it can be stored separately (matching `EncryptedData`).
+    fn encrypt_aes256gcm(
+        &self,
+        key: &[u8],
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|e| CelersError::Broker(format!("AES-256-GCM key error: {e}")))?;
+        let nonce = AesNonce::try_generate()
+            .map_err(|e| CelersError::Broker(format!("AES-256-GCM nonce error: {e}")))?;
+        let mut buf = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|e| CelersError::Broker(format!("AES-256-GCM encryption failed: {e}")))?;
+        // The last 16 bytes are the authentication tag
+        let tag = buf.split_off(buf.len() - 16);
+        Ok((nonce.to_vec(), buf, tag))
     }
 
-    /// Generate authentication tag (mock implementation)
-    fn generate_tag(&self, key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Vec<u8> {
-        // Mock tag generation (in production, use actual AEAD)
-        let mut tag = vec![0u8; 16];
-        for i in 0..16 {
-            tag[i] = key[i % key.len()] ^ iv[i % iv.len()] ^ ciphertext[i % ciphertext.len()];
-        }
-        tag
+    /// Decrypt with AES-256-GCM.  Re-appends `tag` to `ciphertext` before
+    /// handing the combined buffer to the AEAD `decrypt()` call.
+    fn decrypt_aes256gcm(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        ciphertext: &[u8],
+        tag: &[u8],
+    ) -> Result<Vec<u8>> {
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|e| CelersError::Broker(format!("AES-256-GCM key error: {e}")))?;
+        let nonce = AesNonce::try_from(iv)
+            .map_err(|_| CelersError::Broker("AES-256-GCM invalid nonce length".to_string()))?;
+        let mut buf = ciphertext.to_vec();
+        buf.extend_from_slice(tag);
+        cipher
+            .decrypt(&nonce, buf.as_ref())
+            .map_err(|e| CelersError::Broker(format!("AES-256-GCM decryption failed: {e}")))
+    }
+
+    /// Encrypt plaintext with ChaCha20-Poly1305.
+    ///
+    /// Returns `(nonce_bytes, ciphertext, tag)`.  Poly1305 tag (16 bytes) is
+    /// split off from the tail of the ciphertext buffer.
+    fn encrypt_chacha20(
+        &self,
+        key: &[u8],
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        use chacha20poly1305::aead::{Aead as ChachaAead, KeyInit as ChachaKeyInit};
+        let cipher = ChaCha20Poly1305::new_from_slice(key)
+            .map_err(|e| CelersError::Broker(format!("ChaCha20-Poly1305 key error: {e}")))?;
+        let nonce = ChaChaNonce::try_generate()
+            .map_err(|e| CelersError::Broker(format!("ChaCha20-Poly1305 nonce error: {e}")))?;
+        let mut buf = cipher.encrypt(&nonce, plaintext).map_err(|e| {
+            CelersError::Broker(format!("ChaCha20-Poly1305 encryption failed: {e}"))
+        })?;
+        let tag = buf.split_off(buf.len() - 16);
+        Ok((nonce.to_vec(), buf, tag))
+    }
+
+    /// Decrypt with ChaCha20-Poly1305.
+    fn decrypt_chacha20(
+        &self,
+        key: &[u8],
+        iv: &[u8],
+        ciphertext: &[u8],
+        tag: &[u8],
+    ) -> Result<Vec<u8>> {
+        use chacha20poly1305::aead::{Aead as ChachaAead, KeyInit as ChachaKeyInit};
+        let cipher = ChaCha20Poly1305::new_from_slice(key)
+            .map_err(|e| CelersError::Broker(format!("ChaCha20-Poly1305 key error: {e}")))?;
+        let nonce = ChaChaNonce::try_from(iv).map_err(|_| {
+            CelersError::Broker("ChaCha20-Poly1305 invalid nonce length".to_string())
+        })?;
+        let mut buf = ciphertext.to_vec();
+        buf.extend_from_slice(tag);
+        cipher
+            .decrypt(&nonce, buf.as_ref())
+            .map_err(|e| CelersError::Broker(format!("ChaCha20-Poly1305 decryption failed: {e}")))
     }
 }
 
@@ -467,5 +532,45 @@ mod tests {
         assert_eq!(data.key_version, 1);
         assert_eq!(data.iv.len(), 12);
         assert_eq!(data.tag.len(), 16);
+    }
+
+    #[test]
+    fn test_chacha20_roundtrip() {
+        let config =
+            EncryptionConfig::default().with_algorithm(EncryptionAlgorithm::ChaCha20Poly1305);
+        let manager = EncryptionManager::new(config);
+
+        // ChaCha20-Poly1305 also uses a 32-byte key
+        let key = vec![0xABu8; 32];
+        manager.add_key(1, key).unwrap();
+
+        let plaintext = b"ChaCha20-Poly1305 roundtrip test payload";
+        let encrypted = manager.encrypt(plaintext).unwrap();
+
+        // Algorithm field must be recorded correctly
+        assert_eq!(encrypted.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
+
+        let decrypted = manager.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_aes_with_wrong_tag_fails() {
+        let config = EncryptionConfig::default();
+        let manager = EncryptionManager::new(config);
+
+        let key = vec![0x42u8; 32];
+        manager.add_key(1, key).unwrap();
+
+        let plaintext = b"tamper test data";
+        let mut encrypted = manager.encrypt(plaintext).unwrap();
+
+        // Flip every bit in the authentication tag — AEAD must reject this
+        for byte in encrypted.tag.iter_mut() {
+            *byte ^= 0xFF;
+        }
+
+        let result = manager.decrypt(&encrypted);
+        assert!(result.is_err(), "Decryption must fail when tag is tampered");
     }
 }

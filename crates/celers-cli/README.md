@@ -1,6 +1,6 @@
 # celers-cli
 
-**Version: 0.2.0 | Status: [Alpha] | Updated: 2026-03-27**
+**Version: 0.3.0 | Status: [Alpha] | Updated: 2026-07-13**
 
 Command-line interface for managing CeleRS workers, queues, and task execution.
 
@@ -35,8 +35,11 @@ celers status --broker redis://localhost:6379 --queue my_queue
 # Run health diagnostics
 celers health --broker redis://localhost:6379
 
-# Launch interactive dashboard
+# Launch a live auto-refreshing dashboard
 celers dashboard --broker redis://localhost:6379 --queue my_queue
+
+# Launch the interactive REPL (multi-command session, tab completion, history)
+celers interactive --broker redis://localhost:6379 --queue my_queue
 ```
 
 ## Core Features
@@ -173,8 +176,11 @@ celers metrics --pattern "task_*" --format text
 # Watch mode (auto-refresh)
 celers metrics --watch 5  # Refresh every 5 seconds
 
-# Interactive dashboard (TUI)
+# Live auto-refreshing dashboard (clears/redraws on an interval; Ctrl+C to exit)
 celers dashboard --broker redis://localhost:6379 --queue my_queue --refresh 1
+
+# Live (top-like) monitor of a Prometheus metrics endpoint
+celers monitor --endpoint http://localhost:9090/metrics --interval 5 --focus tasks_total,queue_depth
 ```
 
 ### Auto-scaling
@@ -227,6 +233,20 @@ celers analyze bottlenecks --broker redis://localhost:6379 --queue my_queue
 
 # Analyze failure patterns
 celers analyze failures --broker redis://localhost:6379 --queue my_queue
+
+# Export a report as CSV, or self-contained HTML with an inline SVG bar chart
+celers report daily --format csv --output daily.csv --broker redis://localhost:6379 --queue my_queue
+celers report weekly --format html --output weekly.html --broker redis://localhost:6379 --queue my_queue
+
+# Rolling task-execution history, per-worker stats, and per-queue health exports
+celers report history --days 14 --broker redis://localhost:6379 --queue my_queue
+celers report workers --broker redis://localhost:6379
+celers report queues --broker redis://localhost:6379
+
+# Performance profiling: task duration trend, worker comparison, resource usage
+celers analyze profile task --days 7 --broker redis://localhost:6379 --queue my_queue
+celers analyze profile worker --broker redis://localhost:6379
+celers analyze profile resources --days 7 --broker redis://localhost:6379 --queue my_queue
 ```
 
 ### Database Operations
@@ -249,6 +269,142 @@ celers db migrate --url postgresql://user:pass@localhost/celers --action apply
 
 # Check migration status
 celers db migrate --url postgresql://user:pass@localhost/celers --action status
+```
+
+### Interactive Mode
+
+```bash
+# Launch the REPL: command history, tab completion, session state
+celers interactive --broker redis://localhost:6379 --queue my_queue
+```
+
+Recognized REPL commands (`help`/`?` prints this list live):
+
+| Command | Description |
+|---------|-------------|
+| `status`, `st` | Show queue status |
+| `queues`, `ls` | List all queues |
+| `workers`, `w` | List all workers |
+| `health`, `h` | Run health diagnostics |
+| `doctor`, `d` | Automatic problem detection |
+| `metrics`, `m` | Display metrics |
+| `stats`, `cs` | Connection pool & cache statistics (live hit/reuse ratios) |
+| `dlq inspect [limit]` | Inspect DLQ tasks |
+| `dlq clear` | Clear all DLQ tasks |
+| `use <queue>` | Switch to a different queue (offers "did you mean" on a typo) |
+| `broker [url]` | Show/set broker URL |
+| `clear`, `cls` | Clear screen |
+| `exit`, `quit`, `q` | Exit interactive mode |
+
+An unrecognized command (or an unknown queue passed to `use`) gets a Levenshtein-distance "did you mean" suggestion instead of a bare error.
+
+### Load Testing
+
+```bash
+# Generate synthetic load: 1000 tasks at 50/sec, constant arrival
+celers loadtest --total 1000 --rate 50 --broker redis://localhost:6379 --queue my_queue
+
+# Jittered or Poisson-like arrival, deterministic given the same --seed
+celers loadtest --pattern jittered --seed 42 --rate 20 --duration 30 --broker redis://localhost:6379 --queue my_queue
+
+# Preview the generated schedule without enqueuing anything
+celers loadtest --total 500 --rate 100 --dry-run
+
+# `simulate` is a visible alias for `loadtest`
+celers simulate --total 100 --rate 10 --broker redis://localhost:6379 --queue my_queue
+```
+
+### Backup & Restore
+
+```bash
+# Full backup of broker state (queues, DLQ, schedules) to a compressed archive
+celers backup --broker redis://localhost:6379 --output celers-backup.tar.gz
+
+# Incremental backup: only entries changed since a prior archive, or an explicit timestamp
+celers backup --broker redis://localhost:6379 --output incr.tar.gz --previous celers-backup.tar.gz
+celers backup --broker redis://localhost:6379 --output incr.tar.gz --since 2026-07-01T00:00:00Z
+
+# Restore, choosing how to resolve a queue that already has live content at the target
+celers restore --broker redis://localhost:6379 --input celers-backup.tar.gz --conflict-policy skip
+celers restore --broker redis://localhost:6379 --input celers-backup.tar.gz --conflict-policy overwrite
+celers restore --broker redis://localhost:6379 --input celers-backup.tar.gz --conflict-policy merge
+
+# Dry run and selective (per-queue) restore
+celers restore --broker redis://localhost:6379 --input celers-backup.tar.gz --dry-run
+celers restore --broker redis://localhost:6379 --input celers-backup.tar.gz --queues high_priority,default
+```
+
+`--conflict-policy` defaults to `skip` (the safest option: never silently overwrites live data).
+
+### Task Dependency Visualization
+
+```bash
+# Render a task dependency graph from a queue-export JSON file (see `celers queue export`)
+celers deps --from backup.json --format ascii
+celers deps --from backup.json --format dot > graph.dot
+
+# Interactively explore the graph starting from a specific task
+celers deps --from backup.json --interactive --start <task-id>
+```
+
+### Command Aliases
+
+```bash
+# Define a user alias; expansion happens before argument parsing
+celers alias add w "worker --concurrency 8"
+celers w --broker redis://localhost:6379 --queue my_queue   # expands to `worker --concurrency 8 ...`
+
+celers alias list
+celers alias remove w
+```
+
+An alias can never shadow a real command name. Built-in short aliases are also available on many top-level commands, e.g. `celers w` (`worker`), `celers q` (`queue`), `celers t` (`task`), `celers wm` (`worker-mgmt`), `celers i` (`interactive`), `celers dash` (`dashboard`), `celers a` (`alias`).
+
+### Error Codes & Troubleshooting
+
+Every command failure prints a structured `error[E_CODE]: <message>` line plus an actionable `suggestion:` line. Print the full code/message/suggestion reference table:
+
+```bash
+celers error-codes
+```
+
+### Structured Logging
+
+```bash
+# JSON logs (one object per event) instead of the default human-readable text
+celers worker --broker redis://localhost:6379 --queue my_queue --log-format json
+
+# Send logs to a file or a TCP collector instead of stdout
+celers worker --broker redis://localhost:6379 --queue my_queue --log-sink file:/var/log/celers.log
+celers worker --broker redis://localhost:6379 --queue my_queue --log-sink tcp:127.0.0.1:9000
+
+# --log-level still takes precedence over RUST_LOG
+celers worker --broker redis://localhost:6379 --queue my_queue --log-level debug
+```
+
+`--log-format`/`--log-sink`/`--log-level` are global flags, valid on every subcommand.
+
+### Smart Defaults
+
+If `--broker` and the config file's `broker.url` are both unset, the CLI falls back to environment variables, checked in order:
+
+```bash
+export REDIS_URL=redis://localhost:6379
+celers status --queue my_queue   # broker URL auto-detected from REDIS_URL
+```
+
+Fallback order: `REDIS_URL` -> `CELERY_BROKER_URL` -> `AMQP_URL`.
+
+### Performance: Connection Pool & Cache
+
+```bash
+# Configured pool capacity, per-cache TTL, and current in-process entry counts
+celers cache-stats
+
+# Live hit/reuse ratios (meaningful only in a long-running session)
+celers interactive
+# then, inside the REPL:
+> stats
 ```
 
 ## Configuration
@@ -301,6 +457,10 @@ webhook_url = "https://hooks.example.com/alerts"
 check_interval_secs = 60
 dlq_threshold = 100
 failed_tasks_threshold = 50
+
+# User-defined command aliases (also managed via `celers alias add|remove|list`)
+[aliases]
+w = "worker --concurrency 8"
 ```
 
 ### Environment Variables
@@ -451,54 +611,71 @@ fi
 
 | Category | Command | Description |
 |----------|---------|-------------|
-| **Worker** | `worker` | Start worker process |
-| | `worker-mgmt list` | List all workers |
+| **Worker** | `worker` (`w`) | Start worker process |
+| | `worker-mgmt` (`wm`) `list` | List all workers |
 | | `worker-mgmt stats` | Worker statistics |
 | | `worker-mgmt stop` | Stop worker |
 | | `worker-mgmt pause/resume` | Pause/resume worker |
 | | `worker-mgmt drain` | Drain worker |
 | | `worker-mgmt scale` | Scale workers |
 | | `worker-mgmt logs` | Stream worker logs |
-| **Queue** | `queue list` | List queues |
+| **Queue** | `queue` (`q`) `list` | List queues |
 | | `queue stats` | Queue statistics |
 | | `queue purge` | Clear queue |
-| | `queue move` | Move tasks |
-| | `queue export/import` | Backup/restore |
+| | `queue move` | Move tasks between queues |
+| | `queue export/import` | Backup/restore a queue to/from JSON |
 | | `queue pause/resume` | Pause/resume queue |
-| **Task** | `task inspect` | Task details |
+| **Task** | `task` (`t`) `inspect` | Task details |
 | | `task cancel` | Cancel task |
 | | `task retry` | Retry task |
 | | `task result` | Show result |
 | | `task logs` | Task logs |
-| | `task requeue` | Move task |
-| **DLQ** | `dlq inspect` | View failed tasks |
+| | `task requeue` | Move task to a different queue |
+| **DLQ / Replay** | `dlq inspect` | View failed tasks |
 | | `dlq clear` | Clear DLQ |
-| | `dlq replay` | Retry task |
+| | `dlq replay <id>` | Retry one DLQ task |
+| | `replay` | Replay by `--id`/`--pattern`/`--all`, with `--limit`/`--dry-run` |
+| **Load Testing** | `loadtest` (`simulate`) | Generate synthetic task load (constant/jittered/poisson) |
 | **Schedule** | `schedule list` | List schedules |
 | | `schedule add` | Add schedule |
 | | `schedule remove` | Remove schedule |
 | | `schedule pause/resume` | Pause/resume |
 | | `schedule trigger` | Manual trigger |
 | | `schedule history` | Execution history |
-| **Monitoring** | `metrics` | Show metrics |
-| | `dashboard` | Interactive TUI |
+| **Monitoring** | `metrics` | Show metrics (text/json/prometheus, or scrape `--endpoint`) |
+| | `monitor` | Live (top-like) view of a Prometheus endpoint |
+| | `dashboard` (`dash`) | Live auto-refreshing terminal dashboard |
+| | `interactive` (`i`) | Interactive REPL session |
 | | `autoscale start/status` | Auto-scaling |
 | | `alert start/test` | Alerting |
 | **Diagnostics** | `health` | Health check |
 | | `doctor` | Problem detection |
 | | `debug task/worker` | Debug tools |
-| **Reporting** | `report daily/weekly` | Reports |
-| | `analyze bottlenecks` | Performance |
-| | `analyze failures` | Failure patterns |
-| **Database** | `db test-connection` | Test connection |
+| **Reporting** | `report daily/weekly` | Reports (`--format table\|csv\|html`, `--output`, `--template`) |
+| | `report history` | Task execution history over a rolling window |
+| | `report workers` | Per-worker statistics export |
+| | `report queues` | Per-queue depth/health export |
+| | `analyze bottlenecks` | Performance bottleneck detection |
+| | `analyze failures` | Failure pattern analysis |
+| | `analyze profile task/worker/resources` | Duration trend, worker comparison, resource usage |
+| **Backup** | `backup` | Full or incremental (`--previous`/`--since`) broker-state backup |
+| | `restore` | Restore, with `--conflict-policy skip\|overwrite\|merge` |
+| **Dependencies** | `deps` | ASCII/DOT task dependency graph, optional `--interactive` |
+| **Database** | `db test-connection` | Test connection (`--benchmark` for latency) |
 | | `db health` | Database health |
-| | `db pool-stats` | Pool statistics |
-| | `db migrate` | Run migrations |
-| **Config** | `init` | Generate config |
+| | `db pool-stats` | Connection pool statistics |
+| | `db migrate` | Run/inspect migrations |
+| **Aliases** | `alias` (`a`) `list/add/remove` | User-defined command aliases |
+| **Errors / Perf** | `error-codes` | Print the structured error-code reference table |
+| | `cache-stats` | Configured pool/cache capacity & TTL snapshot |
+| **Config** | `init` (`--wizard` for interactive setup) | Generate config |
+| | `config show/reload` | Print/reload the resolved configuration |
 | | `validate` | Validate config |
 | | `completions` | Shell completion |
 | | `manpages` | Generate man pages |
 | **Other** | `status` | Queue status |
+
+Global flags (valid on every subcommand): `--log-level <LEVEL>`, `--log-format text\|json`, `--log-sink stdout\|file:<path>\|tcp:<host:port>`.
 
 ## Colored Output
 
@@ -512,10 +689,9 @@ Colors are automatically disabled when output is piped or in CI environments.
 
 ## Exit Codes
 
-- `0`: Success
-- `1`: General error
-- `2`: Configuration error
-- `3`: Connection error
+- `0`: Success (including `--help`/`--version`)
+- `1`: Command failure — broker/connection/config/task errors. The `error[E_CODE]: <message>` line printed to stderr disambiguates the cause; run `celers error-codes` for the full code/message/suggestion reference table.
+- `2`: CLI usage error (invalid arguments/flags), via `clap`'s own exit path
 
 ## Contributing
 
@@ -527,11 +703,12 @@ See the main CeleRS repository for contribution guidelines.
 - `celers-worker`: Worker runtime
 - `celers-broker-redis`: Redis broker implementation
 - `celers-broker-postgres`: PostgreSQL broker implementation
+- `celers-beat`: Beat scheduler integration (cron-based scheduling, backed up by `backup`)
 - `celers-metrics`: Metrics collection and export
 
 ## Testing
 
-**101 tests passing** (unit tests for command parsing, backup operations, and TUI components)
+**757 tests passing** (unit tests across command parsing, configuration layering, backup/restore, connection pooling, TTL caching, structured logging, smart defaults, alias expansion, error classification, task-dependency graphs, and the interactive REPL)
 
 ## License
 

@@ -2,7 +2,7 @@
 
 > AWS SQS broker implementation for CeleRS
 
-## Status: ✅ STABLE (v0.2.0) — 294 tests passing | Updated: 2026-03-27
+## Status: ✅ STABLE (v0.3.0) — 294 tests passing | Updated: 2026-07-13
 
 Full AWS SQS broker implementation with long polling, visibility timeout management, FIFO queues, DLQ, SSE, IAM authentication, circuit breaker pattern, real-time cost tracking, advanced batch optimization, distributed tracing, quota management, multi-queue routing, performance profiling, message replay, SLA monitoring, **unified metrics aggregation**, **workload-specific presets**, and **self-adaptive auto-tuning**.
 
@@ -532,7 +532,7 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 - [x] Cost optimization guide (90% cost reduction strategies)
 - [x] Monitoring setup guide (CloudWatch + 6 alarms)
 - [x] Testing guide (complete testing instructions)
-- [x] Monitoring and utilities example (`examples/monitoring_utilities.rs` - comprehensive demo of all monitoring and utility functions)
+- [x] Monitoring and utilities example (`examples/sqs_monitoring_utilities.rs` - comprehensive demo of all monitoring and utility functions)
 - [x] Production optimization example (`examples/production_optimization.rs` - real-world optimization scenarios with auto-tuning)
 
 ## Dependencies
@@ -544,7 +544,7 @@ Full AWS SQS broker implementation with long polling, visibility timeout managem
 - `aws-sdk-cloudwatch`: CloudWatch metrics publishing
 - `serde_json`: Message serialization
 - `tracing`: Logging
-- `flate2`: Gzip compression support
+- `oxiarc-deflate`: Gzip compression support
 - `base64`: Base64 encoding for compressed messages
 
 ## AWS IAM Requirements
@@ -627,6 +627,7 @@ For production, restrict `Resource` to specific queue ARNs.
 - No broker topology (exchanges/bindings) like AMQP
 - Ideal for cloud-native, serverless architectures
 - Automatic scaling and redundancy
+- **Pure-Rust dependency caveat**: this crate still pulls in `ring`/`aws-lc-sys` transitively via the AWS SDK (`aws-config`/`aws-sdk-sqs`/`aws-sdk-cloudwatch`) — an accepted, tracked, upstream-blocked limitation (see workspace `CHANGELOG.md` `[0.3.0]` Known Limitations), not a regression; no drop-in Pure-Rust AWS SDK exists yet in the COOLJAPAN ecosystem
 
 ## Usage Examples
 

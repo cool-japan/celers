@@ -263,7 +263,7 @@ impl DistributedRateLimiter {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs_f64();
 
         // Get current tokens and last refill time
@@ -461,7 +461,7 @@ impl InMemoryDistributedRateLimiter {
     async fn refill_tokens(&self, task_type: &str) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs_f64();
 
         let mut buckets = self.buckets.write().await;

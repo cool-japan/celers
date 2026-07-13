@@ -14,6 +14,8 @@
 //! - `[worker]`: Worker runtime settings (concurrency, retries, timeouts)
 //! - `[autoscale]`: Auto-scaling configuration
 //! - `[alerts]`: Alert and notification settings
+//! - `[pool]`: CLI-level connection pool settings (max size, reuse tracking)
+//! - `[cache]`: Read-path TTL cache settings (queue stats, worker lists, ...)
 //!
 //! # Environment Variables
 //!
@@ -57,6 +59,52 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::Path;
 
+/// Serialization format used for a configuration file.
+///
+/// The format is normally auto-detected from a file's extension via
+/// [`ConfigFormat::from_path`], falling back to TOML for unknown or missing
+/// extensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFormat {
+    /// TOML format (`.toml`).
+    Toml,
+    /// YAML format (`.yaml` or `.yml`).
+    Yaml,
+}
+
+impl ConfigFormat {
+    /// Detect the configuration format from a file path's extension.
+    ///
+    /// Recognises `.yaml`/`.yml` as [`ConfigFormat::Yaml`] and everything else
+    /// (including `.toml` and paths without an extension) as
+    /// [`ConfigFormat::Toml`]. Matching is case-insensitive.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_cli::config::ConfigFormat;
+    /// use std::path::Path;
+    ///
+    /// assert_eq!(ConfigFormat::from_path(Path::new("c.yaml")), ConfigFormat::Yaml);
+    /// assert_eq!(ConfigFormat::from_path(Path::new("c.YML")), ConfigFormat::Yaml);
+    /// assert_eq!(ConfigFormat::from_path(Path::new("c.toml")), ConfigFormat::Toml);
+    /// assert_eq!(ConfigFormat::from_path(Path::new("celers")), ConfigFormat::Toml);
+    /// ```
+    #[must_use]
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
+        match path
+            .as_ref()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("yaml" | "yml") => ConfigFormat::Yaml,
+            _ => ConfigFormat::Toml,
+        }
+    }
+}
+
 /// Main CLI configuration structure.
 ///
 /// Contains all settings for broker connection, worker configuration,
@@ -86,6 +134,18 @@ pub struct Config {
     /// Alert configuration
     #[serde(default)]
     pub alerts: Option<AlertConfig>,
+
+    /// CLI-level connection pool configuration
+    #[serde(default)]
+    pub pool: PoolConfig,
+
+    /// Read-path TTL cache configuration
+    #[serde(default)]
+    pub cache: CacheConfig,
+
+    /// User-defined command aliases (`celers alias add|remove|list`), e.g. `w` -> `worker start`.
+    #[serde(default)]
+    pub aliases: Option<crate::aliases::AliasConfig>,
 }
 
 /// Auto-scaling configuration
@@ -201,6 +261,126 @@ impl Default for WorkerConfig {
     }
 }
 
+/// CLI-level connection pool configuration.
+///
+/// Governs [`crate::pool::ClientPool`], the process-local pool of reusable
+/// broker connections used by the `queue`/`worker`/`task` read paths (see
+/// `crate::pool::redis_connection_pool`). This is distinct from the
+/// lower-level `PostgresBroker`/`sqlx`-style database connection pool
+/// reported by [`crate::commands::db_pool_stats`]: that pool manages actual
+/// database connections for `celers db` commands, while this one manages
+/// short-lived CLI-process broker handles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// Maximum number of distinct pooled connections (keyed by broker URL)
+    /// to keep alive at once.
+    #[serde(default = "default_pool_max_size")]
+    pub max_size: usize,
+
+    /// Whether connection reuse is enabled. When `false`, every read-path
+    /// call reconnects instead of reusing a pooled handle (reuse tracking
+    /// still runs, but will always report zero reuse).
+    #[serde(default = "default_pool_reuse_enabled")]
+    pub reuse_enabled: bool,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_size: default_pool_max_size(),
+            reuse_enabled: default_pool_reuse_enabled(),
+        }
+    }
+}
+
+impl PoolConfig {
+    /// Effective pool configuration, honoring `CELERS_POOL_MAX_SIZE` /
+    /// `CELERS_POOL_REUSE_ENABLED` environment overrides (mirroring
+    /// [`Config::apply_env_overrides`]'s mechanism for broker/worker
+    /// settings) and falling back to [`PoolConfig::default`] otherwise.
+    ///
+    /// Command read paths in `commands::queue`/`commands::worker`/
+    /// `commands::task` are reached directly from CLI dispatch without a
+    /// loaded [`Config`] in scope, so they use this as their source of truth
+    /// for pool sizing, keeping it configurable without threading a `Config`
+    /// through every call site.
+    #[must_use]
+    pub fn from_env_or_default() -> Self {
+        let defaults = Self::default();
+        Self {
+            max_size: first_env_parsed(&["CELERS_POOL_MAX_SIZE"]).unwrap_or(defaults.max_size),
+            reuse_enabled: first_env_parsed(&["CELERS_POOL_REUSE_ENABLED"])
+                .unwrap_or(defaults.reuse_enabled),
+        }
+    }
+}
+
+/// Read-path TTL cache configuration.
+///
+/// Governs [`crate::cache::TtlCache`] instances used by the `queue`/`worker`
+/// read paths (`list_queues`, `queue_stats`, `list_workers`, `worker_stats`)
+/// to avoid redundant broker round trips for frequently-read, slowly-changing
+/// data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheConfig {
+    /// How long a cached entry remains valid, in seconds.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// Whether read-path caching is enabled at all. When `false`, callers
+    /// should treat every lookup as a miss and always fetch fresh data.
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_cache_ttl_secs(),
+            enabled: default_cache_enabled(),
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Effective cache configuration, honoring `CELERS_CACHE_TTL_SECS` /
+    /// `CELERS_CACHE_ENABLED` environment overrides and falling back to
+    /// [`CacheConfig::default`] otherwise. See
+    /// [`PoolConfig::from_env_or_default`] for why the read paths use this
+    /// instead of a threaded-through [`Config`].
+    #[must_use]
+    pub fn from_env_or_default() -> Self {
+        let defaults = Self::default();
+        Self {
+            ttl_secs: first_env_parsed(&["CELERS_CACHE_TTL_SECS"]).unwrap_or(defaults.ttl_secs),
+            enabled: first_env_parsed(&["CELERS_CACHE_ENABLED"]).unwrap_or(defaults.enabled),
+        }
+    }
+
+    /// The configured time-to-live as a [`std::time::Duration`], for direct
+    /// use with [`crate::cache::TtlCache::new`].
+    #[must_use]
+    pub fn ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.ttl_secs)
+    }
+}
+
+fn default_pool_max_size() -> usize {
+    16
+}
+
+fn default_pool_reuse_enabled() -> bool {
+    true
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    30
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
 fn default_queue_name() -> String {
     "celers".to_string()
 }
@@ -307,17 +487,49 @@ fn expand_env_vars(s: &str) -> String {
 }
 
 impl Config {
-    /// Load configuration from a TOML file with environment variable expansion
+    /// Load configuration from a file, auto-detecting the format (TOML or YAML)
+    /// from the file extension and expanding environment variables.
+    ///
+    /// `.yaml`/`.yml` files are parsed as YAML; everything else is parsed as
+    /// TOML. Environment variables in the file content are expanded using the
+    /// `${VAR}` / `${VAR:default}` syntax before parsing.
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let format = ConfigFormat::from_path(&path);
+        let content = std::fs::read_to_string(&path)?;
         let expanded_content = expand_env_vars(&content);
-        let config: Config = toml::from_str(&expanded_content)?;
+        Self::from_str_with_format(&expanded_content, format)
+    }
+
+    /// Parse configuration from a string using an explicit format.
+    ///
+    /// Unlike [`Config::from_file`] this does **not** perform environment
+    /// variable expansion; callers that need it should expand the content
+    /// first.
+    pub fn from_str_with_format(content: &str, format: ConfigFormat) -> anyhow::Result<Self> {
+        let config = match format {
+            ConfigFormat::Toml => toml::from_str(content)?,
+            ConfigFormat::Yaml => serde_yaml::from_str(content)?,
+        };
         Ok(config)
     }
 
-    /// Save configuration to a TOML file
+    /// Serialize this configuration to a string in the requested format.
+    pub fn to_string_with_format(&self, format: ConfigFormat) -> anyhow::Result<String> {
+        let content = match format {
+            ConfigFormat::Toml => toml::to_string_pretty(self)?,
+            ConfigFormat::Yaml => serde_yaml::to_string(self)?,
+        };
+        Ok(content)
+    }
+
+    /// Save configuration to a file, auto-detecting the format from the
+    /// file extension.
+    ///
+    /// `.yaml`/`.yml` paths are written as YAML; everything else is written as
+    /// TOML.
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
-        let content = toml::to_string_pretty(self)?;
+        let format = ConfigFormat::from_path(&path);
+        let content = self.to_string_with_format(format)?;
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -339,6 +551,9 @@ impl Config {
             queues: vec!["celers".to_string()],
             autoscale: None,
             alerts: None,
+            pool: PoolConfig::default(),
+            cache: CacheConfig::default(),
+            aliases: None,
         }
     }
 
@@ -473,6 +688,278 @@ impl Config {
 
         Ok(warnings)
     }
+
+    /// Apply environment-variable overrides to this configuration.
+    ///
+    /// Recognised variables (in addition to the `${VAR}` expansion performed
+    /// when loading files) follow the upstream Celery `CELERY_*` / `CELERYD_*`
+    /// conventions, with `CELERS_*` aliases accepted for convenience:
+    ///
+    /// - `CELERY_BROKER_URL` / `CELERS_BROKER_URL` -> `broker.url`
+    /// - `CELERY_DEFAULT_QUEUE` / `CELERS_QUEUE` -> `broker.queue`
+    /// - `CELERS_QUEUE_MODE` -> `broker.mode`
+    /// - `CELERYD_CONCURRENCY` / `CELERS_CONCURRENCY` -> `worker.concurrency`
+    /// - `CELERS_POLL_INTERVAL_MS` -> `worker.poll_interval_ms`
+    /// - `CELERY_TASK_MAX_RETRIES` / `CELERS_MAX_RETRIES` -> `worker.max_retries`
+    /// - `CELERY_TASK_TIME_LIMIT` / `CELERS_TIMEOUT_SECS` -> `worker.default_timeout_secs`
+    /// - `CELERS_QUEUES` -> `queues` (comma-separated)
+    /// - `CELERS_PROFILE` -> `profile`
+    ///
+    /// Variables that are unset or fail to parse are ignored, leaving the
+    /// existing value untouched.
+    ///
+    /// When neither `CELERY_BROKER_URL` nor `CELERS_BROKER_URL` is set,
+    /// `broker.url` falls back to [`crate::smart_defaults::detect_broker_from_env`],
+    /// which additionally recognizes the wider `REDIS_URL` / `AMQP_URL`
+    /// hosting-provider conventions. This keeps the overall precedence as
+    /// CLI arg (applied by the caller, not here) > explicit
+    /// `CELERY_BROKER_URL` / `CELERS_BROKER_URL` > `REDIS_URL` / `AMQP_URL`
+    /// fallback > config file value > hardcoded default.
+    pub fn apply_env_overrides(&mut self) {
+        if let Some(url) = first_env(&["CELERY_BROKER_URL", "CELERS_BROKER_URL"]) {
+            self.broker.url = url;
+        } else if let Some(url) = crate::smart_defaults::detect_broker_from_env() {
+            self.broker.url = url;
+        }
+        if let Some(queue) = first_env(&["CELERY_DEFAULT_QUEUE", "CELERS_QUEUE"]) {
+            self.broker.queue = queue;
+        }
+        if let Some(mode) = first_env(&["CELERS_QUEUE_MODE"]) {
+            self.broker.mode = mode;
+        }
+        if let Some(concurrency) = first_env_parsed(&["CELERYD_CONCURRENCY", "CELERS_CONCURRENCY"])
+        {
+            self.worker.concurrency = concurrency;
+        }
+        if let Some(poll) = first_env_parsed(&["CELERS_POLL_INTERVAL_MS"]) {
+            self.worker.poll_interval_ms = poll;
+        }
+        if let Some(retries) = first_env_parsed(&["CELERY_TASK_MAX_RETRIES", "CELERS_MAX_RETRIES"])
+        {
+            self.worker.max_retries = retries;
+        }
+        if let Some(timeout) = first_env_parsed(&["CELERY_TASK_TIME_LIMIT", "CELERS_TIMEOUT_SECS"])
+        {
+            self.worker.default_timeout_secs = timeout;
+        }
+        if let Some(queues) = first_env(&["CELERS_QUEUES"]) {
+            let parsed: Vec<String> = queues
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            if !parsed.is_empty() {
+                self.queues = parsed;
+            }
+        }
+        if let Some(profile) = first_env(&["CELERS_PROFILE"]) {
+            self.profile = Some(profile);
+        }
+    }
+
+    /// Compute a human-readable diff between this configuration (the previous
+    /// state) and an updated configuration.
+    ///
+    /// Used by the dynamic-reload machinery to report what changed when a
+    /// configuration source is reloaded. Only the operationally significant
+    /// fields are compared.
+    #[must_use]
+    pub fn diff(&self, updated: &Config) -> ConfigDiff {
+        let mut changes = Vec::new();
+
+        push_change_opt(&mut changes, "profile", &self.profile, &updated.profile);
+        push_change(
+            &mut changes,
+            "broker.type",
+            &self.broker.broker_type,
+            &updated.broker.broker_type,
+        );
+        push_change(
+            &mut changes,
+            "broker.url",
+            &self.broker.url,
+            &updated.broker.url,
+        );
+        push_change(
+            &mut changes,
+            "broker.queue",
+            &self.broker.queue,
+            &updated.broker.queue,
+        );
+        push_change(
+            &mut changes,
+            "broker.mode",
+            &self.broker.mode,
+            &updated.broker.mode,
+        );
+        push_change(
+            &mut changes,
+            "broker.failover_urls",
+            &format!("{:?}", self.broker.failover_urls),
+            &format!("{:?}", updated.broker.failover_urls),
+        );
+        push_change(
+            &mut changes,
+            "worker.concurrency",
+            &self.worker.concurrency,
+            &updated.worker.concurrency,
+        );
+        push_change(
+            &mut changes,
+            "worker.poll_interval_ms",
+            &self.worker.poll_interval_ms,
+            &updated.worker.poll_interval_ms,
+        );
+        push_change(
+            &mut changes,
+            "worker.max_retries",
+            &self.worker.max_retries,
+            &updated.worker.max_retries,
+        );
+        push_change(
+            &mut changes,
+            "worker.default_timeout_secs",
+            &self.worker.default_timeout_secs,
+            &updated.worker.default_timeout_secs,
+        );
+        push_change(
+            &mut changes,
+            "queues",
+            &format!("{:?}", self.queues),
+            &format!("{:?}", updated.queues),
+        );
+        push_change(
+            &mut changes,
+            "autoscale",
+            &self.autoscale.is_some(),
+            &updated.autoscale.is_some(),
+        );
+        push_change(
+            &mut changes,
+            "alerts",
+            &self.alerts.is_some(),
+            &updated.alerts.is_some(),
+        );
+        push_change(
+            &mut changes,
+            "pool.max_size",
+            &self.pool.max_size,
+            &updated.pool.max_size,
+        );
+        push_change(
+            &mut changes,
+            "pool.reuse_enabled",
+            &self.pool.reuse_enabled,
+            &updated.pool.reuse_enabled,
+        );
+        push_change(
+            &mut changes,
+            "cache.ttl_secs",
+            &self.cache.ttl_secs,
+            &updated.cache.ttl_secs,
+        );
+        push_change(
+            &mut changes,
+            "cache.enabled",
+            &self.cache.enabled,
+            &updated.cache.enabled,
+        );
+
+        ConfigDiff { changes }
+    }
+}
+
+/// Return the value of the first set environment variable from `keys`.
+fn first_env(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| env::var(key).ok().filter(|v| !v.is_empty()))
+}
+
+/// Return the parsed value of the first set, successfully-parsed environment
+/// variable from `keys`.
+fn first_env_parsed<T: std::str::FromStr>(keys: &[&str]) -> Option<T> {
+    keys.iter()
+        .find_map(|key| env::var(key).ok().and_then(|v| v.parse::<T>().ok()))
+}
+
+/// Record a single field change between two displayable values if they differ.
+fn push_change<T: PartialEq + std::fmt::Display>(
+    changes: &mut Vec<FieldChange>,
+    field: &str,
+    old: &T,
+    new: &T,
+) {
+    if old != new {
+        changes.push(FieldChange {
+            field: field.to_string(),
+            old: old.to_string(),
+            new: new.to_string(),
+        });
+    }
+}
+
+/// Record a change between two optional string values if they differ.
+fn push_change_opt(
+    changes: &mut Vec<FieldChange>,
+    field: &str,
+    old: &Option<String>,
+    new: &Option<String>,
+) {
+    if old != new {
+        changes.push(FieldChange {
+            field: field.to_string(),
+            old: old.clone().unwrap_or_else(|| "<none>".to_string()),
+            new: new.clone().unwrap_or_else(|| "<none>".to_string()),
+        });
+    }
+}
+
+/// A single changed configuration field, as reported by [`Config::diff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldChange {
+    /// Dotted field path (e.g. `broker.url`).
+    pub field: String,
+    /// Previous value rendered as a string.
+    pub old: String,
+    /// New value rendered as a string.
+    pub new: String,
+}
+
+/// The set of configuration fields that changed between two configurations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigDiff {
+    /// The individual field changes.
+    pub changes: Vec<FieldChange>,
+}
+
+impl ConfigDiff {
+    /// Returns `true` when no fields changed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// Number of fields that changed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.changes.len()
+    }
+}
+
+impl std::fmt::Display for ConfigDiff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.changes.is_empty() {
+            return write!(f, "no changes");
+        }
+        for (idx, change) in self.changes.iter().enumerate() {
+            if idx > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{}: {} -> {}", change.field, change.old, change.new)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -497,6 +984,10 @@ mod tests {
         assert_eq!(config.queues, vec!["celers"]);
         assert!(config.autoscale.is_none());
         assert!(config.alerts.is_none());
+        assert_eq!(config.pool.max_size, 16);
+        assert!(config.pool.reuse_enabled);
+        assert_eq!(config.cache.ttl_secs, 30);
+        assert!(config.cache.enabled);
     }
 
     #[test]
@@ -551,6 +1042,12 @@ default_timeout_secs = 600
         assert_eq!(config.broker.mode, "fifo");
         assert_eq!(config.worker.concurrency, 4);
         assert_eq!(config.worker.poll_interval_ms, 1000);
+        // A config file predating the [pool]/[cache] sections must still
+        // parse, falling back to their defaults (backward compatibility).
+        assert_eq!(config.pool.max_size, 16);
+        assert!(config.pool.reuse_enabled);
+        assert_eq!(config.cache.ttl_secs, 30);
+        assert!(config.cache.enabled);
     }
 
     #[test]
@@ -880,5 +1377,187 @@ url = "redis://localhost:6379"
 
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.profile, Some("production".to_string()));
+    }
+
+    #[test]
+    fn test_pool_config_toml_roundtrip() {
+        let toml_str = r#"
+[broker]
+type = "redis"
+url = "redis://localhost:6379"
+
+[pool]
+max_size = 32
+reuse_enabled = false
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.pool.max_size, 32);
+        assert!(!config.pool.reuse_enabled);
+
+        let rendered = toml::to_string(&config).unwrap();
+        assert!(rendered.contains("max_size = 32"));
+        assert!(rendered.contains("reuse_enabled = false"));
+
+        let reparsed: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.pool, config.pool);
+    }
+
+    #[test]
+    fn test_cache_config_toml_roundtrip() {
+        let toml_str = r#"
+[broker]
+type = "redis"
+url = "redis://localhost:6379"
+
+[cache]
+ttl_secs = 120
+enabled = false
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.cache.ttl_secs, 120);
+        assert!(!config.cache.enabled);
+        assert_eq!(config.cache.ttl(), std::time::Duration::from_secs(120));
+
+        let rendered = toml::to_string(&config).unwrap();
+        assert!(rendered.contains("ttl_secs = 120"));
+        assert!(rendered.contains("enabled = false"));
+
+        let reparsed: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.cache, config.cache);
+    }
+
+    #[test]
+    fn test_pool_config_partial_toml_uses_defaults_for_missing_fields() {
+        let toml_str = r#"
+[broker]
+type = "redis"
+url = "redis://localhost:6379"
+
+[pool]
+max_size = 4
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.pool.max_size, 4);
+        assert!(
+            config.pool.reuse_enabled,
+            "omitted field falls back to default"
+        );
+    }
+
+    // NOTE: like `CELERS_POOL_*` / `CELERS_CACHE_*` below, `REDIS_URL` /
+    // `AMQP_URL` / `CELERY_BROKER_URL` are all exercised sequentially within
+    // the single test function below rather than split across multiple test
+    // functions, to avoid two functions racing on the same process-wide env
+    // vars under `cargo test`'s default same-process, multi-threaded runner
+    // (nextest, this crate's primary runner, isolates each test in its own
+    // process and would not have this issue).
+    #[test]
+    fn test_apply_env_overrides_broker_url_falls_back_to_detect_broker_from_env() {
+        env::remove_var("CELERY_BROKER_URL");
+        env::remove_var("CELERS_BROKER_URL");
+        env::remove_var("REDIS_URL");
+        env::remove_var("AMQP_URL");
+
+        // No explicit CELERY_BROKER_URL/CELERS_BROKER_URL, but REDIS_URL is
+        // set: broker.url should pick it up via detect_broker_from_env().
+        env::set_var("REDIS_URL", "redis://from-redis-url:6379");
+        let mut config = Config::default_config();
+        config.apply_env_overrides();
+        assert_eq!(config.broker.url, "redis://from-redis-url:6379");
+
+        // Explicit CELERY_BROKER_URL alongside REDIS_URL: the explicit
+        // override still wins over the detect_broker_from_env() fallback.
+        env::set_var("CELERY_BROKER_URL", "redis://from-celery-broker-url:6379");
+        let mut config = Config::default_config();
+        config.apply_env_overrides();
+        assert_eq!(config.broker.url, "redis://from-celery-broker-url:6379");
+
+        env::remove_var("CELERY_BROKER_URL");
+        env::remove_var("CELERS_BROKER_URL");
+        env::remove_var("REDIS_URL");
+        env::remove_var("AMQP_URL");
+    }
+
+    // NOTE: `CELERS_POOL_*` / `CELERS_CACHE_*` are each exercised by exactly
+    // one test function below (unset/valid/invalid checked sequentially
+    // within that single function), rather than split across multiple test
+    // functions. `cargo test`'s default same-process, multi-threaded
+    // execution would otherwise let two functions race on the same env var
+    // (nextest, this crate's primary runner, isolates each test in its own
+    // process and would not have this issue, but the fallback runner would).
+
+    #[test]
+    fn test_pool_config_from_env_or_default() {
+        env::remove_var("CELERS_POOL_MAX_SIZE");
+        env::remove_var("CELERS_POOL_REUSE_ENABLED");
+        let defaults = PoolConfig::from_env_or_default();
+        assert_eq!(defaults.max_size, 16);
+        assert!(defaults.reuse_enabled);
+
+        env::set_var("CELERS_POOL_MAX_SIZE", "64");
+        env::set_var("CELERS_POOL_REUSE_ENABLED", "false");
+        let overridden = PoolConfig::from_env_or_default();
+        assert_eq!(overridden.max_size, 64);
+        assert!(!overridden.reuse_enabled);
+
+        env::set_var("CELERS_POOL_MAX_SIZE", "not-a-number");
+        let invalid = PoolConfig::from_env_or_default();
+        assert_eq!(
+            invalid.max_size, 16,
+            "unparseable override falls back to default"
+        );
+
+        env::remove_var("CELERS_POOL_MAX_SIZE");
+        env::remove_var("CELERS_POOL_REUSE_ENABLED");
+    }
+
+    #[test]
+    fn test_cache_config_from_env_or_default() {
+        env::remove_var("CELERS_CACHE_TTL_SECS");
+        env::remove_var("CELERS_CACHE_ENABLED");
+        let defaults = CacheConfig::from_env_or_default();
+        assert_eq!(defaults.ttl_secs, 30);
+        assert!(defaults.enabled);
+
+        env::set_var("CELERS_CACHE_TTL_SECS", "5");
+        env::set_var("CELERS_CACHE_ENABLED", "false");
+        let overridden = CacheConfig::from_env_or_default();
+        assert_eq!(overridden.ttl_secs, 5);
+        assert!(!overridden.enabled);
+        assert_eq!(overridden.ttl(), std::time::Duration::from_secs(5));
+
+        env::set_var("CELERS_CACHE_TTL_SECS", "not-a-number");
+        let invalid = CacheConfig::from_env_or_default();
+        assert_eq!(
+            invalid.ttl_secs, 30,
+            "unparseable override falls back to default"
+        );
+
+        env::remove_var("CELERS_CACHE_TTL_SECS");
+        env::remove_var("CELERS_CACHE_ENABLED");
+    }
+
+    #[test]
+    fn test_config_diff_reports_pool_and_cache_changes() {
+        let before = Config::default_config();
+        let mut after = Config::default_config();
+        after.pool.max_size = 99;
+        after.cache.enabled = false;
+
+        let diff = before.diff(&after);
+        assert!(diff.changes.iter().any(|c| c.field == "pool.max_size"));
+        assert!(diff.changes.iter().any(|c| c.field == "cache.enabled"));
+        assert!(!diff.changes.iter().any(|c| c.field == "pool.reuse_enabled"));
+    }
+
+    #[test]
+    fn test_config_diff_no_pool_cache_changes_when_equal() {
+        let before = Config::default_config();
+        let after = Config::default_config();
+        let diff = before.diff(&after);
+        assert!(diff.is_empty());
     }
 }

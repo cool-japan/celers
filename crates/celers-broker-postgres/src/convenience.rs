@@ -1,11 +1,74 @@
 //! Convenience helper methods for common patterns
 
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
-use sqlx::Row;
+use oxisql_core::{Connection, ToSqlValue};
 use std::time::Duration;
 
+use crate::row_ext::{uuid_from_row, uuid_param, RowExt};
 use crate::types::{DbTaskState, DlqTaskInfo, TaskInfo};
 use crate::PostgresBroker;
+
+/// Map a `TaskInfo`-shaped row selecting the standard 12-column projection.
+///
+/// Mirrors `queue_ops.rs`'s private `row_to_task_info` helper (same column
+/// set); duplicated here rather than shared because it is `private` there.
+fn row_to_task_info(row: &oxisql_core::Row) -> Result<TaskInfo> {
+    let state_str: String = row
+        .col("state")
+        .map_err(|e| CelersError::Other(format!("Failed to read state: {}", e)))?;
+    Ok(TaskInfo {
+        id: uuid_from_row(row, "id")
+            .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+        task_name: row
+            .col("task_name")
+            .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
+        state: state_str.parse()?,
+        priority: row
+            .col("priority")
+            .map_err(|e| CelersError::Other(format!("Failed to read priority: {}", e)))?,
+        retry_count: row
+            .col("retry_count")
+            .map_err(|e| CelersError::Other(format!("Failed to read retry_count: {}", e)))?,
+        max_retries: row
+            .col("max_retries")
+            .map_err(|e| CelersError::Other(format!("Failed to read max_retries: {}", e)))?,
+        created_at: row
+            .col("created_at")
+            .map_err(|e| CelersError::Other(format!("Failed to read created_at: {}", e)))?,
+        scheduled_at: row
+            .col("scheduled_at")
+            .map_err(|e| CelersError::Other(format!("Failed to read scheduled_at: {}", e)))?,
+        started_at: row
+            .col("started_at")
+            .map_err(|e| CelersError::Other(format!("Failed to read started_at: {}", e)))?,
+        completed_at: row
+            .col("completed_at")
+            .map_err(|e| CelersError::Other(format!("Failed to read completed_at: {}", e)))?,
+        worker_id: row
+            .col("worker_id")
+            .map_err(|e| CelersError::Other(format!("Failed to read worker_id: {}", e)))?,
+        error_message: row
+            .col("error_message")
+            .map_err(|e| CelersError::Other(format!("Failed to read error_message: {}", e)))?,
+    })
+}
+
+/// Extend a `Vec<&dyn ToSqlValue>` param list with a dynamically sized
+/// `IN ($n, $n+1, ..., $n+len-1)` placeholder clause bound to `uuid_params`
+/// (owned `oxisql_core::Value::Uuid` values via [`uuid_param`]), starting at
+/// 1-based placeholder index `start_idx`. Returns the generated clause text.
+///
+/// Same "`= ANY($1)` has no array `ToSqlValue` in oxisql, rewrite to a
+/// data-length-sized `IN (...)` list, each element bound individually" rewrite
+/// used throughout the already-migrated `results.rs`/`queue_ops.rs`/
+/// `broker_trait.rs` in this crate — only the placeholder *count* is derived
+/// from the slice length, no value is ever spliced into SQL text.
+fn in_clause_placeholders(start_idx: usize, len: usize) -> String {
+    (start_idx..start_idx + len)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Convenience helper methods for common patterns
 impl PostgresBroker {
@@ -89,33 +152,35 @@ impl PostgresBroker {
         if let Some(msg) = self.dequeue().await? {
             let task_id = msg.task.metadata.id;
             let receipt = msg.receipt_handle.clone();
-            let broker1 = self.pool.clone();
-            let broker2 = self.pool.clone();
+            let conn1 = self.conn.clone();
+            let conn2 = self.conn.clone();
 
             let ack_fn = Box::new(move || {
-                let pool = broker1.clone();
+                let conn = conn1.clone();
                 let id = task_id;
                 let _receipt_clone = receipt.clone();
                 Box::pin(async move {
-                    sqlx::query("UPDATE celers_tasks SET state = 'completed', completed_at = NOW() WHERE id = $1")
-                        .bind(id)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| CelersError::Other(format!("Ack failed: {}", e)))?;
+                    let id_param = uuid_param(&id);
+                    conn.execute(
+                        "UPDATE celers_tasks SET state = 'completed', completed_at = NOW() WHERE id = $1",
+                        &[&id_param],
+                    )
+                    .await
+                    .map_err(|e| CelersError::Other(format!("Ack failed: {}", e)))?;
                     Ok(())
                 })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
             });
 
             let reject_fn = Box::new(move |_error: &str| {
-                let pool = broker2.clone();
+                let conn = conn2.clone();
                 let id = task_id;
                 Box::pin(async move {
-                    sqlx::query(
+                    let id_param = uuid_param(&id);
+                    conn.execute(
                         "UPDATE celers_tasks SET retry_count = retry_count + 1 WHERE id = $1",
+                        &[&id_param],
                     )
-                    .bind(id)
-                    .execute(&pool)
                     .await
                     .map_err(|e| CelersError::Other(format!("Reject failed: {}", e)))?;
                     Ok(())
@@ -159,14 +224,19 @@ impl PostgresBroker {
             - chrono::Duration::from_std(older_than)
                 .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
 
-        let result =
-            sqlx::query("DELETE FROM celers_tasks WHERE state = 'completed' AND completed_at < $1")
-                .bind(cutoff)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| CelersError::Other(format!("Purge failed: {}", e)))?;
+        // `DateTime<Utc>` parameter -> RFC3339 string + `$1::text::timestamptz`
+        // cast, per `row_ext.rs`'s documented convention.
+        let cutoff_param = cutoff.to_rfc3339();
+        let rows_affected = self
+            .conn
+            .execute(
+                "DELETE FROM celers_tasks WHERE state = 'completed' AND completed_at < $1::text::timestamptz",
+                &[&cutoff_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Purge failed: {}", e)))?;
 
-        Ok(result.rows_affected() as i64)
+        Ok(rows_affected as i64)
     }
 
     /// Cancel all tasks matching a specific task name
@@ -182,17 +252,18 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn cancel_by_name(&self, task_name: &str) -> Result<i64> {
-        let result = sqlx::query(
-            "UPDATE celers_tasks
+        let rows_affected = self
+            .conn
+            .execute(
+                "UPDATE celers_tasks
              SET state = 'cancelled', completed_at = NOW()
              WHERE task_name = $1 AND state IN ('pending', 'processing')",
-        )
-        .bind(task_name)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Cancel failed: {}", e)))?;
+                &[&task_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Cancel failed: {}", e)))?;
 
-        Ok(result.rows_affected() as i64)
+        Ok(rows_affected as i64)
     }
 
     /// Wait for a specific task to complete (with timeout)
@@ -288,7 +359,14 @@ impl PostgresBroker {
         max_priority: i32,
         limit: i64,
     ) -> Result<Vec<TaskInfo>> {
-        let rows = sqlx::query(&format!(
+        // `self.queue_name` is spliced here as a TABLE NAME (pre-existing
+        // `queue_name`-as-table-name schema drift documented in
+        // `broker_core.rs`'s field doc comment / TODO.md), not as a bound
+        // value — this is static-text splicing, not user-data interpolation,
+        // and is preserved byte-for-byte from the pre-migration
+        // `sqlx::AssertSqlSafe(format!(...))` version. `sqlx::AssertSqlSafe`
+        // itself drops away: oxisql's `query` takes `&str` directly.
+        let query_str = format!(
             "SELECT id, task_name, state, priority, retry_count, max_retries,
                         created_at, scheduled_at, started_at, completed_at, worker_id, error_message
                  FROM {}
@@ -296,31 +374,16 @@ impl PostgresBroker {
                  ORDER BY priority DESC, created_at ASC
                  LIMIT $3",
             self.queue_name
-        ))
-        .bind(min_priority)
-        .bind(max_priority)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to find tasks by priority: {}", e)))?;
+        );
+        let rows = self
+            .conn
+            .query(&query_str, &[&min_priority, &max_priority, &limit])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to find tasks by priority: {}", e)))?;
 
-        let mut tasks = Vec::new();
-        for row in rows {
-            let state_str: String = row.get("state");
-            tasks.push(TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
-                state: state_str.parse()?,
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
-            });
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in &rows {
+            tasks.push(row_to_task_info(row)?);
         }
 
         Ok(tasks)
@@ -345,17 +408,21 @@ impl PostgresBroker {
             - chrono::Duration::from_std(older_than)
                 .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
 
-        let result = sqlx::query(&format!(
+        // Same table-name splice as `find_tasks_by_priority_range` above;
+        // `cutoff` (the actual user-relevant value) is still bound as `$1`.
+        let query_str = format!(
             "UPDATE {} SET state = 'cancelled', completed_at = NOW()
-                 WHERE state = 'pending' AND created_at < $1",
+                 WHERE state = 'pending' AND created_at < $1::text::timestamptz",
             self.queue_name
-        ))
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Cancel old pending failed: {}", e)))?;
+        );
+        let cutoff_param = cutoff.to_rfc3339();
+        let rows_affected = self
+            .conn
+            .execute(&query_str, &[&cutoff_param])
+            .await
+            .map_err(|e| CelersError::Other(format!("Cancel old pending failed: {}", e)))?;
 
-        Ok(result.rows_affected() as i64)
+        Ok(rows_affected as i64)
     }
 
     /// Batch cancel multiple tasks by their IDs
@@ -377,17 +444,28 @@ impl PostgresBroker {
             return Ok(0);
         }
 
-        let result = sqlx::query(&format!(
+        // `id = ANY($1)` -> `IN ($1, .., $N)` rewrite (oxisql has no array
+        // `ToSqlValue`); `self.queue_name` splice is the same pre-existing
+        // table-name convention as above, now at the tail since the `IN`
+        // placeholders occupy the leading `$n` slots.
+        let placeholders = in_clause_placeholders(1, task_ids.len());
+        let query_str = format!(
             "UPDATE {} SET state = 'cancelled', completed_at = NOW()
-                 WHERE id = ANY($1) AND state IN ('pending', 'processing')",
-            self.queue_name
-        ))
-        .bind(task_ids)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Batch cancel failed: {}", e)))?;
+                 WHERE id IN ({}) AND state IN ('pending', 'processing')",
+            self.queue_name, placeholders
+        );
+        let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
+        let param_refs: Vec<&dyn ToSqlValue> = task_id_params
+            .iter()
+            .map(|p| p as &dyn ToSqlValue)
+            .collect();
+        let rows_affected = self
+            .conn
+            .execute(&query_str, &param_refs)
+            .await
+            .map_err(|e| CelersError::Other(format!("Batch cancel failed: {}", e)))?;
 
-        Ok(result.rows_affected() as i64)
+        Ok(rows_affected as i64)
     }
 
     /// Find tasks that have been processing for longer than the threshold
@@ -409,36 +487,24 @@ impl PostgresBroker {
             - chrono::Duration::from_std(threshold)
                 .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
 
-        let rows = sqlx::query(&format!(
+        let query_str = format!(
             "SELECT id, task_name, state, priority, retry_count, max_retries,
                         created_at, scheduled_at, started_at, completed_at, worker_id, error_message
                  FROM {}
-                 WHERE state = 'processing' AND started_at < $1
+                 WHERE state = 'processing' AND started_at < $1::text::timestamptz
                  ORDER BY started_at ASC",
             self.queue_name
-        ))
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to find stuck tasks: {}", e)))?;
+        );
+        let cutoff_param = cutoff.to_rfc3339();
+        let rows = self
+            .conn
+            .query(&query_str, &[&cutoff_param])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to find stuck tasks: {}", e)))?;
 
-        let mut tasks = Vec::new();
-        for row in rows {
-            let state_str: String = row.get("state");
-            tasks.push(TaskInfo {
-                id: row.get("id"),
-                task_name: row.get("task_name"),
-                state: state_str.parse()?,
-                priority: row.get("priority"),
-                retry_count: row.get("retry_count"),
-                max_retries: row.get("max_retries"),
-                created_at: row.get("created_at"),
-                scheduled_at: row.get("scheduled_at"),
-                started_at: row.get("started_at"),
-                completed_at: row.get("completed_at"),
-                worker_id: row.get("worker_id"),
-                error_message: row.get("error_message"),
-            });
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in &rows {
+            tasks.push(row_to_task_info(row)?);
         }
 
         Ok(tasks)
@@ -465,17 +531,19 @@ impl PostgresBroker {
             - chrono::Duration::from_std(threshold)
                 .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
 
-        let result = sqlx::query(&format!(
+        let query_str = format!(
             "UPDATE {} SET state = 'pending', started_at = NULL, worker_id = NULL
-                 WHERE state = 'processing' AND started_at < $1",
+                 WHERE state = 'processing' AND started_at < $1::text::timestamptz",
             self.queue_name
-        ))
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Requeue stuck tasks failed: {}", e)))?;
+        );
+        let cutoff_param = cutoff.to_rfc3339();
+        let rows_affected = self
+            .conn
+            .execute(&query_str, &[&cutoff_param])
+            .await
+            .map_err(|e| CelersError::Other(format!("Requeue stuck tasks failed: {}", e)))?;
 
-        Ok(result.rows_affected() as i64)
+        Ok(rows_affected as i64)
     }
 
     /// Get queue depth grouped by priority level
@@ -495,22 +563,28 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_queue_depth_by_priority(&self) -> Result<std::collections::HashMap<i32, i64>> {
-        let rows = sqlx::query(&format!(
+        let query_str = format!(
             "SELECT priority, COUNT(*) as count
                  FROM {}
                  WHERE state = 'pending'
                  GROUP BY priority
                  ORDER BY priority DESC",
             self.queue_name
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get queue depth: {}", e)))?;
+        );
+        let rows = self
+            .conn
+            .query(&query_str, &[])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get queue depth: {}", e)))?;
 
         let mut depth_map = std::collections::HashMap::new();
-        for row in rows {
-            let priority: i32 = row.get("priority");
-            let count: i64 = row.get("count");
+        for row in &rows {
+            let priority: i32 = row
+                .col("priority")
+                .map_err(|e| CelersError::Other(format!("Failed to read priority: {}", e)))?;
+            let count: i64 = row
+                .col("count")
+                .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
             depth_map.insert(priority, count);
         }
 
@@ -536,25 +610,37 @@ impl PostgresBroker {
         let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
         let one_day_ago = chrono::Utc::now() - chrono::Duration::days(1);
 
-        // Tasks completed in last hour
-        let last_hour: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM {} WHERE state = 'completed' AND completed_at > $1",
+        // Tasks completed in last hour. Original used `query_scalar` +
+        // `.unwrap_or(0)` on error (silently swallowing failures); preserved
+        // exactly via `.ok()` + `.and_then(...)` + `.unwrap_or(0)` below.
+        let one_hour_ago_param = one_hour_ago.to_rfc3339();
+        let last_hour_query = format!(
+            "SELECT COUNT(*) FROM {} WHERE state = 'completed' AND completed_at > $1::text::timestamptz",
             self.queue_name
-        ))
-        .bind(one_hour_ago)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        );
+        let last_hour: i64 = self
+            .conn
+            .query(&last_hour_query, &[&one_hour_ago_param])
+            .await
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|row| row.col_idx::<i64>(0).ok())
+            .unwrap_or(0);
 
         // Tasks completed in last day
-        let last_day: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM {} WHERE state = 'completed' AND completed_at > $1",
+        let one_day_ago_param = one_day_ago.to_rfc3339();
+        let last_day_query = format!(
+            "SELECT COUNT(*) FROM {} WHERE state = 'completed' AND completed_at > $1::text::timestamptz",
             self.queue_name
-        ))
-        .bind(one_day_ago)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        );
+        let last_day: i64 = self
+            .conn
+            .query(&last_day_query, &[&one_day_ago_param])
+            .await
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|row| row.col_idx::<i64>(0).ok())
+            .unwrap_or(0);
 
         // Average per hour over last day
         let avg_per_hour = if last_day > 0 {
@@ -585,25 +671,29 @@ impl PostgresBroker {
     pub async fn get_avg_task_duration_by_name(
         &self,
     ) -> Result<std::collections::HashMap<String, f64>> {
-        let rows = sqlx::query(
-            &format!(
-                "SELECT task_name,
+        let query_str = format!(
+            "SELECT task_name,
                         AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) as avg_duration_ms
                  FROM {}
                  WHERE state = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
                  GROUP BY task_name
                  ORDER BY avg_duration_ms DESC",
-                self.queue_name
-            )
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get avg duration: {}", e)))?;
+            self.queue_name
+        );
+        let rows = self
+            .conn
+            .query(&query_str, &[])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get avg duration: {}", e)))?;
 
         let mut duration_map = std::collections::HashMap::new();
-        for row in rows {
-            let task_name: String = row.get("task_name");
-            let avg_duration: Option<f64> = row.get("avg_duration_ms");
+        for row in &rows {
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let avg_duration: Option<f64> = row.col("avg_duration_ms").map_err(|e| {
+                CelersError::Other(format!("Failed to read avg_duration_ms: {}", e))
+            })?;
             if let Some(duration) = avg_duration {
                 duration_map.insert(task_name, duration);
             }
@@ -643,8 +733,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn expire_tasks_by_ttl(&self, task_name: &str, ttl_secs: i64) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW(),
@@ -654,15 +746,12 @@ impl PostgresBroker {
               AND state IN ('pending', 'processing')
               AND created_at < NOW() - INTERVAL '1 second' * $3
             "#,
-        )
-        .bind(task_name)
-        .bind(&self.queue_name)
-        .bind(ttl_secs)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to expire tasks: {}", e)))?;
+                &[&task_name, &self.queue_name, &ttl_secs],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to expire tasks: {}", e)))?;
 
-        let expired = result.rows_affected() as i64;
+        let expired = rows_affected as i64;
 
         if expired > 0 {
             tracing::info!(
@@ -695,8 +784,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn expire_all_tasks_by_ttl(&self, ttl_secs: i64) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW(),
@@ -705,14 +796,12 @@ impl PostgresBroker {
               AND state IN ('pending', 'processing')
               AND created_at < NOW() - INTERVAL '1 second' * $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(ttl_secs)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to expire all tasks: {}", e)))?;
+                &[&self.queue_name, &ttl_secs],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to expire all tasks: {}", e)))?;
 
-        let expired = result.rows_affected() as i64;
+        let expired = rows_affected as i64;
 
         if expired > 0 {
             tracing::info!(
@@ -767,13 +856,18 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn try_advisory_lock(&self, lock_id: i64) -> Result<bool> {
-        let row = sqlx::query("SELECT pg_try_advisory_lock($1) as locked")
-            .bind(lock_id)
-            .fetch_one(&self.pool)
+        let rows = self
+            .conn
+            .query("SELECT pg_try_advisory_lock($1) as locked", &[&lock_id])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to acquire advisory lock: {}", e)))?;
 
-        let locked: bool = row.get("locked");
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to acquire advisory lock: no rows returned".to_string())
+        })?;
+        let locked: bool = row
+            .col("locked")
+            .map_err(|e| CelersError::Other(format!("Failed to read locked: {}", e)))?;
 
         if locked {
             tracing::debug!(lock_id = lock_id, "Advisory lock acquired");
@@ -798,13 +892,18 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn release_advisory_lock(&self, lock_id: i64) -> Result<bool> {
-        let row = sqlx::query("SELECT pg_advisory_unlock($1) as unlocked")
-            .bind(lock_id)
-            .fetch_one(&self.pool)
+        let rows = self
+            .conn
+            .query("SELECT pg_advisory_unlock($1) as unlocked", &[&lock_id])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to release advisory lock: {}", e)))?;
 
-        let unlocked: bool = row.get("unlocked");
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to release advisory lock: no rows returned".to_string())
+        })?;
+        let unlocked: bool = row
+            .col("unlocked")
+            .map_err(|e| CelersError::Other(format!("Failed to read unlocked: {}", e)))?;
 
         if unlocked {
             tracing::debug!(lock_id = lock_id, "Advisory lock released");
@@ -835,9 +934,8 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn advisory_lock(&self, lock_id: i64) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(lock_id)
-            .execute(&self.pool)
+        self.conn
+            .execute("SELECT pg_advisory_lock($1)", &[&lock_id])
             .await
             .map_err(|e| {
                 CelersError::Other(format!("Failed to acquire blocking advisory lock: {}", e))
@@ -866,20 +964,26 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn is_advisory_lock_held(&self, lock_id: i64) -> Result<bool> {
-        let row = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT COUNT(*) > 0 as held
             FROM pg_locks
             WHERE locktype = 'advisory'
               AND objid = $1
             "#,
-        )
-        .bind(lock_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to check advisory lock: {}", e)))?;
+                &[&lock_id],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to check advisory lock: {}", e)))?;
 
-        let held: bool = row.get("held");
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to check advisory lock: no rows returned".to_string())
+        })?;
+        let held: bool = row
+            .col("held")
+            .map_err(|e| CelersError::Other(format!("Failed to read held: {}", e)))?;
         Ok(held)
     }
 
@@ -903,8 +1007,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_task_percentiles(&self, task_name: &str) -> Result<(f64, f64, f64)> {
-        let row = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY
                     EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000
@@ -923,16 +1029,24 @@ impl PostgresBroker {
               AND completed_at IS NOT NULL
               AND completed_at > started_at
             "#,
-        )
-        .bind(task_name)
-        .bind(&self.queue_name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task percentiles: {}", e)))?;
+                &[&task_name, &self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get task percentiles: {}", e)))?;
 
-        let p50: Option<f64> = row.get("p50");
-        let p95: Option<f64> = row.get("p95");
-        let p99: Option<f64> = row.get("p99");
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get task percentiles: no rows returned".to_string())
+        })?;
+
+        let p50: Option<f64> = row
+            .col("p50")
+            .map_err(|e| CelersError::Other(format!("Failed to read p50: {}", e)))?;
+        let p95: Option<f64> = row
+            .col("p95")
+            .map_err(|e| CelersError::Other(format!("Failed to read p95: {}", e)))?;
+        let p99: Option<f64> = row
+            .col("p99")
+            .map_err(|e| CelersError::Other(format!("Failed to read p99: {}", e)))?;
 
         Ok((p50.unwrap_or(0.0), p95.unwrap_or(0.0), p99.unwrap_or(0.0)))
     }
@@ -960,8 +1074,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_slowest_tasks(&self, limit: i64) -> Result<Vec<TaskInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT
                 id, task_name, state, priority, retry_count, max_retries,
                 created_at, scheduled_at, started_at, completed_at,
@@ -976,35 +1092,17 @@ impl PostgresBroker {
             ORDER BY (completed_at - started_at) DESC
             LIMIT $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get slowest tasks: {}", e)))?;
+                &[&self.queue_name, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get slowest tasks: {}", e)))?;
 
-        let tasks: Result<Vec<TaskInfo>> = rows
-            .iter()
-            .map(|row| {
-                let state_str: String = row.get("state");
-                Ok(TaskInfo {
-                    id: row.get("id"),
-                    task_name: row.get("task_name"),
-                    state: state_str.parse()?,
-                    priority: row.get("priority"),
-                    retry_count: row.get("retry_count"),
-                    max_retries: row.get("max_retries"),
-                    created_at: row.get("created_at"),
-                    scheduled_at: row.get("scheduled_at"),
-                    started_at: row.get("started_at"),
-                    completed_at: row.get("completed_at"),
-                    worker_id: row.get("worker_id"),
-                    error_message: row.get("error_message"),
-                })
-            })
-            .collect();
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in &rows {
+            tasks.push(row_to_task_info(row)?);
+        }
 
-        tasks
+        Ok(tasks)
     }
 
     // ========== Rate Limiting ==========
@@ -1028,8 +1126,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_task_rate(&self, task_name: &str, window_secs: i64) -> Result<i64> {
-        let row = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT COUNT(*) as count
             FROM celers_tasks
             WHERE task_name = $1
@@ -1037,15 +1137,17 @@ impl PostgresBroker {
               AND state = 'completed'
               AND completed_at > NOW() - INTERVAL '1 second' * $3
             "#,
-        )
-        .bind(task_name)
-        .bind(&self.queue_name)
-        .bind(window_secs)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task rate: {}", e)))?;
+                &[&task_name, &self.queue_name, &window_secs],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get task rate: {}", e)))?;
 
-        let count: i64 = row.get("count");
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Failed to get task rate: no rows returned".to_string())
+        })?;
+        let count: i64 = row
+            .col("count")
+            .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
         Ok(count)
     }
 
@@ -1100,23 +1202,22 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn boost_task_priority(&self, task_name: &str, boost_amount: i32) -> Result<i64> {
-        let result = sqlx::query(
-            r#"
+        let rows_affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET priority = priority + $1
             WHERE task_name = $2
               AND queue_name = $3
               AND state = 'pending'
             "#,
-        )
-        .bind(boost_amount)
-        .bind(task_name)
-        .bind(&self.queue_name)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to boost task priority: {}", e)))?;
+                &[&boost_amount, &task_name, &self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to boost task priority: {}", e)))?;
 
-        let boosted = result.rows_affected() as i64;
+        let boosted = rows_affected as i64;
 
         if boosted > 0 {
             tracing::info!(
@@ -1158,23 +1259,33 @@ impl PostgresBroker {
             return Ok(0);
         }
 
-        let result = sqlx::query(
+        // `id = ANY($2)` -> `IN (...)` rewrite. `new_priority` stays at `$1`;
+        // the `IN` list occupies `$2..$1+task_ids.len()`; `queue_name` moves
+        // to the tail.
+        let placeholders = in_clause_placeholders(2, task_ids.len());
+        let queue_name_idx = 2 + task_ids.len();
+        let query_str = format!(
             r#"
             UPDATE celers_tasks
             SET priority = $1
-            WHERE id = ANY($2)
-              AND queue_name = $3
+            WHERE id IN ({})
+              AND queue_name = ${}
               AND state = 'pending'
             "#,
-        )
-        .bind(new_priority)
-        .bind(task_ids)
-        .bind(&self.queue_name)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to set task priority: {}", e)))?;
+            placeholders, queue_name_idx
+        );
+        let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
+        let mut param_refs: Vec<&dyn ToSqlValue> = vec![&new_priority];
+        param_refs.extend(task_id_params.iter().map(|p| p as &dyn ToSqlValue));
+        param_refs.push(&self.queue_name);
 
-        let updated = result.rows_affected() as i64;
+        let rows_affected = self
+            .conn
+            .execute(&query_str, &param_refs)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to set task priority: {}", e)))?;
+
+        let updated = rows_affected as i64;
 
         if updated > 0 {
             tracing::info!(
@@ -1209,24 +1320,30 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_dlq_stats_by_task(&self) -> Result<std::collections::HashMap<String, i64>> {
-        let rows = sqlx::query(
-            r#"
+        // TODO(queue-name-drift): also filters on a queue_name column celers_dead_letter_queue doesn't have — see TODO.md
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT task_name, COUNT(*) as count
-            FROM celers_dlq
+            FROM celers_dead_letter_queue
             WHERE queue_name = $1
             GROUP BY task_name
             ORDER BY count DESC
             "#,
-        )
-        .bind(&self.queue_name)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get DLQ stats: {}", e)))?;
+                &[&self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get DLQ stats: {}", e)))?;
 
         let mut stats = std::collections::HashMap::new();
-        for row in rows {
-            let task_name: String = row.get("task_name");
-            let count: i64 = row.get("count");
+        for row in &rows {
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+            let count: i64 = row
+                .col("count")
+                .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
             stats.insert(task_name, count);
         }
 
@@ -1253,30 +1370,33 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_dlq_error_patterns(&self, limit: i64) -> Result<Vec<(Option<String>, i64)>> {
-        let rows = sqlx::query(
-            r#"
+        // TODO(queue-name-drift): also filters on a queue_name column celers_dead_letter_queue doesn't have — see TODO.md
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT error_message, COUNT(*) as count
-            FROM celers_dlq
+            FROM celers_dead_letter_queue
             WHERE queue_name = $1
             GROUP BY error_message
             ORDER BY count DESC
             LIMIT $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get DLQ error patterns: {}", e)))?;
+                &[&self.queue_name, &limit],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get DLQ error patterns: {}", e)))?;
 
-        let patterns: Vec<(Option<String>, i64)> = rows
-            .iter()
-            .map(|row| {
-                let error_message: Option<String> = row.get("error_message");
-                let count: i64 = row.get("count");
-                (error_message, count)
-            })
-            .collect();
+        let mut patterns = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let error_message: Option<String> = row
+                .col("error_message")
+                .map_err(|e| CelersError::Other(format!("Failed to read error_message: {}", e)))?;
+            let count: i64 = row
+                .col("count")
+                .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
+            patterns.push((error_message, count));
+        }
 
         Ok(patterns)
     }
@@ -1300,32 +1420,43 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_recent_dlq_tasks(&self, window_secs: i64) -> Result<Vec<DlqTaskInfo>> {
-        let rows = sqlx::query(
-            r#"
+        // TODO(queue-name-drift): also filters on a queue_name column celers_dead_letter_queue doesn't have — see TODO.md
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT id, task_id, task_name, retry_count, error_message, failed_at
-            FROM celers_dlq
+            FROM celers_dead_letter_queue
             WHERE queue_name = $1
               AND failed_at > NOW() - INTERVAL '1 second' * $2
             ORDER BY failed_at DESC
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(window_secs)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get recent DLQ tasks: {}", e)))?;
+                &[&self.queue_name, &window_secs],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get recent DLQ tasks: {}", e)))?;
 
-        let tasks: Vec<DlqTaskInfo> = rows
-            .iter()
-            .map(|row| DlqTaskInfo {
-                id: row.get("id"),
-                task_id: row.get("task_id"),
-                task_name: row.get("task_name"),
-                retry_count: row.get("retry_count"),
-                error_message: row.get("error_message"),
-                failed_at: row.get("failed_at"),
-            })
-            .collect();
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in &rows {
+            tasks.push(DlqTaskInfo {
+                id: uuid_from_row(row, "id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+                task_id: uuid_from_row(row, "task_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_id: {}", e)))?,
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
+                retry_count: row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to read retry_count: {}", e))
+                })?,
+                error_message: row.col("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to read error_message: {}", e))
+                })?,
+                failed_at: row
+                    .col("failed_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read failed_at: {}", e)))?,
+            });
+        }
 
         Ok(tasks)
     }
@@ -1351,8 +1482,11 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn cancel_with_reason(&self, task_id: &uuid::Uuid, reason: &str) -> Result<()> {
-        sqlx::query(
-            r#"
+        let error_message = format!("Cancelled: {}", reason);
+        let task_id_param = uuid_param(task_id);
+        self.conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW(),
@@ -1361,13 +1495,10 @@ impl PostgresBroker {
               AND queue_name = $3
               AND state IN ('pending', 'processing')
             "#,
-        )
-        .bind(format!("Cancelled: {}", reason))
-        .bind(task_id)
-        .bind(&self.queue_name)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to cancel task with reason: {}", e)))?;
+                &[&error_message, &task_id_param, &self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to cancel task with reason: {}", e)))?;
 
         tracing::info!(
             task_id = %task_id,
@@ -1406,25 +1537,38 @@ impl PostgresBroker {
             return Ok(0);
         }
 
-        let result = sqlx::query(
+        // `id = ANY($2)` -> `IN (...)` rewrite. `error_message` stays at
+        // `$1`; the `IN` list occupies `$2..2+task_ids.len()`; `queue_name`
+        // moves to the tail.
+        let error_message = format!("Cancelled: {}", reason);
+        let placeholders = in_clause_placeholders(2, task_ids.len());
+        let queue_name_idx = 2 + task_ids.len();
+        let query_str = format!(
             r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW(),
                 error_message = $1
-            WHERE id = ANY($2)
-              AND queue_name = $3
+            WHERE id IN ({})
+              AND queue_name = ${}
               AND state IN ('pending', 'processing')
             "#,
-        )
-        .bind(format!("Cancelled: {}", reason))
-        .bind(task_ids)
-        .bind(&self.queue_name)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to cancel tasks with reason: {}", e)))?;
+            placeholders, queue_name_idx
+        );
+        let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
+        let mut param_refs: Vec<&dyn ToSqlValue> = vec![&error_message];
+        param_refs.extend(task_id_params.iter().map(|p| p as &dyn ToSqlValue));
+        param_refs.push(&self.queue_name);
 
-        let cancelled = result.rows_affected() as i64;
+        let rows_affected = self
+            .conn
+            .execute(&query_str, &param_refs)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to cancel tasks with reason: {}", e))
+            })?;
+
+        let cancelled = rows_affected as i64;
 
         if cancelled > 0 {
             tracing::info!(
@@ -1457,8 +1601,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_cancellation_reasons(&self, limit: i64) -> Result<Vec<(Option<String>, i64)>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT error_message, COUNT(*) as count
             FROM celers_tasks
             WHERE queue_name = $1
@@ -1468,21 +1614,23 @@ impl PostgresBroker {
             ORDER BY count DESC
             LIMIT $2
             "#,
-        )
-        .bind(&self.queue_name)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get cancellation reasons: {}", e)))?;
+                &[&self.queue_name, &limit],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to get cancellation reasons: {}", e))
+            })?;
 
-        let reasons: Vec<(Option<String>, i64)> = rows
-            .iter()
-            .map(|row| {
-                let reason: Option<String> = row.get("error_message");
-                let count: i64 = row.get("count");
-                (reason, count)
-            })
-            .collect();
+        let mut reasons = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let reason: Option<String> = row
+                .col("error_message")
+                .map_err(|e| CelersError::Other(format!("Failed to read error_message: {}", e)))?;
+            let count: i64 = row
+                .col("count")
+                .map_err(|e| CelersError::Other(format!("Failed to read count: {}", e)))?;
+            reasons.push((reason, count));
+        }
 
         Ok(reasons)
     }

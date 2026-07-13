@@ -2,7 +2,7 @@
 
 > Core traits and types for the CeleRS task queue system
 
-## Status: ✅ STABLE — v0.2.0 (2026-03-27) — 247 tests
+## Status: ✅ STABLE — v0.3.0 (2026-07-13) — 438 tests
 
 The core crate provides all fundamental building blocks for task queue systems.
 
@@ -151,11 +151,70 @@ The core crate provides all fundamental building blocks for task queue systems.
 - [x] validate_detailed(), to_env_vars(), dump() methods
 
 ### Potential Improvements
+- [x] Local development mode (in-memory broker) ✅
+  - [x] `InMemoryBroker` implementing the full `Broker` trait (priority-ordered + FIFO-within-priority enqueue/dequeue, receipt-handle `ack`/`reject` with requeue, `queue_size`, `cancel` of ready and in-flight tasks, batch enqueue); tokio `Mutex` + `Notify` blocking dequeue (src/in_memory_broker.rs)
+  - [x] `InMemoryResultBackend` implementing the full `ResultStore` trait (`store_result`/`get_result`/`get_state`/`forget`/`has_result`) plus native tombstone hooks; no external services required
+  - [x] 17 unit tests (enqueue→dequeue→ack round-trip, ordering/priority/FIFO, reject±requeue, cancel ready/in-flight, blocking dequeue wakeup, batch; backend store→get→forget, state mapping, tombstone tri-state)
+- [x] Result caching layer ✅
+  - [x] `CachingResultBackend<B>` wrapping ANY `ResultStore` with a bounded in-memory LRU (native intrusive doubly-linked list + `HashMap` index, O(1), no new dependency); configurable capacity + optional per-entry TTL (src/caching_backend.rs)
+  - [x] Cache hits skip the inner backend; write-through `store_result`; invalidation on `forget`/overwrite; negative-result caching; hit/miss counters; tombstone & TTL hooks delegated to inner backend
+  - [x] 12 unit tests (hit skips inner, store→hit, eviction-at-capacity, TTL expiry→miss, forget invalidation, overwrite refresh, single-entry invalidate, state-from-cache, capacity clamp, concurrent Arc access, into_inner)
 - [x] Add task dependencies/DAG support ✅
 - [x] Implement task result storage backend (celers-backend-*)
 - [x] Add task scheduling (cron-like) (celers-beat)
 - [x] Support for task chains/workflows (celers-canvas)
 - [x] Add task groups/batching primitives (celers-canvas)
+- [x] Distributed rate limiting across workers ✅
+  - [x] `DistributedRateLimitBackend` async trait (shared token/counter store keyed by limiter name; atomic acquire with refill semantics)
+  - [x] `InMemoryDistributedBackend` (tokio Mutex-based, fully testable in-process; Redis backend can implement the same trait)
+  - [x] `DistributedRateLimiter` handle reusing `RateLimitConfig` + token-bucket / sliding-window algorithms (src/rate_limit_distributed.rs)
+  - [x] 10 unit tests (burst/deny, refill, sliding window, cost-N, concurrent acquire caps, reset)
+- [x] Circuit breaker per task type ✅
+  - [x] `CircuitBreaker` core primitive: thread-safe (tokio `RwLock`, `Arc`-shared) three-state machine (Closed/Open/HalfOpen) with rolling failure window, half-open trial-call limiting, and `call()` wrapper recording success/failure (src/circuit_breaker_registry.rs)
+  - [x] `CircuitBreakerConfig` (failure/success thresholds, open timeout, failure window, half-open max calls) as default + per-type override; `CircuitState`, `CircuitSnapshot`, `CircuitBreakerError`
+  - [x] `TaskTypeCircuitBreakers` registry mapping task name -> its own `CircuitBreaker` with `is_open(task)`/`try_acquire`/`call`/`record_*`/`reset(_all)`/`all_states` API; lazy per-type creation, default config + per-type overrides
+  - [x] 18 unit tests + 2 doc tests (trip after threshold, half-open recovery/reopen, trial-call limiting, window expiry, per-type isolation, default-vs-override, call helper short-circuit, reset/inspection, shared-handle consistency)
+- [x] Rate limiting per user/tenant ✅
+  - [x] `TenantRateLimiter` keyed by tenant id, reusing the existing `RateLimiter` (token-bucket / sliding-window) + `RateLimitConfig` via `create_rate_limiter`; thread-safe (std `RwLock`, `Arc`-shared), fail-open on poison (src/tenant_rate_limit.rs)
+  - [x] Default config + per-tenant overrides; optional per-tenant cumulative `quota` (`TenantRateLimit`); per-tenant usage tracking (`TenantUsage`: granted/denied/quota_remaining)
+  - [x] API: `try_acquire`/`has_capacity`/`time_until_available`/`usage`/`set_tenant_config`/`set_tenant_policy`/`set_tenant_quota`/`remove_tenant`/`reset_tenant`/`reset_all`
+  - [x] 17 unit tests + 1 doc test (per-tenant isolation, default-vs-override, quota caps total + isolates others, quota preserves rate, sliding-window tenant, reset, remove falls back to default, concurrent caps, serde round-trip)
+- [x] Event snapshot + event-based alerting ✅
+  - [x] `EventSnapshot` + `EventSnapshotBuilder` (periodic aggregate: task counts by state, queue depth, worker count, timestamp; folds `event::Event`s)
+  - [x] `AlertRule` / `AlertRuleKind` (failure-rate over window, queue-depth threshold, no-heartbeat) with hysteresis + cooldown
+  - [x] `AlertEvaluator` consuming events/snapshots, emitting `RuleAlert` (reuses `event::AlertSeverity`) (src/alerting.rs)
+  - [x] 10 unit tests (rules tripping and recovering, hysteresis, cooldown, window pruning, multi-rule)
+- [x] Result backend roadmap items ✅
+  - [x] Result tombstones (mark deleted results) — distinguishable from "never existed"
+    - [x] `ResultExistence` tri-state enum (Present / Tombstoned / Absent) with `was_deleted()` predicate (src/result_tombstone.rs)
+    - [x] `TombstoneRegistry` thread-safe in-memory store; `lookup`, `is_tombstoned`, `mark_forgotten`, `purge_expired`
+    - [x] `TombstoneExt` for `ResultTombstone` (`age`, `is_expired`, `time_until_expiration`)
+    - [x] DEFAULT trait methods on `ResultStore`: `store_tombstone`, `get_tombstone`, `has_tombstone`, `result_existence`, `forget_with_tombstone` (all default no-op/unsupported)
+    - [x] 10 unit tests (deleted vs absent, expired tombstone treated as absent, purge, ext helpers)
+  - [x] Result groups (grouped results for Group/Chord) ✅
+    - [x] `ResultGroup` holding ordered child metas; `ready()` (all ready?), `successful()`/`failed()` rollup, `status()` -> `GroupStatus`
+    - [x] Ordered collected values (`collected_values`, `successful_values`, `error_messages`); `GroupChild` snapshot (src/result_groups.rs)
+    - [x] 12 unit tests (readiness, success/failure/revoked/rejected rollup, ordered values, dedup)
+  - [x] Result TTL per task type ✅
+    - [x] `ResultTtlConfig` mapping task name -> TTL with default fallback; `ttl_for`, `ttl_for_or`, `expires_at`, serde round-trip (src/result_ttl.rs)
+    - [x] `ResolvedResultTtl` carrying a resolved per-instance TTL
+    - [x] DEFAULT trait hooks on `ResultStore`: `result_ttl_for` (resolve from config), `apply_result_ttl` (default unsupported no-op)
+    - [x] 9 unit tests (default fallback, per-task override wins, never-expires, insert/remove, resolve)
+- [x] Task Security roadmap items ✅
+  - [x] Task signature verification (HMAC-SHA256) ✅
+    - [x] Native, dependency-free SHA-256 + HMAC-SHA256 (`Sha256`, `HmacSha256`) verified against FIPS 180-4 / RFC 4231 vectors (src/task_signature.rs)
+    - [x] `SignedFields` projection (id, name, args, kwargs) with unambiguous, length-prefixed canonical serialization (kwargs sorted; type-tagged values; no field-boundary collisions)
+    - [x] `TaskSigner` (`sign`, `verify`, `verify_optional`, `is_valid`) with constant-time tag comparison; rejects tampered/unsigned/wrong-key/malformed; `TaskSignature` + `SignatureAlgorithm` serde-serializable
+    - [x] 25 unit tests (SHA-256/HMAC KATs, sign+verify round-trip, tamper of id/name/args/kwargs, wrong key, unsigned, malformed, type/boundary non-collision, serde round-trip, no key leak)
+  - [x] Task argument sanitization ✅
+    - [x] `TaskValue` JSON-like value model (shared by signing + PII) with `serde_json::Value` interop, `kind()`, `approx_size()`, `depth()`
+    - [x] `Sanitizer` + `SanitizerConfig`: max arg count, max string/blob size (reject or truncate), max key length, max nesting depth, disallowed value kinds, control-character stripping, secret-key redaction (password/token/secret/api_key/...) — recurses into arrays/objects (src/sanitize.rs)
+    - [x] `SanitizeReport` (strings stripped, control chars removed, values truncated, keys redacted) + `SanitizeError`
+    - [x] 20 unit tests (strip/keep-whitespace, redact top-level + nested secrets, count/size/depth/key limits, truncate at UTF-8 boundary, disallow/allow bytes, serde round-trip)
+  - [x] PII detection and masking ✅
+    - [x] Hand-written (no-regex) scanners for email, credit-card (Luhn-validated), phone, and US-SSN; invalid-Luhn numbers and invalid SSN ranges are ignored (src/pii.rs)
+    - [x] `PiiDetector` + `PiiConfig` (`scan_str`/`mask_str`, `scan_value`/`mask_value`, `scan_call`/`mask_call`); `PiiReport` of `PiiMatch` (kind, byte span, text) with non-overlapping resolution; public `luhn_check`
+    - [x] 25 unit tests (Luhn valid/invalid KATs, email/card/SSN/phone detect + ignore false positives, masking + length-preserving masking, TaskValue/call integration, serde round-trip)
 
 ### Performance ✅
 - [x] Benchmark task creation overhead
@@ -277,9 +336,18 @@ The core crate provides all fundamental building blocks for task queue systems.
   - [x] Workflow with multiple dependencies (DAG)
   - [x] Task state history full lifecycle
 
-**Total: 247 tests, all passing** ✅
+**Total (as of the 2026-07-11 QA/hardening pass): 247 tests, all passing** ✅
 
-## Latest Enhancements (Jan 7, 2026):
+**Current total: 438 tests, all passing** ✅ — the increase since the count above is the 0.3.0 feature work itemized under "Potential Improvements" earlier in this file (local dev mode, result caching, distributed rate limiting, circuit breakers, tenant rate limiting, event snapshot/alerting, result tombstones/groups/TTL, task signing, argument sanitization, PII detection: ~191 tests), verified via `cargo nextest run -p celers-core --all-features`
+
+## Latest Enhancements (2026-07-11):
+
+### Documentation Fixes (QA/Hardening Pass)
+- **Fixed 2 broken/redundant rustdoc intra-doc links** — `src/caching_backend.rs` and `src/in_memory_broker.rs`
+- Added `readme = "README.md"` to `Cargo.toml` package metadata
+- Removed unused dependency `oxicode`
+
+## Previous Enhancements (Jan 7, 2026):
 
 ### Performance Optimizations - Additional Inline Attributes (Session 10)
 - **Added 27 `#[inline]` attributes** to constructor and builder methods for better performance
@@ -461,12 +529,14 @@ The core crate provides all fundamental building blocks for task queue systems.
 
 - `tokio`: Async runtime
 - `async-trait`: Async trait support
-- `serde`: Serialization
+- `serde` / `serde_json`: Serialization
 - `uuid`: Unique IDs
 - `chrono`: Timestamps
 - `thiserror`: Error types
+- `tracing`: Structured logging
 - `regex`: Pattern matching for routing
 - `rand`: Random number generation for jittered retry strategies
+- `num_cpus`: CPU count detection
 
 ## Notes
 

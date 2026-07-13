@@ -1,5 +1,8 @@
 //! Types, structs, enums, and configuration for the worker runtime.
 
+use crate::adaptive_poll::AdaptivePollConfig;
+use crate::affinity::WorkerLabels;
+use crate::batching::BatchConfig;
 use crate::circuit_breaker::CircuitBreakerConfig;
 use crate::dlq::DlqConfig;
 use crate::feature_flags::FeatureFlags;
@@ -136,6 +139,27 @@ pub struct WorkerConfig {
     /// Number of tasks to fetch per batch (when batch dequeue enabled)
     pub batch_size: usize,
 
+    // Adaptive polling options
+    /// Use an adaptive poll-interval controller instead of the fixed
+    /// `poll_interval_ms` when the queue is empty. The controller backs the
+    /// interval off toward `adaptive_poll_config.max_interval_ms` on repeated
+    /// empties and snaps it back toward the minimum when work is found.
+    pub enable_adaptive_poll: bool,
+
+    /// Configuration for the adaptive poll-interval controller (used only when
+    /// `enable_adaptive_poll` is true).
+    pub adaptive_poll_config: AdaptivePollConfig,
+
+    // Task coalescing options
+    /// Coalesce duplicate tasks (sharing a coalescing key) within each dequeued
+    /// batch before processing, dropping redundant work. Most effective together
+    /// with `enable_batch_dequeue`.
+    pub enable_coalescing: bool,
+
+    /// Configuration for batch coalescing (used only when `enable_coalescing` is
+    /// true).
+    pub coalescing_config: BatchConfig,
+
     /// Maximum task result size in bytes (0 = unlimited)
     pub max_result_size_bytes: usize,
 
@@ -165,6 +189,14 @@ pub struct WorkerConfig {
 
     /// Routing strategy
     pub routing_strategy: RoutingStrategy,
+
+    // Task-affinity options
+    /// Capability labels advertised by this worker for label-based task-affinity
+    /// admission (matched against per-task [`crate::affinity::TaskAffinity`] when
+    /// an affinity registry is installed via
+    /// [`Worker::with_affinity`](crate::Worker::with_affinity)). Empty by
+    /// default, in which case any task declaring required labels is deferred.
+    pub worker_labels: WorkerLabels,
 
     // Event emission options
     /// Worker hostname for event identification
@@ -196,6 +228,10 @@ impl Default for WorkerConfig {
             default_timeout_secs: 300,
             enable_batch_dequeue: false,
             batch_size: 10,
+            enable_adaptive_poll: false,
+            adaptive_poll_config: AdaptivePollConfig::default(),
+            enable_coalescing: false,
+            coalescing_config: BatchConfig::default(),
             max_result_size_bytes: 0, // unlimited
             track_memory_usage: false,
             enable_circuit_breaker: false,
@@ -205,6 +241,7 @@ impl Default for WorkerConfig {
             enable_routing: false,
             worker_tags: WorkerTags::new(),
             routing_strategy: RoutingStrategy::default(),
+            worker_labels: WorkerLabels::new(),
             hostname: gethostname(),
             enable_events: false,
             heartbeat_interval_secs: 0, // disabled by default
@@ -403,6 +440,14 @@ impl WorkerConfig {
             return Err("Batch size must be at least 1 when batch dequeue is enabled".to_string());
         }
 
+        if self.enable_adaptive_poll {
+            self.adaptive_poll_config.validate()?;
+        }
+
+        if self.enable_coalescing {
+            self.coalescing_config.validate()?;
+        }
+
         if self.default_timeout_secs == 0 {
             return Err("Default timeout must be at least 1 second".to_string());
         }
@@ -560,6 +605,42 @@ impl WorkerConfigBuilder {
         self
     }
 
+    /// Enable the adaptive poll-interval controller.
+    ///
+    /// When enabled, the worker backs off its empty-queue poll interval up to
+    /// `adaptive_poll_config.max_interval_ms` on repeated empties and snaps it
+    /// back toward the minimum when work is found.
+    ///
+    /// Default: false
+    pub fn enable_adaptive_poll(mut self, enabled: bool) -> Self {
+        self.config.enable_adaptive_poll = enabled;
+        self
+    }
+
+    /// Set the adaptive poll-interval controller configuration.
+    ///
+    /// Has effect only when adaptive polling is enabled.
+    pub fn adaptive_poll_config(mut self, config: AdaptivePollConfig) -> Self {
+        self.config.adaptive_poll_config = config;
+        self
+    }
+
+    /// Enable coalescing of duplicate tasks within each dequeued batch.
+    ///
+    /// Default: false
+    pub fn enable_coalescing(mut self, enabled: bool) -> Self {
+        self.config.enable_coalescing = enabled;
+        self
+    }
+
+    /// Set the batch coalescing configuration.
+    ///
+    /// Has effect only when coalescing is enabled.
+    pub fn coalescing_config(mut self, config: BatchConfig) -> Self {
+        self.config.coalescing_config = config;
+        self
+    }
+
     /// Set the maximum task result size in bytes (0 = unlimited)
     ///
     /// Default: 0 (unlimited)
@@ -621,6 +702,18 @@ impl WorkerConfigBuilder {
     /// Set routing strategy
     pub fn routing_strategy(mut self, strategy: RoutingStrategy) -> Self {
         self.config.routing_strategy = strategy;
+        self
+    }
+
+    /// Set the capability labels advertised by this worker for label-based
+    /// task-affinity admission.
+    ///
+    /// These labels are matched against each task's
+    /// [`crate::affinity::TaskAffinity`] when an affinity registry is installed
+    /// via [`Worker::with_affinity`](crate::Worker::with_affinity). Empty by
+    /// default.
+    pub fn worker_labels(mut self, labels: WorkerLabels) -> Self {
+        self.config.worker_labels = labels;
         self
     }
 
@@ -760,6 +853,10 @@ pub struct WorkerStats {
     active: AtomicU64,
     /// Total number of tasks processed since worker start
     processed: AtomicU64,
+    /// Total number of tasks revoked (cancelled) since worker start
+    revoked: AtomicU64,
+    /// Total number of tasks deferred due to distributed rate limiting
+    rate_limited: AtomicU64,
 }
 
 impl WorkerStats {
@@ -778,6 +875,16 @@ impl WorkerStats {
         self.processed.load(Ordering::Relaxed)
     }
 
+    /// Get the number of tasks revoked (cancelled) during execution
+    pub fn revoked(&self) -> u64 {
+        self.revoked.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of tasks deferred due to distributed rate limiting
+    pub fn rate_limited(&self) -> u64 {
+        self.rate_limited.load(Ordering::Relaxed)
+    }
+
     /// Increment the active task count (called when a task starts)
     pub fn task_started(&self) {
         self.active.fetch_add(1, Ordering::Relaxed);
@@ -788,6 +895,16 @@ impl WorkerStats {
         self.active.fetch_sub(1, Ordering::Relaxed);
         self.processed.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Record that a task was revoked (cancelled) during execution
+    pub fn task_revoked(&self) {
+        self.revoked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a task was deferred/skipped due to distributed rate limiting
+    pub fn task_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl Clone for WorkerStats {
@@ -795,6 +912,8 @@ impl Clone for WorkerStats {
         Self {
             active: AtomicU64::new(self.active.load(Ordering::Relaxed)),
             processed: AtomicU64::new(self.processed.load(Ordering::Relaxed)),
+            revoked: AtomicU64::new(self.revoked.load(Ordering::Relaxed)),
+            rate_limited: AtomicU64::new(self.rate_limited.load(Ordering::Relaxed)),
         }
     }
 }

@@ -433,6 +433,10 @@ pub struct TaskMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chord_id: Option<Uuid>,
 
+    /// On-success chain link: name of task to enqueue with this task's result as first arg
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_success_link: Option<String>,
+
     /// Task dependencies (tasks that must complete before this task can execute)
     #[serde(skip_serializing_if = "HashSet::is_empty", default)]
     pub dependencies: HashSet<TaskId>,
@@ -454,6 +458,7 @@ impl TaskMetadata {
             priority: 0,
             group_id: None,
             chord_id: None,
+            on_success_link: None,
             dependencies: HashSet::new(),
         }
     }
@@ -492,6 +497,14 @@ impl TaskMetadata {
     #[must_use]
     pub fn with_chord_id(mut self, chord_id: Uuid) -> Self {
         self.chord_id = Some(chord_id);
+        self
+    }
+
+    /// Set the on-success chain link task name
+    #[inline]
+    #[must_use]
+    pub fn with_on_success_link(mut self, task_name: String) -> Self {
+        self.on_success_link = Some(task_name);
         self
     }
 
@@ -908,6 +921,7 @@ impl TaskMetadata {
             priority: self.priority,
             group_id: self.group_id,
             chord_id: self.chord_id,
+            on_success_link: self.on_success_link.clone(),
             dependencies: self.dependencies.clone(),
         }
     }
@@ -1045,6 +1059,14 @@ impl SerializedTask {
     #[must_use]
     pub fn with_chord_id(mut self, chord_id: Uuid) -> Self {
         self.metadata.chord_id = Some(chord_id);
+        self
+    }
+
+    /// Set the on-success chain link task name for this task
+    #[inline]
+    #[must_use]
+    pub fn with_on_success_link(mut self, task_name: String) -> Self {
+        self.metadata.on_success_link = Some(task_name);
         self
     }
 
@@ -1440,6 +1462,85 @@ mod tests {
         assert_eq!(task.dependency_count(), 2);
         assert!(task.depends_on(&dep1));
         assert!(task.depends_on(&dep2));
+    }
+
+    // Chain link field tests
+    #[test]
+    fn test_workflow_no_link_serialization_roundtrip() {
+        let task = SerializedTask::new("my_task".to_string(), b"payload".to_vec());
+
+        // No on_success_link set — field must be absent after serde roundtrip
+        let json = serde_json::to_string(&task).expect("serialize");
+        let restored: SerializedTask = serde_json::from_str(&json).expect("deserialize");
+
+        assert!(
+            restored.metadata.on_success_link.is_none(),
+            "on_success_link should be None when never set"
+        );
+        // The field must be absent from the JSON (skip_serializing_if)
+        assert!(
+            !json.contains("on_success_link"),
+            "on_success_link should be omitted from JSON when None"
+        );
+    }
+
+    #[test]
+    fn test_workflow_chain_link_serialization_roundtrip() {
+        let task = SerializedTask::new("step_a".to_string(), b"result_bytes".to_vec())
+            .with_on_success_link("next_task".to_string());
+
+        assert_eq!(
+            task.metadata.on_success_link.as_deref(),
+            Some("next_task"),
+            "on_success_link must be Some(\"next_task\") before serialization"
+        );
+
+        let json = serde_json::to_string(&task).expect("serialize");
+
+        // The field must be present in the JSON
+        assert!(
+            json.contains("on_success_link"),
+            "on_success_link must appear in JSON when set"
+        );
+        assert!(
+            json.contains("next_task"),
+            "link name must appear in serialized JSON"
+        );
+
+        let restored: SerializedTask = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            restored.metadata.on_success_link.as_deref(),
+            Some("next_task"),
+            "on_success_link must survive a serde roundtrip"
+        );
+        assert_eq!(
+            restored.metadata.name, "step_a",
+            "task name must survive a serde roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_task_metadata_with_on_success_link_builder() {
+        let metadata =
+            TaskMetadata::new("producer".to_string()).with_on_success_link("consumer".to_string());
+
+        assert_eq!(
+            metadata.on_success_link.as_deref(),
+            Some("consumer"),
+            "TaskMetadata builder must set on_success_link"
+        );
+    }
+
+    #[test]
+    fn test_serialized_task_with_on_success_link_builder() {
+        let task = SerializedTask::new("a".to_string(), vec![1, 2, 3])
+            .with_on_success_link("b".to_string());
+
+        assert_eq!(
+            task.metadata.on_success_link.as_deref(),
+            Some("b"),
+            "SerializedTask builder must delegate on_success_link to metadata"
+        );
     }
 
     // Integration tests for full task lifecycle

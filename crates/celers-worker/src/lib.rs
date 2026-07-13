@@ -40,9 +40,13 @@
 //! # }
 //! ```
 
+pub mod adaptive_poll;
+pub mod affinity;
+pub mod batching;
 pub mod cancellation;
 pub mod checkpoint;
 pub mod circuit_breaker;
+pub mod coordinated_rate_limit;
 pub mod cpu_affinity;
 pub mod crash_dump;
 pub mod dead_worker_detection;
@@ -52,6 +56,7 @@ pub mod distributed_rate_limit;
 pub mod dlq;
 pub mod dlq_storage;
 pub mod error_aggregation;
+pub mod execution_context;
 pub mod feature_flags;
 pub mod gc_tuning;
 pub mod health;
@@ -64,6 +69,7 @@ pub mod metadata;
 pub mod middleware;
 pub mod performance_metrics;
 pub mod pipeline;
+pub mod poison_pill;
 pub mod prefetch;
 pub mod queue_monitor;
 pub mod rate_limit;
@@ -71,12 +77,17 @@ pub mod resource_tracker;
 pub mod restart_manager;
 pub mod retry;
 pub mod routing;
+#[cfg(feature = "postgres")]
+pub mod row_ext;
 pub mod sandbox;
 pub mod scheduler;
 pub mod shutdown;
 pub mod streaming;
+pub(crate) mod sysinfo;
 pub mod task_resources;
 pub mod task_timeout;
+#[cfg(feature = "postgres")]
+pub mod tls_mode;
 pub mod types;
 pub mod worker_coordination;
 pub mod worker_core;
@@ -107,11 +118,23 @@ pub use types::*;
 // Re-export worker core
 pub use worker_core::*;
 
+pub use adaptive_poll::{AdaptivePoll, AdaptivePollConfig, AdaptivePollStats, PollOutcome};
+pub use affinity::{
+    can_run as affinity_can_run, match_score as affinity_match_score, AffinityDecision,
+    AffinityRegistry, TaskAffinity, WorkerLabels,
+};
+pub use batching::{
+    broker_message_coalesce_key, coalesce, Batch, BatchAccumulator, BatchConfig, BatchStats,
+    CoalesceStrategy, FlushReason,
+};
 pub use cancellation::{CancellationError, CancellationRegistry, CancellationToken};
 pub use checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointManager, CheckpointStats, CheckpointStrategy,
 };
 pub use circuit_breaker::{CircuitBreaker as WorkerCircuitBreaker, CircuitState};
+pub use coordinated_rate_limit::{
+    RateLimitDecision, RateLimitKeyStrategy, WorkerRateLimitCoordinator,
+};
 pub use cpu_affinity::{AffinityConfig, AffinityPolicy, NumaNode};
 pub use crash_dump::{CrashDump, CrashDumpConfig, CrashDumpManager, CrashDumpStats, CrashSeverity};
 pub use dead_worker_detection::{
@@ -126,6 +149,10 @@ pub use dlq::{
 pub use error_aggregation::{
     ErrorAggregator, ErrorAggregatorConfig, ErrorEntry, ErrorPattern, ErrorStats,
 };
+pub use execution_context::{
+    check_cancelled, current_context, current_token, is_cancelled, RevocationPublisher,
+    RevocationSignal, RevocationWatcher, TaskExecutionContext,
+};
 pub use feature_flags::{FeatureFlags, TaskFeatureRequirements};
 pub use incremental_deser::{DeserConfig, DeserState, DeserStats, IncrementalDeserializer};
 pub use leak_detection::{LeakDetector, LeakDetectorConfig, LeakInfo, MemorySample};
@@ -137,12 +164,17 @@ pub use middleware::{
 };
 pub use performance_metrics::{PerformanceConfig, PerformanceStats, PerformanceTracker};
 pub use pipeline::{Pipeline, PipelineConfig, PipelineStage, PipelineStats};
+pub use poison_pill::{
+    PoisonPillConfig, PoisonPillDetector, PoisonPillStats, PoisonPillVerdict, QuarantinedTask,
+    StrikeKind,
+};
 pub use prefetch::{PrefetchBuffer, PrefetchConfig, PrefetchStats};
 pub use queue_monitor::{QueueAlertLevel, QueueMonitor, QueueMonitorConfig, QueueStats};
 pub use rate_limit::{RateLimitConfig, RateLimiter, SlidingWindowConfig, SlidingWindowLimiter};
 pub use resource_tracker::{ResourceLimits, ResourceStats, ResourceTracker};
 pub use restart_manager::{
-    ErrorSeverity, RestartManager, RestartPolicy, RestartStats, RestartStrategy,
+    ErrorSeverity, RestartDecision, RestartManager, RestartPolicy, RestartStats, RestartStrategy,
+    RestartTrigger, SelfHealingSupervisor, SupervisorState, SupervisorStats,
 };
 pub use retry::{RetryConfig, RetryStrategy};
 pub use routing::{RoutingStrategy, TaskRoutingRequirements, WorkerTags};

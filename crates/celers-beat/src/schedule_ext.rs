@@ -262,11 +262,13 @@ impl BlackoutPeriod {
                         if current.month() == 12 {
                             current
                                 .with_year(current.year() + 1)
-                                .unwrap()
+                                .expect("year increment should be valid")
                                 .with_month(1)
-                                .unwrap()
+                                .expect("month 1 is always valid")
                         } else {
-                            current.with_month(current.month() + 1).unwrap()
+                            current
+                                .with_month(current.month() + 1)
+                                .expect("month increment within 1-12 range should be valid")
                         }
                     }
                 };
@@ -478,11 +480,17 @@ impl CompositeSchedule {
         match self.mode {
             CompositeMode::And => {
                 // AND: all must be due, so take the latest (slowest) time
-                Ok(*next_runs.iter().max().unwrap())
+                Ok(*next_runs
+                    .iter()
+                    .max()
+                    .expect("next_runs validated to be non-empty"))
             }
             CompositeMode::Or => {
                 // OR: any can be due, so take the earliest (fastest) time
-                Ok(*next_runs.iter().min().unwrap())
+                Ok(*next_runs
+                    .iter()
+                    .min()
+                    .expect("next_runs validated to be non-empty"))
             }
         }
     }
@@ -1117,18 +1125,21 @@ impl std::fmt::Display for TimezoneInfo {
 /// ```
 /// use celers_beat::ScheduleBuilder;
 ///
-/// // Business hours only (Mon-Fri, 9 AM - 5 PM)
+/// // Every 30 minutes (always-available interval schedule)
 /// let schedule = ScheduleBuilder::new()
 ///     .every_n_minutes(30)
-///     .business_hours_only()
 ///     .build();
 ///
-/// // Every hour during weekends
+/// // Every 2 hours
 /// let schedule = ScheduleBuilder::new()
-///     .every_n_hours(1)
-///     .weekends_only()
+///     .every_n_hours(2)
 ///     .build();
 /// ```
+///
+/// # Feature-gated methods
+/// The `cron` feature unlocks time-window and timezone restrictions:
+/// `business_hours_only()`, `weekdays_only()`, `weekends_only()`, `in_timezone()`.
+/// Each of those methods carries its own example in its own doc comment.
 #[derive(Debug, Clone)]
 pub struct ScheduleBuilder {
     interval_seconds: Option<u64>,

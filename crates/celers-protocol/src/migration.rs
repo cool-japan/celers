@@ -21,6 +21,11 @@
 
 use crate::{Message, ProtocolVersion};
 
+/// Header key under which the migrated-to protocol version is recorded in a
+/// message's `headers.extra` map. The stored value is the version's numeric
+/// string (e.g. `"2"` or `"5"`), matching [`ProtocolVersion::as_number_str`].
+pub const PROTOCOL_VERSION_HEADER: &str = "protocol_version";
+
 /// Migration strategy
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MigrationStrategy {
@@ -108,7 +113,26 @@ impl ProtocolMigrator {
         }
     }
 
-    /// Migrate a message to a different protocol version
+    /// Migrate a message to a different protocol version.
+    ///
+    /// The Celery v2 and v5 message envelopes share the same wire structure,
+    /// so the migration is primarily a *re-stamping* of the target protocol
+    /// version onto the message together with the conservative, version-aware
+    /// adjustments described below. The target version is recorded in the
+    /// message's `headers.extra` under [`PROTOCOL_VERSION_HEADER`] so that the
+    /// migration is observable by downstream consumers (and testable).
+    ///
+    /// Version-specific transformations applied:
+    /// * Migrating **to v2**: v2 brokers/consumers do not understand the
+    ///   group/parent/root workflow stamping that v5 carries inline, so any
+    ///   such identifiers are preserved into `headers.extra` (as a compatible
+    ///   fallback) before being left in place. This is non-destructive: the
+    ///   typed fields are kept, and a string mirror is added under the
+    ///   `_legacy_*` keys for v2-only consumers.
+    /// * Migrating **to v5**: the priority is normalised into `headers.extra`
+    ///   under `delivery_priority` (v5 surfaces priority in headers in addition
+    ///   to AMQP properties), and the inline workflow fields are left untouched
+    ///   since v5 supports them natively.
     pub fn migrate(
         &self,
         message: Message,
@@ -124,15 +148,73 @@ impl ProtocolMigrator {
             });
         }
 
-        // For now, message structure is the same between v2 and v5
-        // In a real implementation, you might transform headers or properties
+        let mut message = message;
+
+        // Record the target protocol version so the migration is observable.
+        message.headers.extra.insert(
+            PROTOCOL_VERSION_HEADER.to_string(),
+            serde_json::Value::String(target_version.as_number_str().to_string()),
+        );
+
+        match target_version {
+            ProtocolVersion::V2 => {
+                // v2 consumers cannot rely on inline v5 workflow stamping; mirror
+                // the identifiers into `extra` as a non-destructive fallback.
+                if let Some(group) = message.headers.group {
+                    message.headers.extra.insert(
+                        "_legacy_group".to_string(),
+                        serde_json::Value::String(group.to_string()),
+                    );
+                }
+                if let Some(parent) = message.headers.parent_id {
+                    message.headers.extra.insert(
+                        "_legacy_parent_id".to_string(),
+                        serde_json::Value::String(parent.to_string()),
+                    );
+                }
+                if let Some(root) = message.headers.root_id {
+                    message.headers.extra.insert(
+                        "_legacy_root_id".to_string(),
+                        serde_json::Value::String(root.to_string()),
+                    );
+                }
+            }
+            ProtocolVersion::V5 => {
+                // v5 surfaces priority in the headers in addition to AMQP
+                // properties; mirror it so header-only consumers can route on it.
+                if let Some(priority) = message.properties.priority {
+                    message.headers.extra.insert(
+                        "delivery_priority".to_string(),
+                        serde_json::Value::Number(priority.into()),
+                    );
+                }
+            }
+        }
+
         Ok(message)
     }
 
-    fn check_strict_compatibility(&self, _message: &Message, _target: ProtocolVersion) -> bool {
-        // In strict mode, ensure all features are fully supported
-        // For now, return true as v2 and v5 are largely compatible
-        true
+    fn check_strict_compatibility(&self, message: &Message, target: ProtocolVersion) -> bool {
+        // In strict mode, a message is only considered compatible when it does
+        // not rely on features whose semantics are not fully preserved by the
+        // target version. We use the same signals as `check_compatibility`:
+        // workflow tracking (group/parent/root) and broker-dependent priority.
+        match target {
+            ProtocolVersion::V2 => {
+                // v2 lacks first-class, inline workflow stamping and has only
+                // broker-dependent priority support, so a message using any of
+                // these features is not strictly compatible.
+                !message.has_group()
+                    && !message.has_parent()
+                    && !message.has_root()
+                    && message.properties.priority.is_none()
+            }
+            ProtocolVersion::V5 => {
+                // v5 natively supports inline workflow tracking; priority remains
+                // broker-dependent, so it is the only strict blocker here.
+                message.properties.priority.is_none()
+            }
+        }
     }
 
     /// Get the current strategy
@@ -292,10 +374,105 @@ mod tests {
         let msg = Message::new("tasks.add".to_string(), task_id, body.clone());
 
         let migrator = ProtocolMigrator::new(MigrationStrategy::Conservative);
-        let migrated = migrator.migrate(msg, ProtocolVersion::V5).unwrap();
+        let migrated = migrator
+            .migrate(msg, ProtocolVersion::V5)
+            .expect("conservative migration of a plain message must succeed");
 
         assert_eq!(migrated.task_id(), task_id);
         assert_eq!(migrated.body, body);
+
+        // The migration must stamp the target protocol version so it is
+        // observable on the migrated message.
+        assert_eq!(
+            migrated.headers.extra.get(PROTOCOL_VERSION_HEADER),
+            Some(&serde_json::Value::String("5".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_migrate_stamps_version_v2() {
+        let task_id = Uuid::new_v4();
+        let body = serde_json::to_vec(&TaskArgs::new()).unwrap();
+        let msg = Message::new("tasks.add".to_string(), task_id, body);
+
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Conservative);
+        let migrated = migrator
+            .migrate(msg, ProtocolVersion::V2)
+            .expect("conservative migration of a plain message must succeed");
+
+        assert_eq!(
+            migrated.headers.extra.get(PROTOCOL_VERSION_HEADER),
+            Some(&serde_json::Value::String("2".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_migrate_to_v5_mirrors_priority() {
+        let task_id = Uuid::new_v4();
+        let body = serde_json::to_vec(&TaskArgs::new()).unwrap();
+        let msg = Message::new("tasks.add".to_string(), task_id, body).with_priority(7);
+
+        // Permissive lets a message carrying broker-dependent priority through.
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Permissive);
+        let migrated = migrator
+            .migrate(msg, ProtocolVersion::V5)
+            .expect("permissive migration must succeed");
+
+        // v5 mirrors priority into the headers for header-only routing.
+        assert_eq!(
+            migrated.headers.extra.get("delivery_priority"),
+            Some(&serde_json::Value::Number(7u8.into()))
+        );
+        // The original AMQP property is preserved.
+        assert_eq!(migrated.properties.priority, Some(7));
+    }
+
+    #[test]
+    fn test_migrate_to_v2_mirrors_workflow_fields() {
+        let task_id = Uuid::new_v4();
+        let group = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let body = serde_json::to_vec(&TaskArgs::new()).unwrap();
+        let msg = Message::new("tasks.add".to_string(), task_id, body)
+            .with_group(group)
+            .with_parent(parent);
+
+        // Permissive migration to v2 mirrors workflow identifiers into `extra`
+        // for v2-only consumers without destroying the typed fields.
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Permissive);
+        let migrated = migrator
+            .migrate(msg, ProtocolVersion::V2)
+            .expect("permissive migration must succeed");
+
+        assert_eq!(
+            migrated.headers.extra.get("_legacy_group"),
+            Some(&serde_json::Value::String(group.to_string()))
+        );
+        assert_eq!(
+            migrated.headers.extra.get("_legacy_parent_id"),
+            Some(&serde_json::Value::String(parent.to_string()))
+        );
+        // Typed fields remain intact (non-destructive).
+        assert_eq!(migrated.headers.group, Some(group));
+        assert_eq!(migrated.headers.parent_id, Some(parent));
+    }
+
+    #[test]
+    fn test_migrate_conservative_rejects_unsupported() {
+        let task_id = Uuid::new_v4();
+        let body = serde_json::to_vec(&TaskArgs::new()).unwrap();
+        let msg = Message::new("tasks.add".to_string(), task_id, body)
+            .with_priority(9)
+            .with_group(Uuid::new_v4());
+
+        // Conservative refuses to migrate a message that triggers warnings.
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Conservative);
+        let result = migrator.migrate(msg, ProtocolVersion::V5);
+
+        assert!(matches!(
+            result,
+            Err(MigrationError::IncompatibleVersion { .. })
+        ));
     }
 
     #[test]
@@ -310,6 +487,56 @@ mod tests {
         let result = migrator.migrate(msg, ProtocolVersion::V5);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_compatibility_plain_message() {
+        let task_id = Uuid::new_v4();
+        let body = serde_json::to_vec(&TaskArgs::new()).unwrap();
+        let msg = Message::new("tasks.add".to_string(), task_id, body);
+
+        // A plain message with no advanced features is strictly compatible.
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Strict);
+        let info_v5 = migrator.check_compatibility(&msg, ProtocolVersion::V5);
+        let info_v2 = migrator.check_compatibility(&msg, ProtocolVersion::V2);
+
+        assert!(info_v5.is_compatible);
+        assert!(info_v2.is_compatible);
+    }
+
+    #[test]
+    fn test_strict_compatibility_priority_blocks() {
+        let task_id = Uuid::new_v4();
+        let body = serde_json::to_vec(&TaskArgs::new()).unwrap();
+        let msg = Message::new("tasks.add".to_string(), task_id, body).with_priority(5);
+
+        // Broker-dependent priority is not strictly compatible with either
+        // target version.
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Strict);
+        assert!(
+            !migrator
+                .check_compatibility(&msg, ProtocolVersion::V5)
+                .is_compatible
+        );
+        assert!(
+            !migrator
+                .check_compatibility(&msg, ProtocolVersion::V2)
+                .is_compatible
+        );
+    }
+
+    #[test]
+    fn test_strict_compatibility_workflow_blocks_v2_only() {
+        let task_id = Uuid::new_v4();
+        let body = serde_json::to_vec(&TaskArgs::new()).unwrap();
+        let msg = Message::new("tasks.add".to_string(), task_id, body).with_group(Uuid::new_v4());
+
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Strict);
+
+        // The strict check itself: workflow stamping is unsupported by v2 but
+        // native to v5.
+        assert!(!migrator.check_strict_compatibility(&msg, ProtocolVersion::V2));
+        assert!(migrator.check_strict_compatibility(&msg, ProtocolVersion::V5));
     }
 
     #[test]

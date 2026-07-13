@@ -2,7 +2,7 @@
 
 > MySQL database broker implementation for CeleRS
 
-## Status: [Alpha] (v0.2.0) — 68 tests passing | Updated: 2026-03-27
+## Status: [Alpha] (v0.3.0) — 106 tests passing, 20 skipped (require live DB) | Updated: 2026-07-13
 
 MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-performance batch operations, queue control, task inspection, result storage, worker tracking, comprehensive maintenance utilities, TraceContext (W3C), circuit breaker, resilience patterns, and advanced hooks/diagnostics.
 
@@ -116,7 +116,7 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 
 ### Connection
 - [x] MySQL connection string
-- [x] Connection pooling via sqlx
+- [x] Single multiplexed connection via `oxisql-mysql` (`PoolConfig.max_connections` retained for diagnostics only — not a true N-connection pool; see CHANGELOG 0.3.0)
 - [x] Configurable queue table name
 - [x] Async query execution
 
@@ -385,12 +385,21 @@ MySQL broker with FOR UPDATE SKIP LOCKED pattern, migrations, DLQ support, high-
 ## Dependencies
 
 - `celers-core`: Core traits and types
-- `sqlx`: MySQL async driver (v0.8 with mysql feature)
-- `serde_json`: Task serialization
-- `tracing`: Logging
+- `celers-metrics`: Prometheus metrics integration (optional, via `metrics` feature)
+- `async-trait`: Async trait support
+- `thiserror`: Error type derivation
+- `serde` / `serde_json`: Task and result serialization
 - `uuid`: Task ID generation
+- `tracing`: Logging
+- `tokio`: Async runtime
 - `chrono`: Timestamp handling
-- `rust_decimal`: Decimal handling for MySQL SUM results
+- `oxisql-core` (chrono feature) / `oxisql-mysql`: Pure-Rust SQL client (MySQL backend)
+- `oxisql-postgres`: present only because `tls_mode.rs` is copied verbatim from `celers-cli`'s dual-backend reference rather than trimmed to MySQL-only; not used by this crate's own broker logic
+- `oxitls` / `rustls`: TLS support
+- `anyhow`: Error handling
+- `url`: Connection URL parsing
+- `oxiarc-deflate`: Task payload compression (DEFLATE)
+- `rand`: Synthetic load generation / test data
 
 ## API Summary
 
@@ -1694,4 +1703,198 @@ These advanced monitoring features provide:
 
 **Test coverage: 172 tests** (68 unit + 104 doc tests)
 **Code quality: Zero warnings, Clippy clean**
+
+## queue_name schema drift audit (2026-07)
+
+This section is a documentation-only note, mirroring the equivalent audit performed this
+round in `celers-broker-postgres`'s `TODO.md` (`## queue_name schema drift (2026-07)`).
+It has been rewritten in full this pass to correct and consolidate two earlier partial
+write-ups into one authoritative table-by-table census, after a deeper follow-up audit
+found 2 more missing-table cases beyond the 3 originally documented here.
+
+### 1. Spine + queue_name model: CONFIRMED CLEAN
+
+`MysqlBroker::queue_name` (see the field doc comment in `src/broker_core.rs`) is used
+consistently, everywhere in this crate, only as a logical JSON label — stored as
+`"queue": self.queue_name` inside the `celers_tasks.metadata` JSON blob at enqueue time.
+It is never a real column and never spliced into a table name. Confirmed by direct read
+of `src/broker_trait.rs`'s `enqueue()`:
+
+```rust
+let mut db_metadata = json!({
+    "queue": self.queue_name,
+    "enqueued_at": chrono::Utc::now().to_rfc3339(),
+});
+```
+
+This round, the core `Broker` trait implementation (`src/broker_trait.rs`) and the
+migration runner plus batch-impl helpers in `src/broker_core.rs` were read in full and
+confirmed clean. **Zero column-drift bugs and zero table-interpolation bugs were found
+anywhere in this crate** — unlike the Postgres broker, which exhibits both the
+queue_name-as-nonexistent-column and queue_name-as-table-name drift patterns. `queue_name`
+is not the real problem in this crate; see below.
+
+### 2. The real issue: 5 tables referenced by code that no migration ever creates
+
+A full grep of `CREATE TABLE` across every file in `migrations/` shows the tables that
+actually exist are: `celers_migrations` (000), `celers_tasks` / `celers_dead_letter_queue`
+/ `celers_task_history` (001), `celers_results` (002), `celers_idempotency_keys` (006),
+`celers_workflows` / `celers_workflow_nodes` / `celers_workflow_edges` (007), and
+`celers_rate_limits` / `celers_locks` / `celers_task_tags` / `celers_metrics` (008).
+`migrations/004_partitioning_guide.sql` and `migrations/005_uuid_optimization.sql`
+contain only SQL comments (documentation), and are never passed to
+`run_migration_tracked` — they create nothing.
+
+Against that real set, 5 tables are referenced by production code but created by no
+migration anywhere. Two of these (`celers_task_results`, `celers_task_idempotency`) were
+not previously documented here and are worse than the 3 already known, because they break
+whole features (result storage piggybacked with recurring-task config, and idempotent
+enqueue) rather than being isolated to drain-mode/heartbeat/group bookkeeping.
+
+#### `celers_task_results` — DEFERRED
+
+Referenced by:
+- `src/broker_core.rs`: `store_result` (line 693), `get_result` (line 741),
+  `delete_result` (line 778), `archive_results` (line 791), `optimize_tables`
+  (line 849), `analyze_tables` (line 877).
+- `src/broker_batch.rs`: `store_result_batch` (line 132), `get_result_batch` (line 213).
+- `src/broker_resilience.rs`: the recurring-task family piggybacks its config storage
+  on this same nonexistent table via a naming convention — `register_recurring_task`
+  (line 226), `process_recurring_tasks` (line 276, referenced twice in this one function),
+  `list_recurring_tasks` (line 356), `delete_recurring_task` (line 389).
+- `src/broker_diagnostics.rs`: `ack_batch_with_results` (line 340, marked
+  `#[allow(dead_code)]`).
+- `src/broker_advanced.rs`: `vacuum_analyze` (line 296), via its hardcoded `tables` vec.
+
+The real migrated table is `celers_results` (from `002_results.sql`), but its column set
+is incompatible with what this code expects (`id CHAR(36) PRIMARY KEY, task_id CHAR(36)
+NOT NULL, task_name, result MEDIUMBLOB, error_message, state, created_at, completed_at,
+expires_at` vs. the code's assumed columns keyed directly by `task_id`). This is not a
+simple rename fix — it needs a genuine schema decision (new migration vs. rewriting the
+code against `celers_results`'s real columns), and the recurring-task feature is
+conceptually a different concern squatting on a results table by naming convention alone.
+**Status: DEFERRED, needs a live DB to verify any fix safely.**
+
+#### `celers_task_idempotency` — DEFERRED
+
+Referenced by `src/broker_resilience.rs`: `enqueue_with_idempotency` (line 901,
+referenced twice), `get_idempotency_record` (line 1030), `cleanup_expired_idempotency_keys`
+(line 1095), `get_idempotency_statistics` (line 1139).
+
+The real migrated table is `celers_idempotency_keys` (from `006_idempotency.sql`), which
+has `idempotency_key VARCHAR(255) PRIMARY KEY` as its natural key. The code's model,
+however, treats a separate `id` UUID as the identity and can insert multiple rows per
+`(idempotency_key, task_id)` pair over time (e.g. after TTL expiry) — which the real
+table's PK would reject outright. This needs an actual primary-key-model decision (not
+just adding columns), is potentially destructive to migrate (MySQL has no `ADD COLUMN IF
+NOT EXISTS`-style safety net for PK changes), and cannot be verified without a live DB.
+**Status: DEFERRED.**
+
+#### `celers_queue_config`, `celers_worker_heartbeat`, `celers_task_groups` — DEFERRED (unchanged)
+
+These 3 were already documented in an earlier pass of this section; line numbers
+re-verified fresh this round and folded into this single authoritative census instead of
+being split across old/new sections.
+
+```
+$ grep -n "celers_queue_config\|celers_worker_heartbeat\|celers_task_groups" crates/celers-broker-sql/src/broker_batch.rs
+309:            INSERT INTO celers_queue_config (queue_name, config_key, config_value, updated_at)
+326:            INSERT INTO celers_queue_config (queue_name, config_key, config_value, updated_at)
+344:            FROM celers_queue_config
+392:            INSERT INTO celers_worker_heartbeat
+423:            UPDATE celers_worker_heartbeat
+484:            FROM celers_worker_heartbeat
+603:            INSERT INTO celers_task_groups
+```
+
+- `celers_queue_config` (lines 309, 326, 344) — used by `enable_drain_mode` (line 306), `disable_drain_mode` (line 323), and `is_drain_mode` (line 340) to persist/read a per-queue `drain_mode` flag.
+- `celers_worker_heartbeat` (lines 392, 423, 484) — used by `register_worker` (line 379), `update_worker_heartbeat` (line 416), and `get_all_worker_heartbeats` (line 469) for worker liveness tracking.
+- `celers_task_groups` (line 603) — used by `enqueue_group` (line 552) to record group_id/queue_name/task_count/metadata for a batch-enqueued task group. Notably, the sibling read function `get_group_status` (line 645) does **not** query `celers_task_groups` at all — it derives group status directly from `celers_tasks` via `JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.group_id')) = ?`, which is the correct/working pattern. This makes the `celers_task_groups` INSERT in `enqueue_group` effectively write-only within this crate today (nothing in `src/broker_batch.rs` reads it back).
+
+Fix direction (not implemented here): either add migrations creating
+`celers_queue_config`, `celers_worker_heartbeat`, and `celers_task_groups` with the
+columns these queries expect, or rework the three call sites to use an existing
+table/column (e.g. folding drain-mode and task-group bookkeeping into `celers_tasks.metadata`,
+the way `get_group_status` already does).
+
+**None of these 5 missing-table problems are fixed by this round of changes** — all 5
+need either a live database to verify a schema/PK redesign safely, or a deliberate
+decision about which of two incompatible code paths to keep. They remain deferred.
+
+### 3. Fixed this round
+
+Two categories of safe, no-live-DB-needed fixes were made this pass:
+
+- **Raw SQL string interpolation cleaned up** in `src/broker_resilience.rs`:
+  `export_tasks()` and `export_dlq()` previously built query text with
+  `format!("... '{}'", value)` / `format!(" LIMIT {}", value)` spliced in via
+  `String::push_str`, instead of using bound parameters. This was a low-actual-risk
+  anti-pattern (the interpolated `state` value comes from a closed Rust enum's
+  `Display` impl, and `limit` is a plain integer — no untrusted string ever reached
+  these call sites), but it is now fixed to use `?` placeholders with conditional
+  `.bind(...)` calls, matching the safe pattern already used elsewhere in this crate
+  (e.g. `src/broker_enhanced.rs`'s `count_by_state_quick()` and
+  `update_batch_state()`). At the time of this fix, `sqlx::AssertSqlSafe(query)` was the
+  mechanism relied on for this guarantee; `sqlx` has since been fully removed from this
+  crate in favor of `oxisql-mysql` (see CHANGELOG 0.3.0's Pure-Rust Migration), but the
+  same safety property — static query text plus only `?`-bound placeholders, no raw
+  string interpolation — still holds today.
+
+- **`verify_migrations()` hardcoded lists corrected** in `src/broker_diagnostics.rs`.
+  Previously all 3 of its hardcoded lists were wrong in ways that made it report a
+  perfectly healthy, fully-migrated database as broken:
+  - The "migrations table doesn't exist yet" branch listed 8 filenames including the
+    2 comment-only files (`004_partitioning_guide.sql`, `005_uuid_optimization.sql`);
+    it now lists only the 6 real tracked migration filenames, with `missing_count`
+    corrected from `8` to `6` to match.
+  - The `expected` array held filenames (`"001_init.sql"`, ...) but was compared
+    against `SELECT version FROM celers_migrations`, which holds plain version codes
+    (`"001"`, ...) — a mismatch that made every migration always show as "missing"
+    even when fully applied. It was also missing `"007"` entirely. `expected` is now
+    `["001", "002", "003", "006", "007", "008"]`, matching what `migrate()` actually
+    records.
+  - The `core_tables` check listed 5 of the tables documented as missing in section 2
+    above (`celers_task_results`, `celers_task_idempotency`, `celers_queue_config`,
+    `celers_worker_heartbeat`, `celers_task_groups`), which could never pass. It now
+    checks `["celers_tasks", "celers_dead_letter_queue", "celers_task_history",
+    "celers_results", "celers_idempotency_keys"]` — tables that are both real and
+    load-bearing. The 5 genuinely-missing tables are deliberately **not** added back;
+    this diagnostic should not paper over the deferred problem in section 2.
+
+  After this fix, `verify_migrations()` on a freshly-migrated database correctly
+  reports `schema_valid: true` with an empty `missing_migrations` list and a complete
+  `applied_migrations` list.
+
+### 4. Dead-feature gap (lower priority, noted but not investigated further)
+
+`migrations/007_workflow.sql` creates `celers_workflows`, `celers_workflow_nodes`, and
+`celers_workflow_edges`, but a grep confirms no code in this crate ever reads or writes
+them — `src/workflow.rs` only defines in-memory types (`Workflow`, `WorkflowStage`,
+`WorkflowBuilder`, hook infrastructure, etc.) with zero `sqlx::query` calls. This is a
+separate, lower-priority gap from the 5 missing-table problem above (here the migration
+exists but the feature doesn't use it, rather than the reverse) and has not been
+investigated further this round.
+
+### 5. Stale-schema-description corrections
+
+Earlier revisions of this file described `celers_queue_config`, `celers_worker_heartbeat`,
+and `celers_task_groups` (see the "Queue Config Table" / "Worker Heartbeat Table" / "Task
+Groups Table" entries under **Schema Design** below, and the corresponding "Production
+Features Migration" bullet under **Recent Enhancements**) as if they were part of an
+already-migrated, working schema. They are not — per section 2 above, no migration
+creates any of them. The real `008_production_features.sql` instead creates
+`celers_rate_limits`, `celers_locks`, `celers_task_tags`, and `celers_metrics`. The
+Schema Design / Recent Enhancements sections below have not been rewritten line-by-line
+in this pass (that duplication is left as future cleanup), but this note supersedes them
+as the accurate statement of what `008_production_features.sql` actually contains.
+
+## broker_core.rs size (2026-07)
+
+`src/broker_core.rs` is currently 2051 lines, over this project's 2000-line
+refactor-policy threshold. This was found during release-check for 0.3.0. Splitting it
+is deferred to a dedicated follow-up session — no split is attempted in this pass.
+`splitrs` (the project's SMT-solver-backed Rust refactoring tool, already installed) is
+the recommended tool for the eventual split.
+
+**Status: DEFERRED / OPEN** — nothing to act on now.
 

@@ -37,7 +37,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Error severity level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -439,6 +439,442 @@ impl RestartManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Self-healing supervisor
+// ---------------------------------------------------------------------------
+
+/// Why a worker needs to be restarted.
+///
+/// These map onto the unhealthy conditions a self-healing supervisor reacts to:
+/// a crashed task, an exceeded memory budget, or missed heartbeats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RestartTrigger {
+    /// The worker panicked or its task loop crashed.
+    Panic,
+    /// The worker exceeded its configured memory budget.
+    MemoryExceeded,
+    /// The worker missed heartbeats and was declared dead.
+    MissedHeartbeat,
+    /// A generic unhealthy condition was reported by the health subsystem.
+    Unhealthy,
+    /// An explicit, operator-requested restart.
+    Manual,
+}
+
+impl RestartTrigger {
+    /// Map this trigger onto an [`ErrorSeverity`].
+    pub fn severity(&self) -> ErrorSeverity {
+        match self {
+            RestartTrigger::Panic | RestartTrigger::MemoryExceeded => ErrorSeverity::Critical,
+            RestartTrigger::MissedHeartbeat | RestartTrigger::Unhealthy => ErrorSeverity::High,
+            RestartTrigger::Manual => ErrorSeverity::Medium,
+        }
+    }
+
+    /// Short, stable human-readable label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RestartTrigger::Panic => "panic",
+            RestartTrigger::MemoryExceeded => "memory_exceeded",
+            RestartTrigger::MissedHeartbeat => "missed_heartbeat",
+            RestartTrigger::Unhealthy => "unhealthy",
+            RestartTrigger::Manual => "manual",
+        }
+    }
+}
+
+impl std::fmt::Display for RestartTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lifecycle state of a [`SelfHealingSupervisor`].
+///
+/// The supervisor behaves like a circuit breaker around the restart loop:
+/// while the breaker is closed it heals the worker, and once too many restarts
+/// pile up within the window it trips into a terminal state and stops trying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SupervisorState {
+    /// The worker is believed healthy; no restart is in progress.
+    #[default]
+    Healthy,
+    /// A restart is currently being backed off / executed.
+    Restarting,
+    /// The supervisor is waiting out a backoff delay before the next restart.
+    BackingOff,
+    /// The restart circuit breaker has tripped: too many restarts within the
+    /// window. The supervisor will not restart again until reset. This is the
+    /// terminal state the worker pool should surface to operators.
+    Terminal,
+}
+
+impl SupervisorState {
+    /// Whether this is the terminal (give-up) state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, SupervisorState::Terminal)
+    }
+
+    /// Whether the worker is considered healthy.
+    pub fn is_healthy(&self) -> bool {
+        matches!(self, SupervisorState::Healthy)
+    }
+}
+
+impl std::fmt::Display for SupervisorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SupervisorState::Healthy => write!(f, "Healthy"),
+            SupervisorState::Restarting => write!(f, "Restarting"),
+            SupervisorState::BackingOff => write!(f, "BackingOff"),
+            SupervisorState::Terminal => write!(f, "Terminal"),
+        }
+    }
+}
+
+/// The decision returned by [`SelfHealingSupervisor::on_unhealthy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartDecision {
+    /// Restart now (no backoff remaining). `attempt` is the 1-based restart
+    /// attempt number this represents.
+    RestartNow {
+        /// The 1-based attempt number for this restart.
+        attempt: usize,
+    },
+    /// Wait the given duration before restarting (still within backoff).
+    Backoff {
+        /// How long the caller should wait before the next restart attempt.
+        delay: Duration,
+    },
+    /// The circuit breaker has tripped; do not restart. The worker has entered
+    /// the terminal state.
+    GiveUp {
+        /// Number of restarts recorded within the window when the breaker
+        /// tripped.
+        restarts_in_window: usize,
+    },
+    /// Restart is disabled by policy.
+    Disabled,
+}
+
+impl RestartDecision {
+    /// Whether the caller should restart now.
+    pub fn should_restart_now(&self) -> bool {
+        matches!(self, RestartDecision::RestartNow { .. })
+    }
+
+    /// Whether the supervisor has given up (terminal).
+    pub fn is_give_up(&self) -> bool {
+        matches!(self, RestartDecision::GiveUp { .. })
+    }
+}
+
+/// A timestamped restart attempt against the supervisor.
+#[derive(Debug, Clone)]
+struct RestartAttempt {
+    timestamp: Instant,
+    trigger: RestartTrigger,
+}
+
+impl RestartAttempt {
+    fn is_within(&self, window: Duration) -> bool {
+        self.timestamp.elapsed() <= window
+    }
+}
+
+/// Aggregate statistics for a [`SelfHealingSupervisor`].
+#[derive(Debug, Clone, Default)]
+pub struct SupervisorStats {
+    /// Current supervisor state.
+    pub state: SupervisorState,
+    /// Total restarts performed since creation.
+    pub total_restarts: usize,
+    /// Restarts within the current window.
+    pub restarts_in_window: usize,
+    /// Total times the breaker tripped into the terminal state.
+    pub trips: usize,
+    /// The last trigger that caused a restart, if any.
+    pub last_trigger: Option<RestartTrigger>,
+    /// Time of the last restart attempt.
+    pub last_restart: Option<Instant>,
+    /// Per-trigger breakdown of restarts within the current window. Useful for
+    /// diagnosing *why* a worker is flapping (e.g. all `MemoryExceeded`).
+    pub triggers_in_window: Vec<(RestartTrigger, usize)>,
+}
+
+/// Internal mutable state for the supervisor.
+struct SupervisorInner {
+    state: SupervisorState,
+    /// Timestamped restart history (pruned to the policy window).
+    history: Vec<RestartAttempt>,
+    /// Cumulative restart count.
+    total_restarts: usize,
+    /// Number of times the breaker tripped.
+    trips: usize,
+    /// Last restart trigger.
+    last_trigger: Option<RestartTrigger>,
+    /// Timestamp of last restart attempt (for backoff calculation).
+    last_restart: Option<Instant>,
+}
+
+impl SupervisorInner {
+    fn new() -> Self {
+        Self {
+            state: SupervisorState::Healthy,
+            history: Vec::new(),
+            total_restarts: 0,
+            trips: 0,
+            last_trigger: None,
+            last_restart: None,
+        }
+    }
+
+    fn prune(&mut self, window: Duration) {
+        self.history.retain(|a| a.is_within(window));
+    }
+
+    fn recent_count(&self, window: Duration) -> usize {
+        self.history.iter().filter(|a| a.is_within(window)).count()
+    }
+
+    /// Per-trigger breakdown of restarts still within the window.
+    fn recent_triggers(&self, window: Duration) -> Vec<(RestartTrigger, usize)> {
+        let mut counts: Vec<(RestartTrigger, usize)> = Vec::new();
+        for attempt in self.history.iter().filter(|a| a.is_within(window)) {
+            if let Some(entry) = counts.iter_mut().find(|(t, _)| *t == attempt.trigger) {
+                entry.1 += 1;
+            } else {
+                counts.push((attempt.trigger, 1));
+            }
+        }
+        counts
+    }
+}
+
+/// Self-healing supervisor: drives automatic restart of an unhealthy worker
+/// (panic, exceeded memory, missed heartbeats) with exponential backoff and a
+/// max-restart circuit breaker.
+///
+/// The supervisor wraps a [`RestartPolicy`] for its backoff/window/limit
+/// configuration and adds:
+///
+/// - a [`SupervisorState`] state machine (Healthy → Restarting/BackingOff →
+///   Terminal),
+/// - per-trigger accounting via [`RestartTrigger`],
+/// - a circuit breaker that opens (enters [`SupervisorState::Terminal`]) once
+///   the number of restarts within [`RestartPolicy::restart_window`] reaches
+///   [`RestartPolicy::max_restarts`], so a crash-looping worker is given up on
+///   instead of being restarted forever.
+///
+/// # Example
+///
+/// ```
+/// use celers_worker::{RestartPolicy, RestartTrigger, SelfHealingSupervisor};
+/// use std::time::Duration;
+///
+/// # async fn example() {
+/// let policy = RestartPolicy::exponential_backoff()
+///     .with_max_restarts(3)
+///     .with_base_delay(Duration::from_millis(10))
+///     .with_restart_window(Duration::from_secs(60));
+/// let supervisor = SelfHealingSupervisor::new(policy);
+///
+/// let decision = supervisor.on_unhealthy(RestartTrigger::Panic).await;
+/// if decision.should_restart_now() {
+///     // perform the actual restart, then:
+///     supervisor.confirm_restart(RestartTrigger::Panic).await;
+/// }
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct SelfHealingSupervisor {
+    policy: RestartPolicy,
+    inner: Arc<RwLock<SupervisorInner>>,
+}
+
+impl SelfHealingSupervisor {
+    /// Create a new supervisor from a restart policy.
+    pub fn new(policy: RestartPolicy) -> Self {
+        Self {
+            policy,
+            inner: Arc::new(RwLock::new(SupervisorInner::new())),
+        }
+    }
+
+    /// Borrow the underlying restart policy.
+    pub fn policy(&self) -> &RestartPolicy {
+        &self.policy
+    }
+
+    /// Current supervisor state.
+    pub async fn state(&self) -> SupervisorState {
+        self.inner.read().await.state
+    }
+
+    /// Whether the supervisor has reached the terminal state.
+    pub async fn is_terminal(&self) -> bool {
+        self.inner.read().await.state.is_terminal()
+    }
+
+    /// Compute the backoff delay for the Nth restart (0-based count of prior
+    /// restarts within the window) using the policy strategy.
+    fn backoff_for(&self, prior_restarts: usize) -> Duration {
+        match self.policy.strategy {
+            RestartStrategy::ExponentialBackoff => {
+                let factor = 2_u64.checked_pow(prior_restarts as u32);
+                let delay_ms = factor
+                    .and_then(|f| (self.policy.base_delay.as_millis() as u64).checked_mul(f))
+                    .unwrap_or(u64::MAX);
+                Duration::from_millis(delay_ms).min(self.policy.max_delay)
+            }
+            RestartStrategy::LinearBackoff => {
+                let delay_ms = (self.policy.base_delay.as_millis() as u64)
+                    .saturating_mul(prior_restarts as u64 + 1);
+                Duration::from_millis(delay_ms).min(self.policy.max_delay)
+            }
+            RestartStrategy::Always | RestartStrategy::Never => Duration::ZERO,
+        }
+    }
+
+    /// React to an unhealthy worker condition and decide whether to restart.
+    ///
+    /// This does **not** itself record a restart; the caller should perform the
+    /// actual restart when [`RestartDecision::should_restart_now`] is true and
+    /// then call [`SelfHealingSupervisor::confirm_restart`]. Splitting the
+    /// decision from the confirmation lets the caller honour backoff without the
+    /// supervisor assuming a restart always succeeds.
+    pub async fn on_unhealthy(&self, trigger: RestartTrigger) -> RestartDecision {
+        if !self.policy.enabled || self.policy.strategy == RestartStrategy::Never {
+            return RestartDecision::Disabled;
+        }
+        if trigger.severity() < self.policy.min_severity {
+            return RestartDecision::Disabled;
+        }
+
+        let mut inner = self.inner.write().await;
+        inner.prune(self.policy.restart_window);
+
+        // Already given up.
+        if inner.state == SupervisorState::Terminal {
+            return RestartDecision::GiveUp {
+                restarts_in_window: inner.recent_count(self.policy.restart_window),
+            };
+        }
+
+        let recent = inner.recent_count(self.policy.restart_window);
+
+        // Circuit breaker: trip if we've already used up the allowance.
+        if let Some(max) = self.policy.max_restarts {
+            if recent >= max {
+                inner.state = SupervisorState::Terminal;
+                inner.trips += 1;
+                warn!(
+                    "Self-healing circuit breaker tripped: {} restarts within {:?}; entering terminal state",
+                    recent, self.policy.restart_window
+                );
+                return RestartDecision::GiveUp {
+                    restarts_in_window: recent,
+                };
+            }
+        }
+
+        // Backoff: are we still inside the delay since the last restart?
+        if let Some(last) = inner.last_restart {
+            let delay = self.backoff_for(recent);
+            let elapsed = last.elapsed();
+            if elapsed < delay {
+                inner.state = SupervisorState::BackingOff;
+                let remaining = delay.saturating_sub(elapsed);
+                debug!(
+                    "Self-healing supervisor backing off; {:?} remaining before next restart",
+                    remaining
+                );
+                return RestartDecision::Backoff { delay: remaining };
+            }
+        }
+
+        inner.state = SupervisorState::Restarting;
+        RestartDecision::RestartNow {
+            attempt: recent + 1,
+        }
+    }
+
+    /// Record that a restart was actually performed for the given trigger.
+    ///
+    /// This advances the circuit-breaker accounting. After confirming, the
+    /// supervisor returns to [`SupervisorState::Healthy`] unless the restart
+    /// just exhausted the allowance, in which case the *next*
+    /// [`SelfHealingSupervisor::on_unhealthy`] call will trip the breaker.
+    pub async fn confirm_restart(&self, trigger: RestartTrigger) {
+        let mut inner = self.inner.write().await;
+        let now = Instant::now();
+        inner.history.push(RestartAttempt {
+            timestamp: now,
+            trigger,
+        });
+        inner.total_restarts += 1;
+        inner.last_trigger = Some(trigger);
+        inner.last_restart = Some(now);
+        inner.prune(self.policy.restart_window);
+
+        if inner.state != SupervisorState::Terminal {
+            inner.state = SupervisorState::Healthy;
+        }
+        info!(
+            "Self-healing supervisor confirmed restart (trigger: {}, total: {})",
+            trigger, inner.total_restarts
+        );
+    }
+
+    /// Convenience: decide and, if a restart is warranted *now*, immediately
+    /// confirm it. Returns the decision. Backoff / give-up decisions are
+    /// returned without recording a restart.
+    pub async fn try_restart(&self, trigger: RestartTrigger) -> RestartDecision {
+        let decision = self.on_unhealthy(trigger).await;
+        if decision.should_restart_now() {
+            self.confirm_restart(trigger).await;
+        }
+        decision
+    }
+
+    /// Report that the worker recovered and is healthy again. This clears the
+    /// backoff timer so a future failure restarts promptly, but it does **not**
+    /// clear the trip history (a flapping worker should still trip the breaker).
+    /// To fully reset the breaker use [`SelfHealingSupervisor::reset`].
+    pub async fn on_recovered(&self) {
+        let mut inner = self.inner.write().await;
+        if inner.state != SupervisorState::Terminal {
+            inner.state = SupervisorState::Healthy;
+            inner.last_restart = None;
+        }
+    }
+
+    /// Manually reset the supervisor, clearing the terminal state and all
+    /// restart history. Use after an operator has remediated the root cause.
+    pub async fn reset(&self) {
+        let mut inner = self.inner.write().await;
+        inner.state = SupervisorState::Healthy;
+        inner.history.clear();
+        inner.last_restart = None;
+        info!("Self-healing supervisor manually reset");
+    }
+
+    /// Snapshot of supervisor statistics.
+    pub async fn stats(&self) -> SupervisorStats {
+        let mut inner = self.inner.write().await;
+        inner.prune(self.policy.restart_window);
+        SupervisorStats {
+            state: inner.state,
+            total_restarts: inner.total_restarts,
+            restarts_in_window: inner.recent_count(self.policy.restart_window),
+            trips: inner.trips,
+            last_trigger: inner.last_trigger,
+            last_restart: inner.last_restart,
+            triggers_in_window: inner.recent_triggers(self.policy.restart_window),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +1092,281 @@ mod tests {
 
         // Should cap at max_delay
         assert_eq!(manager.calculate_backoff_delay(20), Duration::from_secs(10));
+    }
+
+    // -----------------------------------------------------------------------
+    // SelfHealingSupervisor tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_restart_trigger_severity_and_str() {
+        assert_eq!(RestartTrigger::Panic.severity(), ErrorSeverity::Critical);
+        assert_eq!(
+            RestartTrigger::MemoryExceeded.severity(),
+            ErrorSeverity::Critical
+        );
+        assert_eq!(
+            RestartTrigger::MissedHeartbeat.severity(),
+            ErrorSeverity::High
+        );
+        assert_eq!(RestartTrigger::Unhealthy.severity(), ErrorSeverity::High);
+        assert_eq!(RestartTrigger::Manual.severity(), ErrorSeverity::Medium);
+
+        assert_eq!(RestartTrigger::Panic.as_str(), "panic");
+        assert_eq!(
+            RestartTrigger::MemoryExceeded.to_string(),
+            "memory_exceeded"
+        );
+    }
+
+    #[test]
+    fn test_supervisor_state_helpers() {
+        assert!(SupervisorState::Terminal.is_terminal());
+        assert!(!SupervisorState::Healthy.is_terminal());
+        assert!(SupervisorState::Healthy.is_healthy());
+        assert!(!SupervisorState::Restarting.is_healthy());
+        assert_eq!(SupervisorState::default(), SupervisorState::Healthy);
+    }
+
+    #[test]
+    fn test_restart_decision_helpers() {
+        assert!(RestartDecision::RestartNow { attempt: 1 }.should_restart_now());
+        assert!(!RestartDecision::Backoff {
+            delay: Duration::from_secs(1)
+        }
+        .should_restart_now());
+        assert!(RestartDecision::GiveUp {
+            restarts_in_window: 3
+        }
+        .is_give_up());
+        assert!(!RestartDecision::Disabled.is_give_up());
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_disabled_when_policy_disabled() {
+        let supervisor = SelfHealingSupervisor::new(RestartPolicy::never());
+        let decision = supervisor.on_unhealthy(RestartTrigger::Panic).await;
+        assert_eq!(decision, RestartDecision::Disabled);
+        assert!(supervisor.state().await.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_severity_threshold_blocks_low_trigger() {
+        // Require Critical: a Manual (Medium) trigger should be disabled.
+        let policy =
+            RestartPolicy::exponential_backoff().with_min_severity(ErrorSeverity::Critical);
+        let supervisor = SelfHealingSupervisor::new(policy);
+        assert_eq!(
+            supervisor.on_unhealthy(RestartTrigger::Manual).await,
+            RestartDecision::Disabled
+        );
+        // A Panic (Critical) is allowed.
+        assert!(supervisor
+            .on_unhealthy(RestartTrigger::Panic)
+            .await
+            .should_restart_now());
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_first_restart_immediate() {
+        let policy = RestartPolicy::exponential_backoff()
+            .with_base_delay(Duration::from_millis(50))
+            .with_max_restarts(5);
+        let supervisor = SelfHealingSupervisor::new(policy);
+
+        let decision = supervisor.on_unhealthy(RestartTrigger::Panic).await;
+        assert_eq!(decision, RestartDecision::RestartNow { attempt: 1 });
+        assert_eq!(supervisor.state().await, SupervisorState::Restarting);
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_backoff_sequence() {
+        let policy = RestartPolicy::exponential_backoff()
+            .with_base_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(10))
+            .with_max_restarts(10);
+        let supervisor = SelfHealingSupervisor::new(policy);
+
+        // First failure: restart immediately, then confirm.
+        assert!(supervisor
+            .try_restart(RestartTrigger::Panic)
+            .await
+            .should_restart_now());
+
+        // Immediately after, we are within the backoff window for attempt 2.
+        // prior_restarts == 1 -> delay = base * 2^1 = 200ms.
+        match supervisor.on_unhealthy(RestartTrigger::Panic).await {
+            RestartDecision::Backoff { delay } => {
+                assert!(delay <= Duration::from_millis(200));
+                assert!(delay > Duration::ZERO);
+            }
+            other => panic!("expected backoff, got {:?}", other),
+        }
+        assert_eq!(supervisor.state().await, SupervisorState::BackingOff);
+
+        // Wait out the backoff; now a restart is permitted.
+        sleep(Duration::from_millis(220)).await;
+        assert!(supervisor
+            .on_unhealthy(RestartTrigger::Panic)
+            .await
+            .should_restart_now());
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_circuit_breaker_opens_after_n() {
+        // Zero backoff so the breaker logic is exercised independently of timing.
+        let policy = RestartPolicy::always().with_max_restarts(3);
+        let supervisor = SelfHealingSupervisor::new(policy);
+
+        // Three restarts are allowed.
+        for attempt in 1..=3 {
+            let decision = supervisor.try_restart(RestartTrigger::Panic).await;
+            assert_eq!(decision, RestartDecision::RestartNow { attempt });
+            assert!(!supervisor.is_terminal().await);
+        }
+
+        // The 4th attempt trips the breaker into the terminal state.
+        let decision = supervisor.on_unhealthy(RestartTrigger::Panic).await;
+        assert_eq!(
+            decision,
+            RestartDecision::GiveUp {
+                restarts_in_window: 3
+            }
+        );
+        assert!(supervisor.is_terminal().await);
+        assert_eq!(supervisor.state().await, SupervisorState::Terminal);
+
+        // Once terminal, further unhealthy reports keep giving up.
+        assert!(supervisor
+            .on_unhealthy(RestartTrigger::MemoryExceeded)
+            .await
+            .is_give_up());
+
+        let stats = supervisor.stats().await;
+        assert_eq!(stats.total_restarts, 3);
+        assert_eq!(stats.trips, 1);
+        assert!(stats.state.is_terminal());
+        assert_eq!(stats.last_trigger, Some(RestartTrigger::Panic));
+        // All three restarts were panics.
+        assert_eq!(stats.triggers_in_window, vec![(RestartTrigger::Panic, 3)]);
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_window_expiry_allows_more_restarts() {
+        let policy = RestartPolicy::always()
+            .with_max_restarts(2)
+            .with_min_severity(ErrorSeverity::High)
+            .with_restart_window(Duration::from_millis(100));
+        let supervisor = SelfHealingSupervisor::new(policy);
+
+        assert!(supervisor
+            .try_restart(RestartTrigger::Unhealthy)
+            .await
+            .should_restart_now());
+        assert!(supervisor
+            .try_restart(RestartTrigger::Unhealthy)
+            .await
+            .should_restart_now());
+
+        // Third within the window trips the breaker.
+        assert!(supervisor
+            .on_unhealthy(RestartTrigger::Unhealthy)
+            .await
+            .is_give_up());
+
+        // Reset out of terminal, let the window expire, and verify restarts are
+        // permitted again because the old attempts have aged out.
+        supervisor.reset().await;
+        sleep(Duration::from_millis(130)).await;
+        assert!(supervisor
+            .on_unhealthy(RestartTrigger::Unhealthy)
+            .await
+            .should_restart_now());
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_reset_clears_terminal() {
+        let policy = RestartPolicy::always().with_max_restarts(1);
+        let supervisor = SelfHealingSupervisor::new(policy);
+
+        assert!(supervisor
+            .try_restart(RestartTrigger::Panic)
+            .await
+            .should_restart_now());
+        assert!(supervisor
+            .on_unhealthy(RestartTrigger::Panic)
+            .await
+            .is_give_up());
+        assert!(supervisor.is_terminal().await);
+
+        supervisor.reset().await;
+        assert!(!supervisor.is_terminal().await);
+        assert!(supervisor.state().await.is_healthy());
+        // After reset the allowance is restored.
+        assert!(supervisor
+            .on_unhealthy(RestartTrigger::Panic)
+            .await
+            .should_restart_now());
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_on_recovered_clears_backoff() {
+        let policy = RestartPolicy::exponential_backoff()
+            .with_base_delay(Duration::from_secs(10))
+            .with_max_restarts(5);
+        let supervisor = SelfHealingSupervisor::new(policy);
+
+        assert!(supervisor
+            .try_restart(RestartTrigger::Panic)
+            .await
+            .should_restart_now());
+
+        // Long backoff is in effect.
+        assert!(matches!(
+            supervisor.on_unhealthy(RestartTrigger::Panic).await,
+            RestartDecision::Backoff { .. }
+        ));
+
+        // Recovery clears the backoff timer, so the next failure restarts now.
+        supervisor.on_recovered().await;
+        assert!(supervisor.state().await.is_healthy());
+        assert!(supervisor
+            .on_unhealthy(RestartTrigger::Panic)
+            .await
+            .should_restart_now());
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_linear_backoff() {
+        let policy = RestartPolicy::linear_backoff()
+            .with_base_delay(Duration::from_millis(50))
+            .with_max_delay(Duration::from_secs(10))
+            .with_max_restarts(10);
+        let supervisor = SelfHealingSupervisor::new(policy);
+
+        // backoff_for is internal; verify via behaviour: confirm one restart,
+        // then the next decision should back off ~ base * (1+1) = 100ms.
+        supervisor.confirm_restart(RestartTrigger::Panic).await;
+        match supervisor.on_unhealthy(RestartTrigger::Panic).await {
+            RestartDecision::Backoff { delay } => {
+                assert!(delay <= Duration::from_millis(100));
+            }
+            other => panic!("expected backoff, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_clone_shares_state() {
+        let policy = RestartPolicy::always().with_max_restarts(1);
+        let supervisor = SelfHealingSupervisor::new(policy);
+        let clone = supervisor.clone();
+
+        assert!(supervisor
+            .try_restart(RestartTrigger::Panic)
+            .await
+            .should_restart_now());
+        // The clone observes the trip triggered through the original.
+        assert!(clone.on_unhealthy(RestartTrigger::Panic).await.is_give_up());
+        assert!(supervisor.is_terminal().await);
     }
 }

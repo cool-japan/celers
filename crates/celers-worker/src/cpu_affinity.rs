@@ -113,6 +113,72 @@ impl Default for AffinityConfig {
     }
 }
 
+/// Parse a Linux cpulist string (e.g. `"0-3,6,8-10"`) into a sorted, deduplicated
+/// `Vec<usize>`.  Single integers and inclusive ranges separated by commas are supported.
+#[cfg(target_os = "linux")]
+fn parse_cpulist(s: &str) -> Vec<usize> {
+    let mut cores = Vec::new();
+    for piece in s.trim().split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = piece.split_once('-') {
+            if let (Ok(start), Ok(end)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                cores.extend(start..=end);
+            }
+        } else if let Ok(n) = piece.parse::<usize>() {
+            cores.push(n);
+        }
+    }
+    cores.sort_unstable();
+    cores.dedup();
+    cores
+}
+
+/// Read the real NUMA topology from `/sys/devices/system/node`.
+/// Returns an empty `Vec` when the path does not exist or is not readable.
+#[cfg(target_os = "linux")]
+fn read_numa_topology() -> Vec<NumaNode> {
+    let sys_node = std::path::Path::new("/sys/devices/system/node");
+    if !sys_node.exists() {
+        return Vec::new();
+    }
+
+    let mut nodes: Vec<NumaNode> = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(sys_node) else {
+        return Vec::new();
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Only process directories named "nodeN" where N is a non-negative integer
+        let Some(id_str) = name.strip_prefix("node") else {
+            continue;
+        };
+        let Ok(id) = id_str.parse::<usize>() else {
+            continue;
+        };
+
+        let cpulist_path = entry.path().join("cpulist");
+        let Ok(content) = std::fs::read_to_string(&cpulist_path) else {
+            continue;
+        };
+        let cores = parse_cpulist(&content);
+        if cores.is_empty() {
+            continue;
+        }
+
+        nodes.push(NumaNode::new(id, cores));
+    }
+
+    // Sort by NUMA node ID for deterministic output
+    nodes.sort_by_key(|n| n.id);
+    nodes
+}
+
 impl AffinityConfig {
     /// Create a new affinity configuration
     pub fn new() -> Self {
@@ -252,16 +318,11 @@ impl AffinityConfig {
     /// Create a configuration for NUMA-aware placement with auto-detection
     #[cfg(target_os = "linux")]
     pub fn auto_detect_numa() -> Self {
-        // Try to detect NUMA topology
-        // This is a simplified version - real implementation would read from /sys/devices/system/node
-        let num_cpus = num_cpus::get();
-        let cores_per_node = num_cpus / 2; // Assume 2 NUMA nodes
-
-        let numa_nodes = vec![
-            NumaNode::new(0, (0..cores_per_node).collect()),
-            NumaNode::new(1, (cores_per_node..num_cpus).collect()),
-        ];
-
+        let numa_nodes = read_numa_topology();
+        if numa_nodes.is_empty() {
+            // No NUMA or /sys not readable — fall back to single-node auto_detect
+            return Self::auto_detect();
+        }
         Self {
             policy: AffinityPolicy::NumaAware,
             cores: Vec::new(),
@@ -528,5 +589,67 @@ mod tests {
         let display = format!("{}", config);
         assert!(display.contains("PerWorker"));
         assert!(display.contains("[0, 1, 2, 3]"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_cpulist_single() {
+        assert_eq!(parse_cpulist("3"), vec![3]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_cpulist_range() {
+        assert_eq!(parse_cpulist("0-3"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_cpulist_mixed() {
+        assert_eq!(parse_cpulist("0-3,6,8-10"), vec![0, 1, 2, 3, 6, 8, 9, 10]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_cpulist_dedup() {
+        assert_eq!(parse_cpulist("0,0,1"), vec![0, 1]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_read_numa_topology_returns_something() {
+        // On Linux, /sys/devices/system/node always exists; should find at least node0
+        let nodes = read_numa_topology();
+        if std::path::Path::new("/sys/devices/system/node/node0/cpulist").exists() {
+            assert!(!nodes.is_empty(), "Expected at least one NUMA node");
+            assert!(
+                !nodes[0].cores.is_empty(),
+                "node0 must have at least one CPU"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_auto_detect_numa_valid() {
+        let config = AffinityConfig::auto_detect_numa();
+        // Must be either NumaAware (with nodes) or PerWorker (fallback)
+        match config.policy() {
+            AffinityPolicy::NumaAware => {
+                let total_cores: usize = config.numa_nodes().iter().map(|n| n.cores.len()).sum();
+                assert!(
+                    total_cores > 0,
+                    "NumaAware config must expose at least one core"
+                );
+            }
+            AffinityPolicy::PerWorker => {
+                // Fallback branch — auto_detect() was used; cores must be non-empty
+                assert!(
+                    !config.cores().is_empty(),
+                    "PerWorker fallback must have cores"
+                );
+            }
+            other => panic!("Unexpected policy from auto_detect_numa: {:?}", other),
+        }
     }
 }

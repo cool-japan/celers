@@ -225,18 +225,21 @@ impl CostAlertSystem {
 
     /// Register an alert callback
     pub fn register_callback(&mut self, callback: AlertCallback) {
-        self.callbacks.lock().unwrap().push(callback);
+        self.callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(callback);
     }
 
     /// Track a cost and check for alerts
     pub fn track_cost(&mut self, cost_usd: f64) {
         // Update costs
         {
-            let mut daily = self.daily_cost.lock().unwrap();
+            let mut daily = self.daily_cost.lock().unwrap_or_else(|e| e.into_inner());
             *daily += cost_usd;
         }
         {
-            let mut monthly = self.monthly_cost.lock().unwrap();
+            let mut monthly = self.monthly_cost.lock().unwrap_or_else(|e| e.into_inner());
             *monthly += cost_usd;
         }
 
@@ -247,7 +250,7 @@ impl CostAlertSystem {
 
     /// Check daily cost thresholds
     fn check_daily_thresholds(&self) {
-        let daily_cost = *self.daily_cost.lock().unwrap();
+        let daily_cost = *self.daily_cost.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check critical threshold
         if let Some(threshold) = self.config.daily_critical_threshold {
@@ -264,7 +267,10 @@ impl CostAlertSystem {
                         ),
                         timestamp: SystemTime::now(),
                     });
-                    *self.last_daily_critical.lock().unwrap() = Some(SystemTime::now());
+                    *self
+                        .last_daily_critical
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(SystemTime::now());
                 }
                 return;
             }
@@ -284,14 +290,17 @@ impl CostAlertSystem {
                     ),
                     timestamp: SystemTime::now(),
                 });
-                *self.last_daily_warning.lock().unwrap() = Some(SystemTime::now());
+                *self
+                    .last_daily_warning
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(SystemTime::now());
             }
         }
     }
 
     /// Check monthly cost thresholds
     fn check_monthly_thresholds(&self) {
-        let monthly_cost = *self.monthly_cost.lock().unwrap();
+        let monthly_cost = *self.monthly_cost.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check critical threshold
         if let Some(threshold) = self.config.monthly_critical_threshold {
@@ -308,7 +317,10 @@ impl CostAlertSystem {
                         ),
                         timestamp: SystemTime::now(),
                     });
-                    *self.last_monthly_critical.lock().unwrap() = Some(SystemTime::now());
+                    *self
+                        .last_monthly_critical
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(SystemTime::now());
                 }
                 return;
             }
@@ -328,7 +340,10 @@ impl CostAlertSystem {
                     ),
                     timestamp: SystemTime::now(),
                 });
-                *self.last_monthly_warning.lock().unwrap() = Some(SystemTime::now());
+                *self
+                    .last_monthly_warning
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(SystemTime::now());
             }
         }
     }
@@ -339,7 +354,7 @@ impl CostAlertSystem {
             return true;
         }
 
-        if let Some(last_time) = *last_alert.lock().unwrap() {
+        if let Some(last_time) = *last_alert.lock().unwrap_or_else(|e| e.into_inner()) {
             if let Ok(elapsed) = SystemTime::now().duration_since(last_time) {
                 return elapsed.as_secs() >= self.config.deduplication_window_secs;
             }
@@ -351,14 +366,17 @@ impl CostAlertSystem {
     /// Trigger an alert
     fn trigger_alert(&self, alert: CostAlert) {
         // Add to history
-        self.alert_history.lock().unwrap().push(AlertHistory {
-            level: alert.level,
-            budget_type: alert.budget_type,
-            timestamp: alert.timestamp,
-        });
+        self.alert_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(AlertHistory {
+                level: alert.level,
+                budget_type: alert.budget_type,
+                timestamp: alert.timestamp,
+            });
 
         // Call all registered callbacks
-        let callbacks = self.callbacks.lock().unwrap();
+        let callbacks = self.callbacks.lock().unwrap_or_else(|e| e.into_inner());
         for callback in callbacks.iter() {
             callback(&alert);
         }
@@ -366,8 +384,8 @@ impl CostAlertSystem {
 
     /// Check if currently within budget (no critical alerts)
     pub fn is_within_budget(&self) -> bool {
-        let daily_cost = *self.daily_cost.lock().unwrap();
-        let monthly_cost = *self.monthly_cost.lock().unwrap();
+        let daily_cost = *self.daily_cost.lock().unwrap_or_else(|e| e.into_inner());
+        let monthly_cost = *self.monthly_cost.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check daily critical
         if let Some(threshold) = self.config.daily_critical_threshold {
@@ -388,36 +406,51 @@ impl CostAlertSystem {
 
     /// Get current daily cost
     pub fn daily_cost(&self) -> f64 {
-        *self.daily_cost.lock().unwrap()
+        *self.daily_cost.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get current monthly cost
     pub fn monthly_cost(&self) -> f64 {
-        *self.monthly_cost.lock().unwrap()
+        *self.monthly_cost.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Reset daily costs (call at start of each day)
     pub fn reset_daily_costs(&mut self) {
-        *self.daily_cost.lock().unwrap() = 0.0;
-        *self.last_daily_warning.lock().unwrap() = None;
-        *self.last_daily_critical.lock().unwrap() = None;
+        *self.daily_cost.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        *self
+            .last_daily_warning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .last_daily_critical
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Reset monthly costs (call at start of each month)
     pub fn reset_monthly_costs(&mut self) {
-        *self.monthly_cost.lock().unwrap() = 0.0;
-        *self.last_monthly_warning.lock().unwrap() = None;
-        *self.last_monthly_critical.lock().unwrap() = None;
+        *self.monthly_cost.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        *self
+            .last_monthly_warning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .last_monthly_critical
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Get alert history
     pub fn alert_history(&self) -> Vec<AlertHistory> {
-        self.alert_history.lock().unwrap().clone()
+        self.alert_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get alert statistics
     pub fn alert_statistics(&self) -> AlertStatistics {
-        let history = self.alert_history.lock().unwrap();
+        let history = self.alert_history.lock().unwrap_or_else(|e| e.into_inner());
 
         let total_alerts = history.len();
         let warning_alerts = history
@@ -448,7 +481,10 @@ impl CostAlertSystem {
 
     /// Clear alert history
     pub fn clear_history(&mut self) {
-        self.alert_history.lock().unwrap().clear();
+        self.alert_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 

@@ -4,11 +4,12 @@
 //! queue statistics, worker management, and other extended operations.
 
 use crate::broker_core::MysqlBroker;
+use crate::row_ext::RowExt;
 use crate::types::*;
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use chrono::{DateTime, Utc};
+use oxisql_core::{Connection, Transaction};
 use serde_json::json;
-use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -63,17 +64,17 @@ impl MysqlBroker {
             placeholders
         );
 
-        let mut query_builder = sqlx::query(&query);
-        for task_id_str in task_id_strings {
-            query_builder = query_builder.bind(task_id_str);
-        }
+        let param_refs: Vec<&dyn oxisql_core::ToSqlValue> = task_id_strings
+            .iter()
+            .map(|s| s as &dyn oxisql_core::ToSqlValue)
+            .collect();
 
-        let result = query_builder
-            .execute(&self.pool)
+        let cancelled = self
+            .connection()
+            .execute(&query, &param_refs)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to cancel batch: {}", e)))?;
 
-        let cancelled = result.rows_affected();
         tracing::info!(count = cancelled, "Cancelled tasks in batch");
 
         Ok(cancelled)
@@ -105,46 +106,51 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn get_worker_statistics(&self, worker_id: &str) -> Result<WorkerStatistics> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                worker_id,
-                SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as active_tasks,
-                SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
-                SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed_tasks,
-                MAX(started_at) as last_seen,
-                AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as avg_duration
-            FROM celers_tasks
-            WHERE worker_id = ?
-            GROUP BY worker_id
-            "#,
-        )
-        .bind(worker_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT
+                    worker_id,
+                    SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END) as active_tasks,
+                    SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+                    SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as failed_tasks,
+                    MAX(started_at) as last_seen,
+                    AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as avg_duration
+                FROM celers_tasks
+                WHERE worker_id = ?
+                GROUP BY worker_id
+                "#,
+                &[&worker_id],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {}", e)))?;
 
-        if let Some(row) = row {
-            let active: Option<rust_decimal::Decimal> = row.get("active_tasks");
-            let completed: Option<rust_decimal::Decimal> = row.get("completed_tasks");
-            let failed: Option<rust_decimal::Decimal> = row.get("failed_tasks");
-            let last_seen: Option<DateTime<Utc>> = row.get("last_seen");
-            let avg_duration: Option<rust_decimal::Decimal> = row.get("avg_duration");
+        if let Some(row) = rows.into_iter().next() {
+            let active: Option<String> = row
+                .col("active_tasks")
+                .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {e}")))?;
+            let completed: Option<String> = row
+                .col("completed_tasks")
+                .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {e}")))?;
+            let failed: Option<String> = row
+                .col("failed_tasks")
+                .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {e}")))?;
+            let last_seen: Option<DateTime<Utc>> = row
+                .col("last_seen")
+                .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {e}")))?;
+            let avg_duration: Option<String> = row
+                .col("avg_duration")
+                .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {e}")))?;
 
             Ok(WorkerStatistics {
                 worker_id: worker_id.to_string(),
-                active_tasks: active
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
-                completed_tasks: completed
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
-                failed_tasks: failed
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
+                active_tasks: active.and_then(|d| d.parse().ok()).unwrap_or(0),
+                completed_tasks: completed.and_then(|d| d.parse().ok()).unwrap_or(0),
+                failed_tasks: failed.and_then(|d| d.parse().ok()).unwrap_or(0),
                 last_seen: last_seen.unwrap_or_else(Utc::now),
                 avg_task_duration_secs: avg_duration
-                    .and_then(|d| d.to_string().parse::<f64>().ok())
+                    .and_then(|d| d.parse::<f64>().ok())
                     .unwrap_or(0.0),
             })
         } else {
@@ -185,12 +191,21 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn count_by_state_quick(&self, state: DbTaskState) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM celers_tasks WHERE state = ?")
-            .bind(state.to_string())
-            .fetch_one(&self.pool)
+        let rows = self
+            .connection()
+            .query(
+                "SELECT COUNT(*) AS c FROM celers_tasks WHERE state = ?",
+                &[&state.to_string()],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to count tasks by state: {}", e)))?;
 
+        let count: i64 = rows
+            .first()
+            .map(|r| r.col("c"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to count tasks by state: {e}")))?
+            .unwrap_or(0);
         Ok(count)
     }
 
@@ -226,40 +241,50 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn get_task_age_distribution(&self) -> Result<Vec<TaskAgeDistribution>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                CASE
-                    WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 60 THEN '< 1 min'
-                    WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 300 THEN '1-5 min'
-                    WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 900 THEN '5-15 min'
-                    WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 3600 THEN '15-60 min'
-                    ELSE '> 60 min'
-                END as bucket,
-                COUNT(*) as task_count,
-                MAX(TIMESTAMPDIFF(SECOND, created_at, NOW())) as oldest_age
-            FROM celers_tasks
-            WHERE state = 'pending'
-            GROUP BY bucket
-            ORDER BY
-                CASE bucket
-                    WHEN '< 1 min' THEN 1
-                    WHEN '1-5 min' THEN 2
-                    WHEN '5-15 min' THEN 3
-                    WHEN '15-60 min' THEN 4
-                    ELSE 5
-                END
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get task age distribution: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT
+                    CASE
+                        WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 60 THEN '< 1 min'
+                        WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 300 THEN '1-5 min'
+                        WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 900 THEN '5-15 min'
+                        WHEN TIMESTAMPDIFF(SECOND, created_at, NOW()) < 3600 THEN '15-60 min'
+                        ELSE '> 60 min'
+                    END as bucket,
+                    COUNT(*) as task_count,
+                    MAX(TIMESTAMPDIFF(SECOND, created_at, NOW())) as oldest_age
+                FROM celers_tasks
+                WHERE state = 'pending'
+                GROUP BY bucket
+                ORDER BY
+                    CASE bucket
+                        WHEN '< 1 min' THEN 1
+                        WHEN '1-5 min' THEN 2
+                        WHEN '5-15 min' THEN 3
+                        WHEN '15-60 min' THEN 4
+                        ELSE 5
+                    END
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to get task age distribution: {}", e))
+            })?;
 
         let mut distribution = Vec::with_capacity(rows.len());
         for row in rows {
-            let bucket: String = row.get("bucket");
-            let task_count: i64 = row.get("task_count");
-            let oldest_age: Option<i64> = row.get("oldest_age");
+            let bucket: String = row.col("bucket").map_err(|e| {
+                CelersError::Other(format!("Failed to get task age distribution: {e}"))
+            })?;
+            let task_count: i64 = row.col("task_count").map_err(|e| {
+                CelersError::Other(format!("Failed to get task age distribution: {e}"))
+            })?;
+            let oldest_age: Option<i64> = row.col("oldest_age").map_err(|e| {
+                CelersError::Other(format!("Failed to get task age distribution: {e}"))
+            })?;
 
             distribution.push(TaskAgeDistribution {
                 bucket_label: bucket,
@@ -298,40 +323,50 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn get_retry_statistics(&self) -> Result<Vec<RetryStatistics>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                task_name,
-                SUM(retry_count) as total_retries,
-                COUNT(*) as unique_tasks,
-                AVG(retry_count) as avg_retries,
-                MAX(retry_count) as max_retries
-            FROM celers_tasks
-            WHERE retry_count > 0
-            GROUP BY task_name
-            ORDER BY total_retries DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT
+                    task_name,
+                    SUM(retry_count) as total_retries,
+                    COUNT(*) as unique_tasks,
+                    AVG(retry_count) as avg_retries,
+                    MAX(retry_count) as max_retries
+                FROM celers_tasks
+                WHERE retry_count > 0
+                GROUP BY task_name
+                ORDER BY total_retries DESC
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {}", e)))?;
 
         let mut stats = Vec::with_capacity(rows.len());
         for row in rows {
-            let task_name: String = row.get("task_name");
-            let total_retries: Option<rust_decimal::Decimal> = row.get("total_retries");
-            let unique_tasks: i64 = row.get("unique_tasks");
-            let avg_retries: Option<rust_decimal::Decimal> = row.get("avg_retries");
-            let max_retries: i32 = row.get("max_retries");
+            let task_name: String = row
+                .col("task_name")
+                .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {e}")))?;
+            let total_retries: Option<String> = row
+                .col("total_retries")
+                .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {e}")))?;
+            let unique_tasks: i64 = row
+                .col("unique_tasks")
+                .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {e}")))?;
+            let avg_retries: Option<String> = row
+                .col("avg_retries")
+                .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {e}")))?;
+            let max_retries: i32 = row
+                .col("max_retries")
+                .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {e}")))?;
 
             stats.push(RetryStatistics {
                 task_name,
-                total_retries: total_retries
-                    .map(|d| d.to_string().parse().unwrap_or(0))
-                    .unwrap_or(0),
+                total_retries: total_retries.and_then(|d| d.parse().ok()).unwrap_or(0),
                 unique_tasks,
                 avg_retries_per_task: avg_retries
-                    .and_then(|d| d.to_string().parse::<f64>().ok())
+                    .and_then(|d| d.parse::<f64>().ok())
                     .unwrap_or(0.0),
                 max_retries_observed: max_retries,
             });
@@ -360,19 +395,28 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn list_active_workers(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT DISTINCT worker_id
-            FROM celers_tasks
-            WHERE worker_id IS NOT NULL AND state = 'processing'
-            ORDER BY worker_id
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to list active workers: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT DISTINCT worker_id
+                FROM celers_tasks
+                WHERE worker_id IS NOT NULL AND state = 'processing'
+                ORDER BY worker_id
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to list active workers: {}", e)))?;
 
-        let workers: Vec<String> = rows.into_iter().map(|row| row.get("worker_id")).collect();
+        let mut workers = Vec::with_capacity(rows.len());
+        for row in rows {
+            workers.push(
+                row.col("worker_id").map_err(|e| {
+                    CelersError::Other(format!("Failed to list active workers: {e}"))
+                })?,
+            );
+        }
 
         Ok(workers)
     }
@@ -448,18 +492,26 @@ impl MysqlBroker {
         let workers = self.list_active_workers().await?;
 
         // Get oldest pending task age
-        let oldest_age: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT TIMESTAMPDIFF(SECOND, created_at, NOW())
-            FROM celers_tasks
-            WHERE state = 'pending'
-            ORDER BY created_at ASC
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get oldest task: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age
+                FROM celers_tasks
+                WHERE state = 'pending'
+                ORDER BY created_at ASC
+                LIMIT 1
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get oldest task: {}", e)))?;
+        let oldest_age: Option<i64> = rows
+            .first()
+            .map(|r| r.col("age"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to get oldest task: {e}")))?
+            .flatten();
 
         let oldest_age_secs = oldest_age.unwrap_or(0);
         let oldest_age_minutes = oldest_age_secs as f64 / 60.0;
@@ -518,43 +570,48 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn get_task_throughput(&self) -> Result<TaskThroughput> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                SUM(CASE WHEN state = 'completed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE) THEN 1 ELSE 0 END) as completed_1min,
-                SUM(CASE WHEN state = 'completed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) as completed_1hour,
-                SUM(CASE WHEN state = 'failed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE) THEN 1 ELSE 0 END) as failed_1min,
-                SUM(CASE WHEN state = 'failed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) as failed_1hour
-            FROM celers_tasks
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get throughput: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT
+                    SUM(CASE WHEN state = 'completed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE) THEN 1 ELSE 0 END) as completed_1min,
+                    SUM(CASE WHEN state = 'completed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) as completed_1hour,
+                    SUM(CASE WHEN state = 'failed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 MINUTE) THEN 1 ELSE 0 END) as failed_1min,
+                    SUM(CASE WHEN state = 'failed' AND completed_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) as failed_1hour
+                FROM celers_tasks
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get throughput: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("get_task_throughput: query returned no rows".into())
+        })?;
 
-        let completed_1min: Option<rust_decimal::Decimal> = row.get("completed_1min");
-        let completed_1hour: Option<rust_decimal::Decimal> = row.get("completed_1hour");
-        let failed_1min: Option<rust_decimal::Decimal> = row.get("failed_1min");
-        let failed_1hour: Option<rust_decimal::Decimal> = row.get("failed_1hour");
+        let completed_1min: Option<String> = row
+            .col("completed_1min")
+            .map_err(|e| CelersError::Other(format!("Failed to get throughput: {e}")))?;
+        let completed_1hour: Option<String> = row
+            .col("completed_1hour")
+            .map_err(|e| CelersError::Other(format!("Failed to get throughput: {e}")))?;
+        let failed_1min: Option<String> = row
+            .col("failed_1min")
+            .map_err(|e| CelersError::Other(format!("Failed to get throughput: {e}")))?;
+        let failed_1hour: Option<String> = row
+            .col("failed_1hour")
+            .map_err(|e| CelersError::Other(format!("Failed to get throughput: {e}")))?;
 
-        let completed_last_minute = completed_1min
-            .map(|d| d.to_string().parse().unwrap_or(0))
-            .unwrap_or(0);
-        let completed_last_hour = completed_1hour
-            .map(|d| d.to_string().parse().unwrap_or(0))
-            .unwrap_or(0);
+        let completed_last_minute = completed_1min.and_then(|d| d.parse().ok()).unwrap_or(0);
+        let completed_last_hour = completed_1hour.and_then(|d| d.parse().ok()).unwrap_or(0);
 
         let tasks_per_second = completed_last_minute as f64 / 60.0;
 
         Ok(TaskThroughput {
             completed_last_minute,
             completed_last_hour,
-            failed_last_minute: failed_1min
-                .map(|d| d.to_string().parse().unwrap_or(0))
-                .unwrap_or(0),
-            failed_last_hour: failed_1hour
-                .map(|d| d.to_string().parse().unwrap_or(0))
-                .unwrap_or(0),
+            failed_last_minute: failed_1min.and_then(|d| d.parse().ok()).unwrap_or(0),
+            failed_last_hour: failed_1hour.and_then(|d| d.parse().ok()).unwrap_or(0),
             tasks_per_second,
         })
     }
@@ -583,19 +640,21 @@ impl MysqlBroker {
     /// # }
     /// ```
     pub async fn requeue_stuck_tasks_by_worker(&self, worker_id: &str) -> Result<u64> {
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'pending', worker_id = NULL, started_at = NULL
-            WHERE worker_id = ? AND state = 'processing'
-            "#,
-        )
-        .bind(worker_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to requeue tasks for worker: {}", e)))?;
+        let requeued = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'pending', worker_id = NULL, started_at = NULL
+                WHERE worker_id = ? AND state = 'processing'
+                "#,
+                &[&worker_id],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to requeue tasks for worker: {}", e))
+            })?;
 
-        let requeued = result.rows_affected();
         tracing::warn!(worker_id = %worker_id, count = requeued, "Requeued stuck tasks");
 
         Ok(requeued)
@@ -630,12 +689,12 @@ impl MysqlBroker {
     /// ```
     pub async fn with_transaction<F, T, Fut>(&self, f: F) -> Result<T>
     where
-        F: FnOnce(sqlx::Transaction<'_, sqlx::MySql>) -> Fut,
+        F: FnOnce(Box<dyn Transaction + '_>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
         let tx = self
-            .pool
-            .begin()
+            .connection()
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
@@ -676,65 +735,63 @@ impl MysqlBroker {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TaskInfo>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, task_name, state, priority, retry_count, max_retries,
-                   created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-            FROM celers_tasks
-            WHERE JSON_EXTRACT(metadata, ?) = ?
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-            "#,
-        )
-        .bind(json_path)
-        .bind(value)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to query tasks by metadata: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT id, task_name, state, priority, retry_count, max_retries,
+                       created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                FROM celers_tasks
+                WHERE JSON_EXTRACT(metadata, ?) = ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                "#,
+                &[&json_path, &value, &limit, &offset],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to query tasks by metadata: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
             let id_str: String = row
-                .try_get("id")
+                .col("id")
                 .map_err(|e| CelersError::Other(format!("Failed to get id: {}", e)))?;
             let state_str: String = row
-                .try_get("state")
+                .col("state")
                 .map_err(|e| CelersError::Other(format!("Failed to get state: {}", e)))?;
 
             tasks.push(TaskInfo {
                 id: Uuid::parse_str(&id_str)
                     .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
                 task_name: row
-                    .try_get("task_name")
+                    .col("task_name")
                     .map_err(|e| CelersError::Other(format!("Failed to get task_name: {}", e)))?,
                 state: state_str.parse()?,
                 priority: row
-                    .try_get("priority")
+                    .col("priority")
                     .map_err(|e| CelersError::Other(format!("Failed to get priority: {}", e)))?,
                 retry_count: row
-                    .try_get("retry_count")
+                    .col("retry_count")
                     .map_err(|e| CelersError::Other(format!("Failed to get retry_count: {}", e)))?,
                 max_retries: row
-                    .try_get("max_retries")
+                    .col("max_retries")
                     .map_err(|e| CelersError::Other(format!("Failed to get max_retries: {}", e)))?,
                 created_at: row
-                    .try_get("created_at")
+                    .col("created_at")
                     .map_err(|e| CelersError::Other(format!("Failed to get created_at: {}", e)))?,
-                scheduled_at: row.try_get("scheduled_at").map_err(|e| {
+                scheduled_at: row.col("scheduled_at").map_err(|e| {
                     CelersError::Other(format!("Failed to get scheduled_at: {}", e))
                 })?,
                 started_at: row
-                    .try_get("started_at")
+                    .col("started_at")
                     .map_err(|e| CelersError::Other(format!("Failed to get started_at: {}", e)))?,
-                completed_at: row.try_get("completed_at").map_err(|e| {
+                completed_at: row.col("completed_at").map_err(|e| {
                     CelersError::Other(format!("Failed to get completed_at: {}", e))
                 })?,
                 worker_id: row
-                    .try_get("worker_id")
+                    .col("worker_id")
                     .map_err(|e| CelersError::Other(format!("Failed to get worker_id: {}", e)))?,
-                error_message: row.try_get("error_message").map_err(|e| {
+                error_message: row.col("error_message").map_err(|e| {
                     CelersError::Other(format!("Failed to get error_message: {}", e))
                 })?,
             });
@@ -777,22 +834,25 @@ impl MysqlBroker {
         dedup_key: &str,
     ) -> Result<TaskId> {
         // First check if a task with this dedup key already exists
-        let existing = sqlx::query(
-            r#"
-            SELECT id FROM celers_tasks
-            WHERE JSON_EXTRACT(metadata, '$.dedup_key') = ?
-              AND state IN ('pending', 'processing')
-            LIMIT 1
-            "#,
-        )
-        .bind(dedup_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to check for duplicate task: {}", e)))?;
+        let existing_rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT id FROM celers_tasks
+                WHERE JSON_EXTRACT(metadata, '$.dedup_key') = ?
+                  AND state IN ('pending', 'processing')
+                LIMIT 1
+                "#,
+                &[&dedup_key],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to check for duplicate task: {}", e))
+            })?;
 
-        if let Some(row) = existing {
+        if let Some(row) = existing_rows.into_iter().next() {
             let id_str: String = row
-                .try_get("id")
+                .col("id")
                 .map_err(|e| CelersError::Other(format!("Failed to get id: {}", e)))?;
             let task_id = Uuid::parse_str(&id_str)
                 .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
@@ -818,23 +878,27 @@ impl MysqlBroker {
                 }
             }
         }
+        let db_metadata_str =
+            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
 
-        sqlx::query(
-            r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
-            "#,
-        )
-        .bind(task_id.to_string())
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string()))
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue deduplicated task: {}", e)))?;
+        self.connection()
+            .execute(
+                r#"
+                INSERT INTO celers_tasks
+                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                "#,
+                &[
+                    &task_id.to_string(),
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &db_metadata_str,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue deduplicated task: {}", e)))?;
 
         tracing::info!(task_id = %task_id, dedup_key = %dedup_key, "Enqueued new deduplicated task");
 
@@ -902,18 +966,20 @@ impl MysqlBroker {
             completed_at_clause, placeholders
         );
 
-        let mut query_builder = sqlx::query(&query);
-        query_builder = query_builder.bind(new_state.to_string());
-        for task_id_str in task_id_strings {
-            query_builder = query_builder.bind(task_id_str);
+        let new_state_str = new_state.to_string();
+        let mut param_refs: Vec<&dyn oxisql_core::ToSqlValue> =
+            Vec::with_capacity(1 + task_id_strings.len());
+        param_refs.push(&new_state_str);
+        for id in &task_id_strings {
+            param_refs.push(id);
         }
 
-        let result = query_builder
-            .execute(&self.pool)
+        let updated = self
+            .connection()
+            .execute(&query, &param_refs)
             .await
             .map_err(|e| CelersError::Other(format!("Failed to update batch state: {}", e)))?;
 
-        let updated = result.rows_affected();
         tracing::info!(count = updated, state = %new_state, "Updated task states in batch");
 
         Ok(updated)
@@ -1021,23 +1087,22 @@ impl MysqlBroker {
     pub async fn expire_pending_tasks(&self, ttl: Duration) -> Result<u64> {
         let ttl_seconds = ttl.as_secs() as i64;
 
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'cancelled',
-                completed_at = NOW(),
-                error_message = CONCAT('Task expired after ', ?, ' seconds')
-            WHERE state = 'pending'
-              AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
-            "#,
-        )
-        .bind(ttl_seconds)
-        .bind(ttl_seconds)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to expire pending tasks: {}", e)))?;
+        let expired = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'cancelled',
+                    completed_at = NOW(),
+                    error_message = CONCAT('Task expired after ', ?, ' seconds')
+                WHERE state = 'pending'
+                  AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+                "#,
+                &[&ttl_seconds, &ttl_seconds],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to expire pending tasks: {}", e)))?;
 
-        let expired = result.rows_affected();
         if expired > 0 {
             tracing::warn!(
                 count = expired,
@@ -1084,32 +1149,31 @@ impl MysqlBroker {
     ) -> Result<u64> {
         let seconds_ago = older_than.as_secs() as i64;
 
-        let query = if let Some(state) = state {
-            sqlx::query(
-                r#"
-                DELETE FROM celers_tasks
-                WHERE state = ?
-                  AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
-                "#,
-            )
-            .bind(state.to_string())
-            .bind(seconds_ago)
+        let deleted = if let Some(state) = state {
+            let state_str = state.to_string();
+            self.connection()
+                .execute(
+                    r#"
+                    DELETE FROM celers_tasks
+                    WHERE state = ?
+                      AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+                    "#,
+                    &[&state_str, &seconds_ago],
+                )
+                .await
         } else {
-            sqlx::query(
-                r#"
-                DELETE FROM celers_tasks
-                WHERE TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
-                "#,
-            )
-            .bind(seconds_ago)
-        };
+            self.connection()
+                .execute(
+                    r#"
+                    DELETE FROM celers_tasks
+                    WHERE TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+                    "#,
+                    &[&seconds_ago],
+                )
+                .await
+        }
+        .map_err(|e| CelersError::Other(format!("Failed to delete tasks: {}", e)))?;
 
-        let result = query
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to delete tasks: {}", e)))?;
-
-        let deleted = result.rows_affected();
         tracing::info!(count = deleted, "Deleted tasks by criteria");
 
         Ok(deleted)
@@ -1149,21 +1213,20 @@ impl MysqlBroker {
         json_path: &str,
         value: &str,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET metadata = JSON_SET(metadata, ?, ?)
-            WHERE id = ?
-            "#,
-        )
-        .bind(json_path)
-        .bind(value)
-        .bind(task_id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to update task metadata: {}", e)))?;
+        let affected = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET metadata = JSON_SET(metadata, ?, ?)
+                WHERE id = ?
+                "#,
+                &[&json_path, &value, &task_id.to_string()],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to update task metadata: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Search tasks by creation date range
@@ -1211,86 +1274,85 @@ impl MysqlBroker {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TaskInfo>> {
-        let query = if let Some(state) = state {
-            sqlx::query(
-                r#"
-                SELECT id, task_name, state, priority, retry_count, max_retries,
-                       created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-                FROM celers_tasks
-                WHERE created_at >= ? AND created_at <= ?
-                  AND state = ?
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-                "#,
-            )
-            .bind(from)
-            .bind(to)
-            .bind(state.to_string())
-            .bind(limit)
-            .bind(offset)
-        } else {
-            sqlx::query(
-                r#"
-                SELECT id, task_name, state, priority, retry_count, max_retries,
-                       created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-                FROM celers_tasks
-                WHERE created_at >= ? AND created_at <= ?
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-                "#,
-            )
-            .bind(from)
-            .bind(to)
-            .bind(limit)
-            .bind(offset)
-        };
+        // MySQL DATETIME/TIMESTAMP parameter convention — see `row_ext.rs`'s
+        // "DateTime<Utc> parameter convention (MySQL)" section.
+        let from_str = from.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let to_str = to.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to search tasks by date: {}", e)))?;
+        let rows = if let Some(state) = state {
+            let state_str = state.to_string();
+            self.connection()
+                .query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE created_at >= ? AND created_at <= ?
+                      AND state = ?
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    "#,
+                    &[&from_str, &to_str, &state_str, &limit, &offset],
+                )
+                .await
+        } else {
+            self.connection()
+                .query(
+                    r#"
+                    SELECT id, task_name, state, priority, retry_count, max_retries,
+                           created_at, scheduled_at, started_at, completed_at, worker_id, error_message
+                    FROM celers_tasks
+                    WHERE created_at >= ? AND created_at <= ?
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    "#,
+                    &[&from_str, &to_str, &limit, &offset],
+                )
+                .await
+        }
+        .map_err(|e| CelersError::Other(format!("Failed to search tasks by date: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
             let id_str: String = row
-                .try_get("id")
+                .col("id")
                 .map_err(|e| CelersError::Other(format!("Failed to get id: {}", e)))?;
             let state_str: String = row
-                .try_get("state")
+                .col("state")
                 .map_err(|e| CelersError::Other(format!("Failed to get state: {}", e)))?;
 
             tasks.push(TaskInfo {
                 id: Uuid::parse_str(&id_str)
                     .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
                 task_name: row
-                    .try_get("task_name")
+                    .col("task_name")
                     .map_err(|e| CelersError::Other(format!("Failed to get task_name: {}", e)))?,
                 state: state_str.parse()?,
                 priority: row
-                    .try_get("priority")
+                    .col("priority")
                     .map_err(|e| CelersError::Other(format!("Failed to get priority: {}", e)))?,
                 retry_count: row
-                    .try_get("retry_count")
+                    .col("retry_count")
                     .map_err(|e| CelersError::Other(format!("Failed to get retry_count: {}", e)))?,
                 max_retries: row
-                    .try_get("max_retries")
+                    .col("max_retries")
                     .map_err(|e| CelersError::Other(format!("Failed to get max_retries: {}", e)))?,
                 created_at: row
-                    .try_get("created_at")
+                    .col("created_at")
                     .map_err(|e| CelersError::Other(format!("Failed to get created_at: {}", e)))?,
-                scheduled_at: row.try_get("scheduled_at").map_err(|e| {
+                scheduled_at: row.col("scheduled_at").map_err(|e| {
                     CelersError::Other(format!("Failed to get scheduled_at: {}", e))
                 })?,
                 started_at: row
-                    .try_get("started_at")
+                    .col("started_at")
                     .map_err(|e| CelersError::Other(format!("Failed to get started_at: {}", e)))?,
-                completed_at: row.try_get("completed_at").map_err(|e| {
+                completed_at: row.col("completed_at").map_err(|e| {
                     CelersError::Other(format!("Failed to get completed_at: {}", e))
                 })?,
                 worker_id: row
-                    .try_get("worker_id")
+                    .col("worker_id")
                     .map_err(|e| CelersError::Other(format!("Failed to get worker_id: {}", e)))?,
-                error_message: row.try_get("error_message").map_err(|e| {
+                error_message: row.col("error_message").map_err(|e| {
                     CelersError::Other(format!("Failed to get error_message: {}", e))
                 })?,
             });
@@ -1320,54 +1382,61 @@ impl MysqlBroker {
     /// ```
     pub async fn get_dlq_statistics(&self) -> Result<DlqStatistics> {
         // Get total count
-        let total_row = sqlx::query(
-            r#"
-            SELECT COUNT(*) as total
-            FROM celers_dead_letter_queue
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get DLQ total: {}", e)))?;
+        let total_rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT COUNT(*) as total
+                FROM celers_dead_letter_queue
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get DLQ total: {}", e)))?;
 
-        let total_tasks: i64 = total_row
-            .try_get("total")
-            .map_err(|e| CelersError::Other(format!("Failed to get total: {}", e)))?;
+        let total_tasks: i64 = total_rows
+            .first()
+            .map(|r| r.col("total"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to get total: {}", e)))?
+            .unwrap_or(0);
 
         // Get counts by task name
-        let rows = sqlx::query(
-            r#"
-            SELECT task_name,
-                   COUNT(*) as count,
-                   AVG(retry_count) as avg_retries,
-                   MAX(retry_count) as max_retries
-            FROM celers_dead_letter_queue
-            GROUP BY task_name
-            ORDER BY count DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to get DLQ stats: {}", e)))?;
+        let rows = self
+            .connection()
+            .query(
+                r#"
+                SELECT task_name,
+                       COUNT(*) as count,
+                       AVG(retry_count) as avg_retries,
+                       MAX(retry_count) as max_retries
+                FROM celers_dead_letter_queue
+                GROUP BY task_name
+                ORDER BY count DESC
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to get DLQ stats: {}", e)))?;
 
         let mut by_task_name = Vec::new();
         for row in rows {
             let count: i64 = row
-                .try_get("count")
+                .col("count")
                 .map_err(|e| CelersError::Other(format!("Failed to get count: {}", e)))?;
-            let avg_retries: Option<rust_decimal::Decimal> = row
-                .try_get("avg_retries")
+            let avg_retries: Option<String> = row
+                .col("avg_retries")
                 .map_err(|e| CelersError::Other(format!("Failed to get avg_retries: {}", e)))?;
             let max_retries: i32 = row
-                .try_get("max_retries")
+                .col("max_retries")
                 .map_err(|e| CelersError::Other(format!("Failed to get max_retries: {}", e)))?;
 
             by_task_name.push(DlqTaskStats {
                 task_name: row
-                    .try_get("task_name")
+                    .col("task_name")
                     .map_err(|e| CelersError::Other(format!("Failed to get task_name: {}", e)))?,
                 count,
-                avg_retries: avg_retries.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)),
+                avg_retries: avg_retries.and_then(|d| d.parse::<f64>().ok()),
                 max_retries,
             });
         }
@@ -1406,29 +1475,28 @@ impl MysqlBroker {
     pub async fn recover_timed_out_tasks(&self, timeout: Duration) -> Result<u64> {
         let timeout_seconds = timeout.as_secs() as i64;
 
-        let result = sqlx::query(
-            r#"
-            UPDATE celers_tasks
-            SET state = 'pending',
-                worker_id = NULL,
-                started_at = NULL,
-                error_message = CONCAT(
-                    COALESCE(error_message, ''),
-                    IF(error_message IS NOT NULL, '; ', ''),
-                    'Task timed out after ', ?, ' seconds and was requeued'
-                )
-            WHERE state = 'processing'
-              AND started_at IS NOT NULL
-              AND TIMESTAMPDIFF(SECOND, started_at, NOW()) > ?
-            "#,
-        )
-        .bind(timeout_seconds)
-        .bind(timeout_seconds)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to recover timed-out tasks: {}", e)))?;
+        let recovered = self
+            .connection()
+            .execute(
+                r#"
+                UPDATE celers_tasks
+                SET state = 'pending',
+                    worker_id = NULL,
+                    started_at = NULL,
+                    error_message = CONCAT(
+                        COALESCE(error_message, ''),
+                        IF(error_message IS NOT NULL, '; ', ''),
+                        'Task timed out after ', ?, ' seconds and was requeued'
+                    )
+                WHERE state = 'processing'
+                  AND started_at IS NOT NULL
+                  AND TIMESTAMPDIFF(SECOND, started_at, NOW()) > ?
+                "#,
+                &[&timeout_seconds, &timeout_seconds],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to recover timed-out tasks: {}", e)))?;
 
-        let recovered = result.rows_affected();
         if recovered > 0 {
             tracing::warn!(
                 count = recovered,

@@ -438,34 +438,54 @@ impl HealthCheckMiddleware {
 
     /// Get current health status
     pub fn is_healthy(&self) -> bool {
-        *self.is_healthy.lock().unwrap()
+        *self.is_healthy.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Mark as unhealthy
     pub fn mark_unhealthy(&self) {
-        *self.is_healthy.lock().unwrap() = false;
+        *self.is_healthy.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
     /// Mark as healthy
     pub fn mark_healthy(&self) {
-        *self.is_healthy.lock().unwrap() = true;
+        *self.is_healthy.lock().unwrap_or_else(|e| e.into_inner()) = true;
     }
 
     fn should_check(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
-        let last = *self.last_check.lock().unwrap();
+        let last = *self.last_check.lock().unwrap_or_else(|e| e.into_inner());
         now - last >= self.check_interval_secs
     }
 
     fn update_check_time(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
-        *self.last_check.lock().unwrap() = now;
+        *self.last_check.lock().unwrap_or_else(|e| e.into_inner()) = now;
+    }
+
+    /// Run the periodic health evaluation and return the resulting status.
+    ///
+    /// The check is throttled by `check_interval_secs`: it only re-evaluates
+    /// once the interval has elapsed, otherwise it returns the last known
+    /// status. The current health is derived from the manually controllable
+    /// `is_healthy` flag (set via [`mark_healthy`](Self::mark_healthy) /
+    /// [`mark_unhealthy`](Self::mark_unhealthy)), which broker integrations
+    /// can drive from real connectivity probes.
+    fn run_health_check(&self) -> &'static str {
+        if self.should_check() {
+            self.update_check_time();
+        }
+
+        if self.is_healthy() {
+            "healthy"
+        } else {
+            "unhealthy"
+        }
     }
 }
 
@@ -478,20 +498,19 @@ impl Default for HealthCheckMiddleware {
 #[async_trait]
 impl MessageMiddleware for HealthCheckMiddleware {
     async fn before_publish(&self, message: &mut Message) -> Result<()> {
-        if self.should_check() {
-            self.update_check_time();
-            // In a real implementation, would perform actual health check
-            // For now, just inject health status into message headers
-        }
+        // Evaluate (throttled) health and stamp the message so downstream
+        // consumers and monitoring can observe producer health alongside the
+        // time the check was performed.
+        let health_status = self.run_health_check();
+        let checked_at = *self.last_check.lock().unwrap_or_else(|e| e.into_inner());
 
-        let health_status = if self.is_healthy() {
-            "healthy"
-        } else {
-            "unhealthy"
-        };
         message.headers.extra.insert(
             "x-health-status".to_string(),
             serde_json::json!(health_status),
+        );
+        message.headers.extra.insert(
+            "x-health-checked-at".to_string(),
+            serde_json::json!(checked_at),
         );
         Ok(())
     }
@@ -683,7 +702,7 @@ impl MessageMiddleware for CostAttributionMiddleware {
         // Inject timestamp for cost tracking
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         message.headers.extra.insert(
             "x-cost-timestamp".to_string(),
@@ -700,7 +719,7 @@ impl MessageMiddleware for CostAttributionMiddleware {
                 if let Ok(start_time) = timestamp_str.parse::<u64>() {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .expect("SystemTime should be after UNIX_EPOCH")
                         .as_secs();
                     let duration_secs = (now - start_time) as f64;
                     let compute_cost = duration_secs * self.compute_cost_per_sec;
@@ -778,7 +797,10 @@ impl SLAMonitoringMiddleware {
 
     /// Get current SLA compliance rate
     pub fn compliance_rate(&self) -> f64 {
-        let times = self.processing_times.lock().unwrap();
+        let times = self
+            .processing_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if times.is_empty() {
             return 1.0;
         }
@@ -805,7 +827,7 @@ impl MessageMiddleware for SLAMonitoringMiddleware {
         // Inject start timestamp for SLA tracking
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
         message
             .headers
@@ -821,12 +843,15 @@ impl MessageMiddleware for SLAMonitoringMiddleware {
             if let Some(start_str) = start_ms.as_u64() {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("SystemTime should be after UNIX_EPOCH")
                     .as_millis() as u64;
                 let processing_time = now - start_str;
 
                 // Record processing time
-                self.processing_times.lock().unwrap().push(processing_time);
+                self.processing_times
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(processing_time);
 
                 // Inject SLA status
                 let within_sla = processing_time <= self.target_ms;
@@ -1033,7 +1058,7 @@ impl ResourceQuotaMiddleware {
 
     /// Get current usage for a consumer
     pub fn get_usage(&self, consumer_id: &str) -> (usize, usize) {
-        let usage = self.usage.lock().unwrap();
+        let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
         usage
             .get(consumer_id)
             .map(|(msgs, bytes, _)| (*msgs, *bytes))
@@ -1042,15 +1067,15 @@ impl ResourceQuotaMiddleware {
 
     /// Reset quota for a consumer
     pub fn reset_quota(&self, consumer_id: &str) {
-        let mut usage = self.usage.lock().unwrap();
+        let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
         usage.remove(consumer_id);
     }
 
     fn check_and_update_quota(&self, consumer_id: &str, message_size: usize) -> Result<()> {
-        let mut usage = self.usage.lock().unwrap();
+        let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
 
         let (msg_count, byte_count, last_reset) =

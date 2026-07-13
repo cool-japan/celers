@@ -208,7 +208,7 @@ impl Chain {
     ///
     /// // Schedule chain for 1 hour from now
     /// let eta = SystemTime::now()
-    ///     .duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+    ///     .duration_since(UNIX_EPOCH).expect("SystemTime should be after UNIX_EPOCH").as_secs() + 3600;
     /// chain.apply_with_eta(broker, eta).await?;
     /// ```
     pub async fn apply_with_eta<B: Broker>(
@@ -734,8 +734,14 @@ impl std::fmt::Display for Chain {
             write!(
                 f,
                 " {} -> ... -> {}",
-                self.tasks.first().unwrap().task,
-                self.tasks.last().unwrap().task
+                self.tasks
+                    .first()
+                    .expect("tasks validated to be non-empty")
+                    .task,
+                self.tasks
+                    .last()
+                    .expect("tasks validated to be non-empty")
+                    .task
             )?;
         }
         Ok(())

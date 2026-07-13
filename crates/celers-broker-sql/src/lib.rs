@@ -19,6 +19,13 @@
 pub mod types;
 pub use types::*;
 
+// Row-mapping helpers for the OxiSQL-backed MySQL connection (panic-free
+// `row.get::<T, _>()` replacement) — see its module doc for details.
+mod row_ext;
+
+// URL-driven TLS mode selection for the OxiSQL-backed MySQL connection.
+mod tls_mode;
+
 // Circuit breaker and idempotency types
 pub mod circuit_breaker;
 pub use circuit_breaker::*;

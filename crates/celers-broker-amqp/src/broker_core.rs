@@ -85,7 +85,7 @@ impl AmqpBroker {
             config.management_username.clone(),
             config.management_password.clone(),
         ) {
-            Some(ManagementApiClient::new(mgmt_url, mgmt_user, mgmt_pass))
+            Some(ManagementApiClient::new(mgmt_url, mgmt_user, mgmt_pass)?)
         } else {
             None
         };

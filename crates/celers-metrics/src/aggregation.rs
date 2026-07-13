@@ -289,7 +289,7 @@ impl MetricSnapshot {
         Self {
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs(),
             worker_id: worker_id.into(),
             stats,
@@ -307,7 +307,7 @@ impl MetricSnapshot {
     pub fn is_stale(&self, threshold_seconds: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         (now - self.timestamp) > threshold_seconds
     }

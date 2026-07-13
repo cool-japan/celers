@@ -1441,11 +1441,20 @@ impl AlertContext {
     }
 
     /// Get event rate (events per second) over a time window
-    #[allow(clippy::unused_self)]
-    fn get_event_rate(&self, _window_secs: u64) -> f64 {
-        // This is a synchronous approximation for rate calculation
-        // In practice, you'd use the async version with proper locking
-        0.0 // Placeholder - actual implementation would need async context
+    ///
+    /// Best-effort synchronous approximation. Uses `try_read()` which returns immediately;
+    /// if the lock is contended, returns `0.0` conservatively.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    fn get_event_rate(&self, window_secs: u64) -> f64 {
+        if let Ok(events) = self.recent_events.try_read() {
+            let now = Utc::now();
+            let cutoff = now - chrono::Duration::seconds(window_secs as i64);
+            let count = events.iter().filter(|&&ts| ts >= cutoff).count();
+            if window_secs > 0 {
+                return count as f64 / window_secs as f64;
+            }
+        }
+        0.0
     }
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
@@ -1939,5 +1948,32 @@ mod tests {
         assert_eq!(e1.event_type(), "worker-online");
         assert_eq!(e2.event_type(), "task-started");
         assert_eq!(e3.event_type(), "task-started");
+    }
+
+    #[tokio::test]
+    async fn test_get_event_rate_sync_matches_async() {
+        let ctx = AlertContext::new();
+        let now = Utc::now();
+        // Record 6 events in the last 2 seconds (window)
+        for _ in 0..6 {
+            ctx.record_event(now).await;
+        }
+        // Sync rate over 2 seconds = 6/2 = 3.0
+        let sync_rate = ctx.get_event_rate(2);
+        assert!(sync_rate > 0.0, "Expected sync rate > 0, got {sync_rate}");
+        // Async rate should also be > 0
+        let async_rate = ctx.get_event_rate_async(2).await;
+        assert!(
+            async_rate > 0.0,
+            "Expected async rate > 0, got {async_rate}"
+        );
+    }
+
+    #[test]
+    fn test_get_event_rate_empty_context() {
+        let ctx = AlertContext::new();
+        // With no events, rate should be 0.0
+        let rate = ctx.get_event_rate(10);
+        assert_eq!(rate, 0.0);
     }
 }

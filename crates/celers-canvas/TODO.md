@@ -2,12 +2,29 @@
 
 > Canvas workflow primitives for distributed task orchestration
 
-**Version: 0.2.0 | Status: [Stable] | Updated: 2026-03-27 | Tests: 196**
+**Version: 0.3.0 | Status: [Stable] | Updated: 2026-07-13 | Tests: 396 (318 unit/integration + 78 doc)**
 
 ## Status: ✅ COMPLETE - Production-Ready with Full Feature Set
 
 All Canvas workflow primitives implemented and production-ready.
 Major enhancements added: cancellation, retry policies, timeouts, loops, state tracking, DAG export, error propagation control, sub-workflow isolation, workflow recovery/checkpointing, workflow compilation/optimization framework, comprehensive visualization support, and production-ready enhancements (metrics collection, rate limiting, concurrency control, workflow registry).
+
+**Latest enhancements (v0.3.0):**
+- Real nested chain/group execution for chords: a chord nested inside a chain/group now has its
+  header fanned out and its callback enqueued (via a shared `apply_chord_element` helper), instead
+  of the callback being silently dropped
+- Workflow DAG visualization export (`DagVisualize::to_mermaid()`/`to_dot()`) for `CanvasElement`,
+  `NestedChain`, `NestedGroup`, and the advanced primitives (`Map`, `Starmap`, `Chunks`, `Branch`,
+  `Switch`), with deterministic node ids and labelled fan-out/fan-in/chord/decision edges
+- Workflow loops/iteration (`WorkflowLoop`, `WorkflowMap`), sub-workflow composition
+  (`SubWorkflow`, `WorkflowComposition`), and parameterized templates (`ParamTemplate`) with real
+  `${name}` placeholder substitution
+- Workflow versioning + migration (`to_versioned_json`/`from_versioned_json`, `MigrationRegistry`)
+  for upgrading older serialized payloads on load
+- Rate-limit-aware dispatch: `Group::with_rate_limit`/`rate_limited_countdowns` derive
+  per-member staggered dispatch countdowns from a token-bucket `RateLimitConfig`
+- All 318 unit/integration tests (`cargo nextest --all-features`, 2 further `ignore`d) + 78 doc
+  tests (3 further `ignore`d) passing (396 total)
 
 **Latest enhancements (v0.2.0):**
 - Added comprehensive utility methods for workflow introspection and manipulation
@@ -87,6 +104,11 @@ Major enhancements added: cancellation, retry policies, timeouts, loops, state t
   - [x] Configurable time windows
   - [x] Rejection tracking
   - [x] Current rate monitoring
+- [x] Rate limit integration with Canvas workflows
+  - [x] Rate-limit-aware Group/Chain fan-out planning (reuses celers-core `RateLimitConfig` token-bucket params)
+  - [x] `rate_limited_countdowns(n, &config) -> Vec<Duration>` deterministic token-bucket schedule helper (rate_limit.rs)
+  - [x] `rate_limited_countdown_secs(n, &config) -> Vec<u64>` whole-second projection for `options.countdown`
+  - [x] `Group::with_rate_limit(&config)` (rate-derived analogue of `Group::skew`) + `Group::rate_limited_countdowns(&config)`; wired into existing apply/countdown machinery (additive, non-breaking)
 - [x] Workflow concurrency control (WorkflowConcurrencyControl)
   - [x] Maximum concurrent workflow limits
   - [x] Peak concurrency tracking
@@ -144,6 +166,11 @@ Major enhancements added: cancellation, retry policies, timeouts, loops, state t
   - [x] Sub-workflow isolation (IsolationLevel, SubWorkflowIsolation)
   - [x] NestedChain.apply() for executing nested workflows
   - [x] NestedGroup.apply() for parallel nested workflow execution
+  - [x] Real nested chord execution (header fan-out + body callback) in NestedChain/NestedGroup via shared apply_chord_element helper (no longer collapses to just the header group)
+  - [x] Sub-workflows / nested composition (SubWorkflow wrapping Chain/Group/Chord as one composable element)
+    - [x] WorkflowComposition embeds whole workflows as members
+    - [x] Explicit expand() step -> NestedChain (structure preserved)
+    - [x] Explicit flatten() step -> single Chain (only when every member is linearizable; descriptive error otherwise)
 - [x] Workflow cancellation
   - [x] Cancel entire workflow tree
   - [x] Cancel individual branches
@@ -164,9 +191,19 @@ Major enhancements added: cancellation, retry policies, timeouts, loops, state t
   - [x] For-each loops over collections (ForEach)
   - [x] While loops with conditions (WhileLoop)
   - [x] Break and continue support (LoopControl)
+  - [x] Bounded loop primitive (WorkflowLoop) that expands to a flat Chain of iterations
+    - [x] Repeat body N times (LoopBound::Times)
+    - [x] Repeat while a pure predicate over an accumulator holds, with a hard max-iteration cap (LoopBound::While + AccumulatorUpdate); guaranteed termination + ABSOLUTE_MAX_ITERATIONS safety bound
+    - [x] Map-style iteration applying a body chain over a list of inputs (WorkflowMap -> Vec<Chain> / NestedGroup / NestedChain)
 - [x] Workflow templates and macros
   - [x] Reusable workflow patterns (WorkflowTemplate)
   - [x] Template parameterization (TemplateParameter)
+  - [x] Parameterized templates with real ${name} placeholder substitution (ParamTemplate, TemplateParam)
+    - [x] Substitution across task names, positional args, and kwargs (recursing into nested JSON; type-preserving whole-placeholder substitution)
+    - [x] Missing required-parameter validation (CanvasError::Invalid naming the missing params); defaults auto-filled
+- [x] Dynamic workflow modification
+  - [x] Chain runtime add/insert/remove/replace/move steps with index + name validation (add_step, insert_step, remove_step, remove_step_by_name, replace_step, move_step)
+  - [x] Group runtime add/insert/remove/replace members with validation (add_member, insert_member, remove_member, remove_member_by_name, replace_member)
 
 ### State Management
 - [x] Workflow progress tracking
@@ -181,6 +218,11 @@ Major enhancements added: cancellation, retry policies, timeouts, loops, state t
   - [x] Serialize workflow state (via Serde)
   - [x] Checkpoint/snapshot support (WorkflowCheckpoint)
   - [x] State versioning (StateVersion, VersionedWorkflowState, StateMigration)
+  - [x] Workflow versioning and migration (versioning.rs)
+    - [x] Versioned serialized representation embedding a schema version alongside a workflow (VersionedEnvelope, CURRENT_WORKFLOW_VERSION)
+    - [x] Migration registry upgrading older payloads to the current schema via a chain of registered migrators v1->v2->... (MigrationRegistry, Migrator, FnMigrator)
+    - [x] Descriptive errors on unknown/too-new versions and missing migrator steps (CanvasError::Invalid)
+    - [x] Additive to_versioned_json / from_versioned_json(_with) (VersionedWorkflow trait) for Chain/Group/Chord/CanvasElement; existing to_json/from_json untouched
 - [x] Workflow recovery after crashes
   - [x] Resume from last checkpoint (WorkflowCheckpoint)
   - [x] Replay failed stages (WorkflowRecoveryPolicy)
@@ -229,6 +271,11 @@ Major enhancements added: cancellation, retry policies, timeouts, loops, state t
   - [x] Mermaid format (.mmd) - DagExport trait
   - [x] JSON representation - DagExport trait
   - [x] PNG/SVG rendering
+  - [x] Workflow DAG visualization export (GraphViz, Mermaid) - DagVisualize trait
+    - [x] Recursive walk of nested elements (CanvasElement, NestedChain, NestedGroup) with stable, unique, deterministic node ids
+    - [x] Advanced primitives (Map, Starmap, Chunks, Branch, Switch) with labelled decision edges
+    - [x] Correct dependency modelling (chain sequential edges, group fan-out from synthetic start, chord header fans into callback/body, parallel join)
+    - [x] Label escaping for DOT (quotes/backslashes/newlines) and Mermaid (#quot;/<br/>)
 
 ### Data Flow & Passing
 - [x] Advanced result passing

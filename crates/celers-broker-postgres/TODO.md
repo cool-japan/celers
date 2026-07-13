@@ -2,7 +2,138 @@
 
 > PostgreSQL-based broker implementation for CeleRS
 
-## Status: ✅ STABLE (v0.2.0) — 117 tests passing | Updated: 2026-03-27
+## Status: ✅ STABLE (v0.3.0) — 149 tests passing, 26 ignored (require a real PostgreSQL instance) + 179 doc tests passing, 6 ignored | Updated: 2026-07-13
+
+## queue_name schema drift (2026-07)
+
+`PostgresBroker::queue_name` (see the field doc comment in `src/broker_core.rs`) is a
+**logical label stored in `celers_tasks.metadata->>'queue'`** — it is set at enqueue
+time in `src/broker_trait.rs`'s `enqueue()`:
+
+```rust
+let mut db_metadata = json!({
+    "queue": self.queue_name,
+    "enqueued_at": chrono::Utc::now().to_rfc3339(),
+});
+```
+
+It is **not** a real column on `celers_tasks` (or `celers_dead_letter_queue`), and it is
+**not** a SQL table name. A number of peripheral (non-core-spine) functions across this
+crate incorrectly assume one or the other. This section is a documentation-only audit of
+every function found doing so, verified by direct grep/read of the current source. No
+fixes are included here — see individual function doc comments / inline `TODO` markers
+for anything already flagged in-code.
+
+Two distinct bug shapes are tracked below:
+- **(A) column drift** — filters `celers_tasks` (or the DLQ table) on `WHERE queue_name = $n`,
+  a column that does not exist on that table. Fix direction: rewrite as
+  `metadata->>'queue' = $n`.
+- **(B) table-name drift** — interpolates `self.queue_name` directly into the SQL text as
+  if it were a table name (via `format!("...FROM {}...", self.queue_name)`), instead of
+  targeting `celers_tasks` (or, where a snapshot/queue table is genuinely intended,
+  `celers_queue_snapshots`, which does have a real `queue_name` column). **Update
+  2026-07-13**: since this crate's `sqlx` → `oxisql-postgres` migration (see CHANGELOG
+  0.3.0, Pure-Rust Migration), the resulting string is passed as a plain `&str` to
+  `oxisql_core::Connection::execute` — there is no `sqlx::AssertSqlSafe` wrapper (or any
+  equivalent compile-time-checked-query safety net) anymore; this was verified directly
+  against current `src/convenience.rs` / `src/query_optimization.rs`. The underlying bug
+  (queue label spliced in as a table name) is unchanged, only the now-stale implementation
+  detail below has been corrected. This is more severe than (A) — it doesn't merely miss rows, it
+  can point at a nonexistent or wrong table entirely.
+
+### `src/queue_ops.rs` — 2 functions (bug A)
+- `search_tasks_by_jsonpath` (line 321) — filters `celers_tasks` on `WHERE queue_name = $1` — nonexistent column; needs `metadata->>'queue' = $n` rewrite.
+- `find_tasks_by_metadata_filters` (line 396) — same `queue_name` column filter against `celers_tasks` — needs `metadata->>'queue' = $n` rewrite.
+
+### `src/analytics.rs` — 20 functions (bug A), 2 of which also hit a second nonexistent column
+All of the following filter/reference a nonexistent `queue_name` column on `celers_tasks` —
+each needs the same `metadata->>'queue' = $n` rewrite:
+`find_tasks_by_error`, `estimate_wait_time`, `get_worker_stats`, `get_task_age_distribution`,
+`copy_tasks_from_queue`, `move_tasks_from_queue`, `get_hourly_task_counts`, `replay_tasks`,
+`sample_tasks`, `aggregate_by_metadata`, `store_performance_baseline`, `compare_to_baseline`,
+`get_distinct_task_names`, `get_task_breakdown_by_name`, `get_state_transition_history`,
+`get_task_lifecycle`, `detect_abnormal_state_duration`, `get_state_transition_stats`,
+`auto_adjust_priority_by_age`, `auto_adjust_priority_by_retries`, `apply_priority_strategy`.
+
+Additionally:
+- `copy_tasks_from_queue` (lines 373-424) — also references a nonexistent `timeout_secs` column on `celers_tasks` in its `INSERT` (lines 378/381) — needs either a real `timeout_secs` column or removal from the statement.
+- `replay_tasks` (lines 529-596) — also references a nonexistent `timeout_secs` column on `celers_tasks` in its `INSERT` (lines 534/537) — same fix direction as above.
+
+### `src/advanced_ops.rs` — 15 functions (bug A)
+All of the following filter `celers_tasks` on a nonexistent `queue_name` column — needs `metadata->>'queue' = $n` rewrite:
+`rebalance_queue_priorities`, `forecast_queue_depth`, `get_queue_trend_analysis`,
+`estimate_task_completion_time`, `get_queue_capacity_analysis`, `search_tasks`,
+`find_tasks_by_complex_criteria`, `count_tasks_matching`, `add_tasks_to_group`,
+`get_task_group_status`, `get_tasks_in_group`, `cancel_task_group`, `tag_tasks`,
+`find_tasks_by_tag`, `get_all_tags`, `get_tag_statistics`.
+
+**Correction vs. an earlier draft of this investigation**: the task-group functions
+(`add_tasks_to_group`, `get_task_group_status`, `get_tasks_in_group`, `cancel_task_group`)
+do **not** reference a missing `celers_task_groups` table — verified via
+`grep -n "celers_task_group" crates/celers-broker-postgres/src/advanced_ops.rs`, which
+returns zero matches. They query `celers_tasks` directly, e.g.
+`WHERE queue_name = $2 AND id = ANY($3)` combined with a
+`metadata->>'task_group_id'`/`jsonb_set(... '{task_group_id}' ...)` filter — task-group
+membership is correctly tracked via a JSON field, not a separate table. So this is just
+another instance of bug (A), not a missing-table issue. `create_task_group` itself
+(line 902) does not touch `queue_name` or the database at all — it only generates a UUID
+and logs it, relying on `add_tasks_to_group` for the actual metadata tagging — so it is
+omitted from the function list above.
+
+### `src/convenience.rs` — 10 functions (bug A) + 8 functions (bug B)
+
+Bug A (filters `celers_tasks` on nonexistent `queue_name` column via `.bind(&self.queue_name)`
+next to a `queue_name = $n` clause) — needs `metadata->>'queue' = $n` rewrite:
+`expire_tasks_by_ttl`, `expire_all_tasks_by_ttl`, `get_task_percentiles`, `get_slowest_tasks`,
+`get_task_rate`, `boost_task_priority`, `set_task_priority`, `cancel_with_reason`,
+`cancel_batch_with_reason`, `get_cancellation_reasons`.
+
+Bug B (interpolates `self.queue_name` as a table name via a plain `format!("...FROM {} ..." /
+"...UPDATE {} ...", self.queue_name)` string passed to `self.conn.query`/`.execute` — confirmed by
+the source's own comment at `convenience.rs:366`: "`sqlx::AssertSqlSafe` itself drops away: oxisql's
+`query` takes `&str` directly"; see the "Update 2026-07-13" note above) —
+needs to target `celers_tasks` directly (or `celers_queue_snapshots`, which legitimately has
+a real `queue_name` column, if that was the actual intent for any snapshot-related call site):
+`find_tasks_by_priority_range`, `cancel_old_pending`, `batch_cancel`, `find_stuck_tasks`,
+`requeue_stuck_tasks`, `get_queue_depth_by_priority`, `get_throughput_stats`,
+`get_avg_task_duration_by_name`.
+
+Note: `get_dlq_stats_by_task`, `get_dlq_error_patterns`, and `get_recent_dlq_tasks` are
+**not** listed above — they were fixed in a separate, concurrent pass (deduplication work)
+this round. Each of those three still carries its own `WHERE queue_name = $1` filter
+against `celers_dead_letter_queue` (which also has no such column) as a known, separately
+tracked issue — flagged in-code via an inline `// TODO(queue-name-drift): ...` comment
+directly above each query in `src/convenience.rs`.
+
+### `src/scheduling.rs` — 6 functions (bug B)
+All interpolate `self.queue_name` as a table name:
+`schedule_periodic_task`, `list_periodic_schedules`, `cancel_periodic_schedule`,
+`create_queue_snapshot`, `archive_by_criteria`, `apply_retention_policies`.
+
+Nuance: `archive_by_criteria` and `apply_retention_policies` call
+`validate_sql_identifier(&self.queue_name)?` before interpolating it. This prevents SQL
+injection (since `queue_name` could otherwise carry attacker- or config-controlled
+content into raw SQL text) but does **not** fix the underlying semantic bug of treating a
+queue label as a table name — it is a partial mitigation of the injection risk only, not
+a correctness fix.
+
+### `src/query_optimization.rs` — 2 functions (bug B)
+- `explain_dequeue_query` — interpolates `self.queue_name` as a table name via `format!("...FROM {}...", self.queue_name)` (plain string, no `sqlx::AssertSqlSafe` post-migration — see "Update 2026-07-13" note above); calls `validate_sql_identifier(&self.queue_name)?` first (line 29) — same injection-mitigation-only nuance as above, not a correctness fix.
+- `get_query_stats` — interpolates `self.queue_name` (after `trim_start_matches("public.")`) into a `WHERE relname = '{}'` filter against the `pg_stat_user_tables` system catalog, i.e. it also assumes `queue_name` names a real table — but does **not** call `validate_sql_identifier` first, so it lacks even the partial injection mitigation the other functions in this list have.
+
+### Security Hardening — v0.3.0 (verified against source 2026-07-13)
+- [x] `validate_sql_identifier()` (`src/scheduling.rs`) — validates identifiers against
+  `^[A-Za-z_][A-Za-z0-9_]*$` before interpolation; unit-tested (`validate_sql_identifier_accepts_valid_identifiers`,
+  `validate_sql_identifier_rejects_invalid_identifiers`, including a `'; DROP TABLE users;--` case)
+- [x] `apply_retention_policies` (`src/queue_ops.rs`) parses its task-state filter through the
+  closed-vocabulary `DbTaskState` enum (`policy.task_state.parse()?`) instead of splicing the raw
+  string into the generated `WHERE` clause
+- [x] `find_tasks_by_metadata_filters` (`src/queue_ops.rs`) binds both the JSON key and the value as
+  parameters (`metadata->$n = $n+1`) instead of interpolating the key into the query text
+- Scope note: these are real, targeted hardening fixes, not a resolution of the broader
+  "queue_name schema drift" bugs (A)/(B) audited above — `validate_sql_identifier` mitigates SQL
+  injection at the call sites that use it, but does not make `queue_name` a real column or fix the
+  table-name-as-queue-label confusion; see that section for the still-open correctness issues.
 
 ### Latest Enhancements - Round 6 (2026-01-07)
 
@@ -52,6 +183,16 @@
 - Comprehensive database health assessment with grading system
 - Intelligent batch size optimization for network and memory efficiency
 - Production-ready analytics for capacity planning and optimization
+
+**Re-verified 2026-07-13 (v0.3.0 release, current totals — supersedes the Round 6 counts above, which
+reflect a 2026-01-07 snapshot predating further work including the sqlx→oxisql migration):**
+`cargo nextest run -p celers-broker-postgres --all-features` → **149 tests passed, 26 skipped**
+(0 failed); `cargo test --doc -p celers-broker-postgres --all-features` → **179 passed, 6 ignored**
+(0 failed). No `todo!()`/`unimplemented!()` in `src/`. Zero `sqlx` remaining (migrated to
+`oxisql-postgres`/`oxisql-core`); 3 previously-broken private intra-doc-links in `broker_core.rs` /
+`notifications.rs` (rustdoc `[PostgresBroker::conn]`-style square-bracket links pointing at a private
+field, which rustdoc cannot resolve) converted to plain backtick text — doc-comment-only fix,
+confirmed no behavior change.
 
 ### Earlier Enhancements - Round 5 (2026-01-07)
 
@@ -500,7 +641,12 @@
 
 ### Connection ✅
 - [x] PostgreSQL connection string
-- [x] Connection pooling via sqlx
+- [x] Connection handling via `oxisql-postgres` (`PgConnection`) — migrated from `sqlx` in v0.3.0.
+  Note: this is a `Clone`-able wrapper around one shared `Arc<Mutex<tokio_postgres::Client>>`, i.e. a
+  single multiplexed connection, not a real N-connection pool like the previous `sqlx::PgPool` — a
+  known, tracked perf follow-up (see CHANGELOG "Known Limitations"), not a regression fixed here.
+- [x] URL-driven TLS mode (`sslmode` query param honored again as of v0.3.0 — `src/tls_mode.rs`; the
+  initial oxisql port had silently hardcoded `TlsMode::Disabled` at every connect call site)
 - [x] Configurable queue table name
 - [x] Async query execution
 - [x] Custom pool configuration (`with_pool_config`)
@@ -908,7 +1054,9 @@ Recently added production-ready convenience methods:
 ## Dependencies
 
 - `celers-core`: Core traits
-- `sqlx`: PostgreSQL async driver
+- `oxisql-postgres` / `oxisql-core`: PostgreSQL async driver (Pure-Rust; replaced `sqlx` in v0.3.0 —
+  verified via `Cargo.toml` and source on 2026-07-13, zero `sqlx` dependency remains)
+- `oxitls` / `rustls`: TLS support (URL-driven `sslmode` parsing, see `src/tls_mode.rs`)
 - `serde_json`: Task serialization
 - `tracing`: Logging
 

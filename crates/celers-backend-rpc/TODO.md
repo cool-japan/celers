@@ -2,11 +2,13 @@
 
 > gRPC/RPC result backend for CeleRS
 
-**Version: 0.2.0 | Status: [Alpha] | Updated: 2026-03-27 | Tests: 8**
+**Version: 0.3.0 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 18**
 
-## Status: ✅ FEATURE COMPLETE
+## Status: ✅ FEATURE COMPLETE + v0.3.0 CLIENT-SIDE METRICS
 
-Full gRPC result backend client implementation for distributed microservices architectures and service mesh deployments.
+Full gRPC result backend client implementation for distributed microservices architectures and
+service mesh deployments. v0.3.0 adds `RpcMetrics` (`src/metrics.rs`): per-operation request/error
+counts and p50/p95/p99 latency, computed from a 1,000-sample ring buffer per operation.
 
 ## Completed Features
 
@@ -14,7 +16,7 @@ Full gRPC result backend client implementation for distributed microservices arc
 - [x] `connect()` - Connect to gRPC result backend service
 - [x] `from_channel()` - Create from existing gRPC channel
 - [x] Protocol buffer schema definition
-- [x] Automatic code generation via tonic-build
+- [x] Automatic code generation via `tonic-prost-build` (`build.rs`)
 - [x] Type conversion (Rust ↔ Protobuf)
 
 ### ResultBackend Implementation ✅
@@ -268,7 +270,10 @@ Benefits:
 - [ ] mTLS client certificates
 
 ### Monitoring
-- [ ] Prometheus metrics (request count, latency)
+- [x] Client-side metrics — `RpcMetrics` in `src/metrics.rs`: per-operation (`RpcOperation`, one of
+      the 7 RPC methods) request/error counts and mean/p50/p95/p99 latency, exposed via
+      `GrpcResultBackend::metrics()` (snapshot), `metrics_handle()` (shared `Arc` for e.g. a
+      Prometheus exporter task), and `reset_metrics()`
 - [ ] OpenTelemetry tracing
 - [ ] Health check endpoint
 - [ ] gRPC reflection for debugging
@@ -282,7 +287,9 @@ Benefits:
 ## Testing Status
 
 - [x] Compilation tests
-- [x] Unit tests (8 passing: type conversions, chord operations, connection modes)
+- [x] Unit tests (18 passing via `cargo nextest run --all-features`: type conversions, chord
+      operations, connection modes, and the `RpcMetrics` ring-buffer/percentile logic), 1 skipped
+      (`#[ignore]`d, requires a live gRPC server)
 - [ ] Integration tests with mock server
 - [ ] Integration tests with real server
 - [ ] Load testing
@@ -302,10 +309,10 @@ Benefits:
 ## Dependencies
 
 - `celers-backend-redis`: Trait definitions and types
-- `tonic`: gRPC client library
+- `tonic` / `tonic-prost`: gRPC client library
 - `prost`: Protocol buffer serialization
 - `prost-types`: Well-known protobuf types
-- `tonic-build`: Protobuf compilation (build-time)
+- `tonic-prost-build`: Protobuf compilation (build-time, via `build.rs`)
 
 ## Comparison with Other Backends
 

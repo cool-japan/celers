@@ -26,13 +26,17 @@
 //! # }
 //! ```
 
+pub mod metrics;
 pub mod result_store;
+
+pub use metrics::{OperationStats, RpcMetrics, RpcMetricsSnapshot, RpcOperation};
 
 use async_trait::async_trait;
 pub use celers_backend_redis::{
     BackendError, ChordState, Result, ResultBackend, TaskMeta, TaskResult,
 };
 use chrono::{TimeZone, Utc};
+use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -52,6 +56,7 @@ use proto::{
 #[derive(Clone)]
 pub struct GrpcResultBackend {
     client: ResultBackendServiceClient<Channel>,
+    metrics: Arc<RpcMetrics>,
 }
 
 impl GrpcResultBackend {
@@ -66,13 +71,35 @@ impl GrpcResultBackend {
                 BackendError::Connection(format!("Failed to connect to gRPC server: {}", e))
             })?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            metrics: Arc::new(RpcMetrics::new()),
+        })
     }
 
     /// Connect with custom channel
     pub fn from_channel(channel: Channel) -> Self {
         let client = ResultBackendServiceClient::new(channel);
-        Self { client }
+        Self {
+            client,
+            metrics: Arc::new(RpcMetrics::new()),
+        }
+    }
+
+    /// Return a point-in-time snapshot of all RPC metrics.
+    pub fn metrics(&self) -> RpcMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Reset all metric counters and latency samples.
+    pub fn reset_metrics(&self) {
+        self.metrics.reset();
+    }
+
+    /// Return a clone of the internal `Arc<RpcMetrics>` for sharing with other
+    /// components (e.g. a Prometheus exporter running in a separate task).
+    pub fn metrics_handle(&self) -> Arc<RpcMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Convert TaskMeta to proto TaskMeta
@@ -219,12 +246,18 @@ impl ResultBackend for GrpcResultBackend {
             meta: Some(self.to_proto_meta(meta)),
         });
 
-        self.client
+        let start = std::time::Instant::now();
+        let result = self
+            .client
             .store_result(request)
             .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)))?;
+            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let elapsed = start.elapsed();
+        let is_error = result.is_err();
+        self.metrics
+            .record(RpcOperation::StoreResult, elapsed, is_error);
 
-        Ok(())
+        result.map(|_| ())
     }
 
     async fn get_result(&mut self, task_id: Uuid) -> Result<Option<TaskMeta>> {
@@ -232,13 +265,18 @@ impl ResultBackend for GrpcResultBackend {
             task_id: task_id.to_string(),
         });
 
-        let response = self
+        let start = std::time::Instant::now();
+        let result = self
             .client
             .get_result(request)
             .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)))?;
+            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let elapsed = start.elapsed();
+        let is_error = result.is_err();
+        self.metrics
+            .record(RpcOperation::GetResult, elapsed, is_error);
 
-        match response.into_inner().meta {
+        match result?.into_inner().meta {
             Some(proto_meta) => Ok(Some(Self::from_proto_meta(proto_meta)?)),
             None => Ok(None),
         }
@@ -249,12 +287,18 @@ impl ResultBackend for GrpcResultBackend {
             task_id: task_id.to_string(),
         });
 
-        self.client
+        let start = std::time::Instant::now();
+        let result = self
+            .client
             .delete_result(request)
             .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)))?;
+            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let elapsed = start.elapsed();
+        let is_error = result.is_err();
+        self.metrics
+            .record(RpcOperation::DeleteResult, elapsed, is_error);
 
-        Ok(())
+        result.map(|_| ())
     }
 
     async fn set_expiration(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
@@ -263,12 +307,18 @@ impl ResultBackend for GrpcResultBackend {
             ttl_seconds: ttl.as_secs(),
         });
 
-        self.client
+        let start = std::time::Instant::now();
+        let result = self
+            .client
             .set_expiration(request)
             .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)))?;
+            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let elapsed = start.elapsed();
+        let is_error = result.is_err();
+        self.metrics
+            .record(RpcOperation::SetExpiration, elapsed, is_error);
 
-        Ok(())
+        result.map(|_| ())
     }
 
     async fn chord_init(&mut self, state: ChordState) -> Result<()> {
@@ -276,12 +326,18 @@ impl ResultBackend for GrpcResultBackend {
             state: Some(self.to_proto_chord(&state)),
         });
 
-        self.client
+        let start = std::time::Instant::now();
+        let result = self
+            .client
             .chord_init(request)
             .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)))?;
+            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let elapsed = start.elapsed();
+        let is_error = result.is_err();
+        self.metrics
+            .record(RpcOperation::ChordInit, elapsed, is_error);
 
-        Ok(())
+        result.map(|_| ())
     }
 
     async fn chord_complete_task(&mut self, chord_id: Uuid) -> Result<usize> {
@@ -289,13 +345,18 @@ impl ResultBackend for GrpcResultBackend {
             chord_id: chord_id.to_string(),
         });
 
-        let response = self
+        let start = std::time::Instant::now();
+        let result = self
             .client
             .chord_complete_task(request)
             .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)))?;
+            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let elapsed = start.elapsed();
+        let is_error = result.is_err();
+        self.metrics
+            .record(RpcOperation::ChordCompleteTask, elapsed, is_error);
 
-        Ok(response.into_inner().completed_count as usize)
+        Ok(result?.into_inner().completed_count as usize)
     }
 
     async fn chord_get_state(&mut self, chord_id: Uuid) -> Result<Option<ChordState>> {
@@ -303,13 +364,18 @@ impl ResultBackend for GrpcResultBackend {
             chord_id: chord_id.to_string(),
         });
 
-        let response = self
+        let start = std::time::Instant::now();
+        let result = self
             .client
             .chord_get_state(request)
             .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)))?;
+            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let elapsed = start.elapsed();
+        let is_error = result.is_err();
+        self.metrics
+            .record(RpcOperation::ChordGetState, elapsed, is_error);
 
-        match response.into_inner().state {
+        match result?.into_inner().state {
             Some(proto_state) => Ok(Some(Self::from_proto_chord(proto_state)?)),
             None => Ok(None),
         }

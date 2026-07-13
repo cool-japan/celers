@@ -47,6 +47,7 @@
 //! ```
 
 use celers_core::{CelersError, Result, SerializedTask};
+use oxihttp_client::{Client as HttpClient, HttpsClient};
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -59,6 +60,7 @@ pub struct DLQArchivalManager {
     queue_name: String,
     dlq_key: String,
     config: ArchivalConfig,
+    http_client: HttpsClient,
 }
 
 /// Archival configuration
@@ -228,11 +230,17 @@ impl DLQArchivalManager {
         let client = Client::open(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
+        let http_client = HttpClient::builder()
+            .with_webpki_roots()
+            .build_https()
+            .map_err(|e| CelersError::Broker(format!("Failed to build HTTP client: {}", e)))?;
+
         Ok(Self {
             client,
             queue_name: queue_name.to_string(),
             dlq_key: format!("{}:dlq", queue_name),
             config,
+            http_client,
         })
     }
 
@@ -324,13 +332,23 @@ impl DLQArchivalManager {
         match &self.config.backend {
             StorageBackend::Redis { key_prefix } => self.get_redis_archive_stats(key_prefix).await,
             StorageBackend::FileSystem { path } => self.get_filesystem_archive_stats(path).await,
-            StorageBackend::External { .. } => {
-                // For external storage, we'd query the storage service
+            StorageBackend::External { endpoint, bucket } => {
+                let objects = self.list_external_objects(endpoint, bucket).await?;
+                let total_tasks = objects.len();
+                let total_size_bytes: u64 = objects.iter().map(|o| o.size).sum();
+                let timestamps: Vec<i64> = objects
+                    .iter()
+                    .filter_map(|o| o.last_modified.as_deref())
+                    .filter_map(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                    .map(|dt| dt.timestamp())
+                    .collect();
+                let oldest_timestamp = timestamps.iter().copied().min();
+                let newest_timestamp = timestamps.iter().copied().max();
                 Ok(ArchiveStats {
-                    total_tasks: 0,
-                    total_size_bytes: 0,
-                    oldest_timestamp: None,
-                    newest_timestamp: None,
+                    total_tasks,
+                    total_size_bytes,
+                    oldest_timestamp,
+                    newest_timestamp,
                     compression_ratio: None,
                 })
             }
@@ -349,9 +367,61 @@ impl DLQArchivalManager {
             StorageBackend::FileSystem { path } => {
                 self.search_filesystem_archives(path, &criteria).await
             }
-            StorageBackend::External { .. } => {
-                // For external storage, we'd query the storage service
-                Ok(Vec::new())
+            StorageBackend::External { endpoint, bucket } => {
+                let objects = self.list_external_objects(endpoint, bucket).await?;
+                let limit = criteria.limit.unwrap_or(usize::MAX);
+                let mut results = Vec::new();
+                for obj in &objects {
+                    if results.len() >= limit {
+                        break;
+                    }
+                    // Key format: "{queue_name}/{archive_id}.json"
+                    let archive_id = obj
+                        .key
+                        .strip_prefix(&format!("{}/", self.queue_name))
+                        .and_then(|s| s.strip_suffix(".json"))
+                        .unwrap_or("")
+                        .to_string();
+                    if archive_id.is_empty() {
+                        continue;
+                    }
+                    // Short-circuit on archive_id filter before fetching the object
+                    if let Some(ref target_id) = criteria.archive_id {
+                        if archive_id != *target_id {
+                            continue;
+                        }
+                    }
+                    let obj_url =
+                        format!("{}/{}/{}", endpoint.trim_end_matches('/'), bucket, obj.key);
+                    let request = match self.http_client.get(&obj_url) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("Failed to build request for archive {}: {}", archive_id, e);
+                            continue;
+                        }
+                    };
+                    let resp = match request.send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("Failed to fetch external archive {}: {}", archive_id, e);
+                            continue;
+                        }
+                    };
+                    let archived_task: ArchivedTask = match resp.body_json().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(
+                                "Failed to deserialise external archive {}: {}",
+                                archive_id, e
+                            );
+                            continue;
+                        }
+                    };
+                    if self.matches_criteria(&archived_task, &criteria) {
+                        results.push(archived_task);
+                    }
+                }
+                Ok(results)
             }
         }
     }
@@ -550,9 +620,36 @@ impl DLQArchivalManager {
 
                 Ok(())
             }
-            StorageBackend::External { .. } => {
-                // For external storage, we'd use S3 SDK or similar
-                debug!("External storage not yet implemented");
+            StorageBackend::External { endpoint, bucket } => {
+                let key = format!("{}/{}.json", self.queue_name, archived_task.archive_id);
+                let url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), bucket, key);
+                let data = serde_json::to_string(archived_task)
+                    .map_err(|e| CelersError::Serialization(e.to_string()))?;
+                self.http_client
+                    .put(&url)
+                    .map_err(|e| {
+                        CelersError::Broker(format!(
+                            "External PUT request build failed for {}: {}",
+                            url, e
+                        ))
+                    })?
+                    .header("Content-Type", "application/json")
+                    .map_err(|e| {
+                        CelersError::Broker(format!(
+                            "External PUT header failed for {}: {}",
+                            url, e
+                        ))
+                    })?
+                    .body(data)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        CelersError::Broker(format!("External PUT failed for {}: {}", url, e))
+                    })?
+                    .error_for_status()
+                    .map_err(|e| {
+                        CelersError::Broker(format!("External PUT status error for {}: {}", url, e))
+                    })?;
                 Ok(())
             }
         }
@@ -589,9 +686,31 @@ impl DLQArchivalManager {
 
                 Ok(())
             }
-            StorageBackend::External { .. } => {
-                // For external storage, we'd use S3 SDK or similar
-                debug!("External storage not yet implemented");
+            StorageBackend::External { endpoint, bucket } => {
+                let key = format!("{}/{}.json", self.queue_name, archive_id);
+                let url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), bucket, key);
+                let resp = self
+                    .http_client
+                    .delete(&url)
+                    .map_err(|e| {
+                        CelersError::Broker(format!(
+                            "External DELETE request build failed for {}: {}",
+                            url, e
+                        ))
+                    })?
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        CelersError::Broker(format!("External DELETE failed for {}: {}", url, e))
+                    })?;
+                // 204 No Content = success; 404 = already gone (treat as ok)
+                let status = resp.status();
+                if !status.is_success() && status.as_u16() != 404 {
+                    return Err(CelersError::Broker(format!(
+                        "External DELETE returned {} for {}",
+                        status, url
+                    )));
+                }
                 Ok(())
             }
         }
@@ -805,6 +924,65 @@ impl DLQArchivalManager {
         true
     }
 
+    /// List objects in the External S3-compatible backend for this queue.
+    ///
+    /// Issues an S3 ListObjectsV2 GET request (`list-type=2`) and parses the
+    /// XML response. Works with any S3-compatible store (MinIO, Ceph RGW, GCS
+    /// interop layer) that implements the standard ListObjectsV2 schema.
+    async fn list_external_objects(
+        &self,
+        endpoint: &str,
+        bucket: &str,
+    ) -> Result<Vec<ExternalObjectInfo>> {
+        let url = format!(
+            "{}/{}?list-type=2&prefix={}/",
+            endpoint.trim_end_matches('/'),
+            bucket,
+            self.queue_name
+        );
+        let xml = self
+            .http_client
+            .get(&url)
+            .map_err(|e| CelersError::Broker(format!("External LIST request build failed: {}", e)))?
+            .send()
+            .await
+            .map_err(|e| CelersError::Broker(format!("External LIST failed: {}", e)))?
+            .error_for_status()
+            .map_err(|e| CelersError::Broker(format!("External LIST error: {}", e)))?
+            .body_text()
+            .await
+            .map_err(|e| {
+                CelersError::Broker(format!("Failed to read LIST response body: {}", e))
+            })?;
+
+        // Parse S3 ListObjectsV2 XML — each <Contents> block describes one object.
+        let mut objects = Vec::new();
+        let mut offset = 0;
+        while let Some(rel_start) = xml[offset..].find("<Contents>") {
+            let abs_start = offset + rel_start + "<Contents>".len();
+            let Some(rel_end) = xml[abs_start..].find("</Contents>") else {
+                break;
+            };
+            let block = &xml[abs_start..abs_start + rel_end];
+            offset = abs_start + rel_end + "</Contents>".len();
+
+            let key = extract_xml_tag(block, "Key")
+                .unwrap_or_default()
+                .to_string();
+            let size = extract_xml_tag(block, "Size")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let last_modified = extract_xml_tag(block, "LastModified").map(str::to_string);
+
+            objects.push(ExternalObjectInfo {
+                key,
+                size,
+                last_modified,
+            });
+        }
+        Ok(objects)
+    }
+
     /// Generate a unique archive ID
     fn generate_archive_id(&self) -> String {
         use rand::RngExt;
@@ -814,6 +992,25 @@ impl DLQArchivalManager {
             .collect();
         format!("{}-{}", chrono::Utc::now().timestamp(), random_suffix)
     }
+}
+
+/// Metadata for a single object returned by `list_external_objects`.
+struct ExternalObjectInfo {
+    key: String,
+    size: u64,
+    last_modified: Option<String>,
+}
+
+/// Extract the text content of the first `<tag>…</tag>` element found in `xml`.
+///
+/// Handles simple `<Tag>value</Tag>` patterns as found in S3 XML responses.
+/// Does not handle namespaced tags, attributes, or CDATA.
+fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(open.as_str())? + open.len();
+    let end = xml[start..].find(close.as_str())?;
+    Some(&xml[start..start + end])
 }
 
 #[cfg(test)]
@@ -898,5 +1095,63 @@ mod tests {
 
         assert_eq!(stats.total_tasks, 0);
         assert_eq!(stats.total_size_bytes, 0);
+    }
+
+    #[test]
+    fn test_extract_xml_tag_basic() {
+        let xml = "<Key>my-queue/abc123.json</Key><Size>1024</Size>";
+        assert_eq!(extract_xml_tag(xml, "Key"), Some("my-queue/abc123.json"));
+        assert_eq!(extract_xml_tag(xml, "Size"), Some("1024"));
+        assert_eq!(extract_xml_tag(xml, "Missing"), None);
+    }
+
+    #[test]
+    fn test_extract_xml_tag_in_s3_block() {
+        let block = "\n    <Key>tasks/abc-def.json</Key>\n    <Size>2048</Size>\n    <LastModified>2024-01-15T10:00:00.000Z</LastModified>\n";
+        assert_eq!(extract_xml_tag(block, "Key"), Some("tasks/abc-def.json"));
+        assert_eq!(extract_xml_tag(block, "Size"), Some("2048"));
+        assert_eq!(
+            extract_xml_tag(block, "LastModified"),
+            Some("2024-01-15T10:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn test_extract_xml_tag_empty_value() {
+        let xml = "<Prefix></Prefix>";
+        assert_eq!(extract_xml_tag(xml, "Prefix"), Some(""));
+    }
+
+    #[test]
+    fn test_s3_list_xml_parsing_via_extract() {
+        // Simulate an S3 ListObjectsV2 XML response fragment
+        let xml = r#"<ListBucketResult>
+  <KeyCount>2</KeyCount>
+  <Contents>
+    <Key>queue/id1.json</Key><Size>512</Size><LastModified>2024-03-01T00:00:00.000Z</LastModified>
+  </Contents>
+  <Contents>
+    <Key>queue/id2.json</Key><Size>768</Size><LastModified>2024-03-02T00:00:00.000Z</LastModified>
+  </Contents>
+</ListBucketResult>"#;
+
+        // Verify that our parser correctly locates individual <Contents> blocks
+        let mut count = 0;
+        let mut total_size = 0u64;
+        let mut offset = 0;
+        while let Some(rel_start) = xml[offset..].find("<Contents>") {
+            let abs_start = offset + rel_start + "<Contents>".len();
+            let Some(rel_end) = xml[abs_start..].find("</Contents>") else {
+                break;
+            };
+            let block = &xml[abs_start..abs_start + rel_end];
+            offset = abs_start + rel_end + "</Contents>".len();
+            count += 1;
+            total_size += extract_xml_tag(block, "Size")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+        assert_eq!(count, 2);
+        assert_eq!(total_size, 1280);
     }
 }

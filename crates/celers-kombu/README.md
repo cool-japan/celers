@@ -2,7 +2,7 @@
 
 Broker abstraction layer for CeleRS, inspired by Python's Kombu library. Provides unified traits for message broker implementations.
 
-**Status: [Stable] — v0.2.0 (2026-03-27) — 323 tests**
+**Status: [Stable] — v0.3.0 (2026-07-13) — 343 tests (+ 145 doc tests)**
 
 ## Overview
 
@@ -23,10 +23,11 @@ Production-ready broker abstraction with:
 - ✅ **Message Replay**: Debugging and recovery with progress tracking
 - ✅ **Quota Management**: Resource limits with enforcement policies
 - ✅ **Flow Control**: Backpressure detection and poison message handling
-- ✅ **Middleware System**: 21 middleware types for transformation, validation, security, and reliability
-  - **Built-in** (18): Validation, Logging, Metrics, Retry Limit, Rate Limiting, Deduplication, Timeout, Filter, Sampling, Transformation, Tracing, Batching, Audit, Deadline, ContentType, RoutingKey, Idempotency, Backoff
+- ✅ **Middleware System**: 44 middleware types for transformation, validation, security, and reliability
+  - **Built-in** (41): Validation, Logging, Metrics, Retry Limit, Rate Limiting, Deduplication, Timeout, Filter, Sampling, Transformation, Tracing, Batching, Audit, Deadline, ContentType, RoutingKey, Idempotency, Backoff, Caching, Bulkhead, PriorityBoost, ErrorClassification, Correlation, Throttling, CircuitBreaker, SchemaValidation, MessageEnrichment, RetryStrategy, TenantIsolation, Partitioning, AdaptiveTimeout, BatchAckHint, LoadShedding, PriorityEscalation, Observability, HealthCheck, MessageTagging, CostAttribution, SLAMonitoring, MessageVersioning, ResourceQuota
   - **Feature-gated** (3): Compression (Gzip), Signing (HMAC), Encryption (AES-256-GCM)
-- ✅ **Utilities Module**: 47 helper functions for optimization, monitoring, and operational excellence
+  - Compression now records its codec and actually decompresses on consume, and Signing now verifies (and rejects tampered/unsigned bodies) on consume — both were previously silent no-ops on the consume side; fixed in 0.3.0
+- ✅ **Utilities Module**: 75 helper functions for optimization, monitoring, and operational excellence
 
 ## Architecture
 
@@ -951,7 +952,7 @@ Compresses message bodies (requires `compression` feature):
 
 ```toml
 [dependencies]
-celers-kombu = { version = "0.2", features = ["compression"] }
+celers-kombu = { version = "0.3", features = ["compression"] }
 ```
 
 ```rust
@@ -971,13 +972,17 @@ use celers_protocol::compression::CompressionType;
 }
 ```
 
+The codec is recorded in a `content-encoding` header on publish, and the body is
+transparently decompressed on consume (fixed in 0.3.0 — previously the body was
+never restored on the consumer side).
+
 #### SigningMiddleware
 
 Signs messages with HMAC-SHA256 (requires `signing` feature):
 
 ```toml
 [dependencies]
-celers-kombu = { version = "0.2", features = ["signing"] }
+celers-kombu = { version = "0.3", features = ["signing"] }
 ```
 
 ```rust
@@ -994,13 +999,17 @@ use celers_kombu::SigningMiddleware;
 }
 ```
 
+The HMAC signature is stored on publish and verified on consume, rejecting tampered
+or unsigned messages (fixed in 0.3.0 — previously the signature was never checked
+on the consumer side).
+
 #### EncryptionMiddleware
 
 Encrypts messages with AES-256-GCM (requires `encryption` feature):
 
 ```toml
 [dependencies]
-celers-kombu = { version = "0.2", features = ["encryption"] }
+celers-kombu = { version = "0.3", features = ["encryption"] }
 ```
 
 ```rust
@@ -1021,7 +1030,7 @@ use celers_kombu::EncryptionMiddleware;
 
 ```toml
 [dependencies]
-celers-kombu = { version = "0.2", features = ["full"] }
+celers-kombu = { version = "0.3", features = ["full"] }
 ```
 
 ### Combining Middleware
@@ -1437,7 +1446,7 @@ let (hours_to_saturation, growth_rate) = utils::predict_queue_saturation(
 );
 ```
 
-See examples for comprehensive usage: `cargo run --example monitoring` and `cargo run --example operational_excellence`.
+See examples for comprehensive usage: `cargo run --example kombu_monitoring` and `cargo run --example operational_excellence`.
 
 ## Best Practices
 
@@ -1600,7 +1609,7 @@ cargo run --example dlq_usage
 cargo run --example transactions
 
 # Scheduling, consumer groups, replay, quotas
-cargo run --example advanced_features
+cargo run --example kombu_advanced_features
 ```
 
 ### Flow Control & Resilience
@@ -1609,16 +1618,16 @@ cargo run --example advanced_features
 cargo run --example flow_control
 
 # Circuit breaker, connection pooling, health checks
-cargo run --example circuit_breaker
+cargo run --example kombu_circuit_breaker
 ```
 
 ### Monitoring & Operational Excellence
 ```bash
-# 47 utility functions showcase
+# 75 utility functions showcase
 cargo run --example utilities_showcase
 
 # Production monitoring and observability
-cargo run --example monitoring
+cargo run --example kombu_monitoring
 
 # Idempotency, backoff, anomaly detection, SLA tracking, error budgets
 cargo run --example operational_excellence

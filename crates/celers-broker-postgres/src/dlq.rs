@@ -2,10 +2,11 @@
 
 use celers_core::{CelersError, Result, TaskId};
 use chrono::Utc;
-use sqlx::Row;
+use oxisql_core::Connection;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::row_ext::{uuid_from_row, uuid_param, RowExt};
 use crate::types::{DlqTaskInfo, HealthStatus, PoolMetrics};
 use crate::PostgresBroker;
 
@@ -14,29 +15,39 @@ impl PostgresBroker {
 
     /// List tasks in the dead letter queue
     pub async fn list_dlq(&self, limit: i64, offset: i64) -> Result<Vec<DlqTaskInfo>> {
-        let rows = sqlx::query(
-            r#"
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT id, task_id, task_name, retry_count, error_message, failed_at
             FROM celers_dead_letter_queue
             ORDER BY failed_at DESC
             LIMIT $1 OFFSET $2
             "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {}", e)))?;
+                &[&limit, &offset],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {}", e)))?;
 
         let mut tasks = Vec::with_capacity(rows.len());
-        for row in rows {
+        for row in &rows {
             tasks.push(DlqTaskInfo {
-                id: row.get("id"),
-                task_id: row.get("task_id"),
-                task_name: row.get("task_name"),
-                retry_count: row.get("retry_count"),
-                error_message: row.get("error_message"),
-                failed_at: row.get("failed_at"),
+                id: uuid_from_row(row, "id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read id: {}", e)))?,
+                task_id: uuid_from_row(row, "task_id")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_id: {}", e)))?,
+                task_name: row
+                    .col("task_name")
+                    .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?,
+                retry_count: row.col("retry_count").map_err(|e| {
+                    CelersError::Other(format!("Failed to read retry_count: {}", e))
+                })?,
+                error_message: row.col("error_message").map_err(|e| {
+                    CelersError::Other(format!("Failed to read error_message: {}", e))
+                })?,
+                failed_at: row
+                    .col("failed_at")
+                    .map_err(|e| CelersError::Other(format!("Failed to read failed_at: {}", e)))?,
             });
         }
         Ok(tasks)
@@ -47,54 +58,75 @@ impl PostgresBroker {
     /// This moves the task back to the main queue with reset retry count.
     pub async fn requeue_from_dlq(&self, dlq_id: &Uuid) -> Result<TaskId> {
         let mut tx = self
-            .pool
-            .begin()
+            .conn
+            .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
         // Get task from DLQ
-        let row = sqlx::query(
-            r#"
+        let dlq_id_param = uuid_param(dlq_id);
+        let rows = tx
+            .query(
+                r#"
             SELECT task_id, task_name, payload, metadata
             FROM celers_dead_letter_queue
             WHERE id = $1
             "#,
-        )
-        .bind(dlq_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {}", e)))?;
+                &[&dlq_id_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {}", e)))?;
 
-        let row = row.ok_or_else(|| CelersError::Other("DLQ task not found".to_string()))?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| CelersError::Other("DLQ task not found".to_string()))?;
 
-        let task_id: Uuid = row.get("task_id");
-        let task_name: String = row.get("task_name");
-        let payload: Vec<u8> = row.get("payload");
-        let metadata: Option<serde_json::Value> = row.get("metadata");
+        let task_id: Uuid = uuid_from_row(&row, "task_id")
+            .map_err(|e| CelersError::Other(format!("Failed to read task_id: {}", e)))?;
+        let task_name: String = row
+            .col("task_name")
+            .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
+        let payload: Vec<u8> = row
+            .col("payload")
+            .map_err(|e| CelersError::Other(format!("Failed to read payload: {}", e)))?;
+        // `metadata` is a nullable JSON column: read as `Option<String>`
+        // directly (not `row_ext.rs`'s `json_from_row`, which collapses
+        // SQL-NULL and JSON-null to the same `serde_json::Value::Null` —
+        // here a genuinely absent metadata column must forward as SQL
+        // `NULL` on the INSERT below, matching the original
+        // `Option<serde_json::Value>` round-trip exactly). Mirrors
+        // `results.rs`'s `task_result_json_column` rationale.
+        let metadata_param: Option<String> = row
+            .col("metadata")
+            .map_err(|e| CelersError::Other(format!("Failed to read metadata: {}", e)))?;
 
         // Create new task in main queue
         let new_task_id = Uuid::new_v4();
-        sqlx::query(
+        let new_task_id_param = uuid_param(&new_task_id);
+        tx.execute(
             r#"
             INSERT INTO celers_tasks
                 (id, task_name, payload, state, priority, retry_count, max_retries, metadata, created_at, scheduled_at)
             VALUES ($1, $2, $3, 'pending', 0, 0, 3, $4, NOW(), NOW())
             "#,
+            &[
+                &new_task_id_param,
+                &task_name,
+                &payload,
+                &metadata_param,
+            ],
         )
-        .bind(new_task_id)
-        .bind(&task_name)
-        .bind(&payload)
-        .bind(metadata)
-        .execute(&mut *tx)
         .await
         .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
 
         // Delete from DLQ
-        sqlx::query("DELETE FROM celers_dead_letter_queue WHERE id = $1")
-            .bind(dlq_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to delete from DLQ: {}", e)))?;
+        tx.execute(
+            "DELETE FROM celers_dead_letter_queue WHERE id = $1",
+            &[&dlq_id_param],
+        )
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to delete from DLQ: {}", e)))?;
 
         tx.commit()
             .await
@@ -107,43 +139,61 @@ impl PostgresBroker {
 
     /// Purge (delete) a task from the dead letter queue
     pub async fn purge_dlq(&self, dlq_id: &Uuid) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM celers_dead_letter_queue WHERE id = $1")
-            .bind(dlq_id)
-            .execute(&self.pool)
+        let dlq_id_param = uuid_param(dlq_id);
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM celers_dead_letter_queue WHERE id = $1",
+                &[&dlq_id_param],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge DLQ task: {}", e)))?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(affected > 0)
     }
 
     /// Purge all tasks from the dead letter queue
     pub async fn purge_all_dlq(&self) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM celers_dead_letter_queue")
-            .execute(&self.pool)
+        let affected = self
+            .conn
+            .execute("DELETE FROM celers_dead_letter_queue", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge all DLQ: {}", e)))?;
 
-        tracing::info!(count = result.rows_affected(), "Purged all DLQ tasks");
-        Ok(result.rows_affected())
+        tracing::info!(count = affected, "Purged all DLQ tasks");
+        Ok(affected)
     }
 
     // ========== Health & Maintenance ==========
 
     /// Check database health
+    ///
+    /// `connection_pool_size`/`idle_connections`: see the doc comment on
+    /// [`PostgresBroker::get_pool_metrics`] for why these are `0`/unknown
+    /// rather than a live pool snapshot (`oxisql_postgres::PgConnection` has
+    /// no pool-introspection API).
     pub async fn check_health(&self) -> Result<HealthStatus> {
         // Test connection
-        let version: String = sqlx::query_scalar("SELECT version()")
-            .fetch_one(&self.pool)
+        let rows = self
+            .conn
+            .query("SELECT version()", &[])
             .await
+            .map_err(|e| CelersError::Other(format!("Health check failed: {}", e)))?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            CelersError::Other("Health check failed: no rows returned".to_string())
+        })?;
+        let version: String = row
+            .col_idx(0)
             .map_err(|e| CelersError::Other(format!("Health check failed: {}", e)))?;
 
         // Get queue counts
         let stats = self.get_statistics().await?;
 
+        let pool_metrics = self.get_pool_metrics();
         Ok(HealthStatus {
             healthy: true,
-            connection_pool_size: self.pool.options().get_max_connections(),
-            idle_connections: self.pool.num_idle() as u32,
+            connection_pool_size: pool_metrics.max_size,
+            idle_connections: pool_metrics.idle,
             pending_tasks: stats.pending,
             processing_tasks: stats.processing,
             dlq_tasks: stats.dlq,
@@ -155,17 +205,38 @@ impl PostgresBroker {
     ///
     /// This provides comprehensive statistics about the connection pool state,
     /// useful for monitoring and capacity planning.
+    ///
+    /// # Pool-introspection gap (oxisql migration)
+    ///
+    /// The pre-migration `sqlx`-backed version of this method read live
+    /// state off `sqlx::PgPool`/`PgPoolOptions` (`.size()`, `.num_idle()`,
+    /// `.options().get_max_connections()`). `oxisql_postgres::PgConnection`
+    /// — the connection type this crate's migrated task-delivery hot path
+    /// now uses — wraps a single multiplexed `tokio_postgres::Client`
+    /// (`Arc<Mutex<tokio_postgres::Client>>`; confirmed by reading
+    /// `oxisql-postgres` 0.3.2's `connection.rs`), not a real connection
+    /// pool, and exposes no equivalent introspection API of any kind.
+    ///
+    /// Rather than fabricate plausible-looking numbers or silently read
+    /// `self.pool` (the legacy `sqlx` pool this crate is migrating away
+    /// from — reading it here would make this method a hidden blocker to
+    /// that field's eventual removal), this reports `max_size`/`size`/`idle`
+    /// as `0` (unknown) and `in_use`/`waiting` as `0` for the same reason.
+    /// This is the same pattern already established for the sibling MySQL
+    /// migration (`celers-broker-sql`'s `MysqlBroker::get_connection_diagnostics`
+    /// / its `configured_max_connections` field doc): report the gap
+    /// explicitly rather than block the migration on it.
     pub fn get_pool_metrics(&self) -> PoolMetrics {
-        let max_size = self.pool.options().get_max_connections();
-        let size = self.pool.size();
-        let idle = self.pool.num_idle() as u32;
+        let max_size = 0;
+        let size = 0;
+        let idle = 0;
 
         PoolMetrics {
             max_size,
             size,
             idle,
             in_use: size.saturating_sub(idle),
-            waiting: 0, // sqlx doesn't expose waiting connections count
+            waiting: 0, // unknown — see this method's doc comment
         }
     }
 
@@ -175,20 +246,25 @@ impl PostgresBroker {
     pub async fn archive_completed_tasks(&self, older_than: Duration) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::seconds(older_than.as_secs() as i64);
 
-        let result = sqlx::query(
-            r#"
+        // `cutoff` is a `DateTime<Utc>` parameter -> `.to_rfc3339()` bound
+        // through a `$1::text::timestamptz` cast, same convention as
+        // `results.rs`'s `archive_results`.
+        let cutoff_param = cutoff.to_rfc3339();
+        let affected = self
+            .conn
+            .execute(
+                r#"
             DELETE FROM celers_tasks
             WHERE state IN ('completed', 'failed', 'cancelled')
-              AND completed_at < $1
+              AND completed_at < $1::text::timestamptz
             "#,
-        )
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to archive tasks: {}", e)))?;
+                &[&cutoff_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to archive tasks: {}", e)))?;
 
-        tracing::info!(count = result.rows_affected(), cutoff = %cutoff, "Archived completed tasks");
-        Ok(result.rows_affected())
+        tracing::info!(count = affected, cutoff = %cutoff, "Archived completed tasks");
+        Ok(affected)
     }
 
     /// Clean up stuck processing tasks (tasks that have been processing too long)
@@ -197,39 +273,41 @@ impl PostgresBroker {
     pub async fn recover_stuck_tasks(&self, stuck_threshold: Duration) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::seconds(stuck_threshold.as_secs() as i64);
 
-        let result = sqlx::query(
-            r#"
+        // Same `DateTime<Utc>` -> `$1::text::timestamptz` convention as
+        // `archive_completed_tasks` above.
+        let cutoff_param = cutoff.to_rfc3339();
+        let affected = self
+            .conn
+            .execute(
+                r#"
             UPDATE celers_tasks
             SET state = 'pending',
                 started_at = NULL,
                 worker_id = NULL,
                 error_message = 'Recovered from stuck processing state'
             WHERE state = 'processing'
-              AND started_at < $1
+              AND started_at < $1::text::timestamptz
             "#,
-        )
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to recover stuck tasks: {}", e)))?;
+                &[&cutoff_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to recover stuck tasks: {}", e)))?;
 
-        if result.rows_affected() > 0 {
-            tracing::warn!(
-                count = result.rows_affected(),
-                "Recovered stuck processing tasks"
-            );
+        if affected > 0 {
+            tracing::warn!(count = affected, "Recovered stuck processing tasks");
         }
-        Ok(result.rows_affected())
+        Ok(affected)
     }
 
     /// Purge all tasks (dangerous - use with caution)
     pub async fn purge_all(&self) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM celers_tasks")
-            .execute(&self.pool)
+        let affected = self
+            .conn
+            .execute("DELETE FROM celers_tasks", &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge all tasks: {}", e)))?;
 
-        tracing::warn!(count = result.rows_affected(), "Purged all tasks");
-        Ok(result.rows_affected())
+        tracing::warn!(count = affected, "Purged all tasks");
+        Ok(affected)
     }
 }

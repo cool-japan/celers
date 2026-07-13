@@ -218,20 +218,23 @@ impl MetricsMiddleware {
 
     /// Get current metrics snapshot
     pub fn get_metrics(&self) -> BrokerMetrics {
-        self.metrics.lock().unwrap().clone()
+        self.metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
 #[async_trait]
 impl MessageMiddleware for MetricsMiddleware {
     async fn before_publish(&self, _message: &mut Message) -> Result<()> {
-        let mut metrics = self.metrics.lock().unwrap();
+        let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
         metrics.inc_published();
         Ok(())
     }
 
     async fn after_consume(&self, _message: &mut Message) -> Result<()> {
-        let mut metrics = self.metrics.lock().unwrap();
+        let mut metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
         metrics.inc_consumed();
         Ok(())
     }
@@ -362,7 +365,7 @@ impl RateLimitingMiddleware {
 impl MessageMiddleware for RateLimitingMiddleware {
     async fn before_publish(&self, _message: &mut Message) -> Result<()> {
         // Try to acquire a token
-        let mut bucket = self.tokens.lock().unwrap();
+        let mut bucket = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
         if !bucket.try_consume(1.0) {
             return Err(BrokerError::OperationFailed(format!(
                 "Rate limit exceeded: {} messages/sec",
@@ -436,7 +439,7 @@ impl MessageMiddleware for DeduplicationMiddleware {
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
         let msg_id = message.task_id();
-        let mut seen = self.seen_ids.lock().unwrap();
+        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if we've seen this message before
         if seen.contains(&msg_id) {
@@ -490,6 +493,10 @@ pub struct CompressionMiddleware {
 
 #[cfg(feature = "compression")]
 impl CompressionMiddleware {
+    /// Header key used to record the compression encoding so the consumer
+    /// can decompress the body with the matching codec.
+    const COMPRESSION_HEADER: &'static str = "content-encoding";
+
     /// Create a new compression middleware
     ///
     /// # Arguments
@@ -529,17 +536,46 @@ impl MessageMiddleware for CompressionMiddleware {
             // Only use compressed version if it's actually smaller
             if compressed.len() < message.body.len() {
                 message.body = compressed;
-                // Note: In a real implementation, we'd set a header to indicate compression
+                // Record the algorithm used so the consumer can pick the
+                // matching codec for decompression. We store the canonical
+                // encoding name (e.g. "gzip") from the compressor's type.
+                message.headers.extra.insert(
+                    Self::COMPRESSION_HEADER.to_string(),
+                    serde_json::Value::String(
+                        self.compressor.compression_type.as_encoding().to_string(),
+                    ),
+                );
             }
         }
         Ok(())
     }
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
-        // Try to decompress (would need to check header in real implementation)
-        // For now, we'll skip decompression on consume since we don't have metadata
-        // A real implementation would check message headers for compression flag
-        let _ = message;
+        // Check whether this message was compressed on publish. If the flag
+        // is absent the body was never compressed, so we leave it untouched.
+        let encoding = match message.headers.extra.get(Self::COMPRESSION_HEADER) {
+            Some(serde_json::Value::String(encoding)) => encoding.clone(),
+            _ => return Ok(()),
+        };
+
+        // Resolve the codec from the recorded encoding name and decompress.
+        let compression_type = celers_protocol::compression::CompressionType::from_encoding(
+            &encoding,
+        )
+        .ok_or_else(|| {
+            BrokerError::Serialization(format!("unknown compression encoding: {}", encoding))
+        })?;
+
+        let decompressed = celers_protocol::compression::Compressor::new(compression_type)
+            .decompress(&message.body)
+            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        message.body = decompressed;
+
+        // Remove the flag so the consumed message is clean and is not
+        // mistaken for a still-compressed payload by downstream consumers.
+        message.headers.extra.remove(Self::COMPRESSION_HEADER);
+
         Ok(())
     }
 
@@ -569,6 +605,9 @@ pub struct SigningMiddleware {
 
 #[cfg(feature = "signing")]
 impl SigningMiddleware {
+    /// Header key used to carry the hex-encoded HMAC signature of the body.
+    const SIGNATURE_HEADER: &'static str = "signature";
+
     /// Create a new signing middleware
     ///
     /// # Arguments
@@ -585,31 +624,43 @@ impl SigningMiddleware {
 #[async_trait]
 impl MessageMiddleware for SigningMiddleware {
     async fn before_publish(&self, message: &mut Message) -> Result<()> {
-        // Sign the message body
-        let signature = self
+        // Sign the message body and store the signature (hex-encoded) in the
+        // headers so the consumer can verify integrity/authenticity.
+        let signature_hex = self
             .signer
-            .sign(&message.body)
+            .sign_hex(&message.body)
             .map_err(|e| BrokerError::OperationFailed(format!("signing failed: {}", e)))?;
 
-        // Store signature in message headers (would need custom header field)
-        // For now, we'll just validate that signing works
-        // In a real implementation, we'd add a signature field to Message
-        let _ = signature;
+        message.headers.extra.insert(
+            Self::SIGNATURE_HEADER.to_string(),
+            serde_json::Value::String(signature_hex),
+        );
 
         Ok(())
     }
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
-        // In a real implementation, we'd:
-        // 1. Extract signature from message headers
-        // 2. Verify signature against message body
-        // 3. Return error if verification fails
-        //
-        // For now, we'll just validate the message can be signed
-        let _ = self
-            .signer
-            .sign(&message.body)
-            .map_err(|e| BrokerError::OperationFailed(format!("signing failed: {}", e)))?;
+        // Extract the signature recorded at publish time. A missing signature
+        // is treated as a verification failure: we must not accept unsigned
+        // messages through a signing middleware.
+        let signature_hex = match message.headers.extra.get(Self::SIGNATURE_HEADER) {
+            Some(serde_json::Value::String(signature)) => signature.clone(),
+            _ => {
+                return Err(BrokerError::OperationFailed(
+                    "message is missing a signature header".to_string(),
+                ));
+            }
+        };
+
+        // Verify the signature against the body; reject on mismatch.
+        self.signer
+            .verify_hex(&message.body, &signature_hex)
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("signature verification failed: {}", e))
+            })?;
+
+        // Remove the signature header so the verified message is clean.
+        message.headers.extra.remove(Self::SIGNATURE_HEADER);
 
         Ok(())
     }
@@ -619,7 +670,21 @@ impl MessageMiddleware for SigningMiddleware {
     }
 }
 
-/// Encryption middleware - encrypts/decrypts message bodies using AES-256-GCM
+/// Encryption middleware - encrypts/decrypts message bodies at rest and in
+/// transit using authenticated AES-256-GCM.
+///
+/// This middleware mirrors the round-trip contract used by
+/// [`CompressionMiddleware`] and [`SigningMiddleware`]: on publish the body is
+/// encrypted and the encryption scheme is recorded in the
+/// [`Self::ENCRYPTION_HEADER`] header (alongside the per-message nonce); on
+/// consume the body is decrypted and the marker headers are cleared so the
+/// delivered message is plaintext and indistinguishable from one that never
+/// passed through encryption.
+///
+/// Confidentiality is provided by AES-256-GCM and integrity/authenticity is
+/// provided by the GCM authentication tag: any tampering with the ciphertext,
+/// the nonce, or use of the wrong key causes [`Self::after_consume`] to fail
+/// with a clear error instead of returning corrupted plaintext.
 ///
 /// # Examples
 ///
@@ -628,20 +693,34 @@ impl MessageMiddleware for SigningMiddleware {
 /// # {
 /// use celers_kombu::EncryptionMiddleware;
 ///
-/// // 32-byte key for AES-256
+/// // 32-byte key for AES-256.
 /// let key = [0u8; 32];
 /// let middleware = EncryptionMiddleware::new(&key).expect("valid key");
 /// # }
 /// ```
 #[cfg(feature = "encryption")]
 pub struct EncryptionMiddleware {
-    /// Message encryptor instance
+    /// Message encryptor instance (AES-256-GCM).
     encryptor: celers_protocol::crypto::MessageEncryptor,
 }
 
 #[cfg(feature = "encryption")]
 impl EncryptionMiddleware {
-    /// Create a new encryption middleware
+    /// Header key recording the encryption scheme applied to the body so the
+    /// consumer knows the payload is ciphertext and which codec to use. The
+    /// presence of this header is the marker that triggers decryption.
+    pub const ENCRYPTION_HEADER: &'static str = "content-encryption";
+
+    /// Header key carrying the hex-encoded per-message nonce required to
+    /// decrypt the body. AES-GCM requires the exact nonce used during
+    /// encryption; it is not secret but must be transmitted alongside the
+    /// ciphertext.
+    pub const NONCE_HEADER: &'static str = "content-encryption-nonce";
+
+    /// Canonical name of the encryption scheme this middleware implements.
+    pub const SCHEME: &'static str = "aes-256-gcm";
+
+    /// Create a new encryption middleware.
     ///
     /// # Arguments
     ///
@@ -649,7 +728,8 @@ impl EncryptionMiddleware {
     ///
     /// # Returns
     ///
-    /// `Ok(EncryptionMiddleware)` if the key is valid, `Err(BrokerError)` otherwise
+    /// `Ok(EncryptionMiddleware)` if the key is valid, `Err(BrokerError)`
+    /// otherwise (e.g. the key is not exactly 32 bytes).
     pub fn new(key: &[u8]) -> Result<Self> {
         let encryptor = celers_protocol::crypto::MessageEncryptor::new(key)
             .map_err(|e| BrokerError::Configuration(e.to_string()))?;
@@ -662,38 +742,74 @@ impl EncryptionMiddleware {
 #[async_trait]
 impl MessageMiddleware for EncryptionMiddleware {
     async fn before_publish(&self, message: &mut Message) -> Result<()> {
-        // Encrypt the message body
+        // Encrypt the body and record the scheme + nonce in the headers so the
+        // consumer can recognise the ciphertext and decrypt it. The nonce is
+        // generated fresh for every message by the encryptor.
         let (ciphertext, nonce) = self
             .encryptor
             .encrypt(&message.body)
-            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+            .map_err(|e| BrokerError::Serialization(format!("encryption failed: {}", e)))?;
 
-        // In a real implementation, we'd store the nonce in message headers
-        // For now, we'll prepend the nonce to the ciphertext
-        let mut encrypted = nonce.to_vec();
-        encrypted.extend_from_slice(&ciphertext);
-        message.body = encrypted;
+        message.body = ciphertext;
+        message.headers.extra.insert(
+            Self::ENCRYPTION_HEADER.to_string(),
+            serde_json::Value::String(Self::SCHEME.to_string()),
+        );
+        message.headers.extra.insert(
+            Self::NONCE_HEADER.to_string(),
+            serde_json::Value::String(hex::encode(&nonce)),
+        );
 
         Ok(())
     }
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
-        // Extract nonce and ciphertext
-        if message.body.len() < celers_protocol::crypto::NONCE_SIZE {
-            return Err(BrokerError::Serialization(
-                "Message too short to contain nonce".to_string(),
-            ));
+        // Determine whether this message was encrypted on publish. Absence of
+        // the scheme header means the body is plaintext and must be left
+        // untouched (mirrors the compression no-op behaviour).
+        let scheme = match message.headers.extra.get(Self::ENCRYPTION_HEADER) {
+            Some(serde_json::Value::String(scheme)) => scheme.clone(),
+            _ => return Ok(()),
+        };
+
+        // Only the scheme this middleware understands is supported; anything
+        // else is a configuration/interoperability error.
+        if scheme != Self::SCHEME {
+            return Err(BrokerError::Serialization(format!(
+                "unsupported encryption scheme: {}",
+                scheme
+            )));
         }
 
-        let (nonce_bytes, ciphertext) = message.body.split_at(celers_protocol::crypto::NONCE_SIZE);
+        // The nonce header is mandatory for an encrypted body; a missing nonce
+        // means the message is malformed or was tampered with.
+        let nonce_hex = match message.headers.extra.get(Self::NONCE_HEADER) {
+            Some(serde_json::Value::String(nonce)) => nonce.clone(),
+            _ => {
+                return Err(BrokerError::Serialization(
+                    "encrypted message is missing its nonce header".to_string(),
+                ));
+            }
+        };
 
-        // Decrypt the message body
+        let nonce = hex::decode(&nonce_hex)
+            .map_err(|e| BrokerError::Serialization(format!("invalid nonce encoding: {}", e)))?;
+
+        // Decrypt and authenticate. A wrong key, a tampered ciphertext, or a
+        // tampered nonce all surface here as a GCM tag verification failure and
+        // are rejected rather than returning corrupted plaintext.
         let plaintext = self
             .encryptor
-            .decrypt(ciphertext, nonce_bytes)
-            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+            .decrypt(&message.body, &nonce)
+            .map_err(|e| BrokerError::Serialization(format!("decryption failed: {}", e)))?;
 
         message.body = plaintext;
+
+        // Clear the markers so the delivered message is clean plaintext and is
+        // not mistaken for a still-encrypted payload downstream.
+        message.headers.extra.remove(Self::ENCRYPTION_HEADER);
+        message.headers.extra.remove(Self::NONCE_HEADER);
+
         Ok(())
     }
 
@@ -988,7 +1104,7 @@ impl MessageMiddleware for TracingMiddleware {
             "trace-timestamp".to_string(),
             serde_json::json!(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis()),
         );
 

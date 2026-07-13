@@ -959,7 +959,8 @@ impl AmqpBroker {
         let response = mgmt_api
             .client
             .get(&url)
-            .basic_auth(&mgmt_api.username, Some(&mgmt_api.password))
+            .and_then(|b| b.basic_auth(&mgmt_api.username, Some(&mgmt_api.password)))
+            .map_err(|e| BrokerError::OperationFailed(format!("Failed to check aliveness: {}", e)))?
             .send()
             .await
             .map_err(|e| {
@@ -975,7 +976,7 @@ impl AmqpBroker {
             status: String,
         }
 
-        let aliveness: AlivenessResponse = response.json().await.map_err(|e| {
+        let aliveness: AlivenessResponse = response.body_json().await.map_err(|e| {
             BrokerError::Serialization(format!("Failed to parse aliveness response: {}", e))
         })?;
 

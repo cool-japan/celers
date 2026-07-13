@@ -2,12 +2,15 @@
 
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use chrono::Utc;
+use oxisql_core::Connection;
+use oxisql_postgres::PgConnection;
 use serde_json::json;
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::row_ext::{json_from_row, json_param, uuid_param};
+use crate::tls_mode;
 use crate::types::{HookContext, RetryStrategy, TaskHook, TaskHooks, TraceContext};
 
 #[cfg(feature = "metrics")]
@@ -15,7 +18,41 @@ use celers_metrics::{TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL};
 
 /// PostgreSQL-based broker implementation using SKIP LOCKED
 pub struct PostgresBroker {
-    pub(crate) pool: PgPool,
+    /// The OxiSQL connection used throughout this crate's task-delivery hot
+    /// path (`broker_trait.rs`'s `Broker` impl, `queue_ops.rs`, `results.rs`)
+    /// and — as of this migration's final cleanup — this file's own
+    /// internal migration-runner and `move_to_dlq` stored-function call too.
+    ///
+    /// This struct used to also carry a `pool: PgPool` field (the legacy
+    /// `sqlx` connection pool) for exactly those two remaining call sites;
+    /// it has been removed now that they are migrated, completing this
+    /// crate's sqlx→oxisql migration and allowing the `sqlx` dependency to
+    /// be dropped entirely.
+    ///
+    /// `oxisql_postgres::PgConnection` is `Clone` and internally
+    /// `Arc<Mutex<tokio_postgres::Client>>` — cheap to clone, but unlike
+    /// `sqlx::PgPool` all clones share ONE underlying connection rather than
+    /// drawing from a pool of up to `max_connections`. This is a real
+    /// behavioral change from the previous sqlx-based pool and is accepted
+    /// for now per the migration plan as a deferred performance item.
+    pub(crate) conn: PgConnection,
+    /// The connection string this broker was constructed with.
+    ///
+    /// Retained so `notifications.rs` can open its own dedicated
+    /// `PgConnection` for LISTEN/NOTIFY (a long-lived LISTEN connection
+    /// should not share the query connection, per Postgres best practice).
+    pub(crate) database_url: String,
+    /// Logical queue label for multi-tenancy.
+    ///
+    /// This is stored as a JSON label inside `celers_tasks.metadata->>'queue'`
+    /// at enqueue time (see `broker_trait.rs`'s `enqueue()`), NOT as a real
+    /// column on `celers_tasks`, and NOT as a table name.
+    ///
+    /// Several peripheral APIs in this crate currently incorrectly assume one
+    /// or the other (filtering `celers_tasks`/`celers_dead_letter_queue` on a
+    /// nonexistent `queue_name` column, or interpolating this value as if it
+    /// were a SQL table name via `format!("... FROM {} ...", self.queue_name)`).
+    /// See `TODO.md` (`## queue_name schema drift`) for the full tracked list.
     pub(crate) queue_name: String,
     pub(crate) paused: AtomicBool,
     pub(crate) retry_strategy: RetryStrategy,
@@ -34,15 +71,23 @@ impl PostgresBroker {
 
     /// Create a new PostgreSQL broker with a specific queue name
     pub async fn with_queue(database_url: &str, queue_name: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(20)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(database_url)
+        // TLS mode is derived from `database_url`'s `sslmode` query
+        // parameter (see `tls_mode.rs`): a URL with `sslmode=require` (or
+        // `verify-ca`/`verify-full`/`prefer`/`allow`) gets a real TLS
+        // connection, matching the pre-`oxisql`-migration `sqlx` behavior.
+        // Absent/`sslmode=disable` still resolves to `TlsMode::Disabled`,
+        // so plain-text callers are unaffected.
+        let tls_mode = tls_mode::pg_tls_mode_for_url(database_url)
+            .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {}", e)))?;
+        let conn = PgConnection::connect(database_url, tls_mode)
             .await
-            .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to connect to database (oxisql): {}", e))
+            })?;
 
         Ok(Self {
-            pool,
+            conn,
+            database_url: database_url.to_string(),
             queue_name: queue_name.to_string(),
             paused: AtomicBool::new(false),
             retry_strategy: RetryStrategy::default(),
@@ -55,23 +100,37 @@ impl PostgresBroker {
     /// # Arguments
     /// * `database_url` - PostgreSQL connection string
     /// * `queue_name` - Logical queue name
-    /// * `max_connections` - Maximum number of connections in the pool
+    /// * `max_connections` - Maximum number of connections in the pool. Kept
+    ///   in the public signature for API compatibility, but unused now that
+    ///   the legacy `sqlx::PgPool` construction has been removed:
+    ///   `oxisql_postgres::PgConnection` wraps a single multiplexed
+    ///   `tokio_postgres::Client` (see the doc comment on
+    ///   `PostgresBroker::conn`), not a real connection pool, so there is
+    ///   no pool size to configure.
     /// * `acquire_timeout_secs` - Timeout for acquiring a connection (seconds)
     pub async fn with_pool_config(
         database_url: &str,
         queue_name: &str,
-        max_connections: u32,
+        _max_connections: u32,
         acquire_timeout_secs: u64,
     ) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
-            .connect(database_url)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
+        // See `with_queue` above for how the TLS mode is derived from
+        // `database_url`'s `sslmode` query parameter.
+        let tls_mode = tls_mode::pg_tls_mode_for_url(database_url)
+            .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {}", e)))?;
+        let conn = PgConnection::connect_with_timeout(
+            database_url,
+            tls_mode,
+            Duration::from_secs(acquire_timeout_secs),
+        )
+        .await
+        .map_err(|e| {
+            CelersError::Other(format!("Failed to connect to database (oxisql): {}", e))
+        })?;
 
         Ok(Self {
-            pool,
+            conn,
+            database_url: database_url.to_string(),
             queue_name: queue_name.to_string(),
             paused: AtomicBool::new(false),
             retry_strategy: RetryStrategy::default(),
@@ -211,22 +270,31 @@ impl PostgresBroker {
             }
         }
 
-        sqlx::query(
-            r#"
+        // Byte-for-byte identical SQL text to the pre-migration sqlx version.
+        // UUID -> uuid_param, JSON metadata -> json_param, everything else is
+        // an already-primitive ToSqlValue (String, Vec<u8>, i32). Mirrors
+        // `broker_trait.rs`'s `enqueue()`, this crate's proven pilot for this
+        // exact INSERT shape.
+        let task_id_param = uuid_param(&task_id);
+        let metadata_param = json_param(&db_metadata);
+        self.conn
+            .execute(
+                r#"
             INSERT INTO celers_tasks
                 (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
             VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW())
             "#,
-        )
-        .bind(task_id)
-        .bind(&task.metadata.name)
-        .bind(&task.payload)
-        .bind(task.metadata.priority)
-        .bind(task.metadata.max_retries as i32)
-        .bind(db_metadata)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to enqueue task with trace: {}", e)))?;
+                &[
+                    &task_id_param,
+                    &task.metadata.name,
+                    &task.payload,
+                    &task.metadata.priority,
+                    &(task.metadata.max_retries as i32),
+                    &metadata_param,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to enqueue task with trace: {}", e)))?;
 
         #[cfg(feature = "metrics")]
         {
@@ -276,20 +344,23 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn extract_trace_context(&self, task_id: &TaskId) -> Result<Option<TraceContext>> {
-        let row = sqlx::query(
-            r#"
+        let task_id_param = uuid_param(task_id);
+        let rows = self
+            .conn
+            .query(
+                r#"
             SELECT metadata
             FROM celers_tasks
             WHERE id = $1
             "#,
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to fetch task metadata: {}", e)))?;
+                &[&task_id_param],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to fetch task metadata: {}", e)))?;
 
-        if let Some(row) = row {
-            let metadata: serde_json::Value = row.get("metadata");
+        if let Some(row) = rows.into_iter().next() {
+            let metadata = json_from_row(&row, "metadata")
+                .map_err(|e| CelersError::Other(format!("Failed to read metadata: {}", e)))?;
             if let Some(trace_value) = metadata.get("trace_context") {
                 let trace_ctx: TraceContext =
                     serde_json::from_value(trace_value.clone()).map_err(|e| {
@@ -337,36 +408,68 @@ impl PostgresBroker {
     }
 
     /// Run database migrations
+    ///
+    /// Each migration file contains multiple `;`-separated DDL statements
+    /// (and, in `001_init.sql`'s case, a `plpgsql` function body with
+    /// internal semicolons of its own) in one string, so `execute_batch`
+    /// (simple-query protocol, `batch_execute` under the hood) is used
+    /// rather than `execute` (extended/prepared-statement protocol) —
+    /// `oxisql_postgres::Connection::execute`/`query` reject multi-statement
+    /// text, matching the same constraint the pre-migration
+    /// `sqlx::query(...).execute(...)` call relied on sqlx's own
+    /// simple-query fallback for. Mirrors `celers-backend-db`'s migration
+    /// runner, the proven pattern for this exact situation.
     pub async fn migrate(&self) -> Result<()> {
         // Run initial schema migration
         let init_sql = include_str!("../migrations/001_init.sql");
-        sqlx::query(init_sql)
-            .execute(&self.pool)
+        self.conn
+            .execute_batch(init_sql)
             .await
             .map_err(|e| CelersError::Other(format!("Migration 001_init failed: {}", e)))?;
 
         // Run results table migration
         let results_sql = include_str!("../migrations/002_results.sql");
-        sqlx::query(results_sql)
-            .execute(&self.pool)
+        self.conn
+            .execute_batch(results_sql)
             .await
             .map_err(|e| CelersError::Other(format!("Migration 002_results failed: {}", e)))?;
 
         // Run deduplication table migration
         let dedup_sql = include_str!("../migrations/004_deduplication.sql");
-        sqlx::query(dedup_sql)
-            .execute(&self.pool)
+        self.conn.execute_batch(dedup_sql).await.map_err(|e| {
+            CelersError::Other(format!("Migration 004_deduplication failed: {}", e))
+        })?;
+
+        // Run snapshots table migration
+        let snapshots_sql = include_str!("../migrations/005_snapshots.sql");
+        self.conn
+            .execute_batch(snapshots_sql)
+            .await
+            .map_err(|e| CelersError::Other(format!("Migration 005_snapshots failed: {}", e)))?;
+
+        // Run deduplication schema reconciliation migration
+        let dedup_columns_sql = include_str!("../migrations/006_deduplication_columns.sql");
+        self.conn
+            .execute_batch(dedup_columns_sql)
             .await
             .map_err(|e| {
-                CelersError::Other(format!("Migration 004_deduplication failed: {}", e))
+                CelersError::Other(format!("Migration 006_deduplication_columns failed: {}", e))
             })?;
 
         Ok(())
     }
 
-    /// Get the underlying connection pool
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// Get the underlying OxiSQL connection used by the migrated
+    /// task-delivery hot path.
+    ///
+    /// Renamed from the previous `pool()` getter (which returned
+    /// `&sqlx::PgPool`) as part of the sqlx→oxisql migration — this is a
+    /// breaking change for any external caller of the old name. No callers
+    /// of `.pool()` on `PostgresBroker` were found anywhere else in the
+    /// `celers` workspace (grepped `crates/**/*.rs` for `.pool()`), so no
+    /// other crate needed updating.
+    pub fn connection(&self) -> &PgConnection {
+        &self.conn
     }
 
     /// Get the queue name
@@ -375,10 +478,16 @@ impl PostgresBroker {
     }
 
     /// Move a task to the Dead Letter Queue
+    ///
+    /// Same trivial stored-function-call translation pattern as
+    /// `celers-broker-sql`'s `MysqlBroker::move_to_dlq` (`CALL
+    /// move_to_dlq(?)`): a plain `execute` with one bound `Uuid` parameter,
+    /// here calling the Postgres `SELECT move_to_dlq($1)` function form
+    /// (defined in `migrations/001_init.sql`) rather than MySQL's `CALL`.
     pub(crate) async fn move_to_dlq(&self, task_id: &TaskId) -> Result<()> {
-        sqlx::query("SELECT move_to_dlq($1)")
-            .bind(task_id)
-            .execute(&self.pool)
+        let task_id_param = uuid_param(task_id);
+        self.conn
+            .execute("SELECT move_to_dlq($1)", &[&task_id_param])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to move task to DLQ: {}", e)))?;
 

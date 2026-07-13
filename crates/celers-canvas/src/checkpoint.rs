@@ -28,7 +28,7 @@ impl WorkflowCheckpoint {
             workflow_id,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs(),
             completed_tasks: Vec::new(),
             failed_tasks: Vec::new(),
@@ -153,7 +153,7 @@ impl WorkflowRecoveryPolicy {
         if let Some(max_age) = self.max_checkpoint_age {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_secs();
             let age = now.saturating_sub(checkpoint.timestamp);
             age <= max_age
@@ -301,7 +301,7 @@ impl VersionedWorkflowState {
         // Record migration
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
         self.migration_history
             .push((self.version, target, timestamp));

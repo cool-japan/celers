@@ -40,15 +40,23 @@
 use std::sync::Arc;
 
 pub mod alert;
+pub mod calendar;
+pub mod catchup;
 pub mod config;
+pub mod conflict;
+pub mod dispatch_lock;
 pub mod heartbeat;
 pub mod history;
+pub mod jitter;
 pub mod lock;
+pub mod registry;
 pub mod schedule;
 pub mod schedule_ext;
 pub mod scheduler;
 pub mod scheduler_ext;
 pub mod task;
+#[cfg(feature = "cron")]
+pub mod timezone_schedule;
 pub mod wfq;
 
 #[cfg(test)]
@@ -56,10 +64,25 @@ mod tests;
 
 // Re-export main types
 pub use alert::*;
+pub use calendar::{date_of, CalendarHoliday, WorkingCalendar};
+// `catchup::CatchupPolicy` deliberately shadows nothing: the long-standing
+// `history::CatchupPolicy` (interval-tick replay) keeps the crate-root name, so
+// the occurrence-list policy here is reached as `catchup::CatchupPolicy`. The
+// remaining catch-up helpers carry unique names and are re-exported directly.
+pub use catchup::{
+    catch_up, compute_missed, compute_missed_occurrences, MissedOccurrences, MAX_MISSED_OCCURRENCES,
+};
 pub use config::*;
+pub use conflict::{
+    detect_named_schedule_conflicts, detect_schedule_conflicts, enumerate_next_occurrences,
+    enumerate_occurrences_in_window, has_schedule_conflicts, OccurrenceConflict,
+};
+pub use dispatch_lock::{dispatch_lock_key, DEFAULT_DISPATCH_LOCK_TTL_SECS};
 pub use heartbeat::{BeatHeartbeat, BeatRole, HeartbeatConfig, HeartbeatInfo, HeartbeatStats};
 pub use history::*;
+pub use jitter::{apply_jitter, bounded_jitter_offset};
 pub use lock::*;
+pub use registry::{AddOutcome, ScheduleRegistry};
 pub use schedule::*;
 pub use schedule_ext::*;
 pub use scheduler::*;

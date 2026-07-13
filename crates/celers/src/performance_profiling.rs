@@ -57,7 +57,7 @@ impl PerformanceProfiler {
         let name = name.into();
         self.active_spans
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push((name, Instant::now()));
     }
 
