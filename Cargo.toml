@@ -61,9 +61,9 @@ redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager", "ai
 # Cargo feature unification turns the impls on for every crate in the build
 # graph that references `oxisql_core::Row`/`FromValue`, including
 # oxisql-postgres/oxisql-mysql row decoding.
-oxisql-core = { version = "0.3.2", features = ["chrono"] }
-oxisql-postgres = "0.3.2"
-oxisql-mysql = "0.3.2"
+oxisql-core = { version = "0.3.3", features = ["chrono"] }
+oxisql-postgres = "0.3.3"
+oxisql-mysql = "0.3.3"
 # Pure-Rust TLS facade (rustls + rustls-rustcrypto, no ring/aws-lc/openssl).
 # Depended on with the exact same feature set oxisql-postgres itself uses
 # internally (see its Cargo.toml), so the `Arc<rustls::ClientConfig>`
