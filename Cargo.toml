@@ -79,7 +79,7 @@ oxitls = { version = "0.3.0", default-features = false, features = ["pure", "web
 # `CryptoProvider`).
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 lapin = "4.10.0"
-oxihttp-client = { version = "0.2.0", features = ["tls"] }
+oxihttp-client = { version = "0.2.1", features = ["tls"] }
 http = "1.4.2"
 
 # AWS SDK
