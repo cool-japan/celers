@@ -69,7 +69,7 @@ oxisql-mysql = "0.4.0"
 # internally (see its Cargo.toml), so the `Arc<rustls::ClientConfig>`
 # produced by `oxitls::client_config` is guaranteed compatible with
 # `oxisql_postgres::TlsMode::Rustls` / `oxisql_mysql::TlsMode::Rustls`.
-oxitls = { version = "0.2.1", default-features = false, features = ["pure", "webpki-roots"] }
+oxitls = { version = "0.3.0", default-features = false, features = ["pure", "webpki-roots"] }
 # Named directly (not just pulled in transitively via oxitls/oxisql-*) so
 # `celers-cli`'s `tls_mode.rs` can name `rustls::ClientConfig` in its public
 # API. Same version/feature pin as oxitls/oxisql's own Cargo.toml
