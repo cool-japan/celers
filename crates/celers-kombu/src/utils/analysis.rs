@@ -37,9 +37,16 @@ pub fn suggest_connection_pool_size(
         .clamp(1, 5)
         .min(max_allowed_connections);
 
-    // Maximum connections: 150% of peak to handle bursts
-    let recommended_max = ((peak_concurrent_requests as f64 * 1.5).ceil() as usize)
-        .clamp(min_connections + 1, max_allowed_connections);
+    // Maximum connections: 150% of peak to handle bursts, but never above
+    // `max_allowed_connections` and never below `min_connections`. Built
+    // from `.max()`/`.min()` rather than `usize::clamp` (which panics if
+    // its low bound exceeds its high bound): when `max_allowed_connections`
+    // is small (e.g. 1, a perfectly legitimate cap for an embedded or test
+    // broker), `min_connections + 1` can exceed it, which is not itself an
+    // error condition.
+    let hi = max_allowed_connections.max(min_connections);
+    let lo = (min_connections + 1).min(hi);
+    let recommended_max = ((peak_concurrent_requests as f64 * 1.5).ceil() as usize).clamp(lo, hi);
 
     // Initial/recommended: average + 20% buffer
     let recommended_initial = ((avg_concurrent_requests as f64 * 1.2).ceil() as usize)
@@ -302,24 +309,33 @@ pub fn forecast_queue_capacity_ml(
     let future_x = (historical_sizes.len() - 1) as f64 + forecast_hours as f64;
     let forecast = (y_mean + slope * (future_x - x_mean)).max(0.0) as usize;
 
-    // Calculate confidence based on data variance
+    // Calculate confidence based on data variance. Uses `.enumerate()` so
+    // the x-coordinate paired with each sample is its actual position in
+    // the series -- looking it up by value (the previous approach) found
+    // the *first* index matching that value, which silently mis-scored
+    // every repeated size (e.g. a queue idling at a plateau, `[100, 100,
+    // 200]`) against the wrong point on the trend line.
     let variance: f64 = historical_sizes
         .iter()
-        .map(|&s| {
-            let predicted = y_mean
-                + slope
-                    * (historical_sizes
-                        .iter()
-                        .position(|&x| x == s)
-                        .expect("s came from this iterator") as f64
-                        - x_mean);
+        .enumerate()
+        .map(|(i, &s)| {
+            let predicted = y_mean + slope * (i as f64 - x_mean);
             (s as f64 - predicted).powi(2)
         })
         .sum::<f64>()
         / n;
 
     let std_dev = variance.sqrt();
-    let coefficient_of_variation = std_dev / y_mean;
+    let coefficient_of_variation = if y_mean > 0.0 {
+        std_dev / y_mean
+    } else {
+        // All samples are 0 (or otherwise average to 0): nothing to
+        // normalize the deviation by. Such a series has zero variance
+        // too, so treat it as maximally confident rather than dividing by
+        // zero into NaN -- which previously compared `false` against
+        // both thresholds below and silently fell through to "low".
+        0.0
+    };
 
     let confidence = if coefficient_of_variation < 0.1 {
         "high"
@@ -469,16 +485,30 @@ pub fn calculate_multi_queue_efficiency(
         0.0
     };
 
-    // Load balance score: how evenly distributed the drain times are
-    let avg_drain_time = drain_times.iter().filter(|t| t.is_finite()).sum::<f64>()
-        / drain_times.iter().filter(|t| t.is_finite()).count() as f64;
-
-    let variance = drain_times
+    // Load balance score: how evenly distributed the drain times are.
+    // Collected once so the mean, variance, and count all agree with each
+    // other -- and so an all-zero-rate input (every drain time infinite)
+    // is caught explicitly instead of dividing 0.0 by a 0 count into NaN,
+    // which used to propagate all the way through to `load_balance_score`
+    // and violate the function's own documented `0.0..=1.0` contract.
+    let finite_drain_times: Vec<f64> = drain_times
         .iter()
+        .copied()
         .filter(|t| t.is_finite())
+        .collect();
+
+    if finite_drain_times.is_empty() {
+        return (0.0, 0.0, "no_active_queues");
+    }
+
+    let finite_count = finite_drain_times.len() as f64;
+    let avg_drain_time = finite_drain_times.iter().sum::<f64>() / finite_count;
+
+    let variance = finite_drain_times
+        .iter()
         .map(|&t| (t - avg_drain_time).powi(2))
         .sum::<f64>()
-        / drain_times.iter().filter(|t| t.is_finite()).count() as f64;
+        / finite_count;
 
     let coefficient_of_variation = if avg_drain_time > 0.0 {
         variance.sqrt() / avg_drain_time
@@ -976,4 +1006,105 @@ pub fn calculate_queue_utilization_efficiency(
     };
 
     (size_util, efficiency_score, recommendation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- suggest_connection_pool_size -------------------------------------
+
+    #[test]
+    fn connection_pool_size_does_not_panic_with_a_tiny_max_allowed() {
+        // Regression test: `max_allowed_connections == 1` used to make the
+        // internal `usize::clamp(min_connections + 1, max_allowed_connections)`
+        // call panic with "assertion failed: min <= max" (clamp(2, 1)).
+        let (min, max, initial) = suggest_connection_pool_size(10, 10, 1);
+        assert!(min <= max);
+        assert!(max <= 1);
+        assert!(initial >= min && initial <= max);
+    }
+
+    #[test]
+    fn connection_pool_size_never_panics_across_a_range_of_small_caps() {
+        for max_allowed in 0..=8usize {
+            for peak in [0, 1, 5, 50] {
+                for avg in [0, 1, 5, 50] {
+                    let (min, max, initial) = suggest_connection_pool_size(peak, avg, max_allowed);
+                    assert!(
+                        min <= max,
+                        "min({min}) > max({max}) for max_allowed={max_allowed}"
+                    );
+                    assert!(max <= max_allowed.max(min));
+                    assert!(initial >= min && initial <= max);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn connection_pool_size_respects_max_allowed_limit() {
+        let (_, max, _) = suggest_connection_pool_size(200, 150, 100);
+        assert_eq!(max, 100);
+    }
+
+    // --- forecast_queue_capacity_ml -----------------------------------------
+
+    #[test]
+    fn forecast_handles_repeated_sizes_without_index_corruption() {
+        // Previously, the second `100` was scored against the trend line's
+        // predicted value at x=0 (the first index a value of 100 appears
+        // at) instead of its real position x=1, corrupting the variance
+        // used to compute `confidence`.
+        let (forecast, slope, confidence) = forecast_queue_capacity_ml(&[100, 100, 200], 5);
+        assert!(slope > 0.0);
+        assert!(forecast > 200);
+        assert_eq!(confidence, "medium");
+    }
+
+    #[test]
+    fn forecast_all_zero_series_reports_high_confidence_not_nan() {
+        let (forecast, slope, confidence) = forecast_queue_capacity_ml(&[0, 0, 0], 5);
+        assert_eq!(forecast, 0);
+        assert_eq!(slope, 0.0);
+        assert_eq!(confidence, "high");
+        assert!(!slope.is_nan());
+    }
+
+    // --- calculate_multi_queue_efficiency -----------------------------------
+
+    #[test]
+    fn multi_queue_efficiency_handles_all_zero_rates_without_nan() {
+        let sizes = vec![10, 20, 30];
+        let rates: Vec<u64> = vec![0, 0, 0];
+        let (efficiency, balance, recommendation) =
+            calculate_multi_queue_efficiency(&sizes, &rates);
+        assert_eq!(efficiency, 0.0);
+        assert_eq!(balance, 0.0);
+        assert_eq!(recommendation, "no_active_queues");
+        assert!(!efficiency.is_nan());
+        assert!(!balance.is_nan());
+    }
+
+    #[test]
+    fn multi_queue_efficiency_normal_case_stays_in_bounds() {
+        let sizes = vec![100, 150, 120];
+        let rates: Vec<u64> = vec![10, 12, 11];
+        let (efficiency, balance, _) = calculate_multi_queue_efficiency(&sizes, &rates);
+        assert!((0.0..=1.0).contains(&efficiency));
+        assert!((0.0..=1.0).contains(&balance));
+    }
+
+    #[test]
+    fn multi_queue_efficiency_mixed_zero_and_nonzero_rates() {
+        // One queue with rate 0 (infinite drain time) alongside active
+        // queues must not poison the average/variance for the active ones.
+        let sizes = vec![100, 100];
+        let rates: Vec<u64> = vec![0, 10];
+        let (efficiency, balance, recommendation) =
+            calculate_multi_queue_efficiency(&sizes, &rates);
+        assert!(!efficiency.is_nan());
+        assert!(!balance.is_nan());
+        assert_ne!(recommendation, "no_active_queues");
+    }
 }

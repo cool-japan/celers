@@ -1,9 +1,3 @@
-#![allow(
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::missing_fields_in_debug
-)]
-#![allow(clippy::cast_precision_loss)]
 //! `AsyncResult` API for querying task results
 //!
 //! This module provides a Celery-compatible interface for retrieving task results,
@@ -295,6 +289,74 @@ impl TaskResultValue {
     }
 }
 
+/// Polling behaviour for [`AsyncResult::get`] and friends.
+///
+/// The old fixed 100 ms poll was not configurable and applied per child in
+/// `collect_children`, so a large group hammered the backend. Backing off
+/// between polls keeps a long wait cheap while staying responsive for the
+/// common case of a result that lands quickly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncResultConfig {
+    /// Interval before the first re-poll.
+    pub initial_poll_interval: Duration,
+    /// Upper bound the interval backs off to.
+    pub max_poll_interval: Duration,
+    /// Whether a tombstoned (explicitly forgotten) result ends the wait with an
+    /// error instead of polling forever.
+    pub fail_on_tombstone: bool,
+}
+
+impl Default for AsyncResultConfig {
+    fn default() -> Self {
+        Self {
+            initial_poll_interval: Duration::from_millis(100),
+            max_poll_interval: Duration::from_secs(2),
+            fail_on_tombstone: true,
+        }
+    }
+}
+
+impl AsyncResultConfig {
+    /// Create a configuration with a fixed poll interval (no backoff).
+    #[must_use]
+    pub const fn fixed(interval: Duration) -> Self {
+        Self {
+            initial_poll_interval: interval,
+            max_poll_interval: interval,
+            fail_on_tombstone: true,
+        }
+    }
+
+    /// Set the initial poll interval.
+    #[must_use]
+    pub const fn with_initial_poll_interval(mut self, interval: Duration) -> Self {
+        self.initial_poll_interval = interval;
+        self
+    }
+
+    /// Set the maximum poll interval.
+    #[must_use]
+    pub const fn with_max_poll_interval(mut self, interval: Duration) -> Self {
+        self.max_poll_interval = interval;
+        self
+    }
+
+    /// Set whether a tombstoned result ends the wait with an error.
+    #[must_use]
+    pub const fn with_fail_on_tombstone(mut self, fail: bool) -> Self {
+        self.fail_on_tombstone = fail;
+        self
+    }
+
+    /// The interval to use after `attempt` polls (exponential, capped).
+    fn interval_for(&self, attempt: u32) -> Duration {
+        let initial = self.initial_poll_interval.max(Duration::from_millis(1));
+        let max = self.max_poll_interval.max(initial);
+        let factor = 1u32.checked_shl(attempt.min(16)).unwrap_or(u32::MAX);
+        initial.saturating_mul(factor).min(max)
+    }
+}
+
 /// `AsyncResult` handle for querying task results (Celery-compatible API)
 #[derive(Clone)]
 pub struct AsyncResult<S: ResultStore> {
@@ -309,6 +371,9 @@ pub struct AsyncResult<S: ResultStore> {
 
     /// Child results (for group/chord tasks)
     children: Vec<AsyncResult<S>>,
+
+    /// Polling behaviour for the blocking accessors
+    config: AsyncResultConfig,
 }
 
 impl<S: ResultStore + Clone> AsyncResult<S> {
@@ -319,7 +384,22 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
             store,
             parent: None,
             children: Vec::new(),
+            config: AsyncResultConfig::default(),
         }
+    }
+
+    /// Override the polling behaviour used by [`Self::get`] and [`Self::wait`].
+    #[must_use]
+    pub fn with_config(mut self, config: AsyncResultConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The active polling configuration.
+    #[inline]
+    #[must_use]
+    pub const fn config(&self) -> &AsyncResultConfig {
+        &self.config
     }
 
     /// Create an `AsyncResult` with a parent
@@ -329,6 +409,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
             store,
             parent: Some(Box::new(parent)),
             children: Vec::new(),
+            config: AsyncResultConfig::default(),
         }
     }
 
@@ -339,6 +420,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
             store,
             parent: None,
             children,
+            config: AsyncResultConfig::default(),
         }
     }
 
@@ -431,12 +513,24 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
     /// * `timeout` - Optional timeout duration. If None, waits indefinitely.
     ///
     /// # Returns
-    /// * `Ok(Some(Value))` - Task succeeded with result
-    /// * `Ok(None)` - Task completed but has no result
-    /// * `Err(_)` - Task failed or timeout occurred
+    /// * `Ok(Some(Value))` - Task succeeded with a result
+    /// * `Ok(None)` - Task succeeded with no result (a stored JSON `null`)
+    /// * `Err(_)` - Task failed, was revoked/rejected, was forgotten, or the
+    ///   timeout expired
+    ///
+    /// When the backend reports no result, [`ResultStore::result_existence`] is
+    /// consulted: a *tombstoned* result (one that was explicitly forgotten or
+    /// aged out) ends the wait with an error rather than polling forever, which
+    /// is exactly what the tri-state tombstone machinery exists for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::CelersError::Timeout`] when `timeout` expires,
+    /// [`crate::CelersError::TaskExecution`] for a failed, rejected or forgotten
+    /// task, and [`crate::CelersError::TaskRevoked`] for a revoked one.
     pub async fn get(&self, timeout: Option<Duration>) -> crate::Result<Option<Value>> {
         let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(100);
+        let mut attempt = 0u32;
 
         loop {
             // Check if timeout expired
@@ -452,6 +546,10 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
             // Get current result
             if let Some(result) = self.store.get_result(self.task_id).await? {
                 match result {
+                    // A successful task that produced nothing is stored as
+                    // `Success(Value::Null)`; surface that as `Ok(None)` so the
+                    // documented "no result" case is actually reachable.
+                    TaskResultValue::Success(Value::Null) => return Ok(None),
                     TaskResultValue::Success(value) => return Ok(Some(value)),
                     TaskResultValue::Failure { error, traceback } => {
                         let msg = if let Some(tb) = traceback {
@@ -472,12 +570,27 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
                     // Task not ready yet, continue polling
                     _ => {}
                 }
-            } else {
-                // Result not yet available
+            } else if self.config.fail_on_tombstone {
+                // Distinguish "not ready yet" from "the result is gone". Without
+                // this the loop polled forever for a forgotten or TTL-expired
+                // result.
+                if let crate::result_tombstone::ResultExistence::Tombstoned(tombstone) =
+                    self.store.result_existence(self.task_id).await?
+                {
+                    let reason = tombstone
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "result was forgotten".to_string());
+                    return Err(crate::CelersError::TaskExecution(format!(
+                        "Task {} has no result: {reason}",
+                        self.task_id
+                    )));
+                }
             }
 
-            // Wait before next poll
-            tokio::time::sleep(poll_interval).await;
+            // Wait before next poll, backing off up to the configured ceiling.
+            tokio::time::sleep(self.config.interval_for(attempt)).await;
+            attempt = attempt.saturating_add(1);
         }
     }
 
@@ -627,15 +740,18 @@ impl ResultMetadata {
         self
     }
 
-    ///
-    /// # Panics
-    ///
-    /// Panics if the TTL duration cannot be converted to a chrono duration.
     /// Set TTL (time to live)
+    ///
+    /// A TTL too large for `chrono::Duration` (more than `i64::MAX`
+    /// milliseconds) is clamped to `chrono::Duration::MAX` rather than
+    /// panicking; such a value is reachable from a deserialized configuration.
     #[must_use]
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        let delta = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX);
         self.expires_at = Some(
-            Utc::now() + chrono::Duration::from_std(ttl).expect("TTL duration should be valid"),
+            Utc::now()
+                .checked_add_signed(delta)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
         );
         self
     }
@@ -743,10 +859,44 @@ impl ResultChunk {
     }
 
     /// Check if this is the last chunk
+    ///
+    /// Total-safe: a chunk carrying `total == 0` (which a deserialized payload
+    /// can, and which `ResultChunker::chunk` produces for empty data) used to
+    /// underflow here — a panic in debug and a `usize::MAX` comparison in
+    /// release.
     #[inline]
     #[must_use]
     pub const fn is_last(&self) -> bool {
-        self.index == self.total - 1
+        self.total > 0 && self.index + 1 == self.total
+    }
+
+    /// Compute the checksum of this chunk's payload.
+    ///
+    /// SHA-256, hex encoded, using the crate's own pure-Rust implementation.
+    #[must_use]
+    pub fn compute_checksum(data: &[u8]) -> String {
+        crate::task_signature::to_hex(&crate::task_signature::Sha256::digest(data))
+    }
+
+    /// Attach a checksum computed from this chunk's own data.
+    #[must_use]
+    pub fn with_computed_checksum(mut self) -> Self {
+        self.checksum = Some(Self::compute_checksum(&self.data));
+        self
+    }
+
+    /// Verify the chunk against its recorded checksum.
+    ///
+    /// Returns `true` when no checksum is recorded (nothing to verify).
+    #[must_use]
+    pub fn verify_checksum(&self) -> bool {
+        match &self.checksum {
+            Some(expected) => {
+                let actual = Self::compute_checksum(&self.data);
+                crate::task_signature::constant_time_eq(actual.as_bytes(), expected.as_bytes())
+            }
+            None => true,
+        }
     }
 }
 
@@ -830,20 +980,16 @@ pub trait ExtendedResultStore: ResultStore {
     /// Get all chunks for a task
     async fn get_all_chunks(&self, task_id: TaskId) -> crate::Result<Vec<ResultChunk>>;
 
-    /// Store a tombstone
-    async fn store_tombstone(&self, tombstone: ResultTombstone) -> crate::Result<()>;
-
-    /// Get a tombstone
-    async fn get_tombstone(&self, task_id: TaskId) -> crate::Result<Option<ResultTombstone>>;
-
-    /// Check if a task has a tombstone
-    async fn has_tombstone(&self, task_id: TaskId) -> crate::Result<bool> {
-        // Disambiguate from the `ResultStore::get_tombstone` default method,
-        // which is also in scope because `ExtendedResultStore: ResultStore`.
-        Ok(ExtendedResultStore::get_tombstone(self, task_id)
-            .await?
-            .is_some())
-    }
+    // Tombstones are NOT redeclared here.
+    //
+    // `store_tombstone` / `get_tombstone` / `has_tombstone` used to be required
+    // methods on this trait as well as defaulted methods on `ResultStore`. A
+    // subtrait cannot override a supertrait's default, so an implementor
+    // satisfied `ExtendedResultStore` while `ResultStore::get_tombstone` kept
+    // returning `Ok(None)` — and `ResultStore::result_existence` therefore
+    // reported `Absent` for a task whose tombstone the backend was demonstrably
+    // holding. Backends now override the `ResultStore` methods directly, which
+    // is what makes the tri-state resolution correct.
 
     /// Cleanup expired results
     async fn cleanup_expired(&self) -> crate::Result<usize>;
@@ -852,16 +998,101 @@ pub trait ExtendedResultStore: ResultStore {
     async fn query_by_tags(&self, tags: &[String]) -> crate::Result<Vec<TaskId>>;
 }
 
+/// A pluggable compression codec.
+///
+/// Implementations live wherever the codec's dependency lives: a backend crate
+/// can register a deflate or zstd codec and every `ResultCompressor` built with
+/// it then works, instead of the compressor being a type whose only two methods
+/// always fail.
+pub trait CompressionCodec: Send + Sync + std::fmt::Debug {
+    /// Name this codec answers to (e.g. `"zstd"`, `"deflate"`).
+    fn name(&self) -> &str;
+
+    /// Compress `data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the codec cannot process the input.
+    fn compress(&self, data: &[u8]) -> crate::Result<Vec<u8>>;
+
+    /// Decompress `data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not valid for this codec.
+    fn decompress(&self, data: &[u8]) -> crate::Result<Vec<u8>>;
+}
+
+/// The identity codec: stores payloads verbatim under the name `"none"`.
+///
+/// Always available, so a `ResultCompressor` is never a type whose operations
+/// unconditionally fail. It is what `compression_algorithm: "none"` means on
+/// the wire.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IdentityCodec;
+
+impl CompressionCodec for IdentityCodec {
+    fn name(&self) -> &str {
+        "none"
+    }
+
+    fn compress(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
+        Ok(data.to_vec())
+    }
+
+    fn decompress(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
+        Ok(data.to_vec())
+    }
+}
+
 /// Compression helper for result values
+///
+/// Holds a registry of [`CompressionCodec`]s keyed by algorithm name. The
+/// identity codec (`"none"`) is always registered; backends add real codecs with
+/// [`ResultCompressor::with_codec`].
+#[derive(Debug, Clone)]
 pub struct ResultCompressor {
     threshold_bytes: usize,
+    codecs: std::collections::HashMap<String, std::sync::Arc<dyn CompressionCodec>>,
 }
 
 impl ResultCompressor {
     /// Create a new compressor with threshold
     #[must_use]
     pub fn new(threshold_bytes: usize) -> Self {
-        Self { threshold_bytes }
+        let mut codecs: std::collections::HashMap<String, std::sync::Arc<dyn CompressionCodec>> =
+            std::collections::HashMap::new();
+        codecs.insert("none".to_string(), std::sync::Arc::new(IdentityCodec));
+        Self {
+            threshold_bytes,
+            codecs,
+        }
+    }
+
+    /// Register a codec, replacing any codec already registered under its name.
+    #[must_use]
+    pub fn with_codec(mut self, codec: std::sync::Arc<dyn CompressionCodec>) -> Self {
+        self.codecs.insert(codec.name().to_string(), codec);
+        self
+    }
+
+    /// Register a codec on an existing compressor.
+    pub fn register_codec(&mut self, codec: std::sync::Arc<dyn CompressionCodec>) {
+        self.codecs.insert(codec.name().to_string(), codec);
+    }
+
+    /// Names of the registered algorithms, sorted.
+    #[must_use]
+    pub fn algorithms(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.codecs.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Whether an algorithm is available.
+    #[must_use]
+    pub fn supports(&self, algorithm: &str) -> bool {
+        self.codecs.contains_key(algorithm)
     }
 
     /// Check if value should be compressed
@@ -870,24 +1101,34 @@ impl ResultCompressor {
         data.len() >= self.threshold_bytes
     }
 
-    /// Compress data (to be implemented by backend-specific compressors)
-    ///
-    /// Note: Actual compression implementations are provided by backend crates
-    /// (e.g., celers-backend-redis) which have the compression dependencies.
-    pub fn compress(&self, _data: &[u8], _algorithm: &str) -> crate::Result<Vec<u8>> {
-        Err(crate::CelersError::Other(
-            "Compression not available - use backend-specific implementation".to_string(),
-        ))
+    /// Look up a codec by name.
+    fn codec(&self, algorithm: &str) -> crate::Result<&std::sync::Arc<dyn CompressionCodec>> {
+        self.codecs.get(algorithm).ok_or_else(|| {
+            crate::CelersError::Configuration(format!(
+                "unsupported compression algorithm '{algorithm}'; registered: {}",
+                self.algorithms().join(", ")
+            ))
+        })
     }
 
-    /// Decompress data (to be implemented by backend-specific compressors)
+    /// Compress data with the named algorithm.
     ///
-    /// Note: Actual decompression implementations are provided by backend crates
-    /// (e.g., celers-backend-redis) which have the compression dependencies.
-    pub fn decompress(&self, _data: &[u8], _algorithm: &str) -> crate::Result<Vec<u8>> {
-        Err(crate::CelersError::Other(
-            "Decompression not available - use backend-specific implementation".to_string(),
-        ))
+    /// # Errors
+    ///
+    /// Returns [`crate::CelersError::Configuration`] if no codec is registered
+    /// under `algorithm`, or the codec's own error if compression fails.
+    pub fn compress(&self, data: &[u8], algorithm: &str) -> crate::Result<Vec<u8>> {
+        self.codec(algorithm)?.compress(data)
+    }
+
+    /// Decompress data with the named algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::CelersError::Configuration`] if no codec is registered
+    /// under `algorithm`, or the codec's own error if decompression fails.
+    pub fn decompress(&self, data: &[u8], algorithm: &str) -> crate::Result<Vec<u8>> {
+        self.codec(algorithm)?.decompress(data)
     }
 }
 
@@ -909,25 +1150,36 @@ impl ResultChunker {
         Self { chunk_size }
     }
 
-    /// Split data into chunks
+    /// Split data into chunks, attaching an integrity checksum to each.
     #[must_use]
     pub fn chunk(&self, data: &[u8]) -> Vec<ResultChunk> {
-        let total = data.len().div_ceil(self.chunk_size);
+        let total = data.len().div_ceil(self.chunk_size.max(1));
 
-        data.chunks(self.chunk_size)
+        data.chunks(self.chunk_size.max(1))
             .enumerate()
-            .map(|(index, chunk)| ResultChunk::new(index, total, chunk.to_vec()))
+            .map(|(index, chunk)| {
+                ResultChunk::new(index, total, chunk.to_vec()).with_computed_checksum()
+            })
             .collect()
     }
 
     /// Reassemble chunks into original data
+    ///
+    /// Every chunk must agree on `total`, appear at its declared index, and —
+    /// when it carries one — match its checksum. Without those checks a
+    /// corrupted or substituted chunk reassembled silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the chunk set is incomplete, disagrees about the
+    /// total, is out of order, or fails checksum verification.
     pub fn reassemble(&self, chunks: &[ResultChunk]) -> crate::Result<Vec<u8>> {
-        if chunks.is_empty() {
+        let Some(first) = chunks.first() else {
             return Ok(Vec::new());
-        }
+        };
 
         // Verify chunks are complete and in order
-        let total = chunks[0].total;
+        let total = first.total;
         if chunks.len() != total {
             return Err(crate::CelersError::Other(format!(
                 "Incomplete chunks: expected {}, got {}",
@@ -938,10 +1190,21 @@ impl ResultChunker {
 
         let mut result = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
+            if chunk.total != total {
+                return Err(crate::CelersError::Other(format!(
+                    "Inconsistent chunk total at index {i}: expected {total}, got {}",
+                    chunk.total
+                )));
+            }
             if chunk.index != i {
                 return Err(crate::CelersError::Other(format!(
                     "Chunk out of order: expected index {}, got {}",
                     i, chunk.index
+                )));
+            }
+            if !chunk.verify_checksum() {
+                return Err(crate::CelersError::Other(format!(
+                    "Chunk {i} failed checksum verification"
                 )));
             }
             result.extend_from_slice(&chunk.data);
@@ -1201,5 +1464,343 @@ mod tests {
 
         assert_eq!(parent.children().len(), 1);
         assert_eq!(parent.children()[0].task_id(), child_id);
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// A backend that supports tombstones by overriding the `ResultStore`
+    /// methods, plus the whole of `ExtendedResultStore`.
+    #[derive(Clone, Default)]
+    struct TombstoneBackend {
+        results: Arc<Mutex<HashMap<TaskId, TaskResultValue>>>,
+        tombstones: Arc<Mutex<HashMap<TaskId, ResultTombstone>>>,
+    }
+
+    #[async_trait]
+    impl ResultStore for TombstoneBackend {
+        async fn store_result(
+            &self,
+            task_id: TaskId,
+            result: TaskResultValue,
+        ) -> crate::Result<()> {
+            self.results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(task_id, result);
+            Ok(())
+        }
+
+        async fn get_result(&self, task_id: TaskId) -> crate::Result<Option<TaskResultValue>> {
+            Ok(self
+                .results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&task_id)
+                .cloned())
+        }
+
+        async fn get_state(&self, _task_id: TaskId) -> crate::Result<TaskState> {
+            Ok(TaskState::Pending)
+        }
+
+        async fn forget(&self, task_id: TaskId) -> crate::Result<()> {
+            self.results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&task_id);
+            Ok(())
+        }
+
+        async fn has_result(&self, task_id: TaskId) -> crate::Result<bool> {
+            Ok(self
+                .results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&task_id))
+        }
+
+        async fn store_tombstone(&self, tombstone: ResultTombstone) -> crate::Result<()> {
+            self.tombstones
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(tombstone.task_id, tombstone);
+            Ok(())
+        }
+
+        async fn get_tombstone(&self, task_id: TaskId) -> crate::Result<Option<ResultTombstone>> {
+            Ok(self
+                .tombstones
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&task_id)
+                .cloned())
+        }
+    }
+
+    #[async_trait]
+    impl ExtendedResultStore for TombstoneBackend {
+        async fn store_result_with_metadata(
+            &self,
+            task_id: TaskId,
+            result: TaskResultValue,
+            _metadata: ResultMetadata,
+        ) -> crate::Result<()> {
+            self.store_result(task_id, result).await
+        }
+
+        async fn get_metadata(&self, _task_id: TaskId) -> crate::Result<Option<ResultMetadata>> {
+            Ok(None)
+        }
+
+        async fn store_chunk(&self, _task_id: TaskId, _chunk: ResultChunk) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn get_chunk(
+            &self,
+            _task_id: TaskId,
+            _index: usize,
+        ) -> crate::Result<Option<ResultChunk>> {
+            Ok(None)
+        }
+
+        async fn get_all_chunks(&self, _task_id: TaskId) -> crate::Result<Vec<ResultChunk>> {
+            Ok(Vec::new())
+        }
+
+        async fn cleanup_expired(&self) -> crate::Result<usize> {
+            Ok(0)
+        }
+
+        async fn query_by_tags(&self, _tags: &[String]) -> crate::Result<Vec<TaskId>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Regression: `ExtendedResultStore` redeclared `get_tombstone`, which a
+    /// subtrait cannot use to override the supertrait default, so
+    /// `ResultStore::result_existence` reported `Absent` for a task whose
+    /// tombstone the backend was holding.
+    #[tokio::test]
+    async fn test_result_existence_sees_extended_backend_tombstones() {
+        use crate::result_tombstone::ResultExistence;
+
+        let backend = TombstoneBackend::default();
+        let task_id = Uuid::new_v4();
+
+        backend
+            .store_result(task_id, TaskResultValue::Success(Value::from(1)))
+            .await
+            .expect("store");
+        assert!(matches!(
+            backend.result_existence(task_id).await.expect("existence"),
+            ResultExistence::Present
+        ));
+
+        backend
+            .forget_with_tombstone(ResultTombstone::new(task_id).with_reason("expired by policy"))
+            .await
+            .expect("forget with tombstone");
+
+        assert!(backend.has_tombstone(task_id).await.expect("has_tombstone"));
+        let existence = backend.result_existence(task_id).await.expect("existence");
+        match existence {
+            ResultExistence::Tombstoned(tombstone) => {
+                assert_eq!(tombstone.task_id, task_id);
+                assert_eq!(tombstone.reason.as_deref(), Some("expired by policy"));
+            }
+            other => panic!("expected Tombstoned, got {other:?}"),
+        }
+
+        // A task that never existed is still Absent.
+        assert!(matches!(
+            backend
+                .result_existence(Uuid::new_v4())
+                .await
+                .expect("existence"),
+            ResultExistence::Absent
+        ));
+    }
+
+    /// Regression: `get()` polled forever for a result that had been forgotten.
+    #[tokio::test]
+    async fn test_get_fails_fast_on_a_tombstoned_result() {
+        let backend = TombstoneBackend::default();
+        let task_id = Uuid::new_v4();
+        backend
+            .store_tombstone(ResultTombstone::new(task_id).with_reason("forgotten"))
+            .await
+            .expect("store tombstone");
+
+        let result = AsyncResult::new(task_id, backend);
+        let err = result
+            .get(None)
+            .await
+            .expect_err("a tombstoned result must not poll forever");
+        assert!(err.to_string().contains("forgotten"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_none_for_a_null_success() {
+        let backend = MockBackend::new();
+        let task_id = Uuid::new_v4();
+        backend.set_result(
+            task_id,
+            TaskResultValue::Success(Value::Null),
+            TaskState::Succeeded(vec![]),
+        );
+
+        let result = AsyncResult::new(task_id, backend);
+        assert_eq!(result.get(None).await.expect("get"), None);
+        // ...which makes the previously-dead `None` arm of `wait()` reachable.
+        let err = result.wait(None).await.expect_err("wait should report it");
+        assert!(err.to_string().contains("no value"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_async_result_config_backoff() {
+        let config = AsyncResultConfig::default();
+        assert_eq!(config.interval_for(0), Duration::from_millis(100));
+        assert_eq!(config.interval_for(1), Duration::from_millis(200));
+        assert_eq!(config.interval_for(2), Duration::from_millis(400));
+        // Capped at max_poll_interval.
+        assert_eq!(config.interval_for(20), Duration::from_secs(2));
+
+        let fixed = AsyncResultConfig::fixed(Duration::from_millis(50));
+        assert_eq!(fixed.interval_for(0), Duration::from_millis(50));
+        assert_eq!(fixed.interval_for(10), Duration::from_millis(50));
+    }
+
+    /// Regression: `is_last` computed `index == total - 1` on a `usize`,
+    /// underflowing for `total == 0`.
+    #[test]
+    fn test_result_chunk_is_last_is_total_safe() {
+        assert!(!ResultChunk::new(0, 0, vec![]).is_last());
+        assert!(ResultChunk::new(0, 1, vec![]).is_last());
+        assert!(!ResultChunk::new(0, 2, vec![]).is_last());
+        assert!(ResultChunk::new(1, 2, vec![]).is_last());
+    }
+
+    /// Regression: chunk checksums were stored but never verified, so a
+    /// corrupted or substituted chunk reassembled silently.
+    #[test]
+    fn test_reassemble_verifies_checksums_and_totals() {
+        let chunker = ResultChunker::new(4);
+        let data: Vec<u8> = (0..14u8).collect();
+        let chunks = chunker.chunk(&data);
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks.iter().all(|c| c.checksum.is_some()));
+        assert_eq!(chunker.reassemble(&chunks).expect("reassemble"), data);
+
+        // Tamper with one chunk's payload.
+        let mut tampered = chunks.clone();
+        tampered[2].data[0] ^= 0xff;
+        let err = chunker
+            .reassemble(&tampered)
+            .expect_err("a tampered chunk must be rejected");
+        assert!(err.to_string().contains("checksum"), "unexpected: {err}");
+
+        // Disagreeing totals are rejected.
+        let mut inconsistent = chunks.clone();
+        inconsistent[1].total = 99;
+        assert!(chunker.reassemble(&inconsistent).is_err());
+
+        // Out-of-order chunks are still rejected.
+        let mut reordered = chunks;
+        reordered.swap(0, 1);
+        assert!(chunker.reassemble(&reordered).is_err());
+
+        // Empty input round-trips.
+        assert!(chunker.reassemble(&[]).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn test_chunk_checksum_helpers() {
+        let chunk = ResultChunk::new(0, 1, b"hello".to_vec()).with_computed_checksum();
+        assert!(chunk.verify_checksum());
+        assert_eq!(
+            chunk.checksum.as_deref(),
+            Some(ResultChunk::compute_checksum(b"hello").as_str())
+        );
+
+        // A chunk without a checksum verifies vacuously.
+        assert!(ResultChunk::new(0, 1, b"hello".to_vec()).verify_checksum());
+
+        // A wrong checksum fails.
+        let bad = ResultChunk::new(0, 1, b"hello".to_vec()).with_checksum("deadbeef");
+        assert!(!bad.verify_checksum());
+    }
+
+    /// Regression: `with_ttl` called `expect()` on `chrono::Duration::from_std`.
+    #[test]
+    fn test_with_ttl_clamps_instead_of_panicking() {
+        let metadata = ResultMetadata::new().with_ttl(Duration::from_secs(3600));
+        assert!(metadata.expires_at.is_some());
+        assert!(!metadata.is_expired());
+
+        // A TTL far beyond chrono's range clamps rather than panicking.
+        let huge = ResultMetadata::new().with_ttl(Duration::from_secs(u64::MAX / 2));
+        assert!(huge.expires_at.is_some());
+        assert!(!huge.is_expired());
+    }
+
+    /// Regression: `ResultCompressor` was a public, constructible type whose
+    /// only two operations always failed.
+    #[test]
+    fn test_result_compressor_dispatches_to_registered_codecs() {
+        #[derive(Debug)]
+        struct XorCodec;
+
+        impl CompressionCodec for XorCodec {
+            fn name(&self) -> &str {
+                "xor"
+            }
+            fn compress(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
+                Ok(data.iter().map(|b| b ^ 0x5a).collect())
+            }
+            fn decompress(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
+                Ok(data.iter().map(|b| b ^ 0x5a).collect())
+            }
+        }
+
+        let compressor = ResultCompressor::new(4).with_codec(Arc::new(XorCodec));
+        assert_eq!(compressor.algorithms(), vec!["none", "xor"]);
+        assert!(compressor.supports("none"));
+        assert!(compressor.supports("xor"));
+        assert!(!compressor.supports("zstd"));
+
+        assert!(compressor.should_compress(b"12345"));
+        assert!(!compressor.should_compress(b"123"));
+
+        // The always-present identity codec round-trips verbatim.
+        let identity = compressor.compress(b"payload", "none").expect("compress");
+        assert_eq!(identity, b"payload");
+        assert_eq!(
+            compressor
+                .decompress(&identity, "none")
+                .expect("decompress"),
+            b"payload"
+        );
+
+        // The registered codec is actually used.
+        let squeezed = compressor.compress(b"payload", "xor").expect("compress");
+        assert_ne!(squeezed, b"payload");
+        assert_eq!(
+            compressor.decompress(&squeezed, "xor").expect("decompress"),
+            b"payload"
+        );
+
+        // An unregistered algorithm is a named configuration error, not a
+        // blanket "compression not available".
+        let err = compressor
+            .compress(b"payload", "zstd")
+            .expect_err("unknown algorithm must be rejected");
+        assert!(
+            err.to_string()
+                .contains("unsupported compression algorithm"),
+            "unexpected: {err}"
+        );
     }
 }

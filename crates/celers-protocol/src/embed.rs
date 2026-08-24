@@ -22,10 +22,44 @@
 //! assert_eq!(decoded.args, vec![json!(1), json!(2)]);
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Deserialize a list field that Python Celery emits as an explicit `null`.
+///
+/// `app.amqp.as_task_v2` always writes the embed dict with all four keys
+/// present: `{'callbacks': None, 'errbacks': None, 'chain': None, 'chord':
+/// None}`. `#[serde(default)]` only covers a *missing* key, so an explicit
+/// `null` would otherwise be handed to `Vec`'s sequence deserializer and fail
+/// with `invalid type: null, expected a sequence` -- i.e. every genuine
+/// Celery-produced body would be rejected. Mapping `null` to an empty list is
+/// exactly Python's own reading of the field.
+fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Serialize an empty list as `null`, mirroring Python Celery's embed dict.
+///
+/// Celery emits the key with a `None` value rather than omitting it, so a
+/// consumer that indexes `embed['callbacks']` (instead of using `.get`) keeps
+/// working against a CeleRS-produced body.
+fn serialize_empty_vec_as_null<S, T>(values: &[T], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    if values.is_empty() {
+        serializer.serialize_none()
+    } else {
+        serializer.serialize_some(values)
+    }
+}
 
 /// Callback signature for link/errback
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,22 +143,45 @@ impl CallbackSignature {
 }
 
 /// Embed options in the message body
+///
+/// This is the third element of the Celery protocol v2 body tuple
+/// `[args, kwargs, embed]`. The canonical Python shape always carries the four
+/// workflow keys, with `null` standing in for "unused":
+///
+/// ```text
+/// {"callbacks": null, "errbacks": null, "chain": null, "chord": null}
+/// ```
+///
+/// Both directions honour that shape: an explicit `null` decodes to an empty
+/// list, and an empty list encodes back to `null`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmbedOptions {
     /// Callbacks to execute on success (link)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec",
+        serialize_with = "serialize_empty_vec_as_null"
+    )]
     pub callbacks: Vec<CallbackSignature>,
 
     /// Callbacks to execute on error (errback)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec",
+        serialize_with = "serialize_empty_vec_as_null"
+    )]
     pub errbacks: Vec<CallbackSignature>,
 
     /// Chain of tasks to execute after this one
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec",
+        serialize_with = "serialize_empty_vec_as_null"
+    )]
     pub chain: Vec<CallbackSignature>,
 
     /// Chord callback (executed after group completes)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub chord: Option<CallbackSignature>,
 
     /// Group ID
@@ -294,37 +351,39 @@ impl EmbeddedBody {
     }
 
     /// Encode to JSON bytes (Celery wire format)
+    ///
+    /// Produces the canonical protocol v2 body tuple `[args, kwargs, embed]`.
+    /// The embed dict always carries Python Celery's four workflow keys, with
+    /// `null` for the unused ones -- byte-for-byte what `app.amqp.as_task_v2`
+    /// emits:
+    ///
+    /// ```text
+    /// [[1, 2], {}, {"callbacks": null, "errbacks": null, "chain": null, "chord": null}]
+    /// ```
     pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
-        // Convert embed to Value (empty object if no workflow)
-        let embed_value = if self.embed.has_workflow()
-            || self.embed.group.is_some()
-            || self.embed.parent_id.is_some()
-            || self.embed.root_id.is_some()
-        {
-            serde_json::to_value(&self.embed)?
-        } else {
-            Value::Object(serde_json::Map::new())
-        };
-
-        let tuple = (&self.args, &self.kwargs, embed_value);
+        // Serializing the embed directly (rather than via an intermediate
+        // `Value`) keeps the key order stable and the four canonical keys
+        // present even when no workflow is attached.
+        let tuple = (&self.args, &self.kwargs, &self.embed);
 
         serde_json::to_vec(&tuple)
     }
 
     /// Decode from JSON bytes
+    ///
+    /// Accepts every embed shape seen in the wild: the canonical Python dict
+    /// with explicit `null` values, an empty dict `{}` (emitted by some
+    /// third-party producers), a bare `null`, and a non-object placeholder such
+    /// as the empty list a serialized Python tuple can turn into. Anything that
+    /// is not an object carries no workflow, so it decodes to the default
+    /// options rather than failing the whole message.
     pub fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         let tuple: (Vec<Value>, HashMap<String, Value>, Value) = serde_json::from_slice(bytes)?;
 
-        let embed: EmbedOptions = if tuple.2.is_object()
-            && !tuple
-                .2
-                .as_object()
-                .expect("value should be an object")
-                .is_empty()
-        {
-            serde_json::from_value(tuple.2)?
-        } else {
-            EmbedOptions::default()
+        let embed: EmbedOptions = match tuple.2 {
+            object @ Value::Object(_) => serde_json::from_value(object)?,
+            // `null`, `[]` and friends carry no workflow at all.
+            _ => EmbedOptions::default(),
         };
 
         Ok(Self {
@@ -498,6 +557,92 @@ mod tests {
         assert_eq!(body.kwargs.get("debug"), Some(&json!(true)));
         assert!(body.embed.has_callbacks());
         assert_eq!(body.embed.callbacks[0].task, "tasks.callback");
+    }
+
+    /// Golden fixture: the body Python Celery actually puts on the wire.
+    ///
+    /// `celery.app.amqp.AMQP.as_task_v2` builds the body as
+    /// `(args, kwargs, {'callbacks': callbacks, 'errbacks': errbacks,
+    /// 'chain': chain, 'chord': chord})` -- the four keys are *always* present
+    /// and hold `None` when the task carries no workflow. Regression: decoding
+    /// used to fail with `invalid type: null, expected a sequence`, so every
+    /// genuine Celery-produced task body was rejected.
+    #[test]
+    fn test_decode_python_celery_embed_with_explicit_nulls() {
+        // Captured shape of `json.dumps(as_task_v2(...).body)` for
+        // `add.delay(1, 2)` with no callbacks/errbacks/chain/chord.
+        const PYTHON_BODY: &str =
+            r#"[[1,2],{},{"callbacks":null,"errbacks":null,"chain":null,"chord":null}]"#;
+
+        let body = EmbeddedBody::from_json_string(PYTHON_BODY)
+            .expect("a genuine Celery protocol v2 body must decode");
+
+        assert_eq!(body.args, vec![json!(1), json!(2)]);
+        assert!(body.kwargs.is_empty());
+        assert!(body.embed.callbacks.is_empty());
+        assert!(body.embed.errbacks.is_empty());
+        assert!(body.embed.chain.is_empty());
+        assert!(body.embed.chord.is_none());
+        assert!(!body.embed.has_workflow());
+    }
+
+    /// The same null-tolerance must hold when only *some* of the keys are null,
+    /// which is what a `link=`/`chord` task looks like on the wire.
+    #[test]
+    fn test_decode_python_celery_embed_with_partial_nulls() {
+        // `add.apply_async((1, 2), link=notify.s())` -- `callbacks` is a list,
+        // the other three stay `None`.
+        const PYTHON_BODY: &str = r#"[[1,2],{"debug":true},{"callbacks":[{"task":"tasks.notify","args":[],"kwargs":{},"options":{},"immutable":false,"subtask_type":null}],"errbacks":null,"chain":null,"chord":null}]"#;
+
+        let body = EmbeddedBody::from_json_string(PYTHON_BODY)
+            .expect("a Celery body with a link callback must decode");
+
+        assert_eq!(body.kwargs.get("debug"), Some(&json!(true)));
+        assert_eq!(body.embed.callbacks.len(), 1);
+        assert_eq!(body.embed.callbacks[0].task, "tasks.notify");
+        assert!(body.embed.errbacks.is_empty());
+        assert!(body.embed.has_workflow());
+    }
+
+    /// Encoding mirrors the canonical Python shape: the four workflow keys are
+    /// always emitted, `null` when unused, so a Python consumer that indexes
+    /// `embed['callbacks']` (rather than using `.get`) keeps working.
+    #[test]
+    fn test_encode_emits_canonical_python_embed_dict() {
+        let body = EmbeddedBody::new().with_args(vec![json!(1), json!(2)]);
+
+        let encoded = body.to_json_string().expect("encode must succeed");
+        assert_eq!(
+            encoded,
+            r#"[[1,2],{},{"callbacks":null,"errbacks":null,"chain":null,"chord":null}]"#
+        );
+
+        // And it round-trips through our own decoder.
+        let decoded = EmbeddedBody::from_json_string(&encoded).expect("round-trip must decode");
+        assert_eq!(decoded.args, body.args);
+        assert!(!decoded.embed.has_workflow());
+    }
+
+    /// Legacy/third-party producers that emit an empty embed dict -- or omit it
+    /// entirely as `null` -- must keep decoding.
+    #[test]
+    fn test_decode_tolerates_empty_and_null_embed() {
+        let body = EmbeddedBody::from_json_string(r#"[[1],{"k":"v"},{}]"#)
+            .expect("empty embed dict must decode");
+        assert_eq!(body.args, vec![json!(1)]);
+        assert!(!body.embed.has_workflow());
+
+        let body =
+            EmbeddedBody::from_json_string(r#"[[1],{},null]"#).expect("null embed must decode");
+        assert_eq!(body.args, vec![json!(1)]);
+        assert!(!body.embed.has_workflow());
+
+        // A serialized Python tuple can arrive as an empty list; it carries no
+        // workflow, so it must not fail the whole message.
+        let body = EmbeddedBody::from_json_string(r#"[[1],{},[]]"#)
+            .expect("non-object embed placeholder must decode");
+        assert_eq!(body.args, vec![json!(1)]);
+        assert!(!body.embed.has_workflow());
     }
 
     #[test]

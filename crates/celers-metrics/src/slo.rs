@@ -73,6 +73,18 @@ pub fn calculate_error_budget(
     }
 
     let allowed_failures = total_requests * (1.0 - target_success_rate);
+    if allowed_failures <= 0.0 {
+        // A 100% (or effectively 100%) objective allows zero failures. The
+        // budget is untouched only if none actually occurred; otherwise it
+        // is immediately blown. Falling through would compute
+        // `failed_requests / 0.0`, which is `NaN` when there were no
+        // failures either -- and `(1.0 - NaN).max(0.0)` silently evaluates
+        // to `0.0` regardless of whether any failures actually happened,
+        // reporting a fully-exhausted budget for a perfectly healthy
+        // service. Mirrors `slo_tracker::ErrorBudget::compute`'s handling of
+        // `allowed == 0`.
+        return if failed_requests <= 0.0 { 1.0 } else { 0.0 };
+    }
     let budget_used = failed_requests / allowed_failures;
     (1.0 - budget_used).max(0.0)
 }
@@ -271,4 +283,57 @@ pub fn calculate_percentiles(values: &[f64]) -> Option<(f64, f64, f64)> {
     let p99 = calculate_percentile(values, 0.99)?;
 
     Some((p50, p95, p99))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_budget_full_at_100_percent_objective_with_no_failures() {
+        // Regression: `allowed_failures` is exactly 0.0 at a 100% objective,
+        // so `failed_requests / allowed_failures` was `0.0 / 0.0 == NaN`, and
+        // `(1.0 - NaN).max(0.0)` silently evaluated to `0.0` -- reporting a
+        // fully-exhausted budget for a perfectly healthy service.
+        assert_eq!(calculate_error_budget(100.0, 0.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn error_budget_blown_at_100_percent_objective_with_any_failure() {
+        // At a 100% objective a single failure exhausts the (zero-sized)
+        // budget; distinct from the untouched case above (both previously
+        // collapsed to the same `0.0`, so this case could never be told
+        // apart from "healthy").
+        assert_eq!(calculate_error_budget(100.0, 1.0, 1.0), 0.0);
+        assert_eq!(calculate_error_budget(100.0, 50.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn error_budget_ordinary_objective_still_behaves_as_before() {
+        // 99% objective over 1000 requests allows 10 failures.
+        assert_eq!(calculate_error_budget(1000.0, 0.0, 0.99), 1.0);
+        assert!((calculate_error_budget(1000.0, 5.0, 0.99) - 0.5).abs() < 1e-10);
+        assert!(calculate_error_budget(1000.0, 10.0, 0.99).abs() < 1e-10);
+        // Budget exceeded clamps to 0, not negative.
+        assert_eq!(calculate_error_budget(1000.0, 20.0, 0.99), 0.0);
+        // No requests yet: full budget regardless of objective.
+        assert_eq!(calculate_error_budget(0.0, 0.0, 0.99), 1.0);
+    }
+
+    #[test]
+    fn error_budget_is_never_nan() {
+        for (total, failed, objective) in [
+            (0.0, 0.0, 1.0),
+            (100.0, 0.0, 1.0),
+            (100.0, 1.0, 1.0),
+            (100.0, 5.0, 0.99),
+            (1.0, 1.0, 1.0),
+        ] {
+            let budget = calculate_error_budget(total, failed, objective);
+            assert!(
+                !budget.is_nan(),
+                "calculate_error_budget({total}, {failed}, {objective}) was NaN"
+            );
+        }
+    }
 }

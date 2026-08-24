@@ -231,6 +231,87 @@ impl RetryStrategy {
             RetryStrategy::Immediate => 0,
         }
     }
+
+    /// Render this strategy as a SQL scalar expression over the row's own
+    /// `retry_count` column, yielding a backoff in seconds.
+    ///
+    /// This is what lets `reject(requeue = true)` be a **single** atomic
+    /// `UPDATE`: the retry budget and the backoff both have to be evaluated
+    /// against the row's live `retry_count`, and a client-side
+    /// [`RetryStrategy::calculate_backoff`] would require reading that value
+    /// first — reopening exactly the read-then-write race the single statement
+    /// exists to close.
+    ///
+    /// The rendered text contains only integer literals produced by `format!`
+    /// from this enum's own fields, so nothing caller-controlled can reach the
+    /// statement. Exponents are clamped to 62 so the `bigint` cast can never
+    /// overflow, mirroring (and hardening) the client-side calculation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use celers_broker_postgres::RetryStrategy;
+    ///
+    /// assert_eq!(RetryStrategy::Immediate.backoff_sql(), "0::bigint");
+    /// assert_eq!(
+    ///     RetryStrategy::Fixed { delay_secs: 30 }.backoff_sql(),
+    ///     "30::bigint"
+    /// );
+    /// ```
+    #[must_use]
+    pub fn backoff_sql(&self) -> String {
+        // `retry_count` is the pre-increment value inside an `UPDATE ... SET
+        // retry_count = retry_count + 1` statement, matching the argument
+        // `calculate_backoff` receives on the client side.
+        const EXP: &str = "(2::numeric ^ LEAST(GREATEST(retry_count, 0), 62))";
+        match self {
+            RetryStrategy::Exponential { max_delay_secs } => {
+                format!("LEAST({EXP}::bigint, {max_delay_secs}::bigint)")
+            }
+            RetryStrategy::ExponentialWithJitter { max_delay_secs } => {
+                format!("LEAST(({EXP} * (0.5 + random()))::bigint, {max_delay_secs}::bigint)")
+            }
+            RetryStrategy::Linear {
+                base_delay_secs,
+                max_delay_secs,
+            } => format!(
+                "LEAST({base_delay_secs}::bigint * GREATEST(retry_count, 0), {max_delay_secs}::bigint)"
+            ),
+            RetryStrategy::Fixed { delay_secs } => format!("{delay_secs}::bigint"),
+            RetryStrategy::Immediate => "0::bigint".to_string(),
+        }
+    }
+}
+
+/// Retention policy for terminal tasks left in the dispatch table.
+///
+/// `celers_tasks` is the table every `dequeue` scans, and `ack` leaves
+/// completed rows in it for auditing. Without a sweeper the table (and its
+/// indexes) grows monotonically with lifetime throughput. Configure this and
+/// call [`crate::PostgresBroker::spawn_retention_task`] to have terminal rows
+/// pruned in bounded chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// How long a terminal (`completed`/`cancelled`/`failed`) task is kept.
+    pub retain_for: std::time::Duration,
+    /// Interval between sweeps.
+    pub sweep_interval: std::time::Duration,
+    /// Maximum rows deleted per statement, so no sweep holds long row locks.
+    pub batch_size: i64,
+    /// Maximum statements per sweep, bounding one sweep's total work.
+    pub max_batches_per_sweep: u32,
+}
+
+impl Default for RetentionConfig {
+    /// Seven days of history, swept hourly in 10 000-row chunks.
+    fn default() -> Self {
+        Self {
+            retain_for: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            sweep_interval: std::time::Duration::from_secs(60 * 60),
+            batch_size: 10_000,
+            max_batches_per_sweep: 100,
+        }
+    }
 }
 
 impl std::fmt::Display for TaskResultStatus {
@@ -358,7 +439,23 @@ pub struct StageStatus {
     pub pending_tasks: i64,
     pub processing_tasks: i64,
     pub is_complete: bool,
+    /// Whether every stage this stage declares a dependency on has finished.
+    ///
+    /// Resolved against the stage's declared `stage_depends_on` list and the
+    /// live completion state of those upstream stages. It used to be a
+    /// heuristic over this stage's *own* task counts
+    /// (`pending == 0 || processing > 0 || is_complete`), which answered
+    /// "false" exactly when a ready stage was waiting to be dispatched and
+    /// "true" for a stage whose tasks had all failed.
+    ///
+    /// A stage that declares no dependencies is always `true`.
     pub dependencies_met: bool,
+    /// The declared upstream stages that are not finished yet.
+    ///
+    /// Empty whenever [`StageStatus::dependencies_met`] is `true`. An
+    /// operator looking at a stalled workflow needs to know *which* upstream
+    /// stage is blocking, not merely that something is.
+    pub unmet_dependencies: Vec<String>,
 }
 
 /// Task lifecycle hook types for extensibility
@@ -471,6 +568,24 @@ impl TaskHooks {
             TaskHook::BeforeReject(f) => self.before_reject.push(f),
             TaskHook::AfterReject(f) => self.after_reject.push(f),
         }
+    }
+
+    /// Whether any ack hook is registered.
+    ///
+    /// `ack`/`reject` transition a task with one atomic, state-guarded
+    /// `UPDATE ... RETURNING`, which yields the task *after* the write. Hooks
+    /// that must observe the task *before* it are the only reason to spend an
+    /// extra round trip reading the row first, so the delivery path checks
+    /// this and skips that read entirely when no hook is installed.
+    #[must_use]
+    pub fn has_ack_hooks(&self) -> bool {
+        !self.before_ack.is_empty() || !self.after_ack.is_empty()
+    }
+
+    /// Whether any reject hook is registered. See [`TaskHooks::has_ack_hooks`].
+    #[must_use]
+    pub fn has_reject_hooks(&self) -> bool {
+        !self.before_reject.is_empty() || !self.after_reject.is_empty()
     }
 
     /// Execute before_enqueue hooks
@@ -820,7 +935,14 @@ pub struct QueueHealthCheck {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskGroupStatus {
     pub group_id: String,
+    /// The name the group was created with.
+    ///
+    /// Read back from `celers_task_groups`. Previously this echoed
+    /// `group_id`, because `create_task_group` discarded the caller's name
+    /// without persisting it anywhere.
     pub group_name: String,
+    /// The group's free-text description, if one was supplied at creation.
+    pub description: Option<String>,
     pub total_tasks: i64,
     pub pending_count: i64,
     pub processing_count: i64,

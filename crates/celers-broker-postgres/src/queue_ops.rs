@@ -1,7 +1,7 @@
 //! Queue control and task inspection operations
 
 use celers_core::{CelersError, Result, TaskId};
-use oxisql_core::{Connection, ToSqlValue};
+use oxisql_core::ToSqlValue;
 use std::sync::atomic::Ordering;
 
 use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};
@@ -173,11 +173,12 @@ impl PostgresBroker {
             SELECT id, task_name, state, priority, retry_count, max_retries,
                    created_at, scheduled_at, started_at, completed_at, worker_id, error_message
             FROM celers_tasks
-            WHERE metadata->$1 = $2
+            WHERE queue_name = $1
+              AND metadata->$2 = $3::text::jsonb
             ORDER BY created_at DESC
-            LIMIT $3 OFFSET $4
+            LIMIT $4 OFFSET $5
             "#,
-                &[&json_path, &value_param, &limit, &offset],
+                &[&self.queue_name, &json_path, &value_param, &limit, &offset],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to find tasks by metadata: {}", e)))?;
@@ -209,9 +210,10 @@ impl PostgresBroker {
                 r#"
             SELECT COUNT(*) as count
             FROM celers_tasks
-            WHERE metadata->$1 = $2
+            WHERE queue_name = $1
+              AND metadata->$2 = $3::text::jsonb
             "#,
-                &[&json_path, &value_param],
+                &[&self.queue_name, &json_path, &value_param],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to count tasks by metadata: {}", e)))?;
@@ -433,7 +435,15 @@ impl PostgresBroker {
         let mut where_clauses = Vec::with_capacity(filter_pairs.len());
         let mut bind_idx = 2; // $1 is queue_name
         for _ in &filter_pairs {
-            where_clauses.push(format!("metadata->${} = ${}", bind_idx, bind_idx + 1));
+            // The JSON value is bound as text and cast server-side: a
+            // `String` parameter's binary wire encoding is raw UTF-8, which is
+            // not a valid binary `jsonb` payload (that format carries a
+            // 1-byte version header).
+            where_clauses.push(format!(
+                "metadata->${} = ${}::text::jsonb",
+                bind_idx,
+                bind_idx + 1
+            ));
             bind_idx += 2;
         }
 
@@ -539,8 +549,9 @@ impl PostgresBroker {
                 COUNT(*) FILTER (WHERE state = 'cancelled') as cancelled,
                 COUNT(*) as total
             FROM celers_tasks
+            WHERE queue_name = $1
             "#,
-                &[],
+                &[&self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get statistics: {}", e)))?;
@@ -551,7 +562,10 @@ impl PostgresBroker {
 
         let dlq_rows = self
             .conn
-            .query("SELECT COUNT(*) FROM celers_dead_letter_queue", &[])
+            .query(
+                "SELECT COUNT(*) FROM celers_dead_letter_queue WHERE queue_name = $1",
+                &[&self.queue_name],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get DLQ count: {}", e)))?;
         let dlq_row = dlq_rows.into_iter().next().ok_or_else(|| {

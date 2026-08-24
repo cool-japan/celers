@@ -1,32 +1,71 @@
 //! Worker struct and core implementation for task execution.
 
+mod execution;
+mod support;
+
+#[cfg(test)]
+mod tests;
+
 use crate::adaptive_poll::{AdaptivePoll, PollOutcome};
 use crate::affinity::{AffinityDecision, AffinityRegistry};
 use crate::batching::{self, CoalesceStrategy};
 use crate::circuit_breaker::CircuitBreaker;
 use crate::coordinated_rate_limit::{RateLimitDecision, WorkerRateLimitCoordinator};
-use crate::dlq::{self, DlqHandler};
+use crate::dlq::DlqHandler;
 use crate::execution_context::{RevocationWatcher, TaskExecutionContext};
+use crate::memory::MemoryTracker;
 use crate::middleware;
+use crate::routing::RoutingStrategy;
 use crate::types::{DynamicConfig, WorkerConfig, WorkerHandle, WorkerMode, WorkerStats};
 
+use execution::{DeadLetterRequest, TaskDispatch};
+use support::{
+    clamp_defer_delay, effective_max_retries, ActiveTaskGuard, EventSink, InFlightRegistry,
+};
+
 use celers_core::{
-    Broker, Event, EventEmitter, NoOpEventEmitter, Result, TaskEvent, TaskEventBuilder,
-    TaskRegistry, TaskState, WorkerEventBuilder,
+    Broker, Event, EventEmitter, NoOpEventEmitter, Result, TaskEvent, TaskEventBuilder, TaskId,
+    TaskRegistry, WorkerEventBuilder,
 };
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration as StdDuration;
-use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, error, info, warn};
 
-#[cfg(feature = "metrics")]
-use celers_metrics::{
-    TASKS_COMPLETED_BY_TYPE, TASKS_COMPLETED_TOTAL, TASKS_FAILED_BY_TYPE, TASKS_FAILED_TOTAL,
-    TASKS_RETRIED_BY_TYPE, TASKS_RETRIED_TOTAL, TASK_EXECUTION_TIME, TASK_EXECUTION_TIME_BY_TYPE,
-};
+/// How long the dequeue loop waits for a free concurrency permit before
+/// looping back to re-check the worker mode and the shutdown channel.
+const PERMIT_WAIT: Duration = Duration::from_millis(100);
+
+/// Maximum number of buffered lifecycle events flushed in one `emit_batch`.
+const EVENT_FLUSH_BATCH: usize = 64;
+
+/// How long to wait for buffered lifecycle events to flush at shutdown.
+const EVENT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why the dequeue loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// A shutdown signal was received on the shutdown channel.
+    Shutdown,
+    /// The shutdown channel was closed.
+    Disconnected,
+    /// The worker was switched into draining mode.
+    Draining,
+}
+
+impl StopReason {
+    /// Human-readable reason for logging.
+    fn as_str(self) -> &'static str {
+        match self {
+            StopReason::Shutdown => "shutdown signal",
+            StopReason::Disconnected => "shutdown channel closed",
+            StopReason::Draining => "draining mode",
+        }
+    }
+}
 
 /// Worker runtime for consuming and executing tasks
 pub struct Worker<B: Broker, E: EventEmitter = NoOpEventEmitter> {
@@ -97,8 +136,15 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             None
         };
 
+        // `enable_dlq` is authoritative: `DlqConfig::enabled` defaults to false,
+        // so building the handler straight from the default config produced a
+        // handler that silently discarded every entry.
         let dlq_handler = if config.enable_dlq {
-            Some(Arc::new(DlqHandler::new(config.dlq_config.clone())))
+            let dlq_config = crate::dlq::DlqConfig {
+                enabled: true,
+                ..config.dlq_config.clone()
+            };
+            Some(Arc::new(DlqHandler::new(dlq_config)))
         } else {
             None
         };
@@ -137,7 +183,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// revocation signal for an in-flight task arrives, its token is tripped: the
     /// task's future is raced against the token via [`tokio::select!`], so a
     /// cooperative task stops at its next `is_cancelled()` check (and any task is
-    /// dropped at its next `.await`), after which the worker transitions it to
+    /// aborted at its next `.await`), after which the worker transitions it to
     /// `Revoked`.
     ///
     /// # Example
@@ -163,10 +209,11 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// Enable distributed (cluster-wide) rate-limit coordination.
     ///
     /// Before executing each task the worker acquires a permit from the shared
-    /// [`WorkerRateLimitCoordinator`] (keyed by task name or queue). If the shared
-    /// limiter denies the request the task is deferred — requeued for a later
-    /// attempt — rather than executed, so the configured rate is enforced across
-    /// every worker.
+    /// [`WorkerRateLimitCoordinator`] (keyed by task name or by
+    /// [`WorkerConfig::queue_name`](crate::WorkerConfig::queue_name)). If the
+    /// shared limiter denies the request the task is deferred — requeued for a
+    /// later attempt after the limiter's suggested delay — rather than executed,
+    /// so the configured rate is enforced across every worker.
     ///
     /// # Example
     ///
@@ -299,12 +346,45 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     }
 
     /// Check if this worker can handle a specific task type based on routing configuration
+    ///
+    /// The configured [`RoutingStrategy`] decides how the worker's tags are
+    /// applied:
+    ///
+    /// - [`RoutingStrategy::Lenient`] (default) and
+    ///   [`RoutingStrategy::TaskTypeOnly`] admit anything that is not on the
+    ///   worker's exclusion list, honouring the allow-list when one is set.
+    /// - [`RoutingStrategy::Strict`] additionally requires the task type to be
+    ///   named explicitly in the worker's allow-list, so a worker never picks up
+    ///   work it was not told about.
     fn can_handle_task(&self, task_name: &str) -> bool {
         if !self.config.enable_routing {
             return true; // Routing disabled, accept all tasks
         }
 
-        self.config.worker_tags.can_handle_task(task_name)
+        if !self.config.worker_tags.can_handle_task(task_name) {
+            return false;
+        }
+
+        match self.config.routing_strategy {
+            RoutingStrategy::Lenient | RoutingStrategy::TaskTypeOnly => true,
+            RoutingStrategy::Strict => self.config.worker_tags.task_types().contains(task_name),
+        }
+    }
+
+    /// Check whether this worker's feature flags satisfy the task's declared
+    /// feature requirements.
+    ///
+    /// Requirements are looked up in
+    /// [`WorkerConfig::task_feature_requirements`](crate::WorkerConfig::task_feature_requirements);
+    /// tasks with no registered requirements are admitted unconditionally, so
+    /// this is a no-op until the map is populated.
+    fn features_satisfied(&self, task_name: &str) -> bool {
+        match self.config.task_feature_requirements.get(task_name) {
+            Some(requirements) if requirements.has_requirements() => {
+                self.config.feature_flags.satisfies(requirements)
+            }
+            _ => true,
+        }
     }
 
     /// Start the worker loop with graceful shutdown support
@@ -352,6 +432,20 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             }
         }
 
+        // Lifecycle events are telemetry: buffer them so a task never waits on
+        // an event round trip, while preserving emission order.
+        let (events, event_drainer) =
+            if self.config.enable_events && self.event_emitter.is_enabled() {
+                let (sink, drainer) = EventSink::buffered(
+                    Arc::clone(&self.event_emitter),
+                    self.config.event_buffer_capacity,
+                    EVENT_FLUSH_BATCH,
+                );
+                (sink, Some(drainer))
+            } else {
+                (EventSink::disabled(), None)
+            };
+
         // Start heartbeat task if configured
         let heartbeat_handle =
             if self.config.enable_events && self.config.heartbeat_interval_secs > 0 {
@@ -383,7 +477,9 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             w.spawn()
         });
 
-        let result = self.run_loop_inner(&mut shutdown_rx, &hostname, pid).await;
+        let result = self
+            .run_loop_inner(&mut shutdown_rx, &hostname, pid, &events)
+            .await;
 
         // Stop heartbeat task
         if let Some(handle) = heartbeat_handle {
@@ -393,6 +489,22 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         // Stop the revocation watcher
         if let Some(handle) = revocation_handle {
             handle.abort();
+        }
+
+        // Flush buffered lifecycle events before the offline event, so consumers
+        // never see "offline" ahead of a task's terminal event.
+        let dropped_events = events.dropped();
+        drop(events);
+        if let Some(drainer) = event_drainer {
+            if timeout(EVENT_FLUSH_TIMEOUT, drainer).await.is_err() {
+                warn!("Timed out flushing buffered lifecycle events");
+            }
+        }
+        if dropped_events > 0 {
+            warn!(
+                "Dropped {} lifecycle event(s) while the event buffer was full",
+                dropped_events
+            );
         }
 
         // Emit worker offline event
@@ -432,26 +544,81 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         }
     }
 
-    /// Get system load average (returns [0.0, 0.0, 0.0] on non-Unix systems)
+    /// Get system load average (returns [0.0, 0.0, 0.0] where unsupported)
+    ///
+    /// Delegates to [`crate::sysinfo::read_load_average`], which reads
+    /// `/proc/loadavg` on Linux and `getloadavg(3)` on the BSDs/macOS — the
+    /// latter has no `/proc`, where the previous inline implementation silently
+    /// reported a flat zero load in every heartbeat.
     fn get_load_average() -> [f64; 3] {
-        #[cfg(unix)]
-        {
-            use std::fs;
-            if let Ok(contents) = fs::read_to_string("/proc/loadavg") {
-                let parts: Vec<&str> = contents.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    let load1 = parts[0].parse().unwrap_or(0.0);
-                    let load5 = parts[1].parse().unwrap_or(0.0);
-                    let load15 = parts[2].parse().unwrap_or(0.0);
-                    return [load1, load5, load15];
+        crate::sysinfo::read_load_average().unwrap_or([0.0, 0.0, 0.0])
+    }
+
+    /// Current poll interval from the (runtime updatable) dynamic config.
+    fn poll_interval(&self) -> Duration {
+        let ms = self
+            .dynamic_config
+            .read()
+            .map(|c| c.poll_interval_ms)
+            .unwrap_or(1000);
+        Duration::from_millis(ms)
+    }
+
+    /// Sleep for `duration`, returning early with `true` if a shutdown signal
+    /// arrives first (so shutdown latency never inherits a poll or backoff
+    /// interval).
+    async fn sleep_or_shutdown(
+        shutdown_rx: &mut Option<&mut mpsc::Receiver<()>>,
+        duration: Duration,
+    ) -> bool {
+        match shutdown_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    biased;
+                    _ = rx.recv() => true,
+                    () = sleep(duration) => false,
                 }
             }
-            [0.0, 0.0, 0.0]
+            None => {
+                sleep(duration).await;
+                false
+            }
         }
+    }
 
-        #[cfg(not(unix))]
-        {
-            [0.0, 0.0, 0.0]
+    /// Acquire up to `wanted` concurrency permits, waiting at most
+    /// [`PERMIT_WAIT`] for the first one.
+    ///
+    /// Returning `None` means the worker is saturated: the caller loops back to
+    /// re-check the worker mode and shutdown channel instead of dequeuing more
+    /// work it cannot run.
+    async fn acquire_permits(
+        permits: &Arc<Semaphore>,
+        wanted: usize,
+    ) -> Option<Vec<OwnedSemaphorePermit>> {
+        let first = match timeout(PERMIT_WAIT, Arc::clone(permits).acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => return None,
+            Err(_elapsed) => return None,
+        };
+
+        let mut held = Vec::with_capacity(wanted.max(1));
+        held.push(first);
+        while held.len() < wanted {
+            match Arc::clone(permits).try_acquire_owned() {
+                Ok(permit) => held.push(permit),
+                Err(_) => break,
+            }
+        }
+        Some(held)
+    }
+
+    /// Defer a message: return it to the queue for a later attempt without
+    /// treating it as a failed execution.
+    async fn defer_message(&self, task_id: &TaskId, receipt_handle: Option<&str>, reason: &str) {
+        self.stats.task_deferred();
+        if let Err(e) = self.broker.reject(task_id, receipt_handle, true).await {
+            error!("Failed to defer task {} ({}): {}", task_id, reason, e);
         }
     }
 
@@ -461,6 +628,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         shutdown_rx: &mut Option<&mut mpsc::Receiver<()>>,
         hostname: &str,
         pid: u32,
+        events: &EventSink,
     ) -> Result<()> {
         // Adaptive poll-interval controller (clock-free decision math). When
         // adaptive polling is disabled the controller is left as `None` and the
@@ -471,32 +639,43 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             None
         };
 
-        loop {
+        // Concurrency control: `WorkerConfig::concurrency` permits, acquired
+        // *before* dequeuing so a saturated worker stops pulling messages out of
+        // the broker instead of buffering unbounded work in RAM.
+        let concurrency = self
+            .config
+            .concurrency
+            .max(1)
+            .min(u32::MAX as usize)
+            .min(Semaphore::MAX_PERMITS);
+        let permits = Arc::new(Semaphore::new(concurrency));
+
+        // Messages dispatched but not yet disposed of, so a shutdown deadline
+        // can hand them back to the broker instead of stranding them.
+        let in_flight = InFlightRegistry::new();
+
+        let memory_tracker = if self.config.track_memory_usage {
+            Some(Arc::new(MemoryTracker::new()))
+        } else {
+            None
+        };
+
+        let retry_config = self.config.get_retry_config();
+
+        let stop_reason = loop {
             // Check current worker mode
             let current_mode = WorkerMode::from(self.mode.load(Ordering::SeqCst));
 
-            // If draining, wait for active tasks to complete and exit
+            // If draining, stop dequeuing and let in-flight work finish
             if current_mode.is_draining() {
-                info!("Worker in draining mode, waiting for active tasks to complete");
-                while self.stats.active() > 0 {
-                    debug!("Waiting for {} active tasks", self.stats.active());
-                    sleep(Duration::from_millis(100)).await;
-                }
-                info!("All tasks completed, exiting");
-                return Ok(());
+                break StopReason::Draining;
             }
 
             // Check for shutdown signal if receiver is provided
             if let Some(ref mut rx) = shutdown_rx {
                 match rx.try_recv() {
-                    Ok(_) => {
-                        info!("Shutdown signal received, stopping worker gracefully");
-                        return Ok(());
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        warn!("Shutdown channel disconnected, stopping worker");
-                        return Ok(());
-                    }
+                    Ok(_) => break StopReason::Shutdown,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break StopReason::Disconnected,
                     Err(mpsc::error::TryRecvError::Empty) => {
                         // No shutdown signal, continue
                     }
@@ -505,26 +684,33 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
 
             // If in maintenance mode, skip dequeuing and sleep
             if current_mode.is_maintenance() {
-                let poll_interval = self
-                    .dynamic_config
-                    .read()
-                    .map(|c| c.poll_interval_ms)
-                    .unwrap_or(1000);
+                let poll_interval = self.poll_interval();
                 debug!(
-                    "Worker in maintenance mode, sleeping for {}ms",
+                    "Worker in maintenance mode, sleeping for {:?}",
                     poll_interval
                 );
-                sleep(Duration::from_millis(poll_interval)).await;
+                if Self::sleep_or_shutdown(shutdown_rx, poll_interval).await {
+                    break StopReason::Shutdown;
+                }
                 continue;
             }
 
+            // Backpressure: never dequeue more than we have capacity to run.
+            let wanted = if self.config.enable_batch_dequeue {
+                self.config.batch_size.max(1).min(concurrency)
+            } else {
+                1
+            };
+            let Some(mut held_permits) = Self::acquire_permits(&permits, wanted).await else {
+                debug!("Worker at concurrency limit ({}), waiting", concurrency);
+                continue;
+            };
+            let capacity = held_permits.len();
+
             // Dequeue tasks (single or batch depending on configuration)
             let messages_result = if self.config.enable_batch_dequeue {
-                debug!(
-                    "Batch dequeue enabled, fetching up to {} tasks",
-                    self.config.batch_size
-                );
-                self.broker.dequeue_batch(self.config.batch_size).await
+                debug!("Batch dequeue enabled, fetching up to {} tasks", capacity);
+                self.broker.dequeue_batch(capacity).await
             } else {
                 // Single task dequeue (convert to Vec for uniform handling)
                 match self.broker.dequeue().await {
@@ -566,52 +752,49 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                         info!("Dequeued {} tasks in batch", messages.len());
                     }
 
+                    let mut dispatched = 0usize;
+                    let mut defer_delay: Option<Duration> = None;
+
                     // Process each message
                     for msg in messages {
+                        // Every dispatched message consumes one permit; a
+                        // deferred/rejected one releases its permit immediately.
+                        let permit = held_permits.pop();
+
                         let task_id = msg.task.metadata.id;
                         let task_name = msg.task.metadata.name.clone();
                         info!("Processing task {} ({})", task_id, task_name);
 
                         // Emit task-received event
-                        if self.config.enable_events {
-                            let event = TaskEventBuilder::new(task_id, &task_name)
+                        events.emit(
+                            TaskEventBuilder::new(task_id, &task_name)
                                 .hostname(hostname)
                                 .pid(pid)
-                                .received();
-                            if let Err(e) = self.event_emitter.emit(event).await {
-                                debug!("Failed to emit task-received event: {}", e);
-                            }
-                        }
+                                .received(),
+                        );
 
                         // Check routing - can this worker handle this task type?
                         if !self.can_handle_task(&task_name) {
                             warn!(
-                                "Worker routing: cannot handle task type '{}', rejecting task {}",
+                                "Worker routing: cannot handle task type '{}', deferring task {}",
                                 task_name, task_id
                             );
 
-                            // Emit task-rejected event
-                            if self.config.enable_events {
-                                let event = Event::Task(celers_core::TaskEvent::Rejected {
-                                    task_id,
-                                    task_name: Some(task_name.clone()),
-                                    hostname: hostname.to_string(),
-                                    timestamp: chrono::Utc::now(),
-                                    reason: "Worker routing mismatch".to_string(),
-                                });
-                                if let Err(e) = self.event_emitter.emit(event).await {
-                                    debug!("Failed to emit task-rejected event: {}", e);
-                                }
-                            }
+                            events.emit(Event::Task(TaskEvent::Rejected {
+                                task_id,
+                                task_name: Some(task_name.clone()),
+                                hostname: hostname.to_string(),
+                                timestamp: chrono::Utc::now(),
+                                reason: "Worker routing mismatch".to_string(),
+                            }));
 
-                            // Reject task with requeue (another worker might handle it)
-                            if let Err(e) = self
-                                .broker
-                                .reject(&task_id, msg.receipt_handle.as_deref(), true)
-                                .await
-                            {
-                                error!("Failed to reject task {}: {}", task_id, e);
-                            }
+                            // Defer with requeue (another worker might handle it)
+                            self.defer_message(&task_id, msg.receipt_handle.as_deref(), "routing")
+                                .await;
+                            defer_delay = Some(
+                                self.admission_defer_delay()
+                                    .max(defer_delay.unwrap_or(Duration::ZERO)),
+                            );
                             continue;
                         }
 
@@ -628,29 +811,51 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                 task_name, task_id
                             );
 
-                            // Emit task-rejected event
-                            if self.config.enable_events {
-                                let event = Event::Task(celers_core::TaskEvent::Rejected {
-                                    task_id,
-                                    task_name: Some(task_name.clone()),
-                                    hostname: hostname.to_string(),
-                                    timestamp: chrono::Utc::now(),
-                                    reason: "Worker affinity mismatch".to_string(),
-                                });
-                                if let Err(e) = self.event_emitter.emit(event).await {
-                                    debug!("Failed to emit task-rejected event: {}", e);
-                                }
-                            }
+                            events.emit(Event::Task(TaskEvent::Rejected {
+                                task_id,
+                                task_name: Some(task_name.clone()),
+                                hostname: hostname.to_string(),
+                                timestamp: chrono::Utc::now(),
+                                reason: "Worker affinity mismatch".to_string(),
+                            }));
 
                             // Defer (requeue) so a worker with matching labels can
                             // pick the task up.
-                            if let Err(e) = self
-                                .broker
-                                .reject(&task_id, msg.receipt_handle.as_deref(), true)
-                                .await
-                            {
-                                error!("Failed to defer task {} on affinity: {}", task_id, e);
-                            }
+                            self.defer_message(&task_id, msg.receipt_handle.as_deref(), "affinity")
+                                .await;
+                            defer_delay = Some(
+                                self.admission_defer_delay()
+                                    .max(defer_delay.unwrap_or(Duration::ZERO)),
+                            );
+                            continue;
+                        }
+
+                        // Feature-flag admission: a task may declare features the
+                        // worker must have enabled to run it.
+                        if !self.features_satisfied(&task_name) {
+                            warn!(
+                                "Worker features do not satisfy task type '{}', deferring task {}",
+                                task_name, task_id
+                            );
+
+                            events.emit(Event::Task(TaskEvent::Rejected {
+                                task_id,
+                                task_name: Some(task_name.clone()),
+                                hostname: hostname.to_string(),
+                                timestamp: chrono::Utc::now(),
+                                reason: "Worker feature-flag mismatch".to_string(),
+                            }));
+
+                            self.defer_message(
+                                &task_id,
+                                msg.receipt_handle.as_deref(),
+                                "feature flags",
+                            )
+                            .await;
+                            defer_delay = Some(
+                                self.admission_defer_delay()
+                                    .max(defer_delay.unwrap_or(Duration::ZERO)),
+                            );
                             continue;
                         }
 
@@ -658,32 +863,40 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                         if let Some(ref cb) = self.circuit_breaker {
                             if !cb.should_allow(&task_name).await {
                                 warn!(
-                                    "Circuit breaker OPEN for task type '{}', rejecting task {}",
+                                    "Circuit breaker OPEN for task type '{}', failing task {}",
                                     task_name, task_id
                                 );
 
-                                // Emit task-rejected event
-                                if self.config.enable_events {
-                                    let event = Event::Task(celers_core::TaskEvent::Rejected {
-                                        task_id,
-                                        task_name: Some(task_name.clone()),
-                                        hostname: hostname.to_string(),
-                                        timestamp: chrono::Utc::now(),
-                                        reason: "Circuit breaker OPEN".to_string(),
-                                    });
-                                    if let Err(e) = self.event_emitter.emit(event).await {
-                                        debug!("Failed to emit task-rejected event: {}", e);
-                                    }
-                                }
+                                events.emit(Event::Task(TaskEvent::Rejected {
+                                    task_id,
+                                    task_name: Some(task_name.clone()),
+                                    hostname: hostname.to_string(),
+                                    timestamp: chrono::Utc::now(),
+                                    reason: "Circuit breaker OPEN".to_string(),
+                                }));
 
-                                // Reject task without retrying
-                                if let Err(e) = self
-                                    .broker
-                                    .reject(&task_id, msg.receipt_handle.as_deref(), false)
-                                    .await
-                                {
-                                    error!("Failed to reject task {}: {}", task_id, e);
-                                }
+                                // Terminal for the caller: emit task-failed and
+                                // record a DLQ entry so an open circuit is an
+                                // observable failure rather than a task that
+                                // silently disappears.
+                                execution::dead_letter(
+                                    &self.broker,
+                                    self.dlq_handler.as_ref(),
+                                    events,
+                                    hostname,
+                                    pid,
+                                    DeadLetterRequest {
+                                        task: &msg.task,
+                                        task_id,
+                                        receipt_handle: msg.receipt_handle.as_deref(),
+                                        retry_count: execution::spent_retries(&msg.task),
+                                        error_msg: "Circuit breaker OPEN for task type",
+                                        failure_type: "circuit_breaker",
+                                        extra_metadata: vec![("task_name", task_name.clone())],
+                                        dispose: true,
+                                    },
+                                )
+                                .await;
                                 continue;
                             }
                         }
@@ -694,7 +907,10 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                         // (respecting the limiter's suggested retry delay), rather
                         // than running it and exceeding the shared rate.
                         if let Some(ref coordinator) = self.rate_limit_coordinator {
-                            match coordinator.acquire(&task_name, "default").await {
+                            match coordinator
+                                .acquire(&task_name, &self.config.queue_name)
+                                .await
+                            {
                                 Ok(RateLimitDecision::Allowed) => {
                                     // Permit acquired; proceed to execution.
                                 }
@@ -710,16 +926,19 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                     self.stats.task_rate_limited();
 
                                     // Defer (requeue) so the task is retried later.
-                                    if let Err(e) = self
-                                        .broker
-                                        .reject(&task_id, msg.receipt_handle.as_deref(), true)
-                                        .await
-                                    {
-                                        error!(
-                                            "Failed to requeue rate-limited task {}: {}",
-                                            task_id, e
-                                        );
-                                    }
+                                    self.defer_message(
+                                        &task_id,
+                                        msg.receipt_handle.as_deref(),
+                                        "rate limit",
+                                    )
+                                    .await;
+                                    // Honour the limiter's own retry hint (clamped
+                                    // into the configured band) instead of
+                                    // discarding it and spinning.
+                                    defer_delay = Some(
+                                        self.clamped_defer_delay(retry_after)
+                                            .max(defer_delay.unwrap_or(Duration::ZERO)),
+                                    );
                                     continue;
                                 }
                                 Err(e) => {
@@ -736,32 +955,19 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                         }
 
                         // Execute task with timeout (use dynamic config if task doesn't specify)
-                        let default_timeout = self
+                        let (default_timeout, dynamic_max_retries) = self
                             .dynamic_config
                             .read()
-                            .map(|c| c.default_timeout_secs)
-                            .unwrap_or(300);
+                            .map(|c| (c.default_timeout_secs, c.max_retries))
+                            .unwrap_or((300, self.config.max_retries));
                         let timeout_secs =
                             msg.task.metadata.timeout_secs.unwrap_or(default_timeout);
-
-                        let broker = Arc::clone(&self.broker);
-                        let registry = Arc::clone(&self.registry);
-                        let circuit_breaker = self.circuit_breaker.clone();
-                        let receipt_handle = msg.receipt_handle.clone();
-                        let task = msg.task.clone();
-                        let event_emitter = Arc::clone(&self.event_emitter);
-                        let enable_events = self.config.enable_events;
-                        let hostname = hostname.to_string();
-                        let stats = Arc::clone(&self.stats);
-                        let middleware = self.middleware_stack.clone();
-                        let dlq_handler = self.dlq_handler.clone();
 
                         // Cooperative cancellation: register this task as in-flight
                         // and obtain its cancellation token + execution context. The
                         // token is tripped by the revocation watcher if a matching
                         // revocation signal arrives while the task runs.
-                        let revocation_watcher = self.revocation_watcher.clone();
-                        let exec_context = match revocation_watcher {
+                        let exec_context = match self.revocation_watcher {
                             Some(ref watcher) => {
                                 let token = watcher.register(task_id).await;
                                 Some(TaskExecutionContext::new(token))
@@ -769,454 +975,56 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             None => None,
                         };
 
-                        tokio::spawn(async move {
-                            let start_time = Instant::now();
+                        // The task's own retry request, capped by the worker's
+                        // (runtime updatable) retry budget.
+                        let task_max_retries = msg.task.metadata.max_retries;
+                        let receipt_handle = msg.receipt_handle;
 
-                            // Track active task
-                            stats.task_started();
+                        let dispatch = TaskDispatch {
+                            broker: Arc::clone(&self.broker),
+                            registry: Arc::clone(&self.registry),
+                            task: Arc::new(msg.task),
+                            task_id,
+                            receipt_handle: receipt_handle.clone(),
+                            events: events.clone(),
+                            hostname: hostname.to_string(),
+                            pid,
+                            stats: Arc::clone(&self.stats),
+                            middleware: self.middleware_stack.clone(),
+                            dlq_handler: self.dlq_handler.clone(),
+                            circuit_breaker: self.circuit_breaker.clone(),
+                            revocation_watcher: self.revocation_watcher.clone(),
+                            exec_context,
+                            in_flight: in_flight.clone(),
+                            memory_tracker: memory_tracker.clone(),
+                            timeout_secs,
+                            max_retries: effective_max_retries(
+                                task_max_retries,
+                                dynamic_max_retries,
+                            ),
+                            retry_config: retry_config.clone(),
+                            max_result_size_bytes: self.config.max_result_size_bytes,
+                        };
 
-                            // Create middleware context
-                            let mut ctx = middleware::TaskContext {
-                                task_id: task_id.to_string(),
-                                task_name: task.metadata.name.clone(),
-                                retry_count: match task.metadata.state {
-                                    TaskState::Retrying(count) => count,
-                                    _ => 0,
-                                },
-                                worker_name: hostname.clone(),
-                                metadata: std::collections::HashMap::new(),
-                            };
+                        in_flight.register(task_id, receipt_handle);
 
-                            // Emit task-started event
-                            if enable_events {
-                                let event = TaskEventBuilder::new(task_id, &task.metadata.name)
-                                    .hostname(&hostname)
-                                    .pid(pid)
-                                    .started();
-                                if let Err(e) = event_emitter.emit(event).await {
-                                    debug!("Failed to emit task-started event: {}", e);
-                                }
-                            }
+                        // Count the task as active *before* spawning: both drain
+                        // paths gate on this counter, and a task that is queued
+                        // but not yet polled must not look like idle capacity.
+                        self.stats.task_started();
+                        let guard = ActiveTaskGuard::new(Arc::clone(&self.stats), permit);
 
-                            // Call before_task middleware
-                            if let Some(ref mw) = middleware {
-                                if let Err(e) = mw.before_task(&mut ctx).await {
-                                    warn!("Middleware before_task error: {}", e);
-                                }
-                            }
+                        tokio::spawn(execution::run_dispatched_task(dispatch, guard));
+                        dispatched += 1;
+                    }
 
-                            // Outcome of driving the task future, accounting for
-                            // timeout *and* cooperative cancellation.
-                            enum ExecOutcome {
-                                /// Task ran to completion (success or task error).
-                                Completed(Result<Vec<u8>>),
-                                /// Task exceeded its timeout.
-                                TimedOut,
-                                /// Task was cancelled/revoked while running.
-                                Cancelled,
-                            }
-
-                            // Drive the task. When cooperative cancellation is
-                            // enabled, run the task future inside its execution
-                            // context (so task code can observe the ambient token)
-                            // and race it against the token: whichever finishes
-                            // first wins. The whole thing is still bounded by the
-                            // configured timeout.
-                            let exec_outcome = match exec_context {
-                                Some(ref context) => {
-                                    let token = context.token().clone();
-                                    let task_future = context.scope(registry.execute(&task));
-                                    match timeout(Duration::from_secs(timeout_secs), async {
-                                        tokio::select! {
-                                            biased;
-                                            // If already cancelled (or cancelled
-                                            // mid-flight at an await point), stop.
-                                            () = token.cancelled() => None,
-                                            res = task_future => Some(res),
-                                        }
-                                    })
-                                    .await
-                                    {
-                                        Ok(Some(res)) => ExecOutcome::Completed(res),
-                                        Ok(None) => ExecOutcome::Cancelled,
-                                        Err(_) => ExecOutcome::TimedOut,
-                                    }
-                                }
-                                None => match timeout(
-                                    Duration::from_secs(timeout_secs),
-                                    registry.execute(&task),
-                                )
-                                .await
-                                {
-                                    Ok(res) => ExecOutcome::Completed(res),
-                                    Err(_) => ExecOutcome::TimedOut,
-                                },
-                            };
-
-                            match exec_outcome {
-                                ExecOutcome::Completed(Ok(result)) => {
-                                    // Task succeeded
-                                    let duration = start_time.elapsed();
-                                    info!(
-                                        "Task {} completed successfully in {:?}",
-                                        task_id, duration
-                                    );
-                                    debug!("Result size: {} bytes", result.len());
-
-                                    // Parse result as JSON for middleware (best effort)
-                                    let result_json = serde_json::from_slice(&result)
-                                        .unwrap_or(serde_json::json!({"result": "binary"}));
-
-                                    // Call after_task middleware
-                                    if let Some(ref mw) = middleware {
-                                        if let Err(e) = mw.after_task(&ctx, &result_json).await {
-                                            warn!("Middleware after_task error: {}", e);
-                                        }
-                                    }
-
-                                    // Emit task-succeeded event
-                                    if enable_events {
-                                        let event =
-                                            TaskEventBuilder::new(task_id, &task.metadata.name)
-                                                .hostname(&hostname)
-                                                .pid(pid)
-                                                .succeeded(duration.as_secs_f64());
-                                        if let Err(e) = event_emitter.emit(event).await {
-                                            debug!("Failed to emit task-succeeded event: {}", e);
-                                        }
-                                    }
-
-                                    // Record success in circuit breaker
-                                    if let Some(ref cb) = circuit_breaker {
-                                        cb.record_success(&task.metadata.name).await;
-                                    }
-
-                                    #[cfg(feature = "metrics")]
-                                    {
-                                        TASKS_COMPLETED_TOTAL.inc();
-                                        TASK_EXECUTION_TIME.observe(duration.as_secs_f64());
-
-                                        // Track per-task-type metrics
-                                        let task_name = &task.metadata.name;
-                                        TASKS_COMPLETED_BY_TYPE
-                                            .with_label_values(&[task_name])
-                                            .inc();
-                                        TASK_EXECUTION_TIME_BY_TYPE
-                                            .with_label_values(&[task_name])
-                                            .observe(duration.as_secs_f64());
-                                    }
-
-                                    if let Err(e) =
-                                        broker.ack(&task_id, receipt_handle.as_deref()).await
-                                    {
-                                        error!("Failed to acknowledge task {}: {}", task_id, e);
-                                    }
-                                }
-                                ExecOutcome::Completed(Err(e)) => {
-                                    // Task failed
-                                    let error_msg = e.to_string();
-                                    error!("Task {} failed: {}", task_id, error_msg);
-
-                                    // Check if we should retry
-                                    let current_retry = match task.metadata.state {
-                                        TaskState::Retrying(count) => count,
-                                        _ => 0,
-                                    };
-
-                                    if current_retry < task.metadata.max_retries {
-                                        // Requeue for retry
-                                        warn!(
-                                            "Requeuing task {} for retry {}/{}",
-                                            task_id,
-                                            current_retry + 1,
-                                            task.metadata.max_retries
-                                        );
-
-                                        // Call on_retry middleware
-                                        if let Some(ref mw) = middleware {
-                                            if let Err(e) =
-                                                mw.on_retry(&ctx, current_retry + 1).await
-                                            {
-                                                warn!("Middleware on_retry error: {}", e);
-                                            }
-                                        }
-
-                                        // Emit task-retried event
-                                        if enable_events {
-                                            let event =
-                                                TaskEventBuilder::new(task_id, &task.metadata.name)
-                                                    .hostname(&hostname)
-                                                    .pid(pid)
-                                                    .retried(&error_msg, current_retry + 1);
-                                            if let Err(e) = event_emitter.emit(event).await {
-                                                debug!("Failed to emit task-retried event: {}", e);
-                                            }
-                                        }
-
-                                        #[cfg(feature = "metrics")]
-                                        {
-                                            TASKS_RETRIED_TOTAL.inc();
-
-                                            // Track per-task-type metrics
-                                            let task_name = &task.metadata.name;
-                                            TASKS_RETRIED_BY_TYPE
-                                                .with_label_values(&[task_name])
-                                                .inc();
-                                        }
-
-                                        if let Err(e) = broker
-                                            .reject(&task_id, receipt_handle.as_deref(), true)
-                                            .await
-                                        {
-                                            error!("Failed to requeue task {}: {}", task_id, e);
-                                        }
-                                    } else {
-                                        // Max retries reached, permanently fail
-                                        error!(
-                                            "Task {} failed permanently after {} retries",
-                                            task_id, current_retry
-                                        );
-
-                                        // Call on_error middleware
-                                        if let Some(ref mw) = middleware {
-                                            if let Err(e) = mw.on_error(&ctx, &error_msg).await {
-                                                warn!("Middleware on_error error: {}", e);
-                                            }
-                                        }
-
-                                        // Emit task-failed event
-                                        if enable_events {
-                                            let event =
-                                                TaskEventBuilder::new(task_id, &task.metadata.name)
-                                                    .hostname(&hostname)
-                                                    .pid(pid)
-                                                    .failed(&error_msg);
-                                            if let Err(e) = event_emitter.emit(event).await {
-                                                debug!("Failed to emit task-failed event: {}", e);
-                                            }
-                                        }
-
-                                        // Record failure in circuit breaker
-                                        if let Some(ref cb) = circuit_breaker {
-                                            cb.record_failure(&task.metadata.name).await;
-                                        }
-
-                                        // Add to DLQ if enabled
-                                        if let Some(ref dlq) = dlq_handler {
-                                            let dlq_entry = dlq::DlqEntry::new(
-                                                task.clone(),
-                                                task_id,
-                                                current_retry,
-                                                error_msg.clone(),
-                                                hostname.clone(),
-                                            )
-                                            .with_metadata("failure_type", "execution_error");
-
-                                            if let Err(e) = dlq.add_entry(dlq_entry).await {
-                                                warn!(
-                                                    "Failed to add task {} to DLQ: {}",
-                                                    task_id, e
-                                                );
-                                            }
-                                        }
-
-                                        #[cfg(feature = "metrics")]
-                                        {
-                                            TASKS_FAILED_TOTAL.inc();
-
-                                            // Track per-task-type metrics
-                                            let task_name = &task.metadata.name;
-                                            TASKS_FAILED_BY_TYPE
-                                                .with_label_values(&[task_name])
-                                                .inc();
-                                        }
-
-                                        if let Err(e) = broker
-                                            .reject(&task_id, receipt_handle.as_deref(), false)
-                                            .await
-                                        {
-                                            error!("Failed to reject task {}: {}", task_id, e);
-                                        }
-                                    }
-                                }
-                                ExecOutcome::TimedOut => {
-                                    // Timeout
-                                    let error_msg =
-                                        format!("Task timed out after {}s", timeout_secs);
-                                    error!("Task {} timed out after {}s", task_id, timeout_secs);
-
-                                    // Requeue if retries remaining
-                                    let current_retry = match task.metadata.state {
-                                        TaskState::Retrying(count) => count,
-                                        _ => 0,
-                                    };
-
-                                    if current_retry < task.metadata.max_retries {
-                                        // Call on_retry middleware
-                                        if let Some(ref mw) = middleware {
-                                            if let Err(e) =
-                                                mw.on_retry(&ctx, current_retry + 1).await
-                                            {
-                                                warn!("Middleware on_retry error: {}", e);
-                                            }
-                                        }
-
-                                        // Emit task-retried event
-                                        if enable_events {
-                                            let event =
-                                                TaskEventBuilder::new(task_id, &task.metadata.name)
-                                                    .hostname(&hostname)
-                                                    .pid(pid)
-                                                    .retried(&error_msg, current_retry + 1);
-                                            if let Err(e) = event_emitter.emit(event).await {
-                                                debug!("Failed to emit task-retried event: {}", e);
-                                            }
-                                        }
-
-                                        #[cfg(feature = "metrics")]
-                                        {
-                                            TASKS_RETRIED_TOTAL.inc();
-
-                                            // Track per-task-type metrics
-                                            let task_name = &task.metadata.name;
-                                            TASKS_RETRIED_BY_TYPE
-                                                .with_label_values(&[task_name])
-                                                .inc();
-                                        }
-
-                                        if let Err(e) = broker
-                                            .reject(&task_id, receipt_handle.as_deref(), true)
-                                            .await
-                                        {
-                                            error!("Failed to requeue task {}: {}", task_id, e);
-                                        }
-                                    } else {
-                                        // Call on_error middleware
-                                        if let Some(ref mw) = middleware {
-                                            if let Err(e) = mw.on_error(&ctx, &error_msg).await {
-                                                warn!("Middleware on_error error: {}", e);
-                                            }
-                                        }
-
-                                        // Record timeout failure in circuit breaker
-                                        if let Some(ref cb) = circuit_breaker {
-                                            cb.record_failure(&task.metadata.name).await;
-                                        }
-
-                                        // Add to DLQ if enabled
-                                        if let Some(ref dlq) = dlq_handler {
-                                            let dlq_entry = dlq::DlqEntry::new(
-                                                task.clone(),
-                                                task_id,
-                                                current_retry,
-                                                error_msg.clone(),
-                                                hostname.clone(),
-                                            )
-                                            .with_metadata("failure_type", "timeout")
-                                            .with_metadata(
-                                                "timeout_secs",
-                                                timeout_secs.to_string(),
-                                            );
-
-                                            if let Err(e) = dlq.add_entry(dlq_entry).await {
-                                                warn!(
-                                                    "Failed to add task {} to DLQ: {}",
-                                                    task_id, e
-                                                );
-                                            }
-                                        }
-
-                                        // Emit task-failed event
-                                        if enable_events {
-                                            let event =
-                                                TaskEventBuilder::new(task_id, &task.metadata.name)
-                                                    .hostname(&hostname)
-                                                    .pid(pid)
-                                                    .failed(&error_msg);
-                                            if let Err(e) = event_emitter.emit(event).await {
-                                                debug!("Failed to emit task-failed event: {}", e);
-                                            }
-                                        }
-
-                                        #[cfg(feature = "metrics")]
-                                        {
-                                            TASKS_FAILED_TOTAL.inc();
-
-                                            // Track per-task-type metrics
-                                            let task_name = &task.metadata.name;
-                                            TASKS_FAILED_BY_TYPE
-                                                .with_label_values(&[task_name])
-                                                .inc();
-                                        }
-
-                                        if let Err(e) = broker
-                                            .reject(&task_id, receipt_handle.as_deref(), false)
-                                            .await
-                                        {
-                                            error!("Failed to reject task {}: {}", task_id, e);
-                                        }
-                                    }
-                                }
-                                ExecOutcome::Cancelled => {
-                                    // Task was revoked while running: transition to
-                                    // Revoked and stop. The work is abandoned (the
-                                    // task future was dropped at its last await
-                                    // point or stopped at a cooperative check); we
-                                    // do not retry a deliberately revoked task.
-                                    let duration = start_time.elapsed();
-                                    info!(
-                                        "Task {} revoked after {:?}, transitioning to Revoked",
-                                        task_id, duration
-                                    );
-
-                                    // Inform middleware via on_error so observers
-                                    // (tracing/metrics) see the terminal outcome.
-                                    if let Some(ref mw) = middleware {
-                                        if let Err(e) =
-                                            mw.on_error(&ctx, "Task revoked during execution").await
-                                        {
-                                            warn!("Middleware on_error error: {}", e);
-                                        }
-                                    }
-
-                                    // Emit task-revoked event
-                                    if enable_events {
-                                        let event = Event::Task(TaskEvent::Revoked {
-                                            task_id,
-                                            task_name: Some(task.metadata.name.clone()),
-                                            timestamp: chrono::Utc::now(),
-                                            terminated: true,
-                                            signum: None,
-                                            expired: false,
-                                        });
-                                        if let Err(e) = event_emitter.emit(event).await {
-                                            debug!("Failed to emit task-revoked event: {}", e);
-                                        }
-                                    }
-
-                                    stats.task_revoked();
-
-                                    // Acknowledge so the broker removes the task
-                                    // (it must not be redelivered to run again).
-                                    if let Err(e) =
-                                        broker.ack(&task_id, receipt_handle.as_deref()).await
-                                    {
-                                        error!(
-                                            "Failed to acknowledge revoked task {}: {}",
-                                            task_id, e
-                                        );
-                                    }
-                                }
-                            };
-
-                            // Clean up the in-flight cancellation token (if any).
-                            if let Some(ref watcher) = revocation_watcher {
-                                watcher.unregister(&task_id).await;
-                            }
-
-                            // Track task completion
-                            stats.task_completed();
-                        });
+                    // Nothing ran: back off before polling again so a queue full
+                    // of undeliverable work cannot spin the loop at 100% CPU.
+                    if let Some(delay) = defer_delay.filter(|d| dispatched == 0 && !d.is_zero()) {
+                        debug!("All dequeued messages deferred, backing off {:?}", delay);
+                        if Self::sleep_or_shutdown(shutdown_rx, delay).await {
+                            break StopReason::Shutdown;
+                        }
                     }
                 }
                 Ok(_) => {
@@ -1226,37 +1034,122 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                     // used.
                     let sleep_for = match adaptive_poll {
                         Some(ref mut ap) => ap.record(PollOutcome::Empty),
-                        None => {
-                            let poll_interval = self
-                                .dynamic_config
-                                .read()
-                                .map(|c| c.poll_interval_ms)
-                                .unwrap_or(1000);
-                            Duration::from_millis(poll_interval)
-                        }
+                        None => self.poll_interval(),
                     };
                     debug!("Queue empty, sleeping for {:?}", sleep_for);
-                    sleep(sleep_for).await;
+                    if Self::sleep_or_shutdown(shutdown_rx, sleep_for).await {
+                        break StopReason::Shutdown;
+                    }
                 }
                 Err(e) => {
                     // Dequeue failed: back off like an empty poll under the
                     // adaptive controller so a flapping broker is not hammered.
                     let sleep_for = match adaptive_poll {
                         Some(ref mut ap) => ap.record(PollOutcome::Error),
-                        None => {
-                            let poll_interval = self
-                                .dynamic_config
-                                .read()
-                                .map(|c| c.poll_interval_ms)
-                                .unwrap_or(1000);
-                            Duration::from_millis(poll_interval)
-                        }
+                        None => self.poll_interval(),
                     };
                     error!("Error dequeueing tasks: {}", e);
-                    sleep(sleep_for).await;
+                    if Self::sleep_or_shutdown(shutdown_rx, sleep_for).await {
+                        break StopReason::Shutdown;
+                    }
                 }
             }
+        };
+
+        info!(
+            "Worker stopping ({}), draining in-flight tasks",
+            stop_reason.as_str()
+        );
+        self.drain_in_flight(&permits, &in_flight, concurrency)
+            .await;
+        info!("Worker stopped ({})", stop_reason.as_str());
+
+        Ok(())
+    }
+
+    /// Wait for every dispatched task to finish, then hand anything still
+    /// undisposed back to the broker.
+    ///
+    /// The concurrency semaphore doubles as the drain barrier: holding all
+    /// `concurrency` permits means no task is running. On deadline (or when
+    /// [`WorkerConfig::graceful_shutdown`](crate::WorkerConfig::graceful_shutdown)
+    /// is off) the messages that were dequeued but never disposed of are
+    /// requeued, so they are redelivered instead of being stranded in the
+    /// broker's processing list with no reaper to recover them.
+    async fn drain_in_flight(
+        &self,
+        permits: &Arc<Semaphore>,
+        in_flight: &InFlightRegistry,
+        concurrency: usize,
+    ) {
+        let deadline = Duration::from_secs(self.config.shutdown_timeout_secs);
+        let drain_permits = u32::try_from(concurrency).unwrap_or(u32::MAX);
+
+        if self.config.graceful_shutdown && !deadline.is_zero() {
+            let outstanding = in_flight.len();
+            if outstanding > 0 {
+                info!(
+                    "Waiting up to {:?} for {} in-flight task(s) to finish",
+                    deadline, outstanding
+                );
+            }
+            match timeout(deadline, permits.acquire_many(drain_permits)).await {
+                Ok(Ok(_all_permits)) => {
+                    info!("All in-flight tasks completed");
+                }
+                Ok(Err(e)) => {
+                    warn!("Concurrency semaphore closed while draining: {}", e);
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "Graceful shutdown deadline of {:?} exceeded with {} task(s) still \
+                         running; requeueing their messages",
+                        deadline,
+                        in_flight.len()
+                    );
+                }
+            }
+        } else if !in_flight.is_empty() {
+            warn!(
+                "Graceful shutdown disabled; requeueing {} in-flight message(s)",
+                in_flight.len()
+            );
         }
+
+        // Whatever is left was never disposed of by its task: give it back to
+        // the broker rather than losing it.
+        for (task_id, receipt_handle) in in_flight.take_all() {
+            warn!("Requeueing undisposed task {} at shutdown", task_id);
+            if let Err(e) = self
+                .broker
+                .reject(&task_id, receipt_handle.as_deref(), true)
+                .await
+            {
+                error!(
+                    "Failed to requeue in-flight task {} at shutdown: {}",
+                    task_id, e
+                );
+            }
+        }
+    }
+
+    /// Deferral delay for admission decisions (routing / affinity / features).
+    fn admission_defer_delay(&self) -> Duration {
+        clamp_defer_delay(
+            Duration::from_millis(self.config.defer_delay_ms),
+            self.config.defer_delay_ms,
+            self.config.defer_max_delay_ms,
+        )
+    }
+
+    /// Clamp an externally supplied delay (e.g. a rate limiter's `retry_after`)
+    /// into the configured deferral band.
+    fn clamped_defer_delay(&self, requested: Duration) -> Duration {
+        clamp_defer_delay(
+            requested,
+            self.config.defer_delay_ms,
+            self.config.defer_max_delay_ms,
+        )
     }
 
     /// Coalesce duplicate messages within a dequeued batch, acknowledging the
@@ -1266,6 +1159,16 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// [`batching::broker_message_coalesce_key`] preserving first-seen order;
     /// the chosen representative follows `strategy`. Duplicates are best-effort
     /// acked (a failed ack is logged but does not abort processing).
+    ///
+    /// # Result loss
+    ///
+    /// The default coalescing key is `(task name, payload hash)`, which does
+    /// **not** include the task id: two independent submissions with identical
+    /// arguments coalesce into one, and the dropped one never runs and never
+    /// produces a result. Set
+    /// [`WorkerConfig::coalesce_require_same_task_id`](crate::WorkerConfig::coalesce_require_same_task_id)
+    /// to restrict coalescing to true redelivery duplicates (same task id),
+    /// which is lossless.
     async fn coalesce_and_ack_duplicates(
         &self,
         messages: Vec<celers_core::BrokerMessage>,
@@ -1276,12 +1179,21 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     ) {
         use std::collections::HashMap;
 
+        let require_same_id = self.config.coalesce_require_same_task_id;
+
         let mut survivors: Vec<celers_core::BrokerMessage> = Vec::with_capacity(messages.len());
         let mut dropped: Vec<celers_core::BrokerMessage> = Vec::new();
-        let mut index: HashMap<(String, u64), usize> = HashMap::with_capacity(messages.len());
+        let mut index: HashMap<(Option<TaskId>, String, u64), usize> =
+            HashMap::with_capacity(messages.len());
 
         for msg in messages {
-            let key = batching::broker_message_coalesce_key(&msg);
+            let (name, payload_hash) = batching::broker_message_coalesce_key(&msg);
+            let key = if require_same_id {
+                (Some(msg.task.metadata.id), name, payload_hash)
+            } else {
+                (None, name, payload_hash)
+            };
+
             if let Some(&existing_idx) = index.get(&key) {
                 match strategy {
                     CoalesceStrategy::KeepFirst => {
@@ -1318,11 +1230,16 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         (survivors, dropped)
     }
 
-    /// Calculate exponential backoff delay
-    #[allow(dead_code)]
-    pub(crate) fn calculate_backoff_delay(&self, retry_count: u32) -> StdDuration {
-        let delay_ms = self.config.retry_base_delay_ms * 2_u64.pow(retry_count);
-        let delay_ms = delay_ms.min(self.config.retry_max_delay_ms);
-        StdDuration::from_millis(delay_ms)
+    /// Calculate the backoff delay applied before retry attempt `retry_count`.
+    ///
+    /// Delegates to the effective [`RetryConfig`](crate::RetryConfig) (the
+    /// explicit `retry_config` when set, otherwise the legacy
+    /// `retry_base_delay_ms` / `retry_max_delay_ms` pair) — the same value the
+    /// execution loop schedules a retry with. The computation is done in
+    /// floating point and capped, where the previous
+    /// `base * 2u64.pow(retry_count)` overflowed and panicked for large retry
+    /// counts.
+    pub fn calculate_backoff_delay(&self, retry_count: u32) -> StdDuration {
+        support::backoff_delay(&self.config.get_retry_config(), retry_count)
     }
 }

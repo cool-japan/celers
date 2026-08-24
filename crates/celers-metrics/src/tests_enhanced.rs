@@ -328,6 +328,87 @@ fn test_summary_quantile_accuracy_shuffled_input() {
 }
 
 #[test]
+fn test_summary_quantile_accuracy_decreasing_stream() {
+    // Regression test for the P-Square downward-marker-adjustment bug
+    // (interior markers must be able to move *down*, not just up). A
+    // strictly decreasing stream is exactly the case where the original,
+    // broken downward condition (`n[i] - n[i-1] < -1.0`, unsatisfiable since
+    // marker positions never decrease) left every estimate pinned near its
+    // initialization value: pre-fix this reported p50 ~= 998 instead of
+    // ~500, a ~100% error.
+    let summary = NativeSummary::new("s", "help", vec![0.5, 0.9, 0.99]).expect("valid quantiles");
+
+    for v in (1..=1000).rev() {
+        summary.observe(f64::from(v));
+    }
+
+    let p50 = summary.quantile(0.5).expect("p50");
+    let p90 = summary.quantile(0.9).expect("p90");
+    let p99 = summary.quantile(0.99).expect("p99");
+
+    // True percentiles of {1..=1000} are ~500/~900/~990 regardless of feed
+    // order; same tolerance as the increasing-stream case above.
+    assert!((p50 - 500.0).abs() < 25.0, "p50 estimate was {p50}");
+    assert!((p90 - 900.0).abs() < 25.0, "p90 estimate was {p90}");
+    assert!((p99 - 990.0).abs() < 25.0, "p99 estimate was {p99}");
+
+    assert!(p50 < p90, "p50 ({p50}) should be < p90 ({p90})");
+    assert!(p90 < p99, "p90 ({p90}) should be < p99 ({p99})");
+}
+
+#[test]
+fn test_summary_quantile_accuracy_seeded_pseudo_random_stream() {
+    // Deterministic pseudo-random (unordered) stream, matching the audit's
+    // reproduction case for this bug (~36% p50 error before the fix). A
+    // small LCG keeps the test hermetic and reproducible without `rand`.
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // Top 53 bits -> uniform in [0, 1), scaled to an integer in [1, 1000].
+        ((state >> 11) as f64 / (1_u64 << 53) as f64 * 1000.0).floor() + 1.0
+    };
+
+    let mut values: Vec<f64> = Vec::with_capacity(2000);
+    let summary = NativeSummary::new("s", "help", vec![0.5, 0.9, 0.99]).expect("valid quantiles");
+    for _ in 0..2000 {
+        let v = next();
+        values.push(v);
+        summary.observe(v);
+    }
+
+    // Ground truth: exact nearest-rank percentile of the same stream, sorted.
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let true_percentile = |p: f64| -> f64 {
+        let idx = ((p * values.len() as f64).round() as usize).min(values.len() - 1);
+        values[idx]
+    };
+    let true_p50 = true_percentile(0.5);
+    let true_p90 = true_percentile(0.9);
+    let true_p99 = true_percentile(0.99);
+
+    let p50 = summary.quantile(0.5).expect("p50");
+    let p90 = summary.quantile(0.9).expect("p90");
+    let p99 = summary.quantile(0.99).expect("p99");
+
+    // The P-Square estimate is approximate; require it within 10% of the
+    // true value -- well under the ~36% error the audit measured pre-fix.
+    assert!(
+        (p50 - true_p50).abs() < true_p50 * 0.10,
+        "p50 estimate {p50} too far from true {true_p50}"
+    );
+    assert!(
+        (p90 - true_p90).abs() < true_p90 * 0.10,
+        "p90 estimate {p90} too far from true {true_p90}"
+    );
+    assert!(
+        (p99 - true_p99).abs() < true_p99 * 0.10,
+        "p99 estimate {p99} too far from true {true_p99}"
+    );
+}
+
+#[test]
 fn test_summary_quantile_small_sample() {
     // Fewer than five observations should still yield a sensible estimate from
     // the initialization buffer (nearest-rank).

@@ -49,6 +49,7 @@ pub trait RowExt {
     /// (`SELECT version()`, `SELECT count(*)`) is the one case where the
     /// implicit name is well-defined (the function name) and [`RowExt::col`]
     /// is safe and preferred for readability.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     fn col_idx<T: oxisql_core::FromValue>(&self, idx: usize) -> Result<T, OxiSqlError>;
 }
 
@@ -103,8 +104,49 @@ pub(crate) use row_to;
 // through these instead of re-deriving the `u128`/`String` conversion
 // inline.
 
-/// Convert a [`uuid::Uuid`] into an [`oxisql_core::Value::Uuid`] for binding
-/// as a query parameter.
+/// Convert a [`uuid::Uuid`] into an [`oxisql_core::Value::Uuid`].
+///
+/// # ⚠️ NOT safe to bind against a `uuid`-typed Postgres placeholder
+///
+/// Despite the name, **do not** bind this `Value` against a bare `$n`
+/// placeholder that Postgres infers as `uuid` (e.g. `WHERE task_id = $1` on a
+/// `task_id UUID` column) — it will fail against a live server:
+///
+/// - `oxisql-postgres`'s `value_to_param` converts `Value::Uuid(u)` to
+///   `OwnedParam::Text(format!("{}", Value::Uuid(u)))` — the 36-character
+///   hyphenated text form, e.g. `"3fa85f64-5717-4562-b3fc-2c963f66afa6"`.
+/// - `OwnedParam::accepts()` unconditionally returns `true`, bypassing the
+///   `to_sql_checked!` guard that would otherwise reject a text payload for a
+///   `uuid`-typed placeholder before it reaches the wire.
+/// - `postgres-types`' `impl ToSql for String` (which `OwnedParam::Text`
+///   delegates to) writes the raw UTF-8 text bytes regardless of the
+///   server-inferred parameter type (`_ => types::text_to_sql(self, w)`), and
+///   `tokio-postgres` always binds parameters in Postgres **binary** format.
+/// - Postgres' binary `uuid_recv` expects exactly 16 bytes. A 36-byte text
+///   payload sent as a binary `uuid` parameter is rejected by the server.
+///
+/// This is the exact same class of hazard documented below for
+/// `DateTime<Utc>` timestamps, and the fix is the same shape: bind
+/// `id.to_string()` (a plain `String`, whose text and binary wire formats are
+/// identical) with an inner `::text` cast at the placeholder so Postgres
+/// infers `TEXT` rather than `uuid`, then an outer `::uuid` cast to convert
+/// server-side:
+///
+/// ```ignore
+/// let id: uuid::Uuid = ...;
+/// conn.execute(
+///     "DELETE FROM t WHERE id = $1::text::uuid",
+///     &[&id.to_string()],
+/// ).await?;
+/// ```
+///
+/// Every Postgres query parameter in this crate binds `id.to_string()` (with
+/// a `$n::text::uuid` cast) instead of this function — **do not reintroduce
+/// a direct `uuid_param(..)` parameter bind against a UUID-typed
+/// placeholder.** This function remains correct and used on the READ side
+/// ([`uuid_from_row`]/[`opt_uuid_from_row`] decode the server's native binary
+/// `uuid` column encoding, an entirely different code path with no such
+/// hazard) and for round-tripping through those functions in tests.
 ///
 /// # Why `Value`, not a bare `u128`
 ///
@@ -116,23 +158,10 @@ pub(crate) use row_to;
 /// the primitive types (`i64`, `i32`, `f64`, `str`, `String`, `bool`,
 /// `Vec<u8>`) and, notably, for [`oxisql_core::Value`] itself (verified
 /// exhaustively against `oxisql-core`'s `traits.rs`: nine `impl ToSqlValue`
-/// blocks total, none for `u128`). Binding a bare `u128` (e.g.
-/// `&[&uuid_param(&id)]` when `uuid_param` returned `u128`) therefore fails
-/// to compile with "the trait bound `u128: ToSqlValue` is not satisfied" at
-/// every call site.
-///
-/// Returning `Value::Uuid(u.as_u128())` instead sidesteps the gap entirely:
-/// `Value` already implements `ToSqlValue` (`to_value` is just `self.clone()`
-/// — see `oxisql-core`'s `traits.rs`), so every existing `&task_id_param`
-/// binding call site keeps compiling unchanged; only this function's return
-/// type moved from the raw representation to the wrapping enum variant.
-///
-/// # Example
-///
-/// ```ignore
-/// let id = Uuid::new_v4();
-/// conn.execute("INSERT INTO t (id) VALUES ($1)", &[&uuid_param(&id)]).await?;
-/// ```
+/// blocks total, none for `u128`). Binding a bare `u128` therefore fails to
+/// compile with "the trait bound `u128: ToSqlValue` is not satisfied".
+/// Returning `Value::Uuid(u.as_u128())` instead sidesteps the gap: `Value`
+/// already implements `ToSqlValue` (`to_value` is just `self.clone()`).
 #[allow(dead_code)]
 pub fn uuid_param(u: &uuid::Uuid) -> oxisql_core::Value {
     oxisql_core::Value::Uuid(u.as_u128())
@@ -194,6 +223,108 @@ pub fn json_from_row(row: &Row, col: &str) -> Result<serde_json::Value, OxiSqlEr
         .transpose()
         .map_err(|e| OxiSqlError::Other(format!("invalid JSON in column '{col}': {e}")))?
         .unwrap_or(serde_json::Value::Null))
+}
+
+// ── Numeric column convention (DECIMAL / NUMERIC) ───────────────────────────
+//
+// MySQL returns `SUM()`/`AVG()` over exact-value (integer or DECIMAL)
+// arguments as `DECIMAL`, and Postgres returns `NUMERIC` for `EXTRACT(...)`
+// (PostgreSQL >= 14) and for arithmetic over `NUMERIC`. Both map to
+// `oxisql_core::Value::Decimal(String)` on the read side (confirmed against
+// `oxisql-mysql`'s `types.rs` `MYSQL_TYPE_NEWDECIMAL`/`MYSQL_TYPE_DECIMAL`
+// mapping and `oxisql-postgres`'s `types.rs` `Type::NUMERIC` mapping), and
+// `oxisql_core::FromValue` is implemented for `f64`/`i64` against
+// `Value::F64`/`Value::I64` only -- never `Value::Decimal` -- so a direct
+// `row.col::<f64>(..)`/`row.col::<i64>(..)` on such a column always returns
+// `OxiSqlError::TypeMismatch`, regardless of backend.
+//
+// The helpers below are the crate's canonical numeric read: they inspect the
+// raw `Value` (via `Row::get`, bypassing `FromValue`) and accept `F64`, `I64`,
+// *and* `Decimal` (parsing the decimal string), so a query is correct whether
+// the driver happens to hand back an exact float/int type or a decimal
+// string. Prefer these over `row.col::<f64/i64>(..)` for any column derived
+// from `SUM`/`AVG`/`MIN`/`MAX`/`EXTRACT`/division -- i.e. anything that is not
+// provably `COUNT(*)` (always `BIGINT`/`I64`) or already cast in SQL.
+
+/// Read a numeric column as `f64`, accepting `Value::F64`, `Value::I64`, or
+/// `Value::Decimal` (MySQL `DECIMAL`, Postgres `NUMERIC`).
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::TypeMismatch`] if the column holds any other
+/// variant (including `Null` -- use [`opt_decimal_f64_from_row`] for a
+/// nullable column), or [`OxiSqlError::Other`] if a `Decimal` string fails to
+/// parse as `f64`.
+#[cfg_attr(not(feature = "mysql"), allow(dead_code))]
+pub fn decimal_f64_from_row(row: &Row, col: &str) -> Result<f64, OxiSqlError> {
+    opt_decimal_f64_from_row(row, col)?.ok_or(OxiSqlError::TypeMismatch {
+        expected: "F64/I64/Decimal",
+        got: "Null",
+    })
+}
+
+/// Read a nullable numeric column as `Option<f64>`, accepting `Value::F64`,
+/// `Value::I64`, `Value::Decimal`, or `Value::Null` (-> `None`).
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::TypeMismatch`] if the column holds a non-numeric,
+/// non-null variant, or [`OxiSqlError::Other`] if a `Decimal` string fails to
+/// parse as `f64`.
+pub fn opt_decimal_f64_from_row(row: &Row, col: &str) -> Result<Option<f64>, OxiSqlError> {
+    match row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?
+    {
+        oxisql_core::Value::Null => Ok(None),
+        oxisql_core::Value::F64(f) => Ok(Some(*f)),
+        oxisql_core::Value::I64(n) => Ok(Some(*n as f64)),
+        oxisql_core::Value::Decimal(s) => s.parse::<f64>().map(Some).map_err(|e| {
+            OxiSqlError::Other(format!(
+                "invalid DECIMAL/NUMERIC in column '{col}': {e} ({s:?})"
+            ))
+        }),
+        other => Err(OxiSqlError::TypeMismatch {
+            expected: "F64/I64/Decimal",
+            got: other.type_name(),
+        }),
+    }
+}
+
+/// Read a numeric column as `i64`, accepting `Value::I64`, `Value::F64`
+/// (truncating), or `Value::Decimal` (MySQL `DECIMAL`, Postgres `NUMERIC`).
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::TypeMismatch`] if the column holds any other
+/// variant (including `Null`), or [`OxiSqlError::Other`] if a `Decimal`
+/// string fails to parse as `i64` (e.g. it has a fractional part).
+#[allow(dead_code)]
+pub fn decimal_i64_from_row(row: &Row, col: &str) -> Result<i64, OxiSqlError> {
+    match row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?
+    {
+        oxisql_core::Value::I64(n) => Ok(*n),
+        #[allow(clippy::cast_possible_truncation)]
+        oxisql_core::Value::F64(f) => Ok(*f as i64),
+        oxisql_core::Value::Decimal(s) => s.trim().parse::<i64>().or_else(|_| {
+            // A DECIMAL column summing an integer expression can still come
+            // back with a trailing ".0000" scale (e.g. MySQL's `SUM(CASE ...)`
+            // with an implicit decimal precision) -- fall back to parsing as
+            // f64 and rounding rather than failing on well-formed integral
+            // decimals.
+            s.parse::<f64>().map(|f| f.round() as i64).map_err(|e| {
+                OxiSqlError::Other(format!(
+                    "invalid DECIMAL/NUMERIC in column '{col}': {e} ({s:?})"
+                ))
+            })
+        }),
+        other => Err(OxiSqlError::TypeMismatch {
+            expected: "I64/F64/Decimal",
+            got: other.type_name(),
+        }),
+    }
 }
 
 // ── DateTime<Utc> parameter convention (PostgreSQL) ─────────────────────────
@@ -428,5 +559,94 @@ mod tests {
         // Byte length must fall in mysql_common's accepted range for the
         // fractional-seconds variant: `20 < len && len < 27`.
         assert!(formatted.len() > 20 && formatted.len() < 27);
+    }
+
+    // ── decimal_f64_from_row / decimal_i64_from_row ─────────────────────
+
+    #[test]
+    fn decimal_f64_from_row_accepts_f64() {
+        let row = row_with("v", Value::F64(3.5));
+        assert_eq!(decimal_f64_from_row(&row, "v").expect("f64 column"), 3.5);
+    }
+
+    #[test]
+    fn decimal_f64_from_row_accepts_i64_coercion() {
+        let row = row_with("v", Value::I64(7));
+        assert_eq!(decimal_f64_from_row(&row, "v").expect("i64 column"), 7.0);
+    }
+
+    #[test]
+    fn decimal_f64_from_row_accepts_decimal_string() {
+        // Regression guard: MySQL SUM()/AVG() over exact-value arguments and
+        // Postgres NUMERIC (e.g. EXTRACT() on PG >= 14) both surface as
+        // `Value::Decimal(String)`, which `FromValue for f64` rejects.
+        let row = row_with("v", Value::Decimal("123.456".to_string()));
+        let got = decimal_f64_from_row(&row, "v").expect("decimal column");
+        assert!((got - 123.456).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decimal_f64_from_row_errors_on_invalid_decimal_string() {
+        let row = row_with("v", Value::Decimal("not-a-number".to_string()));
+        assert!(decimal_f64_from_row(&row, "v").is_err());
+    }
+
+    #[test]
+    fn decimal_f64_from_row_errors_on_null() {
+        let row = row_with("v", Value::Null);
+        assert!(decimal_f64_from_row(&row, "v").is_err());
+    }
+
+    #[test]
+    fn decimal_f64_from_row_errors_on_missing_column() {
+        let row = row_with("v", Value::F64(1.0));
+        assert!(decimal_f64_from_row(&row, "missing").is_err());
+    }
+
+    #[test]
+    fn opt_decimal_f64_from_row_maps_null_to_none() {
+        let row = row_with("v", Value::Null);
+        assert_eq!(opt_decimal_f64_from_row(&row, "v").expect("nullable"), None);
+    }
+
+    #[test]
+    fn opt_decimal_f64_from_row_maps_decimal_to_some() {
+        let row = row_with("v", Value::Decimal("9.5".to_string()));
+        let got = opt_decimal_f64_from_row(&row, "v").expect("nullable decimal");
+        assert!((got.expect("some") - 9.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decimal_i64_from_row_accepts_i64() {
+        let row = row_with("v", Value::I64(42));
+        assert_eq!(decimal_i64_from_row(&row, "v").expect("i64 column"), 42);
+    }
+
+    #[test]
+    fn decimal_i64_from_row_accepts_integral_decimal_string() {
+        // MySQL `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` surfaces as DECIMAL
+        // even though every summed value is exactly 0 or 1.
+        let row = row_with("v", Value::Decimal("17".to_string()));
+        assert_eq!(decimal_i64_from_row(&row, "v").expect("decimal column"), 17);
+    }
+
+    #[test]
+    fn decimal_i64_from_row_accepts_decimal_string_with_scale() {
+        // Some MySQL/MariaDB versions report an implicit scale
+        // (e.g. "17.0000") for a SUM() over an integer CASE expression.
+        let row = row_with("v", Value::Decimal("17.0000".to_string()));
+        assert_eq!(decimal_i64_from_row(&row, "v").expect("decimal column"), 17);
+    }
+
+    #[test]
+    fn decimal_i64_from_row_errors_on_invalid_decimal_string() {
+        let row = row_with("v", Value::Decimal("abc".to_string()));
+        assert!(decimal_i64_from_row(&row, "v").is_err());
+    }
+
+    #[test]
+    fn decimal_i64_from_row_errors_on_null() {
+        let row = row_with("v", Value::Null);
+        assert!(decimal_i64_from_row(&row, "v").is_err());
     }
 }

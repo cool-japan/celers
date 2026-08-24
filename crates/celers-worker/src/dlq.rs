@@ -4,29 +4,80 @@
 //! after exhausting all retry attempts. Instead of discarding failed tasks,
 //! they are moved to a Dead Letter Queue for later investigation and manual reprocessing.
 //!
+//! # Storage
+//!
+//! A [`DlqHandler`] owns a [`DlqStorage`] backend rather than a private
+//! `Vec`. The default is [`MemoryDlqStorage`], which is bounded by
+//! [`DlqConfig::max_dlq_size`] and lost on restart; configure
+//! [`DlqStorageBackend::Redis`] or [`DlqStorageBackend::Postgres`] and build
+//! the handler with [`DlqHandler::connect`] to get a dead-letter queue that
+//! actually survives the worker that wrote to it.
+//!
+//! Whatever the backend, the queue is bounded: the default cap is 1000
+//! entries and hitting it evicts the oldest entry (loudly). An unbounded DLQ
+//! holding full task payloads is an OOM waiting for a persistently failing
+//! task type.
+//!
 //! # Example
 //!
 //! ```rust
 //! use celers_worker::dlq::{DlqConfig, DlqHandler};
 //!
-//! let config = DlqConfig {
-//!     enabled: true,
-//!     max_dlq_size: Some(10000),
-//!     ttl_seconds: Some(604800), // 7 days
-//!     queue_name: "my_app_dlq".to_string(),
-//! };
+//! let config = DlqConfig::new(true)
+//!     .with_max_size(10_000)
+//!     .with_ttl(604_800) // 7 days
+//!     .with_queue_name("my_app_dlq");
 //!
 //! let handler = DlqHandler::new(config);
 //! assert!(handler.is_enabled());
 //! ```
 
+use crate::dlq_storage::{DlqStorage, MemoryDlqStorage};
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+/// Where a [`DlqHandler`] keeps its entries.
+///
+/// The `Memory` backend is process-local: everything in it is lost when the
+/// worker restarts, which defeats the purpose of a dead-letter queue for
+/// anything but development. Point this at Redis or PostgreSQL in production
+/// and construct the handler with [`DlqHandler::connect`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DlqStorageBackend {
+    /// In-process storage, bounded by [`DlqConfig::max_dlq_size`]. Not durable.
+    #[default]
+    Memory,
+    /// Redis-backed persistence (requires the crate's `redis` feature).
+    Redis {
+        /// Redis connection URL, e.g. `redis://127.0.0.1:6379`.
+        url: String,
+        /// Key prefix for the DLQ's Redis keys.
+        #[serde(default)]
+        key_prefix: Option<String>,
+    },
+    /// PostgreSQL-backed persistence (requires the crate's `postgres` feature).
+    Postgres {
+        /// PostgreSQL connection URL.
+        url: String,
+        /// Table to store entries in.
+        #[serde(default)]
+        table: Option<String>,
+    },
+}
+
+impl DlqStorageBackend {
+    /// Whether this backend survives a worker restart.
+    pub fn is_persistent(&self) -> bool {
+        !matches!(self, Self::Memory)
+    }
+}
 
 /// Configuration for Dead Letter Queue
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,22 +86,36 @@ pub struct DlqConfig {
     pub enabled: bool,
 
     /// Maximum number of messages in DLQ (None = unlimited)
+    ///
+    /// Defaults to `Some(1000)`. `None` means the queue may grow until the
+    /// process runs out of memory — every entry holds a full task payload —
+    /// so only choose it for a backend with its own bound.
     pub max_dlq_size: Option<usize>,
 
     /// Time-to-live for DLQ messages in seconds (None = never expire)
+    ///
+    /// Nothing expires on its own: call [`DlqHandler::cleanup_expired`], or
+    /// let [`DlqHandler::spawn_cleanup_task`] run the sweep on a timer.
     pub ttl_seconds: Option<u64>,
 
     /// Name of the DLQ queue
     pub queue_name: String,
+
+    /// Storage backend for DLQ entries
+    #[serde(default)]
+    pub storage: DlqStorageBackend,
 }
 
 impl Default for DlqConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_dlq_size: None,
+            // Bounded by default: an unbounded queue of full task payloads is
+            // a guaranteed OOM for a persistently failing task type.
+            max_dlq_size: Some(1000),
             ttl_seconds: Some(604800), // 7 days by default
             queue_name: "celery_dlq".to_string(),
+            storage: DlqStorageBackend::Memory,
         }
     }
 }
@@ -79,6 +144,24 @@ impl DlqConfig {
     /// Set the DLQ queue name
     pub fn with_queue_name(mut self, name: impl Into<String>) -> Self {
         self.queue_name = name.into();
+        self
+    }
+
+    /// Remove the size cap.
+    ///
+    /// Only safe when the configured backend enforces its own bound.
+    pub fn unbounded(mut self) -> Self {
+        self.max_dlq_size = None;
+        self
+    }
+
+    /// Select the storage backend.
+    ///
+    /// A persistent backend only takes effect when the handler is built with
+    /// [`DlqHandler::connect`]; the synchronous [`DlqHandler::new`] cannot
+    /// open a connection and falls back to memory (with a warning).
+    pub fn with_storage(mut self, storage: DlqStorageBackend) -> Self {
+        self.storage = storage;
         self
     }
 
@@ -143,9 +226,11 @@ impl DlqEntry {
         error_message: String,
         worker_hostname: String,
     ) -> Self {
+        // A clock that predates the epoch yields 0 rather than panicking: a
+        // dead-letter write must never bring the worker down.
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
+            .unwrap_or_default()
             .as_secs();
 
         Self {
@@ -168,9 +253,11 @@ impl DlqEntry {
 
     /// Get the age of this entry in seconds
     pub fn age_seconds(&self) -> u64 {
+        // A clock that predates the epoch yields 0 rather than panicking: a
+        // dead-letter write must never bring the worker down.
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
+            .unwrap_or_default()
             .as_secs();
         now.saturating_sub(self.dlq_timestamp)
     }
@@ -216,20 +303,95 @@ impl DlqStats {
 }
 
 /// Dead Letter Queue handler
+///
+/// Entries live in a [`DlqStorage`] backend, so a handler built with
+/// [`DlqHandler::connect`] against Redis or PostgreSQL keeps dead-lettered
+/// tasks across restarts. The default backend is in-process memory.
 pub struct DlqHandler {
     config: DlqConfig,
-    entries: Arc<RwLock<Vec<DlqEntry>>>,
+    storage: Arc<dyn DlqStorage>,
     stats: Arc<RwLock<DlqStats>>,
 }
 
 impl DlqHandler {
-    /// Create a new DLQ handler
+    /// Create a new DLQ handler backed by in-process memory.
+    ///
+    /// A persistent backend cannot be opened synchronously; if
+    /// [`DlqConfig::storage`] names one, this logs a warning and falls back to
+    /// memory. Use [`DlqHandler::connect`] to honour the configuration.
     pub fn new(config: DlqConfig) -> Self {
+        if config.storage.is_persistent() {
+            warn!(
+                "DLQ storage backend {:?} requires DlqHandler::connect(); \
+                 falling back to non-persistent in-memory storage",
+                config.storage
+            );
+        }
+        Self::with_storage(config, Arc::new(MemoryDlqStorage::new()))
+    }
+
+    /// Create a DLQ handler over an explicit storage backend.
+    pub fn with_storage(config: DlqConfig, storage: Arc<dyn DlqStorage>) -> Self {
         Self {
             config,
-            entries: Arc::new(RwLock::new(Vec::new())),
+            storage,
             stats: Arc::new(RwLock::new(DlqStats::new())),
         }
+    }
+
+    /// Create a DLQ handler, opening the backend named by
+    /// [`DlqConfig::storage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend cannot be reached, or when the
+    /// configuration names a backend whose cargo feature is not compiled in —
+    /// silently degrading a persistent DLQ to a volatile one would lose tasks
+    /// without telling anybody.
+    pub async fn connect(config: DlqConfig) -> Result<Self> {
+        let storage: Arc<dyn DlqStorage> = match &config.storage {
+            DlqStorageBackend::Memory => Arc::new(MemoryDlqStorage::new()),
+
+            #[cfg(feature = "redis")]
+            DlqStorageBackend::Redis { url, key_prefix } => Arc::new(
+                crate::dlq_storage::RedisDlqStorage::new(url, key_prefix.clone())?,
+            ),
+            #[cfg(not(feature = "redis"))]
+            DlqStorageBackend::Redis { .. } => {
+                return Err(CelersError::Configuration(
+                    "DLQ storage backend 'redis' requires the celers-worker `redis` feature"
+                        .to_string(),
+                ));
+            }
+
+            #[cfg(feature = "postgres")]
+            DlqStorageBackend::Postgres { url, table } => {
+                Arc::new(crate::dlq_storage::PostgresDlqStorage::new(url, table.clone()).await?)
+            }
+            #[cfg(not(feature = "postgres"))]
+            DlqStorageBackend::Postgres { .. } => {
+                return Err(CelersError::Configuration(
+                    "DLQ storage backend 'postgres' requires the celers-worker `postgres` feature"
+                        .to_string(),
+                ));
+            }
+        };
+
+        if !storage.health_check().await? {
+            return Err(CelersError::Configuration(format!(
+                "DLQ storage backend {:?} failed its health check",
+                config.storage
+            )));
+        }
+
+        let handler = Self::with_storage(config, storage);
+        handler.refresh_total().await;
+        Ok(handler)
+    }
+
+    /// The storage backend behind this handler.
+    pub fn storage(&self) -> &Arc<dyn DlqStorage> {
+        &self.storage
     }
 
     /// Check if DLQ is enabled
@@ -237,25 +399,51 @@ impl DlqHandler {
         self.config.enabled
     }
 
+    /// The handler's configuration.
+    pub fn config(&self) -> &DlqConfig {
+        &self.config
+    }
+
+    /// Re-read the backend size into [`DlqStats::total_messages`].
+    async fn refresh_total(&self) {
+        match self.storage.size().await {
+            Ok(size) => self.stats.write().await.total_messages = size,
+            Err(e) => error!("Failed to read DLQ size from storage: {}", e),
+        }
+    }
+
     /// Add a failed task to the DLQ
+    ///
+    /// When [`DlqConfig::max_dlq_size`] is reached the oldest entry is evicted
+    /// to make room. Eviction is reported at `warn` level with the discarded
+    /// task's id, because a silently dropped dead-letter is a task that no
+    /// longer exists anywhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error reported by the storage backend.
     pub async fn add_entry(&self, entry: DlqEntry) -> Result<()> {
         if !self.config.enabled {
             debug!("DLQ is disabled, skipping entry for task {}", entry.task_id);
             return Ok(());
         }
 
-        let mut entries = self.entries.write().await;
-        let mut stats = self.stats.write().await;
-
-        // Check size limit
+        // Enforce the cap before inserting so the queue never exceeds it.
         if let Some(max_size) = self.config.max_dlq_size {
-            if entries.len() >= max_size {
-                warn!(
-                    "DLQ size limit ({}) reached, removing oldest entry",
-                    max_size
-                );
-                entries.remove(0);
-                stats.messages_removed += 1;
+            let mut current = self.storage.size().await?;
+            while current >= max_size {
+                match self.storage.evict_oldest().await? {
+                    Some(evicted) => {
+                        warn!(
+                            "DLQ size limit ({}) reached; discarding oldest entry for task {} \
+                             (task {} failed with: {})",
+                            max_size, evicted.task_id, evicted.task_id, evicted.error_message
+                        );
+                        self.stats.write().await.messages_removed += 1;
+                        current = current.saturating_sub(1);
+                    }
+                    None => break,
+                }
             }
         }
 
@@ -264,8 +452,11 @@ impl DlqHandler {
             entry.task_id, entry.retry_count, entry.error_message
         );
 
-        entries.push(entry);
-        stats.total_messages = entries.len();
+        self.storage.add(entry).await?;
+
+        let total = self.storage.size().await?;
+        let mut stats = self.stats.write().await;
+        stats.total_messages = total;
         stats.messages_added += 1;
 
         Ok(())
@@ -273,61 +464,99 @@ impl DlqHandler {
 
     /// Get all DLQ entries
     pub async fn get_entries(&self) -> Vec<DlqEntry> {
-        self.entries.read().await.clone()
+        match self.storage.get_all().await {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!("Failed to read DLQ entries from storage: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Get a specific DLQ entry by task ID
     pub async fn get_entry(&self, task_id: &TaskId) -> Option<DlqEntry> {
-        let entries = self.entries.read().await;
-        entries.iter().find(|e| &e.task_id == task_id).cloned()
+        match self.storage.get(task_id).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                error!("Failed to read DLQ entry {} from storage: {}", task_id, e);
+                None
+            }
+        }
     }
 
     /// Remove a specific entry by task ID
+    ///
+    /// # Errors
+    ///
+    /// Returns any error reported by the storage backend.
     pub async fn remove_entry(&self, task_id: &TaskId) -> Result<bool> {
-        let mut entries = self.entries.write().await;
-        let mut stats = self.stats.write().await;
-
-        if let Some(pos) = entries.iter().position(|e| &e.task_id == task_id) {
-            entries.remove(pos);
-            stats.total_messages = entries.len();
-            stats.messages_removed += 1;
-            info!("Removed task {} from DLQ", task_id);
-            Ok(true)
-        } else {
-            Ok(false)
+        if !self.storage.remove(task_id).await? {
+            return Ok(false);
         }
+
+        let total = self.storage.size().await?;
+        let mut stats = self.stats.write().await;
+        stats.total_messages = total;
+        stats.messages_removed += 1;
+        info!("Removed task {} from DLQ", task_id);
+        Ok(true)
     }
 
     /// Clean up expired entries based on TTL
+    ///
+    /// # Errors
+    ///
+    /// Returns any error reported by the storage backend.
     pub async fn cleanup_expired(&self) -> Result<usize> {
-        if let Some(ttl) = self.config.ttl_seconds {
-            let mut entries = self.entries.write().await;
+        let Some(ttl) = self.config.ttl_seconds else {
+            return Ok(0);
+        };
+
+        let removed = self.storage.cleanup_expired(ttl).await?;
+        if removed > 0 {
+            info!("Removed {} expired entries from DLQ", removed);
+            let total = self.storage.size().await?;
             let mut stats = self.stats.write().await;
-
-            let before_count = entries.len();
-            entries.retain(|e| !e.is_expired(ttl));
-            let after_count = entries.len();
-            let removed = before_count - after_count;
-
-            if removed > 0 {
-                info!("Removed {} expired entries from DLQ", removed);
-                stats.total_messages = after_count;
-                stats.messages_removed += removed;
-            }
-
-            Ok(removed)
-        } else {
-            Ok(0)
+            stats.total_messages = total;
+            stats.messages_removed += removed;
         }
+
+        Ok(removed)
+    }
+
+    /// Run [`DlqHandler::cleanup_expired`] on a timer until the handle is
+    /// dropped or aborted.
+    ///
+    /// TTL configuration does nothing on its own — something has to run the
+    /// sweep. Call this once during worker start-up when
+    /// [`DlqConfig::ttl_seconds`] is set; the returned handle stops the sweep
+    /// when aborted.
+    pub fn spawn_cleanup_task(self: Arc<Self>, interval: Duration) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = time::interval(interval);
+            // The first tick fires immediately; skip it so start-up is not
+            // charged for a sweep.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match self.cleanup_expired().await {
+                    Ok(0) => debug!("DLQ TTL sweep found nothing to expire"),
+                    Ok(n) => info!("DLQ TTL sweep expired {} entries", n),
+                    Err(e) => error!("DLQ TTL sweep failed: {}", e),
+                }
+            }
+        })
     }
 
     /// Clear all DLQ entries
+    ///
+    /// # Errors
+    ///
+    /// Returns any error reported by the storage backend.
     pub async fn clear(&self) -> Result<usize> {
-        let mut entries = self.entries.write().await;
-        let mut stats = self.stats.write().await;
+        let count = self.storage.clear().await?;
 
-        let count = entries.len();
-        entries.clear();
+        let mut stats = self.stats.write().await;
         stats.total_messages = 0;
         stats.messages_removed += count;
 
@@ -341,8 +570,16 @@ impl DlqHandler {
     }
 
     /// Get the current size of the DLQ
+    ///
+    /// Reports `0` when the backend cannot be read; the error is logged.
     pub async fn size(&self) -> usize {
-        self.entries.read().await.len()
+        match self.storage.size().await {
+            Ok(size) => size,
+            Err(e) => {
+                error!("Failed to read DLQ size from storage: {}", e);
+                0
+            }
+        }
     }
 
     /// Record a successful reprocess
@@ -359,45 +596,82 @@ impl DlqHandler {
 
     /// Get entries older than a certain age (in seconds)
     pub async fn get_entries_older_than(&self, age_seconds: u64) -> Vec<DlqEntry> {
-        let entries = self.entries.read().await;
-        entries
-            .iter()
-            .filter(|e| e.age_seconds() > age_seconds)
-            .cloned()
-            .collect()
+        match self.storage.get_older_than(age_seconds).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!("Failed to read aged DLQ entries from storage: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Get entries for a specific task type
     pub async fn get_entries_by_task_name(&self, task_name: &str) -> Vec<DlqEntry> {
-        let entries = self.entries.read().await;
-        entries
-            .iter()
-            .filter(|e| e.task.metadata.name == task_name)
-            .cloned()
-            .collect()
+        match self.storage.get_by_task_name(task_name).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!("Failed to read DLQ entries for {}: {}", task_name, e);
+                Vec::new()
+            }
+        }
     }
 
     /// Export DLQ entries to JSON
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot be read or the entries cannot
+    /// be serialized.
     pub async fn export_json(&self) -> Result<String> {
-        let entries = self.entries.read().await;
-        serde_json::to_string_pretty(&*entries)
+        let entries = self.storage.get_all().await?;
+        serde_json::to_string_pretty(&entries)
             .map_err(|e| CelersError::Other(format!("Failed to serialize DLQ entries: {}", e)))
     }
 
     /// Import DLQ entries from JSON
+    ///
+    /// Imported entries are subject to [`DlqConfig::max_dlq_size`] just like
+    /// any other insertion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the JSON cannot be parsed or the backend refuses a
+    /// write.
     pub async fn import_json(&self, json: &str) -> Result<usize> {
         let imported: Vec<DlqEntry> = serde_json::from_str(json)
             .map_err(|e| CelersError::Other(format!("Failed to deserialize DLQ entries: {}", e)))?;
 
         let count = imported.len();
-        let mut entries = self.entries.write().await;
-        let mut stats = self.stats.write().await;
+        for entry in imported {
+            self.insert_bounded(entry).await?;
+        }
 
-        entries.extend(imported);
-        stats.total_messages = entries.len();
-
+        self.refresh_total().await;
         info!("Imported {} entries into DLQ", count);
         Ok(count)
+    }
+
+    /// Insert an entry, honouring the size cap but without touching the
+    /// `messages_added` counter (used by import/compaction paths that are
+    /// re-writing existing entries rather than dead-lettering new ones).
+    async fn insert_bounded(&self, entry: DlqEntry) -> Result<()> {
+        if let Some(max_size) = self.config.max_dlq_size {
+            let mut current = self.storage.size().await?;
+            while current >= max_size {
+                match self.storage.evict_oldest().await? {
+                    Some(evicted) => {
+                        warn!(
+                            "DLQ size limit ({}) reached; discarding oldest entry for task {}",
+                            max_size, evicted.task_id
+                        );
+                        self.stats.write().await.messages_removed += 1;
+                        current = current.saturating_sub(1);
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.storage.add(entry).await
     }
 
     /// Get entries that are candidates for automatic reprocessing
@@ -411,7 +685,7 @@ impl DlqHandler {
         min_age_seconds: u64,
         max_retries: u32,
     ) -> Vec<DlqEntry> {
-        let entries = self.entries.read().await;
+        let entries = self.get_entries().await;
         let ttl = self.config.ttl_seconds;
 
         entries
@@ -431,17 +705,17 @@ impl DlqHandler {
     }
 
     /// Remove entries in batch by task IDs
+    ///
+    /// # Errors
+    ///
+    /// Returns any error reported by the storage backend.
     pub async fn remove_entries_batch(&self, task_ids: &[TaskId]) -> Result<usize> {
-        let mut entries = self.entries.write().await;
-        let mut stats = self.stats.write().await;
-
-        let before_count = entries.len();
-        entries.retain(|e| !task_ids.contains(&e.task_id));
-        let after_count = entries.len();
-        let removed = before_count - after_count;
+        let removed = self.storage.remove_batch(task_ids).await?;
 
         if removed > 0 {
-            stats.total_messages = after_count;
+            let total = self.storage.size().await?;
+            let mut stats = self.stats.write().await;
+            stats.total_messages = total;
             stats.messages_removed += removed;
             info!("Removed {} entries from DLQ in batch", removed);
         }
@@ -451,37 +725,22 @@ impl DlqHandler {
 
     /// Get aggregated statistics by task name
     pub async fn get_stats_by_task_name(&self) -> std::collections::HashMap<String, TaskStats> {
-        use std::collections::HashMap;
-
-        let entries = self.entries.read().await;
-        let mut task_stats: HashMap<String, TaskStats> = HashMap::new();
-
-        for entry in entries.iter() {
-            let name = entry.task.metadata.name.clone();
-            let stats = task_stats.entry(name).or_default();
-
-            stats.count += 1;
-            stats.total_retries += entry.retry_count as usize;
-            if entry.retry_count > stats.max_retries {
-                stats.max_retries = entry.retry_count;
-            }
-
-            let age = entry.age_seconds();
-            if age < stats.min_age_seconds {
-                stats.min_age_seconds = age;
-            }
-            if age > stats.max_age_seconds {
-                stats.max_age_seconds = age;
+        match self.storage.get_stats_by_task_name().await {
+            Ok(stats) => stats
+                .into_iter()
+                .map(|(name, stats)| (name, TaskStats::from(stats)))
+                .collect(),
+            Err(e) => {
+                error!("Failed to aggregate DLQ statistics: {}", e);
+                std::collections::HashMap::new()
             }
         }
-
-        task_stats
     }
 
     /// Check if DLQ is approaching capacity
     pub async fn is_near_capacity(&self, threshold_percent: f64) -> bool {
         if let Some(max_size) = self.config.max_dlq_size {
-            let current_size = self.entries.read().await.len();
+            let current_size = self.size().await;
             let threshold = (max_size as f64 * threshold_percent).ceil() as usize;
             current_size >= threshold
         } else {
@@ -491,26 +750,37 @@ impl DlqHandler {
 
     /// Get the oldest entry
     pub async fn get_oldest_entry(&self) -> Option<DlqEntry> {
-        let entries = self.entries.read().await;
-        entries.first().cloned()
+        self.get_entries()
+            .await
+            .into_iter()
+            .min_by_key(|e| e.dlq_timestamp)
     }
 
     /// Get the newest entry
     pub async fn get_newest_entry(&self) -> Option<DlqEntry> {
-        let entries = self.entries.read().await;
-        entries.last().cloned()
+        self.get_entries()
+            .await
+            .into_iter()
+            .max_by_key(|e| e.dlq_timestamp)
     }
 
     /// Compact the DLQ by removing duplicate task IDs, keeping only the newest
+    ///
+    /// Duplicates share a task id, so they cannot be told apart by id alone:
+    /// compaction rewrites the store with the deduplicated set rather than
+    /// deleting by id (which would remove every copy).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error reported by the storage backend.
     pub async fn compact_duplicates(&self) -> Result<usize> {
         use std::collections::HashSet;
 
-        let mut entries = self.entries.write().await;
-        let mut stats = self.stats.write().await;
-        let mut seen_ids = HashSet::new();
+        let mut entries = self.storage.get_all().await?;
         let before_count = entries.len();
 
-        // Keep only the last occurrence of each task ID
+        // Keep only the last occurrence of each task ID.
+        let mut seen_ids = HashSet::new();
         entries.reverse();
         entries.retain(|e| seen_ids.insert(e.task_id));
         entries.reverse();
@@ -519,7 +789,14 @@ impl DlqHandler {
         let removed = before_count - after_count;
 
         if removed > 0 {
-            stats.total_messages = after_count;
+            self.storage.clear().await?;
+            for entry in entries {
+                self.storage.add(entry).await?;
+            }
+
+            let total = self.storage.size().await?;
+            let mut stats = self.stats.write().await;
+            stats.total_messages = total;
             stats.messages_removed += removed;
             info!("Compacted DLQ, removed {} duplicate entries", removed);
         }
@@ -556,6 +833,18 @@ impl TaskStats {
     /// Get the age range
     pub fn age_range_seconds(&self) -> u64 {
         self.max_age_seconds.saturating_sub(self.min_age_seconds)
+    }
+}
+
+impl From<crate::dlq_storage::TaskStats> for TaskStats {
+    fn from(stats: crate::dlq_storage::TaskStats) -> Self {
+        Self {
+            count: stats.count,
+            total_retries: stats.total_retries,
+            max_retries: stats.max_retries,
+            min_age_seconds: stats.min_age_seconds,
+            max_age_seconds: stats.max_age_seconds,
+        }
     }
 }
 
@@ -922,7 +1211,35 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.queue_name, "celery_dlq");
         assert_eq!(config.ttl_seconds, Some(604800));
+        // Bounded by default (idx 163): an unbounded DLQ of full task
+        // payloads is an OOM waiting to happen.
+        assert_eq!(config.max_dlq_size, Some(1000));
+        assert_eq!(config.storage, DlqStorageBackend::Memory);
+        assert!(!config.storage.is_persistent());
+    }
+
+    #[test]
+    fn test_dlq_config_unbounded_is_explicit() {
+        let config = DlqConfig::new(true).unbounded();
         assert_eq!(config.max_dlq_size, None);
+        assert!(!config.has_size_limit());
+    }
+
+    #[test]
+    fn test_dlq_storage_backend_serde_roundtrip() {
+        let backend = DlqStorageBackend::Redis {
+            url: "redis://127.0.0.1:6379".to_string(),
+            key_prefix: Some("app:dlq".to_string()),
+        };
+        let json = serde_json::to_string(&backend).expect("serialize");
+        let parsed: DlqStorageBackend = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, backend);
+        assert!(parsed.is_persistent());
+
+        // A config written before the field existed still deserializes.
+        let legacy = r#"{"enabled":true,"max_dlq_size":10,"ttl_seconds":60,"queue_name":"q"}"#;
+        let config: DlqConfig = serde_json::from_str(legacy).expect("legacy config");
+        assert_eq!(config.storage, DlqStorageBackend::Memory);
     }
 
     #[test]
@@ -1201,6 +1518,216 @@ mod tests {
         let imported = handler.import_json(&json).await.unwrap();
         assert_eq!(imported, 3);
         assert_eq!(handler.size().await, 3);
+    }
+
+    // --- Regression tests for unbounded / unreachable-storage DLQ (idx 163) ---
+
+    #[tokio::test]
+    async fn test_dlq_is_bounded_by_default() {
+        let handler = DlqHandler::new(DlqConfig::new(true));
+        assert_eq!(handler.config().max_dlq_size, Some(1000));
+        assert!(handler.config().has_size_limit());
+    }
+
+    #[tokio::test]
+    async fn test_dlq_eviction_drops_the_oldest_entry() {
+        let handler = DlqHandler::new(DlqConfig::new(true).with_max_size(3));
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let task = create_test_task();
+            let task_id = task.metadata.id;
+            ids.push(task_id);
+            handler
+                .add_entry(DlqEntry::new(
+                    task,
+                    task_id,
+                    3,
+                    format!("Error {}", i),
+                    "worker-1".to_string(),
+                ))
+                .await
+                .expect("add should succeed");
+        }
+
+        assert_eq!(handler.size().await, 3, "the cap must never be exceeded");
+        // The two oldest were evicted, the three newest survive.
+        assert!(handler.get_entry(&ids[0]).await.is_none());
+        assert!(handler.get_entry(&ids[1]).await.is_none());
+        for id in &ids[2..] {
+            assert!(handler.get_entry(id).await.is_some());
+        }
+
+        let stats = handler.get_stats().await;
+        assert_eq!(stats.total_messages, 3);
+        assert_eq!(stats.messages_added, 5);
+        assert_eq!(stats.messages_removed, 2);
+    }
+
+    #[tokio::test]
+    async fn test_dlq_handler_uses_the_injected_storage_backend() {
+        let storage = Arc::new(MemoryDlqStorage::new());
+        let handler = DlqHandler::with_storage(DlqConfig::new(true), Arc::clone(&storage) as _);
+
+        let task = create_test_task();
+        let task_id = task.metadata.id;
+        handler
+            .add_entry(DlqEntry::new(
+                task,
+                task_id,
+                1,
+                "Error".to_string(),
+                "worker-1".to_string(),
+            ))
+            .await
+            .expect("add should succeed");
+
+        // The entry must be in the *backend*, not in a private Vec.
+        assert_eq!(storage.size().await.expect("size"), 1);
+        assert!(storage.get(&task_id).await.expect("get").is_some());
+
+        assert!(handler.remove_entry(&task_id).await.expect("remove"));
+        assert_eq!(storage.size().await.expect("size"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_connect_uses_memory_backend_and_reports_missing_features() {
+        let handler = DlqHandler::connect(DlqConfig::new(true))
+            .await
+            .expect("memory backend always connects");
+        assert_eq!(handler.size().await, 0);
+
+        // Without the corresponding feature the request must fail loudly
+        // instead of silently degrading to a volatile queue.
+        #[cfg(not(feature = "redis"))]
+        {
+            let config = DlqConfig::new(true).with_storage(DlqStorageBackend::Redis {
+                url: "redis://127.0.0.1:6379".to_string(),
+                key_prefix: None,
+            });
+            assert!(DlqHandler::connect(config).await.is_err());
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            let config = DlqConfig::new(true).with_storage(DlqStorageBackend::Postgres {
+                url: "postgres://localhost/celers".to_string(),
+                table: None,
+            });
+            assert!(DlqHandler::connect(config).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_removes_aged_entries() {
+        let handler = DlqHandler::new(DlqConfig::new(true).with_ttl(60));
+
+        let task = create_test_task();
+        let task_id = task.metadata.id;
+        let mut entry = DlqEntry::new(
+            task,
+            task_id,
+            1,
+            "Error".to_string(),
+            "worker-1".to_string(),
+        );
+        // Backdate well beyond the TTL instead of sleeping.
+        entry.dlq_timestamp = entry.dlq_timestamp.saturating_sub(3600);
+        handler.add_entry(entry).await.expect("add should succeed");
+        assert_eq!(handler.size().await, 1);
+
+        assert_eq!(handler.cleanup_expired().await.expect("cleanup"), 1);
+        assert_eq!(handler.size().await, 0);
+        assert_eq!(handler.get_stats().await.total_messages, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_spawn_cleanup_task_runs_the_sweep_on_a_timer() {
+        let handler = Arc::new(DlqHandler::new(DlqConfig::new(true).with_ttl(60)));
+
+        let task = create_test_task();
+        let task_id = task.metadata.id;
+        let mut entry = DlqEntry::new(
+            task,
+            task_id,
+            1,
+            "Error".to_string(),
+            "worker-1".to_string(),
+        );
+        entry.dlq_timestamp = entry.dlq_timestamp.saturating_sub(3600);
+        handler.add_entry(entry).await.expect("add should succeed");
+
+        let sweeper = Arc::clone(&handler).spawn_cleanup_task(Duration::from_secs(30));
+
+        // Paused clock: advancing is instant and deterministic. The loop is
+        // bounded and drives virtual time explicitly, so it neither sleeps nor
+        // depends on how many scheduler ticks the sweeper needs to start.
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(31)).await;
+            tokio::task::yield_now().await;
+            if handler.size().await == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            handler.size().await,
+            0,
+            "the TTL sweep must actually run without anybody polling it"
+        );
+
+        sweeper.abort();
+    }
+
+    #[tokio::test]
+    async fn test_compact_duplicates_keeps_the_newest() {
+        let handler = DlqHandler::new(DlqConfig::new(true).with_max_size(10));
+
+        let task = create_test_task();
+        let task_id = task.metadata.id;
+        for i in 0..3 {
+            handler
+                .add_entry(DlqEntry::new(
+                    task.clone(),
+                    task_id,
+                    i,
+                    format!("Error {}", i),
+                    "worker-1".to_string(),
+                ))
+                .await
+                .expect("add should succeed");
+        }
+        assert_eq!(handler.size().await, 3);
+
+        assert_eq!(handler.compact_duplicates().await.expect("compact"), 2);
+        assert_eq!(handler.size().await, 1);
+        let remaining = handler.get_entry(&task_id).await.expect("entry remains");
+        assert_eq!(remaining.error_message, "Error 2");
+    }
+
+    #[tokio::test]
+    async fn test_stats_by_task_name_reports_real_minimum_age() {
+        let handler = DlqHandler::new(DlqConfig::new(true));
+
+        let task = create_test_task();
+        let task_id = task.metadata.id;
+        let mut entry = DlqEntry::new(
+            task,
+            task_id,
+            2,
+            "Error".to_string(),
+            "worker-1".to_string(),
+        );
+        entry.dlq_timestamp = entry.dlq_timestamp.saturating_sub(120);
+        handler.add_entry(entry).await.expect("add should succeed");
+
+        let stats = handler.get_stats_by_task_name().await;
+        let task_stats = stats.get("test_task").expect("task stats");
+        assert_eq!(task_stats.count, 1);
+        assert_eq!(task_stats.max_retries, 2);
+        assert!(
+            task_stats.min_age_seconds >= 120,
+            "min_age_seconds must reflect the entry, not a Default of 0"
+        );
     }
 
     #[test]

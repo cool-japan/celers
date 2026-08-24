@@ -74,22 +74,42 @@ impl LazyBody {
         }
     }
 
-    /// Get the raw bytes without deserialization
+    /// Get the raw, still base64-*encoded* bytes without decoding them.
+    ///
+    /// This returns the wire-format text bytes exactly as received (e.g.
+    /// `b"dGVzdA=="`), **not** the decoded body content. For the decoded
+    /// body, use [`LazyBody::deserialize`]; for its length without
+    /// allocating, use [`LazyBody::decoded_size`].
     pub fn raw_bytes(&self) -> &[u8] {
         &self.raw
     }
 
-    /// Get the body size in bytes
+    /// Get the size, in bytes, of the raw base64-*encoded* representation.
+    ///
+    /// This is the length of the still-encoded wire text (about 4/3 the
+    /// decoded size), **not** the size of the decoded body. For a size that
+    /// matches [`crate::Message::body_size`] on the same wire input, use
+    /// [`LazyBody::decoded_size`].
     #[inline]
-    pub fn size(&self) -> usize {
+    pub fn encoded_size(&self) -> usize {
         self.raw.len()
+    }
+
+    /// Compute the exact size, in bytes, of the base64-*decoded* body.
+    ///
+    /// This mirrors the length [`LazyBody::deserialize`] would produce, but
+    /// is computed arithmetically from the encoded length so it never
+    /// allocates or decodes the body, preserving the "lazy" contract of
+    /// this type.
+    pub fn decoded_size(&self) -> usize {
+        decoded_base64_len(&self.raw)
     }
 
     /// Deserialize the body (base64 decode)
     pub fn deserialize(&self) -> Result<Vec<u8>, LazyError> {
         // Check cache first
         {
-            let cached = self.cached.read().expect("lock should not be poisoned");
+            let cached = self.cached.read().unwrap_or_else(|e| e.into_inner());
             if let Some(body) = cached.as_ref() {
                 return Ok(body.clone());
             }
@@ -99,7 +119,7 @@ impl LazyBody {
         let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &self.raw)
             .map_err(|e| LazyError::DeserializationFailed(e.to_string()))?;
 
-        let mut cached = self.cached.write().expect("lock should not be poisoned");
+        let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());
         *cached = Some(decoded.clone());
 
         Ok(decoded)
@@ -109,9 +129,32 @@ impl LazyBody {
     pub fn is_cached(&self) -> bool {
         self.cached
             .read()
-            .expect("lock should not be poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .is_some()
     }
+}
+
+/// Compute the exact decoded length of a standard (padded) base64 byte
+/// string without allocating or decoding it.
+///
+/// Per RFC 4648 §4, every 4 encoded bytes decode to 3 bytes, minus one byte
+/// for each trailing `=` padding character (at most two). This is exact for
+/// well-formed, padded base64 input; for malformed input it degrades
+/// gracefully (never panics, never overflows) rather than producing a
+/// guaranteed-correct value, matching [`LazyBody::deserialize`]'s own
+/// eventual decode error in that case.
+fn decoded_base64_len(raw: &[u8]) -> usize {
+    let len = raw.len();
+    if len == 0 {
+        return 0;
+    }
+    let full_len = (len / 4) * 3;
+    let padding = match (raw.get(len.wrapping_sub(1)), raw.get(len.wrapping_sub(2))) {
+        (Some(b'='), Some(b'=')) => 2,
+        (Some(b'='), _) => 1,
+        _ => 0,
+    };
+    full_len.saturating_sub(padding)
 }
 
 /// Lazy-deserialized message
@@ -176,9 +219,23 @@ impl LazyMessage {
         &self.headers.task
     }
 
-    /// Get the body size without deserializing
+    /// Get the exact size, in bytes, of the *decoded* body without
+    /// deserializing it.
+    ///
+    /// This matches [`crate::Message::body_size`] for the same wire input
+    /// (computed arithmetically from the base64-encoded length, so it never
+    /// allocates or decodes the body). For the size of the still-encoded
+    /// wire representation instead, see
+    /// [`LazyMessage::encoded_body_size`].
     pub fn body_size(&self) -> usize {
-        self.body.size()
+        self.body.decoded_size()
+    }
+
+    /// Get the size, in bytes, of the raw base64-*encoded* body without
+    /// decoding it. This is the wire-format length, not the decoded body
+    /// length - see [`LazyMessage::body_size`] for that.
+    pub fn encoded_body_size(&self) -> usize {
+        self.body.encoded_size()
     }
 
     /// Check if body is already deserialized
@@ -186,8 +243,10 @@ impl LazyMessage {
         self.body.is_cached()
     }
 
-    /// Get raw body bytes without deserializing
-    pub fn raw_body(&self) -> &[u8] {
+    /// Get the raw, still base64-*encoded* body bytes without decoding
+    /// them (e.g. `b"dGVzdA=="`, not `b"test"`). For the decoded bytes, use
+    /// [`LazyMessage::body`].
+    pub fn encoded_body(&self) -> &[u8] {
         self.body.raw_bytes()
     }
 
@@ -275,7 +334,7 @@ impl LazyTaskArgs {
     pub fn parse(&self) -> Result<crate::TaskArgs, LazyError> {
         // Check cache
         {
-            let cached = self.cached.read().expect("lock should not be poisoned");
+            let cached = self.cached.read().unwrap_or_else(|e| e.into_inner());
             if let Some(args) = cached.as_ref() {
                 return Ok(args.clone());
             }
@@ -285,7 +344,7 @@ impl LazyTaskArgs {
         let args: crate::TaskArgs = serde_json::from_slice(&self.raw)
             .map_err(|e| LazyError::DeserializationFailed(e.to_string()))?;
 
-        let mut cached = self.cached.write().expect("lock should not be poisoned");
+        let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());
         *cached = Some(args.clone());
 
         Ok(args)
@@ -295,7 +354,7 @@ impl LazyTaskArgs {
     pub fn is_cached(&self) -> bool {
         self.cached
             .read()
-            .expect("lock should not be poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .is_some()
     }
 }
@@ -306,14 +365,58 @@ mod tests {
 
     #[test]
     fn test_lazy_body() {
-        let raw = b"dGVzdCBkYXRh"; // base64 "test data"
+        let raw = b"dGVzdCBkYXRh"; // base64 "test data" (12 encoded bytes -> 9 decoded)
         let body = LazyBody::new(raw.to_vec());
 
-        assert_eq!(body.size(), raw.len());
+        assert_eq!(body.encoded_size(), raw.len());
+        assert_eq!(body.decoded_size(), b"test data".len());
         assert!(!body.is_cached());
 
         let decoded = body.deserialize().unwrap();
         assert_eq!(decoded, b"test data");
+        assert_eq!(body.decoded_size(), decoded.len());
+        assert!(body.is_cached());
+    }
+
+    #[test]
+    fn test_lazy_body_decoded_size_matches_real_decode_for_various_padding() {
+        // No padding: "AAAA" (4 chars) -> 3 bytes.
+        assert_eq!(LazyBody::new(b"AAAA".to_vec()).decoded_size(), 3);
+        // One '=' padding char: "AAA=" (4 chars) -> 2 bytes.
+        assert_eq!(LazyBody::new(b"AAA=".to_vec()).decoded_size(), 2);
+        // Two '=' padding chars: "AA==" (4 chars) -> 1 byte.
+        assert_eq!(LazyBody::new(b"AA==".to_vec()).decoded_size(), 1);
+        // Empty body.
+        assert_eq!(LazyBody::new(Vec::new()).decoded_size(), 0);
+
+        // Cross-check decoded_size() against an actual decode for a longer,
+        // realistic payload.
+        let raw = b"SGVsbG8sIFdvcmxkIQ==".to_vec(); // "Hello, World!"
+        let body = LazyBody::new(raw);
+        let decoded = body.deserialize().unwrap();
+        assert_eq!(body.decoded_size(), decoded.len());
+    }
+
+    #[test]
+    fn test_lazy_body_survives_poisoned_cache_lock() {
+        // Regression: a panic while holding a `LazyBody`'s internal cache
+        // `RwLock` used to poison it, after which every subsequent
+        // `deserialize()`/`is_cached()` call would itself panic via
+        // `.expect("lock should not be poisoned")`. The lock must be
+        // recovered instead (same fix as `MessagePool`, see `pool.rs`).
+        let body = LazyBody::new(b"dGVzdA==".to_vec()); // base64 "test"
+        let cached = body.cached.clone();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cached.write().unwrap();
+            panic!("intentional poison for test");
+        }));
+        assert!(cached.is_poisoned());
+
+        // Neither of these may panic even though the lock is poisoned.
+        assert!(!body.is_cached());
+        let decoded = body.deserialize().unwrap();
+        assert_eq!(decoded, b"test");
         assert!(body.is_cached());
     }
 
@@ -359,7 +462,46 @@ mod tests {
         );
 
         let msg = LazyMessage::from_json(json.as_bytes()).unwrap();
-        assert!(msg.body_size() > 0);
+
+        // Regression: `body_size()` must report the *decoded* body size
+        // ("dGVzdA==" decodes to "test", 4 bytes), not the base64-encoded
+        // wire text length (8 bytes).
+        assert_eq!(msg.body_size(), 4);
+        assert_eq!(msg.encoded_body_size(), 8);
+    }
+
+    #[test]
+    fn test_lazy_message_body_size_matches_owned_message_body_size() {
+        // Regression: for identical wire input, `LazyMessage::body_size()`
+        // must agree with `Message::body_size()` (previously they disagreed
+        // because `LazyMessage` reported the base64-encoded length).
+        let task_id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"headers":{{"task":"tasks.test","id":"{}","lang":"rust"}},"properties":{{"delivery_mode":2}},"body":"SGVsbG8sIFdvcmxkIQ==","content-type":"application/json","content-encoding":"utf-8"}}"#,
+            task_id
+        );
+
+        let lazy = LazyMessage::from_json(json.as_bytes()).unwrap();
+        let owned: crate::Message = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(lazy.body_size(), owned.body_size());
+        assert_eq!(lazy.body().unwrap(), owned.body);
+    }
+
+    #[test]
+    fn test_lazy_message_encoded_body_is_still_encoded_text() {
+        let task_id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"headers":{{"task":"tasks.test","id":"{}","lang":"rust"}},"properties":{{"delivery_mode":2}},"body":"dGVzdA==","content-type":"application/json","content-encoding":"utf-8"}}"#,
+            task_id
+        );
+
+        let msg = LazyMessage::from_json(json.as_bytes()).unwrap();
+
+        // encoded_body() is the raw wire text (undecoded)...
+        assert_eq!(msg.encoded_body(), b"dGVzdA==");
+        // ...while body() is the real, decoded content.
+        assert_eq!(msg.body().unwrap(), b"test");
     }
 
     #[test]
@@ -373,6 +515,26 @@ mod tests {
         assert_eq!(args.args.len(), 3);
         assert_eq!(args.kwargs.get("key").unwrap(), "value");
 
+        assert!(lazy_args.is_cached());
+    }
+
+    #[test]
+    fn test_lazy_task_args_survives_poisoned_cache_lock() {
+        // Same regression as `test_lazy_body_survives_poisoned_cache_lock`,
+        // for `LazyTaskArgs`'s independent cache lock.
+        let json = r#"{"args":[1,2],"kwargs":{}}"#;
+        let lazy_args = LazyTaskArgs::new(json.as_bytes().to_vec());
+        let cached = lazy_args.cached.clone();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cached.write().unwrap();
+            panic!("intentional poison for test");
+        }));
+        assert!(cached.is_poisoned());
+
+        assert!(!lazy_args.is_cached());
+        let parsed = lazy_args.parse().unwrap();
+        assert_eq!(parsed.args.len(), 2);
         assert!(lazy_args.is_cached());
     }
 

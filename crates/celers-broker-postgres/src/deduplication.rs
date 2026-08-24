@@ -1,7 +1,6 @@
 //! Task deduplication support for preventing duplicate task execution
 
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
-use oxisql_core::Connection;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -52,11 +51,13 @@ impl PostgresBroker {
             return self.enqueue(task).await;
         }
 
-        // Start a transaction for atomicity. `self.conn.transaction()` ->
-        // `Box<dyn Transaction>` (see `broker_trait.rs`'s `dequeue()` for the
-        // established precedent of this exact pattern in this crate).
-        let mut tx = self
-            .conn
+        // Start a transaction for atomicity. On a pooled broker this is a
+        // two-step: check out a connection, then open the transaction on it
+        // (see `broker_trait.rs`'s `enqueue_batch()` for the same pattern).
+        // The slot stays reserved until `conn` is dropped at the end of this
+        // function.
+        let conn = self.connection().await?;
+        let mut tx = conn
             .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
@@ -137,11 +138,7 @@ impl PostgresBroker {
         let max_retries = task.metadata.max_retries as i32;
         let metadata_param = json_param(&db_metadata);
         tx.execute(
-            r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW())
-            "#,
+            crate::sql::INSERT_TASK_NOW,
             &[
                 &task_id_param,
                 &task.metadata.name,
@@ -149,6 +146,7 @@ impl PostgresBroker {
                 &priority,
                 &max_retries,
                 &metadata_param,
+                &self.queue_name,
             ],
         )
         .await

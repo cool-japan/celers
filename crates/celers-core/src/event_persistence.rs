@@ -63,9 +63,25 @@ pub struct FileEventPersisterConfig {
     /// File rotation policy
     pub rotation: RotationPolicy,
     /// Number of days to retain event files (default: 30)
+    ///
+    /// Enforced by the persister's background maintenance task (see
+    /// [`FileEventPersisterConfig::background_maintenance`]); a value of `0`
+    /// disables automatic retention.
     pub retention_days: u32,
     /// How often to flush buffered writes (default: 1s)
+    ///
+    /// A background task flushes the write buffer at this cadence so a single
+    /// `emit` is durable within one interval instead of sitting in an in-process
+    /// buffer until the next batch/rotation. A value of zero disables the
+    /// background flusher.
     pub flush_interval: Duration,
+    /// How often the background task applies `retention_days` (default: 1h)
+    pub retention_check_interval: Duration,
+    /// Whether to run the background flush/retention task (default: true)
+    ///
+    /// When disabled, callers must drive [`EventPersister::flush`] and
+    /// [`EventPersister::cleanup`] themselves.
+    pub background_maintenance: bool,
     /// Whether event persistence is enabled
     pub enabled: bool,
 }
@@ -80,6 +96,8 @@ impl Default for FileEventPersisterConfig {
             },
             retention_days: 30,
             flush_interval: Duration::from_secs(1),
+            retention_check_interval: Duration::from_secs(3600),
+            background_maintenance: true,
             enabled: true,
         }
     }
@@ -121,6 +139,20 @@ impl FileEventPersisterConfig {
         self
     }
 
+    /// Set how often retention is applied by the background task
+    #[must_use]
+    pub fn with_retention_check_interval(mut self, interval: Duration) -> Self {
+        self.retention_check_interval = interval;
+        self
+    }
+
+    /// Enable or disable the background flush/retention task
+    #[must_use]
+    pub fn with_background_maintenance(mut self, enabled: bool) -> Self {
+        self.background_maintenance = enabled;
+        self
+    }
+
     /// Set whether persistence is enabled
     #[must_use]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
@@ -140,6 +172,20 @@ pub struct FileEventPersister {
     current_file_size: Arc<AtomicU64>,
     current_file_date: Arc<RwLock<NaiveDate>>,
     events_written: Arc<AtomicU64>,
+    /// Number of flushes performed by the background maintenance task.
+    background_flushes: Arc<AtomicU64>,
+    /// Number of retention passes performed by the background task.
+    background_cleanups: Arc<AtomicU64>,
+    /// Handle of the background maintenance task, aborted on drop.
+    maintenance: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for FileEventPersister {
+    fn drop(&mut self) {
+        if let Some(handle) = self.maintenance.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl FileEventPersister {
@@ -147,26 +193,153 @@ impl FileEventPersister {
     ///
     /// Creates the configured directory if it does not exist and opens
     /// the initial event file for writing.
+    ///
+    /// Unless [`FileEventPersisterConfig::background_maintenance`] is disabled,
+    /// this also spawns a background task that flushes buffered writes every
+    /// `flush_interval` and applies `retention_days` every
+    /// `retention_check_interval`. The task is aborted when the persister is
+    /// dropped.
     pub async fn new(config: FileEventPersisterConfig) -> crate::Result<Self> {
         tokio::fs::create_dir_all(&config.directory).await?;
 
         let today = Utc::now().date_naive();
-        let persister = Self {
+        let mut persister = Self {
             config,
             current_file: Arc::new(RwLock::new(None)),
             current_file_size: Arc::new(AtomicU64::new(0)),
             current_file_date: Arc::new(RwLock::new(today)),
             events_written: Arc::new(AtomicU64::new(0)),
+            background_flushes: Arc::new(AtomicU64::new(0)),
+            background_cleanups: Arc::new(AtomicU64::new(0)),
+            maintenance: None,
         };
 
         persister.ensure_file().await?;
+        persister.start_background_maintenance();
         Ok(persister)
+    }
+
+    /// Spawn the background flush/retention task if it is configured and not
+    /// already running.
+    fn start_background_maintenance(&mut self) {
+        if self.maintenance.is_some() {
+            return;
+        }
+        if !self.config.background_maintenance
+            || !self.config.enabled
+            || self.config.flush_interval.is_zero()
+        {
+            return;
+        }
+
+        let current_file = Arc::clone(&self.current_file);
+        let flushes = Arc::clone(&self.background_flushes);
+        let cleanups = Arc::clone(&self.background_cleanups);
+        let flush_interval = self.config.flush_interval;
+        let retention_interval = self.config.retention_check_interval;
+        let retention_days = self.config.retention_days;
+        let directory = self.config.directory.clone();
+
+        self.maintenance = Some(tokio::spawn(async move {
+            let mut since_retention = Duration::ZERO;
+            loop {
+                tokio::time::sleep(flush_interval).await;
+
+                if let Err(e) = Self::flush_writer(&current_file).await {
+                    tracing::warn!(error = %e, "Background event flush failed");
+                }
+                flushes.fetch_add(1, Ordering::Relaxed);
+
+                if retention_days == 0 || retention_interval.is_zero() {
+                    continue;
+                }
+                since_retention = since_retention.saturating_add(flush_interval);
+                if since_retention < retention_interval {
+                    continue;
+                }
+                since_retention = Duration::ZERO;
+                let older_than = chrono::Duration::days(i64::from(retention_days));
+                match Self::cleanup_directory(&directory, older_than).await {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            tracing::info!(
+                                removed,
+                                retention_days,
+                                "Removed expired event files during retention pass"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Background event retention pass failed");
+                    }
+                }
+                cleanups.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
     }
 
     /// Get the total number of events written since creation
     #[must_use]
     pub fn events_written(&self) -> u64 {
         self.events_written.load(Ordering::Relaxed)
+    }
+
+    /// Number of flushes performed by the background maintenance task.
+    #[must_use]
+    pub fn background_flushes(&self) -> u64 {
+        self.background_flushes.load(Ordering::Relaxed)
+    }
+
+    /// Number of retention passes performed by the background maintenance task.
+    #[must_use]
+    pub fn background_cleanups(&self) -> u64 {
+        self.background_cleanups.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if the background maintenance task is running.
+    #[must_use]
+    pub fn background_maintenance_running(&self) -> bool {
+        self.maintenance
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// Flush the buffered writer behind `current_file`, if one is open.
+    async fn flush_writer(
+        current_file: &Arc<RwLock<Option<tokio::io::BufWriter<tokio::fs::File>>>>,
+    ) -> crate::Result<()> {
+        let mut file_guard = current_file.write().await;
+        if let Some(writer) = file_guard.as_mut() {
+            writer.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Remove event files older than `older_than` from `directory`.
+    async fn cleanup_directory(
+        directory: &Path,
+        older_than: chrono::Duration,
+    ) -> crate::Result<u64> {
+        let cutoff = Utc::now()
+            .date_naive()
+            .checked_sub_signed(older_than)
+            .ok_or_else(|| {
+                crate::CelersError::Other("Invalid duration for cleanup cutoff".to_string())
+            })?;
+
+        let files = Self::list_event_files_in(directory).await?;
+        let mut removed = 0u64;
+
+        for file_path in &files {
+            if let Some(file_date) = Self::parse_file_date(file_path) {
+                if file_date < cutoff {
+                    tokio::fs::remove_file(file_path).await?;
+                    removed += 1;
+                }
+            }
+        }
+
+        Ok(removed)
     }
 
     /// Ensure a file is open and ready for writing, rotating if necessary
@@ -302,10 +475,15 @@ impl FileEventPersister {
         ))
     }
 
-    /// List all event files in the directory
+    /// List all event files in the persister's directory
     async fn list_event_files(&self) -> crate::Result<Vec<PathBuf>> {
+        Self::list_event_files_in(&self.config.directory).await
+    }
+
+    /// List all event files in `directory`
+    async fn list_event_files_in(directory: &Path) -> crate::Result<Vec<PathBuf>> {
         let mut files = Vec::new();
-        let mut entries = tokio::fs::read_dir(&self.config.directory).await?;
+        let mut entries = tokio::fs::read_dir(directory).await?;
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -497,34 +675,11 @@ impl EventPersister for FileEventPersister {
     }
 
     async fn cleanup(&self, older_than: chrono::Duration) -> crate::Result<u64> {
-        let cutoff = Utc::now()
-            .date_naive()
-            .checked_sub_signed(older_than)
-            .ok_or_else(|| {
-                crate::CelersError::Other("Invalid duration for cleanup cutoff".to_string())
-            })?;
-
-        let files = self.list_event_files().await?;
-        let mut removed = 0u64;
-
-        for file_path in &files {
-            if let Some(file_date) = Self::parse_file_date(file_path) {
-                if file_date < cutoff {
-                    tokio::fs::remove_file(file_path).await?;
-                    removed += 1;
-                }
-            }
-        }
-
-        Ok(removed)
+        Self::cleanup_directory(&self.config.directory, older_than).await
     }
 
     async fn flush(&self) -> crate::Result<()> {
-        let mut file_guard = self.current_file.write().await;
-        if let Some(ref mut writer) = *file_guard {
-            writer.flush().await?;
-        }
-        Ok(())
+        Self::flush_writer(&self.current_file).await
     }
 }
 
@@ -560,8 +715,127 @@ mod tests {
         assert_eq!(config.max_file_size_bytes, 104_857_600);
         assert_eq!(config.retention_days, 30);
         assert_eq!(config.flush_interval, Duration::from_secs(1));
+        assert_eq!(config.retention_check_interval, Duration::from_secs(3600));
+        assert!(config.background_maintenance);
         assert!(config.enabled);
         assert_eq!(config.directory, PathBuf::from("./events"));
+    }
+
+    /// Drive the (paused) clock forward in `step` increments, letting the
+    /// spawned maintenance task run between advances, until `check` holds or the
+    /// bounded budget runs out.
+    ///
+    /// Advancing repeatedly rather than once matters: the background task may
+    /// not have registered its first timer yet when the test starts driving the
+    /// clock. No wall-clock sleeping is involved.
+    async fn advance_until(step: Duration, mut check: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            for _ in 0..64 {
+                if check() {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(step).await;
+        }
+        check()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_background_flusher_makes_single_emits_durable() {
+        // Regression: `flush_interval` was dead config. A single `emit` sat in
+        // an 8 KiB in-process BufWriter for an unbounded time and was lost on
+        // crash, even though the persister documents a 1s durability window.
+        let dir = std::env::temp_dir().join(format!("celers_test_flush_{}", Uuid::new_v4()));
+        // A long interval keeps the paused clock's auto-advance from reaching
+        // the first tick on its own, so the flush below is the one this test
+        // triggers explicitly.
+        let config = FileEventPersisterConfig::default()
+            .with_directory(&dir)
+            .with_flush_interval(Duration::from_secs(3600));
+
+        let persister = FileEventPersister::new(config)
+            .await
+            .expect("Failed to create persister");
+        assert!(persister.background_maintenance_running());
+
+        persister
+            .emit(make_task_event("buffered"))
+            .await
+            .expect("emit failed");
+
+        let path = persister.file_path_for_date(Utc::now().date_naive());
+
+        // One flush interval later the background task has flushed it.
+        assert!(
+            advance_until(Duration::from_secs(3601), || persister.background_flushes()
+                > 0)
+            .await,
+            "background flusher never ran"
+        );
+
+        let after = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        assert!(
+            after.contains("buffered"),
+            "event was not flushed to disk: {after:?}"
+        );
+
+        drop(persister);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_background_retention_removes_expired_files() {
+        // Regression: `retention_days` was dead config, so a default-configured
+        // persister grew without bound forever.
+        let dir = std::env::temp_dir().join(format!("celers_test_retain_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // An event file well past the retention horizon.
+        let stale = dir.join("events-2000-01-01.jsonl");
+        tokio::fs::write(&stale, b"{}\n").await.unwrap();
+
+        let config = FileEventPersisterConfig::default()
+            .with_directory(&dir)
+            .with_flush_interval(Duration::from_secs(3600))
+            .with_retention_days(7)
+            .with_retention_check_interval(Duration::from_secs(3600));
+
+        let persister = FileEventPersister::new(config)
+            .await
+            .expect("Failed to create persister");
+
+        assert!(
+            advance_until(Duration::from_secs(3601), || persister
+                .background_cleanups()
+                > 0)
+            .await,
+            "background retention pass never ran"
+        );
+
+        assert!(
+            !stale.exists(),
+            "expired event file was not removed by retention"
+        );
+
+        drop(persister);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_background_maintenance_can_be_disabled() {
+        let dir = std::env::temp_dir().join(format!("celers_test_nobg_{}", Uuid::new_v4()));
+        let config = FileEventPersisterConfig::default()
+            .with_directory(&dir)
+            .with_background_maintenance(false);
+
+        let persister = FileEventPersister::new(config)
+            .await
+            .expect("Failed to create persister");
+        assert!(!persister.background_maintenance_running());
+
+        drop(persister);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

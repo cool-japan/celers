@@ -3,7 +3,11 @@
 //! This module provides adapters between the AsyncResult API (ResultStore trait)
 //! and the Database result backend implementations (PostgreSQL and MySQL).
 
-use crate::{MysqlResultBackend, PostgresResultBackend, TaskMeta, TaskResult};
+#[cfg(feature = "mysql")]
+use crate::MysqlResultBackend;
+#[cfg(feature = "postgres")]
+use crate::PostgresResultBackend;
+use crate::{TaskMeta, TaskResult};
 use async_trait::async_trait;
 use celers_backend_redis::ResultBackend as LocalResultBackend;
 use celers_core::result::{ResultStore, TaskResultValue};
@@ -57,6 +61,7 @@ fn task_result_to_state(result: &TaskResult) -> TaskState {
 }
 
 // PostgreSQL ResultStore implementation
+#[cfg(feature = "postgres")]
 #[async_trait]
 impl ResultStore for PostgresResultBackend {
     async fn store_result(
@@ -122,6 +127,7 @@ impl ResultStore for PostgresResultBackend {
 }
 
 // MySQL ResultStore implementation
+#[cfg(feature = "mysql")]
 #[async_trait]
 impl ResultStore for MysqlResultBackend {
     async fn store_result(

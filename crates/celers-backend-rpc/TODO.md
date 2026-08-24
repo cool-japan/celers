@@ -2,22 +2,33 @@
 
 > gRPC/RPC result backend for CeleRS
 
-**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 18**
+**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-08-24 | Tests: 38**
 
-## Status: ✅ FEATURE COMPLETE + v0.3.0 CLIENT-SIDE METRICS
+## Status: ✅ FEATURE COMPLETE — CLIENT + REFERENCE SERVER
 
-Full gRPC result backend client implementation for distributed microservices architectures and
-service mesh deployments. v0.3.0 adds `RpcMetrics` (`src/metrics.rs`): per-operation request/error
-counts and p50/p95/p99 latency, computed from a 1,000-sample ring buffer per operation.
+Full gRPC result backend **client and reference server** for distributed microservices
+architectures and service mesh deployments. `RpcBackendServer` (`src/server.rs`) closes what was
+previously a client-only crate: it implements the generated `ResultBackendService` trait, wrapping
+any `ResultBackend` (Redis, SQL, in-memory, ...) so `GrpcResultBackend::connect(...)` has something
+to talk to without every user hand-rolling a server (including the chord counter's atomicity)
+themselves. The client also gained per-call deadlines, connect timeouts, message-size limits,
+bearer-token auth, and retry-with-backoff on transient failures (`src/config.rs`), and the wire
+codec (`src/codec.rs`) now preserves sub-second timestamp precision and turns a corrupt
+`result_data` payload into a decode error instead of a silent `Success(null)`.
 
 ## Completed Features
 
 ### Core gRPC Client ✅
-- [x] `connect()` - Connect to gRPC result backend service
-- [x] `from_channel()` - Create from existing gRPC channel
+- [x] `connect()` / `connect_with_config()` - Connect to gRPC result backend service
+- [x] `from_channel()` / `from_channel_with_config()` - Create from existing gRPC channel
+- [x] `GrpcConfig` (`src/config.rs`) - per-call deadline, connect timeout, message-size cap,
+      bearer-token auth, retry policy — with sane defaults (30s/10s/16 MiB/none/3 attempts)
+- [x] Automatic retry with exponential backoff on `Unavailable` / `DeadlineExceeded`
+      (`decide_retry`, unit-tested independent of any network I/O)
 - [x] Protocol buffer schema definition
 - [x] Automatic code generation via `tonic-prost-build` (`build.rs`)
-- [x] Type conversion (Rust ↔ Protobuf)
+- [x] Type conversion (Rust ↔ Protobuf), factored into `src/codec.rs` and shared by the client and
+      the reference server so they can't drift apart on wire semantics
 
 ### ResultBackend Implementation ✅
 - [x] `store_result()` - Store task results via gRPC
@@ -78,8 +89,8 @@ service ResultBackendService {
 | Rust Type | Protobuf Type | Notes |
 |-----------|---------------|-------|
 | Uuid | string | UUID as hyphenated string |
-| DateTime<Utc> | int64 | Unix timestamp (seconds) |
-| serde_json::Value | string | JSON serialized to string |
+| DateTime<Utc> | int64 + uint32 | Unix timestamp (seconds) + nanosecond component, so sub-second precision survives the round trip instead of truncating to `:00` |
+| serde_json::Value | string | JSON serialized to string; a present-but-corrupt string is a decode error, not a silent `Success(null)` |
 | Option<T> | optional T | Proto3 optional fields |
 
 ## Usage Examples
@@ -142,35 +153,32 @@ if completed == 10 {
 let state = backend.chord_get_state(chord_id).await?;
 ```
 
-## Server Implementation (Future)
+## Server Implementation ✅
 
-The server-side implementation is not included in this crate. To use this client, you need to implement a gRPC server that:
+`RpcBackendServer` (`src/server.rs`) implements the generated `ResultBackendService` trait,
+delegating every RPC to any `ResultBackend` implementation (e.g. `RedisResultBackend`) wrapped in
+a `tokio::sync::Mutex`:
 
-1. Implements the `ResultBackendService` from `result_backend.proto`
-2. Stores results in your backend of choice (Redis, database, etc.)
-3. Handles all RPC methods defined in the proto file
-
-Example server skeleton (using tonic):
 ```rust
-use tonic::{transport::Server, Request, Response, Status};
+use celers_backend_rpc::RpcBackendServer;
+use celers_backend_redis::RedisResultBackend;
 
-struct MyResultBackendService {
-    // Your storage backend (Redis, DB, etc.)
-}
-
-#[tonic::async_trait]
-impl ResultBackendService for MyResultBackendService {
-    async fn store_result(
-        &self,
-        request: Request<StoreResultRequest>,
-    ) -> Result<Response<StoreResultResponse>, Status> {
-        // Implement storage logic
-        Ok(Response::new(StoreResultResponse { success: true }))
-    }
-
-    // ... implement other methods
-}
+let backend = RedisResultBackend::new("redis://127.0.0.1/")?;
+RpcBackendServer::serve("0.0.0.0:50051".parse()?, backend).await?;
 ```
+
+- [x] `RpcBackendServer::new` / `into_service` — wrap a `ResultBackend`, build the tonic service
+- [x] `RpcBackendServer::serve` / `serve_with_shutdown` — bind and run, with graceful shutdown
+- [x] All seven RPCs implemented, delegating to the wrapped backend
+- [x] gRPC status-code mapping (`NotFound` / `InvalidArgument` / `Unavailable` / `Internal`)
+      instead of collapsing every failure to `internal`
+- [x] Message-size limits applied on the server side too (not just the client)
+- [x] In-process client-server round-trip test over a real local TCP listener
+      (`server::tests::test_client_server_round_trip`), covering every RPC including the chord
+      lifecycle — no external gRPC server needed to exercise this crate's own correctness
+- [ ] `celers-rpc-server` standalone binary (CLI + config-file loading) — the library API above
+      covers embedding a server in your own process; a standalone binary is a natural follow-up
+      but isn't required to use this crate
 
 ## Architecture Use Cases
 
@@ -238,10 +246,14 @@ Benefits:
 - Flow control
 
 ### Security
-- TLS/SSL encryption
-- mTLS authentication
-- Token-based auth (metadata)
-- Channel credentials
+- [x] Token-based auth (`GrpcConfig::with_auth_token`, sent as an `authorization: Bearer <token>`
+      metadata header on every request)
+- [ ] TLS/SSL encryption — not wired up via tonic's `tls-*` Cargo features, which pull in `ring`
+      or `aws-lc-rs` (both violate this workspace's Pure-Rust policy; tonic 0.14 has no feature to
+      select a pure-Rust crypto backend instead). Bring your own TLS-enabled `Channel` via
+      `GrpcResultBackend::from_channel_with_config` in the meantime.
+- [ ] mTLS authentication (blocked on the same TLS gap above)
+- [ ] Channel credentials beyond the bearer-token metadata header
 
 ## Future Enhancements
 
@@ -264,10 +276,10 @@ Benefits:
 - [ ] Deadline/timeout propagation
 
 ### Authentication
-- [ ] JWT token authentication
+- [x] Bearer-token authentication (`GrpcConfig::with_auth_token`)
+- [ ] JWT token authentication (validation/refresh logic — today's bearer token is opaque)
 - [ ] OAuth2 integration
-- [ ] API key authentication
-- [ ] mTLS client certificates
+- [ ] mTLS client certificates (blocked on the TLS gap noted under Security above)
 
 ### Monitoring
 - [x] Client-side metrics — `RpcMetrics` in `src/metrics.rs`: per-operation (`RpcOperation`, one of
@@ -281,17 +293,25 @@ Benefits:
 ### Load Balancing
 - [ ] Client-side load balancing
 - [ ] Connection affinity
-- [ ] Retry policies
+- [x] Retry policies — exponential backoff with jitter on `Unavailable` / `DeadlineExceeded`
+      (`GrpcConfig::retry`, reusing `celers_backend_redis::retry::RetryStrategy`); non-retryable
+      statuses (e.g. `InvalidArgument`, `NotFound`) fail immediately on the first attempt
 - [ ] Circuit breaker integration
 
 ## Testing Status
 
 - [x] Compilation tests
-- [x] Unit tests (18 passing via `cargo nextest run --all-features`: type conversions, chord
-      operations, connection modes, and the `RpcMetrics` ring-buffer/percentile logic), 1 skipped
-      (`#[ignore]`d, requires a live gRPC server)
-- [ ] Integration tests with mock server
-- [ ] Integration tests with real server
+- [x] Unit tests (38 passing via `cargo nextest run --all-features`: type conversions including
+      sub-second timestamp round-tripping and corrupt-payload rejection, chord operations,
+      connection modes, retry-decision logic, request hardening, and the `RpcMetrics`
+      ring-buffer/percentile logic), 1 skipped (`#[ignore]`d, requires a *live external* server)
+- [x] Integration tests with mock server (`InMemoryBackend` in `server::tests`, exercised over a
+      real local TCP listener via `RpcBackendServer` — not literally mocked at the gRPC layer)
+- [x] Integration tests with a full client-server round trip
+      (`server::tests::test_client_server_round_trip`: store/get/delete plus the full chord
+      lifecycle, all over the network stack, not in-process function calls)
+- [ ] Integration tests against a real external gRPC server on the default port (the `#[ignore]`d
+      `test_grpc_backend_connection`; run manually with `cargo test -- --ignored` once one is up)
 - [ ] Load testing
 - [ ] Latency benchmarks
 
@@ -405,8 +425,11 @@ clusters:
 
 - gRPC uses HTTP/2 (requires compatible infrastructure)
 - Binary protocol is more efficient than JSON
-- Server implementation required (not included)
+- Reference server included (`RpcBackendServer`) — wraps any local `ResultBackend`, so you don't
+  need to hand-roll the seven RPCs (or the chord counter's atomicity) yourself; see [Server
+  Implementation](#server-implementation-) above
 - Great for distributed/cloud deployments
-- Can wrap any backend (Redis, DB, S3, etc.)
-- Protocol Buffers ensure forward/backward compatibility
+- Can wrap any backend (Redis, DB, S3, etc.) behind `RpcBackendServer`
+- Protocol Buffers ensure forward/backward compatibility (the new timestamp-nanos fields are
+  additive: older peers that don't set them still decode correctly, at whole-second precision)
 - Consider network latency in performance calculations

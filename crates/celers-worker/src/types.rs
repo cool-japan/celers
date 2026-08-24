@@ -5,12 +5,13 @@ use crate::affinity::WorkerLabels;
 use crate::batching::BatchConfig;
 use crate::circuit_breaker::CircuitBreakerConfig;
 use crate::dlq::DlqConfig;
-use crate::feature_flags::FeatureFlags;
+use crate::feature_flags::{FeatureFlags, TaskFeatureRequirements};
 use crate::metadata::WorkerMetadata;
 use crate::retry::{RetryConfig, RetryStrategy};
 use crate::routing::{RoutingStrategy, WorkerTags};
 
 use celers_core::Result;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -111,8 +112,41 @@ pub struct WorkerConfig {
     /// Polling interval when queue is empty (milliseconds)
     pub poll_interval_ms: u64,
 
-    /// Enable graceful shutdown
+    /// Name of the queue this worker consumes from.
+    ///
+    /// Used for cluster-wide rate limiting when
+    /// [`RateLimitKeyStrategy::Queue`](crate::RateLimitKeyStrategy::Queue) is
+    /// selected, so per-queue budgets are actually per queue.
+    pub queue_name: String,
+
+    /// Enable graceful shutdown.
+    ///
+    /// When set (the default), a shutdown signal stops the worker from
+    /// dequeuing and waits up to [`shutdown_timeout_secs`](Self::shutdown_timeout_secs)
+    /// for in-flight tasks to finish. Messages that are still undisposed when
+    /// the deadline expires (or immediately, when this is `false`) are requeued
+    /// so the broker redelivers them instead of stranding them.
     pub graceful_shutdown: bool,
+
+    /// How long a graceful shutdown waits for in-flight tasks (seconds).
+    ///
+    /// `0` disables draining entirely (in-flight messages are requeued at once).
+    pub shutdown_timeout_secs: u64,
+
+    /// Base delay applied before polling again when every dequeued message was
+    /// deferred by admission control (routing / affinity / feature flags /
+    /// rate limiting), in milliseconds.
+    ///
+    /// Without it a task no worker can currently serve produces a
+    /// dequeue -> requeue -> dequeue spin at 100% CPU.
+    pub defer_delay_ms: u64,
+
+    /// Upper bound for deferral delays, in milliseconds.
+    ///
+    /// Also clamps externally supplied hints such as a distributed rate
+    /// limiter's `retry_after`, which can be effectively unbounded for a
+    /// zero-rate limiter.
+    pub defer_max_delay_ms: u64,
 
     /// Maximum number of retry attempts
     pub max_retries: u32,
@@ -160,6 +194,15 @@ pub struct WorkerConfig {
     /// true).
     pub coalescing_config: BatchConfig,
 
+    /// Restrict coalescing to true redelivery duplicates (same task id).
+    ///
+    /// The default coalescing key is `(task name, payload hash)`, so two
+    /// *independent* submissions with identical arguments — different task ids
+    /// — collapse into one and the dropped one never runs and never produces a
+    /// result. Enable this to coalesce only repeated deliveries of the *same*
+    /// task id, which is lossless.
+    pub coalesce_require_same_task_id: bool,
+
     /// Maximum task result size in bytes (0 = unlimited)
     pub max_result_size_bytes: usize,
 
@@ -174,7 +217,11 @@ pub struct WorkerConfig {
     pub circuit_breaker_config: CircuitBreakerConfig,
 
     // Dead Letter Queue options
-    /// Enable Dead Letter Queue for permanently failed tasks
+    /// Enable Dead Letter Queue for permanently failed tasks.
+    ///
+    /// This flag is authoritative: the worker enables the handler built from
+    /// [`dlq_config`](Self::dlq_config) even when that config's own `enabled`
+    /// field is left at its `false` default.
     pub enable_dlq: bool,
 
     /// DLQ configuration
@@ -205,6 +252,13 @@ pub struct WorkerConfig {
     /// Enable event emission for task and worker lifecycle events
     pub enable_events: bool,
 
+    /// Capacity of the lifecycle-event buffer.
+    ///
+    /// Events are handed to a background emitter instead of being awaited on
+    /// the task critical path; when the buffer is full events are dropped
+    /// (and counted) rather than back-pressuring task execution.
+    pub event_buffer_capacity: usize,
+
     /// Heartbeat interval in seconds (0 = disabled)
     pub heartbeat_interval_secs: u64,
 
@@ -213,6 +267,14 @@ pub struct WorkerConfig {
 
     /// Feature flags enabled on this worker
     pub feature_flags: FeatureFlags,
+
+    /// Per-task feature requirements matched against
+    /// [`feature_flags`](Self::feature_flags) before a task is executed.
+    ///
+    /// A task whose requirements this worker does not satisfy is deferred
+    /// (requeued) for a worker that does. Tasks with no entry here are admitted
+    /// unconditionally, so this is a no-op until populated.
+    pub task_feature_requirements: HashMap<String, TaskFeatureRequirements>,
 }
 
 impl Default for WorkerConfig {
@@ -220,7 +282,11 @@ impl Default for WorkerConfig {
         Self {
             concurrency: 4,
             poll_interval_ms: 1000,
+            queue_name: "celery".to_string(),
             graceful_shutdown: true,
+            shutdown_timeout_secs: 30,
+            defer_delay_ms: 250,
+            defer_max_delay_ms: 2000,
             max_retries: 3,
             retry_base_delay_ms: 1000,
             retry_max_delay_ms: 60000,
@@ -232,6 +298,7 @@ impl Default for WorkerConfig {
             adaptive_poll_config: AdaptivePollConfig::default(),
             enable_coalescing: false,
             coalescing_config: BatchConfig::default(),
+            coalesce_require_same_task_id: false,
             max_result_size_bytes: 0, // unlimited
             track_memory_usage: false,
             enable_circuit_breaker: false,
@@ -244,9 +311,11 @@ impl Default for WorkerConfig {
             worker_labels: WorkerLabels::new(),
             hostname: gethostname(),
             enable_events: false,
+            event_buffer_capacity: 1024,
             heartbeat_interval_secs: 0, // disabled by default
             metadata: WorkerMetadata::default(),
             feature_flags: FeatureFlags::default(),
+            task_feature_requirements: HashMap::new(),
         }
     }
 }
@@ -472,6 +541,25 @@ impl WorkerConfig {
             retry_config.validate()?;
         }
 
+        if self.defer_max_delay_ms < self.defer_delay_ms {
+            return Err(
+                "Max deferral delay must be greater than or equal to the deferral delay"
+                    .to_string(),
+            );
+        }
+
+        if self.enable_events && self.event_buffer_capacity == 0 {
+            return Err(
+                "Event buffer capacity must be at least 1 when events are enabled".to_string(),
+            );
+        }
+
+        for (task_name, requirements) in &self.task_feature_requirements {
+            requirements
+                .validate()
+                .map_err(|e| format!("Invalid feature requirements for '{task_name}': {e}"))?;
+        }
+
         Ok(())
     }
 }
@@ -507,6 +595,9 @@ impl std::fmt::Display for WorkerConfig {
         if self.enable_routing {
             write!(f, ", routing=enabled")?;
         }
+        if self.graceful_shutdown {
+            write!(f, ", drain={}s", self.shutdown_timeout_secs)?;
+        }
         write!(f, "]")
     }
 }
@@ -541,11 +632,47 @@ impl WorkerConfigBuilder {
         self
     }
 
+    /// Set the name of the queue this worker consumes from
+    ///
+    /// Used as the rate-limit key under
+    /// [`RateLimitKeyStrategy::Queue`](crate::RateLimitKeyStrategy::Queue).
+    ///
+    /// Default: `"celery"`
+    pub fn queue_name(mut self, queue: impl Into<String>) -> Self {
+        self.config.queue_name = queue.into();
+        self
+    }
+
     /// Enable or disable graceful shutdown
     ///
     /// Default: true
     pub fn graceful_shutdown(mut self, enabled: bool) -> Self {
         self.config.graceful_shutdown = enabled;
+        self
+    }
+
+    /// Set how long a graceful shutdown waits for in-flight tasks (seconds)
+    ///
+    /// Default: 30
+    pub fn shutdown_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.config.shutdown_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Set the base delay applied when admission control defers every dequeued
+    /// message (milliseconds)
+    ///
+    /// Default: 250ms
+    pub fn defer_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.config.defer_delay_ms = delay_ms;
+        self
+    }
+
+    /// Set the upper bound for deferral delays (milliseconds)
+    ///
+    /// Default: 2000ms
+    pub fn defer_max_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.config.defer_max_delay_ms = delay_ms;
         self
     }
 
@@ -638,6 +765,18 @@ impl WorkerConfigBuilder {
     /// Has effect only when coalescing is enabled.
     pub fn coalescing_config(mut self, config: BatchConfig) -> Self {
         self.config.coalescing_config = config;
+        self
+    }
+
+    /// Coalesce only repeated deliveries of the *same* task id (lossless).
+    ///
+    /// With the default (`false`) key — `(task name, payload hash)` —
+    /// independent submissions with identical arguments coalesce into one and
+    /// the dropped submissions never produce a result.
+    ///
+    /// Default: false
+    pub fn coalesce_require_same_task_id(mut self, enabled: bool) -> Self {
+        self.config.coalesce_require_same_task_id = enabled;
         self
     }
 
@@ -757,6 +896,30 @@ impl WorkerConfigBuilder {
         self
     }
 
+    /// Declare the feature requirements of a task type.
+    ///
+    /// Before executing a task the worker checks its
+    /// [`feature_flags`](WorkerConfig::feature_flags) against these
+    /// requirements and defers the task if they are not satisfied.
+    pub fn task_features(
+        mut self,
+        task_name: impl Into<String>,
+        requirements: TaskFeatureRequirements,
+    ) -> Self {
+        self.config
+            .task_feature_requirements
+            .insert(task_name.into(), requirements);
+        self
+    }
+
+    /// Set the lifecycle-event buffer capacity
+    ///
+    /// Default: 1024
+    pub fn event_buffer_capacity(mut self, capacity: usize) -> Self {
+        self.config.event_buffer_capacity = capacity;
+        self
+    }
+
     /// Preset: High throughput configuration
     ///
     /// - High concurrency (16 tasks)
@@ -857,6 +1020,11 @@ pub struct WorkerStats {
     revoked: AtomicU64,
     /// Total number of tasks deferred due to distributed rate limiting
     rate_limited: AtomicU64,
+    /// Total number of tasks deferred by admission control (routing, affinity,
+    /// feature flags, rate limiting)
+    deferred: AtomicU64,
+    /// Total number of task handlers that panicked
+    panicked: AtomicU64,
 }
 
 impl WorkerStats {
@@ -885,14 +1053,37 @@ impl WorkerStats {
         self.rate_limited.load(Ordering::Relaxed)
     }
 
+    /// Get the number of tasks deferred by admission control (routing,
+    /// affinity, feature flags or rate limiting)
+    pub fn deferred(&self) -> u64 {
+        self.deferred.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of task handlers that panicked
+    pub fn panicked(&self) -> u64 {
+        self.panicked.load(Ordering::Relaxed)
+    }
+
     /// Increment the active task count (called when a task starts)
     pub fn task_started(&self) {
         self.active.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement the active task count and increment processed (called when a task completes)
+    ///
+    /// The decrement saturates at zero: both drain implementations wait for
+    /// `active() == 0`, so an unbalanced decrement wrapping `u64` around to
+    /// `u64::MAX` would hang graceful shutdown forever.
     pub fn task_completed(&self) {
-        self.active.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current == 0 {
+                    None
+                } else {
+                    Some(current - 1)
+                }
+            });
         self.processed.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -905,6 +1096,16 @@ impl WorkerStats {
     pub fn task_rate_limited(&self) {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Record that a task was deferred (requeued) by admission control
+    pub fn task_deferred(&self) {
+        self.deferred.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a task handler panicked
+    pub fn task_panicked(&self) {
+        self.panicked.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl Clone for WorkerStats {
@@ -914,6 +1115,8 @@ impl Clone for WorkerStats {
             processed: AtomicU64::new(self.processed.load(Ordering::Relaxed)),
             revoked: AtomicU64::new(self.revoked.load(Ordering::Relaxed)),
             rate_limited: AtomicU64::new(self.rate_limited.load(Ordering::Relaxed)),
+            deferred: AtomicU64::new(self.deferred.load(Ordering::Relaxed)),
+            panicked: AtomicU64::new(self.panicked.load(Ordering::Relaxed)),
         }
     }
 }
@@ -949,6 +1152,13 @@ impl WorkerHandle {
     }
 
     /// Start draining (gracefully stop after completing current tasks)
+    ///
+    /// Waits until every in-flight task has finished. The worker's own run loop
+    /// applies [`WorkerConfig::shutdown_timeout_secs`] as a hard deadline and
+    /// requeues whatever is still running when it expires, so this call cannot
+    /// wait indefinitely on a hung task once that deadline passes; use
+    /// [`drain_with_timeout`](Self::drain_with_timeout) to bound the wait on
+    /// the caller's side as well.
     pub async fn drain(&self) -> Result<()> {
         info!("Worker starting drain");
         self.mode
@@ -965,6 +1175,25 @@ impl WorkerHandle {
 
         info!("Worker drain complete");
         Ok(())
+    }
+
+    /// Start draining, waiting at most `timeout` for in-flight tasks.
+    ///
+    /// Returns `true` when every task finished within the deadline and `false`
+    /// when tasks were still running (the worker's run loop then requeues their
+    /// messages so the broker redelivers them).
+    pub async fn drain_with_timeout(&self, timeout: Duration) -> Result<bool> {
+        match tokio::time::timeout(timeout, self.drain()).await {
+            Ok(result) => result.map(|()| true),
+            Err(_elapsed) => {
+                warn!(
+                    "Worker drain timed out after {:?} with {} task(s) still active",
+                    timeout,
+                    self.stats.active()
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Get the current worker mode

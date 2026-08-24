@@ -9,10 +9,24 @@
 //!
 //! Key properties:
 //!
+//! * **Terminal results only** — only immutable, terminal values
+//!   ([`Success`](crate::TaskResultValue::Success),
+//!   [`Failure`](crate::TaskResultValue::Failure),
+//!   [`Revoked`](crate::TaskResultValue::Revoked),
+//!   [`Rejected`](crate::TaskResultValue::Rejected)) are cached. Transient
+//!   states (`Pending`, `Received`, `Started`, `Retry`) are guaranteed to change
+//!   and are therefore always read from the inner backend.
 //! * **Bounded capacity** — at most `capacity` entries are cached; inserting
 //!   beyond capacity evicts the least-recently-used entry.
-//! * **Per-entry TTL** — an optional time-to-live causes cached entries to be
-//!   treated as a miss (and refreshed from the inner backend) once they expire.
+//! * **Per-entry TTL** — cached entries are treated as a miss (and refreshed
+//!   from the inner backend) once they expire. Because write-through
+//!   invalidation is *instance-local*, a deployment whose writer is another
+//!   process (the usual worker/client split) relies on the TTL for freshness,
+//!   so [`CachingResultBackend::new`] installs
+//!   [`DEFAULT_TTL`] rather than caching forever.
+//! * **Separate, short negative cache** — "no result yet" is remembered in its
+//!   own map with its own short TTL ([`DEFAULT_NEGATIVE_TTL`]), so polling for a
+//!   task that has not finished yet cannot pin a stale "absent" answer.
 //! * **Write-through + invalidation** — [`store_result`](crate::ResultStore::store_result) writes through to the
 //!   inner backend and refreshes the cache; [`forget`](crate::ResultStore::forget) removes the entry from
 //!   both the cache and the inner backend.
@@ -63,23 +77,28 @@ use tokio::sync::Mutex;
 /// Sentinel index meaning "no node" within the intrusive linked list.
 const NIL: usize = usize::MAX;
 
-/// A cached snapshot of a task's stored result.
-#[derive(Debug, Clone)]
-struct CachedResult {
-    /// The cached result value, or `None` if the inner backend reported that no
-    /// result exists for this task (a negative cache entry).
-    value: Option<TaskResultValue>,
-    /// When this entry was inserted, used to enforce the optional TTL.
-    inserted_at: Instant,
-}
+/// Default time-to-live applied by [`CachingResultBackend::new`].
+///
+/// Cached terminal results are immutable, but a result can still be *forgotten*
+/// (expired, tombstoned) by another process, so entries are not kept forever by
+/// default.
+pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
+
+/// Default time-to-live for negative ("no result stored") entries.
+///
+/// Deliberately short: the writer is typically a worker in another process, so a
+/// missing result is expected to appear at any moment.
+pub const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(1);
 
 /// One slot of the intrusive doubly-linked LRU list.
 #[derive(Debug)]
-struct LruNode {
+struct LruNode<V> {
     /// The task ID this node caches (only meaningful when occupied).
     key: TaskId,
     /// The cached value for `key`.
-    value: CachedResult,
+    value: V,
+    /// When this entry was inserted, used to enforce the TTL.
+    inserted_at: Instant,
     /// Previous node towards the most-recently-used end (or [`NIL`]).
     prev: usize,
     /// Next node towards the least-recently-used end (or [`NIL`]).
@@ -92,13 +111,13 @@ struct LruNode {
 /// a `HashMap` from key to slab index. All operations are amortised O(1). When
 /// at capacity, inserting a new key evicts the least-recently-used entry.
 #[derive(Debug)]
-struct LruCache {
+struct LruCache<V> {
     /// Maximum number of live entries.
     capacity: usize,
     /// Optional per-entry time-to-live.
     ttl: Option<Duration>,
     /// Backing storage for nodes. Indices are stable for a node's lifetime.
-    nodes: Vec<LruNode>,
+    nodes: Vec<LruNode<V>>,
     /// Map from task ID to its index in `nodes`.
     index: HashMap<TaskId, usize>,
     /// Index of the most-recently-used node, or [`NIL`].
@@ -109,7 +128,7 @@ struct LruCache {
     free: Vec<usize>,
 }
 
-impl LruCache {
+impl<V: Clone> LruCache<V> {
     /// Create a new cache with the given capacity (clamped to at least 1) and
     /// optional TTL.
     fn new(capacity: usize, ttl: Option<Duration>) -> Self {
@@ -188,7 +207,7 @@ impl LruCache {
     /// Return `true` if the entry at `idx` has outlived the configured TTL.
     fn is_expired(&self, idx: usize) -> bool {
         match self.ttl {
-            Some(ttl) => self.nodes[idx].value.inserted_at.elapsed() >= ttl,
+            Some(ttl) => self.nodes[idx].inserted_at.elapsed() >= ttl,
             None => false,
         }
     }
@@ -196,7 +215,7 @@ impl LruCache {
     /// Look up a key. On a live (non-expired) hit, the entry is promoted to
     /// most-recently-used and a clone of its value returned. On an expired hit
     /// the entry is removed and `None` returned (treated as a miss).
-    fn get(&mut self, key: &TaskId) -> Option<CachedResult> {
+    fn get(&mut self, key: &TaskId) -> Option<V> {
         let idx = *self.index.get(key)?;
         if self.is_expired(idx) {
             // Expired: drop it and report a miss.
@@ -211,9 +230,11 @@ impl LruCache {
 
     /// Insert or overwrite an entry, promoting it to most-recently-used and
     /// evicting the LRU entry if inserting a new key would exceed capacity.
-    fn put(&mut self, key: TaskId, value: CachedResult) {
+    fn put(&mut self, key: TaskId, value: V) {
+        let inserted_at = Instant::now();
         if let Some(&idx) = self.index.get(&key) {
             self.nodes[idx].value = value;
+            self.nodes[idx].inserted_at = inserted_at;
             self.touch(idx);
             return;
         }
@@ -226,6 +247,7 @@ impl LruCache {
             self.nodes[reused] = LruNode {
                 key,
                 value,
+                inserted_at,
                 prev: NIL,
                 next: NIL,
             };
@@ -234,6 +256,7 @@ impl LruCache {
             self.nodes.push(LruNode {
                 key,
                 value,
+                inserted_at,
                 prev: NIL,
                 next: NIL,
             });
@@ -272,8 +295,15 @@ impl LruCache {
 pub struct CachingResultBackend<B: ResultStore> {
     /// The wrapped backend that holds the authoritative results.
     inner: B,
-    /// The native LRU cache.
-    cache: Mutex<LruCache>,
+    /// The native LRU cache of *terminal* results.
+    cache: Mutex<LruCache<TaskResultValue>>,
+    /// Separate, short-lived cache of task IDs the inner backend reported as
+    /// having no stored result.
+    negative: Mutex<LruCache<()>>,
+    /// Configured maximum number of entries per cache.
+    capacity: usize,
+    /// Whether negative caching is enabled at all.
+    negative_enabled: bool,
     /// Number of cache hits observed (diagnostics).
     hits: AtomicU64,
     /// Number of cache misses observed (diagnostics).
@@ -281,14 +311,18 @@ pub struct CachingResultBackend<B: ResultStore> {
 }
 
 impl<B: ResultStore> CachingResultBackend<B> {
-    /// Wrap `inner` with a cache of the given `capacity` and no TTL (entries
-    /// never expire on their own; they are only evicted by capacity pressure or
-    /// invalidation).
+    /// Wrap `inner` with a cache of the given `capacity` and the default TTL
+    /// ([`DEFAULT_TTL`]).
+    ///
+    /// A TTL is applied by design: write-through invalidation only affects
+    /// *this* wrapper instance, so when the writer lives in another process
+    /// (worker) the TTL is what bounds staleness. Use
+    /// [`CachingResultBackend::with_ttl`] to choose a different bound.
     ///
     /// The capacity is clamped to a minimum of 1.
     #[must_use]
     pub fn new(inner: B, capacity: usize) -> Self {
-        Self::build(inner, capacity, None)
+        Self::build(inner, capacity, Some(DEFAULT_TTL))
     }
 
     /// Wrap `inner` with a cache of the given `capacity` and a per-entry `ttl`.
@@ -302,14 +336,76 @@ impl<B: ResultStore> CachingResultBackend<B> {
         Self::build(inner, capacity, Some(ttl))
     }
 
+    /// Override the TTL used for negative ("no result stored") entries.
+    ///
+    /// Defaults to [`DEFAULT_NEGATIVE_TTL`]. Keep it short: a task that has not
+    /// finished yet may produce a result at any moment.
+    #[must_use]
+    pub fn with_negative_ttl(self, ttl: Duration) -> Self {
+        let capacity = self.capacity;
+        Self {
+            negative: Mutex::new(LruCache::new(capacity, Some(ttl))),
+            negative_enabled: true,
+            ..self
+        }
+    }
+
+    /// Disable negative caching entirely: a task with no stored result always
+    /// consults the inner backend.
+    #[must_use]
+    pub fn without_negative_caching(self) -> Self {
+        Self {
+            negative_enabled: false,
+            ..self
+        }
+    }
+
     /// Shared constructor.
     fn build(inner: B, capacity: usize, ttl: Option<Duration>) -> Self {
+        let capacity = capacity.max(1);
         Self {
             inner,
             cache: Mutex::new(LruCache::new(capacity, ttl)),
+            negative: Mutex::new(LruCache::new(capacity, Some(DEFAULT_NEGATIVE_TTL))),
+            capacity,
+            negative_enabled: true,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// Record a freshly-read value in the appropriate cache.
+    ///
+    /// Only immutable terminal values are cached; transient states are never
+    /// cached because they are guaranteed to change. An absent result is
+    /// recorded in the separate, short-TTL negative cache.
+    async fn populate(&self, task_id: TaskId, value: Option<&TaskResultValue>) {
+        match value {
+            Some(v) if v.is_terminal() => {
+                self.cache.lock().await.put(task_id, v.clone());
+                if self.negative_enabled {
+                    self.negative.lock().await.remove(&task_id);
+                }
+            }
+            Some(_) => {
+                // Transient state: make sure no stale entry survives.
+                self.cache.lock().await.remove(&task_id);
+                if self.negative_enabled {
+                    self.negative.lock().await.remove(&task_id);
+                }
+            }
+            None => {
+                self.cache.lock().await.remove(&task_id);
+                if self.negative_enabled {
+                    self.negative.lock().await.put(task_id, ());
+                }
+            }
+        }
+    }
+
+    /// Look up a live negative-cache entry.
+    async fn negative_hit(&self, task_id: TaskId) -> bool {
+        self.negative_enabled && self.negative.lock().await.get(&task_id).is_some()
     }
 
     /// Borrow the wrapped inner backend.
@@ -335,9 +431,14 @@ impl<B: ResultStore> CachingResultBackend<B> {
         self.misses.load(Ordering::Relaxed)
     }
 
-    /// Number of entries currently held in the cache.
+    /// Number of terminal results currently held in the cache.
     pub async fn cache_len(&self) -> usize {
         self.cache.lock().await.len()
+    }
+
+    /// Number of live negative ("no result stored") entries currently held.
+    pub async fn negative_cache_len(&self) -> usize {
+        self.negative.lock().await.len()
     }
 
     /// The configured maximum cache capacity.
@@ -345,15 +446,22 @@ impl<B: ResultStore> CachingResultBackend<B> {
         self.cache.lock().await.capacity
     }
 
-    /// Remove a single task's entry from the cache (without touching the inner
-    /// backend).
+    /// The configured time-to-live for cached terminal results, if any.
+    pub async fn ttl(&self) -> Option<Duration> {
+        self.cache.lock().await.ttl
+    }
+
+    /// Remove a single task's entry from both caches (without touching the
+    /// inner backend).
     pub async fn invalidate(&self, task_id: TaskId) {
         self.cache.lock().await.remove(&task_id);
+        self.negative.lock().await.remove(&task_id);
     }
 
     /// Drop every cached entry (without touching the inner backend).
     pub async fn clear_cache(&self) {
         self.cache.lock().await.clear();
+        self.negative.lock().await.clear();
     }
 
     /// Record a hit and return the supplied value (helper to keep call sites
@@ -373,46 +481,45 @@ impl<B: ResultStore> ResultStore for CachingResultBackend<B> {
     async fn store_result(&self, task_id: TaskId, result: TaskResultValue) -> Result<()> {
         // Write through to the authoritative backend first.
         self.inner.store_result(task_id, result.clone()).await?;
-        // Refresh the cache with the freshly stored value.
-        self.cache.lock().await.put(
-            task_id,
-            CachedResult {
-                value: Some(result),
-                inserted_at: Instant::now(),
-            },
-        );
+        // Refresh the caches with the freshly stored value (a transient state
+        // is not cached, but it does invalidate any previous entry).
+        self.populate(task_id, Some(&result)).await;
         Ok(())
     }
 
     async fn get_result(&self, task_id: TaskId) -> Result<Option<TaskResultValue>> {
-        // Fast path: serve from cache on a live hit.
+        // Fast path: serve a terminal result from the cache on a live hit.
         if let Some(cached) = self.cache.lock().await.get(&task_id) {
             self.record_hit();
-            return Ok(cached.value);
+            return Ok(Some(cached));
+        }
+        // Short-lived negative entry: the task had no stored result very
+        // recently.
+        if self.negative_hit(task_id).await {
+            self.record_hit();
+            return Ok(None);
         }
         self.record_miss();
 
-        // Slow path: consult the inner backend and populate the cache (caching
-        // negative results too, so repeated lookups of an absent task are also
-        // served from the cache until invalidated/overwritten).
+        // Slow path: consult the inner backend. Only immutable terminal values
+        // are cached; `Pending`/`Received`/`Started`/`Retry` are guaranteed to
+        // change and must always be read through.
         let value = self.inner.get_result(task_id).await?;
-        self.cache.lock().await.put(
-            task_id,
-            CachedResult {
-                value: value.clone(),
-                inserted_at: Instant::now(),
-            },
-        );
+        self.populate(task_id, value.as_ref()).await;
         Ok(value)
     }
 
     async fn get_state(&self, task_id: TaskId) -> Result<TaskState> {
-        // Derive state from a cached result when possible to avoid a backend
-        // round-trip. A negative cache entry (`value == None`) maps to Pending,
-        // matching the conventional "unknown task" state.
+        // Derive state from a cached terminal result when possible to avoid a
+        // backend round-trip.
         if let Some(cached) = self.cache.lock().await.get(&task_id) {
             self.record_hit();
-            return Ok(state_for_cached(cached.value.as_ref()));
+            return Ok(state_for_cached(Some(&cached)));
+        }
+        if self.negative_hit(task_id).await {
+            self.record_hit();
+            // No result stored: the conventional "unknown task" state.
+            return Ok(TaskState::Pending);
         }
         self.record_miss();
         // Fall through to the inner backend for the authoritative state. We do
@@ -422,28 +529,27 @@ impl<B: ResultStore> ResultStore for CachingResultBackend<B> {
     }
 
     async fn forget(&self, task_id: TaskId) -> Result<()> {
-        // Invalidate the cache, then forget in the inner backend.
+        // Invalidate the caches, then forget in the inner backend.
         self.cache.lock().await.remove(&task_id);
+        self.negative.lock().await.remove(&task_id);
         self.inner.forget(task_id).await
     }
 
     async fn has_result(&self, task_id: TaskId) -> Result<bool> {
-        if let Some(cached) = self.cache.lock().await.get(&task_id) {
+        if self.cache.lock().await.get(&task_id).is_some() {
             self.record_hit();
-            return Ok(cached.value.is_some());
+            return Ok(true);
+        }
+        if self.negative_hit(task_id).await {
+            self.record_hit();
+            return Ok(false);
         }
         self.record_miss();
         // Populate the cache via a full read so a subsequent `get_result`/
-        // `has_result` is a hit.
+        // `has_result` on a finished task is a hit.
         let value = self.inner.get_result(task_id).await?;
         let present = value.is_some();
-        self.cache.lock().await.put(
-            task_id,
-            CachedResult {
-                value,
-                inserted_at: Instant::now(),
-            },
-        );
+        self.populate(task_id, value.as_ref()).await;
         Ok(present)
     }
 
@@ -534,7 +640,10 @@ mod tests {
     #[tokio::test]
     async fn hit_skips_inner_backend() {
         let counting = CountingBackend::default();
-        let cached = CachingResultBackend::new(counting, 16);
+        // Use an explicit (long) negative TTL so the assertion below cannot be
+        // affected by the default short negative TTL elapsing.
+        let cached =
+            CachingResultBackend::new(counting, 16).with_negative_ttl(Duration::from_secs(3600));
         let id = Uuid::new_v4();
 
         // First read is a miss and touches the inner backend once.
@@ -730,6 +839,140 @@ mod tests {
         for h in handles {
             assert!(h.await.unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn new_installs_a_bounded_ttl() {
+        // Regression: `new()` used to install `ttl: None`, so an entry could be
+        // served forever even though the authoritative writer is another
+        // process whose writes this instance never sees.
+        let cached = CachingResultBackend::new(InMemoryResultBackend::new(), 4);
+        assert_eq!(cached.ttl().await, Some(DEFAULT_TTL));
+    }
+
+    #[tokio::test]
+    async fn non_terminal_states_are_never_cached() {
+        // Regression: `Pending`/`Started`/`Retry` were cached and then served
+        // indefinitely even though they are guaranteed to change.
+        let counting = CountingBackend::default();
+        let cached = CachingResultBackend::new(counting, 16);
+        let id = Uuid::new_v4();
+
+        for value in [
+            TaskResultValue::Pending,
+            TaskResultValue::Received,
+            TaskResultValue::Started,
+            TaskResultValue::Retry {
+                attempt: 1,
+                max_retries: 3,
+            },
+        ] {
+            cached.inner().inner.store_result(id, value).await.unwrap();
+            let before = cached.inner().get_calls();
+            assert!(cached.get_result(id).await.unwrap().is_some());
+            assert!(cached.get_result(id).await.unwrap().is_some());
+            // Both reads went to the inner backend: nothing was cached.
+            assert_eq!(cached.inner().get_calls(), before + 2);
+            assert_eq!(cached.cache_len().await, 0);
+        }
+
+        // A terminal value, in contrast, is cached.
+        cached
+            .inner()
+            .inner
+            .store_result(id, TaskResultValue::Success(json!(1)))
+            .await
+            .unwrap();
+        let before = cached.inner().get_calls();
+        assert!(cached.get_result(id).await.unwrap().is_some());
+        assert!(cached.get_result(id).await.unwrap().is_some());
+        assert_eq!(cached.inner().get_calls(), before + 1);
+        assert_eq!(cached.cache_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn polling_observes_completion_written_by_another_process() {
+        // Regression: a `None` read used to be cached forever, so a client
+        // polling `get_result` before the worker finished never observed the
+        // completion. A negative entry must be TTL-bounded and separate.
+        let counting = CountingBackend::default();
+        let cached =
+            CachingResultBackend::new(counting, 16).with_negative_ttl(Duration::from_nanos(0));
+        let id = Uuid::new_v4();
+
+        assert!(cached.get_result(id).await.unwrap().is_none());
+        assert!(!cached.has_result(id).await.unwrap());
+        assert_eq!(cached.get_state(id).await.unwrap(), TaskState::Pending);
+
+        // The "worker" (another process) stores the result straight into the
+        // inner backend, bypassing this wrapper's write-through path.
+        cached
+            .inner()
+            .inner
+            .store_result(id, TaskResultValue::Success(json!(7)))
+            .await
+            .unwrap();
+
+        let value = cached.get_result(id).await.unwrap().expect("completion");
+        assert_eq!(value.success_value().cloned(), Some(json!(7)));
+        assert!(cached.has_result(id).await.unwrap());
+        assert!(matches!(
+            cached.get_state(id).await.unwrap(),
+            TaskState::Succeeded(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn negative_caching_can_be_disabled() {
+        let counting = CountingBackend::default();
+        let cached = CachingResultBackend::new(counting, 16).without_negative_caching();
+        let id = Uuid::new_v4();
+
+        assert!(cached.get_result(id).await.unwrap().is_none());
+        assert!(cached.get_result(id).await.unwrap().is_none());
+        assert_eq!(cached.inner().get_calls(), 2);
+        assert_eq!(cached.negative_cache_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn negative_entry_is_dropped_by_write_through() {
+        let cached = CachingResultBackend::new(InMemoryResultBackend::new(), 16);
+        let id = Uuid::new_v4();
+        assert!(cached.get_result(id).await.unwrap().is_none());
+        assert_eq!(cached.negative_cache_len().await, 1);
+
+        cached
+            .store_result(id, TaskResultValue::Success(json!(1)))
+            .await
+            .unwrap();
+        assert_eq!(cached.negative_cache_len().await, 0);
+        assert!(cached.get_result(id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn transient_overwrite_invalidates_terminal_entry() {
+        // Storing a non-terminal value over a cached terminal one must drop the
+        // stale terminal entry rather than keep serving it.
+        let cached = CachingResultBackend::new(InMemoryResultBackend::new(), 16);
+        let id = Uuid::new_v4();
+        cached
+            .store_result(id, TaskResultValue::Success(json!(1)))
+            .await
+            .unwrap();
+        assert_eq!(cached.cache_len().await, 1);
+
+        cached
+            .store_result(
+                id,
+                TaskResultValue::Retry {
+                    attempt: 1,
+                    max_retries: 3,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached.cache_len().await, 0);
+        assert_eq!(cached.get_state(id).await.unwrap(), TaskState::Retrying(1));
     }
 
     #[tokio::test]

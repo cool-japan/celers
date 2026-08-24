@@ -26,6 +26,10 @@ num_cpus = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which lets the
+# scheduling, background-flush and retention tests run deterministically instead
+# of sleeping on the wall clock. Dev-only: it does not affect the published lib.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "task_bench"

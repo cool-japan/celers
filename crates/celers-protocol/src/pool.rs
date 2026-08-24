@@ -27,6 +27,7 @@
 //! assert_eq!(pool.size(), 0); // Pool is now empty
 //! ```
 
+use chrono::Utc;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -60,7 +61,7 @@ impl MessagePool {
     /// Otherwise, a recycled message is returned (after clearing).
     pub fn acquire(&self) -> PooledMessage {
         let msg = {
-            let mut pool = self.inner.lock().expect("lock should not be poisoned");
+            let mut pool = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             pool.pop()
         };
 
@@ -77,6 +78,12 @@ impl MessagePool {
         msg.headers.retries = None;
         msg.headers.eta = None;
         msg.headers.expires = None;
+        // A freshly acquired message is, semantically, newly created: reset
+        // the creation timestamp so it doesn't leak the previous occupant's
+        // `created_at`. Without this, `Message::created_at()` /
+        // `MessageExt::get_age_seconds()` / age-based routing would compute
+        // an age that belongs to whatever message last occupied this slot.
+        msg.headers.created_at = Some(Utc::now());
         msg.headers.extra.clear();
         msg.properties = crate::MessageProperties::default();
         msg.body.clear();
@@ -84,14 +91,15 @@ impl MessagePool {
         msg.content_encoding = crate::ENCODING_UTF8.to_string();
 
         PooledMessage {
-            message: Some(msg),
+            message: msg,
             pool: self.clone(),
+            taken: false,
         }
     }
 
     /// Return a message to the pool
     fn release(&self, msg: crate::Message) {
-        let mut pool = self.inner.lock().expect("lock should not be poisoned");
+        let mut pool = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < self.max_size {
             pool.push(msg);
         }
@@ -101,10 +109,7 @@ impl MessagePool {
     /// Get the current number of messages in the pool
     #[inline]
     pub fn size(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("lock should not be poisoned")
-            .len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Get the maximum pool size
@@ -115,10 +120,7 @@ impl MessagePool {
 
     /// Clear all messages from the pool
     pub fn clear(&self) {
-        self.inner
-            .lock()
-            .expect("lock should not be poisoned")
-            .clear();
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -131,33 +133,37 @@ impl Default for MessagePool {
 /// A pooled message that automatically returns to the pool when dropped
 ///
 /// Provides deref access to the underlying message.
+///
+/// The message is stored directly (not as `Option<Message>`): `taken` alone
+/// records whether [`PooledMessage::take`] already removed it from pool
+/// management, so every accessor is a plain, infallible field access - none
+/// of `get`/`get_mut`/`Deref`/`DerefMut`/`take` can ever panic.
 pub struct PooledMessage {
-    message: Option<crate::Message>,
+    message: crate::Message,
     pool: MessagePool,
+    taken: bool,
 }
 
 impl PooledMessage {
     /// Take ownership of the message, removing it from pool management
     pub fn take(mut self) -> crate::Message {
-        self.message
-            .take()
-            .expect("pooled message should always contain a message")
+        self.taken = true;
+        std::mem::replace(
+            &mut self.message,
+            crate::Message::new(String::new(), Uuid::nil(), Vec::new()),
+        )
     }
 
     /// Get a reference to the message
     #[inline]
     pub fn get(&self) -> &crate::Message {
-        self.message
-            .as_ref()
-            .expect("pooled message should always contain a message")
+        &self.message
     }
 
     /// Get a mutable reference to the message
     #[inline]
     pub fn get_mut(&mut self) -> &mut crate::Message {
-        self.message
-            .as_mut()
-            .expect("pooled message should always contain a message")
+        &mut self.message
     }
 }
 
@@ -165,23 +171,23 @@ impl std::ops::Deref for PooledMessage {
     type Target = crate::Message;
 
     fn deref(&self) -> &Self::Target {
-        self.message
-            .as_ref()
-            .expect("pooled message should always contain a message")
+        &self.message
     }
 }
 
 impl std::ops::DerefMut for PooledMessage {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.message
-            .as_mut()
-            .expect("pooled message should always contain a message")
+        &mut self.message
     }
 }
 
 impl Drop for PooledMessage {
     fn drop(&mut self) {
-        if let Some(msg) = self.message.take() {
+        if !self.taken {
+            let msg = std::mem::replace(
+                &mut self.message,
+                crate::Message::new(String::new(), Uuid::nil(), Vec::new()),
+            );
             self.pool.release(msg);
         }
     }
@@ -211,7 +217,7 @@ impl TaskArgsPool {
     /// Acquire task arguments from the pool
     pub fn acquire(&self) -> PooledTaskArgs {
         let args = {
-            let mut pool = self.inner.lock().expect("lock should not be poisoned");
+            let mut pool = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             pool.pop()
         };
 
@@ -222,14 +228,15 @@ impl TaskArgsPool {
         args.kwargs.clear();
 
         PooledTaskArgs {
-            args: Some(args),
+            args,
             pool: self.clone(),
+            taken: false,
         }
     }
 
     /// Return task arguments to the pool
     fn release(&self, args: crate::TaskArgs) {
-        let mut pool = self.inner.lock().expect("lock should not be poisoned");
+        let mut pool = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < self.max_size {
             pool.push(args);
         }
@@ -238,10 +245,7 @@ impl TaskArgsPool {
     /// Get the current number of task args in the pool
     #[inline]
     pub fn size(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("lock should not be poisoned")
-            .len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Get the maximum pool size
@@ -252,10 +256,7 @@ impl TaskArgsPool {
 
     /// Clear the pool
     pub fn clear(&self) {
-        self.inner
-            .lock()
-            .expect("lock should not be poisoned")
-            .clear();
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -266,33 +267,34 @@ impl Default for TaskArgsPool {
 }
 
 /// Pooled task arguments
+///
+/// Like [`PooledMessage`], the arguments are stored directly (not as
+/// `Option<TaskArgs>`); `taken` alone records whether
+/// [`PooledTaskArgs::take`] already removed them from pool management, so no
+/// accessor here can panic.
 pub struct PooledTaskArgs {
-    args: Option<crate::TaskArgs>,
+    args: crate::TaskArgs,
     pool: TaskArgsPool,
+    taken: bool,
 }
 
 impl PooledTaskArgs {
     /// Take ownership, removing from pool management
     pub fn take(mut self) -> crate::TaskArgs {
-        self.args
-            .take()
-            .expect("pooled task args should always contain args")
+        self.taken = true;
+        std::mem::take(&mut self.args)
     }
 
     /// Get a reference
     #[inline]
     pub fn get(&self) -> &crate::TaskArgs {
-        self.args
-            .as_ref()
-            .expect("pooled task args should always contain args")
+        &self.args
     }
 
     /// Get a mutable reference
     #[inline]
     pub fn get_mut(&mut self) -> &mut crate::TaskArgs {
-        self.args
-            .as_mut()
-            .expect("pooled task args should always contain args")
+        &mut self.args
     }
 }
 
@@ -300,24 +302,20 @@ impl std::ops::Deref for PooledTaskArgs {
     type Target = crate::TaskArgs;
 
     fn deref(&self) -> &Self::Target {
-        self.args
-            .as_ref()
-            .expect("pooled task args should always contain args")
+        &self.args
     }
 }
 
 impl std::ops::DerefMut for PooledTaskArgs {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.args
-            .as_mut()
-            .expect("pooled task args should always contain args")
+        &mut self.args
     }
 }
 
 impl Drop for PooledTaskArgs {
     fn drop(&mut self) {
-        if let Some(args) = self.args.take() {
-            self.pool.release(args);
+        if !self.taken {
+            self.pool.release(std::mem::take(&mut self.args));
         }
     }
 }
@@ -434,6 +432,67 @@ mod tests {
         let owned = args.take();
         assert_eq!(owned.args.len(), 1);
 
+        assert_eq!(pool.size(), 0);
+    }
+
+    #[test]
+    fn test_message_pool_acquire_refreshes_created_at() {
+        // Regression: a recycled message must not carry the previous
+        // occupant's `created_at` timestamp.
+        let pool = MessagePool::new();
+
+        let mut msg1 = pool.acquire();
+        let stale_created_at = Utc::now() - chrono::Duration::hours(2);
+        msg1.headers.created_at = Some(stale_created_at);
+        drop(msg1);
+
+        let msg2 = pool.acquire();
+        let created_at = msg2
+            .headers
+            .created_at
+            .expect("acquire always sets created_at");
+        assert!(created_at > stale_created_at);
+        assert!(Utc::now() - created_at < chrono::Duration::seconds(5));
+    }
+
+    #[test]
+    fn test_message_pool_survives_poisoned_lock() {
+        // Regression: a panic while holding the pool's internal mutex used
+        // to poison it, after which every subsequent acquire()/size()/
+        // clear() call would itself panic via `.expect("lock should not be
+        // poisoned")`. The pool must recover the guard instead.
+        let pool = MessagePool::new();
+        let inner = pool.inner.clone();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = inner.lock().unwrap();
+            panic!("intentional poison for test");
+        }));
+        assert!(inner.is_poisoned());
+
+        // None of these may panic even though the lock is poisoned.
+        let msg = pool.acquire();
+        drop(msg);
+        assert_eq!(pool.size(), 1);
+        pool.clear();
+        assert_eq!(pool.size(), 0);
+    }
+
+    #[test]
+    fn test_task_args_pool_survives_poisoned_lock() {
+        let pool = TaskArgsPool::new();
+        let inner = pool.inner.clone();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = inner.lock().unwrap();
+            panic!("intentional poison for test");
+        }));
+        assert!(inner.is_poisoned());
+
+        let args = pool.acquire();
+        drop(args);
+        assert_eq!(pool.size(), 1);
+        pool.clear();
         assert_eq!(pool.size(), 0);
     }
 

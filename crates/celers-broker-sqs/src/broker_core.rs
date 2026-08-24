@@ -9,17 +9,31 @@ use aws_sdk_cloudwatch::{
     types::{ComparisonOperator, Dimension, MetricDatum, StandardUnit, Statistic},
     Client as CloudWatchClient,
 };
+use aws_sdk_sqs::types::MessageAttributeValue;
 use aws_sdk_sqs::Client;
-use celers_kombu::{BrokerError, QueueMode, Result};
-use std::collections::HashMap;
+use celers_kombu::{BrokerError, Envelope, QueueMode, Result};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::celery_compat;
+use crate::delivery::ReceiptMetadata;
+use crate::retry_policy::{
+    backoff_delay_ms, is_retryable_error, wall_clock_jitter_permille, MAX_RETRY_ATTEMPTS,
+};
 use crate::types::{
     AdaptivePollingConfig, AlarmConfig, CloudWatchConfig, DlqConfig, FifoConfig, PollingStrategy,
     SseConfig,
 };
+use crate::visibility::VisibilityHeartbeat;
+
+/// Maximum number of receipt-metadata entries kept in memory.
+///
+/// Entries are dropped on `ack`/`reject`; this bound keeps a consumer that
+/// neither acknowledges nor rejects from growing the map without limit.
+const MAX_TRACKED_RECEIPTS: usize = 10_000;
 
 /// AWS SQS broker implementation
 pub struct SqsBroker {
@@ -60,6 +74,21 @@ pub struct SqsBroker {
     pub(crate) celery_config: Option<celery_compat::CelerySqsConfig>,
     /// Celery attribute mapper for message serialization
     pub(crate) celery_mapper: Option<celery_compat::CeleryAttributeMapper>,
+    /// Messages received but not yet returned by `consume`, keyed by the
+    /// *physical* queue they were received from.
+    pub(crate) prefetch: HashMap<String, VecDeque<Envelope>>,
+    /// System-attribute metadata for in-flight messages, keyed by delivery tag.
+    pub(crate) receipt_metadata: HashMap<String, ReceiptMetadata>,
+    /// Insertion order of `receipt_metadata`, used for bounded eviction.
+    pub(crate) receipt_metadata_order: VecDeque<String>,
+    /// Whether to keep in-flight messages invisible with a background heartbeat
+    pub(crate) visibility_heartbeat_enabled: bool,
+    /// Total seconds a single heartbeat may keep a message invisible
+    pub(crate) heartbeat_max_extension_secs: i64,
+    /// Running heartbeats, keyed by delivery tag
+    pub(crate) heartbeats: HashMap<String, VisibilityHeartbeat>,
+    /// Last observed transport/credential health, updated by every SDK call
+    pub(crate) connection_healthy: Arc<AtomicBool>,
 }
 
 impl SqsBroker {
@@ -91,6 +120,13 @@ impl SqsBroker {
             retry_base_delay_ms: 100,
             celery_config: None,
             celery_mapper: None,
+            prefetch: HashMap::new(),
+            receipt_metadata: HashMap::new(),
+            receipt_metadata_order: VecDeque::new(),
+            visibility_heartbeat_enabled: false,
+            heartbeat_max_extension_secs: i64::from(crate::visibility::MAX_VISIBILITY_TIMEOUT_SECS),
+            heartbeats: HashMap::new(),
+            connection_healthy: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -100,15 +136,57 @@ impl SqsBroker {
         self
     }
 
-    /// Set long polling wait time (default 20 seconds, max 20)
+    /// Set the long polling wait time (default 20 seconds, max 20).
+    ///
+    /// This is an upper bound applied to every `ReceiveMessage` request: the
+    /// effective wait is `min(caller timeout, this value, 20)`. It is also
+    /// written to the queue's `ReceiveMessageWaitTimeSeconds` attribute by
+    /// [`create_queue`](celers_kombu::Broker::create_queue).
     pub fn with_wait_time(mut self, seconds: i32) -> Self {
         self.wait_time_seconds = seconds.clamp(0, 20);
         self
     }
 
-    /// Set maximum messages per poll (default 1, max 10)
+    /// Set the number of messages fetched per `ReceiveMessage` (default 1, max 10).
+    ///
+    /// Values above 1 turn on *prefetching*: [`consume`](celers_kombu::Consumer::consume)
+    /// fetches up to this many messages in one request, returns the first and
+    /// buffers the rest per queue, so subsequent calls are served without an
+    /// API round trip. That is where the 10x cost reduction comes from.
+    ///
+    /// The buffered messages are already in flight, so their visibility
+    /// timeout is running: pair a batch size above 1 with a visibility timeout
+    /// comfortably larger than `max_messages * handler duration`, or enable
+    /// [`with_visibility_heartbeat`](Self::with_visibility_heartbeat).
     pub fn with_max_messages(mut self, max: i32) -> Self {
         self.max_messages = max.clamp(1, 10);
+        self
+    }
+
+    /// Keep in-flight messages invisible with a background heartbeat.
+    ///
+    /// When enabled, every message returned by
+    /// [`consume`](celers_kombu::Consumer::consume) or
+    /// [`consume_batch`](Self::consume_batch) gets a background task that calls
+    /// `ChangeMessageVisibility` every `visibility_timeout / 3` seconds until
+    /// the message is acknowledged, rejected, or the extension budget set by
+    /// [`with_heartbeat_max_extension`](Self::with_heartbeat_max_extension) is
+    /// exhausted.
+    ///
+    /// Without it, a handler that outruns the visibility timeout has its
+    /// message redelivered to a second worker while it is still executing.
+    pub fn with_visibility_heartbeat(mut self, enabled: bool) -> Self {
+        self.visibility_heartbeat_enabled = enabled;
+        self
+    }
+
+    /// Total seconds a single heartbeat may keep one message invisible.
+    ///
+    /// Defaults to SQS's own 12-hour ceiling. Lower it so that a wedged handler
+    /// eventually releases its message instead of holding it forever.
+    pub fn with_heartbeat_max_extension(mut self, seconds: i64) -> Self {
+        self.heartbeat_max_extension_secs =
+            seconds.clamp(1, i64::from(crate::visibility::MAX_VISIBILITY_TIMEOUT_SECS));
         self
     }
 
@@ -213,27 +291,43 @@ impl SqsBroker {
     /// backoff when AWS API calls fail.
     ///
     /// # Arguments
-    /// * `max_retries` - Maximum retry attempts (default: 3)
+    /// * `max_retries` - Maximum total attempts, clamped to `1..=20`
     /// * `base_delay_ms` - Base delay in milliseconds for exponential backoff (default: 100)
+    ///
+    /// The delay is `base_delay_ms * 2^attempt`, capped at 60 seconds and
+    /// jittered; see [`crate::retry_policy`]. Only transient failures are
+    /// retried — a client-side validation error fails immediately instead of
+    /// burning the whole budget.
     ///
     /// # Example
     /// ```ignore
     /// let broker = SqsBroker::new("my-queue")
     ///     .await?
-    ///     .with_retry_config(5, 200); // 5 retries, 200ms base delay
+    ///     .with_retry_config(5, 200); // 5 attempts, 200ms base delay
     /// ```
     pub fn with_retry_config(mut self, max_retries: u32, base_delay_ms: u64) -> Self {
-        self.max_retries = max_retries;
+        self.max_retries = max_retries.clamp(1, MAX_RETRY_ATTEMPTS);
         self.retry_base_delay_ms = base_delay_ms;
         self
     }
 
     /// Enable Celery compatibility mode for Python interoperability
     ///
-    /// This enables full compatibility with Python Celery workers via Kombu SQS transport:
-    /// - All Celery headers are mapped to SQS MessageAttributes
-    /// - Queue naming follows Kombu conventions
-    /// - Priority queues are managed via separate SQS queues
+    /// This enables compatibility with Python Celery workers via the Kombu SQS
+    /// transport:
+    ///
+    /// - Every Celery header is mapped to an SQS MessageAttribute on *all*
+    ///   publish paths (single, batch, FIFO, delayed), and read back on both
+    ///   consume paths — the round trip is symmetric.
+    /// - Logical queue names are translated with the configured
+    ///   [`QueueNamingStrategy`](crate::celery_compat::QueueNamingStrategy) on
+    ///   the publish and consume paths. Administrative calls
+    ///   (`create_queue`, `delete_queue`, `purge`, `queue_size`) take the
+    ///   *physical* name; use [`physical_queue_name`](Self::physical_queue_name)
+    ///   to obtain it.
+    /// - When `enable_priority_queues` is set, publishes are routed to a
+    ///   per-priority queue and `consume` polls those queues highest-priority
+    ///   first. [`priority_queues`](Self::priority_queues) lists them.
     ///
     /// # Arguments
     /// * `config` - Celery SQS configuration
@@ -280,9 +374,9 @@ impl SqsBroker {
 
     /// Create a broker with production-optimized settings
     ///
-    /// - Long polling enabled (20s)
-    /// - Batch receiving enabled (10 messages)
-    /// - Visibility timeout: 5 minutes
+    /// - Long polling up to 20s (the caller's poll timeout still applies)
+    /// - Prefetching 10 messages per `ReceiveMessage` request
+    /// - Visibility timeout: 5 minutes, refreshed by a background heartbeat
     /// - Message retention: 14 days
     ///
     /// # Example
@@ -295,6 +389,7 @@ impl SqsBroker {
                 .with_max_messages(10)
                 .with_visibility_timeout(300)
                 .with_message_retention(1209600)
+                .with_visibility_heartbeat(true)
         })
     }
 
@@ -403,19 +498,25 @@ impl SqsBroker {
             .ok_or_else(|| BrokerError::Connection("SQS client not initialized".to_string()))
     }
 
-    /// Get or create queue URL with enhanced caching
+    /// Look up a queue URL, distinguishing "missing" from "broken".
     ///
-    /// This method now caches queue URLs for multiple queues and supports
-    /// automatic queue creation when enabled.
-    pub(crate) async fn get_queue_url(&mut self, queue: &str) -> Result<String> {
-        // Check cache first
+    /// Returns `Ok(None)` **only** when SQS answered `QueueDoesNotExist`. Every
+    /// other failure — throttling, expired or missing credentials, an IAM
+    /// denial on `sqs:GetQueueUrl`, DNS/TLS trouble, a misconfigured region —
+    /// is surfaced as [`BrokerError::Connection`] carrying the real error.
+    ///
+    /// The previous implementation swallowed the SDK error entirely and told
+    /// the operator the queue did not exist, which sent them to fix a
+    /// non-problem while the real cause stayed invisible (and, with
+    /// `auto_create_queue`, turned every transient throttle into a
+    /// `CreateQueue` call).
+    pub(crate) async fn try_get_queue_url(&mut self, queue: &str) -> Result<Option<String>> {
         if let Some(url) = self.queue_url_cache.get(queue) {
-            return Ok(url.clone());
+            return Ok(Some(url.clone()));
         }
 
         let client = self.get_client().await?;
 
-        // Try to get existing queue URL
         match client.get_queue_url().queue_name(queue).send().await {
             Ok(output) => {
                 let url = output
@@ -425,55 +526,66 @@ impl SqsBroker {
                     })?
                     .to_string();
 
-                // Cache the URL
                 self.queue_url_cache.insert(queue.to_string(), url.clone());
-
-                Ok(url)
+                self.mark_healthy();
+                Ok(Some(url))
             }
-            Err(_) => {
-                // Queue doesn't exist
-                if self.auto_create_queue {
-                    // Automatically create the queue
-                    info!("Auto-creating queue: {}", queue);
-                    let mode = if queue.ends_with(".fifo") {
-                        QueueMode::Fifo
-                    } else {
-                        QueueMode::Priority
-                    };
-                    self.create_queue_internal(queue, mode).await?;
+            Err(sdk_error) => {
+                let missing = sdk_error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_queue_does_not_exist());
 
-                    // Retry getting the URL
-                    let output = client
-                        .get_queue_url()
-                        .queue_name(queue)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            BrokerError::OperationFailed(format!(
-                                "Failed to get queue URL after creation: {}",
-                                e
-                            ))
-                        })?;
-
-                    let url = output
-                        .queue_url()
-                        .ok_or_else(|| {
-                            BrokerError::OperationFailed("No queue URL returned".to_string())
-                        })?
-                        .to_string();
-
-                    // Cache the URL
-                    self.queue_url_cache.insert(queue.to_string(), url.clone());
-
-                    Ok(url)
-                } else {
-                    // Return error (use create_queue explicitly)
-                    Err(BrokerError::OperationFailed(format!(
-                        "Queue '{}' does not exist. Call create_queue() first or enable auto_create_queue.",
-                        queue
-                    )))
+                if missing {
+                    // A definitive answer from SQS: the connection is fine.
+                    self.mark_healthy();
+                    return Ok(None);
                 }
+
+                self.mark_unhealthy();
+                Err(BrokerError::Connection(format!(
+                    "GetQueueUrl for '{}' failed: {}",
+                    queue,
+                    crate::retry_policy::describe_error(&sdk_error)
+                )))
             }
+        }
+    }
+
+    /// Get or create queue URL with enhanced caching
+    ///
+    /// This method caches queue URLs for multiple queues and supports
+    /// automatic queue creation when enabled.
+    ///
+    /// # Errors
+    ///
+    /// * [`BrokerError::QueueNotFound`] when the queue genuinely does not exist
+    ///   and auto-creation is disabled.
+    /// * [`BrokerError::Connection`] for credential, permission or transport
+    ///   failures — these are never mistaken for a missing queue.
+    pub(crate) async fn get_queue_url(&mut self, queue: &str) -> Result<String> {
+        if let Some(url) = self.try_get_queue_url(queue).await? {
+            return Ok(url);
+        }
+
+        if !self.auto_create_queue {
+            return Err(BrokerError::QueueNotFound(format!(
+                "{queue} (call create_queue() first or enable auto_create_queue)"
+            )));
+        }
+
+        info!("Auto-creating queue: {}", queue);
+        let mode = if queue.ends_with(".fifo") {
+            QueueMode::Fifo
+        } else {
+            QueueMode::Priority
+        };
+        self.create_queue_internal(queue, mode).await?;
+
+        match self.try_get_queue_url(queue).await? {
+            Some(url) => Ok(url),
+            None => Err(BrokerError::OperationFailed(format!(
+                "Queue '{queue}' still does not exist after CreateQueue succeeded"
+            ))),
         }
     }
 

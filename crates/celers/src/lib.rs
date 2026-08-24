@@ -1005,6 +1005,30 @@ pub use celers_canvas::{
 // Re-export macros
 pub use celers_macros::{task, Task};
 
+// The `#[task]` and `#[derive(Task)]` macros above expand to code that
+// references `celers_core::...`, `async_trait::...` and `serde::...` as
+// *bare* crate-root paths (e.g. `celers_core::Task`, `#[async_trait::async_trait]`).
+// Those paths only resolve on their own when the crate invoking the macro
+// depends on `celers-core`/`async-trait`/`serde` directly. A downstream
+// crate that depends on this facade alone (`celers = { .. }`, no direct
+// `celers-core` dependency) would otherwise hit "failed to resolve: use of
+// undeclared crate or module `celers_core`".
+//
+// Re-exporting the crates here means a downstream consumer that imports
+// this crate's items with a glob (`use celers::*;`) — or reaches them via
+// `celers::celers_core::...` explicitly — brings `celers_core` (and its
+// macro-required friends) into scope as bare names too, so the macro
+// expansion resolves without requiring an extra direct dependency.
+// `#[doc(hidden)]` keeps them out of the crate's rendered docs, since they
+// are implementation plumbing for the macros rather than part of the
+// facade's own documented surface.
+#[doc(hidden)]
+pub use async_trait;
+#[doc(hidden)]
+pub use celers_core;
+#[doc(hidden)]
+pub use serde;
+
 // Optional broker re-exports
 #[cfg(feature = "redis")]
 pub use celers_broker_redis::{

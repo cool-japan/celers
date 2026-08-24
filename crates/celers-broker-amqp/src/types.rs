@@ -684,7 +684,14 @@ impl Default for ConsumerConfig {
 /// AMQP broker configuration
 #[derive(Debug, Clone)]
 pub struct AmqpConfig {
-    /// Prefetch count (QoS) - number of unacknowledged messages allowed
+    /// Prefetch count (QoS) - number of unacknowledged messages allowed.
+    ///
+    /// `0` means "let the broker decide", which for a pushing consumer is
+    /// unbounded. Because [`Consumer::consume`](celers_kombu::Consumer::consume)
+    /// uses a real `basic.consume` subscription, an unbounded prefetch would
+    /// let the broker push a whole queue into this process, so `0` is mapped
+    /// to [`AmqpConfig::DEFAULT_PREFETCH_COUNT`] by
+    /// [`AmqpConfig::effective_prefetch_count`].
     pub prefetch_count: u16,
     /// Global prefetch (applies to entire channel vs per-consumer)
     pub prefetch_global: bool,
@@ -724,6 +731,29 @@ pub struct AmqpConfig {
     pub management_username: Option<String>,
     /// Management API password
     pub management_password: Option<String>,
+    /// Enable AMQP publisher confirms (`confirm.select`) on every channel.
+    ///
+    /// When enabled, every publish waits for a broker acknowledgement and a
+    /// negative acknowledgement is reported as an error. Publisher confirms
+    /// are mutually exclusive with AMQP transactions: while a transaction is
+    /// active the channel is used in transactional mode instead.
+    pub publisher_confirms: bool,
+    /// Publish messages with the AMQP `mandatory` flag.
+    ///
+    /// With `mandatory` set, a message that no queue is bound to is returned
+    /// by the broker instead of being silently discarded, and this crate
+    /// surfaces that as an error. It is `false` by default because publishing
+    /// to a routing key with no bound queue is legitimate in many topologies.
+    pub mandatory_publish: bool,
+    /// Consume with `basic.get` polling instead of a `basic.consume`
+    /// subscription.
+    ///
+    /// Polling is a full round trip per message and makes the configured
+    /// prefetch inert, so it is off by default. Enable it only when
+    /// single-shot, strictly on-demand fetch semantics are required.
+    pub poll_mode: bool,
+    /// Interval between `basic.get` attempts while polling in [`Self::poll_mode`].
+    pub poll_interval: Duration,
 }
 
 impl Default for AmqpConfig {
@@ -749,14 +779,59 @@ impl Default for AmqpConfig {
             management_url: None,
             management_username: None,
             management_password: None,
+            publisher_confirms: true,
+            mandatory_publish: false,
+            poll_mode: false,
+            poll_interval: Duration::from_millis(50),
         }
     }
 }
 
 impl AmqpConfig {
+    /// Prefetch applied to consuming channels when [`Self::prefetch_count`] is `0`.
+    pub const DEFAULT_PREFETCH_COUNT: u16 = 100;
+
+    /// The prefetch count actually sent to the broker via `basic.qos`.
+    ///
+    /// Maps the "let the broker decide" value `0` to
+    /// [`Self::DEFAULT_PREFETCH_COUNT`] so a pushing consumer can never be
+    /// flooded with an entire queue.
+    pub fn effective_prefetch_count(&self) -> u16 {
+        if self.prefetch_count == 0 {
+            Self::DEFAULT_PREFETCH_COUNT
+        } else {
+            self.prefetch_count
+        }
+    }
+
     /// Set prefetch count (QoS)
     pub fn with_prefetch(mut self, count: u16) -> Self {
         self.prefetch_count = count;
+        self
+    }
+
+    /// Enable or disable AMQP publisher confirms (enabled by default)
+    pub fn with_publisher_confirms(mut self, enabled: bool) -> Self {
+        self.publisher_confirms = enabled;
+        self
+    }
+
+    /// Publish with the AMQP `mandatory` flag so unroutable messages are
+    /// reported as errors instead of being discarded by the broker
+    pub fn with_mandatory_publish(mut self, mandatory: bool) -> Self {
+        self.mandatory_publish = mandatory;
+        self
+    }
+
+    /// Use `basic.get` polling instead of a `basic.consume` subscription
+    pub fn with_poll_mode(mut self, poll_mode: bool) -> Self {
+        self.poll_mode = poll_mode;
+        self
+    }
+
+    /// Set the interval between `basic.get` attempts while polling
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
         self
     }
 

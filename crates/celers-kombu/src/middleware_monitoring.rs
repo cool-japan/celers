@@ -1,7 +1,9 @@
 //! Monitoring and operational middleware implementations.
 
-use crate::{BrokerError, MessageMiddleware, Result};
+use crate::middleware::effective_priority;
+use crate::{BrokerError, BrokerMetrics, MessageMiddleware, Result};
 use async_trait::async_trait;
+use celers_protocol::extensions::MessageExt;
 use celers_protocol::Message;
 use std::collections::HashMap;
 
@@ -92,11 +94,49 @@ impl MessageMiddleware for BatchAckHintMiddleware {
 /// let load_shedder = LoadSheddingMiddleware::new(0.8); // 80% threshold
 /// assert_eq!(load_shedder.threshold(), 0.8);
 /// ```
+/// Cloneable handle for updating a [`LoadSheddingMiddleware`]'s current
+/// load estimate from outside a middleware chain.
+///
+/// [`crate::MiddlewareChain`] only ever hands out shared (`&self`)
+/// references to its middlewares, so once a `LoadSheddingMiddleware` has
+/// been boxed into a chain there is no way to reach a
+/// `&mut LoadSheddingMiddleware` to call
+/// [`LoadSheddingMiddleware::update_load`] on it directly (that method
+/// still works when you hold the middleware itself, e.g. before installing
+/// it - this handle is for the common case where you don't). Retain a
+/// `LoadHandle` via [`LoadSheddingMiddleware::load_handle`] *before*
+/// installing the middleware into a chain, and update it from wherever the
+/// real load signal is observed (a periodic queue-depth sampler, CPU load
+/// average, etc.).
+#[derive(Debug, Clone)]
+pub struct LoadHandle {
+    current_load: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl LoadHandle {
+    /// Update the load estimate (clamped to `0.0..=1.0`).
+    pub fn set_load(&self, load: f64) {
+        self.current_load.store(
+            load.clamp(0.0, 1.0).to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Read the current load estimate.
+    pub fn load(&self) -> f64 {
+        f64::from_bits(self.current_load.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadSheddingMiddleware {
     load_threshold: f64, // Threshold for load shedding (0.0-1.0)
     priority_cutoff: u8, // Drop messages below this priority
-    current_load: f64,   // Current system load estimate
+    /// Current system load estimate. Behind an `Arc<AtomicU64>` (storing
+    /// the `f64` bits) rather than a plain `f64` field so it can be
+    /// updated via a cloneable [`LoadHandle`] after the middleware has
+    /// been boxed into a chain - see [`Self::load_handle`].
+    current_load: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl LoadSheddingMiddleware {
@@ -105,7 +145,7 @@ impl LoadSheddingMiddleware {
         Self {
             load_threshold: load_threshold.clamp(0.0, 1.0),
             priority_cutoff: 3, // Default: drop priority < 3 (Low and below)
-            current_load: 0.0,
+            current_load: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0.0f64.to_bits())),
         }
     }
 
@@ -115,9 +155,26 @@ impl LoadSheddingMiddleware {
         self
     }
 
-    /// Update current load estimate
+    /// Update current load estimate.
+    ///
+    /// Requires a direct `&mut LoadSheddingMiddleware`, i.e. this only
+    /// works before the middleware has been boxed into a
+    /// [`crate::MiddlewareChain`] (which only ever hands out `&self`
+    /// afterwards). Get a [`LoadHandle`] via [`Self::load_handle`] first
+    /// if you need to keep updating the load once it's installed.
     pub fn update_load(&mut self, load: f64) {
-        self.current_load = load.clamp(0.0, 1.0);
+        self.current_load.store(
+            load.clamp(0.0, 1.0).to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Get a cloneable handle for updating the load estimate from outside
+    /// a middleware chain. See [`LoadHandle`].
+    pub fn load_handle(&self) -> LoadHandle {
+        LoadHandle {
+            current_load: std::sync::Arc::clone(&self.current_load),
+        }
     }
 
     /// Get the load threshold
@@ -125,9 +182,14 @@ impl LoadSheddingMiddleware {
         self.load_threshold
     }
 
+    /// Read the current load estimate.
+    fn current_load(&self) -> f64 {
+        f64::from_bits(self.current_load.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Check if message should be dropped
     fn should_shed(&self, priority: u8) -> bool {
-        self.current_load > self.load_threshold && priority < self.priority_cutoff
+        self.current_load() > self.load_threshold && priority < self.priority_cutoff
     }
 }
 
@@ -140,13 +202,11 @@ impl Default for LoadSheddingMiddleware {
 #[async_trait]
 impl MessageMiddleware for LoadSheddingMiddleware {
     async fn before_publish(&self, message: &mut Message) -> Result<()> {
-        let priority = message
-            .headers
-            .extra
-            .get("priority")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u8)
-            .unwrap_or(5);
+        // Prefer the typed `properties.priority` field (populated by
+        // `Message::with_priority` / the builder - the field real
+        // priority-queue code reads) falling back to a legacy
+        // `headers.extra["priority"]` marker.
+        let priority = effective_priority(message, 5);
 
         if self.should_shed(priority) {
             // Inject load shedding marker
@@ -156,12 +216,13 @@ impl MessageMiddleware for LoadSheddingMiddleware {
                 .insert("x-load-shed".to_string(), serde_json::json!(true));
             message.headers.extra.insert(
                 "x-current-load".to_string(),
-                serde_json::json!(self.current_load),
+                serde_json::json!(self.current_load()),
             );
 
             return Err(BrokerError::OperationFailed(format!(
                 "Load shedding: current load {:.2} exceeds threshold {:.2}",
-                self.current_load, self.load_threshold
+                self.current_load(),
+                self.load_threshold
             )));
         }
 
@@ -236,10 +297,18 @@ impl MessagePriorityEscalationMiddleware {
     fn calculate_priority(&self, base_priority: u8, age_secs: u64, retries: u32) -> u8 {
         let mut priority = base_priority;
 
-        // Age-based escalation
-        if age_secs >= self.age_threshold_secs {
-            let age_multiplier = (age_secs / self.age_threshold_secs) as u8;
-            priority = priority.saturating_add(age_multiplier * self.escalation_step);
+        // Age-based escalation. `age_secs` now reflects a message's real
+        // elapsed age (previously always 0, so this branch was dead) and
+        // can therefore grow without bound over a message's lifetime;
+        // guard the arithmetic accordingly rather than assuming small,
+        // hand-picked test inputs:
+        //  - `age_threshold_secs == 0` would otherwise divide by zero.
+        //  - `age_multiplier * escalation_step` (both derived from
+        //    unbounded `age_secs`) could otherwise overflow `u8` for a
+        //    sufficiently old message.
+        if self.age_threshold_secs > 0 && age_secs >= self.age_threshold_secs {
+            let age_multiplier = (age_secs / self.age_threshold_secs).min(u8::MAX as u64) as u8;
+            priority = priority.saturating_add(age_multiplier.saturating_mul(self.escalation_step));
         }
 
         // Retry-based escalation
@@ -258,22 +327,33 @@ impl Default for MessagePriorityEscalationMiddleware {
     }
 }
 
-#[async_trait]
-impl MessageMiddleware for MessagePriorityEscalationMiddleware {
-    async fn before_publish(&self, message: &mut Message) -> Result<()> {
-        let base_priority = message
-            .headers
-            .extra
-            .get("priority")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u8)
-            .unwrap_or(5);
-        let age_secs = 0; // Would be calculated from message timestamp in real implementation
+impl MessagePriorityEscalationMiddleware {
+    /// Escalate `message`'s priority based on its real age and retry
+    /// count, stamping the escalation markers if it changed.
+    ///
+    /// Run from both `before_publish` and `after_consume` (see the trait
+    /// impl below for why): a message can accrue age either while
+    /// buffered before its first publish attempt, or while sitting in the
+    /// queue between deliveries, and either point is a meaningful moment
+    /// to escalate a starved message's priority before it is next
+    /// enqueued/requeued.
+    fn escalate(&self, message: &mut Message) {
+        let base_priority = effective_priority(message, 5);
+        // A message's age is available from its real `created_at`
+        // (`get_age_seconds`, always populated by `Message::new`) without
+        // needing any special wiring. This used to be hard-coded to 0,
+        // which disabled the entire age-based escalation branch of
+        // `calculate_priority` and silently ignored `age_threshold_secs`.
+        let age_secs = message.get_age_seconds().unwrap_or(0).max(0) as u64;
         let retries = message.headers.retries.unwrap_or(0);
 
         let new_priority = self.calculate_priority(base_priority, age_secs, retries);
 
         if new_priority != base_priority {
+            // Write to both the typed field (so real priority-queue /
+            // broker code observes it) and the legacy header (backward
+            // compatible with anything still reading it there).
+            message.properties.priority = Some(new_priority);
             message
                 .headers
                 .extra
@@ -287,11 +367,34 @@ impl MessageMiddleware for MessagePriorityEscalationMiddleware {
                 serde_json::json!(base_priority),
             );
         }
+    }
+}
 
+#[async_trait]
+impl MessageMiddleware for MessagePriorityEscalationMiddleware {
+    async fn before_publish(&self, message: &mut Message) -> Result<()> {
+        // A message being published for the first time has an age of
+        // approximately zero by definition, so in the common case only
+        // the retry-count term of `calculate_priority` has any effect
+        // here. Age escalation only meaningfully fires when a message is
+        // being republished after having been buffered for a while (its
+        // `created_at` predates this call) - the more common,
+        // architecturally correct case (a message that aged out while
+        // sitting in the queue between delivery attempts) is handled by
+        // running the same escalation in `after_consume` below.
+        self.escalate(message);
         Ok(())
     }
 
-    async fn after_consume(&self, _message: &mut Message) -> Result<()> {
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        // This is where a message's queue residency is actually
+        // observable: `age_secs` here reflects real time spent waiting
+        // since `created_at`, and `retries` reflects delivery attempts
+        // actually made. If this particular delivery fails and the
+        // message is requeued, the escalated priority applies to its next
+        // position in the queue, which is exactly what prevents
+        // starvation.
+        self.escalate(message);
         Ok(())
     }
 
@@ -302,8 +405,15 @@ impl MessageMiddleware for MessagePriorityEscalationMiddleware {
 
 /// Observability middleware for structured logging and metrics
 ///
-/// Provides structured logging and metrics export for monitoring systems.
-/// Useful for integration with observability platforms.
+/// Provides structured logging (to stderr, in the same style as
+/// [`crate::LoggingMiddleware`]) and, when attached via
+/// [`Self::with_metrics`], metrics export via a shared [`BrokerMetrics`]
+/// (the same counters [`crate::MetricsMiddleware`] uses). `celers-kombu`
+/// deliberately has no dependency on a specific tracing/metrics framework
+/// (e.g. `tracing`, Prometheus client libraries), so this middleware
+/// integrates with what the crate already has rather than pulling one in;
+/// see the crate docs for wiring a real exporter downstream of
+/// `BrokerMetrics`.
 ///
 /// # Examples
 ///
@@ -319,6 +429,7 @@ pub struct ObservabilityMiddleware {
     enable_metrics: bool,
     enable_logging: bool,
     log_level: String,
+    metrics: Option<std::sync::Arc<std::sync::Mutex<BrokerMetrics>>>,
 }
 
 impl ObservabilityMiddleware {
@@ -329,6 +440,7 @@ impl ObservabilityMiddleware {
             enable_metrics: true,
             enable_logging: true,
             log_level: "info".to_string(),
+            metrics: None,
         }
     }
 
@@ -350,9 +462,36 @@ impl ObservabilityMiddleware {
         self
     }
 
+    /// Attach a shared [`BrokerMetrics`] to increment on every publish/
+    /// consume (gated on [`Self::without_metrics`] not having been
+    /// called). Share the same `Arc<Mutex<BrokerMetrics>>` with a
+    /// [`crate::MetricsMiddleware`] to combine both under one counter set.
+    pub fn with_metrics(
+        mut self,
+        metrics: std::sync::Arc<std::sync::Mutex<BrokerMetrics>>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Get service name
     pub fn service_name(&self) -> &str {
         &self.service_name
+    }
+
+    fn log(&self, event: &str, message: &Message) {
+        if !self.enable_logging {
+            return;
+        }
+        eprintln!(
+            "[{}] level={} event={} task={} id={} body_size={}",
+            self.service_name,
+            self.log_level,
+            event,
+            message.task_name(),
+            message.task_id(),
+            message.body.len()
+        );
     }
 }
 
@@ -370,6 +509,12 @@ impl MessageMiddleware for ObservabilityMiddleware {
                 "x-observability-enabled".to_string(),
                 serde_json::json!(true),
             );
+            if let Some(ref metrics) = self.metrics {
+                metrics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .inc_published();
+            }
         }
 
         if self.enable_logging {
@@ -384,11 +529,26 @@ impl MessageMiddleware for ObservabilityMiddleware {
             serde_json::json!(self.service_name),
         );
 
+        self.log("publish", message);
+
         Ok(())
     }
 
-    async fn after_consume(&self, _message: &mut Message) -> Result<()> {
-        // In a real implementation, would emit metrics and logs here
+    async fn after_consume(&self, message: &mut Message) -> Result<()> {
+        // This is the point at which consumption outcome/latency is
+        // actually observable, which is exactly what was previously a
+        // no-op: neither a log line nor a metric was ever emitted here.
+        self.log("consume", message);
+
+        if self.enable_metrics {
+            if let Some(ref metrics) = self.metrics {
+                metrics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .inc_consumed();
+            }
+        }
+
         Ok(())
     }
 
@@ -761,6 +921,22 @@ impl MessageMiddleware for CostAttributionMiddleware {
 ///     .with_percentile(99)
 ///     .with_alert_threshold(0.95);
 /// ```
+/// Bounded window of recent SLA processing-time samples, paired with a
+/// running within-SLA count so [`SLAMonitoringMiddleware::compliance_rate`]
+/// is O(1) instead of rescanning every sample on every call.
+struct SlaWindow {
+    samples: std::collections::VecDeque<u64>,
+    within_sla_count: usize,
+}
+
+/// Maximum number of processing-time samples retained. An unbounded `Vec`
+/// (the previous design) grows by 8 bytes per consumed message forever, so
+/// a long-running worker leaks memory without limit; capping it (like
+/// [`AdaptiveTimeoutMiddleware`]'s sample buffer) bounds that at a fixed,
+/// small cost while still giving `compliance_rate` a representative recent
+/// window.
+const MAX_SLA_SAMPLES: usize = 1024;
+
 pub struct SLAMonitoringMiddleware {
     /// Target processing time in milliseconds
     target_ms: u64,
@@ -768,8 +944,8 @@ pub struct SLAMonitoringMiddleware {
     percentile: u8,
     /// Alert threshold (0.0-1.0, default 0.9 = 90% compliance)
     alert_threshold: f64,
-    /// Processing times buffer
-    processing_times: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Bounded processing-time window
+    processing_times: std::sync::Arc<std::sync::Mutex<SlaWindow>>,
 }
 
 impl SLAMonitoringMiddleware {
@@ -779,7 +955,10 @@ impl SLAMonitoringMiddleware {
             target_ms,
             percentile: 95,
             alert_threshold: 0.9,
-            processing_times: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            processing_times: std::sync::Arc::new(std::sync::Mutex::new(SlaWindow {
+                samples: std::collections::VecDeque::new(),
+                within_sla_count: 0,
+            })),
         }
     }
 
@@ -795,18 +974,40 @@ impl SLAMonitoringMiddleware {
         self
     }
 
-    /// Get current SLA compliance rate
-    pub fn compliance_rate(&self) -> f64 {
-        let times = self
+    /// Record a processing time sample, evicting the oldest sample (and
+    /// correspondingly adjusting the running within-SLA count) once the
+    /// window is at capacity.
+    fn record_sample(&self, processing_time_ms: u64) {
+        let mut window = self
             .processing_times
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if times.is_empty() {
+
+        if window.samples.len() >= MAX_SLA_SAMPLES {
+            if let Some(evicted) = window.samples.pop_front() {
+                if evicted <= self.target_ms {
+                    window.within_sla_count = window.within_sla_count.saturating_sub(1);
+                }
+            }
+        }
+
+        if processing_time_ms <= self.target_ms {
+            window.within_sla_count += 1;
+        }
+        window.samples.push_back(processing_time_ms);
+    }
+
+    /// Get current SLA compliance rate
+    pub fn compliance_rate(&self) -> f64 {
+        let window = self
+            .processing_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if window.samples.is_empty() {
             return 1.0;
         }
 
-        let within_sla = times.iter().filter(|&&t| t <= self.target_ms).count();
-        within_sla as f64 / times.len() as f64
+        window.within_sla_count as f64 / window.samples.len() as f64
     }
 
     /// Check if alert should be triggered
@@ -847,11 +1048,9 @@ impl MessageMiddleware for SLAMonitoringMiddleware {
                     .as_millis() as u64;
                 let processing_time = now - start_str;
 
-                // Record processing time
-                self.processing_times
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(processing_time);
+                // Record processing time (bounded window, O(1) compliance
+                // rate - see `record_sample`).
+                self.record_sample(processing_time);
 
                 // Inject SLA status
                 let within_sla = processing_time <= self.target_ms;
@@ -929,11 +1128,43 @@ impl MessageVersioningMiddleware {
 
     fn is_version_supported(&self, version: &str) -> bool {
         if let Some(ref min_version) = self.min_supported_version {
-            // Simple string comparison (in production, use semantic versioning)
-            version >= min_version.as_str()
+            // Parse both sides as semantic (major, minor, patch) tuples
+            // and compare numerically. A byte-wise string comparison (the
+            // previous approach) is wrong across a decade boundary: the
+            // string "10.0" compares as *less than* "9.0" because '1' <
+            // '9' lexicographically, so a valid newer message would be
+            // rejected as unsupported.
+            match (Self::parse_semver(version), Self::parse_semver(min_version)) {
+                (Some(v), Some(min)) => v >= min,
+                // An unparseable version is treated as unsupported rather
+                // than silently comparing incomparable values.
+                _ => false,
+            }
         } else {
             true
         }
+    }
+
+    /// Parse a `major[.minor[.patch]]` version string into a comparable
+    /// tuple, treating missing components as 0 (so "2" and "2.0.0" compare
+    /// equal). Returns `None` if the leading component isn't a valid
+    /// number.
+    fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse::<u64>().ok()?;
+        let minor = parts
+            .next()
+            .map(|p| p.parse::<u64>())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
+        let patch = parts
+            .next()
+            .map(|p| p.parse::<u64>())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
+        Some((major, minor, patch))
     }
 }
 
@@ -1001,6 +1232,16 @@ impl MessageMiddleware for MessageVersioningMiddleware {
 
     fn name(&self) -> &str {
         "message_versioning"
+    }
+
+    fn is_drop_signal(&self, _err: &BrokerError) -> bool {
+        // A message whose version is below `min_supported_version` will
+        // report the exact same version on every redelivery - retrying
+        // cannot make an old message become a new one, so this is the
+        // middleware's designed "this message can never be processed"
+        // signal rather than a transient processing failure that should be
+        // requeued forever.
+        true
     }
 }
 
@@ -1077,6 +1318,15 @@ impl ResourceQuotaMiddleware {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
+
+        // Opportunistically prune consumers that have been completely
+        // idle for more than one full quota window. Without this, `usage`
+        // grows by one permanent entry per distinct consumer id ever seen
+        // for the lifetime of the process, since nothing else ever
+        // shrinks the map.
+        usage.retain(|_, (_, _, last_reset)| {
+            now.saturating_sub(*last_reset) < self.time_window_secs.saturating_mul(2)
+        });
 
         let (msg_count, byte_count, last_reset) =
             usage.entry(consumer_id.to_string()).or_insert((0, 0, now));
@@ -1158,5 +1408,288 @@ impl MessageMiddleware for ResourceQuotaMiddleware {
 
     fn name(&self) -> &str {
         "resource_quota"
+    }
+
+    fn is_drop_signal(&self, _err: &BrokerError) -> bool {
+        // Quota exhaustion is this middleware's designed "stop admitting
+        // messages for this consumer" signal, not a processing failure -
+        // treat it the same as deduplication/filtering/sampling so the
+        // message is settled (not endlessly redelivered) rather than
+        // propagated as an error.
+        true
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    // -------------------------------------------------------------------
+    // idx114: LoadShedding must read the typed priority field.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn load_shedding_sheds_message_built_with_with_priority() {
+        let mut load_shedder = LoadSheddingMiddleware::new(0.5);
+        load_shedder.update_load(1.0);
+
+        let mut message =
+            celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]).with_priority(1); // Low priority, via the typed field only.
+
+        let result = load_shedder.before_publish(&mut message).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_shedding_allows_high_typed_priority_even_under_load() {
+        let mut load_shedder = LoadSheddingMiddleware::new(0.5);
+        load_shedder.update_load(1.0);
+
+        let mut message =
+            celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]).with_priority(9);
+
+        let result = load_shedder.before_publish(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // idx115: LoadSheddingMiddleware must be armable once boxed into a
+    // chain, via a cloneable LoadHandle obtained beforehand.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn load_shedding_handle_updates_load_after_boxed_into_chain() {
+        let load_shedder = LoadSheddingMiddleware::new(0.5);
+        let handle = load_shedder.load_handle();
+
+        let chain = crate::MiddlewareChain::new().with_middleware(Box::new(load_shedder));
+
+        let mut low_priority_msg =
+            celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]).with_priority(1);
+        // Load starts at 0.0: nothing is shed yet.
+        assert!(chain
+            .process_before_publish(&mut low_priority_msg)
+            .await
+            .is_ok());
+
+        // Arm it via the handle, exactly as `MiddlewareChain` only ever
+        // exposes `&dyn MessageMiddleware` (no `&mut`) once installed.
+        handle.set_load(1.0);
+        assert_eq!(handle.load(), 1.0);
+
+        let mut low_priority_msg2 =
+            celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]).with_priority(1);
+        let result = chain.process_before_publish(&mut low_priority_msg2).await;
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // idx125 / idx203: age-based priority escalation must use the
+    // message's real age, and must fire on the consume side (where queue
+    // residency is actually observable), not just at publish time.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn priority_escalation_after_consume_escalates_once_message_ages() {
+        // Real-clock based: `get_age_seconds` computes elapsed time from
+        // `headers.created_at` via `chrono::Utc::now()`. Backdating
+        // `created_at` directly (bypassing the wait entirely) would be
+        // preferable, but `chrono` is a dependency of `celers-protocol`
+        // (which defines the field), not of `celers-kombu` itself - naming
+        // `chrono::` here would not compile without adding it to this
+        // crate's `Cargo.toml`, which is out of this module's ownership
+        // (see the equivalent PriorityBoostMiddleware test for the same
+        // constraint). So this waits a bit over one second against a
+        // one-second threshold instead.
+        let middleware = MessagePriorityEscalationMiddleware::new(1);
+        let mut message = celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        middleware.after_consume(&mut message).await.unwrap();
+
+        assert!(message.properties.priority.unwrap_or(5) > 5);
+        assert!(message.headers.extra.contains_key("x-priority-escalated"));
+    }
+
+    #[tokio::test]
+    async fn priority_escalation_before_publish_still_escalates_on_retry() {
+        // Regression guard: this exact before_publish behaviour is relied
+        // on elsewhere in this crate's test suite and must keep working
+        // (age is ~0 for a freshly published message, so only the retry
+        // term has an effect here).
+        let middleware = MessagePriorityEscalationMiddleware::new(300);
+        let mut message = celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        message.headers.retries = Some(2);
+
+        middleware.before_publish(&mut message).await.unwrap();
+
+        let escalated = message
+            .headers
+            .extra
+            .get("priority")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert!(escalated > 5);
+        assert_eq!(message.properties.priority, Some(escalated as u8));
+    }
+
+    #[test]
+    fn priority_escalation_zero_threshold_does_not_panic() {
+        // Regression guard for a latent division-by-zero: age escalation
+        // now runs on every consume with a real (unbounded, non-zero)
+        // age, so a degenerate `age_threshold_secs == 0` configuration
+        // must not crash the worker.
+        let middleware = MessagePriorityEscalationMiddleware::new(0);
+        // Large age_secs on purpose: also guards against the multiplier
+        // overflowing `u8`.
+        let boosted = middleware.calculate_priority(5, u64::MAX, 0);
+        assert!(boosted <= middleware.max_priority);
+    }
+
+    // -------------------------------------------------------------------
+    // idx126: SLAMonitoringMiddleware must bound its sample window and
+    // keep compliance_rate correct while doing so.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sla_monitoring_bounds_sample_window_and_stays_accurate() {
+        let middleware = SLAMonitoringMiddleware::new(100).with_alert_threshold(0.5);
+
+        // Push far more samples than MAX_SLA_SAMPLES, alternating
+        // within/outside SLA, and confirm compliance_rate matches the
+        // last MAX_SLA_SAMPLES samples only (eviction bookkeeping is
+        // correct) while the window itself never grows past the cap.
+        for i in 0..(MAX_SLA_SAMPLES * 3) {
+            let sample_ms = if i % 2 == 0 { 50 } else { 200 }; // half within, half over
+            middleware.record_sample(sample_ms);
+        }
+
+        let window = middleware
+            .processing_times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(window.samples.len(), MAX_SLA_SAMPLES);
+        drop(window);
+
+        // Exactly half of the retained samples are within the 100ms SLA.
+        assert!((middleware.compliance_rate() - 0.5).abs() < 1e-9);
+    }
+
+    // -------------------------------------------------------------------
+    // idx126: ResourceQuotaMiddleware must not accumulate a permanent
+    // entry per distinct consumer id.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn resource_quota_prunes_stale_consumers() {
+        let middleware = ResourceQuotaMiddleware::new(100).with_time_window_secs(1);
+
+        // Simulate a consumer whose last activity is long past 2x the
+        // quota window, by writing directly into the (crate-internal)
+        // usage map rather than waiting in real time.
+        {
+            let mut usage = middleware.usage.lock().unwrap_or_else(|e| e.into_inner());
+            usage.insert("stale-consumer".to_string(), (1, 1, 0));
+        }
+        assert_eq!(middleware.get_usage("stale-consumer"), (1, 1));
+
+        // Any subsequent quota check for a different (or the same)
+        // consumer must sweep the stale entry out.
+        middleware
+            .check_and_update_quota("active-consumer", 10)
+            .unwrap();
+
+        assert_eq!(middleware.get_usage("stale-consumer"), (0, 0));
+    }
+
+    // -------------------------------------------------------------------
+    // idx147: MessageVersioningMiddleware must compare versions
+    // numerically, not lexicographically.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn message_versioning_accepts_double_digit_minor_version_bump() {
+        let middleware = MessageVersioningMiddleware::new("10.0").with_min_supported_version("9.0");
+        let mut message = celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        message
+            .headers
+            .extra
+            .insert("x-message-version".to_string(), serde_json::json!("10.0"));
+
+        // A byte-wise string comparison rejects "10.0" as less than "9.0";
+        // a numeric comparison must accept it.
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn message_versioning_rejects_genuinely_older_version() {
+        let middleware = MessageVersioningMiddleware::new("9.0").with_min_supported_version("9.0");
+        let mut message = celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        message
+            .headers
+            .extra
+            .insert("x-message-version".to_string(), serde_json::json!("8.5"));
+
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn message_versioning_rejection_is_settled_as_a_drop_not_requeued_forever() {
+        // A too-old message will report the exact same version on every
+        // redelivery, so `MiddlewareChain::process_after_consume` must
+        // classify the rejection as a designed drop (via `is_drop_signal`)
+        // rather than a genuine failure - otherwise
+        // `MiddlewareConsumer::consume_with_middleware` requeues it and it
+        // is redelivered forever.
+        let middleware = MessageVersioningMiddleware::new("9.0").with_min_supported_version("9.0");
+        let chain = crate::MiddlewareChain::new().with_middleware(Box::new(middleware));
+
+        let mut message = celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        message
+            .headers
+            .extra
+            .insert("x-message-version".to_string(), serde_json::json!("8.5"));
+
+        let decision = chain.process_after_consume(&mut message).await.unwrap();
+        assert!(decision.is_drop());
+    }
+
+    // -------------------------------------------------------------------
+    // idx204: ObservabilityMiddleware must actually emit metrics on the
+    // consume path when a shared BrokerMetrics is attached.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn observability_middleware_increments_shared_metrics() {
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(BrokerMetrics::default()));
+        let middleware = ObservabilityMiddleware::new("svc").with_metrics(metrics.clone());
+
+        let mut message = celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        middleware.before_publish(&mut message).await.unwrap();
+        middleware.after_consume(&mut message).await.unwrap();
+
+        let snapshot = metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(snapshot.messages_published, 1);
+        assert_eq!(snapshot.messages_consumed, 1);
+    }
+
+    #[tokio::test]
+    async fn observability_middleware_without_metrics_does_not_touch_shared_metrics() {
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(BrokerMetrics::default()));
+        let middleware = ObservabilityMiddleware::new("svc")
+            .with_metrics(metrics.clone())
+            .without_metrics();
+
+        let mut message = celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        middleware.before_publish(&mut message).await.unwrap();
+        middleware.after_consume(&mut message).await.unwrap();
+
+        let snapshot = metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(snapshot.messages_published, 0);
+        assert_eq!(snapshot.messages_consumed, 0);
     }
 }

@@ -94,8 +94,10 @@
 //!     Ok(items.len())
 //! }
 //!
-//! // Use with specific type:
-//! let task = ProcessItemsTask::<String>;
+//! // Use with specific type. Generic task structs carry a hidden
+//! // `PhantomData` marker (needed so the struct actually "uses" `T`), so
+//! // construct them through `Default` rather than as a bare unit value:
+//! let task = ProcessItemsTask::<String>::default();
 //! let input = ProcessItemsTaskInput {
 //!     items: vec!["a".to_string(), "b".to_string()],
 //! };
@@ -542,18 +544,27 @@
 //!     pub items: Vec<T>,
 //! }
 //!
+//! // Note: no bounds on the alias's own parameters (avoids the
+//! // `type_alias_bounds` lint); the `T: Send + Clone` bound still applies
+//! // to the `impl Task for ProcessTask<T>` block below.
 //! pub type ProcessTaskOutput<T> = usize;
 //!
+//! // Carries a hidden PhantomData marker so `T` is actually "used" by the
+//! // struct (a field-less `struct ProcessTask<T>;` would be E0392: type
+//! // parameter `T` is never used).
 //! pub struct ProcessTask<T>
 //! where
-//!     T: Send + Clone;
+//!     T: Send + Clone,
+//! {
+//!     _marker: core::marker::PhantomData<(fn() -> T,)>,
+//! }
 //!
 //! impl<T> Default for ProcessTask<T>
 //! where
 //!     T: Send + Clone,
 //! {
 //!     fn default() -> Self {
-//!         ProcessTask
+//!         ProcessTask { _marker: core::marker::PhantomData }
 //!     }
 //! }
 //!
@@ -594,13 +605,13 @@
 //!
 //!         // Validation checks are inserted here
 //!         if (age as i64) < 0 {
-//!             return Err(celers_core::CelersError(format!(
+//!             return Err(celers_core::CelersError::TaskExecution(format!(
 //!                 "Field 'age' value {} is below minimum 0",
 //!                 age
 //!             )));
 //!         }
 //!         if (age as i64) > 120 {
-//!             return Err(celers_core::CelersError(format!(
+//!             return Err(celers_core::CelersError::TaskExecution(format!(
 //!                 "Field 'age' value {} exceeds maximum 120",
 //!                 age
 //!             )));

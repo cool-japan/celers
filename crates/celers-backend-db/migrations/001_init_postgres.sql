@@ -14,8 +14,17 @@ CREATE TABLE IF NOT EXISTS celers_task_results (
     completed_at TIMESTAMP WITH TIME ZONE,
     worker VARCHAR(255),
     expires_at TIMESTAMP WITH TIME ZONE,
+    -- Serialized tail of TaskMeta not covered by a dedicated column above
+    -- (progress, version, tags, metadata, worker_hostname, runtime_ms,
+    -- memory_bytes, retries, queue) -- see `task_meta_extra.rs`.
+    extra JSONB,
     CHECK (result_state IN ('pending', 'started', 'success', 'failure', 'revoked', 'retry'))
 );
+
+-- Idempotent for databases migrated before the `extra` column existed
+-- (CREATE TABLE IF NOT EXISTS above is a no-op on an already-existing
+-- table, so this ALTER is what actually adds the column on upgrade).
+ALTER TABLE celers_task_results ADD COLUMN IF NOT EXISTS extra JSONB;
 
 -- Chord synchronization state
 CREATE TABLE IF NOT EXISTS celers_chord_state (

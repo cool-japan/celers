@@ -167,6 +167,20 @@ pub struct PiiConfig {
     /// first character of `mask`; if `false`, the whole match is replaced by
     /// `mask` verbatim.
     pub preserve_length: bool,
+    /// Scan numeric (`Int`/`UInt`) task values as digit strings.
+    ///
+    /// `TaskValue::from(serde_json::Value)` maps a JSON number to `Int`/`UInt`,
+    /// so an ordinary body such as `{"card": 4111111111111111}` produced a value
+    /// the detector skipped entirely — even though the very same digits would be
+    /// caught instantly if they had arrived as a string.
+    pub scan_numbers: bool,
+    /// Scan `Bytes` values as lossy UTF-8 when they look like text.
+    pub scan_bytes: bool,
+    /// Scan object *keys* in addition to their values.
+    ///
+    /// A key such as `jane.doe@example.com` in a map is a realistic leak, but
+    /// keys are also often structural, so this is opt-in.
+    pub scan_keys: bool,
 }
 
 impl Default for PiiConfig {
@@ -178,6 +192,9 @@ impl Default for PiiConfig {
             detect_ssn: true,
             mask: "[REDACTED]".to_string(),
             preserve_length: false,
+            scan_numbers: true,
+            scan_bytes: true,
+            scan_keys: false,
         }
     }
 }
@@ -207,6 +224,38 @@ impl PiiConfig {
     pub const fn with_preserve_length(mut self, preserve: bool) -> Self {
         self.preserve_length = preserve;
         self
+    }
+
+    /// Enable or disable scanning of numeric values.
+    #[must_use]
+    pub const fn with_scan_numbers(mut self, scan: bool) -> Self {
+        self.scan_numbers = scan;
+        self
+    }
+
+    /// Enable or disable scanning of byte blobs as lossy UTF-8.
+    #[must_use]
+    pub const fn with_scan_bytes(mut self, scan: bool) -> Self {
+        self.scan_bytes = scan;
+        self
+    }
+
+    /// Enable or disable scanning of object keys.
+    #[must_use]
+    pub const fn with_scan_keys(mut self, scan: bool) -> Self {
+        self.scan_keys = scan;
+        self
+    }
+}
+
+/// Render an integral [`TaskValue`] as its decimal digit string.
+///
+/// Returns `None` for anything that is not `Int`/`UInt`.
+fn number_as_text(value: &TaskValue) -> Option<String> {
+    match value {
+        TaskValue::Int(v) => Some(v.to_string()),
+        TaskValue::UInt(v) => Some(v.to_string()),
+        _ => None,
     }
 }
 
@@ -321,17 +370,34 @@ impl PiiDetector {
     fn scan_value_into(&self, value: &TaskValue, report: &mut PiiReport) {
         match value {
             TaskValue::String(s) => report.merge(self.scan_str(s)),
+            TaskValue::Int(_) | TaskValue::UInt(_) => {
+                if self.config.scan_numbers {
+                    if let Some(text) = number_as_text(value) {
+                        report.merge(self.scan_str(&text));
+                    }
+                }
+            }
+            TaskValue::Bytes(bytes) => {
+                if self.config.scan_bytes {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        report.merge(self.scan_str(text));
+                    }
+                }
+            }
             TaskValue::Array(items) => {
                 for item in items {
                     self.scan_value_into(item, report);
                 }
             }
             TaskValue::Object(entries) => {
-                for (_, v) in entries {
+                for (key, v) in entries {
+                    if self.config.scan_keys {
+                        report.merge(self.scan_str(key));
+                    }
                     self.scan_value_into(v, report);
                 }
             }
-            _ => {}
+            TaskValue::Null | TaskValue::Bool(_) | TaskValue::Float(_) => {}
         }
     }
 
@@ -352,17 +418,47 @@ impl PiiDetector {
                     report.merge(found);
                 }
             }
+            // A masked number can no longer be a number, so it becomes a string.
+            TaskValue::Int(_) | TaskValue::UInt(_) => {
+                if self.config.scan_numbers {
+                    if let Some(text) = number_as_text(value) {
+                        let (masked, found) = self.mask_str(&text);
+                        if !found.is_empty() {
+                            *value = TaskValue::String(masked);
+                            report.merge(found);
+                        }
+                    }
+                }
+            }
+            TaskValue::Bytes(bytes) => {
+                if self.config.scan_bytes {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        let (masked, found) = self.mask_str(text);
+                        if !found.is_empty() {
+                            *value = TaskValue::String(masked);
+                            report.merge(found);
+                        }
+                    }
+                }
+            }
             TaskValue::Array(items) => {
                 for item in items.iter_mut() {
                     self.mask_value_into(item, report);
                 }
             }
             TaskValue::Object(entries) => {
-                for (_, v) in entries.iter_mut() {
+                for (key, v) in entries.iter_mut() {
+                    if self.config.scan_keys {
+                        let (masked, found) = self.mask_str(key);
+                        if !found.is_empty() {
+                            *key = masked;
+                            report.merge(found);
+                        }
+                    }
                     self.mask_value_into(v, report);
                 }
             }
-            _ => {}
+            TaskValue::Null | TaskValue::Bool(_) | TaskValue::Float(_) => {}
         }
     }
 
@@ -1128,5 +1224,126 @@ mod tests {
         let r = d.scan_str("123-45-6789");
         assert_eq!(r.total(), 1);
         assert_eq!(r.matches[0].kind, PiiKind::Ssn);
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// Regression: only `TaskValue::String` was inspected, so a JSON body such
+    /// as `{"card": 4111111111111111}` — which maps to `TaskValue::Int` — was
+    /// reported as containing no PII and passed through masking unchanged.
+    #[test]
+    fn numeric_values_are_scanned_and_masked() {
+        let detector = PiiDetector::default();
+
+        let card = TaskValue::Int(4_111_111_111_111_111);
+        let report = detector.scan_value(&card);
+        assert!(
+            report.contains_kind(PiiKind::CreditCard),
+            "a Luhn-valid card number must be detected as a number too"
+        );
+
+        let mut value = card.clone();
+        let report = detector.mask_value(&mut value);
+        assert!(report.contains_kind(PiiKind::CreditCard));
+        assert!(
+            matches!(&value, TaskValue::String(s) if s.contains("[REDACTED]")),
+            "masked value: {value:?}"
+        );
+
+        // Unsigned values too.
+        let unsigned = TaskValue::UInt(4_111_111_111_111_111);
+        assert!(detector
+            .scan_value(&unsigned)
+            .contains_kind(PiiKind::CreditCard));
+
+        // A plain number that is not PII is left completely alone.
+        let mut plain = TaskValue::Int(42);
+        assert!(detector.mask_value(&mut plain).is_empty());
+        assert_eq!(plain, TaskValue::Int(42));
+    }
+
+    #[test]
+    fn numeric_scanning_is_configurable() {
+        let detector = PiiDetector::with_config(PiiConfig::default().with_scan_numbers(false));
+        let card = TaskValue::Int(4_111_111_111_111_111);
+        assert!(detector.scan_value(&card).is_empty());
+
+        let mut value = card.clone();
+        assert!(detector.mask_value(&mut value).is_empty());
+        assert_eq!(value, card);
+    }
+
+    #[test]
+    fn numeric_values_inside_containers_are_scanned() {
+        let detector = PiiDetector::default();
+        let payload = TaskValue::Object(vec![
+            ("card".to_string(), TaskValue::Int(4_111_111_111_111_111)),
+            (
+                "nested".to_string(),
+                TaskValue::Array(vec![TaskValue::UInt(4_111_111_111_111_111)]),
+            ),
+        ]);
+        let report = detector.scan_value(&payload);
+        assert_eq!(report.count_kind(PiiKind::CreditCard), 2);
+    }
+
+    #[test]
+    fn byte_blobs_are_scanned_as_text() {
+        let detector = PiiDetector::default();
+        let bytes = TaskValue::Bytes(b"contact jane.doe@example.com".to_vec());
+        assert!(detector.scan_value(&bytes).contains_kind(PiiKind::Email));
+
+        let mut value = bytes;
+        let report = detector.mask_value(&mut value);
+        assert!(report.contains_kind(PiiKind::Email));
+        assert!(matches!(&value, TaskValue::String(s) if !s.contains("jane.doe@example.com")));
+
+        // Non-UTF-8 blobs are left alone rather than mangled.
+        let mut binary = TaskValue::Bytes(vec![0xff, 0xfe, 0x00]);
+        assert!(detector.mask_value(&mut binary).is_empty());
+        assert_eq!(binary, TaskValue::Bytes(vec![0xff, 0xfe, 0x00]));
+    }
+
+    #[test]
+    fn object_keys_are_scanned_when_enabled() {
+        let payload = || {
+            TaskValue::Object(vec![(
+                "jane.doe@example.com".to_string(),
+                TaskValue::from("ok"),
+            )])
+        };
+
+        // Off by default: keys are often structural.
+        let default_detector = PiiDetector::default();
+        assert!(default_detector.scan_value(&payload()).is_empty());
+
+        let detector = PiiDetector::with_config(PiiConfig::default().with_scan_keys(true));
+        assert!(detector
+            .scan_value(&payload())
+            .contains_kind(PiiKind::Email));
+
+        let mut value = payload();
+        let report = detector.mask_value(&mut value);
+        assert!(report.contains_kind(PiiKind::Email));
+        match &value {
+            TaskValue::Object(entries) => {
+                assert!(!entries[0].0.contains("jane.doe@example.com"));
+            }
+            other => panic!("expected an object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mask_call_covers_numeric_arguments() {
+        let detector = PiiDetector::default();
+        let mut args = vec![TaskValue::Int(4_111_111_111_111_111)];
+        let mut kwargs = vec![("ssn".to_string(), TaskValue::from("123-45-6789"))];
+
+        let report = detector.mask_call(&mut args, &mut kwargs);
+        assert!(report.contains_kind(PiiKind::CreditCard));
+        assert!(report.contains_kind(PiiKind::Ssn));
+        assert!(matches!(&args[0], TaskValue::String(s) if s.contains("[REDACTED]")));
     }
 }

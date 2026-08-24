@@ -64,15 +64,44 @@ impl ProtocolMigrator {
         Self { strategy }
     }
 
+    /// Determine the protocol version a message is currently stamped with.
+    ///
+    /// Reads the [`PROTOCOL_VERSION_HEADER`] stamp written by
+    /// [`ProtocolMigrator::migrate`], [`crate::v5::build_v5_message`] and
+    /// [`crate::v5::to_v5_wire`]. An unstamped message is assumed to be v2 --
+    /// the Celery default (`task_protocol = 2`) and the format a plain
+    /// [`Message`] is built in.
+    pub fn source_version(message: &Message) -> ProtocolVersion {
+        crate::negotiation::parse_version_from_headers(&message.headers.extra)
+            .unwrap_or(ProtocolVersion::V2)
+    }
+
     /// Check if a message is compatible with a target protocol version
     pub fn check_compatibility(
         &self,
         message: &Message,
         target_version: ProtocolVersion,
     ) -> CompatibilityInfo {
-        let from_version = ProtocolVersion::V2; // Default assumption
+        // The source version is read off the message rather than assumed, so
+        // that `CompatibilityInfo::from_version` and the `IncompatibleVersion`
+        // error report the real transition.
+        let from_version = Self::source_version(message);
         let mut warnings = Vec::new();
         let unsupported_features = Vec::new();
+
+        // A v5 -> v2 downgrade loses the inline workflow stamping that v5
+        // carries natively; `migrate` mirrors the identifiers into `_legacy_*`
+        // headers, which a stock v2 consumer will not interpret.
+        if from_version == ProtocolVersion::V5
+            && target_version == ProtocolVersion::V2
+            && (message.has_group() || message.has_parent() || message.has_root())
+        {
+            warnings.push(
+                "Downgrading v5 -> v2: inline workflow stamping (group/parent/root) is mirrored \
+                 into `_legacy_*` headers and is not interpreted by stock v2 consumers"
+                    .to_string(),
+            );
+        }
 
         // Check for features that may not be fully supported across versions
         if message.has_group() && target_version == ProtocolVersion::V2 {
@@ -569,6 +598,73 @@ mod tests {
 
         let err = MigrationError::ValidationError("test error".to_string());
         assert!(err.to_string().contains("Validation error"));
+    }
+
+    /// Regression: `from_version` used to be hardcoded to `V2`, so a message
+    /// this crate itself produced as v5 was reported as migrating *from* v2 --
+    /// in `CompatibilityInfo` and in every `IncompatibleVersion` error message.
+    #[test]
+    fn test_check_compatibility_reads_source_version_from_message() {
+        let v5 = crate::v5::V5MessageSpec::new("tasks.add", Uuid::new_v4())
+            .build()
+            .expect("v5 build must succeed")
+            .into_message();
+
+        assert_eq!(
+            ProtocolMigrator::source_version(&v5),
+            ProtocolVersion::V5,
+            "a message carrying the v5 stamp must be recognised as v5"
+        );
+
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Conservative);
+        let info = migrator.check_compatibility(&v5, ProtocolVersion::V2);
+        assert_eq!(info.from_version, ProtocolVersion::V5);
+        assert_eq!(info.to_version, ProtocolVersion::V2);
+
+        // An unstamped message is still assumed to be v2 (the Celery default).
+        let body = serde_json::to_vec(&TaskArgs::new()).unwrap();
+        let plain = Message::new("tasks.add".to_string(), Uuid::new_v4(), body);
+        assert_eq!(
+            ProtocolMigrator::source_version(&plain),
+            ProtocolVersion::V2
+        );
+        assert_eq!(
+            migrator
+                .check_compatibility(&plain, ProtocolVersion::V5)
+                .from_version,
+            ProtocolVersion::V2
+        );
+    }
+
+    /// A v5 -> v2 downgrade of a workflow-stamped message must warn (and be
+    /// refused by the conservative strategy), and the error must name the real
+    /// source version.
+    #[test]
+    fn test_v5_to_v2_downgrade_warns_about_inline_workflow_stamping() {
+        let v5 = crate::v5::V5MessageSpec::new("tasks.chord_callback", Uuid::new_v4())
+            .with_group(Uuid::new_v4())
+            .build()
+            .expect("v5 build must succeed")
+            .into_message();
+
+        let migrator = ProtocolMigrator::new(MigrationStrategy::Conservative);
+        let info = migrator.check_compatibility(&v5, ProtocolVersion::V2);
+
+        assert_eq!(info.from_version, ProtocolVersion::V5);
+        assert!(
+            info.warnings.iter().any(|w| w.contains("v5 -> v2")),
+            "expected a downgrade warning, got: {:?}",
+            info.warnings
+        );
+        assert!(!info.is_compatible);
+
+        match migrator.migrate(v5, ProtocolVersion::V2) {
+            Err(MigrationError::IncompatibleVersion { from, to, .. }) => {
+                assert_eq!(from, ProtocolVersion::V5);
+                assert_eq!(to, ProtocolVersion::V2);
+            }
+            other => panic!("expected IncompatibleVersion, got {:?}", other),
+        }
     }
 
     #[test]

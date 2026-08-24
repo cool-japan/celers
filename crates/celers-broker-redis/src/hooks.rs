@@ -44,7 +44,25 @@
 use async_trait::async_trait;
 use celers_core::{SerializedTask, TaskId};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Acquire a read guard, recovering it even if the lock is poisoned.
+///
+/// A panic in one hook while it holds the registry's lock must not turn
+/// every subsequent hook registration/execution into a cascading panic
+/// across every task that touches the registry. Every write through this
+/// module is a plain `Vec::push`, so data recovered from a poisoned lock is
+/// always structurally valid — recovering it instead of panicking again is
+/// safe.
+fn read_recover<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Write-lock counterpart of [`read_recover`]; see its documentation.
+fn write_recover<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Result type for hook operations
 pub type HookResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -200,26 +218,17 @@ impl TaskHookRegistry {
 
     /// Add an enqueue hook
     pub fn add_enqueue_hook(&self, hook: Box<dyn EnqueueHook>) {
-        self.enqueue_hooks
-            .write()
-            .expect("lock should not be poisoned")
-            .push(hook);
+        write_recover(&self.enqueue_hooks).push(hook);
     }
 
     /// Add a dequeue hook
     pub fn add_dequeue_hook(&self, hook: Box<dyn DequeueHook>) {
-        self.dequeue_hooks
-            .write()
-            .expect("lock should not be poisoned")
-            .push(hook);
+        write_recover(&self.dequeue_hooks).push(hook);
     }
 
     /// Add a completion hook
     pub fn add_completion_hook(&self, hook: Box<dyn CompletionHook>) {
-        self.completion_hooks
-            .write()
-            .expect("lock should not be poisoned")
-            .push(hook);
+        write_recover(&self.completion_hooks).push(hook);
     }
 
     /// Execute all before_enqueue hooks
@@ -234,21 +243,13 @@ impl TaskHookRegistry {
         task: &mut SerializedTask,
         ctx: &HookContext,
     ) -> HookResult<()> {
-        let hooks_count = {
-            let guard = self
-                .enqueue_hooks
-                .read()
-                .expect("lock should not be poisoned");
-            guard.len()
-        };
+        let hooks_count = read_recover(&self.enqueue_hooks).len();
 
         for i in 0..hooks_count {
             let result = {
-                let guard = self
-                    .enqueue_hooks
-                    .read()
-                    .expect("lock should not be poisoned");
-                guard[i].before_enqueue(task, ctx).await
+                read_recover(&self.enqueue_hooks)[i]
+                    .before_enqueue(task, ctx)
+                    .await
             };
             result?;
         }
@@ -263,21 +264,13 @@ impl TaskHookRegistry {
         task: &SerializedTask,
         ctx: &HookContext,
     ) -> HookResult<()> {
-        let hooks_count = {
-            let guard = self
-                .enqueue_hooks
-                .read()
-                .expect("lock should not be poisoned");
-            guard.len()
-        };
+        let hooks_count = read_recover(&self.enqueue_hooks).len();
 
         for i in 0..hooks_count {
             let result = {
-                let guard = self
-                    .enqueue_hooks
-                    .read()
-                    .expect("lock should not be poisoned");
-                guard[i].after_enqueue(task_id, task, ctx).await
+                read_recover(&self.enqueue_hooks)[i]
+                    .after_enqueue(task_id, task, ctx)
+                    .await
             };
             result?;
         }
@@ -287,21 +280,13 @@ impl TaskHookRegistry {
     /// Execute all before_dequeue hooks
     #[allow(clippy::await_holding_lock)]
     pub async fn execute_before_dequeue(&self, ctx: &HookContext) -> HookResult<()> {
-        let hooks_count = {
-            let guard = self
-                .dequeue_hooks
-                .read()
-                .expect("lock should not be poisoned");
-            guard.len()
-        };
+        let hooks_count = read_recover(&self.dequeue_hooks).len();
 
         for i in 0..hooks_count {
             let result = {
-                let guard = self
-                    .dequeue_hooks
-                    .read()
-                    .expect("lock should not be poisoned");
-                guard[i].before_dequeue(ctx).await
+                read_recover(&self.dequeue_hooks)[i]
+                    .before_dequeue(ctx)
+                    .await
             };
             result?;
         }
@@ -315,21 +300,13 @@ impl TaskHookRegistry {
         task: &mut SerializedTask,
         ctx: &HookContext,
     ) -> HookResult<()> {
-        let hooks_count = {
-            let guard = self
-                .dequeue_hooks
-                .read()
-                .expect("lock should not be poisoned");
-            guard.len()
-        };
+        let hooks_count = read_recover(&self.dequeue_hooks).len();
 
         for i in 0..hooks_count {
             let result = {
-                let guard = self
-                    .dequeue_hooks
-                    .read()
-                    .expect("lock should not be poisoned");
-                guard[i].after_dequeue(task, ctx).await
+                read_recover(&self.dequeue_hooks)[i]
+                    .after_dequeue(task, ctx)
+                    .await
             };
             result?;
         }
@@ -344,21 +321,13 @@ impl TaskHookRegistry {
         status: &CompletionStatus,
         ctx: &HookContext,
     ) -> HookResult<()> {
-        let hooks_count = {
-            let guard = self
-                .completion_hooks
-                .read()
-                .expect("lock should not be poisoned");
-            guard.len()
-        };
+        let hooks_count = read_recover(&self.completion_hooks).len();
 
         for i in 0..hooks_count {
             let result = {
-                let guard = self
-                    .completion_hooks
-                    .read()
-                    .expect("lock should not be poisoned");
-                guard[i].on_completion(task_id, status, ctx).await
+                read_recover(&self.completion_hooks)[i]
+                    .on_completion(task_id, status, ctx)
+                    .await
             };
             result?;
         }
@@ -367,26 +336,17 @@ impl TaskHookRegistry {
 
     /// Get the number of registered enqueue hooks
     pub fn enqueue_hooks_count(&self) -> usize {
-        self.enqueue_hooks
-            .read()
-            .expect("lock should not be poisoned")
-            .len()
+        read_recover(&self.enqueue_hooks).len()
     }
 
     /// Get the number of registered dequeue hooks
     pub fn dequeue_hooks_count(&self) -> usize {
-        self.dequeue_hooks
-            .read()
-            .expect("lock should not be poisoned")
-            .len()
+        read_recover(&self.dequeue_hooks).len()
     }
 
     /// Get the number of registered completion hooks
     pub fn completion_hooks_count(&self) -> usize {
-        self.completion_hooks
-            .read()
-            .expect("lock should not be poisoned")
-            .len()
+        read_recover(&self.completion_hooks).len()
     }
 }
 
@@ -400,18 +360,27 @@ impl Default for TaskHookRegistry {
 // Built-in Hooks
 // ============================================================================
 
-/// Hook that enriches tasks with timestamp metadata
+/// Hook that stamps a task with the wall-clock time it was enqueued.
+///
+/// `TaskMetadata::created_at` records when the `SerializedTask` value was
+/// first constructed, which can be well before it is actually handed to a
+/// broker (built ahead of time, held in a batch, queued behind other work).
+/// This hook overwrites `metadata.updated_at` with the current time
+/// immediately before enqueue, giving callers — and, notably,
+/// `dlq_archival::DLQArchivalManager::archive_old_tasks`'s age filter, which
+/// has no dedicated "entered DLQ" timestamp to work from — a real signal for
+/// "how long has this task actually been in flight" that is distinct from
+/// `created_at`.
 pub struct TimestampEnrichmentHook;
 
 #[async_trait]
 impl EnqueueHook for TimestampEnrichmentHook {
     async fn before_enqueue(
         &self,
-        _task: &mut SerializedTask,
+        task: &mut SerializedTask,
         _ctx: &HookContext,
     ) -> HookResult<()> {
-        // Timestamp is already added by TaskMetadata creation
-        // This is a placeholder for custom enrichment
+        task.metadata.updated_at = chrono::Utc::now();
         Ok(())
     }
 }
@@ -694,6 +663,55 @@ mod tests {
         assert_eq!(registry.enqueue_hooks_count(), 1);
         assert_eq!(registry.dequeue_hooks_count(), 1);
         assert_eq!(registry.completion_hooks_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_enrichment_hook_stamps_updated_at() {
+        let hook = TimestampEnrichmentHook;
+        let ctx = HookContext::new("test_queue".to_string());
+
+        let mut task = SerializedTask::new("test".to_string(), vec![]);
+        let created_at = task.metadata.created_at;
+        // Simulate a task that was built well before it is actually enqueued
+        // (e.g. constructed ahead of time and held in a batch).
+        let stale_updated_at = created_at - chrono::Duration::hours(2);
+        task.metadata.updated_at = stale_updated_at;
+
+        hook.before_enqueue(&mut task, &ctx).await.unwrap();
+
+        // The hook must move `updated_at` forward to (approximately) now,
+        // and leave `created_at` untouched — the whole point is that the two
+        // fields diverge and callers get a real "last touched" signal.
+        assert!(task.metadata.updated_at > stale_updated_at);
+        assert_eq!(task.metadata.created_at, created_at);
+        let age = chrono::Utc::now() - task.metadata.updated_at;
+        assert!(
+            age < chrono::Duration::seconds(5),
+            "updated_at should be stamped to ~now, age was {age}"
+        );
+    }
+
+    #[test]
+    fn test_registry_survives_poisoned_lock() {
+        // A `RwLock` is poisoned whenever a panic unwinds through code
+        // holding a guard on it — including within the *same* thread, which
+        // is what `catch_unwind` lets us exercise deterministically here.
+        let registry = TaskHookRegistry::new();
+        registry.add_enqueue_hook(Box::new(TimestampEnrichmentHook));
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.enqueue_hooks.write().unwrap();
+            panic!("simulated panic while holding the hook registry's lock");
+        }));
+        assert!(poisoned.is_err(), "the simulated panic should propagate");
+
+        // Before the fix, `.expect("lock should not be poisoned")` would
+        // turn every subsequent registry call into a second panic. It must
+        // instead recover the guard (a `Vec::push` never leaves the vec in
+        // an invalid state, so recovery is safe) and keep working.
+        assert_eq!(registry.enqueue_hooks_count(), 1);
+        registry.add_dequeue_hook(Box::new(LoggingHook::new(LogLevel::Info)));
+        assert_eq!(registry.dequeue_hooks_count(), 1);
     }
 
     #[tokio::test]

@@ -8,7 +8,56 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
+use crate::middleware::effective_retries;
 use crate::{BrokerError, MessageMiddleware, Result};
+
+/// A minimal, dependency-free async sleep primitive.
+///
+/// `celers-kombu` intentionally keeps `tokio` out of its non-dev dependency
+/// graph (it is pulled in only for tests/benches), so
+/// [`ThrottlingMiddleware`] cannot use `tokio::time::sleep` directly.
+/// `Delay` parks a dedicated OS thread for the requested duration and wakes
+/// the polling task when it elapses - the same "don't block the executor"
+/// behaviour a runtime-provided timer gives, without adding a dependency.
+struct Delay {
+    deadline: std::time::Instant,
+    waiting: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Delay {
+    fn new(duration: Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + duration,
+            waiting: None,
+        }
+    }
+}
+
+impl std::future::Future for Delay {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        let now = std::time::Instant::now();
+        if now >= this.deadline {
+            return std::task::Poll::Ready(());
+        }
+
+        if this.waiting.is_none() {
+            let waker = cx.waker().clone();
+            let remaining = this.deadline - now;
+            this.waiting = Some(std::thread::spawn(move || {
+                std::thread::sleep(remaining);
+                waker.wake();
+            }));
+        }
+
+        std::task::Poll::Pending
+    }
+}
 
 /// Error classification middleware for intelligent error routing
 ///
@@ -353,13 +402,32 @@ impl MessageMiddleware for ThrottlingMiddleware {
                 .insert("x-backpressure-active".to_string(), serde_json::json!(true));
         }
 
-        // Consume a token
+        // Actually enforce the computed delay - previously this only
+        // annotated the message with a delay hint that nothing honoured,
+        // so messages were published at full rate regardless of
+        // `max_rate`. No `std::sync::Mutex` guard is held across this
+        // `.await` (`calculate_delay`/`should_apply_backpressure` above
+        // already acquired and released their locks).
+        if delay > Duration::from_millis(0) {
+            Delay::new(delay).await;
+        }
+
+        // Refill again after the wait (more tokens may have accrued while
+        // we slept) and consume one.
+        self.refill_tokens();
         let mut tokens = self
             .available_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if *tokens >= 1.0 {
             *tokens -= 1.0;
+        } else {
+            // Floating point/refill-timing edge case immediately after
+            // waiting exactly the computed delay: never go negative, but
+            // still count this publish against the bucket so a burst of
+            // concurrent publishers converges on the configured rate
+            // rather than bypassing it.
+            *tokens = 0.0;
         }
 
         Ok(())
@@ -380,6 +448,17 @@ impl MessageMiddleware for ThrottlingMiddleware {
 /// Implements the circuit breaker pattern to prevent cascading failures.
 /// Tracks failures and opens the circuit after a threshold is reached.
 ///
+/// `before_publish` rejects while the circuit is open (enough failures
+/// within `window`) and `after_consume` records a failure when it finds an
+/// `"error"` key in `headers.extra` - a convention nothing in this
+/// workspace sets automatically, since middleware hooks run before/after
+/// the broker call rather than after your task handler executes. For
+/// accurate tracking, call [`CircuitBreakerMiddleware::record_failure`]
+/// directly from wherever your task's outcome is actually known; the
+/// middleware is `Clone` and shares its state via an internal `Arc`, so a
+/// clone kept by your worker and one installed in a
+/// [`crate::MiddlewareChain`] observe the same circuit.
+///
 /// # Examples
 ///
 /// ```
@@ -389,10 +468,11 @@ impl MessageMiddleware for ThrottlingMiddleware {
 /// let breaker = CircuitBreakerMiddleware::new(5, Duration::from_secs(60));
 /// // Opens circuit after 5 failures within 60 seconds
 /// ```
+#[derive(Clone)]
 pub struct CircuitBreakerMiddleware {
     pub(crate) failure_threshold: usize,
     window: Duration,
-    failures: std::sync::Mutex<Vec<std::time::Instant>>,
+    failures: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
 }
 
 impl CircuitBreakerMiddleware {
@@ -401,11 +481,22 @@ impl CircuitBreakerMiddleware {
         Self {
             failure_threshold,
             window,
-            failures: std::sync::Mutex::new(Vec::new()),
+            failures: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    fn record_failure(&self) {
+    /// Record a failure explicitly.
+    ///
+    /// `after_consume` only records a failure when it finds an `"error"`
+    /// key in `headers.extra` - a convention nothing in this workspace
+    /// populates automatically, since the middleware trait's hooks run
+    /// before/after the broker call rather than after task execution.
+    /// Call this method directly (the middleware is `Clone` and shares its
+    /// internal state via `Arc`, so a clone kept by your worker updates
+    /// the same circuit as one installed in a [`crate::MiddlewareChain`])
+    /// when your task handler reports a failure, for accurate tracking
+    /// that doesn't depend on that header convention.
+    pub fn record_failure(&self) {
         let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
 
@@ -414,6 +505,14 @@ impl CircuitBreakerMiddleware {
 
         // Add new failure
         failures.push(now);
+    }
+
+    /// Clear all recorded failures, closing the circuit immediately.
+    pub fn reset(&self) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn is_circuit_open(&self) -> bool {
@@ -852,13 +951,12 @@ impl Default for RetryStrategyMiddleware {
 #[async_trait]
 impl MessageMiddleware for RetryStrategyMiddleware {
     async fn before_publish(&self, message: &mut Message) -> Result<()> {
-        // Get retry count from headers
-        let retry_count = message
-            .headers
-            .extra
-            .get("x-retry-count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        // Get retry count from the typed `headers.retries` field - the
+        // field actually reserved for this purpose on the wire. The
+        // previous `headers.extra["x-retry-count"]` lookup read a key
+        // nothing in the workspace ever populates, so `retry_count` was
+        // always 0 and the `max_retries` guard below could never fire.
+        let retry_count = effective_retries(message);
 
         // Check if max retries exceeded
         if retry_count >= self.max_retries {
@@ -1282,5 +1380,105 @@ impl MessageMiddleware for AdaptiveTimeoutMiddleware {
 
     fn name(&self) -> &str {
         "adaptive_timeout"
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // idx119: ThrottlingMiddleware must actually delay publishes once the
+    // token bucket is exhausted, not just annotate them.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn throttling_actually_delays_once_bucket_is_exhausted() {
+        // 10 tokens/sec, burst of 1: the second publish must wait for a
+        // token to regenerate (~100ms) rather than proceeding immediately.
+        let middleware = ThrottlingMiddleware::new(10.0).with_burst_size(1);
+
+        let mut msg1 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        middleware.before_publish(&mut msg1).await.unwrap();
+
+        let mut msg2 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        let start = std::time::Instant::now();
+        middleware.before_publish(&mut msg2).await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Generous lower bound (well under the ~100ms expected wait) that
+        // still clearly distinguishes "actually waited" from "returned
+        // immediately", which is what the bug produced.
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "expected before_publish to block for close to the refill \
+             interval, only waited {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn throttling_does_not_delay_within_burst_capacity() {
+        let middleware = ThrottlingMiddleware::new(1000.0).with_burst_size(50);
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let mut msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+            middleware.before_publish(&mut msg).await.unwrap();
+        }
+        // Comfortably within burst capacity: must not have blocked at all.
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    // -------------------------------------------------------------------
+    // idx121: RetryStrategyMiddleware must read the typed retries field.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn retry_strategy_middleware_enforces_max_retries_from_typed_field() {
+        let middleware = RetryStrategyMiddleware::new(RetryStrategy::Fixed).with_max_retries(3);
+        let mut msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        msg.headers.retries = Some(3);
+
+        // retries (3) >= max_retries (3): must reject rather than silently
+        // computing another delay (the previous
+        // `headers.extra["x-retry-count"]` lookup always read 0, so this
+        // guard could never fire).
+        let result = middleware.before_publish(&mut msg).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_strategy_middleware_allows_below_max_retries() {
+        let middleware = RetryStrategyMiddleware::new(RetryStrategy::Fixed).with_max_retries(3);
+        let mut msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        msg.headers.retries = Some(2);
+
+        let result = middleware.before_publish(&mut msg).await;
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // idx141: CircuitBreakerMiddleware must expose a real, explicit
+    // failure-recording API in addition to the header convention.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn circuit_breaker_record_failure_is_public_and_shared_across_clones() {
+        let middleware = CircuitBreakerMiddleware::new(2, Duration::from_secs(60));
+        let worker_handle = middleware.clone();
+
+        // Simulate a worker recording task failures directly (not via the
+        // `headers.extra["error"]` convention).
+        worker_handle.record_failure();
+        worker_handle.record_failure();
+
+        // The clone installed in a chain observes the same circuit state
+        // (shared via the internal `Arc`), so it now rejects.
+        let mut msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        let result = middleware.before_publish(&mut msg).await;
+        assert!(result.is_err());
+
+        middleware.reset();
+        let mut msg2 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        assert!(middleware.before_publish(&mut msg2).await.is_ok());
     }
 }

@@ -1,7 +1,11 @@
+use crate::dispatch::{self, ChainStep};
 use crate::{Branch, CanvasError, Chain, Group, Map, Signature, Switch};
 use celers_core::Broker;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+#[cfg(feature = "backend-redis")]
+use celers_backend_redis::ResultBackend;
 
 /// A canvas element that can be either a simple signature or a nested workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,10 +36,20 @@ pub enum CanvasElement {
         argsets: Vec<Vec<serde_json::Value>>,
     },
 
-    /// A conditional branch
+    /// A conditional branch.
+    ///
+    /// The condition is evaluated by the worker against the **result of the
+    /// preceding step**, and only the selected arm is enqueued. It is therefore
+    /// only meaningful inside a [`NestedChain`], in a non-leading position: a
+    /// leading branch, or a branch used as a [`NestedGroup`] member, has no
+    /// predecessor result to evaluate and is rejected by `validate()`.
     Branch(Branch),
 
-    /// A switch statement
+    /// A switch statement.
+    ///
+    /// Same runtime semantics as [`CanvasElement::Branch`]: the first matching
+    /// case (or the default) is selected by the worker from the preceding
+    /// step's result.
     Switch(Switch),
 }
 
@@ -162,41 +176,111 @@ impl From<Switch> for CanvasElement {
     }
 }
 
-/// Execute a chord element (`header | ... -> body`) nested inside a workflow.
+/// Message used when a nested workflow contains a chord but `apply` was called
+/// without a result backend.
+const NESTED_CHORD_REQUIRES_BACKEND: &str =
+    "A nested Chord needs a result backend to establish its barrier: the callback must run once, \
+     after every header task has completed, with their results. Call `apply_with_backend` (the \
+     `backend-redis` feature) instead of `apply`.";
+
+/// Message used when a nested chain contains a fan-out step that cannot be
+/// sequenced with the link mechanism.
+const NESTED_FANOUT_NOT_SEQUENCEABLE: &str =
+    "A Group/Map/Chord step inside a NestedChain can only be sequenced by a completion barrier, \
+     which the chain-link mechanism cannot express: the following step would start immediately, \
+     in parallel with the fan-out, instead of after it. Restructure the workflow (dispatch the \
+     fan-out as a Chord whose callback is the following step), or use a NestedGroup if the steps \
+     really are concurrent.";
+
+/// Message used when a conditional step appears where there is no predecessor
+/// result to evaluate it against.
+const CONDITIONAL_NEEDS_PREDECESSOR: &str =
+    "A Branch/Switch step is evaluated against the result of the step before it, so it cannot be \
+     the first step of a NestedChain or a branch of a NestedGroup, where no predecessor result \
+     exists.";
+
+/// Flatten a run of canvas elements into linear chain steps.
 ///
-/// A chord fans out the `header` group in parallel and then runs the `body`
-/// callback once the header has been dispatched. Both [`NestedChain`] and
-/// [`NestedGroup`] share this logic so a nested chord is executed in full
-/// rather than collapsing to just its header group.
-///
-/// Result aggregation for the callback is performed by the worker via the
-/// chord barrier when a result backend is configured; here we are responsible
-/// only for placing every component of the chord (header tasks + callback) onto
-/// the broker so the workflow is not silently truncated.
-///
-/// Returns the id of the body callback, which is the logical tail of the chord
-/// (this is what a surrounding [`NestedChain`] threads into its next step).
-async fn apply_chord_element<B: Broker>(
+/// Returns `Err` for any element that cannot be expressed as a linear step.
+fn flatten_element(element: &CanvasElement, steps: &mut Vec<ChainStep>) -> Result<(), CanvasError> {
+    match element {
+        CanvasElement::Signature(sig) => {
+            steps.push(ChainStep::Task(sig.clone()));
+            Ok(())
+        }
+        CanvasElement::Chain(chain) => {
+            steps.extend(chain.tasks.iter().cloned().map(ChainStep::Task));
+            Ok(())
+        }
+        CanvasElement::Branch(branch) => {
+            if steps.is_empty() {
+                return Err(CanvasError::Invalid(
+                    CONDITIONAL_NEEDS_PREDECESSOR.to_string(),
+                ));
+            }
+            steps.push(ChainStep::Branch(branch.clone()));
+            Ok(())
+        }
+        CanvasElement::Switch(switch) => {
+            if steps.is_empty() {
+                return Err(CanvasError::Invalid(
+                    CONDITIONAL_NEEDS_PREDECESSOR.to_string(),
+                ));
+            }
+            steps.push(ChainStep::Switch(switch.clone()));
+            Ok(())
+        }
+        CanvasElement::Group(_) | CanvasElement::Map { .. } => Err(CanvasError::Invalid(
+            NESTED_FANOUT_NOT_SEQUENCEABLE.to_string(),
+        )),
+        CanvasElement::Chord { .. } => Err(CanvasError::Invalid(
+            NESTED_FANOUT_NOT_SEQUENCEABLE.to_string(),
+        )),
+    }
+}
+
+/// Dispatch a single fan-out element (a lone [`CanvasElement::Group`] or
+/// [`CanvasElement::Map`]) under `group_id`.
+async fn dispatch_fanout_element<B: Broker>(
     broker: &B,
-    header: &Group,
-    body: &Signature,
-) -> Result<Uuid, CanvasError> {
-    if header.tasks.is_empty() {
-        return Err(CanvasError::Invalid(
-            "Chord header cannot be empty".to_string(),
-        ));
+    element: &CanvasElement,
+    group_id: Uuid,
+) -> Result<(), CanvasError> {
+    match element {
+        CanvasElement::Group(group) => {
+            group.apply_within(broker, group_id).await?;
+            Ok(())
+        }
+        CanvasElement::Map { task, argsets } => {
+            let group = Map::new(task.clone(), argsets.clone()).to_group();
+            group.apply_within(broker, group_id).await?;
+            Ok(())
+        }
+        other => Err(CanvasError::Invalid(format!(
+            "{} is not a fan-out element",
+            other.element_type()
+        ))),
+    }
+}
+
+/// Dispatch a run of linear chain steps: the head is enqueued now and the rest
+/// travel with it as the chain tail.
+async fn dispatch_steps<B: Broker>(broker: &B, steps: Vec<ChainStep>) -> Result<Uuid, CanvasError> {
+    let mut steps = steps;
+    if steps.is_empty() {
+        return Err(CanvasError::Invalid("No steps to dispatch".to_string()));
     }
 
-    // Fan out the header group (parallel) first.
-    header.clone().apply(broker).await?;
-
-    // Then enqueue the callback body as the tail of the chord. The worker
-    // applies the aggregated header results to it through the chord barrier
-    // when a result backend is available.
-    let body_chain = Chain {
-        tasks: vec![body.clone()],
-    };
-    body_chain.apply(broker).await
+    let tail = steps.split_off(1);
+    match steps.pop() {
+        Some(ChainStep::Task(head)) => dispatch::dispatch_signature(broker, &head, &tail).await,
+        // `flatten_element` refuses a leading conditional, so this is
+        // unreachable through the public API; keep it as a typed guard rather
+        // than a panic.
+        Some(_) | None => Err(CanvasError::Invalid(
+            CONDITIONAL_NEEDS_PREDECESSOR.to_string(),
+        )),
+    }
 }
 
 /// A nested chain that can contain any canvas element
@@ -304,64 +388,143 @@ impl NestedChain {
         Some(result)
     }
 
-    /// Execute the nested chain sequentially
+    /// Check that this nested chain can actually be dispatched.
     ///
-    /// Each element is executed in order. For complex elements (Groups, Chords),
-    /// they are executed and we wait for them to start before continuing.
-    /// Note: This executes elements sequentially but doesn't wait for completion,
-    /// following Celery's async execution model.
-    pub async fn apply<B: Broker>(&self, broker: &B) -> Result<Uuid, CanvasError> {
+    /// Validation happens at *build* time so an unsupported composition is
+    /// caught while the workflow is being assembled rather than surfacing as a
+    /// surprise error at `apply()`. [`apply`](Self::apply) runs the same checks,
+    /// so calling this is optional — but a builder that validates as it goes
+    /// gets much better error locality.
+    ///
+    /// A nested chain is valid when either
+    ///
+    /// * every element is linear ([`CanvasElement::Signature`],
+    ///   [`CanvasElement::Chain`], and [`CanvasElement::Branch`] /
+    ///   [`CanvasElement::Switch`] in any non-leading position), or
+    /// * it consists of a single fan-out element
+    ///   ([`CanvasElement::Group`] / [`CanvasElement::Map`]), which is just a
+    ///   parallel dispatch with nothing to sequence it against.
+    ///
+    /// A fan-out element in any other position is rejected: sequencing it needs
+    /// a completion barrier that the chain-link mechanism cannot express, and
+    /// dispatching it anyway would run the following step concurrently with it.
+    pub fn validate(&self) -> Result<(), CanvasError> {
         if self.elements.is_empty() {
             return Err(CanvasError::Invalid(
                 "NestedChain cannot be empty".to_string(),
             ));
         }
 
-        // Execute each element in sequence
-        let mut last_id = None;
+        if self.elements.len() == 1 {
+            return match &self.elements[0] {
+                CanvasElement::Group(group) if group.tasks.is_empty() => {
+                    Err(CanvasError::Invalid("Group cannot be empty".to_string()))
+                }
+                CanvasElement::Map { argsets, .. } if argsets.is_empty() => {
+                    Err(CanvasError::Invalid("Map cannot be empty".to_string()))
+                }
+                CanvasElement::Group(_) | CanvasElement::Map { .. } => Ok(()),
+                CanvasElement::Chord { header, .. } if header.tasks.is_empty() => Err(
+                    CanvasError::Invalid("Chord header cannot be empty".to_string()),
+                ),
+                CanvasElement::Chord { .. } => Err(CanvasError::Invalid(
+                    NESTED_CHORD_REQUIRES_BACKEND.to_string(),
+                )),
+                other => {
+                    let mut steps = Vec::new();
+                    flatten_element(other, &mut steps)
+                }
+            };
+        }
+
+        let mut steps = Vec::with_capacity(self.elements.len());
         for element in &self.elements {
-            match element {
-                CanvasElement::Signature(sig) => {
-                    // Convert to Chain for sequential execution
-                    let chain = Chain {
-                        tasks: vec![sig.clone()],
-                    };
-                    last_id = Some(chain.apply(broker).await?);
-                }
-                CanvasElement::Chain(chain) => {
-                    last_id = Some(chain.clone().apply(broker).await?);
-                }
-                CanvasElement::Group(group) => {
-                    last_id = Some(group.clone().apply(broker).await?);
-                }
-                CanvasElement::Chord { header, body } => {
-                    // Real nested execution: enqueue the header group (parallel
-                    // fan-out) and then enqueue the body callback as the tail of
-                    // the chord. In a NestedChain the chord's body becomes the
-                    // last step of this element, so its id is the one we carry
-                    // forward to subsequent chain elements.
-                    last_id = Some(apply_chord_element(broker, header, body).await?);
-                }
-                CanvasElement::Map { task, argsets } => {
-                    let map = Map::new(task.clone(), argsets.clone());
-                    last_id = Some(map.apply(broker).await?);
-                }
-                CanvasElement::Branch(_branch) => {
-                    // Branches require runtime evaluation, skip for now
+            if let CanvasElement::Chord { header, .. } = element {
+                if header.tasks.is_empty() {
                     return Err(CanvasError::Invalid(
-                        "Branch elements not supported in NestedChain.apply()".to_string(),
+                        "Chord header cannot be empty".to_string(),
                     ));
                 }
-                CanvasElement::Switch(_switch) => {
-                    // Switch requires runtime evaluation, skip for now
-                    return Err(CanvasError::Invalid(
-                        "Switch elements not supported in NestedChain.apply()".to_string(),
-                    ));
-                }
+                // A chord in a multi-step chain is unsequenceable regardless of
+                // whether a backend is available: its callback is triggered by
+                // the barrier, and nothing can be linked after it.
+                return Err(CanvasError::Invalid(
+                    NESTED_FANOUT_NOT_SEQUENCEABLE.to_string(),
+                ));
+            }
+            flatten_element(element, &mut steps)?;
+        }
+
+        Ok(())
+    }
+
+    /// Execute the nested chain, sequencing its elements for real.
+    ///
+    /// Every element is flattened into one linear chain and dispatched as such:
+    /// the head task is enqueued now and steps 2..N ride along inside its
+    /// payload (see [`crate::dispatch`]). Each step therefore starts only after
+    /// its predecessor has *completed*, which is what "chain" is supposed to
+    /// mean — previously the elements were merely enqueued back-to-back, giving
+    /// a `NestedChain` and a [`NestedGroup`] byte-identical broker traffic.
+    ///
+    /// [`CanvasElement::Branch`] and [`CanvasElement::Switch`] steps are carried
+    /// in the chain tail and evaluated by the worker against the preceding
+    /// step's result, so conditional workflows execute rather than being
+    /// rejected at dispatch time.
+    ///
+    /// See [`validate`](Self::validate) for exactly which compositions are
+    /// supported; unsupported ones fail here rather than being dispatched with
+    /// the wrong ordering.
+    ///
+    /// Returns the id of the head task (or the group id, for a lone fan-out
+    /// element).
+    pub async fn apply<B: Broker>(&self, broker: &B) -> Result<Uuid, CanvasError> {
+        self.validate()?;
+
+        // A lone fan-out element is a plain parallel dispatch.
+        if self.elements.len() == 1
+            && matches!(
+                self.elements[0],
+                CanvasElement::Group(_) | CanvasElement::Map { .. }
+            )
+        {
+            let group_id = Uuid::new_v4();
+            dispatch_fanout_element(broker, &self.elements[0], group_id).await?;
+            return Ok(group_id);
+        }
+
+        let mut steps = Vec::with_capacity(self.elements.len());
+        for element in &self.elements {
+            flatten_element(element, &mut steps)?;
+        }
+
+        dispatch_steps(broker, steps).await
+    }
+
+    /// Execute the nested chain with a result backend available, so a chord
+    /// element can establish a real barrier.
+    ///
+    /// A chord is only sequenceable as the sole element of a nested chain (its
+    /// callback is triggered by the barrier, and nothing can be linked after
+    /// it while [`ChordState`](celers_backend_redis::ChordState) carries only a
+    /// callback *name*). Every other composition behaves exactly as
+    /// [`apply`](Self::apply).
+    #[cfg(feature = "backend-redis")]
+    pub async fn apply_with_backend<B: Broker, R: ResultBackend>(
+        &self,
+        broker: &B,
+        backend: &mut R,
+    ) -> Result<Uuid, CanvasError> {
+        if self.elements.len() == 1 {
+            if let CanvasElement::Chord { header, body } = &self.elements[0] {
+                let chord_id = Uuid::new_v4();
+                crate::Chord::register_and_dispatch(broker, backend, chord_id, header, body)
+                    .await?;
+                return Ok(chord_id);
             }
         }
 
-        last_id.ok_or_else(|| CanvasError::Invalid("No elements executed".to_string()))
+        self.apply(broker).await
     }
 }
 
@@ -457,62 +620,149 @@ impl NestedGroup {
         Some(result)
     }
 
-    /// Execute all elements in parallel
+    /// Check that this nested group can actually be dispatched.
     ///
-    /// All elements in the group are started concurrently.
-    /// Returns a group ID that can be used to track the parallel execution.
-    pub async fn apply<B: Broker>(&self, broker: &B) -> Result<Uuid, CanvasError> {
+    /// Every element must be a self-contained parallel branch: a signature, a
+    /// chain, a sub-group, a map, or (via
+    /// [`apply_with_backend`](Self::apply_with_backend)) a chord.
+    ///
+    /// [`CanvasElement::Branch`] / [`CanvasElement::Switch`] are rejected: a
+    /// conditional is evaluated against the result of the step *before* it, and
+    /// a group branch has no predecessor. Put the conditional inside a
+    /// [`NestedChain`] branch instead.
+    pub fn validate(&self) -> Result<(), CanvasError> {
         if self.elements.is_empty() {
             return Err(CanvasError::Invalid(
                 "NestedGroup cannot be empty".to_string(),
             ));
         }
 
+        for element in &self.elements {
+            match element {
+                CanvasElement::Branch(_) | CanvasElement::Switch(_) => {
+                    return Err(CanvasError::Invalid(
+                        CONDITIONAL_NEEDS_PREDECESSOR.to_string(),
+                    ));
+                }
+                CanvasElement::Group(group) if group.tasks.is_empty() => {
+                    return Err(CanvasError::Invalid("Group cannot be empty".to_string()));
+                }
+                CanvasElement::Chord { header, .. } if header.tasks.is_empty() => {
+                    return Err(CanvasError::Invalid(
+                        "Chord header cannot be empty".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute all elements in parallel
+    ///
+    /// All elements in the group are started concurrently. Every task enqueued
+    /// on behalf of this group — including the members of nested groups and maps
+    /// — is stamped with the group id this method returns, so the returned
+    /// handle can actually be used to track the fan-out (it used to be minted
+    /// and then thrown away).
+    ///
+    /// A [`CanvasElement::Chord`] branch needs a completion barrier and is
+    /// rejected here; use [`apply_with_backend`](Self::apply_with_backend).
+    pub async fn apply<B: Broker>(&self, broker: &B) -> Result<Uuid, CanvasError> {
+        self.validate()?;
+
         // Generate a group ID for tracking
         let group_id = Uuid::new_v4();
 
-        // Execute all elements in parallel
+        for element in &self.elements {
+            if matches!(element, CanvasElement::Chord { .. }) {
+                return Err(CanvasError::Invalid(
+                    NESTED_CHORD_REQUIRES_BACKEND.to_string(),
+                ));
+            }
+            Self::dispatch_branch(broker, element, group_id).await?;
+        }
+
+        Ok(group_id)
+    }
+
+    /// Execute all elements in parallel, establishing a real chord barrier for
+    /// any [`CanvasElement::Chord`] branch.
+    ///
+    /// The chord's header tasks are registered in the backend and enqueued; the
+    /// callback is **not** enqueued here — the worker enqueues it when the
+    /// barrier's completion counter reaches the header size, with the header
+    /// results as its argument. That is the difference between a chord and a
+    /// group with a stray extra task.
+    ///
+    /// A chord branch's header tasks are stamped with the chord's own id rather
+    /// than the enclosing group's, since
+    /// [`group_id`](celers_core::TaskMetadata::group_id) holds a single value
+    /// and the chord identity is the more useful one for those tasks.
+    #[cfg(feature = "backend-redis")]
+    pub async fn apply_with_backend<B: Broker, R: ResultBackend>(
+        &self,
+        broker: &B,
+        backend: &mut R,
+    ) -> Result<Uuid, CanvasError> {
+        self.validate()?;
+
+        let group_id = Uuid::new_v4();
+
         for element in &self.elements {
             match element {
-                CanvasElement::Signature(sig) => {
-                    let chain = Chain {
-                        tasks: vec![sig.clone()],
-                    };
-                    chain.apply(broker).await?;
-                }
-                CanvasElement::Chain(chain) => {
-                    chain.clone().apply(broker).await?;
-                }
-                CanvasElement::Group(group) => {
-                    group.clone().apply(broker).await?;
-                }
                 CanvasElement::Chord { header, body } => {
-                    // Real nested execution: this chord is one parallel branch of
-                    // the group. Enqueue its header (parallel fan-out) and the
-                    // body callback so the whole chord participates in the group
-                    // rather than collapsing to just the header.
-                    apply_chord_element(broker, header, body).await?;
+                    let chord_id = Uuid::new_v4();
+                    crate::Chord::register_and_dispatch(broker, backend, chord_id, header, body)
+                        .await?;
                 }
-                CanvasElement::Map { task, argsets } => {
-                    let map = Map::new(task.clone(), argsets.clone());
-                    map.apply(broker).await?;
-                }
-                CanvasElement::Branch(_branch) => {
-                    // Branches require runtime evaluation, skip for now
-                    return Err(CanvasError::Invalid(
-                        "Branch elements not supported in NestedGroup.apply()".to_string(),
-                    ));
-                }
-                CanvasElement::Switch(_switch) => {
-                    // Switch requires runtime evaluation, skip for now
-                    return Err(CanvasError::Invalid(
-                        "Switch elements not supported in NestedGroup.apply()".to_string(),
-                    ));
-                }
+                other => Self::dispatch_branch(broker, other, group_id).await?,
             }
         }
 
         Ok(group_id)
+    }
+
+    /// Dispatch one non-chord parallel branch under `group_id`.
+    async fn dispatch_branch<B: Broker>(
+        broker: &B,
+        element: &CanvasElement,
+        group_id: Uuid,
+    ) -> Result<(), CanvasError> {
+        match element {
+            CanvasElement::Signature(sig) => {
+                let mut task = dispatch::build_task(sig, &[])?;
+                task.metadata.group_id = Some(group_id);
+                dispatch::dispatch(broker, task, dispatch::Schedule::from_options(&sig.options))
+                    .await?;
+                Ok(())
+            }
+            CanvasElement::Chain(chain) => {
+                let Some((head, tail)) = chain.tasks.split_first() else {
+                    return Err(CanvasError::Invalid("Chain cannot be empty".to_string()));
+                };
+                let steps: Vec<ChainStep> = tail.iter().cloned().map(ChainStep::Task).collect();
+                let mut task = dispatch::build_task(head, &steps)?;
+                task.metadata.group_id = Some(group_id);
+                dispatch::dispatch(
+                    broker,
+                    task,
+                    dispatch::Schedule::from_options(&head.options),
+                )
+                .await?;
+                Ok(())
+            }
+            CanvasElement::Group(_) | CanvasElement::Map { .. } => {
+                dispatch_fanout_element(broker, element, group_id).await
+            }
+            CanvasElement::Chord { .. } => Err(CanvasError::Invalid(
+                NESTED_CHORD_REQUIRES_BACKEND.to_string(),
+            )),
+            CanvasElement::Branch(_) | CanvasElement::Switch(_) => Err(CanvasError::Invalid(
+                CONDITIONAL_NEEDS_PREDECESSOR.to_string(),
+            )),
+        }
     }
 }
 
@@ -532,48 +782,93 @@ impl std::fmt::Display for NestedGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celers_core::SerializedTask;
     use std::sync::{Arc, Mutex};
 
-    /// Minimal broker that records the names of every enqueued task in order.
-    #[derive(Clone)]
-    struct RecordingBroker {
-        tasks: Arc<Mutex<Vec<String>>>,
+    /// How a task reached the broker.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Dispatched {
+        /// `enqueue`
+        Now,
+        /// `enqueue_after(delay_secs)`
+        After(u64),
+        /// `enqueue_at(unix_timestamp)`
+        At(i64),
+    }
+
+    /// Broker that records every enqueued task, in order, together with the
+    /// enqueue variant it arrived through.
+    #[derive(Clone, Default)]
+    pub(crate) struct RecordingBroker {
+        tasks: Arc<Mutex<Vec<(SerializedTask, Dispatched)>>>,
     }
 
     impl RecordingBroker {
-        fn new() -> Self {
-            Self {
-                tasks: Arc::new(Mutex::new(Vec::new())),
-            }
+        pub(crate) fn new() -> Self {
+            Self::default()
         }
 
-        fn names(&self) -> Vec<String> {
+        fn entries(&self) -> Vec<(SerializedTask, Dispatched)> {
             self.tasks
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
 
-        fn count(&self) -> usize {
+        pub(crate) fn tasks(&self) -> Vec<SerializedTask> {
+            self.entries().into_iter().map(|(task, _)| task).collect()
+        }
+
+        pub(crate) fn names(&self) -> Vec<String> {
+            self.tasks()
+                .into_iter()
+                .map(|task| task.metadata.name)
+                .collect()
+        }
+
+        pub(crate) fn count(&self) -> usize {
+            self.entries().len()
+        }
+
+        pub(crate) fn last_task(&self) -> Option<SerializedTask> {
+            self.tasks().pop()
+        }
+
+        pub(crate) fn task_named(&self, name: &str) -> Option<SerializedTask> {
+            self.tasks()
+                .into_iter()
+                .find(|task| task.metadata.name == name)
+        }
+
+        /// (task name, delay in seconds) for every enqueued task.
+        pub(crate) fn schedules(&self) -> Vec<(String, Option<u64>)> {
+            self.entries()
+                .into_iter()
+                .map(|(task, dispatched)| {
+                    let delay = match dispatched {
+                        Dispatched::Now => None,
+                        Dispatched::After(secs) => Some(secs),
+                        Dispatched::At(_) => None,
+                    };
+                    (task.metadata.name, delay)
+                })
+                .collect()
+        }
+
+        fn record(&self, task: SerializedTask, dispatched: Dispatched) -> celers_core::TaskId {
+            let id = task.metadata.id;
             self.tasks
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len()
+                .push((task, dispatched));
+            id
         }
     }
 
     #[async_trait::async_trait]
     impl celers_core::Broker for RecordingBroker {
-        async fn enqueue(
-            &self,
-            task: celers_core::SerializedTask,
-        ) -> celers_core::Result<celers_core::TaskId> {
-            let id = task.metadata.id;
-            self.tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(task.metadata.name.clone());
-            Ok(id)
+        async fn enqueue(&self, task: SerializedTask) -> celers_core::Result<celers_core::TaskId> {
+            Ok(self.record(task, Dispatched::Now))
         }
 
         async fn dequeue(&self) -> celers_core::Result<Option<celers_core::BrokerMessage>> {
@@ -604,64 +899,131 @@ mod tests {
         async fn cancel(&self, _task_id: &celers_core::TaskId) -> celers_core::Result<bool> {
             Ok(true)
         }
+
+        async fn enqueue_after(
+            &self,
+            task: SerializedTask,
+            delay_secs: u64,
+        ) -> celers_core::Result<celers_core::TaskId> {
+            Ok(self.record(task, Dispatched::After(delay_secs)))
+        }
+
+        async fn enqueue_at(
+            &self,
+            task: SerializedTask,
+            execute_at: i64,
+        ) -> celers_core::Result<celers_core::TaskId> {
+            Ok(self.record(task, Dispatched::At(execute_at)))
+        }
     }
 
-    /// A NestedChain that contains a nested Group must fan the group out in
-    /// parallel while keeping the surrounding chain sequential. A chain only
-    /// enqueues its first task (links carry the rest), so the head task plus the
-    /// two parallel group members yields three immediate enqueues, in order.
+    /// Decode the chain tail a canvas-dispatched task carries in its payload.
+    fn chain_tail_names(task: &celers_core::SerializedTask) -> Vec<String> {
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&task.payload).expect("canvas payload must be JSON");
+        envelope
+            .get(crate::CHAIN_TAIL_KEY)
+            .and_then(|tail| tail.as_array())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|step| {
+                        step.get("task")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("<conditional>")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A NestedChain whose elements are all linear must be dispatched as ONE
+    /// chain: only the head goes on the broker now, and every later step rides
+    /// in its tail so it can only start after its predecessor completes.
     #[tokio::test]
-    async fn nested_chain_with_group_fans_out_in_order() {
+    async fn nested_chain_of_linear_elements_dispatches_a_single_linked_chain() {
         let broker = RecordingBroker::new();
 
         let workflow = NestedChain::new()
             .then("head", vec![])
-            .then_group(Group::new().add("par_a", vec![]).add("par_b", vec![]))
-            .then_chain(Chain::new().then("tail1", vec![]).then("tail2", vec![]));
+            .then_chain(Chain::new().then("mid1", vec![]).then("mid2", vec![]))
+            .then("tail", vec![]);
 
-        let result = workflow.apply(&broker).await;
-        assert!(result.is_ok(), "nested chain should apply");
+        workflow.apply(&broker).await.expect("nested chain applies");
 
-        // head (1) + group par_a, par_b (2) + tail chain first task (1) = 4
         assert_eq!(
             broker.names(),
-            vec![
-                "head".to_string(),
-                "par_a".to_string(),
-                "par_b".to_string(),
-                "tail1".to_string(),
-            ],
-            "sequential order preserved; group fanned out; nested chain enqueues only its first task"
+            vec!["head".to_string()],
+            "a chain enqueues only its head; the rest travel in the tail"
+        );
+
+        let head = broker
+            .last_task()
+            .expect("the head task must have been enqueued");
+        assert_eq!(
+            head.metadata.on_success_link.as_deref(),
+            Some("mid1"),
+            "the immediate successor's name must be linked"
+        );
+        assert_eq!(
+            chain_tail_names(&head),
+            vec!["mid1".to_string(), "mid2".to_string(), "tail".to_string()],
+            "every remaining element must be flattened into the chain tail, in order"
         );
     }
 
-    /// A NestedGroup containing a nested Chain must run every branch in parallel
-    /// while each nested chain still only enqueues its first task.
+    /// A NestedGroup runs each element as a concurrent branch, and every task it
+    /// enqueues must carry the group id it returns so the fan-out is trackable.
     #[tokio::test]
-    async fn nested_group_with_nested_chains_runs_branches_in_parallel() {
+    async fn nested_group_stamps_its_group_id_on_every_branch() {
         let broker = RecordingBroker::new();
 
         let workflow = NestedGroup::new()
             .add("solo", vec![])
             .add_chain(Chain::new().then("a1", vec![]).then("a2", vec![]))
-            .add_chain(Chain::new().then("b1", vec![]).then("b2", vec![]));
+            .add_element(CanvasElement::group(
+                Group::new().add("g1", vec![]).add("g2", vec![]),
+            ));
 
-        let result = workflow.apply(&broker).await;
-        assert!(result.is_ok(), "nested group should apply");
+        let group_id = workflow.apply(&broker).await.expect("nested group applies");
 
-        // solo (1) + chain-a first task (1) + chain-b first task (1) = 3
+        // solo (1) + chain head a1 (1) + sub-group g1,g2 (2) = 4
         assert_eq!(
             broker.names(),
-            vec!["solo".to_string(), "a1".to_string(), "b1".to_string()],
-            "each parallel branch contributes; nested chains enqueue only their first task"
+            vec![
+                "solo".to_string(),
+                "a1".to_string(),
+                "g1".to_string(),
+                "g2".to_string(),
+            ],
+            "each branch contributes; nested chains enqueue only their head"
+        );
+
+        for task in broker.tasks() {
+            assert_eq!(
+                task.metadata.group_id,
+                Some(group_id),
+                "task '{}' must be stamped with the nested group's id",
+                task.metadata.name
+            );
+        }
+
+        let chain_head = broker
+            .task_named("a1")
+            .expect("the nested chain head must be enqueued");
+        assert_eq!(
+            chain_tail_names(&chain_head),
+            vec!["a2".to_string()],
+            "a chain branch keeps its own continuation"
         );
     }
 
-    /// A chord nested inside a NestedChain must enqueue BOTH the header group
-    /// (parallel) and the body callback, instead of collapsing to just the
-    /// header. The callback is the tail, so subsequent chain steps follow it.
+    /// A chord nested inside a NestedChain must NOT enqueue its callback: the
+    /// callback is triggered by the barrier once every header task completes.
+    /// Without a result backend there is no barrier, so `apply` refuses.
     #[tokio::test]
-    async fn nested_chain_chord_enqueues_header_and_body() {
+    async fn nested_chain_chord_without_backend_is_refused() {
         let broker = RecordingBroker::new();
 
         let workflow = NestedChain::new()
@@ -672,27 +1034,22 @@ mod tests {
             )
             .then("after", vec![]);
 
-        let result = workflow.apply(&broker).await;
-        assert!(result.is_ok(), "nested chain with chord should apply");
-
-        // before (1) + chord header map_a, map_b (2) + chord body reduce (1) + after (1) = 5
+        let err = workflow
+            .apply(&broker)
+            .await
+            .expect_err("a chord without a barrier must not be dispatched");
+        assert!(err.is_invalid());
         assert_eq!(
-            broker.names(),
-            vec![
-                "before".to_string(),
-                "map_a".to_string(),
-                "map_b".to_string(),
-                "reduce".to_string(),
-                "after".to_string(),
-            ],
-            "chord body callback must be enqueued, not dropped"
+            broker.count(),
+            0,
+            "nothing may be enqueued when the chord cannot be honoured"
         );
     }
 
-    /// A chord nested inside a NestedGroup must likewise enqueue header + body
-    /// as one parallel branch of the group.
+    /// Likewise for a chord branch of a NestedGroup: refusing is the only way to
+    /// avoid running the callback in parallel with its own header.
     #[tokio::test]
-    async fn nested_group_chord_enqueues_header_and_body() {
+    async fn nested_group_chord_without_backend_is_refused() {
         let broker = RecordingBroker::new();
 
         let workflow = NestedGroup::new()
@@ -702,19 +1059,130 @@ mod tests {
                 Signature::new("callback".to_string()),
             ));
 
-        let result = workflow.apply(&broker).await;
-        assert!(result.is_ok(), "nested group with chord should apply");
-
-        // sibling (1) + chord header h1, h2 (2) + chord body callback (1) = 4
-        assert_eq!(broker.count(), 4, "chord header + body both enqueued");
-        let names = broker.names();
-        assert!(names.contains(&"sibling".to_string()));
-        assert!(names.contains(&"h1".to_string()));
-        assert!(names.contains(&"h2".to_string()));
+        let err = workflow
+            .apply(&broker)
+            .await
+            .expect_err("a chord branch without a barrier must be refused");
+        assert!(err.is_invalid());
         assert!(
-            names.contains(&"callback".to_string()),
-            "chord body callback must be enqueued, not dropped"
+            !broker.names().contains(&"callback".to_string()),
+            "the callback must never be enqueued directly"
         );
+    }
+
+    /// A fan-out element in the middle of a NestedChain cannot be sequenced with
+    /// the link mechanism, so it must fail closed instead of dispatching the
+    /// following step concurrently with the fan-out.
+    #[tokio::test]
+    async fn nested_chain_rejects_unsequenceable_fanout_step() {
+        let broker = RecordingBroker::new();
+
+        let workflow = NestedChain::new()
+            .then("head", vec![])
+            .then_group(Group::new().add("par_a", vec![]).add("par_b", vec![]))
+            .then("tail", vec![]);
+
+        let err = workflow
+            .apply(&broker)
+            .await
+            .expect_err("a mid-chain group cannot be sequenced");
+        assert!(err.is_invalid());
+        assert_eq!(broker.count(), 0, "nothing enqueued on a rejected workflow");
+
+        // The same check is available at build time.
+        assert!(workflow.validate().is_err());
+    }
+
+    /// A lone fan-out element is a plain parallel dispatch with nothing to
+    /// sequence it against, so it is accepted.
+    #[tokio::test]
+    async fn nested_chain_of_a_single_group_dispatches_the_fanout() {
+        let broker = RecordingBroker::new();
+
+        let workflow =
+            NestedChain::new().then_group(Group::new().add("p1", vec![]).add("p2", vec![]));
+
+        let group_id = workflow.apply(&broker).await.expect("lone group applies");
+
+        assert_eq!(broker.names(), vec!["p1".to_string(), "p2".to_string()]);
+        for task in broker.tasks() {
+            assert_eq!(task.metadata.group_id, Some(group_id));
+        }
+    }
+
+    /// A Branch is a real chain step now: it is carried in the tail so the
+    /// worker can evaluate it against the predecessor's result.
+    #[tokio::test]
+    async fn nested_chain_carries_a_branch_step_in_the_tail() {
+        let broker = RecordingBroker::new();
+
+        let branch = Branch::new(
+            crate::Condition::field_greater_than("count", 100.0),
+            Signature::new("big_batch".to_string()),
+        )
+        .otherwise(Signature::new("small_batch".to_string()));
+
+        let workflow = NestedChain::new()
+            .then("count_rows", vec![])
+            .then_branch(branch);
+
+        workflow
+            .apply(&broker)
+            .await
+            .expect("a conditional workflow must dispatch");
+
+        assert_eq!(broker.names(), vec!["count_rows".to_string()]);
+
+        let head = broker.last_task().expect("head enqueued");
+        assert!(
+            head.metadata.on_success_link.is_none(),
+            "a conditional successor has no statically known name"
+        );
+
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&head.payload).expect("payload is JSON");
+        assert_eq!(envelope[crate::CHAIN_TAIL_KEY][0]["step_type"], "branch");
+        assert_eq!(
+            envelope[crate::CHAIN_TAIL_KEY][0]["then_branch"]["task"],
+            "big_batch"
+        );
+    }
+
+    /// A conditional cannot be the first step: there is no predecessor result to
+    /// evaluate it against.
+    #[tokio::test]
+    async fn leading_conditional_is_rejected() {
+        let broker = RecordingBroker::new();
+
+        let workflow = NestedChain::new().then_branch(Branch::new(
+            crate::Condition::always(),
+            Signature::new("yes".to_string()),
+        ));
+
+        let err = workflow
+            .apply(&broker)
+            .await
+            .expect_err("a leading conditional has nothing to evaluate");
+        assert!(err.is_invalid());
+        assert_eq!(broker.count(), 0);
+    }
+
+    /// A NestedGroup branch has no predecessor either, so conditionals are
+    /// rejected at validation time rather than at dispatch time.
+    #[test]
+    fn nested_group_rejects_conditionals_at_validation_time() {
+        let workflow =
+            NestedGroup::new()
+                .add("sibling", vec![])
+                .add_element(CanvasElement::branch(Branch::new(
+                    crate::Condition::always(),
+                    Signature::new("yes".to_string()),
+                )));
+
+        let err = workflow
+            .validate()
+            .expect_err("a conditional group branch is meaningless");
+        assert!(err.is_invalid());
     }
 
     /// A chord with an empty header is invalid and must surface an error rather
@@ -731,32 +1199,120 @@ mod tests {
         assert_eq!(broker.count(), 0, "nothing should be enqueued on error");
     }
 
-    /// Deeply nested composition: a chain whose steps are themselves a group and
-    /// a chord. Verifies recursion executes every leaf task.
+    /// An empty nested workflow is rejected in both directions.
     #[tokio::test]
-    async fn deeply_nested_composition_executes_all_leaves() {
+    async fn empty_nested_workflows_are_rejected() {
         let broker = RecordingBroker::new();
 
-        let workflow = NestedChain::new()
-            .then_group(
-                Group::new()
-                    .add("g1", vec![])
-                    .add("g2", vec![])
-                    .add("g3", vec![]),
-            )
-            .then_chord(
-                Group::new().add("c1", vec![]).add("c2", vec![]),
-                Signature::new("done".to_string()),
+        assert!(NestedChain::new().apply(&broker).await.is_err());
+        assert!(NestedGroup::new().apply(&broker).await.is_err());
+        assert_eq!(broker.count(), 0);
+    }
+
+    /// Per-signature countdowns must reach the broker's scheduling API rather
+    /// than being dropped: a staggered group is only staggered if the delays
+    /// actually travel.
+    #[tokio::test]
+    async fn nested_group_honours_member_countdowns() {
+        let broker = RecordingBroker::new();
+
+        let workflow = NestedGroup::new().add_element(CanvasElement::group(
+            Group::new()
+                .add("fast", vec![])
+                .add("slow", vec![])
+                .skew(0.0, 5.0),
+        ));
+
+        workflow.apply(&broker).await.expect("group applies");
+
+        assert_eq!(
+            broker.schedules(),
+            vec![("fast".to_string(), None), ("slow".to_string(), Some(5))],
+            "the second member must be handed to the delayed-enqueue path"
+        );
+    }
+
+    /// Real chord barriers for nested chords require a result backend.
+    #[cfg(feature = "backend-redis")]
+    mod with_backend {
+        use super::*;
+        use crate::tests_backend::MockResultBackend;
+
+        /// A chord inside a NestedGroup must register a barrier holding every
+        /// header task id, stamp `chord_id` on the header tasks, and NOT enqueue
+        /// the callback — the worker does that when the barrier completes.
+        #[tokio::test]
+        async fn nested_group_chord_establishes_a_real_barrier() {
+            let broker = RecordingBroker::new();
+            let mut backend = MockResultBackend::new();
+
+            let workflow =
+                NestedGroup::new()
+                    .add("sibling", vec![])
+                    .add_element(CanvasElement::chord(
+                        Group::new().add("h1", vec![]).add("h2", vec![]),
+                        Signature::new("callback".to_string()),
+                    ));
+
+            workflow
+                .apply_with_backend(&broker, &mut backend)
+                .await
+                .expect("chord branch applies with a backend");
+
+            assert_eq!(
+                broker.names(),
+                vec!["sibling".to_string(), "h1".to_string(), "h2".to_string()],
+                "the callback must not be enqueued alongside its own header"
             );
 
-        let result = workflow.apply(&broker).await;
-        assert!(result.is_ok(), "deeply nested composition should apply");
+            let state = backend.only_state();
+            assert_eq!(state.callback.as_deref(), Some("callback"));
+            assert_eq!(state.total, 2);
+            assert_eq!(
+                state.task_ids.len(),
+                2,
+                "the barrier must know which tasks it is waiting for"
+            );
 
-        // group g1,g2,g3 (3) + chord header c1,c2 (2) + chord body done (1) = 6
-        assert_eq!(
-            broker.count(),
-            6,
-            "every leaf task of the nested workflow is enqueued"
-        );
+            let header_ids: Vec<_> = broker
+                .tasks()
+                .into_iter()
+                .filter(|t| t.metadata.name.starts_with('h'))
+                .map(|t| t.metadata.id)
+                .collect();
+            assert_eq!(
+                state.task_ids, header_ids,
+                "recorded ids must be the enqueued header tasks, in declaration order"
+            );
+
+            for task in broker.tasks() {
+                if task.metadata.name.starts_with('h') {
+                    assert_eq!(task.metadata.chord_id, Some(state.chord_id));
+                }
+            }
+        }
+
+        /// The same barrier is available for a chord that is the whole nested
+        /// chain.
+        #[tokio::test]
+        async fn nested_chain_single_chord_establishes_a_real_barrier() {
+            let broker = RecordingBroker::new();
+            let mut backend = MockResultBackend::new();
+
+            let workflow = NestedChain::new().then_chord(
+                Group::new().add("m1", vec![]).add("m2", vec![]),
+                Signature::new("reduce".to_string()),
+            );
+
+            let chord_id = workflow
+                .apply_with_backend(&broker, &mut backend)
+                .await
+                .expect("single-chord nested chain applies");
+
+            assert_eq!(broker.names(), vec!["m1".to_string(), "m2".to_string()]);
+            let state = backend.only_state();
+            assert_eq!(state.chord_id, chord_id);
+            assert_eq!(state.callback.as_deref(), Some("reduce"));
+        }
     }
 }

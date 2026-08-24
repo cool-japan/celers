@@ -58,6 +58,24 @@ impl From<crate::ValidationError> for BuilderError {
 /// Result type for message building
 pub type BuilderResult<T> = Result<T, BuilderError>;
 
+/// Header key under which [`MessageBuilder::queue`] stores the target queue
+/// name.
+///
+/// The Celery protocol has no dedicated "queue" header field on the message
+/// envelope itself (queue selection is normally an AMQP-level publish-time
+/// concern), so `MessageBuilder` mirrors it into `headers.extra` under this
+/// key rather than silently discarding it, matching the workspace's existing
+/// convention of custom `*_HEADER` constants (see [`crate::v5`]).
+pub const QUEUE_HEADER: &str = "queue";
+
+/// Header key under which [`MessageBuilder::routing_key`] stores the AMQP
+/// routing key, mirroring Celery's `delivery_info.routing_key`.
+pub const ROUTING_KEY_HEADER: &str = "routing_key";
+
+/// Header key under which [`MessageBuilder::max_retries`] stores the
+/// configured retry ceiling for the task.
+pub const MAX_RETRIES_HEADER: &str = "max_retries";
+
 /// Fluent builder for creating Celery messages
 #[derive(Debug, Clone)]
 pub struct MessageBuilder {
@@ -386,6 +404,30 @@ impl MessageBuilder {
         headers.root_id = self.root_id;
         headers.group = self.group_id;
 
+        // Carry queue / routing key / max retries through as headers so
+        // `.queue(...)`, `.routing_key(...)` and `.max_retries(...)` are not
+        // silently discarded. These have no dedicated envelope field (see
+        // `QUEUE_HEADER` / `ROUTING_KEY_HEADER` / `MAX_RETRIES_HEADER`), so
+        // they are inserted first and the caller's own `.header(...)` extras
+        // are applied afterward, letting an explicit extra header win over
+        // the typed setter if both are used for the same key.
+        if let Some(queue) = &self.queue {
+            headers
+                .extra
+                .insert(QUEUE_HEADER.to_string(), Value::String(queue.clone()));
+        }
+        if let Some(routing_key) = &self.routing_key {
+            headers.extra.insert(
+                ROUTING_KEY_HEADER.to_string(),
+                Value::String(routing_key.clone()),
+            );
+        }
+        if let Some(max_retries) = self.max_retries {
+            headers
+                .extra
+                .insert(MAX_RETRIES_HEADER.to_string(), Value::from(max_retries));
+        }
+
         // Add extra headers
         for (key, value) in self.extra_headers {
             headers.extra.insert(key, value);
@@ -399,13 +441,24 @@ impl MessageBuilder {
             reply_to: self.reply_to,
         };
 
-        // Build message
+        // Build message. Content encoding follows content type: JSON is
+        // text (utf-8), everything else (msgpack, binary, custom formats)
+        // is treated as binary. Hardcoding utf-8 regardless of content type
+        // would declare `content-encoding: utf-8` on a binary body; this
+        // mirrors the mapping `build_v5_message` uses (see `v5.rs`) so the
+        // two construction paths agree on the same envelope field.
+        let content_encoding = if matches!(self.content_type, ContentType::Json) {
+            ContentEncoding::Utf8
+        } else {
+            ContentEncoding::Binary
+        };
+
         let message = Message {
             headers,
             properties,
             body,
             content_type: self.content_type.as_str().to_string(),
-            content_encoding: ContentEncoding::Utf8.as_str().to_string(),
+            content_encoding: content_encoding.as_str().to_string(),
         };
 
         Ok(message)
@@ -649,6 +702,91 @@ mod tests {
             .unwrap();
 
         assert_eq!(message.task_name(), "tasks.test");
+    }
+
+    #[test]
+    fn test_message_builder_applies_queue_routing_key_and_max_retries() {
+        // Regression: queue(), routing_key() and max_retries() must not be
+        // silently discarded by build().
+        let message = MessageBuilder::new("tasks.test")
+            .queue("high-priority")
+            .routing_key("tasks.high_priority")
+            .max_retries(5)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            message.headers.extra.get(QUEUE_HEADER),
+            Some(&json!("high-priority"))
+        );
+        assert_eq!(
+            message.headers.extra.get(ROUTING_KEY_HEADER),
+            Some(&json!("tasks.high_priority"))
+        );
+        assert_eq!(
+            message.headers.extra.get(MAX_RETRIES_HEADER),
+            Some(&json!(5))
+        );
+    }
+
+    #[test]
+    fn test_message_builder_without_queue_omits_queue_headers() {
+        // A builder that never calls .queue()/.routing_key()/.max_retries()
+        // must not fabricate those headers.
+        let message = MessageBuilder::new("tasks.test").build().unwrap();
+
+        assert!(!message.headers.extra.contains_key(QUEUE_HEADER));
+        assert!(!message.headers.extra.contains_key(ROUTING_KEY_HEADER));
+        assert!(!message.headers.extra.contains_key(MAX_RETRIES_HEADER));
+    }
+
+    #[test]
+    fn test_message_builder_explicit_header_overrides_queue_setter() {
+        // An explicit `.header(...)` call for the same key applied after
+        // `.queue(...)` wins, since extra headers are merged in afterward.
+        let message = MessageBuilder::new("tasks.test")
+            .queue("default")
+            .header(QUEUE_HEADER, json!("override"))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            message.headers.extra.get(QUEUE_HEADER),
+            Some(&json!("override"))
+        );
+    }
+
+    #[test]
+    fn test_message_builder_json_content_encoding_is_utf8() {
+        let message = MessageBuilder::new("tasks.test")
+            .content_type(ContentType::Json)
+            .build()
+            .unwrap();
+
+        assert_eq!(message.content_encoding, "utf-8");
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_message_builder_msgpack_content_encoding_is_binary() {
+        // Regression: a msgpack-typed built message must not declare
+        // content-encoding: utf-8 for what is actually a binary body.
+        let message = MessageBuilder::new("tasks.test")
+            .content_type(ContentType::MessagePack)
+            .build()
+            .unwrap();
+
+        assert_eq!(message.content_encoding, "binary");
+    }
+
+    #[test]
+    fn test_message_builder_custom_content_type_encoding_is_binary() {
+        let message = MessageBuilder::new("tasks.test")
+            .content_type(ContentType::Custom("application/x-custom".to_string()))
+            .build()
+            .unwrap();
+
+        assert_eq!(message.content_encoding, "binary");
     }
 
     #[test]

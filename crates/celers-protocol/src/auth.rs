@@ -57,8 +57,19 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Message signer using HMAC-SHA256
 ///
-/// Provides cryptographic signing and verification of messages using HMAC-SHA256.
-/// This is compatible with Python Celery's message signing when using SHA256.
+/// Provides cryptographic signing and verification of messages using HMAC-SHA256
+/// with a shared secret, for **CeleRS-to-CeleRS integrity checking**.
+///
+/// # Not interoperable with `celery.security`
+///
+/// Python Celery's message signing is *not* HMAC. `celery.security` signs with
+/// an X.509 certificate and an RSA private key (configured via
+/// `security_key` / `security_certificate` / `security_cert_store`, activated by
+/// `app.setup_security()`), and wraps the payload in an `application/data`
+/// envelope carrying `signature`, `signer` and `body`. There is no shared-secret
+/// mode, and no SHA256 setting makes the two schemes meet: a Python worker
+/// cannot verify a signature produced here, and this type cannot verify one
+/// produced there. Use it only when both ends are CeleRS.
 #[cfg(feature = "signing")]
 pub struct MessageSigner {
     key: Vec<u8>,

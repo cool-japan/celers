@@ -273,11 +273,18 @@ impl MessageMiddleware for RetryLimitMiddleware {
     }
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
-        // Check retry count from message headers
+        // Check retry count from message headers. Celery's own check is
+        // `if request.retries >= max_retries: raise MaxRetriesExceededError`
+        // and `celers_protocol::retry::RetryPolicy::should_retry` likewise
+        // uses `current_retries < self.max_retries` - i.e. a message whose
+        // retry count already *equals* the configured maximum has used up
+        // its last allowed attempt and must not be retried again. The
+        // previous strict `>` comparison let exactly one extra attempt
+        // through.
         let retries = message.headers.retries.unwrap_or(0);
-        if retries > self.max_retries {
+        if retries >= self.max_retries {
             return Err(BrokerError::Configuration(format!(
-                "Message exceeded maximum retries: {} > {}",
+                "Message exceeded maximum retries: {} >= {}",
                 retries, self.max_retries
             )));
         }
@@ -286,6 +293,14 @@ impl MessageMiddleware for RetryLimitMiddleware {
 
     fn name(&self) -> &str {
         "retry_limit"
+    }
+
+    fn is_drop_signal(&self, _err: &BrokerError) -> bool {
+        // Once a message has exhausted its retry budget there is no value
+        // in redelivering it again - it will just hit this same check
+        // forever. Treat exceeding the limit as a designed drop rather
+        // than a failure that should be requeued.
+        true
     }
 }
 
@@ -398,9 +413,19 @@ impl MessageMiddleware for RateLimitingMiddleware {
 /// // Use default cache size (10,000)
 /// let default_middleware = DeduplicationMiddleware::with_default_cache();
 /// ```
+/// Internal deduplication cache state: a [`HashSet`](std::collections::HashSet)
+/// for O(1) membership checks paired with a
+/// [`VecDeque`](std::collections::VecDeque) recording true insertion order,
+/// so eviction can remove the actual oldest entry instead of whatever a
+/// `HashSet`'s unspecified iteration order happens to produce first.
+struct DedupState {
+    seen: std::collections::HashSet<Uuid>,
+    order: std::collections::VecDeque<Uuid>,
+}
+
 pub struct DeduplicationMiddleware {
     /// Recently seen message IDs
-    seen_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    seen_ids: std::sync::Arc<std::sync::Mutex<DedupState>>,
     /// Maximum size of seen IDs cache
     max_cache_size: usize,
 }
@@ -413,7 +438,10 @@ impl DeduplicationMiddleware {
     /// * `max_cache_size` - Maximum number of message IDs to track
     pub fn new(max_cache_size: usize) -> Self {
         Self {
-            seen_ids: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            seen_ids: std::sync::Arc::new(std::sync::Mutex::new(DedupState {
+                seen: std::collections::HashSet::new(),
+                order: std::collections::VecDeque::new(),
+            })),
             max_cache_size,
         }
     }
@@ -439,24 +467,30 @@ impl MessageMiddleware for DeduplicationMiddleware {
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
         let msg_id = message.task_id();
-        let mut seen = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.seen_ids.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if we've seen this message before
-        if seen.contains(&msg_id) {
+        if state.seen.contains(&msg_id) {
             return Err(BrokerError::OperationFailed(format!(
                 "Duplicate message detected: {}",
                 msg_id
             )));
         }
 
-        // Add to seen set
-        seen.insert(msg_id);
+        // Add to seen set, recording insertion order.
+        state.seen.insert(msg_id);
+        state.order.push_back(msg_id);
 
-        // Evict oldest entries if cache is too large (simple FIFO eviction)
-        if seen.len() > self.max_cache_size {
-            // Remove first element (note: HashSet doesn't have ordering, so this is arbitrary)
-            if let Some(&id) = seen.iter().next() {
-                seen.remove(&id);
+        // Evict true FIFO (oldest-inserted first) once the cache is too
+        // large. A bare `HashSet` has no ordering, so evicting via
+        // `seen.iter().next()` (the previous approach) could remove the ID
+        // just inserted with probability 1/N and, more generally, dropped
+        // recent IDs while ancient ones survived indefinitely.
+        while state.order.len() > self.max_cache_size {
+            if let Some(oldest) = state.order.pop_front() {
+                state.seen.remove(&oldest);
+            } else {
+                break;
             }
         }
 
@@ -465,6 +499,13 @@ impl MessageMiddleware for DeduplicationMiddleware {
 
     fn name(&self) -> &str {
         "deduplication"
+    }
+
+    fn is_drop_signal(&self, _err: &BrokerError) -> bool {
+        // A duplicate is duplicate forever - redelivering it will hit this
+        // exact check again. This is the middleware's designed "skip this
+        // message" signal, not a processing failure.
+        true
     }
 }
 
@@ -495,7 +536,22 @@ pub struct CompressionMiddleware {
 impl CompressionMiddleware {
     /// Header key used to record the compression encoding so the consumer
     /// can decompress the body with the matching codec.
+    ///
+    /// Note: this intentionally reuses the same string as the envelope's
+    /// own top-level `content_encoding` field / a conventional
+    /// `content-encoding` header name for backward compatibility with
+    /// existing deployments and tests. If your producer also sets its own
+    /// `content-encoding` header for an unrelated purpose, do not combine
+    /// it with this middleware on the same message: `after_consume` will
+    /// treat any value found there as this middleware's own compression
+    /// marker and attempt to decompress the body accordingly (it will fail
+    /// loudly with a "unknown compression encoding" or decompression error
+    /// rather than silently corrupting the body, but the message will
+    /// still be rejected).
     const COMPRESSION_HEADER: &'static str = "content-encoding";
+    /// Header key used to stash the message's pre-compression
+    /// `content_encoding` field so it can be restored exactly on consume.
+    const ORIGINAL_CONTENT_ENCODING_HEADER: &'static str = "x-original-content-encoding";
 
     /// Create a new compression middleware
     ///
@@ -535,15 +591,30 @@ impl MessageMiddleware for CompressionMiddleware {
 
             // Only use compressed version if it's actually smaller
             if compressed.len() < message.body.len() {
+                let encoding = self.compressor.compression_type.as_encoding().to_string();
+
+                // Stash the pre-compression `content_encoding` so
+                // `after_consume` can restore it exactly, then mark the
+                // envelope's own encoding field with the *real* wire
+                // encoding of the (now compressed) body. Leaving
+                // `content_encoding` untouched would have the published
+                // envelope actively misdescribe its own body (e.g. still
+                // claiming "utf-8" for gzip bytes), which any consumer
+                // that trusts `content-encoding` - including a Python
+                // Celery worker - would try to decode as text/JSON.
+                message.headers.extra.insert(
+                    Self::ORIGINAL_CONTENT_ENCODING_HEADER.to_string(),
+                    serde_json::Value::String(message.content_encoding.clone()),
+                );
+                message.content_encoding = encoding.clone();
+
                 message.body = compressed;
                 // Record the algorithm used so the consumer can pick the
                 // matching codec for decompression. We store the canonical
                 // encoding name (e.g. "gzip") from the compressor's type.
                 message.headers.extra.insert(
                     Self::COMPRESSION_HEADER.to_string(),
-                    serde_json::Value::String(
-                        self.compressor.compression_type.as_encoding().to_string(),
-                    ),
+                    serde_json::Value::String(encoding),
                 );
             }
         }
@@ -571,6 +642,21 @@ impl MessageMiddleware for CompressionMiddleware {
             .map_err(|e| BrokerError::Serialization(e.to_string()))?;
 
         message.body = decompressed;
+
+        // Restore the pre-compression content_encoding exactly (falling
+        // back to the well-known default only if the stash header is
+        // somehow missing, e.g. a message compressed by an older version
+        // of this middleware).
+        let restored_encoding = message
+            .headers
+            .extra
+            .remove(Self::ORIGINAL_CONTENT_ENCODING_HEADER)
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| "utf-8".to_string());
+        message.content_encoding = restored_encoding;
 
         // Remove the flag so the consumed message is clean and is not
         // mistaken for a still-compressed payload by downstream consumers.
@@ -920,6 +1006,15 @@ impl MessageMiddleware for FilterMiddleware {
     fn name(&self) -> &str {
         "filter"
     }
+
+    fn is_drop_signal(&self, _err: &BrokerError) -> bool {
+        // A message that fails the predicate today will fail it again on
+        // redelivery (the predicate is a pure function of the message
+        // content, which redelivery does not change) - this is the
+        // middleware's designed "skip this message" signal, not a
+        // processing failure that should be retried.
+        true
+    }
 }
 
 /// Sampling middleware for statistical message sampling.
@@ -965,9 +1060,22 @@ impl SamplingMiddleware {
         let count = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Deterministic sampling based on counter
-        let threshold = (u64::MAX as f64 * self.sample_rate) as u64;
-        (count % u64::MAX) < threshold
+        // Deterministic sampling based on counter: bucket the running
+        // count into `RESOLUTION` slots and admit the message iff its
+        // bucket falls within the leading `sample_rate` fraction of them.
+        //
+        // The previous formula computed `threshold = u64::MAX * rate` and
+        // tested `count % u64::MAX < threshold`. Since `count % u64::MAX`
+        // is just `count` for any realistic message count, and `threshold`
+        // is astronomically larger than any realistic `count` for every
+        // `rate` above ~5e-20, that predicate was true for essentially
+        // every message regardless of `rate` (only `rate == 0.0` ever
+        // filtered anything). Bucketing into a small, fixed resolution
+        // keeps the comparison meaningful at real message volumes.
+        const RESOLUTION: u64 = 10_000;
+        let bucket = count % RESOLUTION;
+        let threshold = (RESOLUTION as f64 * self.sample_rate).round() as u64;
+        bucket < threshold
     }
 }
 
@@ -989,6 +1097,15 @@ impl MessageMiddleware for SamplingMiddleware {
 
     fn name(&self) -> &str {
         "sampling"
+    }
+
+    fn is_drop_signal(&self, _err: &BrokerError) -> bool {
+        // Statistical sampling is this middleware's designed "skip this
+        // message" signal, not a processing failure. Without this override
+        // a sampled-out message would be requeued (its `counter` bumped
+        // again) rather than settled, defeating the point of sampling as a
+        // load-reduction control.
+        true
     }
 }
 
@@ -1129,5 +1246,170 @@ impl MessageMiddleware for TracingMiddleware {
 
     fn name(&self) -> &str {
         "tracing"
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // idx112: SamplingMiddleware must actually sample at the configured
+    // rate instead of admitting ~100% of messages for any non-zero rate.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sampling_admits_approximately_configured_fraction() {
+        let sampler = SamplingMiddleware::new(0.1);
+        let admitted = (0..10_000).filter(|_| sampler.should_sample()).count();
+        // Deterministic (counter-based, not random): exactly 1000 of the
+        // first 10,000 calls fall in the leading 10% bucket range.
+        assert_eq!(admitted, 1000);
+    }
+
+    #[test]
+    fn sampling_rate_one_admits_everything() {
+        let sampler = SamplingMiddleware::new(1.0);
+        assert!((0..5_000).all(|_| sampler.should_sample()));
+    }
+
+    #[test]
+    fn sampling_rate_zero_admits_nothing() {
+        let sampler = SamplingMiddleware::new(0.0);
+        assert!((0..5_000).all(|_| !sampler.should_sample()));
+    }
+
+    // -------------------------------------------------------------------
+    // idx122 (completeness): FilterMiddleware and SamplingMiddleware use
+    // `Err` from `after_consume` as their designed "drop this message"
+    // signal (see idx112 / the type docs), exactly like
+    // `DeduplicationMiddleware` and `RetryLimitMiddleware` above. Without a
+    // matching `is_drop_signal` override, `MiddlewareChain::process_after_consume`
+    // treats that `Err` as a genuine failure, which
+    // `MiddlewareConsumer::consume_with_middleware` requeues rather than
+    // drops - turning a designed filter/sample-out into an infinite
+    // redelivery loop instead of a settled drop.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn filter_rejection_is_settled_as_a_drop_not_a_failure() {
+        let chain = crate::MiddlewareChain::new().with_middleware(Box::new(FilterMiddleware::new(
+            |msg: &Message| msg.task_name() == "allowed",
+        )));
+
+        let mut message = Message::new("rejected_task".to_string(), Uuid::new_v4(), vec![]);
+        let decision = chain.process_after_consume(&mut message).await.unwrap();
+        assert!(decision.is_drop());
+    }
+
+    #[tokio::test]
+    async fn sampling_rejection_is_settled_as_a_drop_not_a_failure() {
+        let chain =
+            crate::MiddlewareChain::new().with_middleware(Box::new(SamplingMiddleware::new(0.0)));
+
+        let mut message = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        let decision = chain.process_after_consume(&mut message).await.unwrap();
+        assert!(decision.is_drop());
+    }
+
+    // -------------------------------------------------------------------
+    // idx152: DeduplicationMiddleware must evict the true oldest entry,
+    // not an arbitrary HashSet-order one.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn deduplication_evicts_oldest_inserted_id_first() {
+        let middleware = DeduplicationMiddleware::new(2);
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+
+        let mut msg_a = Message::new("t".to_string(), id_a, vec![]);
+        let mut msg_b = Message::new("t".to_string(), id_b, vec![]);
+        let mut msg_c = Message::new("t".to_string(), id_c, vec![]);
+
+        // Insert A, then B, then C (cache size is 2, so inserting C must
+        // evict A - the oldest - not an arbitrary entry).
+        middleware.after_consume(&mut msg_a).await.unwrap();
+        middleware.after_consume(&mut msg_b).await.unwrap();
+        middleware.after_consume(&mut msg_c).await.unwrap();
+
+        // B and C are still tracked: redelivering either is still a
+        // duplicate. Checked before touching A below, since a successful
+        // (non-duplicate) `after_consume` call itself inserts into the
+        // cache and would otherwise evict again.
+        let mut msg_b_redelivered = Message::new("t".to_string(), id_b, vec![]);
+        assert!(middleware
+            .after_consume(&mut msg_b_redelivered)
+            .await
+            .is_err());
+        let mut msg_c_redelivered = Message::new("t".to_string(), id_c, vec![]);
+        assert!(middleware
+            .after_consume(&mut msg_c_redelivered)
+            .await
+            .is_err());
+
+        // A was evicted: redelivering it is no longer detected as a
+        // duplicate.
+        let mut msg_a_redelivered = Message::new("t".to_string(), id_a, vec![]);
+        assert!(middleware
+            .after_consume(&mut msg_a_redelivered)
+            .await
+            .is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // idx153: RetryLimitMiddleware must reject once retries reach (not
+    // just exceed) max_retries.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn retry_limit_rejects_at_exactly_max_retries() {
+        let middleware = RetryLimitMiddleware::new(3);
+        let mut message = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        message.headers.retries = Some(3);
+
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_limit_allows_below_max_retries() {
+        let middleware = RetryLimitMiddleware::new(3);
+        let mut message = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        message.headers.retries = Some(2);
+
+        let result = middleware.after_consume(&mut message).await;
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // idx123: CompressionMiddleware must keep `content_encoding` in sync
+    // with the actual wire encoding of the body.
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn compression_updates_and_restores_content_encoding() {
+        use celers_protocol::compression::CompressionType;
+
+        let middleware = CompressionMiddleware::new(CompressionType::Gzip).with_min_size(16);
+        let original_body = b"compress me ".repeat(64);
+        let mut msg = Message::new("test".to_string(), Uuid::new_v4(), original_body.clone());
+        let original_encoding = msg.content_encoding.clone();
+
+        middleware.before_publish(&mut msg).await.unwrap();
+
+        // The body is now compressed bytes, so `content_encoding` must no
+        // longer claim the original (e.g. "utf-8") encoding.
+        assert_ne!(msg.content_encoding, original_encoding);
+        assert_eq!(msg.content_encoding, "gzip");
+
+        middleware.after_consume(&mut msg).await.unwrap();
+
+        // Round trip restores both the body and the original encoding.
+        assert_eq!(msg.body, original_body);
+        assert_eq!(msg.content_encoding, original_encoding);
     }
 }

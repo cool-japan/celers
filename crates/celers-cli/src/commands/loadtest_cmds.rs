@@ -51,6 +51,19 @@ pub const MAX_PLAN_ENTRIES: usize = 10_000_000;
 /// validation ceiling so a planned task can always be enqueued.
 pub const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 
+/// Hard upper bound on the *total* synthetic payload volume
+/// (`entries * effective_payload_size`) a single plan may request.
+///
+/// This is a distinct guard from [`MAX_PLAN_ENTRIES`]: a plan can stay well
+/// under the entry cap yet still request an enormous total payload volume
+/// (e.g. `--total 100000 --payload-size 1048576` requests ~104 GB total)
+/// that would flood the broker over the life of the run even though
+/// [`SyntheticTask`] now generates its payload lazily at enqueue time rather
+/// than materializing every task's bytes up front. When the requested
+/// volume exceeds this budget, the plan is clamped to the largest count
+/// that fits ([`LoadPlan::capped_by_bytes`] reports when this happened).
+pub const MAX_PLAN_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Default task name used when the caller does not supply one.
 pub const DEFAULT_TASK_NAME: &str = "loadtest.noop";
 
@@ -236,6 +249,15 @@ impl LoadTestConfig {
 /// index, *not* a real task UUID; it exists so plans are reproducible and
 /// inspectable. The actual [`SerializedTask`] (with its random UUID) is built
 /// only at enqueue time in [`run_loadtest`].
+///
+/// Payload bytes are **not** stored on this struct -- only `seed` and
+/// `payload_size`, the inputs [`build_payload`] needs to regenerate them
+/// deterministically on demand via [`SyntheticTask::payload`]. A plan with a
+/// large `total` and/or `payload_size` would otherwise hold every task's
+/// full payload in memory simultaneously (`total * payload_size` bytes,
+/// e.g. ~100 GB for `--total 100000 --payload-size 1048576`) before a single
+/// task is enqueued; generating lazily bounds a plan's memory to
+/// `O(total)` small structs regardless of payload size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticTask {
     /// Zero-based position of this task within the plan.
@@ -247,17 +269,34 @@ pub struct SyntheticTask {
     /// Task name (copied from the configuration).
     pub name: String,
 
-    /// Synthetic payload bytes (deterministic given the config).
-    pub payload: Vec<u8>,
+    /// Seed this task's payload is deterministically derived from (see
+    /// [`SyntheticTask::payload`]).
+    pub seed: u64,
+
+    /// Size, in bytes, of the payload [`SyntheticTask::payload`] generates.
+    pub payload_size: usize,
 }
 
 impl SyntheticTask {
+    /// Deterministically regenerate this task's payload bytes.
+    ///
+    /// Generated lazily rather than stored, so a [`LoadPlan`] with a large
+    /// `total` and/or `payload_size` never holds more than a handful of
+    /// payloads in memory at once (only the ones actually being enqueued or
+    /// previewed at any given moment). Calling this twice for the same task
+    /// always returns identical bytes (same `(seed, index, payload_size)` in,
+    /// same [`build_payload`] output out).
+    #[must_use]
+    pub fn payload(&self) -> Vec<u8> {
+        build_payload(self.seed, self.index, self.payload_size)
+    }
+
     /// Convert this synthetic task into a real [`SerializedTask`] ready to
     /// enqueue. A fresh task UUID is assigned by `SerializedTask::new`; the
     /// synthetic id is not reused so the broker sees a genuine unique task.
     #[must_use]
     pub fn to_serialized(&self) -> SerializedTask {
-        SerializedTask::new(self.name.clone(), self.payload.clone())
+        SerializedTask::new(self.name.clone(), self.payload())
     }
 }
 
@@ -285,9 +324,15 @@ pub struct LoadPlan {
     /// Effective per-task payload size in bytes (after clamping).
     pub payload_size: usize,
 
-    /// `true` if [`MAX_PLAN_ENTRIES`] capped the schedule below the requested
-    /// total.
+    /// `true` if [`MAX_PLAN_ENTRIES`] or [`MAX_PLAN_TOTAL_BYTES`] capped the
+    /// schedule below the requested total (see also
+    /// [`LoadPlan::capped_by_bytes`] to distinguish which one).
     pub capped: bool,
+
+    /// `true` specifically when [`MAX_PLAN_TOTAL_BYTES`] (rather than
+    /// [`MAX_PLAN_ENTRIES`]) is what capped the schedule -- i.e. the
+    /// requested `total * effective_payload_size` exceeded the byte budget.
+    pub capped_by_bytes: bool,
 
     /// The originally requested total, retained so callers can report when the
     /// realised count differs (duration cap / entry cap).
@@ -433,14 +478,18 @@ fn arrival_offsets(
 /// 1. An invalid rate (`<= 0` or non-finite) or a `total` of zero yields an
 ///    empty plan.
 /// 2. The number of *candidate* tasks is `total`, capped at
-///    [`MAX_PLAN_ENTRIES`] (recorded in [`LoadPlan::capped`]).
+///    [`MAX_PLAN_ENTRIES`] and further capped so `candidate_count *
+///    effective_payload_size` does not exceed [`MAX_PLAN_TOTAL_BYTES`]
+///    (recorded in [`LoadPlan::capped`] / [`LoadPlan::capped_by_bytes`]).
 /// 3. Arrival offsets are computed per [`ArrivalPattern`]: constant spacing is
 ///    exactly `1000 / rate` ms; jittered/Poisson spacing is derived from the
 ///    seed and sorted ascending.
 /// 4. When [`LoadTestConfig::duration`] is set, offsets beyond the window are
 ///    dropped, which may reduce the realised count below `total`.
 /// 5. Each surviving offset is paired with a [`SyntheticTask`] carrying a
-///    deterministic id and payload.
+///    deterministic id; the payload itself is generated lazily on demand
+///    (see [`SyntheticTask::payload`]), so building a plan never allocates
+///    `total * payload_size` bytes up front.
 #[must_use]
 pub fn plan_loadtest(config: &LoadTestConfig) -> LoadPlan {
     let payload_size = config.effective_payload_size();
@@ -452,6 +501,7 @@ pub fn plan_loadtest(config: &LoadTestConfig) -> LoadPlan {
             pattern: Some(config.pattern),
             payload_size,
             capped: false,
+            capped_by_bytes: false,
             requested_total: config.total,
         };
     };
@@ -462,13 +512,24 @@ pub fn plan_loadtest(config: &LoadTestConfig) -> LoadPlan {
             pattern: Some(config.pattern),
             payload_size,
             capped: false,
+            capped_by_bytes: false,
             requested_total: 0,
         };
     }
 
-    // Cap the candidate count to keep allocation bounded.
-    let capped = config.total > MAX_PLAN_ENTRIES;
-    let candidate_count = config.total.min(MAX_PLAN_ENTRIES);
+    // Cap the candidate count to keep the entry count bounded...
+    let capped_by_entries = config.total > MAX_PLAN_ENTRIES;
+    let mut candidate_count = config.total.min(MAX_PLAN_ENTRIES);
+
+    // ...and separately cap it so the *total* payload volume the plan would
+    // enqueue over its run stays under budget. `payload_size` is always in
+    // `[1, MAX_PAYLOAD_BYTES]` (see `effective_payload_size`), so this can
+    // never divide by zero.
+    let byte_budget_count = (MAX_PLAN_TOTAL_BYTES / payload_size as u64) as usize;
+    let capped_by_bytes = candidate_count > byte_budget_count;
+    if capped_by_bytes {
+        candidate_count = byte_budget_count.max(1);
+    }
 
     let cap_ms = config.duration.map(|d| d.as_secs_f64() * 1000.0);
 
@@ -504,7 +565,8 @@ pub fn plan_loadtest(config: &LoadTestConfig) -> LoadPlan {
                     index,
                     synthetic_id,
                     name: config.task_name.clone(),
-                    payload: build_payload(config.seed, index, payload_size),
+                    seed: config.seed,
+                    payload_size,
                 },
             }
         })
@@ -514,7 +576,8 @@ pub fn plan_loadtest(config: &LoadTestConfig) -> LoadPlan {
         entries,
         pattern: Some(config.pattern),
         payload_size,
-        capped,
+        capped: capped_by_entries || capped_by_bytes,
+        capped_by_bytes,
         requested_total: config.total,
     }
 }
@@ -552,7 +615,21 @@ fn print_plan(plan: &LoadPlan, dry_run: bool) {
             plan.requested_total.to_string().yellow()
         );
     }
-    if plan.capped {
+    if plan.capped_by_bytes {
+        println!(
+            "{}",
+            format!(
+                "  Note: capped at {} total payload byte(s) ({} byte(s) x {} entries) -- \
+                 requested {} x {} byte(s) would exceed the budget",
+                MAX_PLAN_TOTAL_BYTES,
+                plan.payload_size,
+                plan.len(),
+                plan.requested_total,
+                plan.payload_size,
+            )
+            .yellow()
+        );
+    } else if plan.capped {
         println!(
             "{}",
             format!("  Note: capped at {MAX_PLAN_ENTRIES} entries").yellow()
@@ -580,13 +657,16 @@ fn print_plan(plan: &LoadPlan, dry_run: bool) {
     let show_all = n <= PREVIEW * 2;
 
     let print_entry = |entry: &ScheduledTask| {
+        // `payload_size` alone is enough for the preview -- `build_payload`
+        // always produces exactly that many bytes, so there is no need to
+        // materialize the payload just to print its length.
         println!(
             "  [{:>8} ms] #{:<6} id={:016x} {} ({} bytes)",
             entry.offset_ms,
             entry.task.index,
             entry.task.synthetic_id,
             entry.task.name,
-            entry.task.payload.len(),
+            entry.task.payload_size,
         );
     };
 
@@ -717,26 +797,41 @@ pub async fn run_loadtest(
     }
 
     let elapsed = t0.elapsed();
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        enqueued as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
     println!();
-    println!(
-        "{}",
-        format!(
-            "✓ Enqueued {enqueued} task(s) in {:.2}s ({:.2} tasks/s)",
-            elapsed.as_secs_f64(),
-            if elapsed.as_secs_f64() > 0.0 {
-                enqueued as f64 / elapsed.as_secs_f64()
-            } else {
-                0.0
-            }
-        )
-        .green()
-        .bold()
-    );
     if failed > 0 {
         println!(
             "{}",
-            format!("  {failed} task(s) failed to enqueue").yellow()
+            format!(
+                "⚠ Enqueued {enqueued} task(s) in {:.2}s ({rate:.2} tasks/s)",
+                elapsed.as_secs_f64()
+            )
+            .yellow()
+            .bold()
         );
+        println!("{}", format!("  {failed} task(s) failed to enqueue").red());
+    } else {
+        println!(
+            "{}",
+            format!(
+                "✓ Enqueued {enqueued} task(s) in {:.2}s ({rate:.2} tasks/s)",
+                elapsed.as_secs_f64()
+            )
+            .green()
+            .bold()
+        );
+    }
+
+    // A load test that silently drops enqueue failures on the floor gives
+    // no CI/scripted-usage signal that anything went wrong (see `doctor`'s
+    // sibling exit-code fix for the same principle). Any failure is real
+    // data loss for this run, so it must not be `Ok(())`.
+    if failed > 0 {
+        anyhow::bail!("{failed} of {} task(s) failed to enqueue", plan.len());
     }
 
     Ok(())
@@ -1123,7 +1218,9 @@ mod tests {
         let plan = plan_loadtest(&cfg);
         assert_eq!(plan.payload_size, 256);
         for entry in &plan.entries {
-            assert_eq!(entry.task.payload.len(), 256);
+            assert_eq!(entry.task.payload_size, 256);
+            // Lazily-generated bytes must actually be that length.
+            assert_eq!(entry.task.payload().len(), 256);
         }
     }
 
@@ -1136,7 +1233,7 @@ mod tests {
         let plan = plan_loadtest(&cfg);
         assert_eq!(plan.payload_size, 1);
         for entry in &plan.entries {
-            assert_eq!(entry.task.payload.len(), 1);
+            assert_eq!(entry.task.payload().len(), 1);
         }
     }
 
@@ -1147,7 +1244,7 @@ mod tests {
         cfg.total = 1;
         let plan = plan_loadtest(&cfg);
         assert_eq!(plan.payload_size, MAX_PAYLOAD_BYTES);
-        assert_eq!(plan.entries[0].task.payload.len(), MAX_PAYLOAD_BYTES);
+        assert_eq!(plan.entries[0].task.payload().len(), MAX_PAYLOAD_BYTES);
     }
 
     #[test]
@@ -1159,16 +1256,101 @@ mod tests {
 
         let p1 = plan_loadtest(&cfg);
         let p2 = plan_loadtest(&cfg);
-        // Reproducible bytes.
-        assert_eq!(p1.entries[0].task.payload, p2.entries[0].task.payload);
+        // Reproducible bytes: same (seed, index, size) always regenerates
+        // identical content, even though it is no longer stored on the plan.
+        assert_eq!(p1.entries[0].task.payload(), p2.entries[0].task.payload());
         // Distinct tasks have distinct payloads (with overwhelming probability).
-        assert_ne!(p1.entries[0].task.payload, p1.entries[1].task.payload);
+        assert_ne!(p1.entries[0].task.payload(), p1.entries[1].task.payload());
 
         // A different seed changes the payload bytes.
         let mut other = cfg.clone();
         other.seed = 556;
         let p3 = plan_loadtest(&other);
-        assert_ne!(p1.entries[0].task.payload, p3.entries[0].task.payload);
+        assert_ne!(p1.entries[0].task.payload(), p3.entries[0].task.payload());
+    }
+
+    #[test]
+    fn payload_is_not_materialized_eagerly_in_synthetic_task() {
+        // Regression guard: `SyntheticTask` must carry the inputs needed to
+        // regenerate its payload (`seed`, `payload_size`), not the bytes
+        // themselves -- otherwise a large plan is back to holding
+        // `total * payload_size` bytes in memory before enqueuing anything.
+        let mut cfg = base_config();
+        cfg.total = 1;
+        cfg.seed = 42;
+
+        cfg.payload_size = 1;
+        let tiny = plan_loadtest(&cfg).entries[0].task.clone();
+
+        cfg.payload_size = 1_000_000;
+        let huge = plan_loadtest(&cfg).entries[0].task.clone();
+
+        assert_eq!(tiny.payload_size, 1);
+        assert_eq!(huge.payload_size, 1_000_000);
+        // The struct's own footprint must not scale with the requested
+        // payload size -- if it did, `SyntheticTask` would be storing bytes
+        // again instead of the (seed, index, size) needed to regenerate them.
+        assert_eq!(std::mem::size_of_val(&tiny), std::mem::size_of_val(&huge));
+        // And it must stay small regardless -- generously under any
+        // plausible size a `String` name plus a few integers would need.
+        assert!(std::mem::size_of_val(&tiny) < 128);
+    }
+
+    // ---- MAX_PLAN_TOTAL_BYTES budget -----------------------------------
+
+    #[test]
+    fn plan_loadtest_bounds_total_payload_bytes() {
+        let mut cfg = base_config();
+        cfg.total = 100_000;
+        cfg.payload_size = MAX_PAYLOAD_BYTES; // 1 MiB/task
+        let plan = plan_loadtest(&cfg);
+
+        // Requesting 100,000 x 1 MiB (~104.8 GB) must be clamped to the
+        // byte budget rather than producing anywhere close to that many
+        // entries.
+        let total_bytes = plan.len() as u64 * plan.payload_size as u64;
+        assert!(total_bytes <= MAX_PLAN_TOTAL_BYTES);
+        assert!(plan.capped_by_bytes);
+        assert!(plan.capped);
+        assert!(plan.len() < cfg.total);
+        assert!(plan.truncated());
+    }
+
+    #[test]
+    fn plan_loadtest_stays_under_byte_budget_is_not_capped() {
+        // At the max payload size, the byte budget allows exactly
+        // `MAX_PLAN_TOTAL_BYTES / MAX_PAYLOAD_BYTES` = 2048 entries; staying
+        // at or under that must not trigger the byte cap.
+        let byte_budget_count = (MAX_PLAN_TOTAL_BYTES / MAX_PAYLOAD_BYTES as u64) as usize;
+        let mut cfg = base_config();
+        cfg.total = byte_budget_count;
+        cfg.payload_size = MAX_PAYLOAD_BYTES;
+        let plan = plan_loadtest(&cfg);
+        assert_eq!(plan.len(), byte_budget_count);
+        assert!(!plan.capped_by_bytes);
+        assert!(!plan.capped);
+    }
+
+    #[test]
+    fn plan_loadtest_one_past_byte_budget_is_capped() {
+        let byte_budget_count = (MAX_PLAN_TOTAL_BYTES / MAX_PAYLOAD_BYTES as u64) as usize;
+        let mut cfg = base_config();
+        cfg.total = byte_budget_count + 1;
+        cfg.payload_size = MAX_PAYLOAD_BYTES;
+        let plan = plan_loadtest(&cfg);
+        assert_eq!(plan.len(), byte_budget_count);
+        assert!(plan.capped_by_bytes);
+        assert!(plan.capped);
+    }
+
+    #[test]
+    fn plan_loadtest_modest_plan_is_never_byte_capped() {
+        let mut cfg = base_config();
+        cfg.total = 250;
+        cfg.payload_size = 16;
+        let plan = plan_loadtest(&cfg);
+        assert!(!plan.capped_by_bytes);
+        assert_eq!(plan.len(), 250);
     }
 
     // ---- task name honored --------------------------------------------
@@ -1296,5 +1478,80 @@ mod tests {
         // Empty plan branch.
         let empty = LoadPlan::default();
         print_plan(&empty, true);
+    }
+
+    // ---- live-broker regression test (idx 340) --------------------------
+    //
+    // Local Redis used by this module's live-broker regression test, same
+    // convention as `commands::task`/`commands::replay_cmds`. Scopes its
+    // own queue name with a fresh UUID so concurrent test runs never
+    // collide.
+    const TEST_BROKER_URL: &str = "redis://127.0.0.1:6379";
+
+    /// Regression test for idx 340: `run_loadtest` used to always return
+    /// `Ok(())` even when every enqueue failed, printing only a dimmed
+    /// warning line with no exit-code signal for CI/scripted usage. Forces
+    /// every enqueue to fail deterministically (the main queue key is made
+    /// a Redis STRING, so the broker's LPUSH/RPUSH hits `WRONGTYPE`) and
+    /// confirms `run_loadtest` now returns `Err`.
+    #[tokio::test]
+    async fn run_loadtest_fails_when_every_enqueue_fails() {
+        let queue_name = format!("test-loadtest-fail-{}", uuid::Uuid::new_v4());
+
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("conn");
+        let _: () = redis::cmd("SET")
+            .arg(&queue_name)
+            .arg("not-a-queue")
+            .query_async(&mut conn)
+            .await
+            .expect("seed wrong-type key");
+
+        let mut cfg = base_config();
+        cfg.total = 3;
+        cfg.rate_per_sec = 1000.0; // negligible inter-arrival sleep
+        cfg.jitter_fraction = 0.0;
+
+        let result = run_loadtest(TEST_BROKER_URL, &queue_name, &cfg, false).await;
+        assert!(
+            result.is_err(),
+            "run_loadtest must fail (nonzero exit) when every enqueue fails"
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(&queue_name)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(0);
+    }
+
+    /// A load test where every task enqueues successfully must still
+    /// return `Ok(())` -- the fix must not turn a healthy run into a
+    /// false-positive failure.
+    #[tokio::test]
+    async fn run_loadtest_succeeds_when_all_enqueue() {
+        let queue_name = format!("test-loadtest-ok-{}", uuid::Uuid::new_v4());
+
+        let mut cfg = base_config();
+        cfg.total = 5;
+        cfg.rate_per_sec = 1000.0;
+        cfg.jitter_fraction = 0.0;
+
+        let result = run_loadtest(TEST_BROKER_URL, &queue_name, &cfg, false).await;
+        assert!(result.is_ok(), "healthy run must not fail: {result:?}");
+
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("conn");
+        let _: i64 = redis::cmd("DEL")
+            .arg(&queue_name)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(0);
     }
 }

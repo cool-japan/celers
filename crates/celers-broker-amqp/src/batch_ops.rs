@@ -7,14 +7,21 @@ use lapin::{
     types::{FieldTable, ShortString},
     BasicProperties,
 };
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::broker_core::AmqpBroker;
+use crate::confirm::classify_confirmation;
 use crate::types::*;
 
 // Additional AmqpBroker methods
 impl AmqpBroker {
+    /// Upper bound on the number of messages [`AmqpBroker::drain_queue`]
+    /// fetches before giving up, so a queue that is being written to
+    /// concurrently cannot spin the drain loop forever.
+    pub const DEFAULT_DRAIN_LIMIT: usize = 100_000;
+
     /// Publish messages with pipelining for maximum throughput
     ///
     /// Pipeline publishing sends multiple messages before waiting for confirms,
@@ -62,7 +69,12 @@ impl AmqpBroker {
             })
             .collect();
 
-        let channel = self.get_channel().await?;
+        let confirms_enabled = self.confirms_enabled();
+        let publish_options = BasicPublishOptions {
+            mandatory: self.config.mandatory_publish,
+            ..Default::default()
+        };
+        let (channel, pooled) = self.acquire_publish_channel().await?;
 
         let effective_depth = if pipeline_depth == 0 {
             messages.len() // Unlimited - send all before waiting
@@ -73,13 +85,21 @@ impl AmqpBroker {
         let mut confirms = Vec::with_capacity(effective_depth);
         let mut success_count: usize = 0;
         let mut publish_count: usize = 0;
+        let mut first_error: Option<BrokerError> = None;
 
-        for (idx, message) in messages.iter().enumerate() {
+        let mut fatal_error: Option<BrokerError> = None;
+
+        'publish: for (idx, message) in messages.iter().enumerate() {
             let (ref effective_exchange, ref effective_routing_key) = resolved_routes[idx];
 
             // Serialize message to JSON
-            let payload = serde_json::to_vec(message)
-                .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+            let payload = match serde_json::to_vec(message) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    fatal_error = Some(BrokerError::Serialization(e.to_string()));
+                    break 'publish;
+                }
+            };
 
             // Build properties
             let mut properties = BasicProperties::default()
@@ -99,16 +119,25 @@ impl AmqpBroker {
             }
 
             // Publish message and collect confirm future
-            let confirm = channel
+            let confirm = match channel
                 .basic_publish(
                     effective_exchange.as_str().into(),
                     effective_routing_key.as_str().into(),
-                    BasicPublishOptions::default(),
+                    publish_options,
                     &payload,
                     properties,
                 )
                 .await
-                .map_err(|e| BrokerError::OperationFailed(format!("Failed to publish: {}", e)))?;
+            {
+                Ok(confirm) => confirm,
+                Err(e) => {
+                    fatal_error = Some(BrokerError::OperationFailed(format!(
+                        "Failed to publish: {}",
+                        e
+                    )));
+                    break 'publish;
+                }
+            };
 
             confirms.push(confirm);
             publish_count += 1;
@@ -116,11 +145,52 @@ impl AmqpBroker {
             // Wait for confirms when pipeline is full or at the end
             if confirms.len() >= effective_depth || idx == messages.len() - 1 {
                 for confirm in confirms.drain(..) {
-                    if confirm.await.is_ok() {
-                        success_count += 1;
+                    let outcome = match confirm.await {
+                        Ok(confirmation) => classify_confirmation(confirmation, confirms_enabled),
+                        Err(e) => Err(BrokerError::OperationFailed(format!(
+                            "Failed to confirm publish: {}",
+                            e
+                        ))),
+                    };
+                    match outcome {
+                        Ok(()) => success_count += 1,
+                        Err(e) => {
+                            if first_error.is_none() {
+                                first_error = Some(e);
+                            }
+                        }
                     }
                 }
             }
+        }
+
+        // Never abandon confirms that were already issued.
+        for confirm in confirms.drain(..) {
+            let outcome = match confirm.await {
+                Ok(confirmation) => classify_confirmation(confirmation, confirms_enabled),
+                Err(e) => Err(BrokerError::OperationFailed(format!(
+                    "Failed to confirm publish: {}",
+                    e
+                ))),
+            };
+            match outcome {
+                Ok(()) => success_count += 1,
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        self.release_publish_channel(channel, pooled).await;
+
+        if let Some(e) = fatal_error {
+            self.channel_metrics.publish_errors += (messages.len() - success_count) as u64;
+            self.publisher_confirm_stats.total_confirms += publish_count as u64;
+            self.publisher_confirm_stats.successful_confirms += success_count as u64;
+            self.publisher_confirm_stats.failed_confirms += (publish_count - success_count) as u64;
+            return Err(e);
         }
 
         // Update metrics
@@ -132,9 +202,12 @@ impl AmqpBroker {
             self.channel_metrics.publish_errors += (messages.len() - success_count) as u64;
             self.publisher_confirm_stats.failed_confirms += (messages.len() - success_count) as u64;
             warn!(
-                "Pipeline publish: {} of {} messages confirmed",
+                "Pipeline publish: {} of {} messages confirmed{}",
                 success_count,
-                messages.len()
+                messages.len(),
+                first_error
+                    .map(|e| format!(" (first failure: {})", e))
+                    .unwrap_or_default()
             );
         } else {
             debug!(
@@ -182,17 +255,28 @@ impl AmqpBroker {
             })
             .collect();
 
-        let channel = self.get_channel().await?;
+        let confirms_enabled = self.confirms_enabled();
+        let publish_options = BasicPublishOptions {
+            mandatory: self.config.mandatory_publish,
+            ..Default::default()
+        };
+        let (channel, pooled) = self.acquire_publish_channel().await?;
 
         // Publish all messages and collect confirm futures
         let mut confirms = Vec::with_capacity(messages.len());
+        let mut fatal_error: Option<BrokerError> = None;
 
-        for (idx, message) in messages.iter().enumerate() {
+        'publish: for (idx, message) in messages.iter().enumerate() {
             let (ref effective_exchange, ref effective_routing_key) = resolved_routes[idx];
 
             // Serialize message to JSON
-            let payload = serde_json::to_vec(message)
-                .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+            let payload = match serde_json::to_vec(message) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    fatal_error = Some(BrokerError::Serialization(e.to_string()));
+                    break 'publish;
+                }
+            };
 
             // Build properties
             let mut properties = BasicProperties::default()
@@ -212,33 +296,73 @@ impl AmqpBroker {
             }
 
             // Publish message and collect confirm future
-            let confirm = channel
+            let confirm = match channel
                 .basic_publish(
                     effective_exchange.as_str().into(),
                     effective_routing_key.as_str().into(),
-                    BasicPublishOptions::default(),
+                    publish_options,
                     &payload,
                     properties,
                 )
                 .await
-                .map_err(|e| BrokerError::OperationFailed(format!("Failed to publish: {}", e)))?;
+            {
+                Ok(confirm) => confirm,
+                Err(e) => {
+                    fatal_error = Some(BrokerError::OperationFailed(format!(
+                        "Failed to publish: {}",
+                        e
+                    )));
+                    break 'publish;
+                }
+            };
 
             confirms.push(confirm);
         }
 
-        // Wait for all publisher confirms
+        // Wait for all publisher confirms. A negative acknowledgement or an
+        // unroutable (returned) message is a failure, not a success.
         let mut success_count = 0;
+        let mut first_error: Option<BrokerError> = None;
         for confirm in confirms {
-            if confirm.await.is_ok() {
-                success_count += 1;
+            let outcome = match confirm.await {
+                Ok(confirmation) => classify_confirmation(confirmation, confirms_enabled),
+                Err(e) => Err(BrokerError::OperationFailed(format!(
+                    "Failed to confirm publish: {}",
+                    e
+                ))),
+            };
+            match outcome {
+                Ok(()) => success_count += 1,
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
             }
+        }
+
+        self.release_publish_channel(channel, pooled).await;
+
+        self.channel_metrics.messages_published += success_count as u64;
+        self.publisher_confirm_stats.total_confirms += messages.len() as u64;
+        self.publisher_confirm_stats.successful_confirms += success_count as u64;
+        if success_count < messages.len() {
+            self.channel_metrics.publish_errors += (messages.len() - success_count) as u64;
+            self.publisher_confirm_stats.failed_confirms += (messages.len() - success_count) as u64;
+        }
+
+        if let Some(e) = fatal_error {
+            return Err(e);
         }
 
         if success_count < messages.len() {
             warn!(
-                "Batch publish: {} of {} messages confirmed",
+                "Batch publish: {} of {} messages confirmed{}",
                 success_count,
-                messages.len()
+                messages.len(),
+                first_error
+                    .map(|e| format!(" (first failure: {})", e))
+                    .unwrap_or_default()
             );
         } else {
             debug!(
@@ -268,11 +392,29 @@ impl AmqpBroker {
     /// println!("Drained {} messages", messages.len());
     /// ```
     pub async fn drain_queue(&mut self, queue: &str) -> Result<Vec<Envelope>> {
+        self.drain_queue_limited(queue, Self::DEFAULT_DRAIN_LIMIT)
+            .await
+    }
+
+    /// Drain at most `max_messages` messages from a queue.
+    ///
+    /// Unlike [`Self::drain_queue`] the caller chooses the cap, which matters
+    /// for a queue that is being written to concurrently: without a cap the
+    /// drain can never finish.
+    ///
+    /// Messages that fail to deserialize are rejected without requeue (so
+    /// they are dead-lettered rather than left unacknowledged forever) and
+    /// counted in `consume_errors`.
+    pub async fn drain_queue_limited(
+        &mut self,
+        queue: &str,
+        max_messages: usize,
+    ) -> Result<Vec<Envelope>> {
         let mut envelopes = Vec::new();
         let mut consumed_count = 0;
         let mut error_count = 0;
 
-        loop {
+        for _ in 0..max_messages {
             let channel = self.get_channel().await?;
             match channel
                 .basic_get(queue.into(), BasicGetOptions { no_ack: false })
@@ -289,6 +431,14 @@ impl AmqpBroker {
                     }
                     Err(e) => {
                         warn!("Failed to deserialize message during drain: {}", e);
+                        // Do not leave the poison message unacknowledged.
+                        let _ = delivery
+                            .acker
+                            .nack(BasicNackOptions {
+                                multiple: false,
+                                requeue: false,
+                            })
+                            .await;
                         error_count += 1;
                     }
                 },
@@ -433,6 +583,50 @@ impl AmqpBroker {
         Ok(total_purged)
     }
 
+    /// Name of the temporary reply queue used for the RPC exchange identified
+    /// by `correlation_id`.
+    ///
+    /// The reply queue name is derived from the correlation id so that the
+    /// two can never disagree; the authoritative reply address is still
+    /// carried by the request's `reply_to` property.
+    pub(crate) fn reply_queue_for(correlation_id: &str) -> String {
+        format!("reply.{}", correlation_id)
+    }
+
+    /// Resolve where an RPC reply must be published, from the request envelope.
+    ///
+    /// AMQP semantics: `reply_to` is the reply address and `correlation_id`
+    /// is only the matching token, so the destination is read from
+    /// `reply_to` and never reconstructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::OperationFailed`] when the request carries no
+    /// `correlation_id` or no `reply_to`.
+    pub(crate) fn rpc_reply_target(request_envelope: &Envelope) -> Result<(String, String)> {
+        let correlation_id = request_envelope
+            .message
+            .properties
+            .correlation_id
+            .clone()
+            .ok_or_else(|| {
+                BrokerError::OperationFailed("Request message missing correlation_id".to_string())
+            })?;
+
+        let reply_to = request_envelope
+            .message
+            .properties
+            .reply_to
+            .clone()
+            .ok_or_else(|| {
+                BrokerError::OperationFailed(
+                    "Request message missing reply_to; cannot route the RPC reply".to_string(),
+                )
+            })?;
+
+        Ok((correlation_id, reply_to))
+    }
+
     /// Request-Reply (RPC) pattern: Send a message and wait for reply
     ///
     /// Implements the RPC pattern by:
@@ -467,8 +661,10 @@ impl AmqpBroker {
         mut request: Message,
         timeout: Duration,
     ) -> Result<Message> {
-        // Create temporary reply queue with auto-delete
-        let reply_queue_name = format!("reply.{}", uuid::Uuid::new_v4());
+        // The reply queue name and the correlation id must agree, so derive
+        // one from the other instead of drawing two unrelated UUIDs.
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let reply_queue_name = Self::reply_queue_for(&correlation_id);
         {
             let channel = self.get_channel().await?;
             channel
@@ -489,9 +685,11 @@ impl AmqpBroker {
                 })?;
         }
 
-        // Set reply-to and correlation-id
-        let correlation_id = uuid::Uuid::new_v4().to_string();
+        // Set reply-to and correlation-id, both on the AMQP properties and on
+        // the serialized message body: the RPC server deserializes the body,
+        // so a `reply_to` that only exists in the AMQP frame is invisible to it.
         request.properties.correlation_id = Some(correlation_id.clone());
+        request.properties.reply_to = Some(reply_queue_name.clone());
         let reply_to = reply_queue_name.clone();
 
         // Serialize and publish request
@@ -558,35 +756,56 @@ impl AmqpBroker {
             {
                 Ok(Some(delivery)) => {
                     // Check correlation ID matches
-                    if let Some(corr_id) = delivery.properties.correlation_id() {
-                        if corr_id.as_str() == correlation_id {
-                            // Acknowledge the reply
-                            channel
-                                .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-                                .await
-                                .map_err(|e| {
-                                    BrokerError::OperationFailed(format!(
-                                        "Failed to ack reply: {}",
-                                        e
-                                    ))
-                                })?;
+                    let matches = delivery
+                        .properties
+                        .correlation_id()
+                        .as_ref()
+                        .map(|corr_id| corr_id.as_str() == correlation_id)
+                        .unwrap_or(false);
 
-                            // Deserialize reply
-                            let reply = serde_json::from_slice::<Message>(&delivery.data)
-                                .map_err(|e| BrokerError::Serialization(e.to_string()))?;
-
-                            // Clean up reply queue
-                            let _ = channel
-                                .queue_delete(
-                                    reply_queue_name.as_str().into(),
-                                    QueueDeleteOptions::default(),
-                                )
-                                .await;
-
-                            debug!("Received RPC reply for correlation_id: {}", correlation_id);
-                            return Ok(reply);
-                        }
+                    if !matches {
+                        // A stale or foreign reply on our private queue: it can
+                        // never become the answer we are waiting for, so drop it
+                        // instead of leaving it unacknowledged forever. Requeuing
+                        // it would put it straight back at the head of this queue
+                        // and spin the loop.
+                        warn!(
+                            "Discarding RPC reply with unexpected correlation_id on queue '{}'",
+                            reply_queue_name
+                        );
+                        let _ = delivery
+                            .acker
+                            .nack(BasicNackOptions {
+                                multiple: false,
+                                requeue: false,
+                            })
+                            .await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
                     }
+
+                    // Acknowledge the reply
+                    channel
+                        .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                        .await
+                        .map_err(|e| {
+                            BrokerError::OperationFailed(format!("Failed to ack reply: {}", e))
+                        })?;
+
+                    // Deserialize reply
+                    let reply = serde_json::from_slice::<Message>(&delivery.data)
+                        .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+                    // Clean up reply queue
+                    let _ = channel
+                        .queue_delete(
+                            reply_queue_name.as_str().into(),
+                            QueueDeleteOptions::default(),
+                        )
+                        .await;
+
+                    debug!("Received RPC reply for correlation_id: {}", correlation_id);
+                    return Ok(reply);
                 }
                 Ok(None) => {
                     // No message yet, wait a bit
@@ -633,26 +852,49 @@ impl AmqpBroker {
     /// }
     /// ```
     pub async fn rpc_reply(&mut self, request_envelope: &Envelope, reply: Message) -> Result<()> {
-        use celers_kombu::Producer;
-
-        // Extract correlation_id and reply_to from request
-        let correlation_id = request_envelope
-            .message
-            .properties
-            .correlation_id
-            .as_ref()
-            .ok_or_else(|| {
-                BrokerError::OperationFailed("Request message missing correlation_id".to_string())
-            })?;
-
-        // Simplified: Use correlation_id to determine reply queue
-        let reply_queue = format!("reply.{}", correlation_id);
+        // The reply address is whatever the requester asked for; it is never
+        // reconstructed from the correlation id.
+        let (correlation_id, reply_queue) = Self::rpc_reply_target(request_envelope)?;
 
         // Publish reply with correlation_id
         let mut reply_msg = reply;
         reply_msg.properties.correlation_id = Some(correlation_id.clone());
 
-        self.publish(&reply_queue, reply_msg).await?;
+        let payload = serde_json::to_vec(&reply_msg)
+            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        let properties = BasicProperties::default()
+            .with_delivery_mode(2)
+            .with_content_type(ShortString::from("application/json"))
+            .with_content_encoding(ShortString::from("utf-8"))
+            .with_correlation_id(ShortString::from(correlation_id.as_str()));
+
+        let confirms_enabled = self.confirms_enabled();
+        let channel = self.get_channel().await?;
+
+        // The reply queue is a temporary queue with no binding, so the reply
+        // goes to the default exchange with the queue name as routing key.
+        let confirmation = channel
+            .basic_publish(
+                "".into(),
+                reply_queue.as_str().into(),
+                BasicPublishOptions::default(),
+                &payload,
+                properties,
+            )
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to publish RPC reply: {}", e))
+            })?
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to confirm RPC reply: {}", e))
+            })?;
+
+        classify_confirmation(confirmation, confirms_enabled)?;
+
+        self.channel_metrics.messages_published += 1;
+
         debug!(
             "Sent RPC reply to {} with correlation_id: {}",
             reply_queue, correlation_id
@@ -779,10 +1021,12 @@ impl AmqpBroker {
     ) -> Result<Vec<Envelope>> {
         let max_messages = max_messages.min(1000); // Cap at 1000
         let mut envelopes = Vec::with_capacity(max_messages);
+        // Every delivery fetched in this call, so none can be abandoned in the
+        // unacknowledged state if the batch aborts halfway through.
+        let mut in_flight_tags: Vec<u64> = Vec::with_capacity(max_messages);
 
         let start = Instant::now();
         let mut consumed_count = 0u64;
-        let mut error_count = 0u64;
 
         for _ in 0..max_messages {
             // Check timeout
@@ -801,6 +1045,7 @@ impl AmqpBroker {
             match get_result {
                 Ok(Some(delivery)) => match serde_json::from_slice::<Message>(&delivery.data) {
                     Ok(message) => {
+                        in_flight_tags.push(delivery.delivery_tag);
                         envelopes.push(Envelope {
                             delivery_tag: delivery.delivery_tag.to_string(),
                             message,
@@ -809,8 +1054,20 @@ impl AmqpBroker {
                         consumed_count += 1;
                     }
                     Err(e) => {
-                        error_count += 1;
-                        self.channel_metrics.consume_errors += error_count;
+                        // Requeue everything fetched so far, then reject the
+                        // poison message without requeue so it is dead-lettered
+                        // instead of poisoning the next batch too.
+                        self.requeue_tags(&in_flight_tags).await;
+                        let _ = delivery
+                            .acker
+                            .nack(BasicNackOptions {
+                                multiple: false,
+                                requeue: false,
+                            })
+                            .await;
+                        self.channel_metrics.consume_errors += 1;
+                        self.channel_metrics.messages_requeued += in_flight_tags.len() as u64;
+                        self.channel_metrics.messages_rejected += 1;
                         return Err(BrokerError::Serialization(e.to_string()));
                     }
                 },
@@ -819,8 +1076,9 @@ impl AmqpBroker {
                     break;
                 }
                 Err(e) => {
-                    error_count += 1;
-                    self.channel_metrics.consume_errors += error_count;
+                    self.requeue_tags(&in_flight_tags).await;
+                    self.channel_metrics.consume_errors += 1;
+                    self.channel_metrics.messages_requeued += in_flight_tags.len() as u64;
                     return Err(BrokerError::OperationFailed(format!(
                         "Failed to get message: {}",
                         e
@@ -841,6 +1099,41 @@ impl AmqpBroker {
         }
 
         Ok(envelopes)
+    }
+
+    /// Requeue the given deliveries, one by one.
+    ///
+    /// `BasicNackOptions { multiple: true, .. }` would nack *every*
+    /// unacknowledged delivery up to that tag on the channel - including
+    /// deliveries belonging to unrelated consumers sharing the broker's
+    /// channel - so each tag is nacked individually.
+    async fn requeue_tags(&mut self, tags: &[u64]) {
+        if tags.is_empty() {
+            return;
+        }
+
+        let channel = match self.get_channel().await {
+            Ok(channel) => channel,
+            Err(e) => {
+                warn!("Cannot requeue {} deliveries: {}", tags.len(), e);
+                return;
+            }
+        };
+
+        for tag in tags {
+            if let Err(e) = channel
+                .basic_nack(
+                    *tag,
+                    BasicNackOptions {
+                        multiple: false,
+                        requeue: true,
+                    },
+                )
+                .await
+            {
+                warn!("Failed to requeue delivery {}: {}", tag, e);
+            }
+        }
     }
 
     /// Peek at messages in a queue without consuming them.
@@ -871,52 +1164,64 @@ impl AmqpBroker {
     pub async fn peek_queue(&mut self, queue: &str, max_messages: usize) -> Result<Vec<Message>> {
         let max_messages = max_messages.min(100); // Cap at 100 for safety
         let mut messages = Vec::with_capacity(max_messages);
-        let channel = self.get_channel().await?;
+        let mut seen_ids: HashSet<String> = HashSet::with_capacity(max_messages);
+        // Every delivery is held unacknowledged until the whole peek is done,
+        // so the broker cannot hand the same message back on the next
+        // `basic_get`. Rejecting immediately would put the message straight
+        // back at the head of the queue and the loop would keep re-reading it.
+        let mut in_flight_tags: Vec<u64> = Vec::with_capacity(max_messages);
+        let mut error: Option<BrokerError> = None;
 
-        for _ in 0..max_messages {
-            let get_result = channel
-                .basic_get(queue.into(), BasicGetOptions { no_ack: false })
-                .await;
+        {
+            let channel = self.get_channel().await?;
 
-            match get_result {
-                Ok(Some(delivery)) => {
-                    let delivery_tag = delivery.delivery_tag;
+            'peek: for _ in 0..max_messages {
+                let get_result = channel
+                    .basic_get(queue.into(), BasicGetOptions { no_ack: false })
+                    .await;
 
-                    match serde_json::from_slice::<Message>(&delivery.data) {
-                        Ok(message) => {
-                            messages.push(message);
+                match get_result {
+                    Ok(Some(delivery)) => {
+                        in_flight_tags.push(delivery.delivery_tag);
 
-                            // Requeue the message immediately
-                            channel
-                                .basic_reject(delivery_tag, BasicRejectOptions { requeue: true })
-                                .await
-                                .map_err(|e| {
-                                    BrokerError::OperationFailed(format!(
-                                        "Failed to requeue peeked message: {}",
-                                        e
-                                    ))
-                                })?;
-                        }
-                        Err(e) => {
-                            // Requeue even on deserialization error
-                            let _ = channel
-                                .basic_reject(delivery_tag, BasicRejectOptions { requeue: true })
-                                .await;
-                            return Err(BrokerError::Serialization(e.to_string()));
+                        match serde_json::from_slice::<Message>(&delivery.data) {
+                            Ok(message) => {
+                                // Defensive de-duplication: if the broker does
+                                // hand back a message we already hold, stop
+                                // rather than reporting it twice.
+                                if !seen_ids.insert(message.headers.id.to_string()) {
+                                    break 'peek;
+                                }
+                                messages.push(message);
+                            }
+                            Err(e) => {
+                                error = Some(BrokerError::Serialization(e.to_string()));
+                                break 'peek;
+                            }
                         }
                     }
-                }
-                Ok(None) => {
-                    // No more messages
-                    break;
-                }
-                Err(e) => {
-                    return Err(BrokerError::OperationFailed(format!(
-                        "Failed to peek message: {}",
-                        e
-                    )));
+                    Ok(None) => {
+                        // No more messages
+                        break 'peek;
+                    }
+                    Err(e) => {
+                        error = Some(BrokerError::OperationFailed(format!(
+                            "Failed to peek message: {}",
+                            e
+                        )));
+                        break 'peek;
+                    }
                 }
             }
+        }
+
+        // Put everything back exactly once, now that nothing else will be read.
+        let requeued = in_flight_tags.len() as u64;
+        self.requeue_tags(&in_flight_tags).await;
+        self.channel_metrics.messages_requeued += requeued;
+
+        if let Some(e) = error {
+            return Err(e);
         }
 
         debug!("Peeked {} messages from queue: {}", messages.len(), queue);

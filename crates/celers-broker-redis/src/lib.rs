@@ -15,7 +15,12 @@
 
 use async_trait::async_trait;
 use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
-use redis::{AsyncCommands, Client};
+use redis::{
+    aio::{ConnectionManager, ConnectionManagerConfig},
+    AsyncCommands, Client,
+};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "metrics")]
@@ -27,6 +32,8 @@ pub mod advanced_queue;
 pub mod authorization;
 pub mod backup_restore;
 pub mod batch_ext;
+#[cfg(test)]
+mod broker_tests;
 pub mod bulkhead;
 pub mod circuit_breaker;
 pub mod cluster;
@@ -186,7 +193,34 @@ pub use utilities::{
     QueueEfficiency, RebalancingRecommendation, SLACompliance, ScalingTimeEstimate,
     WorkerDistribution,
 };
-use visibility::VisibilityManager;
+pub use visibility::{NackAction, PopOutcome, QueueKeys, VisibilityManager, DEFAULT_SWEEP_BATCH};
+
+/// How many revoked messages a single dequeue will discard before giving up
+/// and reporting the queue as empty.
+const REVOKED_SKIP_BUDGET: usize = 32;
+
+/// How many pending entries [`RedisBroker::cancel`] scans per structure when
+/// looking for copies of the revoked task.
+const REVOKE_SCAN_LIMIT: usize = 10_000;
+
+/// How long a revocation is remembered, in seconds (24 hours).
+const DEFAULT_REVOCATION_TTL_SECS: u64 = 86_400;
+
+/// How many dead-letter entries are replayed per `EVAL`.
+const REPLAY_CHUNK: usize = 500;
+
+/// Default seconds between two background sweeps (delayed-task promotion and
+/// visibility-timeout recovery) triggered from `dequeue`.
+const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 1;
+
+/// Current Unix time in seconds, saturating to 0 if the clock predates the
+/// epoch rather than panicking.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
 
 /// Queue mode for Redis broker
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -219,20 +253,87 @@ impl std::fmt::Display for QueueMode {
 }
 
 /// Redis-based broker implementation
+///
+/// # Connections
+///
+/// The broker holds one auto-reconnecting [`ConnectionManager`], created on
+/// first use and shared (cheaply cloned) by every operation. Opening a
+/// connection per call — as this used to do — pays a TCP handshake, an
+/// AUTH/SELECT round trip, a tokio task spawn and a socket left in
+/// `TIME_WAIT` for *every message*, which exhausts the ephemeral port range
+/// long before Redis itself is the bottleneck. Blocking pops cannot share a
+/// multiplexed connection (they would stall every other command queued behind
+/// them on that socket), so they are served from a small dedicated
+/// [`ConnectionPool`].
+///
+/// # Delivery guarantees
+///
+/// Dequeue is a single `EVAL` that pops the message, stages it on
+/// `<queue>:processing` and records its visibility deadline in
+/// `<queue>:unacked`. Unacknowledged work is redelivered once that deadline
+/// passes, so a crashed worker's task is never stranded. See the
+/// [`visibility`] module for the full model.
 pub struct RedisBroker {
     client: Client,
+    /// Shared multiplexed connection, established on first use.
+    ///
+    /// Lazily initialised rather than built in the constructor because the
+    /// constructors are synchronous and may run outside a tokio runtime.
+    conn: OnceCell<ConnectionManager>,
+    /// Dedicated connections for blocking pops, which must not share the
+    /// multiplexed connection.
+    blocking_pool: OnceCell<ConnectionPool>,
+    blocking_pool_config: PoolConfig,
+    manager_config: ConnectionManagerConfig,
+    keys: QueueKeys,
     queue_name: String,
     processing_queue: String,
     dlq_name: String,
     delayed_queue: String,
     cancel_channel: String,
     mode: QueueMode,
-    #[allow(dead_code)]
     visibility_manager: VisibilityManager,
     visibility_timeout_secs: u64,
+    /// How long `dequeue` waits for a message before reporting an empty queue
+    block_timeout_secs: f64,
+    /// Minimum seconds between two housekeeping sweeps
+    sweep_interval_secs: u64,
+    /// Unix time of the last housekeeping sweep
+    last_sweep: AtomicU64,
+    /// How long a revocation is remembered
+    revocation_ttl_secs: u64,
 }
 
 impl RedisBroker {
+    /// Assemble a broker around an already-built client.
+    fn from_client(
+        client: Client,
+        queue_name: &str,
+        mode: QueueMode,
+        manager_config: ConnectionManagerConfig,
+    ) -> Self {
+        Self {
+            client,
+            conn: OnceCell::new(),
+            blocking_pool: OnceCell::new(),
+            blocking_pool_config: PoolConfig::default(),
+            manager_config,
+            keys: QueueKeys::new(queue_name),
+            queue_name: queue_name.to_string(),
+            processing_queue: format!("{}:processing", queue_name),
+            dlq_name: format!("{}:dlq", queue_name),
+            delayed_queue: format!("{}:delayed", queue_name),
+            cancel_channel: format!("{}:cancel", queue_name),
+            mode,
+            visibility_manager: VisibilityManager::new(),
+            visibility_timeout_secs: 300, // 5 minutes default
+            block_timeout_secs: 1.0,
+            sweep_interval_secs: DEFAULT_SWEEP_INTERVAL_SECS,
+            last_sweep: AtomicU64::new(0),
+            revocation_ttl_secs: DEFAULT_REVOCATION_TTL_SECS,
+        }
+    }
+
     /// Create a new Redis broker with FIFO mode
     pub fn new(redis_url: &str, queue_name: &str) -> Result<Self> {
         Self::with_mode(redis_url, queue_name, QueueMode::Fifo)
@@ -243,17 +344,12 @@ impl RedisBroker {
         let client = Client::open(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
-        Ok(Self {
+        Ok(Self::from_client(
             client,
-            queue_name: queue_name.to_string(),
-            processing_queue: format!("{}:processing", queue_name),
-            dlq_name: format!("{}:dlq", queue_name),
-            delayed_queue: format!("{}:delayed", queue_name),
-            cancel_channel: format!("{}:cancel", queue_name),
+            queue_name,
             mode,
-            visibility_manager: VisibilityManager::new(),
-            visibility_timeout_secs: 300, // 5 minutes default
-        })
+            ConnectionManagerConfig::new(),
+        ))
     }
 
     /// Create a new Redis broker from a RedisConfig
@@ -262,17 +358,12 @@ impl RedisBroker {
 
         debug!("Created Redis broker with config: {}", config.describe());
 
-        Ok(Self {
+        Ok(Self::from_client(
             client,
-            queue_name: queue_name.to_string(),
-            processing_queue: format!("{}:processing", queue_name),
-            dlq_name: format!("{}:dlq", queue_name),
-            delayed_queue: format!("{}:delayed", queue_name),
-            cancel_channel: format!("{}:cancel", queue_name),
+            queue_name,
             mode,
-            visibility_manager: VisibilityManager::new(),
-            visibility_timeout_secs: 300, // 5 minutes default
-        })
+            config.manager_config(),
+        ))
     }
 
     /// Create a new Redis broker from a SentinelClient (for high availability)
@@ -285,22 +376,57 @@ impl RedisBroker {
 
         info!("Created Redis broker with Sentinel support");
 
-        Ok(Self {
+        Ok(Self::from_client(
             client,
-            queue_name: queue_name.to_string(),
-            processing_queue: format!("{}:processing", queue_name),
-            dlq_name: format!("{}:dlq", queue_name),
-            delayed_queue: format!("{}:delayed", queue_name),
-            cancel_channel: format!("{}:cancel", queue_name),
+            queue_name,
             mode,
-            visibility_manager: VisibilityManager::new(),
-            visibility_timeout_secs: 300, // 5 minutes default
-        })
+            ConnectionManagerConfig::new(),
+        ))
     }
 
     /// Set visibility timeout (default: 300 seconds)
+    ///
+    /// A message that is not acknowledged within this window is put back on
+    /// the queue by the reaper, so this is the longest a crashed worker can
+    /// hold work hostage.
     pub fn with_visibility_timeout(mut self, timeout_secs: u64) -> Self {
         self.visibility_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Set how long [`Broker::dequeue`] waits for a message before reporting
+    /// an empty queue (default: 1 second).
+    pub fn with_block_timeout(mut self, timeout_secs: f64) -> Self {
+        self.block_timeout_secs = timeout_secs.max(0.0);
+        self
+    }
+
+    /// Set the minimum interval between housekeeping sweeps (default: 1
+    /// second).
+    ///
+    /// Each sweep promotes due delayed tasks and reclaims in-flight messages
+    /// past their visibility deadline. Sweeps are triggered opportunistically
+    /// from `dequeue`, and this interval keeps N polling workers from each
+    /// paying for one on every poll.
+    pub fn with_sweep_interval(mut self, interval_secs: u64) -> Self {
+        self.sweep_interval_secs = interval_secs;
+        self
+    }
+
+    /// Set how long a revocation recorded by [`Broker::cancel`] is remembered
+    /// (default: 24 hours).
+    pub fn with_revocation_ttl(mut self, ttl_secs: u64) -> Self {
+        self.revocation_ttl_secs = ttl_secs;
+        self
+    }
+
+    /// Size the pool backing blocking pops (default: [`PoolConfig::default`]).
+    ///
+    /// A blocking command occupies its connection for the whole wait, so this
+    /// caps how many dequeues can be parked at once; beyond it, callers wait
+    /// for a free connection instead of opening more sockets.
+    pub fn with_blocking_pool(mut self, config: PoolConfig) -> Self {
+        self.blocking_pool_config = config;
         self
     }
 
@@ -309,13 +435,39 @@ impl RedisBroker {
         self.mode
     }
 
+    /// Get the shared multiplexed connection, establishing it on first use.
+    ///
+    /// [`ConnectionManager`] is cheap to clone, multiplexes concurrent
+    /// commands over one socket and reconnects by itself after a failure.
+    async fn get_connection(&self) -> Result<ConnectionManager> {
+        self.conn
+            .get_or_try_init(|| async {
+                self.client
+                    .get_connection_manager_with_config(self.manager_config.clone())
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))
+            })
+            .await
+            .cloned()
+    }
+
+    /// Get the pool backing blocking pops, creating it on first use.
+    async fn blocking_connections(&self) -> Result<&ConnectionPool> {
+        self.blocking_pool
+            .get_or_try_init(|| async {
+                ConnectionPool::new(self.client.clone(), self.blocking_pool_config.clone()).await
+            })
+            .await
+    }
+
+    /// The Redis keys this broker operates on.
+    pub fn keys(&self) -> &QueueKeys {
+        &self.keys
+    }
+
     /// Get the number of tasks in the Dead Letter Queue
     pub async fn dlq_size(&self) -> Result<usize> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let size: usize = conn
             .llen(&self.dlq_name)
@@ -327,11 +479,7 @@ impl RedisBroker {
 
     /// Inspect tasks in the Dead Letter Queue
     pub async fn inspect_dlq(&self, limit: isize) -> Result<Vec<SerializedTask>> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let items: Vec<String> = conn
             .lrange(&self.dlq_name, 0, limit - 1)
@@ -348,13 +496,23 @@ impl RedisBroker {
         Ok(tasks)
     }
 
+    /// Turn a raw dead-letter entry into the `(original, replacement, score)`
+    /// triple the replay script consumes, resetting the task to `Pending`.
+    fn replay_triple(item: String) -> Result<(String, String, f64)> {
+        let mut task: SerializedTask =
+            serde_json::from_str(&item).map_err(|e| CelersError::Deserialization(e.to_string()))?;
+        task.metadata.state = celers_core::TaskState::Pending;
+
+        let score = -(task.metadata.priority as f64);
+        let replacement =
+            serde_json::to_string(&task).map_err(|e| CelersError::Serialization(e.to_string()))?;
+
+        Ok((item, replacement, score))
+    }
+
     /// Replay a task from the Dead Letter Queue back to the main queue
     pub async fn replay_from_dlq(&self, task_id: &TaskId) -> Result<bool> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         // Get all DLQ items
         let items: Vec<String> = conn
@@ -368,41 +526,29 @@ impl RedisBroker {
                 .map_err(|e| CelersError::Deserialization(e.to_string()))?;
 
             if &task.metadata.id == task_id {
-                // Remove from DLQ
-                conn.lrem::<_, _, ()>(&self.dlq_name, 1, &item)
+                let triple = Self::replay_triple(item)?;
+
+                // The claim (LREM) and the re-enqueue happen in one
+                // server-side step, so a failure in between can neither
+                // duplicate nor lose the task.
+                let moved = self
+                    .visibility_manager
+                    .replay_dlq(
+                        &mut conn,
+                        &self.keys,
+                        self.mode,
+                        std::slice::from_ref(&triple),
+                    )
                     .await
-                    .map_err(|e| {
-                        CelersError::Broker(format!("Failed to remove from DLQ: {}", e))
-                    })?;
+                    .map_err(|e| CelersError::Broker(format!("Failed to replay task: {}", e)))?;
 
-                // Reset retry count in task metadata
-                let mut replayed_task = task;
-                replayed_task.metadata.state = celers_core::TaskState::Pending;
-
-                let serialized = serde_json::to_string(&replayed_task)
-                    .map_err(|e| CelersError::Serialization(e.to_string()))?;
-
-                // Re-enqueue based on mode
-                match self.mode {
-                    QueueMode::Fifo => {
-                        conn.rpush::<_, _, ()>(&self.queue_name, &serialized)
-                            .await
-                            .map_err(|e| {
-                                CelersError::Broker(format!("Failed to replay task: {}", e))
-                            })?;
-                    }
-                    QueueMode::Priority => {
-                        let score = -replayed_task.metadata.priority as f64;
-                        conn.zadd::<_, _, _, ()>(&self.queue_name, &serialized, score)
-                            .await
-                            .map_err(|e| {
-                                CelersError::Broker(format!("Failed to replay task: {}", e))
-                            })?;
-                    }
+                if moved > 0 {
+                    info!("Replayed task {} from DLQ", task_id);
+                    return Ok(true);
                 }
 
-                info!("Replayed task {} from DLQ", task_id);
-                return Ok(true);
+                // Another replayer claimed the same entry first.
+                return Ok(false);
             }
         }
 
@@ -411,11 +557,7 @@ impl RedisBroker {
 
     /// Clear all tasks from the Dead Letter Queue
     pub async fn clear_dlq(&self) -> Result<usize> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let count: usize = conn
             .llen(&self.dlq_name)
@@ -454,8 +596,16 @@ impl RedisBroker {
     }
 
     /// Create a task deduplicator
+    ///
+    /// Shares this broker's connection when one has already been
+    /// established, so a deduplicator built per enqueue does not open a
+    /// connection of its own.
     pub fn deduplicator(&self) -> Deduplicator {
-        Deduplicator::new(self.client.clone(), &self.queue_name)
+        let deduplicator = Deduplicator::new(self.client.clone(), &self.queue_name);
+        match self.conn.get() {
+            Some(manager) => deduplicator.with_connection_manager(manager.clone()),
+            None => deduplicator,
+        }
     }
 
     /// Create a script manager for Lua script optimization
@@ -473,8 +623,17 @@ impl RedisBroker {
     }
 
     /// Create a batch operations handler for advanced batch processing
+    ///
+    /// Inherits this broker's visibility timeout and, when one has already
+    /// been established, its connection.
     pub fn batch_operations(&self) -> BatchOperations {
-        BatchOperations::new(self.client.clone(), self.queue_name.clone(), self.mode)
+        let operations =
+            BatchOperations::new(self.client.clone(), self.queue_name.clone(), self.mode)
+                .with_visibility_timeout(self.visibility_timeout_secs);
+        match self.conn.get() {
+            Some(manager) => operations.with_connection_manager(manager.clone()),
+            None => operations,
+        }
     }
 
     /// Create a priority manager for dynamic priority adjustments
@@ -510,11 +669,7 @@ impl RedisBroker {
     /// This helps prevent unbounded queue growth by automatically expiring old tasks.
     /// TTL is set in seconds.
     pub async fn set_queue_ttl(&self, ttl_secs: u64) -> Result<()> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         // Set TTL on main queue
         let _: () = redis::cmd("EXPIRE")
@@ -549,11 +704,7 @@ impl RedisBroker {
 
     /// Clean up old tasks from DLQ (older than specified age in seconds)
     pub async fn cleanup_dlq(&self, max_age_secs: u64) -> Result<usize> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let items: Vec<String> = conn
             .lrange(&self.dlq_name, 0, -1)
@@ -630,23 +781,29 @@ impl RedisBroker {
         &self.queue_name
     }
 
+    /// Get the unacked set name (in-flight messages and their deadlines)
+    pub fn unacked_set_name(&self) -> &str {
+        &self.keys.unacked
+    }
+
     /// Get all queue names managed by this broker
+    ///
+    /// Includes the unacked set: it holds in-flight bookkeeping, so leaving
+    /// it out of [`Self::purge_all_queues`] would strand deadlines whose
+    /// messages no longer exist and have the reaper resurrect ghosts.
     pub fn queue_names(&self) -> Vec<String> {
         vec![
             self.queue_name.clone(),
             self.processing_queue.clone(),
             self.dlq_name.clone(),
             self.delayed_queue.clone(),
+            self.keys.unacked.clone(),
         ]
     }
 
     /// Check if a specific queue exists and has tasks
     pub async fn queue_exists(&self, queue_name: &str) -> Result<bool> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let exists: bool = redis::cmd("EXISTS")
             .arg(queue_name)
@@ -659,11 +816,7 @@ impl RedisBroker {
 
     /// Get the size of a specific queue by name
     pub async fn get_queue_size_by_name(&self, queue_name: &str) -> Result<usize> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         // Try both list and sorted set
         let list_size: usize = conn.llen(queue_name).await.unwrap_or(0);
@@ -677,11 +830,7 @@ impl RedisBroker {
 
     /// Delete a specific queue (use with caution!)
     pub async fn delete_queue(&self, queue_name: &str) -> Result<()> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         conn.del::<_, ()>(queue_name)
             .await
@@ -719,16 +868,58 @@ impl RedisBroker {
         Ok(sizes)
     }
 
-    /// Move all tasks from processing queue back to main queue
+    /// Requeue in-flight tasks whose visibility timeout has expired.
     ///
-    /// Useful for recovering tasks that were being processed when a worker crashed.
-    /// Returns the number of tasks moved.
+    /// This is the crash-recovery path: a worker that dies mid-task stops
+    /// acknowledging, its deadline lapses, and the message goes back on the
+    /// queue. Tasks a *live* worker is still executing keep their deadline
+    /// and are left alone — the old blanket "move everything back" behaviour
+    /// duplicated exactly those tasks, so it now lives under the explicit
+    /// name [`Self::force_recover_all_processing_tasks`].
+    ///
+    /// One call moves at most [`DEFAULT_SWEEP_BATCH`] messages so a huge
+    /// backlog cannot stall the (single-threaded) Redis server; call it again
+    /// while it keeps returning that many.
+    ///
+    /// Returns the number of tasks requeued.
     pub async fn recover_processing_tasks(&self) -> Result<usize> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
+        let mut conn = self.get_connection().await?;
+
+        let recovered = self
+            .visibility_manager
+            .reap(
+                &mut conn,
+                &self.keys,
+                self.mode,
+                self.visibility_timeout_secs,
+                DEFAULT_SWEEP_BATCH,
+            )
             .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+            .map_err(|e| {
+                CelersError::Broker(format!("Failed to recover timed-out tasks: {}", e))
+            })?;
+
+        if recovered > 0 {
+            info!("Recovered {} timed-out tasks from processing", recovered);
+        }
+
+        Ok(recovered.max(0) as usize)
+    }
+
+    /// Move **every** in-flight task back to the main queue, whether or not
+    /// its visibility timeout has expired.
+    ///
+    /// # Warning
+    ///
+    /// Tasks that a live worker is executing right now are moved too, so they
+    /// will run a second time. Use this only when no worker is running (for
+    /// example after an unclean shutdown of the whole fleet); during normal
+    /// operation use [`Self::recover_processing_tasks`], which only reclaims
+    /// work whose owner has gone silent past the visibility timeout.
+    ///
+    /// Returns the number of tasks moved.
+    pub async fn force_recover_all_processing_tasks(&self) -> Result<usize> {
+        let mut conn = self.get_connection().await?;
 
         let items: Vec<String> = conn
             .lrange(&self.processing_queue, 0, -1)
@@ -743,22 +934,26 @@ impl RedisBroker {
 
         let count = items.len();
         let mut pipe = redis::pipe();
+        // MULTI/EXEC: a bare pipeline is only batching, so a failure halfway
+        // through would leave tasks in both structures.
+        pipe.atomic();
 
         for item in &items {
             // Parse to get task
             if let Ok(task) = serde_json::from_str::<SerializedTask>(item) {
-                // Add back to main queue based on mode
+                // Add back to the *back* of the main queue based on mode
                 match self.mode {
                     QueueMode::Fifo => {
-                        pipe.rpush(&self.queue_name, item);
+                        pipe.lpush(&self.queue_name, item);
                     }
                     QueueMode::Priority => {
                         let score = -(task.metadata.priority as f64);
                         pipe.zadd(&self.queue_name, item, score);
                     }
                 }
-                // Remove from processing queue
+                // Clear both in-flight structures
                 pipe.lrem(&self.processing_queue, 1, item);
+                pipe.zrem(&self.keys.unacked, item);
             }
         }
 
@@ -788,11 +983,7 @@ impl RedisBroker {
     ///
     /// This is an approximation based on serialized task sizes.
     pub async fn estimate_memory_usage(&self) -> Result<usize> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let mut total_bytes = 0usize;
 
@@ -812,32 +1003,62 @@ impl RedisBroker {
 
     /// Move tasks from DLQ back to main queue in bulk
     ///
+    /// Single pass: one `LRANGE` to read the candidates, then one `EVAL` per
+    /// [`REPLAY_CHUNK`] entries to claim and re-enqueue them. Replaying `n`
+    /// tasks by calling [`Self::replay_from_dlq`] in a loop would instead read
+    /// and deserialize the *whole* dead letter queue once per task.
+    ///
     /// Returns the number of tasks moved.
     pub async fn bulk_replay_from_dlq(&self, max_count: Option<usize>) -> Result<usize> {
-        let limit = max_count.unwrap_or(isize::MAX as usize) as isize;
-        let tasks = self.inspect_dlq(limit).await?;
-        let count = tasks.len();
-
-        for task in tasks {
-            self.replay_from_dlq(&task.metadata.id).await?;
+        let limit = max_count.unwrap_or(usize::MAX).min(isize::MAX as usize) as isize;
+        if limit == 0 {
+            return Ok(0);
         }
 
-        Ok(count)
+        let mut conn = self.get_connection().await?;
+
+        let items: Vec<String> = conn
+            .lrange(&self.dlq_name, 0, limit - 1)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to get DLQ items: {}", e)))?;
+
+        let mut triples = Vec::with_capacity(items.len());
+        for item in items {
+            match Self::replay_triple(item) {
+                Ok(triple) => triples.push(triple),
+                // A malformed entry cannot be re-enqueued; leave it in the
+                // DLQ for inspection rather than failing the whole batch.
+                Err(e) => warn!("Skipping undeserializable DLQ entry: {}", e),
+            }
+        }
+
+        let mut moved = 0usize;
+        for chunk in triples.chunks(REPLAY_CHUNK) {
+            let chunk_moved = self
+                .visibility_manager
+                .replay_dlq(&mut conn, &self.keys, self.mode, chunk)
+                .await
+                .map_err(|e| CelersError::Broker(format!("Failed to replay DLQ batch: {}", e)))?;
+            moved += chunk_moved.max(0) as usize;
+        }
+
+        if moved > 0 {
+            info!("Replayed {} tasks from DLQ", moved);
+        }
+
+        Ok(moved)
     }
 
     /// Peek at the next task without dequeueing it
     ///
     /// Useful for inspecting what will be processed next without removing it from the queue.
     pub async fn peek_next(&self) -> Result<Option<SerializedTask>> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let data: Option<String> = match self.mode {
             QueueMode::Fifo => {
-                // Get last item (will be next to dequeue)
+                // The tail is the oldest message and therefore the next one
+                // out: producers push to the head, consumers pop the tail.
                 conn.lindex(&self.queue_name, -1)
                     .await
                     .map_err(|e| CelersError::Broker(format!("Failed to peek: {}", e)))?
@@ -879,72 +1100,185 @@ impl RedisBroker {
 
     /// Move ready delayed tasks to the main queue
     ///
-    /// Checks the delayed queue for tasks ready to execute (timestamp <= now)
-    /// and moves them to the main queue atomically.
-    async fn process_delayed_tasks(&self) -> Result<usize> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+    /// A single `EVAL` claims each due message with `ZREM` before pushing it,
+    /// so concurrent sweepers are mutually exclusive. The previous
+    /// read-then-write pipeline let every worker read the same ready set and
+    /// re-enqueue it before any of them removed it, delivering each delayed
+    /// task once per concurrent poller; a bare `redis::pipe()` is command
+    /// batching, not `MULTI`/`EXEC`, so it never made that safe.
+    ///
+    /// One call promotes at most [`DEFAULT_SWEEP_BATCH`] tasks; call it again
+    /// while it keeps returning that many.
+    ///
+    /// Returns the number of tasks promoted.
+    pub async fn promote_delayed_tasks(&self) -> Result<usize> {
+        let mut conn = self.get_connection().await?;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| CelersError::Other(format!("Failed to get current time: {}", e)))?
-            .as_secs() as f64;
-
-        // Get all tasks ready for execution (score <= now)
-        let ready_tasks: Vec<String> =
-            conn.zrangebyscore(&self.delayed_queue, "-inf", now)
-                .await
-                .map_err(|e| CelersError::Broker(format!("Failed to get ready tasks: {}", e)))?;
-
-        if ready_tasks.is_empty() {
-            return Ok(0);
-        }
-
-        let count = ready_tasks.len();
-
-        // Move tasks to main queue based on queue mode
-        let mut pipe = redis::pipe();
-
-        for task_data in &ready_tasks {
-            // Deserialize to get priority for sorted queue
-            if let Ok(task) = serde_json::from_str::<SerializedTask>(task_data) {
-                match self.mode {
-                    QueueMode::Fifo => {
-                        pipe.rpush(&self.queue_name, task_data);
-                    }
-                    QueueMode::Priority => {
-                        let score = -(task.metadata.priority as f64);
-                        pipe.zadd(&self.queue_name, task_data, score);
-                    }
-                }
-            }
-
-            // Remove from delayed queue
-            pipe.zrem(&self.delayed_queue, task_data);
-        }
-
-        // Execute all operations atomically
-        pipe.query_async::<redis::Value>(&mut conn)
+        let moved = self
+            .visibility_manager
+            .promote_delayed(&mut conn, &self.keys, self.mode, DEFAULT_SWEEP_BATCH)
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to move delayed tasks: {}", e)))?;
 
-        debug!("Moved {} delayed tasks to main queue", count);
+        if moved > 0 {
+            debug!("Moved {} delayed tasks to main queue", moved);
+        }
 
-        Ok(count)
+        Ok(moved.max(0) as usize)
     }
+
+    /// Whether enough time has passed to run another housekeeping sweep.
+    ///
+    /// Claiming the slot with a compare-exchange means that when N workers
+    /// poll simultaneously exactly one of them pays for the sweep.
+    fn claim_sweep(&self) -> bool {
+        let now = now_secs();
+        let last = self.last_sweep.load(Ordering::Relaxed);
+
+        if now.saturating_sub(last) < self.sweep_interval_secs {
+            return false;
+        }
+
+        self.last_sweep
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Promote due delayed tasks and reclaim timed-out in-flight messages.
+    ///
+    /// Runs at most once every [`Self::with_sweep_interval`] seconds. Both
+    /// steps are bounded, atomic scripts, so this costs two round trips —
+    /// never the unbounded `ZRANGEBYSCORE` + deserialize-everything pass that
+    /// used to run on *every* dequeue of *every* worker.
+    ///
+    /// Failures are logged rather than propagated: housekeeping must not turn
+    /// a healthy dequeue into an error, but it must not be silent either.
+    async fn run_maintenance(&self, conn: &mut ConnectionManager) {
+        if !self.claim_sweep() {
+            return;
+        }
+
+        match self
+            .visibility_manager
+            .promote_delayed(conn, &self.keys, self.mode, DEFAULT_SWEEP_BATCH)
+            .await
+        {
+            Ok(moved) if moved > 0 => debug!("Promoted {} delayed tasks", moved),
+            Ok(_) => {}
+            Err(e) => warn!("Failed to promote delayed tasks: {}", e),
+        }
+
+        match self
+            .visibility_manager
+            .reap(
+                conn,
+                &self.keys,
+                self.mode,
+                self.visibility_timeout_secs,
+                DEFAULT_SWEEP_BATCH,
+            )
+            .await
+        {
+            Ok(recovered) if recovered > 0 => {
+                warn!(
+                    "Recovered {} tasks whose visibility timeout expired",
+                    recovered
+                )
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Failed to recover timed-out tasks: {}", e),
+        }
+    }
+
+    /// Blocking tail of the dequeue path.
+    ///
+    /// Runs on a dedicated pooled connection: a blocking command issued on
+    /// the shared multiplexed connection would park every other command
+    /// queued behind it on that socket.
+    async fn blocking_pop(&self, conn: &mut ConnectionManager) -> Result<Option<String>> {
+        // Priority mode has no blocking primitive (there is no
+        // `BZPOPMIN`-into-list), so the atomic script is the whole story.
+        if !self.mode.is_fifo() || self.block_timeout_secs <= 0.0 {
+            return Ok(None);
+        }
+
+        let mut pooled = self.blocking_connections().await?.get().await?;
+        let data: Option<String> = pooled
+            .get_mut()
+            .brpoplpush(
+                &self.queue_name,
+                &self.processing_queue,
+                self.block_timeout_secs,
+            )
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to dequeue task: {}", e)))?;
+        drop(pooled);
+
+        let Some(message) = data else {
+            return Ok(None);
+        };
+
+        // Record the visibility deadline for the message we just staged. If
+        // this write is lost (crash, connection drop) the reaper adopts the
+        // orphan on its next pass, so recovery never depends on it landing.
+        self.visibility_manager
+            .register_unacked(conn, &self.keys, &message, self.visibility_timeout_secs)
+            .await
+            .map_err(|e| {
+                CelersError::Broker(format!("Failed to record visibility deadline: {}", e))
+            })?;
+
+        // The atomic script filters revoked messages itself; this path has to
+        // ask, or a revoked task would still be delivered.
+        if let Ok(Some(id)) = message_task_id(&message) {
+            if self
+                .visibility_manager
+                .is_revoked(conn, &self.keys, &id)
+                .await
+                .unwrap_or(false)
+            {
+                self.visibility_manager
+                    .ack_unacked(conn, &self.keys, &message)
+                    .await
+                    .map_err(|e| {
+                        CelersError::Broker(format!("Failed to drop revoked task: {}", e))
+                    })?;
+                debug!("Dropped revoked task {} during dequeue", id);
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(message))
+    }
+
+    /// Move a message that cannot be deserialized out of the in-flight
+    /// structures and into the dead letter queue.
+    ///
+    /// Without this a poison message is redelivered forever: the reaper puts
+    /// it back on the queue every visibility timeout, and every worker that
+    /// picks it up fails on it again.
+    async fn quarantine_poison_message(&self, conn: &mut ConnectionManager, message: &str) {
+        if let Err(e) = self
+            .visibility_manager
+            .nack_unacked(conn, &self.keys, message, NackAction::DeadLetter, self.mode)
+            .await
+        {
+            error!("Failed to quarantine undeserializable message: {}", e);
+        }
+    }
+}
+
+/// Extract the task id from a raw serialized message.
+fn message_task_id(message: &str) -> Result<Option<String>> {
+    let task: SerializedTask =
+        serde_json::from_str(message).map_err(|e| CelersError::Deserialization(e.to_string()))?;
+    Ok(Some(task.metadata.id.to_string()))
 }
 
 #[async_trait]
 impl Broker for RedisBroker {
     async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let task_id = task.metadata.id;
         let priority = task.metadata.priority;
@@ -953,8 +1287,13 @@ impl Broker for RedisBroker {
 
         match self.mode {
             QueueMode::Fifo => {
-                // Use list for FIFO (priority ignored)
-                conn.rpush::<_, _, ()>(&self.queue_name, &serialized)
+                // Push to the head: consumers pop the tail (`BRPOPLPUSH` /
+                // `RPOP`), so head-push + tail-pop is FIFO. Appending with
+                // `RPUSH` instead would make the queue a *stack* — the newest
+                // task delivered first, the oldest starving indefinitely —
+                // and would disagree with Kombu, whose Redis transport also
+                // produces with `LPUSH` and consumes with `RPOP`.
+                conn.lpush::<_, _, ()>(&self.queue_name, &serialized)
                     .await
                     .map_err(|e| CelersError::Broker(format!("Failed to enqueue task: {}", e)))?;
             }
@@ -985,49 +1324,58 @@ impl Broker for RedisBroker {
         Ok(task_id)
     }
 
+    /// Take the next message, staging it as in-flight under a visibility
+    /// timeout.
+    ///
+    /// The pop, the staging and the deadline are one atomic `EVAL`, so a
+    /// message can never be lost between "removed from the queue" and
+    /// "recorded somewhere recoverable" — the old Priority path did
+    /// `ZPOPMIN` and then a *separate* `LPUSH`, and a crash in between
+    /// destroyed the task with no trace anywhere in Redis.
+    ///
+    /// Returns `None` when the queue is empty, paused, or the only available
+    /// messages were revoked.
     async fn dequeue(&self) -> Result<Option<BrokerMessage>> {
-        // Process delayed tasks first (move ready tasks to main queue)
-        let _ = self.process_delayed_tasks().await;
+        let mut conn = self.get_connection().await?;
 
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
+        // Promote due delayed tasks and reclaim expired in-flight work.
+        // Throttled, bounded and atomic (see `run_maintenance`).
+        self.run_maintenance(&mut conn).await;
+
+        let outcome = self
+            .visibility_manager
+            .pop_to_unacked(
+                &mut conn,
+                &self.keys,
+                self.mode,
+                self.visibility_timeout_secs,
+                REVOKED_SKIP_BUDGET,
+            )
             .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+            .map_err(|e| CelersError::Broker(format!("Failed to dequeue task: {}", e)))?;
 
-        let result = match self.mode {
-            QueueMode::Fifo => {
-                // Use BRPOPLPUSH for atomic dequeue and move to processing queue
-                conn.brpoplpush(&self.queue_name, &self.processing_queue, 1.0)
-                    .await
-                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue task: {}", e)))?
+        let result = match outcome {
+            PopOutcome::Message(data) => Some(data),
+            PopOutcome::Paused => {
+                debug!("Queue {} is paused, not dequeuing", self.queue_name);
+                return Ok(None);
             }
-            QueueMode::Priority => {
-                // Use ZPOPMIN to get highest priority task (lowest score due to negation)
-                // Note: Redis doesn't have BZPOPMINLPUSH, so we do two operations
-                let items: Vec<(String, f64)> = conn
-                    .zpopmin(&self.queue_name, 1)
-                    .await
-                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue task: {}", e)))?;
-
-                if let Some((data, _score)) = items.first() {
-                    // Move to processing queue
-                    conn.lpush::<_, _, ()>(&self.processing_queue, data)
-                        .await
-                        .map_err(|e| {
-                            CelersError::Broker(format!("Failed to move task to processing: {}", e))
-                        })?;
-                    Some(data.clone())
-                } else {
-                    None
-                }
-            }
+            // Nothing was ready; wait for an arrival instead of spinning.
+            PopOutcome::Empty => self.blocking_pop(&mut conn).await?,
         };
 
         match result {
             Some(data) => {
-                let task: SerializedTask = serde_json::from_str(&data)
-                    .map_err(|e| CelersError::Deserialization(e.to_string()))?;
+                let task: SerializedTask = match serde_json::from_str(&data) {
+                    Ok(task) => task,
+                    Err(e) => {
+                        // Do not leave it in-flight: the reaper would put it
+                        // back on the queue every visibility timeout forever.
+                        error!("Undeserializable message moved to DLQ: {}", e);
+                        self.quarantine_poison_message(&mut conn, &data).await;
+                        return Err(CelersError::Deserialization(e.to_string()));
+                    }
+                };
 
                 debug!(
                     "Dequeued task {} (priority: {})",
@@ -1044,13 +1392,12 @@ impl Broker for RedisBroker {
 
     async fn ack(&self, task_id: &TaskId, receipt_handle: Option<&str>) -> Result<()> {
         if let Some(handle) = receipt_handle {
-            let mut conn = self
-                .client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+            let mut conn = self.get_connection().await?;
 
-            conn.lrem::<_, _, ()>(&self.processing_queue, 1, handle)
+            // Clears both in-flight structures: the visibility deadline and
+            // the processing-list entry.
+            self.visibility_manager
+                .ack_unacked(&mut conn, &self.keys, handle)
                 .await
                 .map_err(|e| CelersError::Broker(format!("Failed to ack task: {}", e)))?;
 
@@ -1066,18 +1413,7 @@ impl Broker for RedisBroker {
         requeue: bool,
     ) -> Result<()> {
         if let Some(handle) = receipt_handle {
-            let mut conn = self
-                .client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
-
-            // Remove from processing queue
-            conn.lrem::<_, _, ()>(&self.processing_queue, 1, handle)
-                .await
-                .map_err(|e| {
-                    CelersError::Broker(format!("Failed to remove from processing: {}", e))
-                })?;
+            let mut conn = self.get_connection().await?;
 
             if requeue {
                 // Re-add to main queue (increment retry count)
@@ -1094,23 +1430,22 @@ impl Broker for RedisBroker {
                 let serialized = serde_json::to_string(&task)
                     .map_err(|e| CelersError::Serialization(e.to_string()))?;
 
-                match self.mode {
-                    QueueMode::Fifo => {
-                        conn.rpush::<_, _, ()>(&self.queue_name, &serialized)
-                            .await
-                            .map_err(|e| {
-                                CelersError::Broker(format!("Failed to requeue task: {}", e))
-                            })?;
-                    }
-                    QueueMode::Priority => {
-                        let score = -task.metadata.priority as f64;
-                        conn.zadd::<_, _, _, ()>(&self.queue_name, &serialized, score)
-                            .await
-                            .map_err(|e| {
-                                CelersError::Broker(format!("Failed to requeue task: {}", e))
-                            })?;
-                    }
-                }
+                // One EVAL clears both in-flight structures and requeues the
+                // rewritten payload at the *back* of the queue, so a retry
+                // cannot spin ahead of tasks that were already waiting.
+                self.visibility_manager
+                    .nack_unacked(
+                        &mut conn,
+                        &self.keys,
+                        handle,
+                        NackAction::Requeue {
+                            payload: &serialized,
+                            score: -(task.metadata.priority as f64),
+                        },
+                        self.mode,
+                    )
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to requeue task: {}", e)))?;
 
                 info!(
                     "Rejected and requeued task {} (retry {})",
@@ -1118,7 +1453,14 @@ impl Broker for RedisBroker {
                 );
             } else {
                 // Move to Dead Letter Queue
-                conn.lpush::<_, _, ()>(&self.dlq_name, handle)
+                self.visibility_manager
+                    .nack_unacked(
+                        &mut conn,
+                        &self.keys,
+                        handle,
+                        NackAction::DeadLetter,
+                        self.mode,
+                    )
                     .await
                     .map_err(|e| {
                         CelersError::Broker(format!("Failed to move task to DLQ: {}", e))
@@ -1130,11 +1472,7 @@ impl Broker for RedisBroker {
     }
 
     async fn queue_size(&self) -> Result<usize> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let size: usize = match self.mode {
             QueueMode::Fifo => conn
@@ -1162,30 +1500,51 @@ impl Broker for RedisBroker {
         Ok(size)
     }
 
+    /// Revoke a task.
+    ///
+    /// The revocation is **durable**: the id is recorded in
+    /// `<queue>:revoked` (scored by its expiry, pruned on every call) and
+    /// every dequeue path drops messages whose id is listed there, so a task
+    /// that is still sitting in the queue really is cancelled. Pending copies
+    /// are also removed from the main and delayed queues on a best-effort,
+    /// bounded scan.
+    ///
+    /// Pub/Sub notification is kept for workers that are already executing
+    /// the task, but it is *not* the mechanism: it is fire-and-forget, so a
+    /// worker that is restarting or momentarily disconnected never sees it —
+    /// which is exactly why the old implementation, which only published,
+    /// cancelled nothing at all.
+    ///
+    /// Returns `true` once the revocation is recorded.
     async fn cancel(&self, task_id: &TaskId) -> Result<bool> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
-
-        // Publish cancellation message
+        let mut conn = self.get_connection().await?;
         let cancel_msg = task_id.to_string();
+
+        let removed = self
+            .visibility_manager
+            .revoke(
+                &mut conn,
+                &self.keys,
+                &cancel_msg,
+                self.mode,
+                self.revocation_ttl_secs,
+                REVOKE_SCAN_LIMIT,
+            )
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to record revocation: {}", e)))?;
+
+        // Notify workers that may already be executing the task.
         let subscribers: i32 = conn
             .publish(&self.cancel_channel, &cancel_msg)
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to publish cancel message: {}", e)))?;
 
-        if subscribers > 0 {
-            info!(
-                "Published cancellation for task {} to {} subscriber(s)",
-                task_id, subscribers
-            );
-            Ok(true)
-        } else {
-            warn!("No subscribers listening for task {} cancellation", task_id);
-            Ok(false)
-        }
+        info!(
+            "Revoked task {} (removed {} pending copies, notified {} subscriber(s))",
+            task_id, removed, subscribers
+        );
+
+        Ok(true)
     }
 
     // Optimized batch operations using Redis pipelining
@@ -1195,14 +1554,13 @@ impl Broker for RedisBroker {
             return Ok(Vec::new());
         }
 
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let mut task_ids = Vec::with_capacity(tasks.len());
         let mut pipe = redis::pipe();
+        // MULTI/EXEC so a batch enqueue is all-or-nothing rather than a
+        // partially applied batch after a mid-flight failure.
+        pipe.atomic();
 
         // Build pipeline with all enqueue operations
         for task in &tasks {
@@ -1214,7 +1572,8 @@ impl Broker for RedisBroker {
 
             match self.mode {
                 QueueMode::Fifo => {
-                    pipe.rpush(&self.queue_name, &serialized);
+                    // Head-push, tail-pop: see `enqueue`.
+                    pipe.lpush(&self.queue_name, &serialized);
                 }
                 QueueMode::Priority => {
                     let score = -(task.metadata.priority as f64);
@@ -1258,73 +1617,37 @@ impl Broker for RedisBroker {
             return Ok(Vec::new());
         }
 
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
+        let mut conn = self.get_connection().await?;
+
+        self.run_maintenance(&mut conn).await;
+
+        // One EVAL pops the whole batch, stages it and records a visibility
+        // deadline per message. The old Priority path popped the batch with
+        // `ZPOPMIN` and only then pipelined the `LPUSH`es, so a failure in
+        // between destroyed up to `count` tasks at once.
+        let items = self
+            .visibility_manager
+            .pop_batch_to_unacked(
+                &mut conn,
+                &self.keys,
+                self.mode,
+                self.visibility_timeout_secs,
+                count,
+            )
             .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+            .map_err(|e| CelersError::Broker(format!("Failed to dequeue batch: {}", e)))?;
 
-        let mut messages = Vec::with_capacity(count);
-
-        match self.mode {
-            QueueMode::Fifo => {
-                // Use pipeline for FIFO batch dequeue
-                let mut pipe = redis::pipe();
-                for _ in 0..count {
-                    pipe.rpoplpush(&self.queue_name, &self.processing_queue);
-                }
-
-                let results: Vec<Option<String>> = pipe
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue batch: {}", e)))?;
-
-                for data_opt in results {
-                    if let Some(data) = data_opt {
-                        let task: SerializedTask = serde_json::from_str(&data)
-                            .map_err(|e| CelersError::Deserialization(e.to_string()))?;
-
-                        messages.push(BrokerMessage {
-                            task,
-                            receipt_handle: Some(data),
-                        });
-                    } else {
-                        break; // Queue is empty
-                    }
-                }
-            }
-            QueueMode::Priority => {
-                // For priority queue, pop multiple items at once
-                let items: Vec<(String, f64)> = conn
-                    .zpopmin(&self.queue_name, count as isize)
-                    .await
-                    .map_err(|e| CelersError::Broker(format!("Failed to dequeue batch: {}", e)))?;
-
-                if !items.is_empty() {
-                    // Move all to processing queue using pipeline
-                    let mut pipe = redis::pipe();
-                    for (data, _score) in &items {
-                        pipe.lpush(&self.processing_queue, data);
-                    }
-
-                    pipe.query_async::<redis::Value>(&mut conn)
-                        .await
-                        .map_err(|e| {
-                            CelersError::Broker(format!(
-                                "Failed to move batch to processing: {}",
-                                e
-                            ))
-                        })?;
-
-                    for (data, _score) in items {
-                        let task: SerializedTask = serde_json::from_str(&data)
-                            .map_err(|e| CelersError::Deserialization(e.to_string()))?;
-
-                        messages.push(BrokerMessage {
-                            task,
-                            receipt_handle: Some(data),
-                        });
-                    }
+        let mut messages = Vec::with_capacity(items.len());
+        for data in items {
+            match serde_json::from_str::<SerializedTask>(&data) {
+                Ok(task) => messages.push(BrokerMessage {
+                    task,
+                    receipt_handle: Some(data),
+                }),
+                Err(e) => {
+                    // Quarantine rather than poison-loop the batch forever.
+                    error!("Undeserializable message moved to DLQ: {}", e);
+                    self.quarantine_poison_message(&mut conn, &data).await;
                 }
             }
         }
@@ -1350,17 +1673,18 @@ impl Broker for RedisBroker {
             return Ok(());
         }
 
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let mut pipe = redis::pipe();
+        // MULTI/EXEC: acknowledging half a batch would leave the rest
+        // in-flight and have the reaper redeliver already-finished work.
+        pipe.atomic();
         let mut ack_count = 0;
 
         for (task_id, receipt_handle) in tasks {
             if let Some(handle) = receipt_handle {
+                // Clear both in-flight structures, as `ack` does.
+                pipe.zrem(&self.keys.unacked, handle);
                 pipe.lrem(&self.processing_queue, 1, handle);
                 ack_count += 1;
             } else {
@@ -1382,11 +1706,7 @@ impl Broker for RedisBroker {
     // Delayed Task Execution
 
     async fn enqueue_at(&self, task: SerializedTask, execute_at: i64) -> Result<TaskId> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.get_connection().await?;
 
         let task_id = task.metadata.id;
         let serialized =

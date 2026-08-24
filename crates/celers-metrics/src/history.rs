@@ -124,7 +124,14 @@ impl MetricHistory {
         let first = samples.front().expect("non-empty VecDeque has a front");
         let last = samples.back().expect("non-empty VecDeque has a back");
 
-        let time_delta = (last.timestamp - first.timestamp) as f64;
+        // `record_batch` accepts arbitrary, unordered timestamps, and even
+        // `record()`'s `SystemTime::now()` can step backwards across an NTP
+        // correction, so `front()` is not guaranteed to be chronologically
+        // earlier than `back()`. A plain `u64` subtraction would then
+        // underflow (panic in debug, wrap to ~1.8e19 in release, silently
+        // turning the trend into ~0 and disabling trend-based alerts).
+        // `saturating_sub` reports "no reliable time span" (`None`) instead.
+        let time_delta = last.timestamp.saturating_sub(first.timestamp) as f64;
         if time_delta == 0.0 {
             return None;
         }
@@ -221,7 +228,9 @@ impl MetricHistory {
         let trend = if samples.len() >= 2 {
             let first = samples.front().expect("len >= 2 means front exists");
             let last = samples.back().expect("len >= 2 means back exists");
-            let time_delta = (last.timestamp - first.timestamp) as f64;
+            // See `MetricHistory::trend` for why this must saturate rather
+            // than subtract directly.
+            let time_delta = last.timestamp.saturating_sub(first.timestamp) as f64;
             if time_delta > 0.0 {
                 Some((last.value - first.value) / time_delta)
             } else {
@@ -417,15 +426,24 @@ pub fn recommend_scaling(config: &AutoScalingConfig) -> ScalingRecommendation {
         0.0
     };
 
-    // Check if queue is growing too large
+    // Check if queue is growing too large. The `current_workers <
+    // config.max_workers` guard is evaluated *before* the arithmetic below
+    // (not just before the returned recommendation): `config.max_workers -
+    // current_workers` would otherwise underflow whenever more workers are
+    // already live than the configured maximum allows (e.g. after a config
+    // change lowering `max_workers`, or a manual scale-out) -- a panic in
+    // debug builds, or a huge wrapped `usize` in release that would falsely
+    // recommend scaling up by billions of workers.
     let queue_per_worker = queue_size / metrics.active_workers;
-    if queue_per_worker > config.target_queue_per_worker * 2.0 {
+    if queue_per_worker > config.target_queue_per_worker * 2.0
+        && current_workers < config.max_workers
+    {
         let additional_workers_needed = ((queue_size / config.target_queue_per_worker).ceil()
             as usize)
             .saturating_sub(current_workers)
-            .min(config.max_workers - current_workers);
+            .min(config.max_workers.saturating_sub(current_workers));
 
-        if additional_workers_needed > 0 && current_workers < config.max_workers {
+        if additional_workers_needed > 0 {
             return ScalingRecommendation::ScaleUp {
                 workers: additional_workers_needed,
                 reason: format!(
@@ -600,33 +618,52 @@ pub fn forecast_metric(history: &MetricHistory, seconds_ahead: u64) -> Option<Fo
         return None; // Need at least 3 samples for reasonable forecast
     }
 
-    // Simple linear regression: y = mx + b
+    // Simple linear regression: y = mx + b, fit on timestamps *centered* on
+    // the first sample (i.e. seconds-since-first-sample) rather than raw
+    // Unix timestamps (~1.7e9). Centering keeps the regression inputs small,
+    // which matters because `n * sum_x2 - sum_x^2` is computed from sums of
+    // squared timestamps: at raw-epoch magnitude that difference is a
+    // subtraction of two ~1e20 values whose f64 ulp (~32768) dwarfs the true
+    // result for any short, second-resolution history, so the "avoid
+    // division by zero" guard below would trip on every realistic input and
+    // this function would always return `None`. Centered offsets (0, 1, 2,
+    // ...) keep the intermediate sums many orders of magnitude smaller, so
+    // the cancellation error stays far below the guard's threshold. A signed
+    // offset (rather than a plain `u64` subtraction) also tolerates samples
+    // that are not perfectly ordered by timestamp.
     let n = samples.len() as f64;
-    let sum_x: f64 = samples.iter().map(|s| s.timestamp as f64).sum();
+    let t0 = samples[0].timestamp;
+    let offsets: Vec<f64> = samples
+        .iter()
+        .map(|s| (s.timestamp as i64 - t0 as i64) as f64)
+        .collect();
+
+    let sum_x: f64 = offsets.iter().sum();
     let sum_y: f64 = samples.iter().map(|s| s.value).sum();
-    let sum_xy: f64 = samples.iter().map(|s| s.timestamp as f64 * s.value).sum();
-    let sum_x2: f64 = samples.iter().map(|s| (s.timestamp as f64).powi(2)).sum();
+    let sum_xy: f64 = offsets.iter().zip(&samples).map(|(x, s)| x * s.value).sum();
+    let sum_x2: f64 = offsets.iter().map(|x| x.powi(2)).sum();
 
     let denominator = n * sum_x2 - sum_x.powi(2);
     if denominator.abs() < 1e-10 {
-        return None; // Avoid division by zero
+        return None; // Degenerate: all samples share the same timestamp
     }
 
     let slope = (n * sum_xy - sum_x * sum_y) / denominator;
     let intercept = (sum_y - slope * sum_x) / n;
 
-    // Forecast value
-    let latest_timestamp = samples.last()?.timestamp;
-    let future_timestamp = latest_timestamp + seconds_ahead;
-    let predicted_value = slope * future_timestamp as f64 + intercept;
+    // Forecast value, evaluated in the same centered coordinate system.
+    let latest_offset = *offsets.last()?;
+    let future_offset = latest_offset + seconds_ahead as f64;
+    let predicted_value = slope * future_offset + intercept;
 
     // Calculate confidence based on R^2
     let mean_y = sum_y / n;
     let ss_tot: f64 = samples.iter().map(|s| (s.value - mean_y).powi(2)).sum();
-    let ss_res: f64 = samples
+    let ss_res: f64 = offsets
         .iter()
-        .map(|s| {
-            let predicted = slope * s.timestamp as f64 + intercept;
+        .zip(&samples)
+        .map(|(x, s)| {
+            let predicted = slope * x + intercept;
             (s.value - predicted).powi(2)
         })
         .sum();
@@ -988,9 +1025,15 @@ pub fn forecast_exponential(
         trend = config.beta * (level - prev_level) + (1.0 - config.beta) * trend;
     }
 
-    // Forecast ahead
+    // Forecast ahead. `saturating_sub` guards the same non-monotonic-sample
+    // hazard documented on `MetricHistory::trend` (an underflowing `u64`
+    // subtraction here would otherwise panic in debug builds or wrap to a
+    // huge `f64` in release, which `periods_ahead`'s `.min(1000.0)` cap would
+    // then silently mask as "1000 periods ahead").
     let avg_time_delta = if samples.len() > 1 {
-        let total_time = (samples[samples.len() - 1].timestamp - samples[0].timestamp) as f64;
+        let total_time = samples[samples.len() - 1]
+            .timestamp
+            .saturating_sub(samples[0].timestamp) as f64;
         let avg_delta = total_time / (samples.len() - 1) as f64;
         avg_delta.max(1.0) // Minimum 1 second to prevent division issues
     } else {
@@ -1174,7 +1217,72 @@ pub fn recommend_cost_optimizations(config: &CostOptimizationConfig) -> Vec<Cost
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prometheus_metrics::TOTAL_PAYLOAD_BYTES_PROCESSED;
+    use crate::prometheus_metrics::{
+        reset_metrics, ACTIVE_WORKERS, PROCESSING_QUEUE_SIZE, QUEUE_SIZE,
+        TOTAL_PAYLOAD_BYTES_PROCESSED,
+    };
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_recommend_scaling_does_not_underflow_when_workers_exceed_max() {
+        // Regression test: more live workers than the configured maximum
+        // (e.g. after a config change lowering `max_workers`, or a manual
+        // scale-out) must not underflow `max_workers - current_workers`.
+        reset_metrics();
+        ACTIVE_WORKERS.set(150.0);
+        QUEUE_SIZE.set(5000.0); // well above 2x target-per-worker
+        PROCESSING_QUEUE_SIZE.set(2.0);
+
+        let config = AutoScalingConfig::new()
+            .with_target_queue_per_worker(10.0)
+            .with_max_workers(100);
+
+        // Must not panic (previously underflowed in debug builds, or wrapped
+        // to a huge usize in release, falsely recommending scaling up by
+        // billions of workers).
+        let recommendation = recommend_scaling(&config);
+
+        // Already at/over the configured maximum: the queue-size branch must
+        // not recommend scaling further up, and low utilization (2/150) with
+        // a queue above `target_queue_per_worker` doesn't trigger the
+        // scale-down branch either.
+        assert_eq!(recommendation, ScalingRecommendation::NoChange);
+    }
+
+    #[test]
+    fn test_trend_and_snapshot_handle_non_monotonic_timestamps_without_panicking() {
+        let history = MetricHistory::new(10);
+        // `record_batch` accepts arbitrary timestamp ordering (e.g. day-keyed
+        // data supplied out of order); the front of the deque ends up newer
+        // than the back. Before the fix this underflowed the `u64`
+        // subtraction inside `trend()`/`snapshot()`.
+        history.record_batch(&[(2000, 10.0), (1000, 20.0), (500, 30.0)]);
+
+        // No reliable (non-negative) time span between front and back:
+        // report "unknown" rather than a bogus giant rate.
+        assert_eq!(history.trend(), None);
+
+        let snapshot = history.snapshot();
+        assert_eq!(snapshot.trend, None);
+        assert_eq!(snapshot.count, 3);
+        assert_eq!(snapshot.latest, Some(30.0));
+    }
+
+    #[test]
+    fn test_forecast_exponential_handles_non_monotonic_timestamps_without_panicking() {
+        let history = MetricHistory::new(10);
+        history.record_batch(&[(2000, 10.0), (1000, 12.0), (500, 15.0)]);
+
+        let config = ExponentialSmoothingConfig::default();
+        // Must not panic; the saturated (zero) average delta is floored to
+        // the minimum 1 second rather than underflowing.
+        let forecast = forecast_exponential(&history, 60, &config);
+        let result = forecast.expect("3+ samples always produce a forecast");
+        assert!(result.predicted_value.is_finite());
+        assert!(result.level.is_finite());
+        assert!(result.trend.is_finite());
+    }
 
     #[test]
     fn test_data_cost_uses_payload_bytes() {

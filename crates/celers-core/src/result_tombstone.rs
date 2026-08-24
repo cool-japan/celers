@@ -174,27 +174,122 @@ impl TombstoneExt for ResultTombstone {
 /// Expired tombstones (those whose `tombstone_ttl` has elapsed) are treated as
 /// [`ResultExistence::Absent`] on lookup and can be physically removed via
 /// [`TombstoneRegistry::purge_expired`].
-#[derive(Debug, Default)]
+///
+/// # Bounded growth
+///
+/// `ResultTombstone::new` leaves `tombstone_ttl` unset, and a tombstone without
+/// a TTL never expires — so a long-lived process that forgets results would
+/// accumulate one map entry per forgotten task id forever. The registry
+/// therefore applies [`DEFAULT_TOMBSTONE_TTL`] to any inserted tombstone that
+/// carries none, and caps itself at [`DEFAULT_MAX_TOMBSTONES`] entries, evicting
+/// the oldest first. Both are configurable, and `purge_expired` can be scheduled
+/// from a background task for prompt reclamation.
+#[derive(Debug)]
 pub struct TombstoneRegistry {
     inner: RwLock<HashMap<TaskId, ResultTombstone>>,
+    /// TTL applied to inserted tombstones that carry none.
+    default_ttl: Option<Duration>,
+    /// Maximum number of tombstones retained.
+    max_entries: usize,
+}
+
+/// Default TTL applied to tombstones inserted without one.
+///
+/// A tombstone only needs to outlive the window in which a client might still be
+/// waiting on the forgotten result; a day is generous.
+pub const DEFAULT_TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Default cap on the number of tombstones retained.
+pub const DEFAULT_MAX_TOMBSTONES: usize = 100_000;
+
+impl Default for TombstoneRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TombstoneRegistry {
-    /// Create a new, empty tombstone registry.
+    /// Create a new, empty tombstone registry with the default TTL and cap.
     #[must_use]
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            default_ttl: Some(DEFAULT_TOMBSTONE_TTL),
+            max_entries: DEFAULT_MAX_TOMBSTONES,
+        }
+    }
+
+    /// Set the TTL applied to inserted tombstones that carry none.
+    ///
+    /// `None` disables the default, restoring "never expires" for such
+    /// tombstones — they are then only reclaimed by the capacity bound.
+    #[must_use]
+    pub fn with_default_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.default_ttl = ttl;
+        self
+    }
+
+    /// Set the maximum number of tombstones retained. `0` is treated as `1`.
+    #[must_use]
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries.max(1);
+        self.enforce_capacity();
+        self
+    }
+
+    /// The TTL applied to tombstones inserted without one.
+    #[inline]
+    #[must_use]
+    pub const fn default_ttl(&self) -> Option<Duration> {
+        self.default_ttl
+    }
+
+    /// The maximum number of tombstones retained.
+    #[inline]
+    #[must_use]
+    pub const fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Drop expired tombstones first, then the oldest, until the cap holds.
+    fn enforce_capacity(&self) {
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let max = self.max_entries.max(1);
+        if guard.len() <= max {
+            return;
+        }
+        guard.retain(|_, tombstone| !tombstone.is_expired());
+        while guard.len() > max {
+            let Some(victim) = guard
+                .iter()
+                .min_by_key(|(_, tombstone)| tombstone.deleted_at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            guard.remove(&victim);
         }
     }
 
     /// Record a tombstone, overwriting any previous marker for the same task.
     ///
+    /// A tombstone with no TTL of its own inherits the registry's
+    /// [`Self::default_ttl`], so the entry is reclaimable.
+    ///
     /// Returns the previously stored tombstone for the task, if any.
-    pub fn insert(&self, tombstone: ResultTombstone) -> Option<ResultTombstone> {
+    pub fn insert(&self, mut tombstone: ResultTombstone) -> Option<ResultTombstone> {
+        if tombstone.tombstone_ttl.is_none() {
+            if let Some(ttl) = self.default_ttl {
+                tombstone.tombstone_ttl = Some(ttl);
+            }
+        }
         let task_id = tombstone.task_id;
-        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        guard.insert(task_id, tombstone)
+        let previous = {
+            let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            guard.insert(task_id, tombstone)
+        };
+        self.enforce_capacity();
+        previous
     }
 
     /// Convenience: record that `task_id` was forgotten, with an optional
@@ -437,5 +532,75 @@ mod tests {
         assert!(!registry.is_empty());
         assert_eq!(registry.clear(), 2);
         assert!(registry.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// Regression: `ResultTombstone::new` leaves the TTL unset and
+    /// `is_expired()` returns `false` for a `None` TTL, so a tombstone created
+    /// through `mark_forgotten` or a bare `insert` never expired and nothing
+    /// ever reclaimed it.
+    #[test]
+    fn mark_forgotten_tombstones_expire_by_default() {
+        let registry = TombstoneRegistry::new().with_default_ttl(Some(Duration::from_millis(0)));
+        let task_id = Uuid::new_v4();
+        registry.mark_forgotten(task_id, Some("aged out".to_string()));
+
+        // A zero TTL means the tombstone is immediately expired.
+        let stored = registry.get(task_id).expect("tombstone recorded");
+        assert_eq!(stored.tombstone_ttl, Some(Duration::from_millis(0)));
+        assert!(registry.lookup(task_id).is_absent());
+        assert!(!registry.is_tombstoned(task_id));
+        assert_eq!(registry.purge_expired(), 1);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn default_ttl_is_applied_and_configurable() {
+        let registry = TombstoneRegistry::new();
+        assert_eq!(registry.default_ttl(), Some(DEFAULT_TOMBSTONE_TTL));
+        assert_eq!(registry.max_entries(), DEFAULT_MAX_TOMBSTONES);
+
+        let task_id = Uuid::new_v4();
+        registry.mark_forgotten(task_id, None);
+        let stored = registry.get(task_id).expect("tombstone recorded");
+        assert_eq!(stored.tombstone_ttl, Some(DEFAULT_TOMBSTONE_TTL));
+        // Not yet expired, so it is still a tombstone.
+        assert!(registry.is_tombstoned(task_id));
+
+        // An explicit TTL on the tombstone wins over the registry default.
+        let other = Uuid::new_v4();
+        registry.insert(ResultTombstone::new(other).with_ttl(Duration::from_secs(7)));
+        assert_eq!(
+            registry.get(other).and_then(|t| t.tombstone_ttl),
+            Some(Duration::from_secs(7))
+        );
+
+        // Opting out restores the never-expiring behaviour explicitly.
+        let forever = TombstoneRegistry::new().with_default_ttl(None);
+        let id = Uuid::new_v4();
+        forever.mark_forgotten(id, None);
+        assert_eq!(forever.get(id).and_then(|t| t.tombstone_ttl), None);
+        assert!(forever.is_tombstoned(id));
+    }
+
+    #[test]
+    fn registry_is_capacity_bounded() {
+        let registry = TombstoneRegistry::new().with_max_entries(10);
+        assert_eq!(registry.max_entries(), 10);
+
+        for _ in 0..500 {
+            registry.mark_forgotten(Uuid::new_v4(), None);
+        }
+        assert_eq!(registry.len(), 10, "registry must respect its capacity");
+
+        // Zero is clamped to one.
+        let tiny = TombstoneRegistry::new().with_max_entries(0);
+        assert_eq!(tiny.max_entries(), 1);
+        tiny.mark_forgotten(Uuid::new_v4(), None);
+        tiny.mark_forgotten(Uuid::new_v4(), None);
+        assert_eq!(tiny.len(), 1);
     }
 }

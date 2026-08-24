@@ -25,15 +25,97 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Convert fractional seconds to whole milliseconds, saturating and clamping at
+/// zero.
+///
+/// Celery accepts float time limits, so a config file may legitimately carry
+/// `0.5`. Negative and non-finite values are meaningless as limits and collapse
+/// to `0`.
+// Justification for the lossy cast: the value is checked for finiteness, clamped
+// at zero and compared against `2^64` immediately before the conversion.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[must_use]
+pub fn seconds_to_millis(seconds: f64) -> u64 {
+    const U64_MAX_AS_F64: f64 = 18_446_744_073_709_551_616.0;
+    if seconds.is_nan() || seconds <= 0.0 {
+        return 0;
+    }
+    if seconds.is_infinite() {
+        // An infinite limit is "effectively never"; saturate rather than
+        // collapsing to zero, which `check()` would read as "already exceeded".
+        return u64::MAX;
+    }
+    let millis = (seconds * 1000.0).round();
+    if millis <= 0.0 {
+        0
+    } else if millis >= U64_MAX_AS_F64 {
+        u64::MAX
+    } else {
+        millis as u64
+    }
+}
+
+/// Convert whole milliseconds back to fractional seconds for serialization.
+// Justification: limits are bounded by any realistic deployment far below 2^53.
+#[allow(clippy::cast_precision_loss)]
+#[must_use]
+fn millis_to_seconds(millis: u64) -> f64 {
+    millis as f64 / 1000.0
+}
+
+/// Serde adapter storing a limit as fractional seconds on the wire (matching
+/// Celery's `time_limit` / `soft_time_limit`) while keeping millisecond
+/// precision in memory.
+mod serde_optional_seconds {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(millis: &Option<u64>, ser: S) -> Result<S::Ok, S::Error> {
+        match millis {
+            Some(value) => ser.serialize_some(&super::millis_to_seconds(*value)),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<u64>, D::Error> {
+        let seconds = Option::<f64>::deserialize(de)?;
+        // A configured limit of zero (or a negative/NaN one) is meaningless:
+        // `check()` compares `elapsed >= limit`, so it would fire before the task
+        // ran a single instruction. Treat it as "unset", matching
+        // `TimeLimitConfig::with_soft_limit`.
+        Ok(seconds
+            .map(super::seconds_to_millis)
+            .filter(|millis| *millis > 0))
+    }
+}
+
 /// Time limit configuration for a task
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// Limits are stored in **milliseconds**. Storing whole seconds silently
+/// truncated any sub-second configuration to zero, and `check()` treats a zero
+/// limit as "already exceeded", so a 500 ms limit meant "every task is instantly
+/// over its limit" rather than "over its limit after 500 ms". Celery accepts
+/// float time limits, so sub-second values are a legitimate configuration.
+///
+/// On the wire the fields are still named `soft_seconds` / `hard_seconds` and
+/// carry fractional seconds, so existing configuration files keep working.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TimeLimitConfig {
-    /// Soft time limit in seconds (warning before kill)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub soft_seconds: Option<u64>,
-    /// Hard time limit in seconds (force kill)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hard_seconds: Option<u64>,
+    /// Soft time limit in milliseconds (warning before kill)
+    #[serde(
+        rename = "soft_seconds",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_optional_seconds"
+    )]
+    pub soft_millis: Option<u64>,
+    /// Hard time limit in milliseconds (force kill)
+    #[serde(
+        rename = "hard_seconds",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_optional_seconds"
+    )]
+    pub hard_millis: Option<u64>,
 }
 
 impl TimeLimitConfig {
@@ -44,51 +126,74 @@ impl TimeLimitConfig {
     }
 
     /// Set the soft time limit
+    ///
+    /// Sub-second durations are preserved. `Duration::ZERO` is rejected as
+    /// meaningless (it would mark every task as instantly over its limit) and
+    /// leaves the limit unset.
     #[must_use]
     pub fn with_soft_limit(mut self, duration: Duration) -> Self {
-        self.soft_seconds = Some(duration.as_secs());
+        self.soft_millis = duration_to_millis(duration);
         self
     }
 
     /// Set the hard time limit
+    ///
+    /// Sub-second durations are preserved; `Duration::ZERO` leaves the limit
+    /// unset (see [`Self::with_soft_limit`]).
     #[must_use]
     pub fn with_hard_limit(mut self, duration: Duration) -> Self {
-        self.hard_seconds = Some(duration.as_secs());
+        self.hard_millis = duration_to_millis(duration);
         self
     }
 
     /// Set both soft and hard limits
     #[must_use]
     pub fn with_limits(mut self, soft: Duration, hard: Duration) -> Self {
-        self.soft_seconds = Some(soft.as_secs());
-        self.hard_seconds = Some(hard.as_secs());
+        self.soft_millis = duration_to_millis(soft);
+        self.hard_millis = duration_to_millis(hard);
         self
     }
 
     /// Get the soft limit as Duration
+    #[must_use]
     pub fn soft_limit(&self) -> Option<Duration> {
-        self.soft_seconds.map(Duration::from_secs)
+        self.soft_millis.map(Duration::from_millis)
     }
 
     /// Get the hard limit as Duration
+    #[must_use]
     pub fn hard_limit(&self) -> Option<Duration> {
-        self.hard_seconds.map(Duration::from_secs)
+        self.hard_millis.map(Duration::from_millis)
     }
 
     /// Check if any time limit is configured
     #[inline]
     #[must_use]
     pub const fn has_limits(&self) -> bool {
-        self.soft_seconds.is_some() || self.hard_seconds.is_some()
+        self.soft_millis.is_some() || self.hard_millis.is_some()
     }
 
     /// Merge with another config, taking non-None values from the other
     #[must_use]
     pub fn merge(&self, other: &TimeLimitConfig) -> TimeLimitConfig {
         TimeLimitConfig {
-            soft_seconds: other.soft_seconds.or(self.soft_seconds),
-            hard_seconds: other.hard_seconds.or(self.hard_seconds),
+            soft_millis: other.soft_millis.or(self.soft_millis),
+            hard_millis: other.hard_millis.or(self.hard_millis),
         }
+    }
+}
+
+/// Convert a limit duration to milliseconds, rejecting a zero limit.
+///
+/// A zero limit is never a useful configuration: `check()` compares
+/// `elapsed >= limit`, so it would fire before the task ran a single
+/// instruction. Treating it as "unset" is the only sane interpretation.
+fn duration_to_millis(duration: Duration) -> Option<u64> {
+    let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    if millis == 0 {
+        None
+    } else {
+        Some(millis)
     }
 }
 
@@ -99,20 +204,62 @@ pub enum TimeLimitExceeded {
     SoftLimitExceeded {
         /// Task ID
         task_id: String,
-        /// Elapsed time in seconds
-        elapsed_seconds: u64,
-        /// Configured soft limit in seconds
-        limit_seconds: u64,
+        /// Elapsed time in milliseconds
+        elapsed_millis: u64,
+        /// Configured soft limit in milliseconds
+        limit_millis: u64,
     },
     /// Hard time limit exceeded (force kill)
     HardLimitExceeded {
         /// Task ID
         task_id: String,
-        /// Elapsed time in seconds
-        elapsed_seconds: u64,
-        /// Configured hard limit in seconds
-        limit_seconds: u64,
+        /// Elapsed time in milliseconds
+        elapsed_millis: u64,
+        /// Configured hard limit in milliseconds
+        limit_millis: u64,
     },
+}
+
+impl TimeLimitExceeded {
+    /// The task this violation belongs to.
+    #[inline]
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        match self {
+            Self::SoftLimitExceeded { task_id, .. } | Self::HardLimitExceeded { task_id, .. } => {
+                task_id
+            }
+        }
+    }
+
+    /// How long the task had been running when the limit fired.
+    #[inline]
+    #[must_use]
+    pub const fn elapsed(&self) -> Duration {
+        match self {
+            Self::SoftLimitExceeded { elapsed_millis, .. }
+            | Self::HardLimitExceeded { elapsed_millis, .. } => {
+                Duration::from_millis(*elapsed_millis)
+            }
+        }
+    }
+
+    /// The limit that was exceeded.
+    #[inline]
+    #[must_use]
+    pub const fn limit(&self) -> Duration {
+        match self {
+            Self::SoftLimitExceeded { limit_millis, .. }
+            | Self::HardLimitExceeded { limit_millis, .. } => Duration::from_millis(*limit_millis),
+        }
+    }
+
+    /// Whether this is the hard (force-kill) limit rather than the soft one.
+    #[inline]
+    #[must_use]
+    pub const fn is_hard(&self) -> bool {
+        matches!(self, Self::HardLimitExceeded { .. })
+    }
 }
 
 impl std::fmt::Display for TimeLimitExceeded {
@@ -120,22 +267,26 @@ impl std::fmt::Display for TimeLimitExceeded {
         match self {
             Self::SoftLimitExceeded {
                 task_id,
-                elapsed_seconds,
-                limit_seconds,
+                elapsed_millis,
+                limit_millis,
             } => {
+                let elapsed = millis_to_seconds(*elapsed_millis);
+                let limit = millis_to_seconds(*limit_millis);
                 write!(
                     f,
-                    "Soft time limit exceeded for task {task_id}: {elapsed_seconds}s elapsed (limit: {limit_seconds}s)"
+                    "Soft time limit exceeded for task {task_id}: {elapsed}s elapsed (limit: {limit}s)"
                 )
             }
             Self::HardLimitExceeded {
                 task_id,
-                elapsed_seconds,
-                limit_seconds,
+                elapsed_millis,
+                limit_millis,
             } => {
+                let elapsed = millis_to_seconds(*elapsed_millis);
+                let limit = millis_to_seconds(*limit_millis);
                 write!(
                     f,
-                    "Hard time limit exceeded for task {task_id}: {elapsed_seconds}s elapsed (limit: {limit_seconds}s)"
+                    "Hard time limit exceeded for task {task_id}: {elapsed}s elapsed (limit: {limit}s)"
                 )
             }
         }
@@ -228,29 +379,40 @@ impl TimeLimit {
         TimeLimitStatus::Ok
     }
 
+    /// Get elapsed time in whole milliseconds
+    #[inline]
+    #[must_use]
+    pub fn elapsed_millis(&self) -> u64 {
+        u64::try_from(self.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// Check and return error if limit exceeded
+    ///
+    /// Comparisons use the full `Duration`, so a sub-second limit fires at the
+    /// configured moment rather than immediately.
     #[must_use]
     pub fn check_exceeded(&self) -> Option<TimeLimitExceeded> {
-        let elapsed_seconds = self.elapsed_seconds();
+        let elapsed = self.elapsed();
+        let elapsed_millis = self.elapsed_millis();
 
         // Check hard limit first
-        if let Some(limit_seconds) = self.config.hard_seconds {
-            if elapsed_seconds >= limit_seconds {
+        if let Some(limit) = self.config.hard_limit() {
+            if elapsed >= limit {
                 return Some(TimeLimitExceeded::HardLimitExceeded {
                     task_id: self.task_id.clone(),
-                    elapsed_seconds,
-                    limit_seconds,
+                    elapsed_millis,
+                    limit_millis: self.config.hard_millis.unwrap_or_default(),
                 });
             }
         }
 
         // Check soft limit
-        if let Some(limit_seconds) = self.config.soft_seconds {
-            if elapsed_seconds >= limit_seconds {
+        if let Some(limit) = self.config.soft_limit() {
+            if elapsed >= limit {
                 return Some(TimeLimitExceeded::SoftLimitExceeded {
                     task_id: self.task_id.clone(),
-                    elapsed_seconds,
-                    limit_seconds,
+                    elapsed_millis,
+                    limit_millis: self.config.soft_millis.unwrap_or_default(),
                 });
             }
         }
@@ -349,10 +511,21 @@ impl TaskTimeLimits {
         self.limits.remove(task_name);
     }
 
-    /// Get time limit configuration for a task
+    /// Get the effective time limit configuration for a task
+    ///
+    /// The per-task configuration is **merged onto** the default rather than
+    /// replacing it, field by field. Choosing one or the other silently dropped
+    /// the global soft limit whenever a task overrode only the hard limit — the
+    /// natural way to say "this task may run longer" — leaving it with no soft
+    /// limit at all.
     #[must_use]
-    pub fn get_limit(&self, task_name: &str) -> Option<&TimeLimitConfig> {
-        self.limits.get(task_name).or(self.default_config.as_ref())
+    pub fn get_limit(&self, task_name: &str) -> Option<TimeLimitConfig> {
+        match (self.limits.get(task_name), self.default_config.as_ref()) {
+            (Some(task), Some(default)) => Some(default.merge(task)),
+            (Some(task), None) => Some(task.clone()),
+            (None, Some(default)) => Some(default.clone()),
+            (None, None) => None,
+        }
     }
 
     /// Check if a task type has time limits configured
@@ -365,8 +538,8 @@ impl TaskTimeLimits {
     #[must_use]
     pub fn create_tracker(&self, task_id: &str, task_name: &str) -> Option<TimeLimit> {
         self.get_limit(task_name)
-            .filter(|c| c.has_limits())
-            .map(|config| TimeLimit::new(task_id, config.clone()))
+            .filter(TimeLimitConfig::has_limits)
+            .map(|config| TimeLimit::new(task_id, config))
     }
 
     /// Set the default time limit configuration
@@ -471,8 +644,8 @@ impl TimeLimitSettings {
         let default_config =
             if self.default_soft_limit.is_some() || self.default_hard_limit.is_some() {
                 Some(TimeLimitConfig {
-                    soft_seconds: self.default_soft_limit,
-                    hard_seconds: self.default_hard_limit,
+                    soft_millis: self.default_soft_limit.map(|s| s.saturating_mul(1000)),
+                    hard_millis: self.default_hard_limit.map(|s| s.saturating_mul(1000)),
                 })
             } else {
                 None
@@ -520,15 +693,29 @@ mod tests {
         assert_eq!(tracker.check(), TimeLimitStatus::Ok);
     }
 
+    /// Back-date a tracker's start so limits can be asserted without sleeping.
+    ///
+    /// Returns `None` when the process has not been running long enough for the
+    /// subtraction to be representable, which only happens on a machine that
+    /// just booted; callers treat that as "skip".
+    fn tracker_started_ago(
+        task_id: &str,
+        config: TimeLimitConfig,
+        ago: Duration,
+    ) -> Option<TimeLimit> {
+        Instant::now()
+            .checked_sub(ago)
+            .map(|started| TimeLimit::with_start_time(task_id, config, started))
+    }
+
     #[test]
     fn test_time_limit_soft_exceeded() {
         let config = TimeLimitConfig::new().with_soft_limit(Duration::from_millis(10));
 
-        let tracker = TimeLimit::new("task-123", config);
-
-        // Wait for soft limit to be exceeded
-        thread::sleep(Duration::from_millis(15));
-
+        let Some(tracker) = tracker_started_ago("task-123", config, Duration::from_millis(15))
+        else {
+            return;
+        };
         assert_eq!(tracker.check(), TimeLimitStatus::SoftLimitExceeded);
     }
 
@@ -538,11 +725,10 @@ mod tests {
             .with_soft_limit(Duration::from_millis(5))
             .with_hard_limit(Duration::from_millis(10));
 
-        let tracker = TimeLimit::new("task-123", config);
-
-        // Wait for hard limit to be exceeded
-        thread::sleep(Duration::from_millis(15));
-
+        let Some(tracker) = tracker_started_ago("task-123", config, Duration::from_millis(15))
+        else {
+            return;
+        };
         assert_eq!(tracker.check(), TimeLimitStatus::HardLimitExceeded);
     }
 
@@ -550,15 +736,17 @@ mod tests {
     fn test_time_limit_exceeded_error() {
         let config = TimeLimitConfig::new().with_soft_limit(Duration::from_millis(10));
 
-        let tracker = TimeLimit::new("task-123", config);
-        thread::sleep(Duration::from_millis(15));
+        let Some(tracker) = tracker_started_ago("task-123", config, Duration::from_millis(15))
+        else {
+            return;
+        };
 
-        let error = tracker.check_exceeded();
-        assert!(error.is_some());
-        assert!(matches!(
-            error,
-            Some(TimeLimitExceeded::SoftLimitExceeded { .. })
-        ));
+        let error = tracker.check_exceeded().expect("soft limit should be hit");
+        assert!(matches!(error, TimeLimitExceeded::SoftLimitExceeded { .. }));
+        assert_eq!(error.task_id(), "task-123");
+        assert_eq!(error.limit(), Duration::from_millis(10));
+        assert!(error.elapsed() >= Duration::from_millis(15));
+        assert!(!error.is_hard());
     }
 
     #[test]
@@ -581,9 +769,9 @@ mod tests {
         assert!(limits.has_limit("fast.task"));
         assert!(!limits.has_limit("unknown.task"));
 
-        let slow_config = limits.get_limit("slow.task").unwrap();
-        assert_eq!(slow_config.soft_seconds, Some(60));
-        assert_eq!(slow_config.hard_seconds, Some(120));
+        let slow_config = limits.get_limit("slow.task").expect("limit configured");
+        assert_eq!(slow_config.soft_limit(), Some(Duration::from_secs(60)));
+        assert_eq!(slow_config.hard_limit(), Some(Duration::from_secs(120)));
     }
 
     #[test]
@@ -594,8 +782,8 @@ mod tests {
 
         // Unknown task should get default limit
         assert!(limits.has_limit("any.task"));
-        let config = limits.get_limit("any.task").unwrap();
-        assert_eq!(config.hard_seconds, Some(300));
+        let config = limits.get_limit("any.task").expect("default configured");
+        assert_eq!(config.hard_limit(), Some(Duration::from_secs(300)));
     }
 
     #[test]
@@ -636,14 +824,11 @@ mod tests {
             .with_soft_limit(Duration::from_secs(30))
             .with_hard_limit(Duration::from_secs(60));
 
-        let override_config = TimeLimitConfig {
-            soft_seconds: Some(15),
-            hard_seconds: None,
-        };
+        let override_config = TimeLimitConfig::new().with_soft_limit(Duration::from_secs(15));
 
         let merged = base.merge(&override_config);
-        assert_eq!(merged.soft_seconds, Some(15)); // Overridden
-        assert_eq!(merged.hard_seconds, Some(60)); // From base
+        assert_eq!(merged.soft_limit(), Some(Duration::from_secs(15))); // Overridden
+        assert_eq!(merged.hard_limit(), Some(Duration::from_secs(60))); // From base
     }
 
     #[test]
@@ -664,10 +849,9 @@ mod tests {
         settings.default_hard_limit = Some(60);
         settings.task_limits.insert(
             "slow.task".to_string(),
-            TimeLimitConfig {
-                soft_seconds: Some(120),
-                hard_seconds: Some(300),
-            },
+            TimeLimitConfig::new()
+                .with_soft_limit(Duration::from_secs(120))
+                .with_hard_limit(Duration::from_secs(300)),
         );
 
         let json = serde_json::to_string(&settings).unwrap();
@@ -715,22 +899,165 @@ mod tests {
         settings.default_hard_limit = Some(60);
         settings.task_limits.insert(
             "custom.task".to_string(),
-            TimeLimitConfig {
-                soft_seconds: Some(10),
-                hard_seconds: Some(20),
-            },
+            TimeLimitConfig::new()
+                .with_soft_limit(Duration::from_secs(10))
+                .with_hard_limit(Duration::from_secs(20)),
         );
 
         let limits = settings.into_task_time_limits();
 
         // Default should be applied
-        let default = limits.get_limit("any.task").unwrap();
-        assert_eq!(default.soft_seconds, Some(30));
-        assert_eq!(default.hard_seconds, Some(60));
+        let default = limits.get_limit("any.task").expect("default configured");
+        assert_eq!(default.soft_limit(), Some(Duration::from_secs(30)));
+        assert_eq!(default.hard_limit(), Some(Duration::from_secs(60)));
 
         // Custom should override
-        let custom = limits.get_limit("custom.task").unwrap();
-        assert_eq!(custom.soft_seconds, Some(10));
-        assert_eq!(custom.hard_seconds, Some(20));
+        let custom = limits.get_limit("custom.task").expect("custom configured");
+        assert_eq!(custom.soft_limit(), Some(Duration::from_secs(10)));
+        assert_eq!(custom.hard_limit(), Some(Duration::from_secs(20)));
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// Regression: limits were stored as whole seconds, so a sub-second limit
+    /// truncated to zero and `check()` reported "exceeded" before the task ran.
+    #[test]
+    fn test_sub_second_limits_are_preserved() {
+        let config = TimeLimitConfig::new()
+            .with_soft_limit(Duration::from_millis(500))
+            .with_hard_limit(Duration::from_millis(1_500));
+
+        assert_eq!(config.soft_limit(), Some(Duration::from_millis(500)));
+        assert_eq!(config.hard_limit(), Some(Duration::from_millis(1_500)));
+
+        // At t=0 nothing is exceeded.
+        let tracker = TimeLimit::with_start_time("task-1", config.clone(), Instant::now());
+        assert_eq!(tracker.check(), TimeLimitStatus::Ok);
+        assert!(tracker.check_exceeded().is_none());
+
+        // At t=600ms the soft limit — and only the soft limit — has fired.
+        if let Some(tracker) =
+            tracker_started_ago("task-1", config.clone(), Duration::from_millis(600))
+        {
+            assert_eq!(tracker.check(), TimeLimitStatus::SoftLimitExceeded);
+        }
+
+        // At t=1.6s the hard limit has fired.
+        if let Some(tracker) = tracker_started_ago("task-1", config, Duration::from_millis(1_600)) {
+            assert_eq!(tracker.check(), TimeLimitStatus::HardLimitExceeded);
+        }
+    }
+
+    #[test]
+    fn test_zero_limit_is_treated_as_unset() {
+        let config = TimeLimitConfig::new()
+            .with_soft_limit(Duration::ZERO)
+            .with_hard_limit(Duration::ZERO);
+        assert!(!config.has_limits());
+
+        let tracker = TimeLimit::with_start_time("task-1", config, Instant::now());
+        assert_eq!(tracker.check(), TimeLimitStatus::Ok);
+    }
+
+    #[test]
+    fn test_config_serializes_as_fractional_seconds() {
+        let config = TimeLimitConfig::new()
+            .with_soft_limit(Duration::from_millis(500))
+            .with_hard_limit(Duration::from_secs(60));
+
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert_eq!(json, r#"{"soft_seconds":0.5,"hard_seconds":60.0}"#);
+
+        let parsed: TimeLimitConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, config);
+
+        // Integer-seconds configuration files (the historical shape) still load.
+        let legacy: TimeLimitConfig =
+            serde_json::from_str(r#"{"soft_seconds":30,"hard_seconds":60}"#)
+                .expect("legacy config should deserialize");
+        assert_eq!(legacy.soft_limit(), Some(Duration::from_secs(30)));
+        assert_eq!(legacy.hard_limit(), Some(Duration::from_secs(60)));
+
+        // As does an empty config.
+        let empty: TimeLimitConfig = serde_json::from_str("{}").expect("empty config");
+        assert!(!empty.has_limits());
+    }
+
+    #[test]
+    fn test_seconds_to_millis_is_saturating() {
+        assert_eq!(seconds_to_millis(0.5), 500);
+        assert_eq!(seconds_to_millis(1.25), 1_250);
+        assert_eq!(seconds_to_millis(0.0), 0);
+        assert_eq!(seconds_to_millis(-1.0), 0);
+        assert_eq!(seconds_to_millis(f64::NAN), 0);
+        assert_eq!(seconds_to_millis(f64::NEG_INFINITY), 0);
+        assert_eq!(seconds_to_millis(f64::INFINITY), u64::MAX);
+        assert_eq!(seconds_to_millis(1e30), u64::MAX);
+    }
+
+    #[test]
+    fn test_zero_limits_in_config_files_deserialize_as_unset() {
+        let config: TimeLimitConfig =
+            serde_json::from_str(r#"{"soft_seconds":0,"hard_seconds":-3}"#).expect("deserialize");
+        assert!(
+            !config.has_limits(),
+            "a zero limit would mark every task instantly over its limit"
+        );
+    }
+
+    /// Regression: `get_limit` returned the per-task config *or* the default,
+    /// so overriding only the hard limit silently dropped the global soft limit.
+    #[test]
+    fn test_per_task_override_merges_with_the_default() {
+        let mut limits = TaskTimeLimits::with_default(
+            TimeLimitConfig::new()
+                .with_soft_limit(Duration::from_secs(30))
+                .with_hard_limit(Duration::from_secs(60)),
+        );
+        limits.set_task_limit(
+            "slow.task",
+            TimeLimitConfig::new().with_hard_limit(Duration::from_secs(600)),
+        );
+
+        let effective = limits.get_limit("slow.task").expect("limit configured");
+        assert_eq!(
+            effective.soft_limit(),
+            Some(Duration::from_secs(30)),
+            "the global soft limit must survive a hard-limit-only override"
+        );
+        assert_eq!(effective.hard_limit(), Some(Duration::from_secs(600)));
+
+        // A tracker built from the manager sees the merged configuration too.
+        let tracker = limits
+            .create_tracker("task-1", "slow.task")
+            .expect("tracker should be created");
+        assert_eq!(tracker.config().soft_limit(), Some(Duration::from_secs(30)));
+        assert_eq!(
+            tracker.config().hard_limit(),
+            Some(Duration::from_secs(600))
+        );
+
+        // Tasks with no override still get the plain default.
+        let default = limits.get_limit("other.task").expect("default configured");
+        assert_eq!(default.soft_limit(), Some(Duration::from_secs(30)));
+        assert_eq!(default.hard_limit(), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_settings_merge_default_with_per_task_override() {
+        let mut settings = TimeLimitSettings::new();
+        settings.default_soft_limit = Some(30);
+        settings.default_hard_limit = Some(60);
+        settings.task_limits.insert(
+            "slow.task".to_string(),
+            TimeLimitConfig::new().with_hard_limit(Duration::from_secs(600)),
+        );
+
+        let limits = settings.into_task_time_limits();
+        let effective = limits.get_limit("slow.task").expect("limit configured");
+        assert_eq!(effective.soft_limit(), Some(Duration::from_secs(30)));
+        assert_eq!(effective.hard_limit(), Some(Duration::from_secs(600)));
     }
 }

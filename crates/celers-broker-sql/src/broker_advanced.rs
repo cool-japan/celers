@@ -541,8 +541,9 @@ impl MysqlBroker {
             "current_step": current_step,
             "updated_at": chrono::Utc::now().to_rfc3339(),
         });
-        let progress_json_str =
-            serde_json::to_string(&progress_json).unwrap_or_else(|_| "{}".to_string());
+        let progress_json_str = serde_json::to_string(&progress_json).map_err(|e| {
+            CelersError::Serialization(format!("Failed to serialize task progress: {e}"))
+        })?;
 
         let affected = self
             .connection()
@@ -762,34 +763,19 @@ impl MysqlBroker {
 
         // No duplicate found, enqueue new task with dedup_key
         let task_id = task.metadata.id;
-        let mut db_metadata = json!({
-            "queue": self.queue_name,
-            "enqueued_at": chrono::Utc::now().to_rfc3339(),
-            "dedup_key": dedup_key,
-        });
-
-        // Merge task metadata
-        if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
-            if let Some(obj) = db_metadata.as_object_mut() {
-                if let Some(meta_obj) = task_meta.as_object() {
-                    for (k, v) in meta_obj {
-                        obj.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
         let db_metadata_str =
-            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
+            self.build_task_metadata_document(&task, json!({ "dedup_key": dedup_key }))?;
 
         self.connection()
             .execute(
                 r#"
                 INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                    (id, queue_name, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
                 "#,
                 &[
                     &task_id.to_string(),
+                    &self.queue_name,
                     &task.metadata.name,
                     &task.payload,
                     &task.metadata.priority,

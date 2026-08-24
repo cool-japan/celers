@@ -8,7 +8,8 @@
 //! - Chord state management (barrier synchronization)
 //! - Atomic counter operations
 //! - SQL-based result queries and analytics
-//! - Support for both PostgreSQL and MySQL
+//! - Support for both PostgreSQL and MySQL, independently selectable via the
+//!   `postgres`/`mysql` Cargo features (both enabled by default)
 //!
 //! # Example
 //!
@@ -28,51 +29,142 @@
 //! ```
 
 pub mod analytics;
+#[cfg(feature = "postgres")]
 pub mod event_persistence;
-#[cfg(feature = "distributed-locks")]
+#[cfg(all(feature = "distributed-locks", feature = "postgres"))]
 pub mod lock;
+#[cfg(feature = "postgres")]
+mod pg_pool;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 pub mod result_store;
 mod row_ext;
+#[cfg(feature = "mysql")]
+mod sql_split;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+mod task_meta_extra;
 mod tls_mode;
 
-pub use analytics::{
-    MysqlAnalytics, PercentileLatencies, PostgresAnalytics, StorageStats, TaskStats, WorkerStat,
-};
+#[cfg(feature = "mysql")]
+pub use analytics::MysqlAnalytics;
+#[cfg(feature = "postgres")]
+pub use analytics::PostgresAnalytics;
+pub use analytics::{PercentileLatencies, StorageStats, TaskStats, WorkerStat};
+#[cfg(feature = "postgres")]
 pub use event_persistence::{DbEventPersister, DbEventPersisterConfig};
+#[cfg(feature = "postgres")]
+pub use pg_pool::{PgConnPool, DEFAULT_POOL_SIZE};
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use async_trait::async_trait;
 pub use celers_backend_redis::{
-    BackendError, ChordState, Result, ResultBackend, TaskMeta, TaskResult, TaskTtlConfig,
+    BackendError, ChordState, ProgressInfo, Result, ResultBackend, TaskMeta, TaskResult,
+    TaskTtlConfig,
 };
-use chrono::{DateTime, Utc};
+// `DateTime` (the bare type name) is only spelled explicitly in MySQL's
+// `get_result` (`row.col::<DateTime<Utc>>(..)`) — Postgres's equivalent read
+// relies on type inference and never names `DateTime` directly, so a
+// postgres-only build would otherwise flag it unused.
+#[cfg(feature = "mysql")]
+use chrono::DateTime;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use chrono::Utc;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use oxisql_core::{Connection, ToSqlValue};
-use row_ext::{json_from_row, json_param, uuid_param, RowExt};
+#[cfg(feature = "postgres")]
+use row_ext::uuid_from_row;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use row_ext::RowExt;
+#[cfg(feature = "postgres")]
+use row_ext::{json_from_row, json_param};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use serde_json::json;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use std::time::Duration;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use task_meta_extra::TaskMetaExtra;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use uuid::Uuid;
 
+/// Decode a stored `result_state` string (plus its accompanying columns)
+/// into a [`TaskResult`].
+///
+/// Shared by every DB read path (Postgres/MySQL, single/batch) so the
+/// mapping is defined exactly once. Unlike the ad-hoc `match` this replaces,
+/// an unrecognised state is a hard [`BackendError::Serialization`] rather
+/// than a silent `TaskResult::Pending` — a schema/code vocabulary drift
+/// (a newer writer, a manual data fix, a partially-applied migration, a
+/// mixed-version rolling deploy) must be loud, not indistinguishable from a
+/// task that simply hasn't run yet: a caller polling `is_task_complete` on a
+/// silently-mispapped row would otherwise wait forever, and it would count in
+/// neither the success nor the failure bucket of `TaskStats`.
+///
+/// # Errors
+///
+/// Returns [`BackendError::Serialization`] if `state` is not one of
+/// `"pending"`/`"started"`/`"success"`/`"failure"`/`"revoked"`/`"retry"`.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn decode_result_state(
+    task_id: Uuid,
+    state: &str,
+    result_data: Option<serde_json::Value>,
+    error_message: Option<String>,
+    retry_count: Option<i32>,
+) -> Result<TaskResult> {
+    Ok(match state {
+        "pending" => TaskResult::Pending,
+        "started" => TaskResult::Started,
+        "success" => TaskResult::Success(result_data.unwrap_or(json!(null))),
+        // A NULL error_message on a `failure` row is a genuine anomaly (the
+        // failure path should always record a reason), but it must not
+        // silently downgrade to an empty string that looks like "no error" —
+        // surface it as an explicit placeholder instead.
+        "failure" => TaskResult::Failure(
+            error_message.unwrap_or_else(|| "unknown error (error_message was NULL)".to_string()),
+        ),
+        "revoked" => TaskResult::Revoked,
+        "retry" => TaskResult::Retry(retry_count.unwrap_or(0) as u32),
+        other => {
+            return Err(BackendError::Serialization(format!(
+                "unknown result_state {other:?} for task {task_id}"
+            )))
+        }
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// PostgreSQL backend
+// ══════════════════════════════════════════════════════════════════════════
+
 /// PostgreSQL result backend implementation
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 pub struct PostgresResultBackend {
-    conn: oxisql_postgres::PgConnection,
+    conn: PgConnPool,
     ttl_config: TaskTtlConfig,
 }
 
+#[cfg(feature = "postgres")]
 impl PostgresResultBackend {
-    /// Create a new PostgreSQL result backend
+    /// Create a new PostgreSQL result backend backed by a pool of
+    /// [`DEFAULT_POOL_SIZE`] independent connections.
     ///
     /// # Arguments
     /// * `database_url` - PostgreSQL connection string (e.g., "postgres://user:pass@localhost/db")
     pub async fn new(database_url: &str) -> Result<Self> {
+        Self::with_pool_size(database_url, DEFAULT_POOL_SIZE).await
+    }
+
+    /// Create a new PostgreSQL result backend with an explicit connection
+    /// pool size (see [`PgConnPool`] for the pooling/reconnect behavior this
+    /// provides over a single shared connection).
+    pub async fn with_pool_size(database_url: &str, pool_size: usize) -> Result<Self> {
         let tls = tls_mode::pg_tls_mode_for_url(database_url)
             .map_err(|e| BackendError::Connection(format!("Failed to resolve TLS mode: {e}")))?;
-        let conn = oxisql_postgres::PgConnection::connect_with_timeout(
-            database_url,
-            tls,
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|e| BackendError::Connection(format!("Failed to connect to database: {}", e)))?;
+        let conn = PgConnPool::connect(database_url, tls, pool_size, Duration::from_secs(5))
+            .await
+            .map_err(|e| {
+                BackendError::Connection(format!("Failed to connect to database: {}", e))
+            })?;
 
         Ok(Self {
             conn,
@@ -116,14 +208,32 @@ impl PostgresResultBackend {
         Ok(())
     }
 
-    /// Get the underlying connection
-    pub fn connection(&self) -> &oxisql_postgres::PgConnection {
+    /// Get the underlying connection pool.
+    pub fn connection(&self) -> &PgConnPool {
         &self.conn
     }
 
-    /// Return an analytics helper bound to the same connection.
+    /// Return an analytics helper bound to the same connection pool.
     pub fn analytics(&self) -> PostgresAnalytics {
         PostgresAnalytics::new(self.conn.clone())
+    }
+
+    /// Check whether the backend can currently reach the database.
+    ///
+    /// Issues a trivial `SELECT 1` against the connection pool (benefiting
+    /// from [`PgConnPool::query`]'s reconnect-and-retry-once-on-connection-
+    /// loss policy) and reports whether it succeeded. Mirrors
+    /// `celers_backend_redis::RedisResultBackend::health_check`'s contract
+    /// for use in the same monitoring/readiness-probe role: `Ok(true)` means
+    /// healthy, `Err(_)` means a connection or other error occurred.
+    pub async fn health_check(&self) -> Result<bool> {
+        match self.conn.query("SELECT 1", &[]).await {
+            Ok(rows) => Ok(!rows.is_empty()),
+            Err(e) => Err(BackendError::Connection(format!(
+                "health_check query failed: {}",
+                e
+            ))),
+        }
     }
 
     /// Clean up expired results (returns number of deleted rows)
@@ -144,8 +254,73 @@ impl PostgresResultBackend {
         })?;
         Ok(count as usize)
     }
+
+    /// Spawn a background task that calls [`PostgresResultBackend::cleanup_expired`]
+    /// on `interval` forever, logging (rather than propagating) any error so
+    /// one failed cleanup pass never kills the scheduler.
+    ///
+    /// Purely opt-in: nothing calls this automatically. Wire it in from
+    /// application start-up if periodic expiry cleanup is desired — this
+    /// crate is a library and must not spawn background work the caller
+    /// didn't ask for.
+    pub fn spawn_periodic_cleanup(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let backend = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // The first tick fires immediately; skip it so the first real
+            // cleanup happens after one full `interval`, not at t=0.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match backend.cleanup_expired().await {
+                    Ok(n) if n > 0 => tracing::debug!(deleted = n, "cleaned up expired results"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "periodic cleanup_expired failed"),
+                }
+            }
+        })
+    }
+
+    /// Serialize the extended [`TaskMeta`] fields (progress, tags, metadata,
+    /// version, ...) into the JSON text stored in the `extra` column.
+    fn extra_param(meta: &TaskMeta) -> Result<String> {
+        TaskMetaExtra::from_meta(meta)
+            .to_json_string()
+            .map_err(|e| BackendError::Serialization(format!("Failed to serialize extra: {e}")))
+    }
+
+    /// Parse the `extra` column's text (if present) and overlay it onto `meta`.
+    fn apply_extra(meta: &mut TaskMeta, raw: Option<&str>) -> Result<()> {
+        let extra = TaskMetaExtra::from_column(raw)
+            .map_err(|e| BackendError::Serialization(format!("Failed to parse extra: {e}")))?;
+        extra.apply_to(meta);
+        Ok(())
+    }
+
+    /// Compute the `expires_at` parameter for `store_result`'s INSERT from
+    /// the per-task-type TTL config: `Some(rfc3339 string)` when a TTL is
+    /// configured for `task_name`, `None` otherwise.
+    ///
+    /// Folding this into the initial INSERT (see `store_result`) rather than
+    /// a second, separate `set_expiration` UPDATE afterward removes a
+    /// round-trip on the hottest write path and closes the partial-write
+    /// window where a row existed with no `expires_at` if that second,
+    /// independent statement failed after the first had already committed.
+    fn ttl_expires_at_param(ttl_config: &TaskTtlConfig, task_name: &str) -> Result<Option<String>> {
+        ttl_config
+            .get_ttl(task_name)
+            .map(|ttl| {
+                let expires_at = Utc::now()
+                    + chrono::Duration::from_std(ttl).map_err(|e| {
+                        BackendError::Serialization(format!("Invalid TTL duration: {}", e))
+                    })?;
+                Ok(expires_at.to_rfc3339())
+            })
+            .transpose()
+    }
 }
 
+#[cfg(feature = "postgres")]
 #[async_trait]
 impl ResultBackend for PostgresResultBackend {
     async fn store_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<()> {
@@ -161,15 +336,18 @@ impl ResultBackend for PostgresResultBackend {
         let created_at_param = meta.created_at.to_rfc3339();
         let started_at_param = meta.started_at.map(|dt| dt.to_rfc3339());
         let completed_at_param = meta.completed_at.map(|dt| dt.to_rfc3339());
+        let extra_param = Self::extra_param(meta)?;
+        let expires_at_param = Self::ttl_expires_at_param(&self.ttl_config, &meta.task_name)?;
 
         self.conn
             .execute(
                 r#"
                 INSERT INTO celers_task_results
                     (task_id, task_name, result_state, result_data, error_message, retry_count,
-                     created_at, started_at, completed_at, worker)
-                VALUES ($1, $2, $3, $4, $5, $6,
-                        $7::text::timestamptz, $8::text::timestamptz, $9::text::timestamptz, $10)
+                     created_at, started_at, completed_at, worker, extra, expires_at)
+                VALUES ($1::text::uuid, $2, $3, $4, $5, $6,
+                        $7::text::timestamptz, $8::text::timestamptz, $9::text::timestamptz, $10, $11,
+                        $12::text::timestamptz)
                 ON CONFLICT (task_id) DO UPDATE SET
                     result_state = EXCLUDED.result_state,
                     result_data = EXCLUDED.result_data,
@@ -177,10 +355,18 @@ impl ResultBackend for PostgresResultBackend {
                     retry_count = EXCLUDED.retry_count,
                     started_at = EXCLUDED.started_at,
                     completed_at = EXCLUDED.completed_at,
-                    worker = EXCLUDED.worker
+                    worker = EXCLUDED.worker,
+                    extra = EXCLUDED.extra,
+                    -- Only overwrite an existing expires_at when THIS store
+                    -- configured a TTL (EXCLUDED.expires_at IS NOT NULL);
+                    -- otherwise preserve whatever was already there. Matches
+                    -- the pre-fold behavior, where a separate set_expiration
+                    -- UPDATE ran (and unconditionally overwrote) only when a
+                    -- TTL was configured for this task_name.
+                    expires_at = COALESCE(EXCLUDED.expires_at, celers_task_results.expires_at)
                 "#,
                 &[
-                    &uuid_param(&task_id),
+                    &task_id.to_string(),
                     &meta.task_name,
                     &result_state,
                     &result_data.map(|v| json_param(&v)),
@@ -190,15 +376,12 @@ impl ResultBackend for PostgresResultBackend {
                     &started_at_param,
                     &completed_at_param,
                     &meta.worker,
+                    &extra_param,
+                    &expires_at_param,
                 ],
             )
             .await
             .map_err(|e| BackendError::Connection(format!("Failed to store result: {}", e)))?;
-
-        // Apply per-task TTL if configured
-        if let Some(ttl) = self.ttl_config.get_ttl(&meta.task_name) {
-            self.set_expiration(task_id, ttl).await?;
-        }
 
         Ok(())
     }
@@ -209,11 +392,11 @@ impl ResultBackend for PostgresResultBackend {
             .query(
                 r#"
                 SELECT task_id, task_name, result_state, result_data, error_message,
-                       retry_count, created_at, started_at, completed_at, worker
+                       retry_count, created_at, started_at, completed_at, worker, extra
                 FROM celers_task_results
-                WHERE task_id = $1
+                WHERE task_id = $1::text::uuid
                 "#,
-                &[&uuid_param(&task_id)],
+                &[&task_id.to_string()],
             )
             .await
             .map_err(|e| BackendError::Connection(format!("Failed to get result: {}", e)))?;
@@ -236,19 +419,20 @@ impl ResultBackend for PostgresResultBackend {
                 let retry_count: Option<i32> = row
                     .col("retry_count")
                     .map_err(|e| BackendError::Connection(format!("Failed to get result: {e}")))?;
+                let extra_raw: Option<String> = row
+                    .col("extra")
+                    .map_err(|e| BackendError::Connection(format!("Failed to get result: {e}")))?;
 
-                let result = match result_state.as_str() {
-                    "pending" => TaskResult::Pending,
-                    "started" => TaskResult::Started,
-                    "success" => TaskResult::Success(result_data.unwrap_or(json!(null))),
-                    "failure" => TaskResult::Failure(error_message.unwrap_or_default()),
-                    "revoked" => TaskResult::Revoked,
-                    "retry" => TaskResult::Retry(retry_count.unwrap_or(0) as u32),
-                    _ => TaskResult::Pending,
-                };
+                let result = decode_result_state(
+                    task_id,
+                    &result_state,
+                    result_data,
+                    error_message,
+                    retry_count,
+                )?;
 
-                let meta = TaskMeta {
-                    task_id: row_ext::uuid_from_row(&row, "task_id").map_err(|e| {
+                let mut meta = TaskMeta {
+                    task_id: uuid_from_row(&row, "task_id").map_err(|e| {
                         BackendError::Connection(format!("Failed to get result: {e}"))
                     })?,
                     task_name: row.col("task_name").map_err(|e| {
@@ -277,6 +461,7 @@ impl ResultBackend for PostgresResultBackend {
                     retries: None,
                     queue: None,
                 };
+                Self::apply_extra(&mut meta, extra_raw.as_deref())?;
 
                 Ok(Some(meta))
             }
@@ -287,8 +472,8 @@ impl ResultBackend for PostgresResultBackend {
     async fn delete_result(&mut self, task_id: Uuid) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM celers_task_results WHERE task_id = $1",
-                &[&uuid_param(&task_id)],
+                "DELETE FROM celers_task_results WHERE task_id = $1::text::uuid",
+                &[&task_id.to_string()],
             )
             .await
             .map_err(|e| BackendError::Connection(format!("Failed to delete result: {}", e)))?;
@@ -304,8 +489,8 @@ impl ResultBackend for PostgresResultBackend {
 
         self.conn
             .execute(
-                "UPDATE celers_task_results SET expires_at = $1::text::timestamptz WHERE task_id = $2",
-                &[&expires_at_param, &uuid_param(&task_id)],
+                "UPDATE celers_task_results SET expires_at = $1::text::timestamptz WHERE task_id = $2::text::uuid",
+                &[&expires_at_param, &task_id.to_string()],
             )
             .await
             .map_err(|e| BackendError::Connection(format!("Failed to set expiration: {}", e)))?;
@@ -323,7 +508,7 @@ impl ResultBackend for PostgresResultBackend {
             .execute(
                 r#"
                 INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
-                VALUES ($1, $2, 0, $3, $4, $5::text::timestamptz, $6, $7, $8)
+                VALUES ($1::text::uuid, $2, 0, $3, $4, $5::text::timestamptz, $6, $7, $8)
                 ON CONFLICT (chord_id) DO UPDATE SET
                     total = EXCLUDED.total,
                     callback = EXCLUDED.callback,
@@ -333,7 +518,7 @@ impl ResultBackend for PostgresResultBackend {
                     cancellation_reason = EXCLUDED.cancellation_reason
                 "#,
                 &[
-                    &uuid_param(&state.chord_id),
+                    &state.chord_id.to_string(),
                     &(state.total as i64),
                     &state.callback,
                     &json_param(&task_ids),
@@ -353,8 +538,8 @@ impl ResultBackend for PostgresResultBackend {
         let rows = self
             .conn
             .query(
-                "SELECT chord_increment_counter($1)",
-                &[&uuid_param(&chord_id)],
+                "SELECT chord_increment_counter($1::text::uuid)",
+                &[&chord_id.to_string()],
             )
             .await
             .map_err(|e| {
@@ -377,9 +562,9 @@ impl ResultBackend for PostgresResultBackend {
                 r#"
                 SELECT chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason
                 FROM celers_chord_state
-                WHERE chord_id = $1
+                WHERE chord_id = $1::text::uuid
                 "#,
-                &[&uuid_param(&chord_id)],
+                &[&chord_id.to_string()],
             )
             .await
             .map_err(|e| BackendError::Connection(format!("Failed to get chord state: {}", e)))?;
@@ -403,7 +588,7 @@ impl ResultBackend for PostgresResultBackend {
                 })?;
 
                 let state = ChordState {
-                    chord_id: row_ext::uuid_from_row(&row, "chord_id").map_err(|e| {
+                    chord_id: uuid_from_row(&row, "chord_id").map_err(|e| {
                         BackendError::Connection(format!("Failed to get chord state: {e}"))
                     })?,
                     total: total as usize,
@@ -439,10 +624,16 @@ impl ResultBackend for PostgresResultBackend {
             return Ok(());
         }
 
-        let mut tx =
-            self.conn.transaction().await.map_err(|e| {
-                BackendError::Connection(format!("Failed to begin transaction: {}", e))
-            })?;
+        // A transaction must stay pinned to one physical connection for its
+        // whole lifetime, so it is obtained via `PgConnPool::get()` (an
+        // owned, round-robin-picked connection) rather than through the
+        // pool's own `execute`/`query`, which pick a (possibly different)
+        // connection per call. See `pg_pool.rs`'s module doc for why.
+        let picked = self.conn.get().await;
+        let mut tx = picked
+            .transaction()
+            .await
+            .map_err(|e| BackendError::Connection(format!("Failed to begin transaction: {}", e)))?;
 
         for (task_id, meta) in results {
             let (result_state, result_data, error_message, retry_count) = match &meta.result {
@@ -456,14 +647,15 @@ impl ResultBackend for PostgresResultBackend {
             let created_at_param = meta.created_at.to_rfc3339();
             let started_at_param = meta.started_at.map(|dt| dt.to_rfc3339());
             let completed_at_param = meta.completed_at.map(|dt| dt.to_rfc3339());
+            let extra_param = Self::extra_param(meta)?;
 
             tx.execute(
                 r#"
                 INSERT INTO celers_task_results
                     (task_id, task_name, result_state, result_data, error_message, retry_count,
-                     created_at, started_at, completed_at, worker)
-                VALUES ($1, $2, $3, $4, $5, $6,
-                        $7::text::timestamptz, $8::text::timestamptz, $9::text::timestamptz, $10)
+                     created_at, started_at, completed_at, worker, extra)
+                VALUES ($1::text::uuid, $2, $3, $4, $5, $6,
+                        $7::text::timestamptz, $8::text::timestamptz, $9::text::timestamptz, $10, $11)
                 ON CONFLICT (task_id) DO UPDATE SET
                     result_state = EXCLUDED.result_state,
                     result_data = EXCLUDED.result_data,
@@ -471,10 +663,11 @@ impl ResultBackend for PostgresResultBackend {
                     retry_count = EXCLUDED.retry_count,
                     started_at = EXCLUDED.started_at,
                     completed_at = EXCLUDED.completed_at,
-                    worker = EXCLUDED.worker
+                    worker = EXCLUDED.worker,
+                    extra = EXCLUDED.extra
                 "#,
                 &[
-                    &uuid_param(task_id),
+                    &task_id.to_string(),
                     &meta.task_name,
                     &result_state,
                     &result_data.map(|v| json_param(&v)),
@@ -484,6 +677,7 @@ impl ResultBackend for PostgresResultBackend {
                     &started_at_param,
                     &completed_at_param,
                     &meta.worker,
+                    &extra_param,
                 ],
             )
             .await
@@ -507,26 +701,25 @@ impl ResultBackend for PostgresResultBackend {
         // oxisql-core's `traits.rs`), and building a `Value::TypedArray`
         // literal to bind against `= ANY($1)` would hit the exact same
         // Postgres binary/text wire-format hazard documented in
-        // `row_ext.rs` for `DateTime<Utc>` (a `uuid[]`-inferred placeholder
-        // expects a structured binary array, not the array-literal text
-        // `value_to_param` would actually send). A dynamically-built
-        // `IN (...)` with one `$n` placeholder per element sidesteps the
-        // array-binding hazard entirely — every value still goes through a
-        // parameter placeholder, only the *number* of placeholders (a count,
-        // not a value) is spliced into the SQL text.
+        // `row_ext.rs` for UUID scalars and `DateTime<Utc>` above. A
+        // dynamically-built `IN (...)` with one `$n::text::uuid` placeholder
+        // per element sidesteps the array-binding hazard entirely — every
+        // value still goes through a parameter placeholder (bound as plain
+        // `String`, cast to `uuid` server-side), only the *number* of
+        // placeholders (a count, not a value) is spliced into the SQL text.
         let placeholders: String = (1..=task_ids.len())
-            .map(|i| format!("${i}"))
+            .map(|i| format!("${i}::text::uuid"))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
             r#"
             SELECT task_id, task_name, result_state, result_data, error_message,
-                   retry_count, created_at, started_at, completed_at, worker
+                   retry_count, created_at, started_at, completed_at, worker, extra
             FROM celers_task_results
             WHERE task_id IN ({placeholders})
             "#
         );
-        let params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
+        let params: Vec<String> = task_ids.iter().map(|id| id.to_string()).collect();
         let param_refs: Vec<&dyn ToSqlValue> =
             params.iter().map(|v| v as &dyn ToSqlValue).collect();
 
@@ -539,7 +732,7 @@ impl ResultBackend for PostgresResultBackend {
         // Create a HashMap for O(1) lookup
         let mut results_map = std::collections::HashMap::new();
         for row in rows {
-            let task_id = row_ext::uuid_from_row(&row, "task_id")
+            let task_id = uuid_from_row(&row, "task_id")
                 .map_err(|e| BackendError::Connection(format!("Failed to get results: {e}")))?;
             let result_state: String = row
                 .col("result_state")
@@ -557,18 +750,19 @@ impl ResultBackend for PostgresResultBackend {
             let retry_count: Option<i32> = row
                 .col("retry_count")
                 .map_err(|e| BackendError::Connection(format!("Failed to get results: {e}")))?;
+            let extra_raw: Option<String> = row
+                .col("extra")
+                .map_err(|e| BackendError::Connection(format!("Failed to get results: {e}")))?;
 
-            let result = match result_state.as_str() {
-                "pending" => TaskResult::Pending,
-                "started" => TaskResult::Started,
-                "success" => TaskResult::Success(result_data.unwrap_or(json!(null))),
-                "failure" => TaskResult::Failure(error_message.unwrap_or_default()),
-                "revoked" => TaskResult::Revoked,
-                "retry" => TaskResult::Retry(retry_count.unwrap_or(0) as u32),
-                _ => TaskResult::Pending,
-            };
+            let result = decode_result_state(
+                task_id,
+                &result_state,
+                result_data,
+                error_message,
+                retry_count,
+            )?;
 
-            let meta = TaskMeta {
+            let mut meta = TaskMeta {
                 task_id,
                 task_name: row
                     .col("task_name")
@@ -596,6 +790,7 @@ impl ResultBackend for PostgresResultBackend {
                 retries: None,
                 queue: None,
             };
+            Self::apply_extra(&mut meta, extra_raw.as_deref())?;
 
             results_map.insert(task_id, meta);
         }
@@ -613,14 +808,14 @@ impl ResultBackend for PostgresResultBackend {
         }
 
         // See the comment in `get_results_batch` for why a dynamically-built
-        // `IN (...)` with one `$n` placeholder per element is used instead
-        // of `= ANY($1)`.
+        // `IN (...)` with one `$n::text::uuid` placeholder per element is
+        // used instead of `= ANY($1)`.
         let placeholders: String = (1..=task_ids.len())
-            .map(|i| format!("${i}"))
+            .map(|i| format!("${i}::text::uuid"))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!("DELETE FROM celers_task_results WHERE task_id IN ({placeholders})");
-        let params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
+        let params: Vec<String> = task_ids.iter().map(|id| id.to_string()).collect();
         let param_refs: Vec<&dyn ToSqlValue> =
             params.iter().map(|v| v as &dyn ToSqlValue).collect();
 
@@ -633,18 +828,32 @@ impl ResultBackend for PostgresResultBackend {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// MySQL backend
+// ══════════════════════════════════════════════════════════════════════════
+
 /// MySQL result backend implementation
+#[cfg(feature = "mysql")]
 #[derive(Clone)]
 pub struct MysqlResultBackend {
     conn: oxisql_mysql::MyConnection,
     ttl_config: TaskTtlConfig,
 }
 
+#[cfg(feature = "mysql")]
 impl MysqlResultBackend {
     /// Create a new MySQL result backend
     ///
     /// # Arguments
     /// * `database_url` - MySQL connection string (e.g., "mysql://user:pass@localhost/db")
+    ///
+    /// `oxisql_mysql::MyConnection` is backed by a real `mysql_async::Pool`
+    /// (confirmed against its own doc comments: "callers can share a
+    /// `MyConnection` across async tasks without additional locking"), so
+    /// unlike the Postgres backend this already pools connections and
+    /// transparently discards/replaces a broken one on next checkout — no
+    /// bespoke pooling wrapper is needed here. See [`Self::with_pool_size`]
+    /// to configure the pool's connection limits explicitly.
     pub async fn new(database_url: &str) -> Result<Self> {
         let tls = tls_mode::mysql_tls_mode_for_url(database_url)
             .map_err(|e| BackendError::Connection(format!("Failed to resolve TLS mode: {e}")))?;
@@ -653,6 +862,31 @@ impl MysqlResultBackend {
             .map_err(|e| {
                 BackendError::Connection(format!("Failed to connect to database: {}", e))
             })?;
+
+        Ok(Self {
+            conn,
+            ttl_config: TaskTtlConfig::new(),
+        })
+    }
+
+    /// Create a new MySQL result backend with an explicit pool connection
+    /// limit (`mysql_async`'s default is 10 when unset).
+    pub async fn with_pool_size(database_url: &str, pool_max: usize) -> Result<Self> {
+        let tls = tls_mode::mysql_tls_mode_for_url(database_url)
+            .map_err(|e| BackendError::Connection(format!("Failed to resolve TLS mode: {e}")))?;
+        let url = url::Url::parse(database_url)
+            .map_err(|e| BackendError::Connection(format!("Invalid database URL: {e}")))?;
+        let conn = oxisql_mysql::MyConnectionBuilder::new()
+            .host(url.host_str().unwrap_or("localhost"))
+            .port(url.port().unwrap_or(3306))
+            .user(url.username())
+            .password(url.password().unwrap_or(""))
+            .dbname(url.path().trim_start_matches('/'))
+            .pool_max(pool_max.max(1))
+            .tls_mode(tls)
+            .connect()
+            .await
+            .map_err(|e| BackendError::Connection(format!("Failed to connect to database: {e}")))?;
 
         Ok(Self {
             conn,
@@ -680,23 +914,32 @@ impl MysqlResultBackend {
     pub async fn migrate(&self) -> Result<()> {
         let migration_sql = include_str!("../migrations/001_init_mysql.sql");
 
-        // Split and execute MySQL migration (handle DELIMITER sections)
-        let statements: Vec<&str> = migration_sql.split("DELIMITER //").collect();
+        // Split on the `DELIMITER //` marker: everything before it is
+        // ordinary `;`-terminated DDL, everything after is one or more
+        // stored-procedure bodies (each internally `;`-terminated between
+        // `DELIMITER //` and `DELIMITER ;`, executed as a single statement).
+        let sections: Vec<&str> = migration_sql.split("DELIMITER //").collect();
 
-        // Execute main DDL
-        if let Some(main_sql) = statements.first() {
-            for statement in main_sql.split(';') {
-                let trimmed = statement.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with("--") {
-                    self.conn.execute(trimmed, &[]).await.map_err(|e| {
-                        BackendError::Connection(format!("Migration failed: {}", e))
-                    })?;
-                }
+        // Execute the main DDL section via a real statement splitter that
+        // respects string/identifier quoting and comments (see
+        // `sql_split.rs`) instead of a naive `str::split(';')`, which both
+        // breaks on any `;` inside a string/identifier and can silently
+        // *drop* a statement that follows a comment line within the same
+        // fragment.
+        if let Some(main_sql) = sections.first() {
+            for statement in sql_split::split_sql_statements(main_sql) {
+                self.conn
+                    .execute(&statement, &[])
+                    .await
+                    .map_err(|e| BackendError::Connection(format!("Migration failed: {}", e)))?;
             }
         }
 
-        // Execute stored procedures
-        for &proc_section in statements.iter().skip(1) {
+        // Execute stored procedures: each section between `DELIMITER //` and
+        // the next `DELIMITER ;` is one procedure body, executed whole (its
+        // internal `;`s are part of the procedure's `BEGIN...END` block, not
+        // statement separators at this level).
+        for &proc_section in sections.iter().skip(1) {
             if let Some(proc_sql) = proc_section.split("DELIMITER ;").next() {
                 let trimmed = proc_sql.trim();
                 if !trimmed.is_empty() {
@@ -707,6 +950,35 @@ impl MysqlResultBackend {
             }
         }
 
+        // Backward-compatible column add for databases migrated before the
+        // `extra` column existed. A fresh install already has it (via the
+        // CREATE TABLE above); MySQL 5.7 has no `ADD COLUMN IF NOT EXISTS`
+        // (that syntax needs 8.0.29+/newer MariaDB), so portably checking
+        // `information_schema.columns` first and only running the `ALTER`
+        // when the column is actually missing is what keeps `migrate()` safe
+        // to call repeatedly across MySQL/MariaDB versions.
+        let has_extra_column = self
+            .conn
+            .query(
+                "SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'celers_task_results' \
+                   AND column_name = 'extra'",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                BackendError::Connection(format!("Failed to check for extra column: {}", e))
+            })?;
+        if has_extra_column.is_empty() {
+            self.conn
+                .execute("ALTER TABLE celers_task_results ADD COLUMN extra JSON", &[])
+                .await
+                .map_err(|e| {
+                    BackendError::Connection(format!("Failed to add extra column: {}", e))
+                })?;
+        }
+
         Ok(())
     }
 
@@ -715,12 +987,66 @@ impl MysqlResultBackend {
         MysqlAnalytics::new(self.conn.clone())
     }
 
+    /// Check whether the backend can currently reach the database.
+    ///
+    /// Issues a trivial `SELECT 1` (benefiting from the underlying
+    /// `mysql_async::Pool`'s own checkout/discard-broken-connection
+    /// behavior — see [`MysqlResultBackend::new`]'s doc comment) and reports
+    /// whether it succeeded. Mirrors
+    /// `celers_backend_redis::RedisResultBackend::health_check`'s contract
+    /// for use in the same monitoring/readiness-probe role: `Ok(true)` means
+    /// healthy, `Err(_)` means a connection or other error occurred.
+    pub async fn health_check(&self) -> Result<bool> {
+        match self.conn.query("SELECT 1", &[]).await {
+            Ok(rows) => Ok(!rows.is_empty()),
+            Err(e) => Err(BackendError::Connection(format!(
+                "health_check query failed: {}",
+                e
+            ))),
+        }
+    }
+
     /// Get the underlying connection
     pub fn connection(&self) -> &oxisql_mysql::MyConnection {
         &self.conn
     }
+
+    /// Serialize the extended [`TaskMeta`] fields (progress, tags, metadata,
+    /// version, ...) into the JSON text stored in the `extra` column.
+    fn extra_param(meta: &TaskMeta) -> Result<String> {
+        TaskMetaExtra::from_meta(meta)
+            .to_json_string()
+            .map_err(|e| BackendError::Serialization(format!("Failed to serialize extra: {e}")))
+    }
+
+    /// Parse the `extra` column's text (if present) and overlay it onto `meta`.
+    fn apply_extra(meta: &mut TaskMeta, raw: Option<&str>) -> Result<()> {
+        let extra = TaskMetaExtra::from_column(raw)
+            .map_err(|e| BackendError::Serialization(format!("Failed to parse extra: {e}")))?;
+        extra.apply_to(meta);
+        Ok(())
+    }
+
+    /// Compute the `expires_at` parameter for `store_result`'s INSERT from
+    /// the per-task-type TTL config: `Some(MySQL DATETIME string)` when a TTL
+    /// is configured for `task_name`, `None` otherwise. See
+    /// `PostgresResultBackend::ttl_expires_at_param` for why this is folded
+    /// into the initial INSERT rather than a second `set_expiration` UPDATE.
+    fn ttl_expires_at_param(ttl_config: &TaskTtlConfig, task_name: &str) -> Result<Option<String>> {
+        ttl_config
+            .get_ttl(task_name)
+            .map(|ttl| {
+                let expires_at = Utc::now()
+                    + chrono::Duration::from_std(ttl).map_err(|e| {
+                        BackendError::Serialization(format!("Invalid TTL duration: {}", e))
+                    })?;
+                Ok(expires_at.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            })
+            .transpose()
+    }
 }
 
+#[cfg(feature = "mysql")]
 #[async_trait]
 impl ResultBackend for MysqlResultBackend {
     async fn store_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<()> {
@@ -746,14 +1072,16 @@ impl ResultBackend for MysqlResultBackend {
         let completed_at_param = meta
             .completed_at
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+        let extra_param = Self::extra_param(meta)?;
+        let expires_at_param = Self::ttl_expires_at_param(&self.ttl_config, &meta.task_name)?;
 
         self.conn
             .execute(
                 r#"
                 INSERT INTO celers_task_results
                     (task_id, task_name, result_state, result_data, error_message, retry_count,
-                     created_at, started_at, completed_at, worker)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, started_at, completed_at, worker, extra, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE
                     result_state = VALUES(result_state),
                     result_data = VALUES(result_data),
@@ -761,7 +1089,12 @@ impl ResultBackend for MysqlResultBackend {
                     retry_count = VALUES(retry_count),
                     started_at = VALUES(started_at),
                     completed_at = VALUES(completed_at),
-                    worker = VALUES(worker)
+                    worker = VALUES(worker),
+                    extra = VALUES(extra),
+                    -- See PostgresResultBackend::store_result's ON CONFLICT
+                    -- clause: only overwrite an existing expires_at when
+                    -- THIS store configured a TTL, otherwise preserve it.
+                    expires_at = COALESCE(VALUES(expires_at), expires_at)
                 "#,
                 &[
                     &task_id.to_string(),
@@ -774,15 +1107,12 @@ impl ResultBackend for MysqlResultBackend {
                     &started_at_param,
                     &completed_at_param,
                     &meta.worker,
+                    &extra_param,
+                    &expires_at_param,
                 ],
             )
             .await
             .map_err(|e| BackendError::Connection(format!("Failed to store result: {}", e)))?;
-
-        // Apply per-task TTL if configured
-        if let Some(ttl) = self.ttl_config.get_ttl(&meta.task_name) {
-            self.set_expiration(task_id, ttl).await?;
-        }
 
         Ok(())
     }
@@ -793,7 +1123,7 @@ impl ResultBackend for MysqlResultBackend {
             .query(
                 r#"
                 SELECT task_id, task_name, result_state, result_data, error_message,
-                       retry_count, created_at, started_at, completed_at, worker
+                       retry_count, created_at, started_at, completed_at, worker, extra
                 FROM celers_task_results
                 WHERE task_id = ?
                 "#,
@@ -819,22 +1149,24 @@ impl ResultBackend for MysqlResultBackend {
                 let retry_count: Option<i32> = row
                     .col("retry_count")
                     .map_err(|e| BackendError::Connection(format!("Failed to get result: {e}")))?;
+                let extra_raw: Option<String> = row
+                    .col("extra")
+                    .map_err(|e| BackendError::Connection(format!("Failed to get result: {e}")))?;
 
                 let result_data = result_data_str.and_then(|s| serde_json::from_str(&s).ok());
 
-                let result = match result_state.as_str() {
-                    "pending" => TaskResult::Pending,
-                    "started" => TaskResult::Started,
-                    "success" => TaskResult::Success(result_data.unwrap_or(json!(null))),
-                    "failure" => TaskResult::Failure(error_message.unwrap_or_default()),
-                    "revoked" => TaskResult::Revoked,
-                    "retry" => TaskResult::Retry(retry_count.unwrap_or(0) as u32),
-                    _ => TaskResult::Pending,
-                };
+                let parsed_task_id = Uuid::parse_str(&task_id_str)
+                    .map_err(|e| BackendError::Serialization(e.to_string()))?;
+                let result = decode_result_state(
+                    parsed_task_id,
+                    &result_state,
+                    result_data,
+                    error_message,
+                    retry_count,
+                )?;
 
-                let meta = TaskMeta {
-                    task_id: Uuid::parse_str(&task_id_str)
-                        .map_err(|e| BackendError::Serialization(e.to_string()))?,
+                let mut meta = TaskMeta {
+                    task_id: parsed_task_id,
                     task_name: row.col("task_name").map_err(|e| {
                         BackendError::Connection(format!("Failed to get result: {e}"))
                     })?,
@@ -861,6 +1193,7 @@ impl ResultBackend for MysqlResultBackend {
                     retries: None,
                     queue: None,
                 };
+                Self::apply_extra(&mut meta, extra_raw.as_deref())?;
 
                 Ok(Some(meta))
             }
@@ -935,11 +1268,33 @@ impl ResultBackend for MysqlResultBackend {
     }
 
     async fn chord_complete_task(&mut self, chord_id: Uuid) -> Result<usize> {
-        // MySQL doesn't support function returns in SELECT, use procedure with OUT parameter
-        // For now, use a simpler UPDATE + SELECT approach
-        self.conn
+        // Atomic increment-and-read: both statements MUST run on the same
+        // physical connection, so this uses an explicit transaction (which
+        // `MyTransaction` pins to one connection borrowed from the pool for
+        // its whole lifetime — see `oxisql-mysql`'s `connection.rs` doc
+        // comment) rather than `self.conn.execute`/`.query`, each of which
+        // independently checks a connection out of `mysql_async::Pool` and
+        // could land on two different physical connections.
+        //
+        // `LAST_INSERT_ID(expr)` is MySQL's own documented idiom for a
+        // session-scoped atomic increment-and-read (see the MySQL Reference
+        // Manual's "Obtaining the Unique ID": `UPDATE sequence SET
+        // id=LAST_INSERT_ID(id+1); SELECT LAST_INSERT_ID();`): the UPDATE's
+        // row-level lock serializes concurrent increments on the same row,
+        // and `LAST_INSERT_ID()` returns exactly the value *this session's*
+        // UPDATE computed, immune to another connection's concurrent
+        // increment landing in between (unlike the previous separate
+        // UPDATE-then-SELECT, where two concurrent callers could each read
+        // back the OTHER's incremented value and both observe the terminal
+        // count — firing the chord callback twice).
+        let mut tx =
+            self.conn.transaction().await.map_err(|e| {
+                BackendError::Connection(format!("Failed to begin transaction: {}", e))
+            })?;
+
+        let affected = tx
             .execute(
-                "UPDATE celers_chord_state SET completed = completed + 1 WHERE chord_id = ?",
+                "UPDATE celers_chord_state SET completed = LAST_INSERT_ID(completed + 1) WHERE chord_id = ?",
                 &[&chord_id.to_string()],
             )
             .await
@@ -947,21 +1302,34 @@ impl ResultBackend for MysqlResultBackend {
                 BackendError::Connection(format!("Failed to increment chord counter: {}", e))
             })?;
 
-        let rows = self
-            .conn
-            .query(
-                "SELECT completed FROM celers_chord_state WHERE chord_id = ?",
-                &[&chord_id.to_string()],
-            )
-            .await
-            .map_err(|e| BackendError::Connection(format!("Failed to get chord counter: {}", e)))?;
-        let row = rows.into_iter().next().ok_or_else(|| {
-            BackendError::Connection("chord counter query returned no rows".to_string())
-        })?;
+        if affected == 0 {
+            // No such chord row: roll back (nothing to commit) and report a
+            // meaningful not-found error rather than the previous behavior
+            // of a generic "chord counter query returned no rows" — same
+            // spirit as the caller-visible error identifying the missing id.
+            tx.rollback().await.map_err(|e| {
+                BackendError::Connection(format!("Failed to roll back transaction: {}", e))
+            })?;
+            return Err(BackendError::NotFound(chord_id));
+        }
 
+        let rows = tx
+            .query("SELECT LAST_INSERT_ID() AS completed", &[])
+            .await
+            .map_err(|e| {
+                BackendError::Connection(format!("Failed to read chord counter: {}", e))
+            })?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            BackendError::Connection("LAST_INSERT_ID() query returned no rows".to_string())
+        })?;
         let count: i64 = row
             .col("completed")
             .map_err(|e| BackendError::Connection(format!("Failed to read chord counter: {e}")))?;
+
+        tx.commit().await.map_err(|e| {
+            BackendError::Connection(format!("Failed to commit transaction: {}", e))
+        })?;
+
         Ok(count as usize)
     }
 
@@ -1059,13 +1427,14 @@ impl ResultBackend for MysqlResultBackend {
             let completed_at_param = meta
                 .completed_at
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+            let extra_param = Self::extra_param(meta)?;
 
             tx.execute(
                 r#"
                 INSERT INTO celers_task_results
                     (task_id, task_name, result_state, result_data, error_message, retry_count,
-                     created_at, started_at, completed_at, worker)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, started_at, completed_at, worker, extra)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE
                     result_state = VALUES(result_state),
                     result_data = VALUES(result_data),
@@ -1073,7 +1442,8 @@ impl ResultBackend for MysqlResultBackend {
                     retry_count = VALUES(retry_count),
                     started_at = VALUES(started_at),
                     completed_at = VALUES(completed_at),
-                    worker = VALUES(worker)
+                    worker = VALUES(worker),
+                    extra = VALUES(extra)
                 "#,
                 &[
                     &task_id.to_string(),
@@ -1086,6 +1456,7 @@ impl ResultBackend for MysqlResultBackend {
                     &started_at_param,
                     &completed_at_param,
                     &meta.worker,
+                    &extra_param,
                 ],
             )
             .await
@@ -1109,7 +1480,7 @@ impl ResultBackend for MysqlResultBackend {
         let query_str = format!(
             r#"
             SELECT task_id, task_name, result_state, result_data, error_message,
-                   retry_count, created_at, started_at, completed_at, worker
+                   retry_count, created_at, started_at, completed_at, worker, extra
             FROM celers_task_results
             WHERE task_id IN ({})
             "#,
@@ -1152,18 +1523,19 @@ impl ResultBackend for MysqlResultBackend {
             let retry_count: Option<i32> = row
                 .col("retry_count")
                 .map_err(|e| BackendError::Connection(format!("Failed to get results: {e}")))?;
+            let extra_raw: Option<String> = row
+                .col("extra")
+                .map_err(|e| BackendError::Connection(format!("Failed to get results: {e}")))?;
 
-            let result = match result_state.as_str() {
-                "pending" => TaskResult::Pending,
-                "started" => TaskResult::Started,
-                "success" => TaskResult::Success(result_data.unwrap_or(json!(null))),
-                "failure" => TaskResult::Failure(error_message.unwrap_or_default()),
-                "revoked" => TaskResult::Revoked,
-                "retry" => TaskResult::Retry(retry_count.unwrap_or(0) as u32),
-                _ => TaskResult::Pending,
-            };
+            let result = decode_result_state(
+                task_id,
+                &result_state,
+                result_data,
+                error_message,
+                retry_count,
+            )?;
 
-            let meta = TaskMeta {
+            let mut meta = TaskMeta {
                 task_id,
                 task_name: row
                     .col("task_name")
@@ -1191,6 +1563,7 @@ impl ResultBackend for MysqlResultBackend {
                 retries: None,
                 queue: None,
             };
+            Self::apply_extra(&mut meta, extra_raw.as_deref())?;
 
             results_map.insert(task_id, meta);
         }
@@ -1230,6 +1603,7 @@ impl ResultBackend for MysqlResultBackend {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     #[ignore] // Requires PostgreSQL running
     async fn test_postgres_backend_creation() {
@@ -1240,6 +1614,50 @@ mod tests {
         assert!(backend.is_ok());
     }
 
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL running
+    async fn test_postgres_store_get_delete_roundtrip_uuid_binding() {
+        // Regression test for the UUID binary-wire-format hazard: every
+        // Postgres call site in this file binds `task_id.to_string()` with a
+        // `$n::text::uuid` cast rather than a bare `Value::Uuid`. This
+        // exercises every fixed call site transitively (store_result's
+        // INSERT, get_result's SELECT, delete_result's DELETE) against a
+        // live server, where the bug would surface as a connection/protocol
+        // error rather than a Rust-level type error.
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let mut backend = PostgresResultBackend::new(&database_url)
+            .await
+            .expect("connect");
+        backend.migrate().await.expect("migrate");
+
+        let task_id = Uuid::new_v4();
+        let mut meta = TaskMeta::new(task_id, "uuid_roundtrip_test".to_string());
+        meta.result = TaskResult::Success(serde_json::json!({"ok": true}));
+        meta.tags = vec!["t1".to_string()];
+        meta.version = 3;
+
+        backend.store_result(task_id, &meta).await.expect("store");
+        let fetched = backend
+            .get_result(task_id)
+            .await
+            .expect("get")
+            .expect("row exists");
+        assert_eq!(fetched.task_id, task_id);
+        assert_eq!(fetched.tags, vec!["t1".to_string()]);
+        assert_eq!(fetched.version, 3);
+        assert!(matches!(fetched.result, TaskResult::Success(_)));
+
+        backend.delete_result(task_id).await.expect("delete");
+        assert!(backend
+            .get_result(task_id)
+            .await
+            .expect("get after delete")
+            .is_none());
+    }
+
+    #[cfg(feature = "mysql")]
     #[tokio::test]
     #[ignore] // Requires MySQL running
     async fn test_mysql_backend_creation() {
@@ -1248,5 +1666,219 @@ mod tests {
 
         let backend = MysqlResultBackend::new(&database_url).await;
         assert!(backend.is_ok());
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_mysql_chord_complete_task_fires_callback_exactly_once_concurrently() {
+        // Regression test for the non-atomic UPDATE-then-SELECT chord
+        // counter: spawns `total` tasks all completing the SAME chord
+        // concurrently and asserts exactly one of them observes
+        // `count >= total` (the condition `celers-worker`'s `workflows.rs`
+        // gates the chord callback dispatch on). Before the fix, the
+        // separate UPDATE and SELECT statements let two concurrent callers
+        // both read back the terminal count, firing the callback twice.
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let backend = MysqlResultBackend::new(&database_url)
+            .await
+            .expect("connect");
+        backend.migrate().await.expect("migrate");
+
+        let chord_id = Uuid::new_v4();
+        const TOTAL: usize = 8;
+        let state = ChordState {
+            chord_id,
+            total: TOTAL,
+            completed: 0,
+            callback: Some("noop".to_string()),
+            task_ids: (0..TOTAL).map(|_| Uuid::new_v4()).collect(),
+            created_at: Utc::now(),
+            timeout: None,
+            cancelled: false,
+            cancellation_reason: None,
+            retry_count: 0,
+            max_retries: None,
+        };
+        let mut init_backend = backend.clone();
+        init_backend.chord_init(state).await.expect("chord_init");
+
+        let mut handles = Vec::with_capacity(TOTAL);
+        for _ in 0..TOTAL {
+            let mut worker_backend = backend.clone();
+            handles.push(tokio::spawn(async move {
+                worker_backend
+                    .chord_complete_task(chord_id)
+                    .await
+                    .expect("chord_complete_task")
+            }));
+        }
+
+        let mut terminal_observations = 0usize;
+        for handle in handles {
+            let count = handle.await.expect("task join");
+            if count >= TOTAL {
+                terminal_observations += 1;
+            }
+        }
+
+        assert_eq!(
+            terminal_observations, 1,
+            "exactly one concurrent caller must observe the terminal chord count \
+             (Celery chord semantics: the callback fires exactly once)"
+        );
+    }
+
+    #[test]
+    fn decode_result_state_maps_every_known_state() {
+        let task_id = Uuid::new_v4();
+        assert!(matches!(
+            decode_result_state(task_id, "pending", None, None, None).unwrap(),
+            TaskResult::Pending
+        ));
+        assert!(matches!(
+            decode_result_state(task_id, "started", None, None, None).unwrap(),
+            TaskResult::Started
+        ));
+        assert!(matches!(
+            decode_result_state(task_id, "success", Some(json!({"a":1})), None, None).unwrap(),
+            TaskResult::Success(_)
+        ));
+        assert!(matches!(
+            decode_result_state(task_id, "revoked", None, None, None).unwrap(),
+            TaskResult::Revoked
+        ));
+        match decode_result_state(task_id, "retry", None, None, Some(3)).unwrap() {
+            TaskResult::Retry(n) => assert_eq!(n, 3),
+            other => panic!("expected Retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_result_state_errors_on_unknown_state_instead_of_silently_pending() {
+        let task_id = Uuid::new_v4();
+        let err = decode_result_state(task_id, "some_future_state", None, None, None)
+            .expect_err("unknown state must error, not silently map to Pending");
+        assert!(matches!(err, BackendError::Serialization(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("some_future_state"));
+        assert!(msg.contains(&task_id.to_string()));
+    }
+
+    #[test]
+    fn decode_result_state_failure_with_null_error_message_gets_explicit_placeholder() {
+        let task_id = Uuid::new_v4();
+        match decode_result_state(task_id, "failure", None, None, None).unwrap() {
+            TaskResult::Failure(msg) => {
+                assert!(
+                    !msg.is_empty(),
+                    "a NULL error_message must not silently become an empty-string failure reason"
+                );
+                assert!(msg.to_lowercase().contains("unknown"));
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_result_state_failure_with_present_message_is_preserved() {
+        let task_id = Uuid::new_v4();
+        match decode_result_state(task_id, "failure", None, Some("boom".to_string()), None).unwrap()
+        {
+            TaskResult::Failure(msg) => assert_eq!(msg, "boom"),
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    // ── ttl_expires_at_param: the TTL-folded-into-INSERT helper ─────────
+    //
+    // Regression coverage for folding `expires_at` into `store_result`'s
+    // INSERT instead of a second, separate `set_expiration` UPDATE (see its
+    // doc comment): these are pure, DB-free unit tests of the value/format
+    // computed for the new `$12`/`?` parameter, independent of the live-DB
+    // integration tests above.
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_ttl_expires_at_param_is_none_without_a_configured_ttl() {
+        let ttl_config = TaskTtlConfig::new();
+        let result = PostgresResultBackend::ttl_expires_at_param(&ttl_config, "untracked_task")
+            .expect("no TTL configured must not error");
+        assert!(
+            result.is_none(),
+            "no TTL configured must leave expires_at untouched (None), not force it to NULL/now"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_ttl_expires_at_param_is_a_future_rfc3339_timestamp_when_ttl_configured() {
+        let mut ttl_config = TaskTtlConfig::new();
+        ttl_config.set_task_ttl("ttl_task", Duration::from_secs(3600));
+        let before = Utc::now();
+
+        let raw = PostgresResultBackend::ttl_expires_at_param(&ttl_config, "ttl_task")
+            .expect("TTL config must not error")
+            .expect("a configured TTL must produce Some(..)");
+
+        // Must parse as RFC3339 (the format `$12::text::timestamptz` expects
+        // on the text side of the cast).
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&raw)
+            .expect("must be a valid RFC3339 timestamp")
+            .with_timezone(&Utc);
+        assert!(expires_at > before, "expires_at must be in the future");
+        assert!(
+            expires_at <= before + chrono::Duration::seconds(3601),
+            "expires_at must be ~= now + ttl, not something unrelated to the configured 3600s TTL"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_ttl_expires_at_param_falls_back_to_the_default_ttl() {
+        let ttl_config = TaskTtlConfig::with_default(Duration::from_secs(60));
+        let result =
+            PostgresResultBackend::ttl_expires_at_param(&ttl_config, "any_task_name_at_all")
+                .expect("default TTL must not error");
+        assert!(
+            result.is_some(),
+            "a configured default TTL must apply to every task_name"
+        );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_ttl_expires_at_param_is_none_without_a_configured_ttl() {
+        let ttl_config = TaskTtlConfig::new();
+        let result = MysqlResultBackend::ttl_expires_at_param(&ttl_config, "untracked_task")
+            .expect("no TTL configured must not error");
+        assert!(result.is_none());
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_ttl_expires_at_param_matches_the_mysql_datetime_grammar_when_ttl_configured() {
+        let mut ttl_config = TaskTtlConfig::new();
+        ttl_config.set_task_ttl("ttl_task", Duration::from_secs(3600));
+
+        let raw = MysqlResultBackend::ttl_expires_at_param(&ttl_config, "ttl_task")
+            .expect("TTL config must not error")
+            .expect("a configured TTL must produce Some(..)");
+
+        // See row_ext.rs's MySQL DateTime<Utc> parameter convention: a space
+        // separator, no 'T', no timezone suffix — never an RFC3339 string.
+        assert!(
+            !raw.contains('T'),
+            "MySQL DATETIME grammar has no 'T' separator: {raw:?}"
+        );
+        assert!(
+            !raw.contains('+') && !raw.contains('Z'),
+            "MySQL DATETIME grammar has no timezone suffix: {raw:?}"
+        );
+        assert!(
+            chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S%.6f").is_ok(),
+            "must match MySQL's own DATETIME text grammar: {raw:?}"
+        );
     }
 }

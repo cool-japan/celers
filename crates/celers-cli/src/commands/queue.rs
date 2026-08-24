@@ -3,7 +3,7 @@
 use crate::cache::{CacheStats, TtlCache};
 use crate::config::CacheConfig;
 use crate::pool::pooled_redis_connection;
-use celers_broker_redis::RedisBroker;
+use celers_broker_redis::{QueueState, RedisBroker};
 use celers_core::Broker;
 use colored::Colorize;
 use std::collections::HashMap;
@@ -346,11 +346,41 @@ pub async fn queue_names(broker_url: &str) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-/// Purge all tasks from a queue
-pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow::Result<()> {
-    let broker = RedisBroker::new(broker_url, queue)?;
+/// Read `key`'s current size via `LLEN` (list) or `ZCARD` (zset); `0` for
+/// any other type (including `"none"`, i.e. the key does not exist).
+/// `key_type` must already be known (from a prior `TYPE` call on the same
+/// key) so this never has to re-issue it.
+async fn read_sized_key(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+    key_type: &str,
+) -> anyhow::Result<usize> {
+    Ok(match key_type {
+        "list" => redis::cmd("LLEN").arg(key).query_async(conn).await?,
+        "zset" => redis::cmd("ZCARD").arg(key).query_async(conn).await?,
+        _ => 0,
+    })
+}
 
-    let queue_size = broker.queue_size().await?;
+/// Purge all tasks from a queue's main (pending) key.
+///
+/// Reads and deletes the *same* Redis key -- the one `RedisBroker` itself
+/// reads from and writes to (see `crate::keys::main`) -- rather than
+/// reading the size through the broker and then deleting an unrelated
+/// `celers:{queue}` key that no producer or worker ever creates (idx 313:
+/// that mismatch used to make this command always print a false "✓ Purged N
+/// tasks" while leaving the real queue untouched).
+pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow::Result<()> {
+    let client = redis::Client::open(broker_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    let queue_key = crate::keys::main(queue);
+    let queue_type: String = redis::cmd("TYPE")
+        .arg(&queue_key)
+        .query_async(&mut conn)
+        .await?;
+
+    let queue_size = read_sized_key(&mut conn, &queue_key, &queue_type).await?;
 
     if queue_size == 0 {
         println!("{}", "✓ Queue is already empty".green());
@@ -368,20 +398,30 @@ pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow
         return Ok(());
     }
 
-    // Connect to Redis directly to delete the queue
-    let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
-
-    let queue_key = format!("celers:{queue}");
-    redis::cmd("DEL")
+    // Re-measure immediately before deleting (same key, same connection) so
+    // the reported count reflects what this call actually removes rather
+    // than a read taken slightly earlier, and use `DEL`'s own return value
+    // to detect the rare race where the key was already gone by the time we
+    // got here (e.g. a concurrent purge) instead of claiming a purge that
+    // did not happen.
+    let final_size = read_sized_key(&mut conn, &queue_key, &queue_type).await?;
+    let deleted: i64 = redis::cmd("DEL")
         .arg(&queue_key)
-        .query_async::<()>(&mut conn)
+        .query_async(&mut conn)
         .await?;
     invalidate_queue_caches(broker_url, queue);
 
+    if deleted == 0 {
+        println!(
+            "{}",
+            format!("✓ Queue '{queue}' was already empty (raced with a concurrent purge)").yellow()
+        );
+        return Ok(());
+    }
+
     println!(
         "{}",
-        format!("✓ Purged {queue_size} tasks from queue '{queue}'").green()
+        format!("✓ Purged {final_size} tasks from queue '{queue}'").green()
     );
 
     Ok(())
@@ -428,10 +468,10 @@ pub async fn queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 async fn fetch_queue_stats(broker_url: &str, queue: &str) -> anyhow::Result<QueueStatsSnapshot> {
     let conn = pooled_redis_connection(broker_url).await?;
 
-    let queue_key = format!("celers:{queue}");
-    let processing_key = format!("{queue_key}:processing");
-    let dlq_key = format!("{queue_key}:dlq");
-    let delayed_key = format!("{queue_key}:delayed");
+    let queue_key = crate::keys::main(queue);
+    let processing_key = crate::keys::processing(queue);
+    let dlq_key = crate::keys::dlq(queue);
+    let delayed_key = crate::keys::delayed(queue);
 
     let mut main_conn = conn.clone();
     let mut processing_conn = conn.clone();
@@ -641,9 +681,10 @@ pub async fn move_queue(
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    // Construct queue keys
-    let from_key = format!("celers:{from_queue}");
-    let to_key = format!("celers:{to_queue}");
+    // Construct queue keys (see `crate::keys` -- these must match the bare,
+    // unprefixed key scheme `RedisBroker` itself reads/writes).
+    let from_key = crate::keys::main(from_queue);
+    let to_key = crate::keys::main(to_queue);
 
     // Determine the source queue type
     let from_type: String = redis::cmd("TYPE")
@@ -721,21 +762,29 @@ pub async fn move_queue(
             match task {
                 Some(task_str) => {
                     if to_type == "list" || to_type == "none" {
-                        // Destination is FIFO queue (or create new)
-                        let _: usize = redis::cmd("LPUSH")
+                        // Destination is FIFO queue (or create new). `RPUSH`
+                        // to match `RedisBroker::enqueue`'s own push
+                        // direction for list-mode queues -- an `LPUSH` here
+                        // would silently invert this task's position
+                        // relative to every task the broker itself enqueues.
+                        let _: usize = redis::cmd("RPUSH")
                             .arg(&to_key)
                             .arg(&task_str)
                             .query_async(&mut conn)
                             .await?;
                     } else if to_type == "zset" {
-                        // Destination is priority queue
+                        // Destination is priority queue. Score is the
+                        // negated priority, matching
+                        // `RedisBroker::enqueue`'s `-priority as f64`
+                        // convention (ZPOPMIN pops the lowest score first,
+                        // so higher `priority` values must sort lower).
                         if let Ok(task) =
                             serde_json::from_str::<celers_core::SerializedTask>(&task_str)
                         {
-                            let priority = f64::from(task.metadata.priority);
+                            let score = -f64::from(task.metadata.priority);
                             let _: usize = redis::cmd("ZADD")
                                 .arg(&to_key)
-                                .arg(priority)
+                                .arg(score)
                                 .arg(&task_str)
                                 .query_async(&mut conn)
                                 .await?;
@@ -771,19 +820,22 @@ pub async fn move_queue(
             let (task_str, _score) = &result[0];
 
             if to_type == "list" || to_type == "none" {
-                // Destination is FIFO queue
-                let _: usize = redis::cmd("LPUSH")
+                // Destination is FIFO queue. `RPUSH` to match
+                // `RedisBroker::enqueue`'s push direction (see the FIFO
+                // branch above).
+                let _: usize = redis::cmd("RPUSH")
                     .arg(&to_key)
                     .arg(task_str)
                     .query_async(&mut conn)
                     .await?;
             } else if to_type == "zset" {
-                // Destination is priority queue
+                // Destination is priority queue. Negated priority, matching
+                // `RedisBroker::enqueue`'s scoring convention (see above).
                 if let Ok(task) = serde_json::from_str::<celers_core::SerializedTask>(task_str) {
-                    let priority = f64::from(task.metadata.priority);
+                    let score = -f64::from(task.metadata.priority);
                     let _: usize = redis::cmd("ZADD")
                         .arg(&to_key)
-                        .arg(priority)
+                        .arg(score)
                         .arg(task_str)
                         .query_async(&mut conn)
                         .await?;
@@ -832,14 +884,116 @@ pub async fn move_queue(
     Ok(())
 }
 
-/// Export queue tasks to a JSON file
+/// One raw queue entry as captured by [`export_queue`]/consumed by
+/// [`import_queue`].
+///
+/// `raw` is the exact, unparsed string Redis returned from `LRANGE`/
+/// `ZRANGE` -- never re-serialized through this CLI's own
+/// `celers_core::SerializedTask` -- so an entry this CLI cannot deserialize
+/// (a Celery-native message, a task written by a different CeleRS version,
+/// a partially-written entry, ...) is still exported and re-imported
+/// byte-for-byte instead of being silently dropped (idx 332).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExportedEntry {
+    /// The entry exactly as stored in Redis.
+    raw: String,
+    /// This entry's `ZADD` score at export time (`None` for a FIFO/list
+    /// export). Captured via `ZRANGE ... WITHSCORES` so importing into a
+    /// priority queue can restore the exact original ordering without
+    /// needing to parse `raw` at all.
+    score: Option<f64>,
+}
+
+/// On-disk shape written by [`export_queue`] and read by [`import_queue`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QueueExport {
+    queue_name: String,
+    queue_type: String,
+    exported_at: String,
+    task_count: usize,
+    entries: Vec<ExportedEntry>,
+}
+
+/// Max entries fetched per `LRANGE`/`ZRANGE` round trip while exporting, so
+/// a very large queue is streamed in bounded chunks rather than pulled into
+/// CLI memory (and the single Redis reply) in one unbounded `0 -1` call.
+const EXPORT_CHUNK_SIZE: isize = 1000;
+
+/// Read every entry of a list-type queue in [`EXPORT_CHUNK_SIZE`]-sized
+/// pages via repeated `LRANGE start stop` calls.
+async fn export_list_entries(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+) -> anyhow::Result<Vec<ExportedEntry>> {
+    let mut entries = Vec::new();
+    let mut start: isize = 0;
+    loop {
+        let stop = start + EXPORT_CHUNK_SIZE - 1;
+        let chunk: Vec<String> = redis::cmd("LRANGE")
+            .arg(key)
+            .arg(start)
+            .arg(stop)
+            .query_async(conn)
+            .await?;
+        let got = chunk.len();
+        entries.extend(
+            chunk
+                .into_iter()
+                .map(|raw| ExportedEntry { raw, score: None }),
+        );
+        if got < EXPORT_CHUNK_SIZE as usize {
+            break;
+        }
+        start += EXPORT_CHUNK_SIZE;
+    }
+    Ok(entries)
+}
+
+/// Read every entry of a zset-type queue (with its score) in
+/// [`EXPORT_CHUNK_SIZE`]-sized pages via repeated `ZRANGE start stop
+/// WITHSCORES` calls.
+async fn export_zset_entries(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+) -> anyhow::Result<Vec<ExportedEntry>> {
+    let mut entries = Vec::new();
+    let mut start: isize = 0;
+    loop {
+        let stop = start + EXPORT_CHUNK_SIZE - 1;
+        let chunk: Vec<(String, f64)> = redis::cmd("ZRANGE")
+            .arg(key)
+            .arg(start)
+            .arg(stop)
+            .arg("WITHSCORES")
+            .query_async(conn)
+            .await?;
+        let got = chunk.len();
+        entries.extend(chunk.into_iter().map(|(raw, score)| ExportedEntry {
+            raw,
+            score: Some(score),
+        }));
+        if got < EXPORT_CHUNK_SIZE as usize {
+            break;
+        }
+        start += EXPORT_CHUNK_SIZE;
+    }
+    Ok(entries)
+}
+
+/// Export queue tasks to a JSON file.
+///
+/// Every entry is captured raw and byte-for-byte (see [`ExportedEntry`]),
+/// so nothing is silently dropped even when this CLI's own
+/// `SerializedTask` cannot parse an entry -- unlike the previous
+/// `if let Ok(task) = serde_json::from_str(...)` implementation, which
+/// dropped unparseable entries with no warning and reported the
+/// already-reduced count as if it were the total (idx 332).
 pub async fn export_queue(broker_url: &str, queue: &str, output_file: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let queue_key = format!("celers:{queue}");
+    let queue_key = crate::keys::main(queue);
 
-    // Get queue type
     let queue_type: String = redis::cmd("TYPE")
         .arg(&queue_key)
         .query_async(&mut conn)
@@ -852,49 +1006,21 @@ pub async fn export_queue(broker_url: &str, queue: &str, output_file: &str) -> a
 
     println!("{}", format!("Exporting queue '{queue}'...").cyan());
 
-    // Fetch all tasks
-    let tasks: Vec<String> = if queue_type == "list" {
-        redis::cmd("LRANGE")
-            .arg(&queue_key)
-            .arg(0)
-            .arg(-1)
-            .query_async(&mut conn)
-            .await?
+    let entries = if queue_type == "list" {
+        export_list_entries(&mut conn, &queue_key).await?
     } else if queue_type == "zset" {
-        redis::cmd("ZRANGE")
-            .arg(&queue_key)
-            .arg(0)
-            .arg(-1)
-            .query_async(&mut conn)
-            .await?
+        export_zset_entries(&mut conn, &queue_key).await?
     } else {
         println!("{}", format!("✗ Unknown queue type: {queue_type}").red());
         return Ok(());
     };
 
-    // Parse tasks and create export data
-    let mut export_tasks = Vec::new();
-    for task_str in tasks {
-        if let Ok(task) = serde_json::from_str::<celers_core::SerializedTask>(&task_str) {
-            export_tasks.push(task);
-        }
-    }
-
-    #[derive(serde::Serialize)]
-    struct QueueExport {
-        queue_name: String,
-        queue_type: String,
-        exported_at: String,
-        task_count: usize,
-        tasks: Vec<celers_core::SerializedTask>,
-    }
-
     let export_data = QueueExport {
         queue_name: queue.to_string(),
         queue_type: queue_type.clone(),
         exported_at: chrono::Utc::now().to_rfc3339(),
-        task_count: export_tasks.len(),
-        tasks: export_tasks,
+        task_count: entries.len(),
+        entries,
     };
 
     // Write to file
@@ -904,7 +1030,7 @@ pub async fn export_queue(broker_url: &str, queue: &str, output_file: &str) -> a
     println!(
         "{}",
         format!(
-            "✓ Exported {} tasks from queue '{}' to '{}'",
+            "✓ Exported {} entries from queue '{}' to '{}' (raw, byte-faithful)",
             export_data.task_count, queue, output_file
         )
         .green()
@@ -917,7 +1043,7 @@ pub async fn export_queue(broker_url: &str, queue: &str, output_file: &str) -> a
     Ok(())
 }
 
-/// Import queue tasks from a JSON file
+/// Import queue tasks from a JSON file produced by [`export_queue`].
 pub async fn import_queue(
     broker_url: &str,
     queue: &str,
@@ -926,16 +1052,6 @@ pub async fn import_queue(
 ) -> anyhow::Result<()> {
     // Read and parse file
     let json = std::fs::read_to_string(input_file)?;
-
-    #[derive(serde::Deserialize)]
-    struct QueueExport {
-        queue_name: String,
-        queue_type: String,
-        exported_at: String,
-        task_count: usize,
-        tasks: Vec<celers_core::SerializedTask>,
-    }
-
     let export_data: QueueExport = serde_json::from_str(&json)?;
 
     // Show import info
@@ -963,7 +1079,7 @@ pub async fn import_queue(
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
-    let queue_key = format!("celers:{queue}");
+    let queue_key = crate::keys::main(queue);
 
     // Determine destination queue type
     let to_type: String = redis::cmd("TYPE")
@@ -973,27 +1089,39 @@ pub async fn import_queue(
 
     println!(
         "{}",
-        format!("Importing {} tasks...", export_data.task_count).cyan()
+        format!("Importing {} entries...", export_data.task_count).cyan()
     );
 
     let mut imported = 0;
-    for task in export_data.tasks {
-        let task_json = serde_json::to_string(&task)?;
-
+    for entry in export_data.entries {
         if to_type == "list" || to_type == "none" {
-            // Destination is FIFO queue
-            let _: usize = redis::cmd("LPUSH")
+            // Destination is FIFO queue. `RPUSH` to match
+            // `RedisBroker::enqueue`'s own push direction for list-mode
+            // queues.
+            let _: usize = redis::cmd("RPUSH")
                 .arg(&queue_key)
-                .arg(&task_json)
+                .arg(&entry.raw)
                 .query_async(&mut conn)
                 .await?;
         } else if to_type == "zset" {
-            // Destination is priority queue
-            let priority = f64::from(task.metadata.priority);
+            // Destination is priority queue. Prefer the score captured at
+            // export time (restores the exact original ordering
+            // byte-for-byte); fall back to recomputing `-priority` from the
+            // raw JSON (matching `RedisBroker::enqueue`'s convention) only
+            // when importing a score-less FIFO export into a priority
+            // destination.
+            let score = entry
+                .score
+                .or_else(|| {
+                    serde_json::from_str::<celers_core::SerializedTask>(&entry.raw)
+                        .ok()
+                        .map(|task| -f64::from(task.metadata.priority))
+                })
+                .unwrap_or(0.0);
             let _: usize = redis::cmd("ZADD")
                 .arg(&queue_key)
-                .arg(priority)
-                .arg(&task_json)
+                .arg(score)
+                .arg(&entry.raw)
                 .query_async(&mut conn)
                 .await?;
         }
@@ -1003,7 +1131,7 @@ pub async fn import_queue(
             print!(
                 "\r{}",
                 format!(
-                    "Imported {} / {} tasks...",
+                    "Imported {} / {} entries...",
                     imported, export_data.task_count
                 )
                 .cyan()
@@ -1018,7 +1146,7 @@ pub async fn import_queue(
     println!();
     println!(
         "{}",
-        format!("✓ Successfully imported {imported} tasks into queue '{queue}'")
+        format!("✓ Successfully imported {imported} entries into queue '{queue}'")
             .green()
             .bold()
     );
@@ -1026,22 +1154,29 @@ pub async fn import_queue(
     Ok(())
 }
 
-/// Pause queue processing
+/// Pause queue processing.
+///
+/// Goes through `RedisBroker::queue_controller()` (`QueueController::pause`)
+/// rather than a raw `SET celers:{queue}:paused`: the CLI's previous
+/// hand-rolled key (`celers:{queue}:paused`) did not match
+/// `QueueController`'s own `{queue}:paused` key at all (idx 312), and even
+/// after aligning the key, `QueueController` is the single source of truth
+/// for queue pause/drain state that any broker-side consumer (present or
+/// future) is expected to check -- writing it directly with raw commands
+/// would just be reinventing that logic with a second chance to drift.
+///
+/// NOTE: as of this fix, `RedisBroker::dequeue` still does not itself
+/// consult `QueueController::can_dequeue`/`is_paused` (that gap lives in
+/// `celers-broker-redis`, outside this crate) -- so a paused queue is now at
+/// least recorded under the *correct* key, in the *correct* format, ready
+/// for that consultation to be wired in, but does not yet stop a running
+/// worker from dequeuing on its own. See the crate-level followups.
 pub async fn pause_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
-    let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
-
-    let pause_key = format!("celers:{queue}:paused");
-
-    // Set pause flag with a timestamp
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let _: () = redis::cmd("SET")
-        .arg(&pause_key)
-        .arg(&timestamp)
-        .query_async(&mut conn)
-        .await?;
+    let broker = RedisBroker::new(broker_url, queue)?;
+    broker.queue_controller().pause().await?;
     invalidate_queue_caches(broker_url, queue);
 
+    let timestamp = chrono::Utc::now().to_rfc3339();
     println!(
         "{}",
         format!("✓ Queue '{queue}' has been paused").green().bold()
@@ -1057,29 +1192,18 @@ pub async fn pause_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resume queue processing
+/// Resume queue processing. See [`pause_queue`] for why this goes through
+/// `QueueController` instead of a raw `GET`/`DEL`.
 pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
-    let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let broker = RedisBroker::new(broker_url, queue)?;
+    let controller = broker.queue_controller();
 
-    let pause_key = format!("celers:{queue}:paused");
-
-    // Check if queue is paused
-    let paused: Option<String> = redis::cmd("GET")
-        .arg(&pause_key)
-        .query_async(&mut conn)
-        .await?;
-
-    if paused.is_none() {
+    if controller.get_state().await? == QueueState::Active {
         println!("{}", format!("✓ Queue '{queue}' is not paused").yellow());
         return Ok(());
     }
 
-    // Remove pause flag
-    let _: () = redis::cmd("DEL")
-        .arg(&pause_key)
-        .query_async(&mut conn)
-        .await?;
+    controller.resume().await?;
     invalidate_queue_caches(broker_url, queue);
 
     println!(
@@ -1089,9 +1213,6 @@ pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     println!();
     println!("{}", "Note:".yellow().bold());
     println!("  • Workers will now process tasks from this queue");
-    if let Some(paused_at) = paused {
-        println!("  • Was paused at: {}", paused_at.dimmed());
-    }
 
     Ok(())
 }
@@ -1099,6 +1220,216 @@ pub async fn resume_queue(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Local Redis used by this module's live-broker regression tests.
+    /// Every test below scopes its own queue name with a fresh UUID so
+    /// concurrent test runs (this suite, other crates' suites, other
+    /// parallel work against the same shared Redis instance) never collide.
+    const TEST_BROKER_URL: &str = "redis://127.0.0.1:6379";
+
+    /// Regression test for idx 312/313: `purge_queue` used to read the
+    /// queue's size through `RedisBroker` (which resolves to the *real* key)
+    /// and then `DEL celers:{queue}` -- a key nothing ever wrote to -- so it
+    /// unconditionally printed "✓ Purged N tasks" while leaving the real
+    /// queue completely untouched. This proves a purge against a queue
+    /// populated the same way a real producer would (via `RedisBroker`)
+    /// actually empties that same, real key.
+    #[tokio::test]
+    async fn purge_queue_actually_empties_the_real_broker_key() {
+        let queue_name = format!("test-purge-{}", uuid::Uuid::new_v4());
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+
+        for i in 0..3 {
+            let task = celers_core::SerializedTask::new(format!("task-{i}"), Vec::new());
+            broker.enqueue(task).await.expect("enqueue");
+        }
+        assert_eq!(broker.queue_size().await.expect("size"), 3);
+
+        purge_queue(TEST_BROKER_URL, &queue_name, true)
+            .await
+            .expect("purge");
+
+        assert_eq!(
+            broker.queue_size().await.expect("size after purge"),
+            0,
+            "purge_queue must empty the exact key RedisBroker reads from/writes to"
+        );
+    }
+
+    /// `purge_queue` against a queue key that was never created must be a
+    /// safe no-op (not an error), and purging an already-empty real queue
+    /// (created then fully drained) must likewise succeed cleanly -- this
+    /// exercises the `deleted == 0` / already-empty branches added while
+    /// fixing idx 313.
+    #[tokio::test]
+    async fn purge_queue_on_nonexistent_or_already_empty_queue_is_a_safe_noop() {
+        let never_created = format!("test-purge-missing-{}", uuid::Uuid::new_v4());
+        purge_queue(TEST_BROKER_URL, &never_created, true)
+            .await
+            .expect("purging a queue key that was never created must not error");
+
+        let emptied = format!("test-purge-emptied-{}", uuid::Uuid::new_v4());
+        let broker = RedisBroker::new(TEST_BROKER_URL, &emptied).expect("broker");
+        broker
+            .enqueue(celers_core::SerializedTask::new(
+                "solo".to_string(),
+                Vec::new(),
+            ))
+            .await
+            .expect("enqueue");
+        purge_queue(TEST_BROKER_URL, &emptied, true)
+            .await
+            .expect("first purge");
+        purge_queue(TEST_BROKER_URL, &emptied, true)
+            .await
+            .expect("second purge against an already-empty queue must not error");
+    }
+
+    /// Regression test for idx 332: an entry this CLI's own
+    /// `celers_core::SerializedTask` cannot deserialize (e.g. a
+    /// Celery-native message, or a task from an incompatible CeleRS
+    /// version) must still survive an export/import round trip
+    /// byte-for-byte, instead of being silently dropped with the reduced
+    /// count reported as if it were the total.
+    #[tokio::test]
+    async fn export_then_import_round_trips_entries_the_cli_cannot_deserialize() {
+        let src_queue = format!("test-export-src-{}", uuid::Uuid::new_v4());
+        let dst_queue = format!("test-export-dst-{}", uuid::Uuid::new_v4());
+
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("conn");
+
+        let opaque_entry = r#"{"not":"a serialized task","id":42}"#;
+        let _: usize = redis::cmd("RPUSH")
+            .arg(crate::keys::main(&src_queue))
+            .arg(opaque_entry)
+            .query_async(&mut conn)
+            .await
+            .expect("seed opaque entry");
+
+        let export_path = std::env::temp_dir().join(format!(
+            "celers_cli_export_test_{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let export_path_str = export_path.to_str().expect("utf8 temp path");
+
+        export_queue(TEST_BROKER_URL, &src_queue, export_path_str)
+            .await
+            .expect("export");
+        import_queue(TEST_BROKER_URL, &dst_queue, export_path_str, true)
+            .await
+            .expect("import");
+
+        let dst_key = crate::keys::main(&dst_queue);
+        let imported: Vec<String> = redis::cmd("LRANGE")
+            .arg(&dst_key)
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut conn)
+            .await
+            .expect("lrange dst");
+
+        assert_eq!(
+            imported,
+            vec![opaque_entry.to_string()],
+            "an entry the CLI cannot parse as SerializedTask must still round-trip byte-for-byte"
+        );
+
+        let _ = std::fs::remove_file(&export_path);
+        let _: () = redis::cmd("DEL")
+            .arg(&dst_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(());
+    }
+
+    /// Regression test for the priority-score-sign half of idx 312's "CLI
+    /// disagrees with the broker on push direction" finding: `move_queue`
+    /// used to `ZADD` a moved task's positive, un-negated priority as its
+    /// score, while `RedisBroker::enqueue` always scores a priority queue
+    /// with `-priority`. Since `ZPOPMIN` (what `RedisBroker::dequeue` uses
+    /// in Priority mode) pops the *lowest* score first, that sign mismatch
+    /// would make a moved high-priority task dequeue *after* a
+    /// broker-enqueued low-priority one instead of before it.
+    #[tokio::test]
+    async fn move_queue_into_priority_destination_uses_broker_compatible_score_sign() {
+        let from_queue = format!("test-move-src-{}", uuid::Uuid::new_v4());
+        let to_queue = format!("test-move-dst-{}", uuid::Uuid::new_v4());
+
+        let from_broker = RedisBroker::new(TEST_BROKER_URL, &from_queue).expect("broker");
+        let mut high_priority_task =
+            celers_core::SerializedTask::new("high".to_string(), Vec::new());
+        high_priority_task.metadata.priority = 9;
+        from_broker
+            .enqueue(high_priority_task)
+            .await
+            .expect("enqueue high priority");
+
+        let to_broker = RedisBroker::with_mode(
+            TEST_BROKER_URL,
+            &to_queue,
+            celers_broker_redis::QueueMode::Priority,
+        )
+        .expect("broker");
+        let mut low_priority_task = celers_core::SerializedTask::new("low".to_string(), Vec::new());
+        low_priority_task.metadata.priority = 1;
+        to_broker
+            .enqueue(low_priority_task)
+            .await
+            .expect("seed destination with low priority task");
+
+        move_queue(TEST_BROKER_URL, &from_queue, &to_queue, true)
+            .await
+            .expect("move");
+
+        let first = to_broker
+            .dequeue()
+            .await
+            .expect("dequeue")
+            .expect("destination has a task");
+        assert_eq!(
+            first.task.metadata.priority, 9,
+            "the moved higher-priority task must dequeue before the pre-seeded lower-priority one"
+        );
+    }
+
+    /// Regression test for the queue-pause half of idx 312/324:
+    /// `pause_queue`/`resume_queue` used to write/read
+    /// `celers:{queue}:paused`, a key `QueueController` (the real owner of
+    /// pause/drain state) never looks at. This proves the CLI's pause/resume
+    /// commands now observably change `QueueController`'s own state for the
+    /// same queue.
+    #[tokio::test]
+    async fn pause_queue_and_resume_queue_change_the_real_queue_controller_state() {
+        let queue_name = format!("test-pause-{}", uuid::Uuid::new_v4());
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+        let controller = broker.queue_controller();
+
+        assert_eq!(
+            controller.get_state().await.expect("state"),
+            QueueState::Active
+        );
+
+        pause_queue(TEST_BROKER_URL, &queue_name)
+            .await
+            .expect("pause");
+        assert_eq!(
+            controller.get_state().await.expect("state after pause"),
+            QueueState::Paused,
+            "pause_queue must be observable through QueueController, the real owner of this state"
+        );
+
+        resume_queue(TEST_BROKER_URL, &queue_name)
+            .await
+            .expect("resume");
+        assert_eq!(
+            controller.get_state().await.expect("state after resume"),
+            QueueState::Active
+        );
+    }
 
     /// Stand-in for a per-key broker round trip (e.g. `TYPE` + `LLEN`):
     /// deterministic and independent of every other call, exactly the shape

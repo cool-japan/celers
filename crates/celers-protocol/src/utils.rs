@@ -82,7 +82,7 @@ pub fn time_until_eta(message: &Message) -> Option<Duration> {
     })
 }
 
-/// Calculate the age of a message based on its ETA or expires timestamp
+/// Calculate the age of a message, based on its real `created_at` timestamp.
 ///
 /// # Arguments
 ///
@@ -90,37 +90,18 @@ pub fn time_until_eta(message: &Message) -> Option<Duration> {
 ///
 /// # Returns
 ///
-/// `Duration` representing the estimated age of the message.
-/// If the message has an ETA in the past, returns the duration since that ETA.
-/// If the message has an expires timestamp, estimates age as 1/4 of time until expiration.
-/// Otherwise returns zero.
-///
-/// Note: This is an estimation since messages don't carry creation timestamps.
-/// For accurate message age tracking, add a custom header with creation timestamp.
-pub fn message_age(message: &Message) -> Duration {
-    let now = Utc::now();
-
-    // If ETA is in the past, assume message was created around that time
-    if let Some(eta) = message.headers.eta {
-        if eta < now {
-            return now - eta;
-        }
-    }
-
-    // If expires is set, estimate age based on typical TTL patterns
-    // This is a heuristic: assume message was created 1 hour before expiration
-    // or 25% of the time to expiration, whichever is smaller
-    if let Some(expires) = message.headers.expires {
-        if expires > now {
-            let time_to_expire = expires - now;
-            let estimated_ttl = time_to_expire + Duration::hours(1);
-            return Duration::hours(1).min(estimated_ttl / 4);
-        }
-        // Message is expired, estimate it was created 1 hour before expiration
-        return now - (expires - Duration::hours(1));
-    }
-
-    Duration::zero()
+/// `Some(Duration)` — the wall-clock time elapsed since
+/// `message.headers.created_at`, as recorded by
+/// [`crate::MessageHeaders::new`] when the message was constructed.
+/// `None` if the message carries no creation timestamp at all (for example,
+/// one produced by another protocol implementation, or an older wire
+/// format, that omits the field) — callers should treat `None` as "age
+/// unknown", not as zero.
+pub fn message_age(message: &Message) -> Option<Duration> {
+    message
+        .headers
+        .created_at
+        .map(|created_at| Utc::now() - created_at)
 }
 
 /// Check if a message should be retried based on retry count
@@ -191,7 +172,14 @@ pub fn exponential_backoff(
     base_delay_secs: u32,
     max_delay_secs: u32,
 ) -> Duration {
-    let delay_secs = (base_delay_secs * 2_u32.pow(retry_count)).min(max_delay_secs);
+    // Saturating arithmetic: `2_u32.pow(retry_count)` alone overflows for
+    // retry_count >= 32, and the subsequent multiplication by
+    // base_delay_secs can overflow even earlier - both would panic in
+    // debug builds and silently wrap to a tiny delay in release builds if
+    // computed before the max-delay cap is applied.
+    let delay_secs = base_delay_secs
+        .saturating_mul(2_u32.saturating_pow(retry_count))
+        .min(max_delay_secs);
     Duration::seconds(delay_secs as i64)
 }
 
@@ -388,6 +376,57 @@ mod tests {
 
         // Test max cap
         assert_eq!(exponential_backoff(10, 1, 60), Duration::seconds(60));
+    }
+
+    #[test]
+    fn test_exponential_backoff_no_overflow_at_high_retry_counts() {
+        // Regression: `base_delay_secs * 2_u32.pow(retry_count)` used to
+        // overflow u32 (panic in debug, wrap in release) before the
+        // max-delay cap was applied. With base_delay_secs = 1 this already
+        // overflowed at retry_count 32.
+        assert_eq!(exponential_backoff(32, 1, 100), Duration::seconds(100));
+        assert_eq!(exponential_backoff(40, 1, 3600), Duration::seconds(3600));
+        assert_eq!(
+            exponential_backoff(u32::MAX, 60, 7200),
+            Duration::seconds(7200)
+        );
+    }
+
+    #[test]
+    fn test_message_age_uses_real_created_at() {
+        let msg = create_test_message();
+
+        // A freshly built message always carries `created_at` (set by
+        // `MessageHeaders::new`), so age should be a small, non-negative
+        // duration close to zero - not a fabricated value.
+        let age = message_age(&msg).expect("freshly built message has created_at");
+        assert!(age >= Duration::zero());
+        assert!(age < Duration::seconds(5));
+    }
+
+    #[test]
+    fn test_message_age_none_without_created_at() {
+        let mut msg = create_test_message();
+        msg.headers.created_at = None;
+        assert_eq!(message_age(&msg), None);
+    }
+
+    #[test]
+    fn test_message_age_ignores_eta_and_expires_heuristics() {
+        // Regression: message_age() must reflect the real created_at
+        // timestamp, not a value fabricated from eta/expires (the previous
+        // heuristic behavior).
+        let mut msg = create_test_message();
+        let created_at = Utc::now() - Duration::hours(3);
+        msg.headers.created_at = Some(created_at);
+        // Would have produced a tiny heuristic age under the old logic.
+        msg.headers.expires = Some(Utc::now() + Duration::minutes(5));
+        // Would have produced a ~13-hour heuristic age under the old logic.
+        msg.headers.eta = Some(Utc::now() - Duration::hours(10));
+
+        let age = message_age(&msg).unwrap();
+        assert!(age >= Duration::hours(3));
+        assert!(age < Duration::hours(3) + Duration::seconds(5));
     }
 
     #[test]

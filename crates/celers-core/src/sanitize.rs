@@ -283,6 +283,21 @@ pub enum SanitizeError {
         /// Configured limit.
         limit: usize,
     },
+    /// The aggregate approximate weight of the payload exceeded
+    /// `max_total_bytes`.
+    PayloadTooLarge {
+        /// Observed aggregate size in bytes.
+        size: usize,
+        /// Configured limit in bytes.
+        limit: usize,
+    },
+    /// An array or object held more elements than `max_container_len`.
+    ContainerTooLong {
+        /// Observed element count.
+        len: usize,
+        /// Configured limit.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for SanitizeError {
@@ -305,6 +320,18 @@ impl fmt::Display for SanitizeError {
             }
             SanitizeError::KeyTooLong { size, limit } => {
                 write!(f, "key too long: {size} bytes exceeds limit of {limit}")
+            }
+            SanitizeError::PayloadTooLarge { size, limit } => {
+                write!(
+                    f,
+                    "payload too large: {size} bytes exceeds limit of {limit}"
+                )
+            }
+            SanitizeError::ContainerTooLong { len, limit } => {
+                write!(
+                    f,
+                    "container too long: {len} elements exceeds limit of {limit}"
+                )
             }
         }
     }
@@ -351,12 +378,110 @@ pub struct SanitizerConfig {
     /// Value kinds that are rejected outright. Empty means "allow all".
     pub disallowed_kinds: BTreeSet<ValueKind>,
 
-    /// Lower-cased substrings that mark a key as secret; matching keys have
-    /// their values replaced with [`SanitizerConfig::redaction_placeholder`].
+    /// Maximum aggregate approximate weight, in bytes, of a whole payload
+    /// (see [`TaskValue::approx_size`]).
+    ///
+    /// Per-string, per-key and per-depth limits alone cannot stop an array of
+    /// ten million small integers, which is well within `max_depth` and has no
+    /// oversized string in it.
+    #[serde(default = "default_max_total_bytes")]
+    pub max_total_bytes: usize,
+
+    /// Maximum number of elements in any single array or object.
+    #[serde(default = "default_max_container_len")]
+    pub max_container_len: usize,
+
+    /// Lower-cased markers that make a key secret. A marker matches when its
+    /// own word sequence appears as consecutive whole words of the key, where
+    /// words are split on `_`, `-`, `.`, `/`, `:`, whitespace and camel-case
+    /// boundaries.
+    ///
+    /// Whole-word matching is what keeps ordinary arguments intact: `auth` and
+    /// `auth_token` are secret, `author` and `authorized_by` are not.
     pub secret_key_markers: BTreeSet<String>,
+
+    /// Lower-cased nouns that make a key secret when a key word *ends* with
+    /// them, even with no separator: `authtoken`, `mytoken`, `apipassword`.
+    ///
+    /// Whole-word matching alone would let those glued spellings through, which
+    /// would be a loosening of a security-relevant default. Matching only at the
+    /// *end* of a word is what keeps `tokenizer` and `author` intact.
+    #[serde(default = "default_secret_key_suffixes")]
+    pub secret_key_suffixes: BTreeSet<String>,
+
+    /// Lower-cased nouns that make a key secret when a key word *starts* with
+    /// them: `secretkey`, `passwordhash`, `credentialstore`.
+    ///
+    /// Deliberately narrower than [`Self::secret_key_suffixes`]: `token`,
+    /// `auth`, `session` and `private` are excluded because ordinary words
+    /// extend them (`tokenizer`, `author`, `session_count`, `privateer`).
+    #[serde(default = "default_secret_key_prefixes")]
+    pub secret_key_prefixes: BTreeSet<String>,
+
+    /// Lower-cased markers matched as raw substrings of the key.
+    ///
+    /// Empty by default. This is the escape hatch for deployments that want the
+    /// blunter historical behaviour (`token` matching `tokenizer`) for a
+    /// specific set of markers.
+    #[serde(default)]
+    pub secret_key_substrings: BTreeSet<String>,
+
+    /// Lower-cased keys that are never redacted, whatever the markers say.
+    ///
+    /// Defaults to a handful of metric-style keys that share a word with a
+    /// marker but carry no secret (`token_count`, `session_count`, ...).
+    #[serde(default)]
+    pub allowed_keys: BTreeSet<String>,
 
     /// Placeholder value substituted for redacted secrets.
     pub redaction_placeholder: String,
+}
+
+/// Serde default for [`SanitizerConfig::max_total_bytes`].
+const fn default_max_total_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// Serde default for [`SanitizerConfig::max_container_len`].
+const fn default_max_container_len() -> usize {
+    10_000
+}
+
+/// Serde/`Default` value for [`SanitizerConfig::secret_key_suffixes`].
+fn default_secret_key_suffixes() -> BTreeSet<String> {
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "credential",
+        "credentials",
+        "cookie",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "sessionid",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+/// Serde/`Default` value for [`SanitizerConfig::secret_key_prefixes`].
+fn default_secret_key_prefixes() -> BTreeSet<String> {
+    [
+        "password",
+        "passwd",
+        "secret",
+        "credential",
+        "credentials",
+        "apikey",
+        "accesskey",
+        "privatekey",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 impl Default for SanitizerConfig {
@@ -382,15 +507,34 @@ impl Default for SanitizerConfig {
         ];
         let secret_key_markers = markers.iter().map(|s| (*s).to_string()).collect();
 
+        // Keys that share a word with a marker but are plainly metrics, not
+        // secrets. Deployments can extend or replace this set.
+        let allowed = [
+            "token_count",
+            "token_counts",
+            "tokens_used",
+            "session_count",
+            "session_counts",
+            "auth_count",
+            "auth_attempts",
+        ];
+        let allowed_keys = allowed.iter().map(|s| (*s).to_string()).collect();
+
         Self {
             max_arg_count: 64,
             max_string_bytes: 64 * 1024,
             max_key_bytes: 256,
             max_depth: 16,
+            max_total_bytes: 4 * 1024 * 1024,
+            max_container_len: 10_000,
             oversize_action: OversizeAction::Reject,
             strip_control_chars: true,
             disallowed_kinds: disallowed,
             secret_key_markers,
+            secret_key_suffixes: default_secret_key_suffixes(),
+            secret_key_prefixes: default_secret_key_prefixes(),
+            secret_key_substrings: BTreeSet::new(),
+            allowed_keys,
             redaction_placeholder: "[REDACTED]".to_string(),
         }
     }
@@ -407,6 +551,8 @@ impl SanitizerConfig {
             max_string_bytes: 8 * 1024 * 1024,
             max_key_bytes: 4096,
             max_depth: 64,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_container_len: 1_000_000,
             oversize_action: OversizeAction::Truncate,
             strip_control_chars: true,
             disallowed_kinds: BTreeSet::new(),
@@ -456,11 +602,56 @@ impl SanitizerConfig {
         self
     }
 
-    /// Add a single secret-key marker (matched case-insensitively as a
-    /// substring of the key).
+    /// Set the maximum aggregate payload weight in bytes.
+    #[must_use]
+    pub const fn with_max_total_bytes(mut self, n: usize) -> Self {
+        self.max_total_bytes = n;
+        self
+    }
+
+    /// Set the maximum number of elements in any single container.
+    #[must_use]
+    pub const fn with_max_container_len(mut self, n: usize) -> Self {
+        self.max_container_len = n;
+        self
+    }
+
+    /// Add a single secret-key marker (matched case-insensitively against whole
+    /// words of the key).
     #[must_use]
     pub fn with_secret_marker(mut self, marker: impl Into<String>) -> Self {
         self.secret_key_markers.insert(marker.into().to_lowercase());
+        self
+    }
+
+    /// Add a noun that makes a key secret when a key word ends with it.
+    #[must_use]
+    pub fn with_secret_suffix(mut self, marker: impl Into<String>) -> Self {
+        self.secret_key_suffixes
+            .insert(marker.into().to_lowercase());
+        self
+    }
+
+    /// Add a noun that makes a key secret when a key word starts with it.
+    #[must_use]
+    pub fn with_secret_prefix(mut self, marker: impl Into<String>) -> Self {
+        self.secret_key_prefixes
+            .insert(marker.into().to_lowercase());
+        self
+    }
+
+    /// Add a marker matched as a raw case-insensitive substring of the key.
+    #[must_use]
+    pub fn with_secret_substring(mut self, marker: impl Into<String>) -> Self {
+        self.secret_key_substrings
+            .insert(marker.into().to_lowercase());
+        self
+    }
+
+    /// Add a key that is never redacted, whatever the markers say.
+    #[must_use]
+    pub fn with_allowed_key(mut self, key: impl Into<String>) -> Self {
+        self.allowed_keys.insert(key.into().to_lowercase());
         self
     }
 
@@ -472,13 +663,98 @@ impl SanitizerConfig {
     }
 
     /// Whether `key` looks like a secret according to the configured markers.
+    ///
+    /// Markers are matched against **whole words** of the key rather than raw
+    /// substrings. Substring matching redacted ordinary arguments — `author`
+    /// contains `auth`, `tokenizer` contains `token` — and because redaction is
+    /// destructive and in place, a task on the execute path received
+    /// `[REDACTED]` instead of its real argument. `secret_key_substrings` keeps
+    /// the old behaviour available where it is genuinely wanted, and
+    /// `allowed_keys` exempts specific keys outright.
     #[must_use]
     pub fn is_secret_key(&self, key: &str) -> bool {
         let lowered = key.to_lowercase();
-        self.secret_key_markers
+
+        if self.allowed_keys.contains(&lowered) {
+            return false;
+        }
+
+        if self
+            .secret_key_substrings
             .iter()
             .any(|marker| lowered.contains(marker.as_str()))
+        {
+            return true;
+        }
+
+        let words = key_words(key);
+        if self
+            .secret_key_markers
+            .iter()
+            .any(|marker| contains_word_sequence(&words, &key_words(marker)))
+        {
+            return true;
+        }
+
+        // Glued spellings with no separator: `authtoken`, `secretkey`. Without
+        // these, whole-word matching would be a net loosening of the default
+        // policy compared with the old substring behaviour.
+        words.iter().any(|word| {
+            self.secret_key_suffixes
+                .iter()
+                .any(|marker| word.ends_with(marker.as_str()))
+                || self
+                    .secret_key_prefixes
+                    .iter()
+                    .any(|marker| word.starts_with(marker.as_str()))
+        })
     }
+}
+
+/// Split a key into lower-cased words on separator characters and camel-case
+/// boundaries.
+///
+/// `api_key`, `apiKey`, `API-Key` and `api.key` all yield `["api", "key"]`.
+fn key_words(key: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = key.chars().collect();
+
+    for (index, &ch) in chars.iter().enumerate() {
+        if !ch.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        if ch.is_uppercase() && !current.is_empty() {
+            let previous = chars[index - 1];
+            let next_is_lower = chars.get(index + 1).is_some_and(|c| c.is_lowercase());
+            // `fooBar` -> foo|Bar, `HTTPServer` -> HTTP|Server.
+            if previous.is_lowercase() || previous.is_numeric() || next_is_lower {
+                words.push(std::mem::take(&mut current));
+            }
+        }
+
+        current.extend(ch.to_lowercase());
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words
+}
+
+/// Whether `needle` appears as a contiguous run of words inside `haystack`.
+fn contains_word_sequence(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Summary of the actions a [`Sanitizer`] performed on a payload.
@@ -548,7 +824,9 @@ impl Sanitizer {
     pub fn sanitize_args(&self, args: &mut [TaskValue]) -> Result<SanitizeReport, SanitizeError> {
         self.check_arg_count(args.len(), 0)?;
         let mut report = SanitizeReport::default();
+        let mut total = 0usize;
         for value in args.iter_mut() {
+            self.accumulate_size(value, &mut total)?;
             self.sanitize_value(value, 1, &mut report)?;
         }
         Ok(report)
@@ -566,6 +844,7 @@ impl Sanitizer {
     ) -> Result<SanitizeReport, SanitizeError> {
         self.check_arg_count(kwargs.len(), 0)?;
         let mut report = SanitizeReport::default();
+        let mut total = 0usize;
         for (key, value) in kwargs.iter_mut() {
             if key.len() > self.config.max_key_bytes {
                 return Err(SanitizeError::KeyTooLong {
@@ -579,6 +858,7 @@ impl Sanitizer {
                 // Redacted values are not scanned/stripped further.
                 continue;
             }
+            self.accumulate_size(value, &mut total)?;
             self.sanitize_value(value, 1, &mut report)?;
         }
         Ok(report)
@@ -604,7 +884,10 @@ impl Sanitizer {
         }
 
         let mut report = SanitizeReport::default();
+        // The aggregate weight is tracked across the whole call, not per value.
+        let mut total = 0usize;
         for value in args.iter_mut() {
+            self.accumulate_size(value, &mut total)?;
             self.sanitize_value(value, 1, &mut report)?;
         }
         for (key, value) in kwargs.iter_mut() {
@@ -619,9 +902,23 @@ impl Sanitizer {
                 report.redacted_keys += 1;
                 continue;
             }
+            self.accumulate_size(value, &mut total)?;
             self.sanitize_value(value, 1, &mut report)?;
         }
         Ok(report)
+    }
+
+    /// Add `value`'s approximate weight to the running total, failing once the
+    /// configured aggregate limit is exceeded.
+    fn accumulate_size(&self, value: &TaskValue, total: &mut usize) -> Result<(), SanitizeError> {
+        *total = total.saturating_add(value.approx_size());
+        if *total > self.config.max_total_bytes {
+            return Err(SanitizeError::PayloadTooLarge {
+                size: *total,
+                limit: self.config.max_total_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// Recursively sanitize a single value at the given nesting `depth`.
@@ -662,11 +959,13 @@ impl Sanitizer {
                 }
             }
             TaskValue::Array(items) => {
+                self.check_container_len(items.len())?;
                 for item in items.iter_mut() {
                     self.sanitize_value(item, depth + 1, report)?;
                 }
             }
             TaskValue::Object(entries) => {
+                self.check_container_len(entries.len())?;
                 for (key, item) in entries.iter_mut() {
                     if key.len() > self.config.max_key_bytes {
                         return Err(SanitizeError::KeyTooLong {
@@ -725,6 +1024,17 @@ impl Sanitizer {
         Ok(())
     }
 
+    /// Enforce `max_container_len` against a single array/object.
+    fn check_container_len(&self, len: usize) -> Result<(), SanitizeError> {
+        if len > self.config.max_container_len {
+            return Err(SanitizeError::ContainerTooLong {
+                len,
+                limit: self.config.max_container_len,
+            });
+        }
+        Ok(())
+    }
+
     /// Enforce `max_arg_count` against `count` (plus an `extra` offset used
     /// when combining lists).
     fn check_arg_count(&self, count: usize, extra: usize) -> Result<(), SanitizeError> {
@@ -739,27 +1049,63 @@ impl Sanitizer {
     }
 }
 
-/// Remove control characters from a string in place, returning how many were
-/// removed.
+/// Whether `c` is a Unicode format/separator codepoint that must be stripped
+/// alongside the C0/C1 control characters.
 ///
-/// "Control character" means any [`char::is_control`] codepoint **except**
+/// [`char::is_control`] only covers General_Category `Cc`
+/// (`U+0000`–`U+001F`, `U+007F`–`U+009F`). The characters below are category
+/// `Cf` (or `Zl`/`Zp`) and therefore passed straight through, yet they are the
+/// classic log-spoofing vectors:
+///
+/// * `U+202A`–`U+202E` and `U+2066`–`U+2069` — bidirectional overrides and
+///   isolates ("Trojan Source"): they visually reorder a log line;
+/// * `U+200B`–`U+200F` — zero-width space/joiners and LTR/RTL marks: invisible
+///   characters that hide or reorder text;
+/// * `U+2028`/`U+2029` — line and paragraph separators: they inject a line
+///   break into line-oriented logs;
+/// * `U+FEFF` — zero-width no-break space (BOM) appearing mid-string.
+#[must_use]
+pub const fn is_unicode_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Whether `c` must be stripped by [`strip_control_chars`].
+#[inline]
+fn is_strippable(c: char) -> bool {
+    if matches!(c, '\t' | '\n' | '\r') {
+        return false;
+    }
+    c.is_control() || is_unicode_format_char(c)
+}
+
+/// Remove control and Unicode format characters from a string in place,
+/// returning how many were removed.
+///
+/// Stripped codepoints are any [`char::is_control`] character plus the
+/// bidi/format characters listed by [`is_unicode_format_char`], **except**
 /// the common whitespace characters tab (`\t`), newline (`\n`), and carriage
 /// return (`\r`), which are preserved because they are legitimate in most
-/// textual arguments. This neutralizes ANSI escape sequences, NUL bytes, and
-/// other terminal/log-injection vectors.
+/// textual arguments. This neutralizes ANSI escape sequences, NUL bytes,
+/// bidirectional-override log spoofing, and other terminal/log-injection
+/// vectors.
 #[must_use]
 pub fn strip_control_chars(s: &mut String) -> usize {
     let mut removed = 0usize;
-    let needs_work = s
-        .chars()
-        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'));
-    if !needs_work {
+    if !s.chars().any(is_strippable) {
         return 0;
     }
     let cleaned: String = s
         .chars()
-        .filter(|c| {
-            let keep = !c.is_control() || matches!(c, '\t' | '\n' | '\r');
+        .filter(|&c| {
+            let keep = !is_strippable(c);
             if !keep {
                 removed += 1;
             }
@@ -1026,5 +1372,272 @@ mod tests {
         let sanitizer = Sanitizer::new(SanitizerConfig::permissive());
         let mut args = vec![TaskValue::Bytes(vec![1, 2, 3])];
         assert!(sanitizer.sanitize_args(&mut args).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// Regression: `is_secret_key` matched markers as raw substrings, so
+    /// ordinary arguments were destructively replaced with `[REDACTED]`.
+    #[test]
+    fn secret_key_detection_matches_whole_words_only() {
+        let config = SanitizerConfig::default();
+
+        // Genuine secrets still match.
+        for key in [
+            "password",
+            "api_key",
+            "apiKey",
+            "API-KEY",
+            "auth",
+            "auth_token",
+            "authToken",
+            "x.session.cookie",
+            "access_key_id",
+            "user_secret",
+        ] {
+            assert!(
+                config.is_secret_key(key),
+                "{key} should be treated as secret"
+            );
+        }
+
+        // Glued spellings with no separator must still be caught: whole-word
+        // matching alone would be a net loosening of the default policy.
+        for key in [
+            "authtoken",
+            "mytoken",
+            "usertoken",
+            "apitoken",
+            "secretkey",
+            "passwordhash",
+            "credentialstore",
+            "sessionid",
+            "accesskeyid",
+        ] {
+            assert!(
+                config.is_secret_key(key),
+                "{key} should be treated as secret"
+            );
+        }
+
+        // Ordinary arguments must survive untouched.
+        for key in [
+            "author",
+            "authority",
+            "authorized_by",
+            "authorization_note",
+            "tokenizer",
+            "token_count",
+            "session_count",
+            "privateer",
+            "username",
+            "sort_key",
+            "keyword",
+            "monkey_patch",
+        ] {
+            assert!(
+                !config.is_secret_key(key),
+                "{key} must not be treated as secret"
+            );
+        }
+    }
+
+    /// Guards the security direction of the whole-word rewrite: every key the
+    /// old substring matcher redacted for a *good* reason must still be redacted.
+    #[test]
+    fn secret_key_detection_did_not_loosen_for_real_secrets() {
+        let config = SanitizerConfig::default();
+        for key in [
+            "password",
+            "user_password",
+            "passwordHash",
+            "db_passwd",
+            "secret",
+            "client_secret",
+            "secretKey",
+            "api_key",
+            "API_KEY",
+            "apikey",
+            "access_key",
+            "accessKeyId",
+            "auth",
+            "auth_header",
+            "authToken",
+            "bearer_token",
+            "refresh_token",
+            "session",
+            "session_id",
+            "sessionId",
+            "cookie",
+            "set_cookie",
+            "credential",
+            "aws_credentials",
+            "private",
+            "private_key",
+            "privateKey",
+        ] {
+            assert!(
+                config.is_secret_key(key),
+                "{key} must still be treated as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_affix_sets_are_configurable() {
+        // A word ending in a suffix marker is secret...
+        let config = SanitizerConfig::default();
+        assert!(config.is_secret_key("xyztoken"));
+        // ...but the bare marker rule does not fire on a longer prefix.
+        assert!(!config.is_secret_key("tokenxyz"));
+
+        let with_prefix = SanitizerConfig::default().with_secret_prefix("token");
+        assert!(with_prefix.is_secret_key("tokenxyz"));
+
+        let with_suffix = SanitizerConfig::default().with_secret_suffix("pin");
+        assert!(with_suffix.is_secret_key("userpin"));
+        assert!(!SanitizerConfig::default().is_secret_key("userpin"));
+    }
+
+    #[test]
+    fn ordinary_kwargs_are_not_redacted() {
+        let sanitizer = Sanitizer::default();
+        let mut kwargs = vec![
+            ("author".to_string(), TaskValue::from("alice")),
+            ("token_count".to_string(), TaskValue::from(1234_i64)),
+            ("session_count".to_string(), TaskValue::from(7_i64)),
+            ("tokenizer".to_string(), TaskValue::from("bpe")),
+            ("api_key".to_string(), TaskValue::from("sk-live-1")),
+        ];
+        let report = sanitizer
+            .sanitize_kwargs(&mut kwargs)
+            .expect("sanitize should succeed");
+
+        assert_eq!(report.redacted_keys, 1);
+        assert_eq!(kwargs[0].1, TaskValue::from("alice"));
+        assert_eq!(kwargs[1].1, TaskValue::from(1234_i64));
+        assert_eq!(kwargs[2].1, TaskValue::from(7_i64));
+        assert_eq!(kwargs[3].1, TaskValue::from("bpe"));
+        assert_eq!(kwargs[4].1, TaskValue::from("[REDACTED]"));
+    }
+
+    #[test]
+    fn substring_markers_and_allowlist_are_configurable() {
+        // Opt back in to the blunt behaviour for a specific marker.
+        let blunt = SanitizerConfig::default().with_secret_substring("token");
+        assert!(blunt.is_secret_key("tokenizer"));
+
+        // And exempt a key outright.
+        let exempt = SanitizerConfig::default().with_allowed_key("api_key");
+        assert!(!exempt.is_secret_key("api_key"));
+        assert!(exempt.is_secret_key("password"));
+    }
+
+    #[test]
+    fn key_words_splits_on_separators_and_camel_case() {
+        assert_eq!(key_words("api_key"), vec!["api", "key"]);
+        assert_eq!(key_words("apiKey"), vec!["api", "key"]);
+        assert_eq!(key_words("API-Key"), vec!["api", "key"]);
+        assert_eq!(key_words("HTTPServer"), vec!["http", "server"]);
+        assert_eq!(key_words("author"), vec!["author"]);
+        assert_eq!(
+            key_words("x.session.cookie"),
+            vec!["x", "session", "cookie"]
+        );
+        assert!(key_words("").is_empty());
+    }
+
+    /// Regression: `char::is_control` covers only category `Cc`, so the
+    /// bidirectional overrides, zero-width characters and line/paragraph
+    /// separators used for log spoofing passed straight through.
+    #[test]
+    fn unicode_format_characters_are_stripped() {
+        let mut s =
+            "user\u{202E}drowssap\u{202C} logged\u{2028}in\u{200B}now\u{2069}\u{FEFF}".to_string();
+        let removed = strip_control_chars(&mut s);
+        assert_eq!(removed, 6, "stripped {s:?}");
+        assert_eq!(s, "userdrowssap loggedinnow");
+
+        // Legitimate whitespace is preserved.
+        let mut keep = "a\tb\nc\rd".to_string();
+        assert_eq!(strip_control_chars(&mut keep), 0);
+        assert_eq!(keep, "a\tb\nc\rd");
+
+        // And the classic C0 vectors still go.
+        let mut ansi = "before\u{1b}[31mred\u{0}after".to_string();
+        assert_eq!(strip_control_chars(&mut ansi), 2);
+        assert_eq!(ansi, "before[31mredafter");
+    }
+
+    #[test]
+    fn bidi_override_in_a_task_argument_is_neutralized() {
+        let sanitizer = Sanitizer::default();
+        let mut args = vec![TaskValue::from("safe\u{202E}evil")];
+        let report = sanitizer
+            .sanitize_args(&mut args)
+            .expect("sanitize should succeed");
+        assert_eq!(report.control_chars_removed, 1);
+        assert_eq!(args[0], TaskValue::from("safeevil"));
+    }
+
+    /// Regression: only per-string and per-depth limits were enforced, so an
+    /// array of millions of small integers passed sanitization untouched.
+    #[test]
+    fn aggregate_payload_size_is_bounded() {
+        let config = SanitizerConfig::default().with_max_total_bytes(1024);
+        let sanitizer = Sanitizer::new(config);
+
+        let big = TaskValue::Array((0..1000).map(TaskValue::Int).collect());
+        let mut args = vec![big];
+        let err = sanitizer
+            .sanitize_args(&mut args)
+            .expect_err("an oversized payload must be rejected");
+        assert!(
+            matches!(err, SanitizeError::PayloadTooLarge { .. }),
+            "{err}"
+        );
+
+        // The limit is cumulative across a whole call, not per value.
+        let mut args = vec![TaskValue::from("x".repeat(600))];
+        let mut kwargs = vec![("k".to_string(), TaskValue::from("y".repeat(600)))];
+        let err = sanitizer
+            .sanitize_call(&mut args, &mut kwargs)
+            .expect_err("cumulative weight must be enforced");
+        assert!(
+            matches!(err, SanitizeError::PayloadTooLarge { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn container_length_is_bounded() {
+        let config = SanitizerConfig::default()
+            .with_max_container_len(4)
+            .with_max_total_bytes(usize::MAX);
+        let sanitizer = Sanitizer::new(config);
+
+        let mut ok = vec![TaskValue::Array((0..4).map(TaskValue::Int).collect())];
+        assert!(sanitizer.sanitize_args(&mut ok).is_ok());
+
+        let mut too_long = vec![TaskValue::Array((0..5).map(TaskValue::Int).collect())];
+        let err = sanitizer
+            .sanitize_args(&mut too_long)
+            .expect_err("an over-long array must be rejected");
+        assert!(
+            matches!(err, SanitizeError::ContainerTooLong { len: 5, limit: 4 }),
+            "{err}"
+        );
+
+        // Nested containers are checked too.
+        let mut nested = vec![TaskValue::Object(vec![(
+            "inner".to_string(),
+            TaskValue::Array((0..9).map(TaskValue::Int).collect()),
+        )])];
+        assert!(matches!(
+            sanitizer.sanitize_args(&mut nested),
+            Err(SanitizeError::ContainerTooLong { len: 9, limit: 4 })
+        ));
     }
 }

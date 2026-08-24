@@ -6,11 +6,12 @@
 //! - Selective task processing
 
 use celers_core::{BrokerMessage, CelersError, Result, SerializedTask, TaskId};
-use redis::{AsyncCommands, Client};
+use redis::{aio::ConnectionManager, AsyncCommands, Client};
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
-use crate::QueueMode;
+use crate::{QueueKeys, QueueMode};
 
 /// Task filter function type
 pub type TaskFilter = Arc<dyn Fn(&SerializedTask) -> bool + Send + Sync>;
@@ -18,9 +19,13 @@ pub type TaskFilter = Arc<dyn Fn(&SerializedTask) -> bool + Send + Sync>;
 /// Extended batch operations for Redis broker
 pub struct BatchOperations {
     client: Client,
+    /// Long-lived multiplexed connection, shared by every call.
+    conn: OnceCell<ConnectionManager>,
+    keys: QueueKeys,
     queue_name: String,
     processing_queue: String,
     mode: QueueMode,
+    visibility_timeout_secs: u64,
 }
 
 impl BatchOperations {
@@ -29,10 +34,62 @@ impl BatchOperations {
         let processing_queue = format!("{}:processing", queue_name);
         Self {
             client,
+            conn: OnceCell::new(),
+            keys: QueueKeys::new(&queue_name),
             queue_name,
             processing_queue,
             mode,
+            visibility_timeout_secs: 300,
         }
+    }
+
+    /// Reuse an existing connection manager instead of opening one lazily.
+    pub fn with_connection_manager(self, manager: ConnectionManager) -> Self {
+        let conn = OnceCell::new();
+        // Only fails if the cell is already initialised, which it is not.
+        let _ = conn.set(manager);
+        Self { conn, ..self }
+    }
+
+    /// Set the visibility timeout recorded for messages this handler
+    /// delivers (default: 300 seconds).
+    pub fn with_visibility_timeout(mut self, timeout_secs: u64) -> Self {
+        self.visibility_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Stage a delivered message as in-flight.
+    ///
+    /// Writes both structures the broker's reaper reads: the processing list
+    /// (the message itself) and the unacked set (its visibility deadline).
+    /// Without the deadline these messages would sit in the processing list
+    /// forever if the worker died.
+    async fn stage_in_flight(&self, conn: &mut ConnectionManager, message: &str) -> Result<()> {
+        let deadline = crate::now_secs() + self.visibility_timeout_secs;
+
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        pipe.lpush(&self.processing_queue, message);
+        pipe.zadd(&self.keys.unacked, message, deadline);
+
+        pipe.query_async::<redis::Value>(conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to move to processing: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Get the shared connection, establishing it on first use.
+    async fn connection(&self) -> Result<ConnectionManager> {
+        self.conn
+            .get_or_try_init(|| async {
+                self.client
+                    .get_connection_manager()
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))
+            })
+            .await
+            .cloned()
     }
 
     /// Dequeue batch with custom filter
@@ -66,11 +123,7 @@ impl BatchOperations {
             return Ok(Vec::new());
         }
 
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.connection().await?;
 
         let mut messages = Vec::new();
         let mut checked = 0;
@@ -79,6 +132,8 @@ impl BatchOperations {
         match self.mode {
             QueueMode::Fifo => {
                 while messages.len() < count && checked < max_checks {
+                    // The tail holds the oldest message: producers push to
+                    // the head, so `RPOP` is the FIFO end.
                     let data: Option<String> =
                         conn.rpop(&self.queue_name, None).await.map_err(|e| {
                             CelersError::Broker(format!("Failed to dequeue task: {}", e))
@@ -90,22 +145,19 @@ impl BatchOperations {
                             .map_err(|e| CelersError::Deserialization(e.to_string()))?;
 
                         if filter(&task) {
-                            // Move to processing queue
-                            conn.lpush::<_, _, ()>(&self.processing_queue, &serialized)
-                                .await
-                                .map_err(|e| {
-                                    CelersError::Broker(format!(
-                                        "Failed to move to processing: {}",
-                                        e
-                                    ))
-                                })?;
+                            // Stage as in-flight: the processing list holds
+                            // the message, the unacked set its deadline, so
+                            // the reaper can recover it if this worker dies.
+                            self.stage_in_flight(&mut conn, &serialized).await?;
 
                             messages.push(BrokerMessage {
                                 task,
                                 receipt_handle: Some(serialized),
                             });
                         } else {
-                            // Put back at the front if it doesn't match
+                            // Put it back at the *back* of the queue (the
+                            // head), so this scan makes progress instead of
+                            // popping the same message forever.
                             conn.lpush::<_, _, ()>(&self.queue_name, &serialized)
                                 .await
                                 .map_err(|e| {
@@ -139,12 +191,8 @@ impl BatchOperations {
                         .map_err(|e| CelersError::Deserialization(e.to_string()))?;
 
                     if filter(&task) {
-                        // Move to processing queue
-                        conn.lpush::<_, _, ()>(&self.processing_queue, &data)
-                            .await
-                            .map_err(|e| {
-                                CelersError::Broker(format!("Failed to move to processing: {}", e))
-                            })?;
+                        // Stage as in-flight (message + visibility deadline)
+                        self.stage_in_flight(&mut conn, &data).await?;
 
                         messages.push(BrokerMessage {
                             task,
@@ -224,19 +272,19 @@ impl BatchOperations {
             return Ok(0);
         }
 
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = self.connection().await?;
 
         let mut pipe = redis::pipe();
+        // MULTI/EXEC: a half-applied rejection batch would leave tasks
+        // in-flight with no owner.
+        pipe.atomic();
         let mut rejected_count = 0;
 
         for (task_id, receipt_handle, requeue) in rejections {
             if let Some(handle) = receipt_handle {
-                // Remove from processing queue
+                // Clear both in-flight structures
                 pipe.lrem(&self.processing_queue, 1, handle);
+                pipe.zrem(&self.keys.unacked, handle);
                 rejected_count += 1;
 
                 if *requeue {
@@ -251,7 +299,10 @@ impl BatchOperations {
                         if let Ok(serialized) = serde_json::to_string(&task) {
                             match self.mode {
                                 QueueMode::Fifo => {
-                                    pipe.rpush(&self.queue_name, &serialized);
+                                    // Head-push: the retried task goes to the
+                                    // *back* of the delivery order rather
+                                    // than jumping ahead of waiting work.
+                                    pipe.lpush(&self.queue_name, &serialized);
                                 }
                                 QueueMode::Priority => {
                                     let score = -(task.metadata.priority as f64);

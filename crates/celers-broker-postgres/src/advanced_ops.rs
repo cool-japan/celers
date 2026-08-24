@@ -2,7 +2,7 @@
 
 use celers_core::{CelersError, Result};
 use chrono::Utc;
-use oxisql_core::{Connection, ToSqlValue};
+use oxisql_core::ToSqlValue;
 use uuid::Uuid;
 
 use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};
@@ -1064,14 +1064,118 @@ impl PostgresBroker {
     pub async fn create_task_group(
         &self,
         group_name: &str,
-        _description: Option<&str>,
+        description: Option<&str>,
     ) -> Result<String> {
-        let group_id = Uuid::new_v4().to_string();
+        let group_uuid = Uuid::new_v4();
+        let group_id = group_uuid.to_string();
 
-        // Store group metadata in a dedicated metadata field or separate tracking
-        // For now, we'll just return the group_id and rely on metadata tagging
+        // The group's own identity is persisted in `celers_task_groups`
+        // (migration 007). It used to be discarded — the method generated a
+        // UUID, logged it, and returned, so `get_task_group_status` had
+        // nothing to read back and echoed the id where the name belonged.
+        // (Group *membership* was always genuine: `add_tasks_to_group`
+        // `jsonb_set`s a `task_group_id` into each task's metadata.)
+        let group_id_param = uuid_param(&group_uuid);
+        let description_param = description.map(str::to_string);
+        self.conn
+            .execute(
+                "INSERT INTO celers_task_groups (group_id, queue_name, group_name, description) \
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &group_id_param,
+                    &self.queue_name,
+                    &group_name,
+                    &description_param,
+                ],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to create task group: {}", e)))?;
+
         tracing::info!(group_id = %group_id, group_name = %group_name, "Created task group");
         Ok(group_id)
+    }
+
+    /// Look up a task group by the name it was created with
+    ///
+    /// Returns `(group_id, description)` for the most recently created group
+    /// with that name in this queue, or `None` if there is no such group.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_broker_postgres::PostgresBroker;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    ///
+    /// if let Some((group_id, _description)) =
+    ///     broker.find_task_group_by_name("data_import_batch_2024_01").await?
+    /// {
+    ///     let status = broker.get_task_group_status(&group_id).await?;
+    ///     println!("{:?}", status.map(|s| s.completion_percentage));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn find_task_group_by_name(
+        &self,
+        group_name: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT group_id, description FROM celers_task_groups \
+                  WHERE queue_name = $1 AND group_name = $2 \
+                  ORDER BY created_at DESC LIMIT 1",
+                &[&self.queue_name, &group_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to find task group: {}", e)))?;
+
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let group_id = uuid_from_row(row, "group_id")
+            .map_err(|e| CelersError::Other(format!("Failed to read group_id: {}", e)))?;
+        let description: Option<String> = row
+            .col("description")
+            .map_err(|e| CelersError::Other(format!("Failed to read description: {}", e)))?;
+        Ok(Some((group_id.to_string(), description)))
+    }
+
+    /// Read a task group's persisted name and description.
+    ///
+    /// Returns `None` when the group id does not resolve to a stored group —
+    /// which is the case for groups created before migration 007, or for a
+    /// membership tag written by hand.
+    async fn task_group_identity(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let Ok(group_uuid) = Uuid::parse_str(group_id) else {
+            return Ok(None);
+        };
+        let group_id_param = uuid_param(&group_uuid);
+        let rows = self
+            .conn
+            .query(
+                "SELECT group_name, description FROM celers_task_groups \
+                  WHERE group_id = $1 AND queue_name = $2",
+                &[&group_id_param, &self.queue_name],
+            )
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to read task group: {}", e)))?;
+
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let group_name: String = row
+            .col("group_name")
+            .map_err(|e| CelersError::Other(format!("Failed to read group_name: {}", e)))?;
+        let description: Option<String> = row
+            .col("description")
+            .map_err(|e| CelersError::Other(format!("Failed to read description: {}", e)))?;
+        Ok(Some((group_name, description)))
     }
 
     /// Add tasks to group
@@ -1215,9 +1319,18 @@ impl PostgresBroker {
                 0.0
             };
 
+            // Resolve the group's real name/description from
+            // `celers_task_groups`; fall back to the id only for a group that
+            // predates the table (or a hand-written membership tag).
+            let (group_name, description) = self
+                .task_group_identity(group_id)
+                .await?
+                .unwrap_or_else(|| (group_id.to_string(), None));
+
             Ok(Some(TaskGroupStatus {
                 group_id: group_id.to_string(),
-                group_name: group_id.to_string(),
+                group_name,
+                description,
                 total_tasks,
                 pending_count,
                 processing_count,
@@ -1375,7 +1488,7 @@ impl PostgresBroker {
             SET metadata = jsonb_set(
                 COALESCE(metadata, '{{}}'::jsonb),
                 '{{tags}}',
-                COALESCE(metadata->'tags', '[]'::jsonb) || $1::jsonb
+                COALESCE(metadata->'tags', '[]'::jsonb) || $1::text::jsonb
             )
             WHERE queue_name = $2 AND id IN ({})
             "#,

@@ -5,16 +5,20 @@ use celers_kombu::{
     Broker, BrokerError, Consumer, Envelope, Producer, QueueMode, Result, Transport,
 };
 use celers_protocol::Message;
+use futures_util::StreamExt;
 use lapin::{
     options::*,
     types::{FieldTable, ShortString},
-    BasicProperties, Channel, Connection, ConnectionProperties,
+    BasicProperties, Channel, Connection,
 };
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use crate::confirm::classify_confirmation;
+use crate::connect;
 use crate::management::ManagementApiClient;
-use crate::pool::{ChannelPool, ConnectionPool, DeduplicationCache};
+use crate::pool::{configure_channel, ChannelPool, ConnectionPool, DeduplicationCache};
 use crate::topic_routing;
 use crate::types::*;
 
@@ -46,6 +50,16 @@ pub struct AmqpBroker {
     pub(crate) management_api_client: Option<ManagementApiClient>,
     /// Topic router for task-based routing key resolution (if configured)
     pub(crate) topic_router: Option<topic_routing::TopicRouter>,
+    /// Whether the cached channel actually has publisher confirms enabled.
+    ///
+    /// This tracks the channel, not the configuration: a channel created for
+    /// an AMQP transaction is in `tx` mode and can never be in confirm mode.
+    pub(crate) channel_confirm_mode: bool,
+    /// Live `basic.consume` subscriptions, keyed by queue name.
+    ///
+    /// Consumers are bound to the channel that created them, so this map is
+    /// cleared whenever the channel is replaced.
+    pub(crate) consumers: HashMap<String, lapin::Consumer>,
 }
 
 impl AmqpBroker {
@@ -57,8 +71,17 @@ impl AmqpBroker {
     /// Create a new AMQP broker with custom configuration
     pub async fn with_config(url: &str, queue_name: &str, config: AmqpConfig) -> Result<Self> {
         let connection_pool = if config.connection_pool_size > 0 {
+            // Pooled connections must use exactly the same URI (vhost,
+            // heartbeat, connection timeout) as the primary connection.
+            let pool_url = match config.vhost {
+                Some(ref vhost) if url.ends_with('/') => format!("{}{}", url, vhost),
+                Some(ref vhost) => format!("{}/{}", url, vhost),
+                None => url.to_string(),
+            };
+            let uri = connect::build_uri(&pool_url, config.heartbeat, config.connection_timeout)?;
             Some(ConnectionPool::new(
-                url.to_string(),
+                uri,
+                config.connection_timeout,
                 config.connection_pool_size,
             ))
         } else {
@@ -106,6 +129,8 @@ impl AmqpBroker {
             deduplication_cache,
             management_api_client,
             topic_router: None,
+            channel_confirm_mode: false,
+            consumers: HashMap::new(),
         })
     }
 
@@ -215,7 +240,75 @@ impl AmqpBroker {
         }
     }
 
-    /// Check connection health and attempt auto-reconnection if needed
+    /// Open a connection using the configured heartbeat, vhost and timeout.
+    pub(crate) async fn open_connection(&self) -> Result<Connection> {
+        let uri = connect::build_uri(
+            &self.effective_url(),
+            self.config.heartbeat,
+            self.config.connection_timeout,
+        )?;
+        connect::open_connection(&uri, self.config.connection_timeout).await
+    }
+
+    /// Whether publisher confirms should be enabled on a newly created channel.
+    ///
+    /// `confirm.select` and `tx.select` are mutually exclusive on a channel,
+    /// so confirms are suppressed while an AMQP transaction is in progress.
+    pub(crate) fn confirms_enabled(&self) -> bool {
+        self.config.publisher_confirms && self.transaction_state != TransactionState::Started
+    }
+
+    /// Create a channel with QoS and publisher confirms applied.
+    pub(crate) async fn create_configured_channel(
+        &self,
+        connection: &Connection,
+    ) -> Result<Channel> {
+        let channel = connection
+            .create_channel()
+            .await
+            .map_err(|e| BrokerError::Connection(format!("Failed to create channel: {}", e)))?;
+
+        configure_channel(
+            &channel,
+            self.config.effective_prefetch_count(),
+            self.config.prefetch_global,
+            self.confirms_enabled(),
+        )
+        .await?;
+
+        debug!(
+            "Created channel (prefetch={}, global={}, confirms={})",
+            self.config.effective_prefetch_count(),
+            self.config.prefetch_global,
+            self.confirms_enabled()
+        );
+
+        Ok(channel)
+    }
+
+    /// Whether the cached channel exists and is still usable.
+    ///
+    /// A channel dies permanently on any channel-level exception (a failed
+    /// passive declare, an unroutable mandatory publish, an ack with an
+    /// unknown delivery tag) while the TCP connection stays up, so channel
+    /// health has to be checked independently of connection health.
+    pub(crate) fn channel_alive(&self) -> bool {
+        self.channel
+            .as_ref()
+            .map(|ch| ch.status().connected())
+            .unwrap_or(false)
+    }
+
+    /// Drop the cached channel and every subscription bound to it.
+    pub(crate) fn discard_channel(&mut self) {
+        self.channel = None;
+        self.channel_confirm_mode = false;
+        // Consumers are channel-scoped: a consumer from a dead channel never
+        // yields another delivery, so they must not survive the channel.
+        self.consumers.clear();
+    }
+
+    /// Check connection and channel health, attempting auto-reconnection if needed
     pub(crate) async fn ensure_connection(&mut self) -> Result<()> {
         // Check if connection is alive
         let connection_alive = self
@@ -225,6 +318,7 @@ impl AmqpBroker {
             .unwrap_or(false);
 
         if !connection_alive {
+            self.discard_channel();
             if self.config.auto_reconnect {
                 info!("Connection lost, attempting auto-reconnection...");
                 self.auto_reconnect().await?;
@@ -233,6 +327,11 @@ impl AmqpBroker {
                     "Connection lost and auto-reconnect is disabled".to_string(),
                 ));
             }
+        } else if self.channel.is_some() && !self.channel_alive() {
+            // The connection is fine but the channel died: drop it so the
+            // next `get_channel()` transparently creates a fresh one.
+            warn!("AMQP channel is closed, discarding it and creating a new one");
+            self.discard_channel();
         }
 
         Ok(())
@@ -285,15 +384,11 @@ impl AmqpBroker {
 
     /// Internal reconnection logic without triggering ensure_connection
     async fn reconnect_internal(&mut self) -> Result<()> {
-        let url = self.effective_url();
-
         // Try to connect
-        let connection = Connection::connect(&url, ConnectionProperties::default())
-            .await
-            .map_err(|e| BrokerError::Connection(format!("Failed to connect: {}", e)))?;
+        let connection = self.open_connection().await?;
 
         self.connection = Some(connection);
-        self.channel = None; // Reset channel
+        self.discard_channel(); // Reset channel and its subscriptions
 
         // Create channel directly without going through get_channel
         let connection = self
@@ -301,23 +396,7 @@ impl AmqpBroker {
             .as_ref()
             .ok_or_else(|| BrokerError::Connection("Not connected".to_string()))?;
 
-        let channel = connection
-            .create_channel()
-            .await
-            .map_err(|e| BrokerError::Connection(format!("Failed to create channel: {}", e)))?;
-
-        // Apply QoS settings
-        if self.config.prefetch_count > 0 {
-            channel
-                .basic_qos(
-                    self.config.prefetch_count,
-                    BasicQosOptions {
-                        global: self.config.prefetch_global,
-                    },
-                )
-                .await
-                .map_err(|e| BrokerError::Connection(format!("Failed to set QoS: {}", e)))?;
-        }
+        let channel = self.create_configured_channel(connection).await?;
 
         self.channel = Some(channel);
 
@@ -391,11 +470,18 @@ impl AmqpBroker {
     }
 
     /// Get or create channel
+    ///
+    /// Transparently replaces a channel that the broker closed (a channel
+    /// dies on any channel-level exception even though the connection stays
+    /// up), so a single failed passive declare cannot poison every later
+    /// publish, consume and ack.
     pub(crate) async fn get_channel(&mut self) -> Result<&Channel> {
-        // Ensure connection is healthy before getting channel
+        // Ensure connection (and channel) health before getting the channel
         self.ensure_connection().await?;
 
-        if self.channel.is_none() {
+        if !self.channel_alive() {
+            self.discard_channel();
+
             if !self.is_connected() {
                 self.connect().await?;
             }
@@ -405,28 +491,9 @@ impl AmqpBroker {
                 .as_ref()
                 .ok_or_else(|| BrokerError::Connection("Not connected".to_string()))?;
 
-            let channel = connection
-                .create_channel()
-                .await
-                .map_err(|e| BrokerError::Connection(format!("Failed to create channel: {}", e)))?;
+            let channel = self.create_configured_channel(connection).await?;
 
-            // Apply QoS settings if configured
-            if self.config.prefetch_count > 0 {
-                channel
-                    .basic_qos(
-                        self.config.prefetch_count,
-                        BasicQosOptions {
-                            global: self.config.prefetch_global,
-                        },
-                    )
-                    .await
-                    .map_err(|e| BrokerError::Connection(format!("Failed to set QoS: {}", e)))?;
-                debug!(
-                    "Set QoS prefetch={} global={}",
-                    self.config.prefetch_count, self.config.prefetch_global
-                );
-            }
-
+            self.channel_confirm_mode = self.confirms_enabled();
             self.channel = Some(channel);
         }
 
@@ -435,9 +502,255 @@ impl AmqpBroker {
             .ok_or_else(|| BrokerError::Connection("Channel not available".to_string()))
     }
 
+    /// Acquire a channel to publish on.
+    ///
+    /// When channel pooling is enabled (and no AMQP transaction is in
+    /// progress) this hands out a pooled channel - created from a pooled
+    /// connection when connection pooling is enabled too - so that batch
+    /// publishing does not serialise behind the broker's primary channel.
+    /// The returned flag tells [`Self::release_publish_channel`] whether the
+    /// channel belongs to the pool.
+    ///
+    /// Pooled channels are only ever used for publishing: delivery tags are
+    /// channel-scoped, so consuming/acking always stays on the primary
+    /// channel.
+    pub(crate) async fn acquire_publish_channel(&mut self) -> Result<(Channel, bool)> {
+        let pooling_usable =
+            self.channel_pool.is_some() && self.transaction_state != TransactionState::Started;
+
+        if !pooling_usable {
+            return Ok((self.get_channel().await?.clone(), false));
+        }
+
+        // Make sure we have a live connection to create pooled channels from.
+        self.get_channel().await?;
+
+        let prefetch = self.config.effective_prefetch_count();
+        let prefetch_global = self.config.prefetch_global;
+        let confirms = self.confirms_enabled();
+
+        let pooled_connection = match self.connection_pool {
+            Some(ref pool) => Some(pool.acquire().await?),
+            None => None,
+        };
+
+        let result = {
+            let connection = match pooled_connection {
+                Some(ref connection) => connection,
+                None => self
+                    .connection
+                    .as_ref()
+                    .ok_or_else(|| BrokerError::Connection("Not connected".to_string()))?,
+            };
+
+            let pool = self
+                .channel_pool
+                .as_ref()
+                .ok_or_else(|| BrokerError::Connection("Channel pool not available".to_string()))?;
+
+            pool.acquire(connection, prefetch, prefetch_global, confirms)
+                .await
+        };
+
+        // The connection goes straight back to the pool: it stays open, so
+        // the channel we just created on it remains valid.
+        if let (Some(connection), Some(pool)) = (pooled_connection, self.connection_pool.as_ref()) {
+            pool.release(connection).await;
+        }
+
+        match result {
+            Ok(channel) => Ok((channel, true)),
+            Err(e) => {
+                warn!("Falling back to the primary channel: {}", e);
+                Ok((self.get_channel().await?.clone(), false))
+            }
+        }
+    }
+
+    /// Return a channel obtained from [`Self::acquire_publish_channel`].
+    pub(crate) async fn release_publish_channel(&self, channel: Channel, pooled: bool) {
+        if !pooled {
+            return;
+        }
+        if let Some(ref pool) = self.channel_pool {
+            pool.release(channel).await;
+        }
+    }
+
+    /// Make sure a `basic.consume` subscription exists for `queue`.
+    async fn ensure_consumer(&mut self, queue: &str) -> Result<()> {
+        // Refreshes connection/channel health first; a dead channel drops
+        // every subscription bound to it.
+        self.ensure_connection().await?;
+
+        if self.consumers.contains_key(queue) {
+            return Ok(());
+        }
+
+        let channel = self.get_channel().await?.clone();
+        let consumer = channel
+            .basic_consume(
+                queue.into(),
+                // Empty tag: the broker generates a unique consumer tag.
+                "".into(),
+                BasicConsumeOptions {
+                    no_local: false,
+                    no_ack: false,
+                    exclusive: false,
+                    nowait: false,
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!(
+                    "Failed to start consumer on queue '{}': {}",
+                    queue, e
+                ))
+            })?;
+
+        debug!(
+            "Subscribed to queue '{}' with prefetch {}",
+            queue,
+            self.config.effective_prefetch_count()
+        );
+        self.consumers.insert(queue.to_string(), consumer);
+        Ok(())
+    }
+
+    /// Consume through a long-lived `basic.consume` subscription.
+    ///
+    /// Messages are pushed by the broker (bounded by the configured
+    /// prefetch), so a message that arrives right after a failed attempt is
+    /// delivered immediately instead of after a full timeout.
+    async fn consume_subscribed(
+        &mut self,
+        queue: &str,
+        timeout: Duration,
+    ) -> Result<Option<Envelope>> {
+        self.ensure_consumer(queue).await?;
+
+        let next = {
+            let consumer = self.consumers.get_mut(queue).ok_or_else(|| {
+                BrokerError::Connection(format!("No consumer for queue '{}'", queue))
+            })?;
+
+            match tokio::time::timeout(timeout, consumer.next()).await {
+                Ok(next) => next,
+                // Nothing arrived within the timeout.
+                Err(_) => return Ok(None),
+            }
+        };
+
+        match next {
+            Some(Ok(delivery)) => match serde_json::from_slice::<Message>(&delivery.data) {
+                Ok(message) => {
+                    let envelope = Envelope {
+                        delivery_tag: delivery.delivery_tag.to_string(),
+                        message,
+                        redelivered: delivery.redelivered,
+                    };
+                    self.channel_metrics.messages_consumed += 1;
+                    debug!("Consumed message from queue: {}", queue);
+                    Ok(Some(envelope))
+                }
+                Err(e) => {
+                    // Never leave a poison message unacked: reject it without
+                    // requeue so it goes to the dead-letter exchange (or is
+                    // dropped) instead of blocking the prefetch window.
+                    let _ = delivery
+                        .acker
+                        .nack(BasicNackOptions {
+                            multiple: false,
+                            requeue: false,
+                        })
+                        .await;
+                    self.channel_metrics.consume_errors += 1;
+                    self.channel_metrics.messages_rejected += 1;
+                    Err(BrokerError::Serialization(e.to_string()))
+                }
+            },
+            Some(Err(e)) => {
+                self.channel_metrics.consume_errors += 1;
+                self.consumers.remove(queue);
+                Err(BrokerError::OperationFailed(format!(
+                    "Failed to receive message: {}",
+                    e
+                )))
+            }
+            None => {
+                // The subscription ended: the channel is gone. Drop it so the
+                // next call transparently resubscribes on a fresh channel.
+                warn!("Consumer for queue '{}' was cancelled by the broker", queue);
+                self.discard_channel();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Consume with `basic.get` polling (opt-in via [`AmqpConfig::poll_mode`]).
+    async fn consume_polling(
+        &mut self,
+        queue: &str,
+        timeout: Duration,
+    ) -> Result<Option<Envelope>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let poll_interval = self.config.poll_interval;
+
+        loop {
+            let channel = self.get_channel().await?;
+            let get_result = channel
+                .basic_get(queue.into(), BasicGetOptions { no_ack: false })
+                .await;
+
+            match get_result {
+                Ok(Some(delivery)) => {
+                    return match serde_json::from_slice::<Message>(&delivery.data) {
+                        Ok(message) => {
+                            let envelope = Envelope {
+                                delivery_tag: delivery.delivery_tag.to_string(),
+                                message,
+                                redelivered: delivery.redelivered,
+                            };
+                            self.channel_metrics.messages_consumed += 1;
+                            debug!("Consumed message from queue: {}", queue);
+                            Ok(Some(envelope))
+                        }
+                        Err(e) => {
+                            let _ = delivery
+                                .acker
+                                .nack(BasicNackOptions {
+                                    multiple: false,
+                                    requeue: false,
+                                })
+                                .await;
+                            self.channel_metrics.consume_errors += 1;
+                            self.channel_metrics.messages_rejected += 1;
+                            Err(BrokerError::Serialization(e.to_string()))
+                        }
+                    };
+                }
+                Ok(None) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(None);
+                    }
+                    // Poll again shortly instead of burning the whole timeout.
+                    tokio::time::sleep((deadline - now).min(poll_interval)).await;
+                }
+                Err(e) => {
+                    self.channel_metrics.consume_errors += 1;
+                    return Err(BrokerError::OperationFailed(format!(
+                        "Failed to get message: {}",
+                        e
+                    )));
+                }
+            }
+        }
+    }
+
     /// Connect with retry logic
     pub(crate) async fn connect_with_retry(&mut self) -> Result<()> {
-        let url = self.effective_url();
         let mut last_error = None;
 
         for attempt in 0..=self.config.retry_count {
@@ -451,10 +764,10 @@ impl AmqpBroker {
                 tokio::time::sleep(self.config.retry_delay).await;
             }
 
-            match Connection::connect(&url, ConnectionProperties::default()).await {
+            match self.open_connection().await {
                 Ok(connection) => {
                     self.connection = Some(connection);
-                    self.channel = None; // Reset channel
+                    self.discard_channel(); // Reset channel
                     return Ok(());
                 }
                 Err(e) => {
@@ -501,13 +814,10 @@ impl Transport for AmqpBroker {
         if self.config.retry_count > 0 {
             self.connect_with_retry().await?;
         } else {
-            let url = self.effective_url();
-            let connection = Connection::connect(&url, ConnectionProperties::default())
-                .await
-                .map_err(|e| BrokerError::Connection(format!("Failed to connect: {}", e)))?;
+            let connection = self.open_connection().await?;
 
             self.connection = Some(connection);
-            self.channel = None; // Reset channel
+            self.discard_channel(); // Reset channel
         }
 
         // Setup topology
@@ -518,6 +828,9 @@ impl Transport for AmqpBroker {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
+        // Drop live subscriptions before tearing the channel down
+        self.consumers.clear();
+
         // Close channel pool first
         if let Some(ref channel_pool) = self.channel_pool {
             channel_pool.close_all().await;
@@ -619,26 +932,46 @@ impl Producer for AmqpBroker {
         }
 
         // Publish and get confirmation future in a scoped block to drop channel reference
-        let confirm_future = {
-            let channel = self.get_channel().await?;
-            channel
-                .basic_publish(
-                    effective_exchange.as_str().into(),
-                    effective_routing_key.as_str().into(),
-                    BasicPublishOptions::default(),
-                    &payload,
-                    properties,
-                )
-                .await
-                .map_err(|e| BrokerError::OperationFailed(format!("Failed to publish: {}", e)))?
+        let (channel, pooled) = self.acquire_publish_channel().await?;
+        let publish_result = channel
+            .basic_publish(
+                effective_exchange.as_str().into(),
+                effective_routing_key.as_str().into(),
+                BasicPublishOptions {
+                    mandatory: self.config.mandatory_publish,
+                    ..Default::default()
+                },
+                &payload,
+                properties,
+            )
+            .await;
+
+        let confirm_future = match publish_result {
+            Ok(confirm_future) => confirm_future,
+            Err(e) => {
+                self.release_publish_channel(channel, pooled).await;
+                self.channel_metrics.publish_errors += 1;
+                return Err(BrokerError::OperationFailed(format!(
+                    "Failed to publish: {}",
+                    e
+                )));
+            }
         };
 
         // Now we can update metrics since channel reference is dropped
         self.publisher_confirm_stats.pending_confirms += 1;
 
-        // Wait for confirmation
-        match confirm_future.await {
-            Ok(_) => {
+        // Wait for the broker's acknowledgement. A `Nack`, a returned
+        // (unroutable) message, or a channel that is not in confirm mode are
+        // all publish failures - never "successful confirms".
+        let confirmation = confirm_future
+            .await
+            .map_err(|e| BrokerError::OperationFailed(format!("Failed to confirm publish: {}", e)));
+        self.release_publish_channel(channel, pooled).await;
+
+        let confirms_enabled = self.confirms_enabled();
+        match confirmation.and_then(|c| classify_confirmation(c, confirms_enabled)) {
+            Ok(()) => {
                 // Update metrics
                 self.channel_metrics.messages_published += 1;
                 self.publisher_confirm_stats.total_confirms += 1;
@@ -665,10 +998,11 @@ impl Producer for AmqpBroker {
                 self.publisher_confirm_stats.total_confirms += 1;
                 self.publisher_confirm_stats.failed_confirms += 1;
                 self.publisher_confirm_stats.pending_confirms -= 1;
-                Err(BrokerError::OperationFailed(format!(
-                    "Failed to confirm publish: {}",
-                    e
-                )))
+                warn!(
+                    "Publish to {}/{} was not confirmed: {}",
+                    effective_exchange, effective_routing_key, e
+                );
+                Err(e)
             }
         }
     }
@@ -677,49 +1011,10 @@ impl Producer for AmqpBroker {
 #[async_trait]
 impl Consumer for AmqpBroker {
     async fn consume(&mut self, queue: &str, timeout: Duration) -> Result<Option<Envelope>> {
-        let channel = self.get_channel().await?;
-
-        // Use basic_get for polling (compatible with Redis implementation)
-        let get_result = channel
-            .basic_get(queue.into(), BasicGetOptions { no_ack: false })
-            .await;
-
-        match get_result {
-            Ok(Some(delivery)) => {
-                // Deserialize message
-                match serde_json::from_slice::<Message>(&delivery.data) {
-                    Ok(message) => {
-                        let envelope = Envelope {
-                            delivery_tag: delivery.delivery_tag.to_string(),
-                            message,
-                            redelivered: delivery.redelivered,
-                        };
-
-                        // Update metrics
-                        self.channel_metrics.messages_consumed += 1;
-
-                        debug!("Consumed message from queue: {}", queue);
-                        Ok(Some(envelope))
-                    }
-                    Err(e) => {
-                        self.channel_metrics.consume_errors += 1;
-                        Err(BrokerError::Serialization(e.to_string()))
-                    }
-                }
-            }
-            Ok(None) => {
-                // No message available
-                tokio::time::sleep(timeout).await;
-                Ok(None)
-            }
-            Err(e) => {
-                self.channel_metrics.consume_errors += 1;
-                Err(BrokerError::OperationFailed(format!(
-                    "Failed to get message: {}",
-                    e
-                )))
-            }
+        if self.config.poll_mode {
+            return self.consume_polling(queue, timeout).await;
         }
+        self.consume_subscribed(queue, timeout).await
     }
 
     async fn ack(&mut self, delivery_tag: &str) -> Result<()> {

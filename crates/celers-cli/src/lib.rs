@@ -32,6 +32,7 @@ pub mod config;
 pub mod config_layer;
 pub mod errors;
 pub mod interactive;
+pub mod keys;
 pub mod logging;
 pub mod pool;
 pub mod row_ext;

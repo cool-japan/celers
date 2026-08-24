@@ -40,11 +40,16 @@
 //! ```
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+/// Bucket key used once a stats map ([`ErrorAggregator`]'s `task_stats`
+/// or `error_type_stats`) has reached its configured cardinality cap and
+/// a *new* key would otherwise be added.
+const OVERFLOW_STATS_KEY: &str = "__other__";
 
 /// Configuration for error aggregator
 #[derive(Clone)]
@@ -59,6 +64,14 @@ pub struct ErrorAggregatorConfig {
     pub prune_interval: Duration,
     /// Enable error pattern detection
     pub enable_pattern_detection: bool,
+    /// Maximum number of *distinct* keys tracked in the per-task and
+    /// per-error-type statistics maps. Once reached, a previously-unseen
+    /// task name or error type is folded into a shared overflow bucket
+    /// instead of adding a new entry, so cardinality derived from
+    /// unbounded input (e.g. an error message used as the "type") cannot
+    /// grow the maps without bound even though `entries` itself is
+    /// capped by `max_entries`.
+    pub max_distinct_stat_keys: usize,
 }
 
 impl ErrorAggregatorConfig {
@@ -70,6 +83,7 @@ impl ErrorAggregatorConfig {
             auto_prune: true,
             prune_interval: Duration::from_secs(300), // 5 minutes
             enable_pattern_detection: true,
+            max_distinct_stat_keys: 1000,
         }
     }
 
@@ -100,6 +114,12 @@ impl ErrorAggregatorConfig {
     /// Enable or disable pattern detection
     pub fn with_pattern_detection(mut self, enable: bool) -> Self {
         self.enable_pattern_detection = enable;
+        self
+    }
+
+    /// Set the maximum number of distinct keys tracked per statistics map
+    pub fn with_max_distinct_stat_keys(mut self, max: usize) -> Self {
+        self.max_distinct_stat_keys = max;
         self
     }
 }
@@ -226,8 +246,10 @@ pub struct ErrorPattern {
 pub struct ErrorAggregator {
     /// Configuration
     config: ErrorAggregatorConfig,
-    /// Error entries
-    entries: Arc<RwLock<Vec<ErrorEntry>>>,
+    /// Error entries. A `VecDeque` so the `max_entries` cap can be
+    /// enforced structurally as a true ring buffer (`pop_front` on
+    /// overflow) independent of the time window -- see [`Self::insert_entry`].
+    entries: Arc<RwLock<VecDeque<ErrorEntry>>>,
     /// Error statistics by task name
     task_stats: Arc<RwLock<HashMap<String, ErrorStats>>>,
     /// Error statistics by error type
@@ -243,7 +265,7 @@ impl ErrorAggregator {
     pub fn new(config: ErrorAggregatorConfig) -> Self {
         Self {
             config,
-            entries: Arc::new(RwLock::new(Vec::new())),
+            entries: Arc::new(RwLock::new(VecDeque::new())),
             task_stats: Arc::new(RwLock::new(HashMap::new())),
             error_type_stats: Arc::new(RwLock::new(HashMap::new())),
             patterns: Arc::new(RwLock::new(Vec::new())),
@@ -253,28 +275,60 @@ impl ErrorAggregator {
 
     /// Record a new error
     pub async fn record_error(&self, task_name: String, error_type: String, message: String) {
-        let entry = ErrorEntry::new(task_name.clone(), error_type.clone(), message);
+        let entry = ErrorEntry::new(task_name, error_type, message);
+        self.insert_entry(entry).await;
+    }
 
-        // Add entry
-        let mut entries = self.entries.write().await;
-        entries.push(entry.clone());
-        drop(entries);
+    /// Record an error with full details
+    pub async fn record_error_full(&self, entry: ErrorEntry) {
+        self.insert_entry(entry).await;
+    }
 
-        // Update task statistics
-        let mut task_stats = self.task_stats.write().await;
-        task_stats
-            .entry(task_name.clone())
-            .or_insert_with(ErrorStats::new)
-            .update();
-        drop(task_stats);
+    /// Insert `entry` and perform every associated bookkeeping step
+    /// (statistics, pattern detection, capacity enforcement).
+    /// [`record_error`](Self::record_error) and
+    /// [`record_error_full`](Self::record_error_full) both route through
+    /// this single path so neither can bypass the `max_entries` cap --
+    /// previously `record_error_full` pushed directly onto `entries` and
+    /// never pruned at all.
+    async fn insert_entry(&self, entry: ErrorEntry) {
+        let task_name = entry.task_name.clone();
+        let error_type = entry.error_type.clone();
 
-        // Update error type statistics
-        let mut error_type_stats = self.error_type_stats.write().await;
-        error_type_stats
-            .entry(error_type.clone())
-            .or_insert_with(ErrorStats::new)
-            .update();
-        drop(error_type_stats);
+        {
+            let mut entries = self.entries.write().await;
+            entries.push_back(entry);
+            // Hard cap enforced structurally as a ring buffer, independent
+            // of the time window: a sustained error rate that produces
+            // more than `max_entries` errors within a single `window_size`
+            // used to leave the "forcing prune" branch below with nothing
+            // to remove (it pruned only by age), so this cannot be
+            // skipped by tuning the window.
+            if entries.len() > self.config.max_entries {
+                warn!("Error entries exceeded max size, forcing prune");
+                while entries.len() > self.config.max_entries {
+                    entries.pop_front();
+                }
+            }
+        }
+
+        // Update statistics (bounded: see `bump_stats_map`).
+        {
+            let mut task_stats = self.task_stats.write().await;
+            Self::bump_stats_map(
+                &mut task_stats,
+                &task_name,
+                self.config.max_distinct_stat_keys,
+            );
+        }
+        {
+            let mut error_type_stats = self.error_type_stats.write().await;
+            Self::bump_stats_map(
+                &mut error_type_stats,
+                &error_type,
+                self.config.max_distinct_stat_keys,
+            );
+        }
 
         debug!("Recorded error: {} - {}", task_name, error_type);
 
@@ -283,43 +337,27 @@ impl ErrorAggregator {
             self.detect_patterns().await;
         }
 
-        // Auto-prune if enabled
+        // Auto-prune if enabled (age-based; the hard cap above already
+        // guarantees an upper bound regardless of this setting).
         if self.config.auto_prune {
             self.maybe_prune().await;
         }
-
-        // Check if we've exceeded max entries
-        let entries = self.entries.read().await;
-        if entries.len() > self.config.max_entries {
-            drop(entries);
-            warn!("Error entries exceeded max size, forcing prune");
-            self.prune_old_errors().await;
-        }
     }
 
-    /// Record an error with full details
-    pub async fn record_error_full(&self, entry: ErrorEntry) {
-        let task_name = entry.task_name.clone();
-        let error_type = entry.error_type.clone();
-
-        // Add entry
-        let mut entries = self.entries.write().await;
-        entries.push(entry);
-        drop(entries);
-
-        // Update statistics
-        let mut task_stats = self.task_stats.write().await;
-        task_stats
-            .entry(task_name)
-            .or_insert_with(ErrorStats::new)
-            .update();
-        drop(task_stats);
-
-        let mut error_type_stats = self.error_type_stats.write().await;
-        error_type_stats
-            .entry(error_type)
-            .or_insert_with(ErrorStats::new)
-            .update();
+    /// Insert-or-update `key`'s entry in a stats map, bucketing into a
+    /// shared overflow key once the map already holds
+    /// `max_distinct_keys` *different* keys and `key` is not one of
+    /// them. Without this, per-task/per-error-type cardinality derived
+    /// from unbounded input (e.g. an error message folded into the
+    /// "type") would let the stats maps grow forever even with `entries`
+    /// itself capped.
+    fn bump_stats_map(map: &mut HashMap<String, ErrorStats>, key: &str, max_distinct_keys: usize) {
+        let target_key = if map.contains_key(key) || map.len() < max_distinct_keys {
+            key
+        } else {
+            OVERFLOW_STATS_KEY
+        };
+        map.entry(target_key.to_string()).or_default().update();
     }
 
     /// Get total number of errors
@@ -712,5 +750,133 @@ mod tests {
         assert_eq!(config.max_entries, 5000);
         assert!(!config.auto_prune);
         assert!(!config.enable_pattern_detection);
+    }
+
+    // --- Regression tests (idx 183) ---------------------------------------
+
+    /// Regression test: a sustained burst of errors that all land within
+    /// one `window_size` used to make `prune_old_errors` (age-based) a
+    /// no-op, so `max_entries` was not a real cap. The cap must now hold
+    /// via `entries` behaving as a structural ring buffer.
+    #[tokio::test]
+    async fn test_max_entries_is_a_real_cap_under_sustained_burst() {
+        let config = ErrorAggregatorConfig::new()
+            .with_max_entries(5)
+            // A long window means "prune by age" would remove nothing --
+            // every entry recorded in this test is well within it.
+            .with_window_size(Duration::from_secs(3600))
+            .with_pattern_detection(false);
+        let aggregator = ErrorAggregator::new(config);
+
+        for i in 0..50 {
+            aggregator
+                .record_error("task".to_string(), format!("Error{i}"), "msg".to_string())
+                .await;
+        }
+
+        assert_eq!(
+            aggregator.total_errors().await,
+            5,
+            "entries must never exceed max_entries, regardless of how many arrive within the window"
+        );
+    }
+
+    /// The cap must hold immediately (synchronously, on every insert),
+    /// not just "eventually" once some background sweep runs.
+    #[tokio::test]
+    async fn test_max_entries_cap_holds_after_every_single_insert() {
+        let config = ErrorAggregatorConfig::new()
+            .with_max_entries(3)
+            .with_window_size(Duration::from_secs(3600))
+            .with_pattern_detection(false);
+        let aggregator = ErrorAggregator::new(config);
+
+        for i in 0..10 {
+            aggregator
+                .record_error("task".to_string(), format!("Error{i}"), "msg".to_string())
+                .await;
+            assert!(aggregator.total_errors().await <= 3);
+        }
+    }
+
+    /// Regression test: `record_error_full` used to push directly onto
+    /// `entries` and never prune at all -- unconditionally unbounded.
+    #[tokio::test]
+    async fn test_record_error_full_is_capped_too() {
+        let config = ErrorAggregatorConfig::new()
+            .with_max_entries(4)
+            .with_window_size(Duration::from_secs(3600))
+            .with_pattern_detection(false);
+        let aggregator = ErrorAggregator::new(config);
+
+        for i in 0..25 {
+            let entry = ErrorEntry::new("task".to_string(), format!("Error{i}"), "msg".to_string());
+            aggregator.record_error_full(entry).await;
+        }
+
+        assert_eq!(aggregator.total_errors().await, 4);
+    }
+
+    /// The ring buffer must evict the *oldest* entries first, keeping the
+    /// most recent ones -- a FIFO cap, not an arbitrary truncation.
+    #[tokio::test]
+    async fn test_max_entries_cap_keeps_most_recent_entries() {
+        let config = ErrorAggregatorConfig::new()
+            .with_max_entries(3)
+            .with_window_size(Duration::from_secs(3600))
+            .with_pattern_detection(false);
+        let aggregator = ErrorAggregator::new(config);
+
+        for i in 0..10 {
+            aggregator
+                .record_error("task".to_string(), "Error".to_string(), format!("msg{i}"))
+                .await;
+        }
+
+        let remaining = aggregator.errors_by_task("task").await;
+        let messages: Vec<&str> = remaining.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, vec!["msg7", "msg8", "msg9"]);
+    }
+
+    /// Regression test: `task_stats`/`error_type_stats` are keyed by
+    /// caller-supplied strings and were never bounded, so a high-
+    /// cardinality source (e.g. distinct task names, or an error message
+    /// folded into "error_type") could grow them without bound even
+    /// though `entries` is capped. New keys beyond the configured
+    /// cardinality must fold into a shared overflow bucket instead.
+    #[tokio::test]
+    async fn test_stats_maps_are_bounded_with_overflow_bucket() {
+        let config = ErrorAggregatorConfig::new()
+            .with_max_entries(1000)
+            .with_max_distinct_stat_keys(2)
+            .with_pattern_detection(false);
+        let aggregator = ErrorAggregator::new(config);
+
+        for task in ["A", "B", "C", "D", "E"] {
+            aggregator
+                .record_error(task.to_string(), "Error".to_string(), "msg".to_string())
+                .await;
+        }
+
+        // All 5 entries are still recorded individually...
+        assert_eq!(aggregator.total_errors().await, 5);
+
+        // ...but the per-task stats map holds at most
+        // `max_distinct_stat_keys + 1` keys (the real ones, plus the
+        // shared overflow bucket), not one key per distinct task name.
+        let top_tasks = aggregator.top_error_tasks(100).await;
+        assert_eq!(
+            top_tasks.len(),
+            3,
+            "expected 2 real keys + 1 overflow bucket, got {top_tasks:?}"
+        );
+
+        // "A" and "B" arrived first and get real slots (count 1 each);
+        // "C", "D", "E" all fold into the shared overflow bucket (count 3),
+        // which sorts first since `top_error_tasks` orders by count desc.
+        assert_eq!(
+            top_tasks[0].1, 3,
+            "overflow bucket should have absorbed 3 tasks"
+        );
     }
 }

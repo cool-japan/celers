@@ -114,6 +114,38 @@ impl DbLockBackend {
         Ok(rows_affected)
     }
 
+    /// Spawn a background task that calls [`DbLockBackend::cleanup_expired`]
+    /// on `interval` forever, logging (rather than propagating) any error so
+    /// one failed cleanup pass never kills the scheduler.
+    ///
+    /// Nothing in this crate calls this automatically — expired lock rows
+    /// otherwise accumulate forever, since `cleanup_expired` previously had
+    /// no caller anywhere in the workspace. This is opt-in (not spawned from
+    /// `new`/`with_table_name`) because a library must not start background
+    /// work the caller didn't ask for; wire it in from application start-up
+    /// (e.g. alongside the beat scheduler) if periodic lock-table cleanup is
+    /// desired.
+    pub fn spawn_periodic_cleanup(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let backend = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // The first tick fires immediately; skip it so the first real
+            // cleanup happens after one full `interval`, not at t=0.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match backend.cleanup_expired().await {
+                    Ok(n) if n > 0 => tracing::debug!(deleted = n, "cleaned up expired locks"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "periodic cleanup_expired failed"),
+                }
+            }
+        })
+    }
+
     /// Get the underlying connection.
     pub fn connection(&self) -> &oxisql_postgres::PgConnection {
         &self.conn

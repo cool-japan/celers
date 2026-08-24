@@ -191,6 +191,12 @@ pub struct ScheduledTask {
     pub inherited_priority: Option<TaskPriority>,
     /// Tasks that donated priority to this task
     pub priority_donors: Vec<String>,
+    /// When this task last received a starvation-prevention boost, if
+    /// ever. Gates re-boosting: without this, a task that has been
+    /// waiting past the threshold would be re-boosted on every
+    /// starvation-prevention sweep for as long as it keeps waiting,
+    /// letting `priority_boost` grow without bound.
+    pub last_boosted_at: Option<Instant>,
 }
 
 impl ScheduledTask {
@@ -210,14 +216,20 @@ impl ScheduledTask {
             priority_boost: 0,
             inherited_priority: None,
             priority_donors: Vec::new(),
+            last_boosted_at: None,
         }
     }
 
     /// Get effective priority (including boost and inheritance)
+    ///
+    /// `saturating_add` rather than `+`: `priority_boost` accumulates
+    /// over the (potentially very long) time a task waits in the queue,
+    /// so a raw `+` risks an eventual overflow panic in debug builds
+    /// (and a wraparound-driven priority inversion in release builds).
     pub fn effective_priority(&self) -> u32 {
         let base = self.priority as u32;
         let inherited = self.inherited_priority.map(|p| p as u32).unwrap_or(base);
-        base.max(inherited) + self.priority_boost
+        base.max(inherited).saturating_add(self.priority_boost)
     }
 
     /// Get wait time
@@ -225,9 +237,24 @@ impl ScheduledTask {
         self.queued_at.elapsed()
     }
 
+    /// Time since this task was queued, or since it last received a
+    /// starvation-prevention boost if it has ever received one. Used to
+    /// gate re-boosting to at most once per threshold interval rather
+    /// than once per sweep for as long as the task keeps waiting.
+    pub fn time_since_last_boost(&self) -> Duration {
+        match self.last_boosted_at {
+            Some(t) => t.elapsed(),
+            None => self.wait_time(),
+        }
+    }
+
     /// Apply starvation prevention boost
+    ///
+    /// `saturating_add` guards against an eventual overflow after many
+    /// boosts over a very long wait (see [`effective_priority`](Self::effective_priority)).
     pub fn apply_boost(&mut self, boost: u32) {
-        self.priority_boost += boost;
+        self.priority_boost = self.priority_boost.saturating_add(boost);
+        self.last_boosted_at = Some(Instant::now());
     }
 
     /// Inherit priority from a higher-priority task
@@ -295,6 +322,14 @@ pub struct SchedulerConfig {
     pub resource_aware: bool,
     /// Enable starvation prevention
     pub prevent_starvation: bool,
+    /// Minimum time between starvation-prevention sweeps. Each sweep is
+    /// an *O*(*n*) pass over the whole queue (see
+    /// `apply_starvation_prevention`); running it unconditionally on
+    /// every single `dequeue()` call -- which can happen many times per
+    /// second under load, with `max_queue_size` defaulting to 1000 -- is
+    /// needlessly expensive. This throttles it to at most once per
+    /// interval regardless of dequeue frequency.
+    pub starvation_sweep_interval: Duration,
 }
 
 impl SchedulerConfig {
@@ -332,6 +367,12 @@ impl SchedulerConfig {
         self.prevent_starvation = enabled;
         self
     }
+
+    /// Set the minimum time between starvation-prevention sweeps
+    pub fn with_starvation_sweep_interval(mut self, interval: Duration) -> Self {
+        self.starvation_sweep_interval = interval;
+        self
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -342,84 +383,84 @@ impl Default for SchedulerConfig {
             max_queue_size: 1000,
             resource_aware: true,
             prevent_starvation: true,
+            starvation_sweep_interval: Duration::from_secs(5),
         }
     }
 }
 
 /// Multi-level priority queue for better priority management
+///
+/// Backed by a single [`BinaryHeap`] ordered by
+/// [`ScheduledTask::effective_priority`] -- deliberately *not* five
+/// separate per-base-priority heaps. Partitioning by base priority (as
+/// this type previously did, indexing into `queues[task.priority as
+/// usize]`) meant a boosted low-priority task stayed physically stuck in
+/// the lowest queue and was still never popped while any higher-priority
+/// queue was non-empty: starvation prevention could reorder a task
+/// *within* its own level but could never let it overtake a higher base
+/// level, which defeated the feature entirely. A single heap ordered by
+/// effective priority makes boost/inheritance promote a task across
+/// levels naturally, because that is exactly what `Ord` for
+/// `ScheduledTask` already compares.
 #[derive(Debug)]
 pub struct MultiLevelQueue {
-    /// Separate queues for each priority level
-    queues: [BinaryHeap<ScheduledTask>; 5],
-    /// Total task count across all queues
-    total_count: usize,
+    heap: BinaryHeap<ScheduledTask>,
 }
 
 impl MultiLevelQueue {
     /// Create a new multi-level queue
     pub fn new() -> Self {
         Self {
-            queues: [
-                BinaryHeap::new(), // Lowest
-                BinaryHeap::new(), // Low
-                BinaryHeap::new(), // Normal
-                BinaryHeap::new(), // High
-                BinaryHeap::new(), // Highest
-            ],
-            total_count: 0,
+            heap: BinaryHeap::new(),
         }
     }
 
-    /// Push a task to the appropriate queue
+    /// Push a task onto the queue
     pub fn push(&mut self, task: ScheduledTask) {
-        let priority_idx = task.priority as usize;
-        self.queues[priority_idx].push(task);
-        self.total_count += 1;
+        self.heap.push(task);
     }
 
-    /// Pop the highest priority task
+    /// Bulk-insert many tasks in one pass.
+    ///
+    /// `BinaryHeap::extend` performs a single *O*(*n*) rebuild rather
+    /// than `n` individual *O*(log *n*) `push` calls, so prefer this over
+    /// a loop of `push` calls when restoring a batch of tasks that were
+    /// set aside during a scan (e.g. the resource-aware dequeue path or a
+    /// starvation-prevention sweep putting back everything it looked at).
+    pub fn push_many(&mut self, tasks: impl IntoIterator<Item = ScheduledTask>) {
+        self.heap.extend(tasks);
+    }
+
+    /// Pop the highest effective-priority task
     pub fn pop(&mut self) -> Option<ScheduledTask> {
-        // Check queues from highest to lowest priority
-        for queue in self.queues.iter_mut().rev() {
-            if let Some(task) = queue.pop() {
-                self.total_count -= 1;
-                return Some(task);
-            }
-        }
-        None
+        self.heap.pop()
     }
 
     /// Get total number of tasks
     pub fn len(&self) -> usize {
-        self.total_count
+        self.heap.len()
     }
 
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
-        self.total_count == 0
+        self.heap.is_empty()
     }
 
-    /// Clear all queues
+    /// Clear the queue
     pub fn clear(&mut self) {
-        for queue in &mut self.queues {
-            queue.clear();
-        }
-        self.total_count = 0;
+        self.heap.clear();
     }
 
-    /// Drain all tasks from all queues
+    /// Drain all tasks from the queue (arbitrary order)
     pub fn drain(&mut self) -> Vec<ScheduledTask> {
-        let mut all_tasks = Vec::with_capacity(self.total_count);
-        for queue in &mut self.queues {
-            all_tasks.extend(queue.drain());
-        }
-        self.total_count = 0;
-        all_tasks
+        self.heap.drain().collect()
     }
 
-    /// Get count for specific priority level
+    /// Get count of tasks at a specific *base* priority level (their
+    /// original `priority` field, independent of any boost or inherited
+    /// priority currently pushing their effective priority higher).
     pub fn count_at_priority(&self, priority: TaskPriority) -> usize {
-        self.queues[priority as usize].len()
+        self.heap.iter().filter(|t| t.priority == priority).count()
     }
 }
 
@@ -437,6 +478,9 @@ pub struct TaskScheduler {
     queue: Arc<RwLock<MultiLevelQueue>>,
     /// Available resources
     resources: Arc<RwLock<AvailableResources>>,
+    /// When the last starvation-prevention sweep ran, used to throttle
+    /// sweeps to `SchedulerConfig::starvation_sweep_interval`.
+    last_starvation_sweep: Arc<RwLock<Instant>>,
 }
 
 impl TaskScheduler {
@@ -446,6 +490,7 @@ impl TaskScheduler {
             config,
             queue: Arc::new(RwLock::new(MultiLevelQueue::new())),
             resources: Arc::new(RwLock::new(AvailableResources::default())),
+            last_starvation_sweep: Arc::new(RwLock::new(Instant::now())),
         }
     }
 
@@ -476,9 +521,18 @@ impl TaskScheduler {
             return None;
         }
 
-        // Apply starvation prevention if enabled
+        // Apply starvation prevention if enabled, throttled to at most
+        // once per `starvation_sweep_interval` regardless of how often
+        // `dequeue()` itself is called (see `SchedulerConfig::starvation_sweep_interval`).
         if self.config.prevent_starvation {
-            self.apply_starvation_prevention(&mut queue).await;
+            let due = {
+                let last_sweep = self.last_starvation_sweep.read().await;
+                last_sweep.elapsed() >= self.config.starvation_sweep_interval
+            };
+            if due {
+                *self.last_starvation_sweep.write().await = Instant::now();
+                self.apply_starvation_prevention(&mut queue).await;
+            }
         }
 
         // If resource-aware scheduling is disabled, just pop the highest priority task
@@ -486,46 +540,58 @@ impl TaskScheduler {
             return queue.pop();
         }
 
-        // Find the highest priority task that can be scheduled
+        // Find the highest priority task that can be scheduled, setting
+        // aside (not discarding) any higher-priority tasks that don't fit
+        // the current resources.
         let resources = self.resources.read().await;
-        let mut temp_tasks = Vec::new();
+        let mut skipped = Vec::new();
 
-        while let Some(task) = queue.pop() {
-            if resources.can_satisfy(&task.requirements) {
-                // Put back the tasks we skipped
-                for t in temp_tasks {
-                    queue.push(t);
-                }
-                return Some(task);
+        let found = loop {
+            match queue.pop() {
+                Some(task) if resources.can_satisfy(&task.requirements) => break Some(task),
+                Some(task) => skipped.push(task),
+                None => break None,
             }
-            temp_tasks.push(task);
+        };
+
+        // Restore whatever was skipped in one O(n) pass (`push_many`)
+        // rather than pushing each one back individually.
+        if !skipped.is_empty() {
+            queue.push_many(skipped);
         }
 
-        // No task could be scheduled, put them all back
-        for task in temp_tasks {
-            queue.push(task);
-        }
-
-        None
+        found
     }
 
     /// Apply starvation prevention logic
+    ///
+    /// Boosts only tasks that have been waiting more than
+    /// `starvation_threshold` *since their last boost* (see
+    /// [`ScheduledTask::time_since_last_boost`]) rather than since they
+    /// were queued: a task's raw wait time only grows, so gating on that
+    /// alone would re-boost the same still-waiting task on every sweep
+    /// for as long as it kept waiting, growing `priority_boost` without
+    /// bound.
     async fn apply_starvation_prevention(&self, queue: &mut MultiLevelQueue) {
         let threshold = self.config.starvation_threshold;
         let boost_amount = self.config.priority_boost_amount;
 
         let tasks: Vec<_> = queue.drain();
-        for mut task in tasks {
-            if task.wait_time() > threshold {
-                task.apply_boost(boost_amount);
-                info!(
-                    "Applied priority boost to task {} (wait time: {:?})",
-                    task.task_id,
-                    task.wait_time()
-                );
-            }
-            queue.push(task);
-        }
+        let tasks: Vec<_> = tasks
+            .into_iter()
+            .map(|mut task| {
+                if task.time_since_last_boost() > threshold {
+                    task.apply_boost(boost_amount);
+                    info!(
+                        "Applied priority boost to task {} (wait time: {:?})",
+                        task.task_id,
+                        task.wait_time()
+                    );
+                }
+                task
+            })
+            .collect();
+        queue.push_many(tasks);
     }
 
     /// Check if a task can be scheduled with current resources
@@ -600,9 +666,7 @@ impl TaskScheduler {
             }
         }
 
-        for task in tasks {
-            queue.push(task);
-        }
+        queue.push_many(tasks);
 
         if found_recipient {
             Ok(())
@@ -1136,5 +1200,237 @@ mod tests {
         assert_eq!(task.task_id, "low-task");
         assert!(task.has_inherited_priority());
         assert_eq!(task.effective_priority(), TaskPriority::High as u32);
+    }
+
+    // --- Regression tests (idx 177) ----------------------------------------
+
+    /// The central regression test: starvation prevention must be able to
+    /// let a boosted task overtake a *higher base priority* task. Under
+    /// the previous five-separate-heaps implementation this was
+    /// impossible: `push` indexed into `queues[task.priority as usize]`
+    /// by *base* priority, so a boosted `Lowest` task stayed physically
+    /// stuck in `queues[0]` and was still never popped while any `High`
+    /// task existed in `queues[3]`, no matter how large its boost grew.
+    #[tokio::test]
+    async fn test_starvation_prevention_promotes_task_across_priority_levels() {
+        let config = SchedulerConfig::default()
+            .with_starvation_threshold(Duration::from_millis(20))
+            .with_starvation_sweep_interval(Duration::ZERO)
+            .with_priority_boost(10) // enough to overtake Highest (4) from Lowest (0)
+            .resource_aware(false);
+        let scheduler = TaskScheduler::new(config);
+
+        let starving = ScheduledTask::new(
+            "starving".to_string(),
+            "starving".to_string(),
+            TaskPriority::Lowest,
+            TaskRequirements::default(),
+        );
+        scheduler.enqueue(starving).await.unwrap();
+
+        // Let it age past the starvation threshold.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // A freshly-queued Highest-priority task, which a broken
+        // implementation would always pop first regardless of how long
+        // "starving" had been waiting.
+        let fresh_high = ScheduledTask::new(
+            "fresh-high".to_string(),
+            "fresh-high".to_string(),
+            TaskPriority::Highest,
+            TaskRequirements::default(),
+        );
+        scheduler.enqueue(fresh_high).await.unwrap();
+
+        let dequeued = scheduler.dequeue().await.unwrap();
+        assert_eq!(
+            dequeued.task_id, "starving",
+            "a sufficiently-starved Lowest-priority task must be able to overtake a fresh Highest-priority one"
+        );
+    }
+
+    /// Starvation-prevention sweeps must be throttled to
+    /// `starvation_sweep_interval`, not run unconditionally on every
+    /// `dequeue()` call. With an interval far longer than the test can
+    /// possibly take, the very first `dequeue()` call must not sweep at
+    /// all, so plain base-priority ordering is unaffected.
+    #[tokio::test]
+    async fn test_starvation_sweep_is_throttled_by_configured_interval() {
+        let config = SchedulerConfig::default()
+            .with_starvation_threshold(Duration::from_millis(10))
+            .with_starvation_sweep_interval(Duration::from_secs(3600))
+            .with_priority_boost(10)
+            .resource_aware(false);
+        let scheduler = TaskScheduler::new(config);
+
+        let starving = ScheduledTask::new(
+            "starving".to_string(),
+            "starving".to_string(),
+            TaskPriority::Lowest,
+            TaskRequirements::default(),
+        );
+        scheduler.enqueue(starving).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(30)).await; // past the 10ms threshold
+
+        let fresh_high = ScheduledTask::new(
+            "fresh-high".to_string(),
+            "fresh-high".to_string(),
+            TaskPriority::Highest,
+            TaskRequirements::default(),
+        );
+        scheduler.enqueue(fresh_high).await.unwrap();
+
+        let dequeued = scheduler.dequeue().await.unwrap();
+        assert_eq!(
+            dequeued.task_id, "fresh-high",
+            "a sweep must not run before the configured interval has elapsed"
+        );
+    }
+
+    /// `time_since_last_boost` must fall back to the full wait time for a
+    /// never-boosted task, but reset to (near) zero immediately after a
+    /// boost -- this is what gates re-boosting to at most once per
+    /// threshold interval instead of once per sweep.
+    #[test]
+    fn test_time_since_last_boost_resets_after_boost() {
+        let mut task = ScheduledTask::new(
+            "t".to_string(),
+            "t".to_string(),
+            TaskPriority::Lowest,
+            TaskRequirements::default(),
+        );
+        assert!(task.last_boosted_at.is_none());
+        assert!(task.time_since_last_boost() < Duration::from_millis(100));
+
+        task.apply_boost(1);
+        assert!(task.last_boosted_at.is_some());
+        assert!(
+            task.time_since_last_boost() < Duration::from_millis(100),
+            "time_since_last_boost must reset to ~0 right after a boost"
+        );
+    }
+
+    /// Regression test: repeatedly satisfying the "past threshold" check
+    /// without gating on `time_since_last_boost` would re-boost the same
+    /// still-waiting task on every sweep. Simulating many sweeps directly
+    /// (bypassing real wait-time accumulation) must show the boost is
+    /// only applied when due, not unconditionally.
+    #[test]
+    fn test_apply_starvation_boost_is_not_reapplied_immediately() {
+        let mut task = ScheduledTask::new(
+            "t".to_string(),
+            "t".to_string(),
+            TaskPriority::Lowest,
+            TaskRequirements::default(),
+        );
+        let threshold = Duration::from_secs(60);
+
+        // First check: never boosted, wait_time() is tiny, so it is not
+        // yet due for a boost.
+        assert!(task.time_since_last_boost() <= threshold);
+
+        // Force a boost as if it were due, then immediately re-check:
+        // it must not look due again a moment later.
+        task.apply_boost(1);
+        assert!(task.time_since_last_boost() <= threshold);
+        assert_eq!(task.priority_boost, 1);
+    }
+
+    /// Regression test: `priority_boost += boost` and
+    /// `base + priority_boost` could overflow after enough boosts over a
+    /// long enough wait. Both must saturate instead of panicking/wrapping.
+    #[test]
+    fn test_apply_boost_and_effective_priority_saturate_on_overflow() {
+        let mut task = ScheduledTask::new(
+            "t".to_string(),
+            "t".to_string(),
+            TaskPriority::Highest,
+            TaskRequirements::default(),
+        );
+        task.priority_boost = u32::MAX - 1;
+
+        // Would panic in debug builds / wrap in release with raw `+=`.
+        task.apply_boost(10);
+        assert_eq!(task.priority_boost, u32::MAX);
+
+        // Would panic in debug builds / wrap in release with raw `+`.
+        assert_eq!(task.effective_priority(), u32::MAX);
+    }
+
+    #[test]
+    fn test_multi_level_queue_push_many_restores_all_tasks_in_priority_order() {
+        let mut queue = MultiLevelQueue::new();
+        let tasks = vec![
+            ScheduledTask::new(
+                "a".to_string(),
+                "a".to_string(),
+                TaskPriority::Low,
+                TaskRequirements::default(),
+            ),
+            ScheduledTask::new(
+                "b".to_string(),
+                "b".to_string(),
+                TaskPriority::High,
+                TaskRequirements::default(),
+            ),
+            ScheduledTask::new(
+                "c".to_string(),
+                "c".to_string(),
+                TaskPriority::Normal,
+                TaskRequirements::default(),
+            ),
+        ];
+
+        queue.push_many(tasks);
+
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.pop().unwrap().task_id, "b");
+        assert_eq!(queue.pop().unwrap().task_id, "c");
+        assert_eq!(queue.pop().unwrap().task_id, "a");
+        assert!(queue.is_empty());
+    }
+
+    /// The resource-aware dequeue path must restore *every* task it set
+    /// aside while scanning past ones that didn't fit, not just the
+    /// first or last.
+    #[tokio::test]
+    async fn test_resource_aware_dequeue_restores_all_skipped_tasks() {
+        let config = SchedulerConfig::default().resource_aware(true);
+        let scheduler = TaskScheduler::new(config);
+        scheduler
+            .update_resources(AvailableResources {
+                available_memory_mb: 100,
+                available_cpu_cores: 4,
+                ..Default::default()
+            })
+            .await;
+
+        // Three high-priority tasks that don't fit (popped and skipped
+        // first), then one low-priority task that does.
+        for (id, mem) in [("big1", 200), ("big2", 300), ("big3", 400)] {
+            scheduler
+                .enqueue(ScheduledTask::new(
+                    id.to_string(),
+                    id.to_string(),
+                    TaskPriority::Highest,
+                    TaskRequirements::new().with_min_memory_mb(mem),
+                ))
+                .await
+                .unwrap();
+        }
+        scheduler
+            .enqueue(ScheduledTask::new(
+                "fits".to_string(),
+                "fits".to_string(),
+                TaskPriority::Lowest,
+                TaskRequirements::new().with_min_memory_mb(50),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(scheduler.dequeue().await.unwrap().task_id, "fits");
+        // All three skipped tasks must still be in the queue afterward.
+        assert_eq!(scheduler.queue_size().await, 3);
     }
 }

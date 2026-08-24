@@ -66,18 +66,28 @@ impl ScheduleConfig {
     }
 
     /// Check if message is ready for delivery
+    ///
+    /// Delegates to [`Self::delivery_time`] so a delay-based schedule is
+    /// evaluated against `now + delay`, exactly like an absolute
+    /// `scheduled_at` timestamp would be. Previously, a delay-only
+    /// schedule (no `scheduled_at`) fell through to an unconditional
+    /// `true`, so `ScheduleConfig::delay(Duration::from_secs(3600))`
+    /// reported itself ready to deliver immediately -- any scheduler
+    /// driving delivery off `is_ready()` would fire delayed messages
+    /// right away instead of honoring the delay.
     pub fn is_ready(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_secs();
-
-        if let Some(timestamp) = self.scheduled_at {
-            return now >= timestamp;
+        match self.delivery_time() {
+            Some(timestamp) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("SystemTime should be after UNIX_EPOCH")
+                    .as_secs();
+                now >= timestamp
+            }
+            // Neither `scheduled_at` nor `delay` is set: there is no
+            // schedule to wait on, so the message is ready immediately.
+            None => true,
         }
-
-        // If only delay is set, it's ready when converted to timestamp
-        true
     }
 
     /// Get delivery timestamp
@@ -355,5 +365,66 @@ impl ReplayProgress {
                 (self.messages_replayed as f64 / total as f64) * 100.0
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now_unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_secs()
+    }
+
+    #[test]
+    fn delay_schedule_is_not_immediately_ready() {
+        // Regression test: a delay-only `ScheduleConfig` (no `scheduled_at`)
+        // used to report `is_ready() == true` unconditionally, so a
+        // scheduler driving delivery off it would fire the message right
+        // away instead of waiting out the delay.
+        let schedule = ScheduleConfig::delay(Duration::from_secs(3600));
+        assert!(!schedule.is_ready());
+    }
+
+    #[test]
+    fn delay_schedule_is_ready_once_delivery_time_has_passed() {
+        // `is_ready` must agree with `delivery_time`: neither is
+        // literally simulable without mocking the clock, but we can
+        // assert that a schedule whose delivery time is in the past
+        // (constructed via `at`, which is how `delay` conceptually
+        // resolves) is ready.
+        let past = ScheduleConfig::at(0);
+        assert!(past.is_ready());
+        assert_eq!(past.delivery_time(), Some(0));
+    }
+
+    #[test]
+    fn zero_delay_schedule_is_ready() {
+        let schedule = ScheduleConfig::delay(Duration::from_secs(0));
+        assert!(schedule.is_ready());
+    }
+
+    #[test]
+    fn delay_schedule_fields_are_unchanged() {
+        // `delay()` must keep storing the delay in `delay` (not eagerly
+        // resolve it into `scheduled_at`) so existing introspection of
+        // the raw fields keeps working.
+        let schedule = ScheduleConfig::delay(Duration::from_secs(30));
+        assert_eq!(schedule.delay, Some(Duration::from_secs(30)));
+        assert!(schedule.scheduled_at.is_none());
+    }
+
+    #[test]
+    fn is_ready_matches_delivery_time_for_a_future_delay() {
+        let schedule = ScheduleConfig::delay(Duration::from_secs(3600));
+        let now = now_unix_secs();
+        let delivery = schedule
+            .delivery_time()
+            .expect("delay-based schedule must have a delivery time");
+        assert!(delivery > now);
+        assert!(!schedule.is_ready());
     }
 }

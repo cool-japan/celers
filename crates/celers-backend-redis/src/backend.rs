@@ -6,32 +6,97 @@
 
 use chrono::{DateTime, Utc};
 use futures_util::stream::StreamExt;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+use crate::codec;
 use crate::query::TaskQuery;
 use crate::result_backend_trait::{ResultBackend, ResultStream};
-use crate::stats::{BackendStats, BatchOperationResult, PoolStats, StateCount, TaskSummary};
+use crate::stats::{ttl, BackendStats, BatchOperationResult, PoolStats, StateCount, TaskSummary};
 use crate::types::{BackendError, ProgressInfo, Result, TaskMeta, TaskResult, TaskTtlConfig};
-use crate::{cache, chunking, compression, encryption, metrics};
+use crate::{cache, chunking, compression, encryption, metrics, pipeline, retry, telemetry};
+
+/// Configuration for versioned result history.
+///
+/// When enabled, every call to
+/// [`store_versioned_result`](crate::ResultBackend::store_versioned_result)
+/// keeps a copy of the payload under `{task_key}:v{n}` so previous versions can
+/// be retrieved with
+/// [`get_result_version`](crate::ResultBackend::get_result_version).
+#[derive(Debug, Clone)]
+pub struct VersioningConfig {
+    /// Whether versioned history is retained.
+    pub enabled: bool,
+    /// Maximum number of historical versions to keep (older ones are deleted).
+    pub max_versions: u32,
+}
+
+impl Default for VersioningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_versions: 10,
+        }
+    }
+}
+
+impl VersioningConfig {
+    /// Create a configuration with the default retention (10 versions).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Disable versioned history entirely.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            max_versions: 0,
+        }
+    }
+
+    /// Set how many historical versions are retained.
+    pub fn with_max_versions(mut self, max_versions: u32) -> Self {
+        self.max_versions = max_versions;
+        self
+    }
+}
 
 /// Redis result backend implementation
 #[derive(Clone)]
 pub struct RedisResultBackend {
     pub(crate) client: Client,
+    /// Lazily-established reconnecting connection, shared by every clone.
+    pub(crate) connection: Arc<OnceCell<ConnectionManager>>,
     pub(crate) key_prefix: String,
     pub(crate) compression_config: compression::CompressionConfig,
     pub(crate) encryption_config: encryption::EncryptionConfig,
     pub(crate) metrics: metrics::BackendMetrics,
     pub(crate) cache: cache::ResultCache,
     pub(crate) ttl_config: TaskTtlConfig,
-    pub(crate) compression_stats: celers_protocol::compression::CompressionStats,
+    /// Shared (interior-mutable) so statistics survive the `clone()` performed
+    /// by the `ResultStore` adapter on every call.
+    pub(crate) compression_stats: Arc<compression::CompressionStats>,
     pub(crate) chunking_config: chunking::ChunkingConfig,
     pub(crate) chunker: chunking::ResultChunker,
+    pub(crate) pipeline_config: pipeline::PipelineConfig,
+    pub(crate) retry_strategy: retry::RetryStrategy,
+    pub(crate) telemetry: Option<Arc<dyn telemetry::TelemetryHook>>,
+    pub(crate) versioning: VersioningConfig,
+    /// Publish a pub/sub notification on every result write so waiters do not
+    /// have to poll.
+    pub(crate) notify_on_store: bool,
 }
 
 impl RedisResultBackend {
+    /// Create a backend against `url`.
+    ///
+    /// Results expire after [`ttl::SUCCESS`] (24 hours) by default, matching
+    /// Celery's `result_expires`. Use [`Self::without_ttl`] for permanent
+    /// results or [`Self::with_ttl_config`] for per-task-type expiry.
     pub fn new(url: &str) -> Result<Self> {
         let client = Client::open(url).map_err(|e| {
             BackendError::Connection(format!("Failed to create Redis client: {}", e))
@@ -39,20 +104,96 @@ impl RedisResultBackend {
 
         Ok(Self {
             client,
+            connection: Arc::new(OnceCell::new()),
             key_prefix: "celery-task-meta-".to_string(),
             compression_config: compression::CompressionConfig::default(),
             encryption_config: encryption::EncryptionConfig::disabled(),
             metrics: metrics::BackendMetrics::new(),
             cache: cache::ResultCache::new(cache::CacheConfig::default()),
-            ttl_config: TaskTtlConfig::new(),
-            compression_stats: celers_protocol::compression::CompressionStats::default(),
+            ttl_config: TaskTtlConfig::with_default(ttl::SUCCESS),
+            compression_stats: Arc::new(compression::CompressionStats::new()),
             chunking_config: chunking::ChunkingConfig::default(),
             chunker: chunking::ResultChunker::new(chunking::ChunkingConfig::default()),
+            pipeline_config: pipeline::PipelineConfig::default(),
+            retry_strategy: retry::RetryStrategy::default(),
+            telemetry: None,
+            versioning: VersioningConfig::default(),
+            notify_on_store: true,
         })
     }
 
     pub fn with_prefix(mut self, prefix: String) -> Self {
         self.key_prefix = prefix;
+        self
+    }
+
+    /// Store results permanently (no expiry).
+    ///
+    /// Overrides the 24-hour default installed by [`Self::new`]. Note that
+    /// without a TTL, Redis memory grows with every task the deployment ever
+    /// runs unless results are removed explicitly.
+    pub fn without_ttl(mut self) -> Self {
+        self.ttl_config = TaskTtlConfig::new();
+        self
+    }
+
+    /// Configure Redis pipelining and the per-command timeout.
+    pub fn with_pipeline_config(mut self, config: pipeline::PipelineConfig) -> Self {
+        self.pipeline_config = config;
+        self
+    }
+
+    /// Get the pipeline configuration.
+    pub fn pipeline_config(&self) -> &pipeline::PipelineConfig {
+        &self.pipeline_config
+    }
+
+    /// Configure how transient Redis failures are retried.
+    pub fn with_retry_strategy(mut self, strategy: retry::RetryStrategy) -> Self {
+        self.retry_strategy = strategy;
+        self
+    }
+
+    /// Disable automatic retries of transient Redis failures.
+    pub fn without_retries(mut self) -> Self {
+        self.retry_strategy = retry::RetryStrategy::new().with_max_attempts(1);
+        self
+    }
+
+    /// Get the retry strategy.
+    pub fn retry_strategy(&self) -> &retry::RetryStrategy {
+        &self.retry_strategy
+    }
+
+    /// Register a telemetry hook fired around every backend operation.
+    pub fn with_telemetry_hook(mut self, hook: Arc<dyn telemetry::TelemetryHook>) -> Self {
+        self.telemetry = Some(hook);
+        self
+    }
+
+    /// Get the registered telemetry hook, if any.
+    pub fn telemetry_hook(&self) -> Option<&Arc<dyn telemetry::TelemetryHook>> {
+        self.telemetry.as_ref()
+    }
+
+    /// Configure versioned result history.
+    pub fn with_versioning(mut self, config: VersioningConfig) -> Self {
+        self.versioning = config;
+        self
+    }
+
+    /// Get the versioning configuration.
+    pub fn versioning_config(&self) -> &VersioningConfig {
+        &self.versioning
+    }
+
+    /// Enable or disable the pub/sub notification published on every write.
+    ///
+    /// The notification is what lets
+    /// [`wait_for_result`](Self::wait_for_result) return as soon as a result
+    /// lands instead of waiting for the next poll.
+    pub fn with_store_notifications(mut self, enabled: bool) -> Self {
+        self.notify_on_store = enabled;
         self
     }
 
@@ -166,12 +307,82 @@ impl RedisResultBackend {
     }
 
     /// Get the compression statistics
-    pub fn compression_stats(&self) -> &celers_protocol::compression::CompressionStats {
+    ///
+    /// The counters live behind an `Arc`, so they are shared by every clone of
+    /// this backend — including the short-lived clones the `ResultStore`
+    /// adapter makes per call.
+    pub fn compression_stats(&self) -> &compression::CompressionStats {
         &self.compression_stats
+    }
+
+    /// Get a connection to Redis.
+    ///
+    /// A single [`ConnectionManager`] is established lazily and shared by every
+    /// clone of this backend. It reconnects transparently, so callers never
+    /// hold on to a dead socket, and a `get_result` no longer costs a fresh TCP
+    /// connect + handshake per call.
+    pub(crate) async fn connection(&self) -> Result<ConnectionManager> {
+        self.connection
+            .get_or_try_init(|| async {
+                ConnectionManager::new(self.client.clone())
+                    .await
+                    .map_err(BackendError::from)
+            })
+            .await
+            .cloned()
+    }
+
+    /// Run `future` under the configured command timeout, if one is set.
+    pub(crate) async fn with_timeout<T, F>(&self, what: &str, future: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        match self.pipeline_config.timeout {
+            Some(limit) => match tokio::time::timeout(limit, future).await {
+                Ok(result) => result,
+                Err(_) => Err(BackendError::Connection(format!(
+                    "Redis operation `{}` timed out after {:?}",
+                    what, limit
+                ))),
+            },
+            None => future.await,
+        }
     }
 
     pub(crate) fn task_key(&self, task_id: Uuid) -> String {
         format!("{}{}", self.key_prefix, task_id)
+    }
+
+    /// Build a `SCAN`/`KEYS` pattern for task keys from a suffix pattern.
+    ///
+    /// [`find_tasks_by_pattern`](Self::find_tasks_by_pattern) prepends the key
+    /// prefix itself, so callers must pass a *suffix* only. This helper exists
+    /// so the composition is testable without a live Redis.
+    pub(crate) fn scan_pattern(&self, suffix: &str) -> String {
+        format!("{}{}", self.key_prefix, suffix)
+    }
+
+    /// Pattern matching every task key managed by this backend.
+    ///
+    /// Note the leading prefix is supplied by `find_tasks_by_pattern`, so this
+    /// is deliberately just `"*"`.
+    pub(crate) const ALL_TASKS_PATTERN: &'static str = "*";
+
+    pub(crate) fn archive_key(&self, task_id: Uuid) -> String {
+        format!("{}archive:{}", self.key_prefix, task_id)
+    }
+
+    pub(crate) fn version_key(&self, task_id: Uuid, version: u32) -> String {
+        format!("{}{}:v{}", self.key_prefix, task_id, version)
+    }
+
+    pub(crate) fn version_counter_key(&self, task_id: Uuid) -> String {
+        format!("{}{}:version", self.key_prefix, task_id)
+    }
+
+    /// Pub/sub channel a result write is announced on.
+    pub(crate) fn notify_channel(&self, task_id: Uuid) -> String {
+        format!("{}{}:notify", self.key_prefix, task_id)
     }
 
     pub(crate) fn chord_key(&self, chord_id: Uuid) -> String {
@@ -257,7 +468,7 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn health_check(&mut self) -> Result<bool> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let result: String = redis::cmd("PING").query_async(&mut conn).await?;
         Ok(result == "PONG")
     }
@@ -266,7 +477,7 @@ impl RedisResultBackend {
     ///
     /// Uses Redis SCAN command instead of KEYS for safe iteration in production.
     pub(crate) async fn scan_keys(&mut self, pattern: &str) -> Result<Vec<String>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut all_keys = Vec::new();
         let mut cursor = 0u64;
 
@@ -312,7 +523,7 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn get_stats(&mut self) -> Result<BackendStats> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
 
         // Count task result keys using SCAN (production-safe)
         let task_pattern = format!("{}*", self.key_prefix);
@@ -418,7 +629,7 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn cleanup_completed_chords(&mut self) -> Result<usize> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let keys = self.scan_keys("celery-chord-*").await?;
 
         let mut deleted = 0;
@@ -540,7 +751,7 @@ impl RedisResultBackend {
             return Ok(());
         }
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut pipe = redis::pipe();
 
         let ttl_secs = ttl.as_secs() as i64;
@@ -822,7 +1033,7 @@ impl RedisResultBackend {
     ///
     /// This is more efficient than calling `get_result` if you only need to check existence.
     pub async fn task_exists(&mut self, task_id: Uuid) -> Result<bool> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
         let exists: bool = conn.exists(&key).await?;
         Ok(exists)
@@ -832,7 +1043,7 @@ impl RedisResultBackend {
     ///
     /// Returns a vector of booleans indicating whether each task exists.
     pub async fn tasks_exist_batch(&mut self, task_ids: &[Uuid]) -> Result<Vec<bool>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut pipe = redis::pipe();
 
         for task_id in task_ids {
@@ -915,7 +1126,7 @@ impl RedisResultBackend {
     ///
     /// Returns the remaining time before the task expires, or None if no TTL is set.
     pub async fn get_ttl(&mut self, task_id: Uuid) -> Result<Option<Duration>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
 
         let ttl_secs: i64 = conn.ttl(&key).await?;
@@ -932,7 +1143,7 @@ impl RedisResultBackend {
     ///
     /// Extends the TTL of a task by the specified duration from now.
     pub async fn refresh_ttl(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
         let _: bool = conn.expire(&key, ttl.as_secs() as i64).await?;
         Ok(())
@@ -943,7 +1154,7 @@ impl RedisResultBackend {
     /// Efficiently updates TTL for multiple tasks using pipelining.
     /// Returns the number of tasks that had their TTL updated.
     pub async fn refresh_ttl_batch(&mut self, task_ids: &[Uuid], ttl: Duration) -> Result<usize> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut pipe = redis::pipe();
 
         for task_id in task_ids {
@@ -959,7 +1170,7 @@ impl RedisResultBackend {
     ///
     /// The task will no longer expire automatically.
     pub async fn persist_task(&mut self, task_id: Uuid) -> Result<()> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
         let _: bool = conn.persist(&key).await?;
         Ok(())
@@ -1027,7 +1238,7 @@ impl RedisResultBackend {
         results: &[(Uuid, TaskMeta)],
         ttl: Option<Duration>,
     ) -> Result<()> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut pipe = redis::pipe();
         pipe.atomic();
 
@@ -1065,7 +1276,7 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn atomic_delete_multiple(&mut self, task_ids: &[Uuid]) -> Result<usize> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut pipe = redis::pipe();
         pipe.atomic();
 
@@ -1120,7 +1331,7 @@ impl RedisResultBackend {
         keys: &[&str],
         args: &[&str],
     ) -> Result<T> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let result = redis::Script::new(script)
             .key(keys)
             .arg(args)
@@ -1207,7 +1418,7 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn find_tasks_by_pattern(&mut self, pattern: &str) -> Result<Vec<Uuid>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let full_pattern = format!("{}{}", self.key_prefix, pattern);
 
         let mut task_ids = Vec::new();
@@ -1296,7 +1507,7 @@ impl RedisResultBackend {
         parent_id: Uuid,
         child_ids: &[Uuid],
     ) -> Result<()> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = format!("{}deps:{}", self.key_prefix, parent_id);
 
         let child_strings: Vec<String> = child_ids.iter().map(|id| id.to_string()).collect();
@@ -1313,7 +1524,7 @@ impl RedisResultBackend {
     /// # Returns
     /// Vector of task IDs that are children of the given parent task
     pub async fn get_task_dependencies(&mut self, parent_id: Uuid) -> Result<Vec<Uuid>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = format!("{}deps:{}", self.key_prefix, parent_id);
 
         let child_strings: Vec<String> = conn.smembers(&key).await?;
@@ -1328,7 +1539,7 @@ impl RedisResultBackend {
 
     /// Remove task dependencies
     pub async fn remove_task_dependencies(&mut self, parent_id: Uuid) -> Result<()> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = format!("{}deps:{}", self.key_prefix, parent_id);
         let _: () = conn.del(&key).await?;
         Ok(())
@@ -1378,7 +1589,7 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn get_connection_info(&mut self) -> Result<String> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let info: String = redis::cmd("INFO").query_async(&mut conn).await?;
         Ok(info)
     }
@@ -1741,7 +1952,7 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn archive_result(&mut self, task_id: Uuid, archive_ttl: Duration) -> Result<()> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
 
         let source_key = format!("{}task-meta-{}", self.key_prefix, task_id);
         let archive_key = format!("{}archive:task-meta-{}", self.key_prefix, task_id);
@@ -1763,7 +1974,7 @@ impl RedisResultBackend {
 
     /// Retrieve an archived task result
     pub async fn get_archived_result(&mut self, task_id: Uuid) -> Result<Option<TaskMeta>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let archive_key = format!("{}archive:task-meta-{}", self.key_prefix, task_id);
 
         let data: Option<String> = conn.get(&archive_key).await?;
@@ -1805,7 +2016,7 @@ impl RedisResultBackend {
     /// # Returns
     /// Connection pool statistics
     pub async fn get_pool_stats(&self) -> PoolStats {
-        let is_connected = match self.client.get_multiplexed_async_connection().await {
+        let is_connected = match self.connection().await {
             Ok(mut conn) => {
                 let pong: std::result::Result<String, _> =
                     redis::cmd("PING").query_async(&mut conn).await;

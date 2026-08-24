@@ -2,10 +2,8 @@
 
 use celers_core::{CelersError, Result};
 use chrono::{DateTime, Utc};
-use oxisql_core::Connection;
 
 use crate::row_ext::RowExt;
-use crate::scheduling::validate_sql_identifier;
 use crate::PostgresBroker;
 
 // Query Optimization Methods
@@ -26,24 +24,24 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn explain_dequeue_query(&self) -> Result<String> {
-        validate_sql_identifier(&self.queue_name)?;
-
-        let explain_query = format!(
-            r#"
+        // The queue label is a bound predicate on the real `queue_name`
+        // column, not a table name: the statement below mirrors the shape of
+        // the claim sub-select in `sql::claim_one_sql()` so the plan it
+        // reports is the plan the hot path actually gets.
+        let explain_query = r#"
             EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
             SELECT id, task_name, payload, retry_count, max_retries, created_at
-            FROM {}
-            WHERE state = 'pending' AND scheduled_at <= NOW()
+            FROM celers_tasks
+            WHERE queue_name = $1
+              AND state = 'pending' AND scheduled_at <= NOW()
             ORDER BY priority DESC, created_at ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED
-            "#,
-            self.queue_name
-        );
+            "#;
 
         let rows = self
             .conn
-            .query(&explain_query, &[])
+            .query(explain_query, &[&self.queue_name])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
 
@@ -74,8 +72,10 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_query_stats(&self) -> Result<String> {
-        let query = format!(
-            r#"
+        // `pg_stat_user_tables` is per-TABLE, and the broker's tasks all live
+        // in `celers_tasks` regardless of their logical queue label — the
+        // previous `relname = '<queue_name>'` filter matched nothing.
+        let query = r#"
             SELECT
                 schemaname,
                 relname,
@@ -93,14 +93,12 @@ impl PostgresBroker {
                 last_analyze,
                 last_autoanalyze
             FROM pg_stat_user_tables
-            WHERE relname = '{}'
-            "#,
-            self.queue_name.trim_start_matches("public.")
-        );
+            WHERE relname = 'celers_tasks'
+            "#;
 
         let rows = self
             .conn
-            .query(&query, &[])
+            .query(query, &[])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get query stats: {}", e)))?;
         let row = rows.into_iter().next().ok_or_else(|| {

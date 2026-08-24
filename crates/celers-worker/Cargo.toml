@@ -28,7 +28,6 @@ chrono = { workspace = true }
 rand = { workspace = true }
 crossbeam-deque = { workspace = true }
 num_cpus = { workspace = true }
-libc = { workspace = true }
 redis = { workspace = true, optional = true }
 oxisql-core = { workspace = true, optional = true }
 oxisql-postgres = { workspace = true, optional = true }
@@ -37,6 +36,15 @@ rustls = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 
+# `libc` is referenced exclusively from Unix-gated code: `sysinfo.rs`
+# (getrusage/sysctlbyname/getloadavg), `cpu_affinity.rs`
+# (sched_setaffinity/sched_getaffinity) and the `rlimit` bridge in
+# `sandbox.rs`. Declaring it per-target keeps it out of Windows and wasm
+# builds entirely instead of compiling and linking an FFI crate that nothing
+# on those targets can call.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [features]
 default = []
 metrics = ["celers-metrics"]
@@ -44,5 +52,13 @@ canvas = ["celers-canvas"]
 workflows = ["canvas", "celers-backend-redis"]
 redis = ["dep:redis"]
 postgres = ["dep:oxisql-core", "dep:oxisql-postgres", "dep:oxitls", "dep:rustls", "dep:url", "dep:anyhow"]
+# Opt-in, off by default: lets `Sandbox::enforce_process_limits` apply real
+# `setrlimit` limits on Unix. Without it the sandbox reports the control as
+# unavailable rather than silently ignoring it.
+rlimit = []
 
 [dev-dependencies]
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which is what
+# lets the timeout, shutdown-grace and TTL-sweep tests assert real behaviour
+# without sleeping. Test-only: it is inert unless a test pauses the clock.
+tokio = { workspace = true, features = ["test-util"] }

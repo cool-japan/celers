@@ -109,16 +109,25 @@ impl CelersError {
         matches!(self, CelersError::InvalidStateTransition { .. })
     }
 
-    /// Check if this is a retryable error
+    /// Check if this *transport-level* error is worth retrying
     ///
-    /// Returns true for broker errors and IO errors, which are typically transient.
-    /// Returns false for serialization, configuration, and state transition errors.
+    /// Returns `true` for broker, IO and timeout errors: transient conditions
+    /// where the same operation may well succeed on a later attempt.
+    ///
+    /// Returns `false` for everything else, including
+    /// [`CelersError::TaskExecution`]. A task failing in user code is not a
+    /// transport problem — retrying it blindly turns a deterministic bug or bad
+    /// input into an infinite retry loop. Whether *that* failure should be
+    /// retried is decided by
+    /// [`ExceptionPolicy`](crate::exception::ExceptionPolicy) /
+    /// [`RetryStrategy`](crate::retry::RetryStrategy), which classify the actual
+    /// exception.
     #[inline]
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         matches!(
             self,
-            CelersError::Broker(_) | CelersError::Io(_) | CelersError::TaskExecution(_)
+            CelersError::Broker(_) | CelersError::Io(_) | CelersError::Timeout(_)
         )
     }
 
@@ -189,7 +198,9 @@ mod tests {
         let err = CelersError::TaskExecution("panic occurred".to_string());
         assert!(err.is_task_execution());
         assert!(!err.is_task_not_found());
-        assert!(err.is_retryable()); // Task execution errors are retryable
+        // User-code failures are NOT transport-retryable: retryability there is
+        // decided by ExceptionPolicy / RetryStrategy, not by the error type.
+        assert!(!err.is_retryable());
         assert_eq!(err.category(), "task_execution");
     }
 
@@ -235,14 +246,16 @@ mod tests {
 
     #[test]
     fn test_is_retryable_logic() {
-        // Retryable errors
+        // Retryable errors: transient transport-level conditions.
         assert!(CelersError::Broker("timeout".to_string()).is_retryable());
-        assert!(CelersError::TaskExecution("temporary failure".to_string()).is_retryable());
         assert!(CelersError::from(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
             "connection aborted"
         ))
         .is_retryable());
+        // Regression: Timeout is the canonical transient failure in a task
+        // queue and used to be classified non-retryable.
+        assert!(CelersError::Timeout("deadline exceeded".to_string()).is_retryable());
 
         // Non-retryable errors
         assert!(!CelersError::Serialization("bad format".to_string()).is_retryable());
@@ -252,5 +265,8 @@ mod tests {
             to: "b".to_string()
         }
         .is_retryable());
+        // Regression: a poison task would otherwise be retried forever by any
+        // caller trusting this classifier.
+        assert!(!CelersError::TaskExecution("deterministic bug".to_string()).is_retryable());
     }
 }

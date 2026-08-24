@@ -1,10 +1,12 @@
 //! Advanced middleware implementations.
 
 use async_trait::async_trait;
+use celers_protocol::extensions::MessageExt;
 use celers_protocol::Message;
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
+use crate::middleware::{effective_priority, effective_retries};
 use crate::{BrokerError, MessageMiddleware, Priority, Result};
 
 /// Batching middleware for automatic message batching
@@ -77,6 +79,30 @@ impl MessageMiddleware for BatchingMiddleware {
     }
 }
 
+/// A pluggable destination for [`AuditMiddleware`] entries.
+///
+/// By default `AuditMiddleware` only stamps its audit entry into the
+/// message's own headers (`audit-publish` / `audit-consume`), which is
+/// visible to - and mutable by - any downstream code that also touches the
+/// message, and is lost once the message is acknowledged. That is adequate
+/// for local debugging, but is not a tamper-resistant audit trail. Provide
+/// a sink via [`AuditMiddleware::with_sink`] to *also* forward every entry
+/// to a real, durable destination (a log aggregator, an audit table, an
+/// event stream, ...).
+pub trait AuditSink: Send + Sync {
+    /// Record one already-formatted audit entry.
+    fn record(&self, entry: &str);
+}
+
+impl<F> AuditSink for F
+where
+    F: Fn(&str) + Send + Sync,
+{
+    fn record(&self, entry: &str) {
+        (self)(entry)
+    }
+}
+
 /// Audit middleware for comprehensive audit logging
 ///
 /// Logs all message operations for audit trails and compliance.
@@ -89,9 +115,33 @@ impl MessageMiddleware for BatchingMiddleware {
 /// let middleware = AuditMiddleware::new(true);
 /// assert_eq!(middleware.name(), "audit");
 /// ```
-#[derive(Debug, Clone)]
+///
+/// Header stamping alone is visible to (and mutable by) any downstream
+/// code that also touches the message. Attach a real destination with
+/// [`AuditMiddleware::with_sink`] for a durable, tamper-resistant trail:
+///
+/// ```
+/// use celers_kombu::AuditMiddleware;
+/// use std::sync::{Arc, Mutex};
+///
+/// let log = Arc::new(Mutex::new(Vec::<String>::new()));
+/// let log_for_sink = log.clone();
+/// let middleware = AuditMiddleware::new(true)
+///     .with_sink(move |entry: &str| log_for_sink.lock().unwrap().push(entry.to_string()));
+/// ```
+#[derive(Clone)]
 pub struct AuditMiddleware {
     log_body: bool,
+    sink: Option<std::sync::Arc<dyn AuditSink>>,
+}
+
+impl std::fmt::Debug for AuditMiddleware {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditMiddleware")
+            .field("log_body", &self.log_body)
+            .field("has_sink", &self.sink.is_some())
+            .finish()
+    }
 }
 
 impl AuditMiddleware {
@@ -101,7 +151,10 @@ impl AuditMiddleware {
     ///
     /// * `log_body` - Whether to include message body in audit logs
     pub fn new(log_body: bool) -> Self {
-        Self { log_body }
+        Self {
+            log_body,
+            sink: None,
+        }
     }
 
     /// Create audit middleware with body logging enabled
@@ -112,6 +165,15 @@ impl AuditMiddleware {
     /// Create audit middleware without body logging
     pub fn without_body_logging() -> Self {
         Self::new(false)
+    }
+
+    /// Attach a sink that receives a copy of every audit entry in addition
+    /// to (not instead of) the existing header stamping. Use this to
+    /// deliver audit records to a real destination rather than relying
+    /// solely on the message's own (mutable, in-band, ephemeral) headers.
+    pub fn with_sink(mut self, sink: impl AuditSink + 'static) -> Self {
+        self.sink = Some(std::sync::Arc::new(sink));
+        self
     }
 
     fn create_audit_entry(&self, message: &Message, operation: &str) -> String {
@@ -142,11 +204,19 @@ impl MessageMiddleware for AuditMiddleware {
     async fn before_publish(&self, message: &mut Message) -> Result<()> {
         let audit_entry = self.create_audit_entry(message, "PUBLISH");
 
-        // In production, this would be sent to an audit logging system
-        message
-            .headers
-            .extra
-            .insert("audit-publish".to_string(), serde_json::json!(audit_entry));
+        // Always stamp the entry into the message's own headers (visible
+        // to any downstream code that inspects it, but mutable and not
+        // durable beyond the message's own lifetime)...
+        message.headers.extra.insert(
+            "audit-publish".to_string(),
+            serde_json::json!(audit_entry.clone()),
+        );
+
+        // ...and, if a sink was configured, also forward it to a real,
+        // tamper-resistant destination.
+        if let Some(ref sink) = self.sink {
+            sink.record(&audit_entry);
+        }
 
         // Add audit ID
         let audit_id = uuid::Uuid::new_v4().to_string();
@@ -161,11 +231,14 @@ impl MessageMiddleware for AuditMiddleware {
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
         let audit_entry = self.create_audit_entry(message, "CONSUME");
 
-        // In production, this would be sent to an audit logging system
-        message
-            .headers
-            .extra
-            .insert("audit-consume".to_string(), serde_json::json!(audit_entry));
+        message.headers.extra.insert(
+            "audit-consume".to_string(),
+            serde_json::json!(audit_entry.clone()),
+        );
+
+        if let Some(ref sink) = self.sink {
+            sink.record(&audit_entry);
+        }
 
         Ok(())
     }
@@ -371,12 +444,13 @@ impl RoutingKeyMiddleware {
     /// Create a routing key from task name with priority
     pub fn from_task_and_priority() -> Self {
         Self::new(|msg| {
-            let priority = msg
-                .headers
-                .extra
-                .get("priority")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            // Prefer the typed `properties.priority` field - the one
+            // actually populated by `Message::with_priority` and the
+            // message builder - falling back to a legacy
+            // `headers.extra["priority"]` marker, matching
+            // `effective_priority`'s default-of-0 behaviour here for
+            // parity with the previous implementation when neither is set.
+            let priority = effective_priority(msg, 0);
             format!("tasks.{}.priority_{}", msg.headers.task, priority)
         })
     }
@@ -404,12 +478,59 @@ impl MessageMiddleware for RoutingKeyMiddleware {
     }
 }
 
-/// Idempotency middleware for ensuring exactly-once message processing
+/// Idempotency middleware for detecting - and, optionally, automatically
+/// dropping - repeated deliveries of the same message.
 ///
-/// This middleware tracks processed message IDs to prevent duplicate processing.
-/// Unlike DeduplicationMiddleware which only prevents duplicate publishing,
-/// IdempotencyMiddleware ensures that a message is processed only once even if
-/// it's delivered multiple times (e.g., due to network issues or retries).
+/// This middleware tracks processed message IDs to recognise duplicate
+/// deliveries. Unlike `DeduplicationMiddleware` which only prevents
+/// duplicate *publishing*, `IdempotencyMiddleware` recognises when a
+/// message is *delivered* more than once (e.g., due to network issues or
+/// broker-level redelivery after a lost ack).
+///
+/// # Detection-only by default
+///
+/// By default (`new`/`with_default_cache`), `after_consume` only stamps
+/// `x-already-processed` on the message and always returns `Ok`; it does
+/// not itself stop the message from being handed to your task handler.
+/// **Your consumer/worker is responsible for checking
+/// `x-already-processed` and skipping re-execution when it is `true`**,
+/// e.g. after calling `middleware.after_consume(&mut message).await`:
+///
+/// ```
+/// use celers_kombu::{IdempotencyMiddleware, MessageMiddleware};
+///
+/// fn should_skip(message: &celers_protocol::Message) -> bool {
+///     message
+///         .headers
+///         .extra
+///         .get("x-already-processed")
+///         .and_then(|v| v.as_bool())
+///         .unwrap_or(false)
+/// }
+///
+/// let middleware = IdempotencyMiddleware::new(10_000);
+/// assert_eq!(middleware.name(), "idempotency");
+/// // if !should_skip(&message) { run_task(&message).await; }
+/// ```
+///
+/// This is the default (rather than dropping automatically) so that
+/// installing `IdempotencyMiddleware` never silently changes existing
+/// delivery behaviour for callers who only want the detection signal.
+///
+/// # Automatic enforcement (opt-in)
+///
+/// Call [`Self::with_enforcement`] to make `after_consume` itself reject a
+/// repeat delivery with an `Err` that [`MessageMiddleware::is_drop_signal`]
+/// classifies as a designed drop (mirroring `DeduplicationMiddleware`), so
+/// [`crate::MiddlewareChain::process_after_consume`] /
+/// [`crate::MiddlewareConsumer::consume_with_middleware`] settle it as a
+/// drop rather than handing it to your task handler at all:
+///
+/// ```
+/// use celers_kombu::IdempotencyMiddleware;
+///
+/// let middleware = IdempotencyMiddleware::new(10_000).with_enforcement(true);
+/// ```
 ///
 /// # Examples
 ///
@@ -420,18 +541,32 @@ impl MessageMiddleware for RoutingKeyMiddleware {
 /// assert_eq!(middleware.name(), "idempotency");
 /// ```
 pub struct IdempotencyMiddleware {
-    processed_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    processed_ids: std::sync::Arc<std::sync::Mutex<IdempotencyState>>,
     max_cache_size: usize,
+    enforce: bool,
+}
+
+/// Internal idempotency cache state: a
+/// [`HashSet`](std::collections::HashSet) for O(1) membership checks
+/// paired with a [`VecDeque`](std::collections::VecDeque) recording true
+/// insertion order, so eviction removes the actual oldest entries instead
+/// of whatever a `HashSet`'s unspecified iteration order happens to
+/// produce first.
+struct IdempotencyState {
+    seen: std::collections::HashSet<String>,
+    order: VecDeque<String>,
 }
 
 impl IdempotencyMiddleware {
     /// Create a new idempotency middleware with a custom cache size
     pub fn new(max_cache_size: usize) -> Self {
         Self {
-            processed_ids: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
+            processed_ids: std::sync::Arc::new(std::sync::Mutex::new(IdempotencyState {
+                seen: std::collections::HashSet::new(),
+                order: VecDeque::new(),
+            })),
             max_cache_size,
+            enforce: false,
         }
     }
 
@@ -440,36 +575,54 @@ impl IdempotencyMiddleware {
         Self::new(10000)
     }
 
+    /// Enable (or disable) automatic enforcement: when `true`,
+    /// `after_consume` rejects a repeat delivery outright (see the type
+    /// docs' "Automatic enforcement" section) instead of only stamping
+    /// `x-already-processed` and letting it through. Defaults to `false`.
+    pub fn with_enforcement(mut self, enforce: bool) -> Self {
+        self.enforce = enforce;
+        self
+    }
+
     /// Check if a message ID has been processed
     pub fn is_processed(&self, message_id: &str) -> bool {
         self.processed_ids
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .seen
             .contains(message_id)
     }
 
     /// Mark a message ID as processed
     pub fn mark_processed(&self, message_id: String) {
-        let mut cache = self.processed_ids.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.processed_ids.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Simple cache eviction: if we exceed max size, clear oldest 20%
-        if cache.len() >= self.max_cache_size {
-            let to_remove = self.max_cache_size / 5;
-            let ids_to_remove: Vec<String> = cache.iter().take(to_remove).cloned().collect();
-            for id in ids_to_remove {
-                cache.remove(&id);
+        // Cache eviction: if we're at capacity, evict the oldest 20% by
+        // true insertion order (a bare `HashSet` has no ordering, so
+        // evicting via its iteration order - the previous approach -
+        // removed arbitrary entries rather than the actual oldest ones).
+        if state.order.len() >= self.max_cache_size {
+            let to_remove = (self.max_cache_size / 5).max(1);
+            for _ in 0..to_remove {
+                match state.order.pop_front() {
+                    Some(oldest) => {
+                        state.seen.remove(&oldest);
+                    }
+                    None => break,
+                }
             }
         }
 
-        cache.insert(message_id);
+        if state.seen.insert(message_id.clone()) {
+            state.order.push_back(message_id);
+        }
     }
 
     /// Clear all processed message IDs
     pub fn clear(&self) {
-        self.processed_ids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let mut state = self.processed_ids.lock().unwrap_or_else(|e| e.into_inner());
+        state.seen.clear();
+        state.order.clear();
     }
 
     /// Get the number of tracked message IDs
@@ -477,6 +630,7 @@ impl IdempotencyMiddleware {
         self.processed_ids
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .seen
             .len()
     }
 }
@@ -512,6 +666,16 @@ impl MessageMiddleware for IdempotencyMiddleware {
                 .headers
                 .extra
                 .insert("x-already-processed".to_string(), serde_json::json!(true));
+
+            // Opt-in enforcement (see `Self::with_enforcement`): reject the
+            // repeat delivery outright rather than merely flagging it and
+            // relying on the caller to check `x-already-processed`.
+            if self.enforce {
+                return Err(BrokerError::OperationFailed(format!(
+                    "Message already processed (idempotency key: {})",
+                    idempotency_key
+                )));
+            }
         } else {
             // Mark as being processed
             self.mark_processed(idempotency_key.clone());
@@ -526,6 +690,15 @@ impl MessageMiddleware for IdempotencyMiddleware {
 
     fn name(&self) -> &str {
         "idempotency"
+    }
+
+    fn is_drop_signal(&self, _err: &BrokerError) -> bool {
+        // Under `with_enforcement(true)`, a repeat delivery is this
+        // middleware's designed "skip this message" signal (identical in
+        // spirit to `DeduplicationMiddleware`), not a processing failure -
+        // it must be settled as a drop rather than requeued, or every
+        // repeat delivery would loop forever hitting this same check.
+        self.enforce
     }
 }
 
@@ -597,13 +770,12 @@ impl MessageMiddleware for BackoffMiddleware {
     }
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
-        // Calculate and inject backoff delay based on retry count
-        let retry_count = message
-            .headers
-            .extra
-            .get("retries")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        // Calculate and inject backoff delay based on retry count. Prefer
+        // the typed `headers.retries` field - the one actually reserved
+        // for this purpose on the wire (see `effective_retries`) - falling
+        // back to a legacy `headers.extra["retries"]` marker so callers
+        // that only ever set it there keep working.
+        let retry_count = effective_retries(message);
 
         let backoff_delay = self.calculate_delay(retry_count);
 
@@ -633,6 +805,39 @@ impl MessageMiddleware for BackoffMiddleware {
 /// This middleware caches the results of message processing to avoid
 /// reprocessing identical messages. Useful for expensive operations that
 /// are idempotent (e.g., external API calls, database queries).
+///
+/// # This middleware does not populate the cache by itself
+///
+/// [`MessageMiddleware::after_consume`] runs *before* your task handler
+/// executes (there is no post-execution hook in this trait), so it has no
+/// result to cache yet - it can only check for and report an existing
+/// entry via [`Self::get_cached`] (surfaced as the `x-cache-hit` /
+/// `x-cached-result-size` headers). **Your consumer/worker must call
+/// [`Self::store_result`] itself once a task handler produces a result**,
+/// e.g.:
+///
+/// ```
+/// use celers_kombu::CachingMiddleware;
+/// use std::time::Duration;
+/// # fn run_task(_body: &[u8]) -> Vec<u8> { Vec::new() }
+///
+/// let middleware = CachingMiddleware::new(1000, Duration::from_secs(3600));
+/// let message = celers_protocol::Message::new(
+///     "my_task".to_string(),
+///     uuid::Uuid::new_v4(),
+///     b"args".to_vec(),
+/// );
+///
+/// let result = match middleware.get_cached(&message) {
+///     Some(cached) => cached,
+///     None => {
+///         let result = run_task(&message.body);
+///         middleware.store_result(&message, result.clone());
+///         result
+///     }
+/// };
+/// # let _ = result;
+/// ```
 ///
 /// # Examples
 ///
@@ -674,9 +879,23 @@ impl CachingMiddleware {
     }
 
     /// Generate cache key from message
+    ///
+    /// Keyed by task name plus a hash of the body, **not** the message ID.
+    /// The message ID is unique per message by construction, so keying on
+    /// it made a cache hit structurally impossible even when populated: no
+    /// two distinct messages could ever share a key. Keying on the task
+    /// name and body content means two *different* deliveries of "the same
+    /// call" (same task, same serialized arguments) - e.g. a republish
+    /// after a lost ack, or an explicit retry - correctly map to the same
+    /// cache entry.
     fn cache_key(&self, message: &Message) -> String {
-        // Use message ID and task name as cache key
-        format!("{}:{}", message.headers.id, message.headers.task)
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        message.body.hash(&mut hasher);
+        let body_hash = hasher.finish();
+        format!("{}:{:x}", message.headers.task, body_hash)
     }
 
     /// Check if a cached result exists and is still valid
@@ -780,9 +999,26 @@ impl MessageMiddleware for CachingMiddleware {
 #[derive(Clone)]
 pub struct BulkheadMiddleware {
     max_concurrent: usize,
-    permits: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Bounds how long an acquired permit can remain outstanding before it
+    /// is treated as abandoned and reclaimed. Permits are acquired in
+    /// `before_publish` and released in `after_consume`; if a producer and
+    /// a consumer run as different processes (the common Celery/Kombu
+    /// deployment shape) with different `BulkheadMiddleware` instances,
+    /// `release` for a given permit is never observed by the instance that
+    /// acquired it. Without a TTL, every publish would permanently consume
+    /// a slot and the bulkhead would lock up forever after
+    /// `max_concurrent` publishes. Sharing one instance (via `Clone`, which
+    /// shares the underlying `Arc`) between the publish and consume sides
+    /// of the *same* process still gets prompt, TTL-independent release.
+    permit_ttl: Duration,
+    permits: std::sync::Arc<std::sync::Mutex<HashMap<String, VecDeque<Instant>>>>,
     partition_fn: std::sync::Arc<dyn Fn(&Message) -> String + Send + Sync>,
 }
+
+/// Default permit TTL: generous enough to cover realistic end-to-end
+/// publish-to-consume latency, short enough that an abandoned permit
+/// (producer-only deployment) does not lock a partition out indefinitely.
+const DEFAULT_BULKHEAD_PERMIT_TTL: Duration = Duration::from_secs(300);
 
 impl BulkheadMiddleware {
     /// Create a new bulkhead middleware with max concurrent operations
@@ -793,6 +1029,7 @@ impl BulkheadMiddleware {
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             max_concurrent,
+            permit_ttl: DEFAULT_BULKHEAD_PERMIT_TTL,
             permits: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             partition_fn: std::sync::Arc::new(|msg| {
                 // Default: partition by task name
@@ -808,50 +1045,76 @@ impl BulkheadMiddleware {
     {
         Self {
             max_concurrent,
+            permit_ttl: DEFAULT_BULKHEAD_PERMIT_TTL,
             permits: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             partition_fn: std::sync::Arc::new(partition_fn),
         }
     }
 
-    /// Try to acquire a permit for the given partition
+    /// Override how long an acquired permit may remain outstanding before
+    /// it is reclaimed (see the field doc on [`Self`] for why this
+    /// exists). Defaults to 5 minutes.
+    pub fn with_permit_ttl(mut self, ttl: Duration) -> Self {
+        self.permit_ttl = ttl;
+        self
+    }
+
+    /// Try to acquire a permit for the given partition. Returns `false` if
+    /// the partition already has `max_concurrent` non-expired permits
+    /// outstanding.
     pub fn try_acquire(&self, partition: &str) -> bool {
         let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
-        let current = permits.entry(partition.to_string()).or_insert(0);
-        if *current < self.max_concurrent {
-            *current += 1;
+        let now = Instant::now();
+        let entry = permits.entry(partition.to_string()).or_default();
+        // Reclaim any permits that outlived the TTL before deciding
+        // whether there is room for a new one.
+        entry.retain(|acquired_at| now.duration_since(*acquired_at) < self.permit_ttl);
+
+        if entry.len() < self.max_concurrent {
+            entry.push_back(now);
             true
         } else {
             false
         }
     }
 
-    /// Release a permit for the given partition
+    /// Release the oldest outstanding permit for the given partition.
     pub fn release(&self, partition: &str) {
         let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(current) = permits.get_mut(partition) {
-            if *current > 0 {
-                *current -= 1;
+        if let Some(entry) = permits.get_mut(partition) {
+            entry.pop_front();
+            if entry.is_empty() {
+                // Bound the outer map: don't keep a permanent (empty)
+                // entry for every distinct partition string ever seen.
+                permits.remove(partition);
             }
         }
     }
 
-    /// Get current concurrent operations for a partition
+    /// Get current (non-expired) concurrent operations for a partition
     pub fn current_operations(&self, partition: &str) -> usize {
-        self.permits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(partition)
-            .copied()
-            .unwrap_or(0)
+        let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match permits.get_mut(partition) {
+            Some(entry) => {
+                entry.retain(|acquired_at| now.duration_since(*acquired_at) < self.permit_ttl);
+                entry.len()
+            }
+            None => 0,
+        }
     }
 
-    /// Get total concurrent operations across all partitions
+    /// Get total (non-expired) concurrent operations across all partitions
     pub fn total_operations(&self) -> usize {
-        self.permits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .sum()
+        let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let mut total = 0;
+        permits.retain(|_, entry| {
+            entry.retain(|acquired_at| now.duration_since(*acquired_at) < self.permit_ttl);
+            total += entry.len();
+            !entry.is_empty()
+        });
+        total
     }
 }
 
@@ -872,12 +1135,20 @@ impl MessageMiddleware for BulkheadMiddleware {
                 "x-bulkhead-current".to_string(),
                 serde_json::json!(self.max_concurrent),
             );
-        } else {
-            message.headers.extra.insert(
-                "x-bulkhead-partition".to_string(),
-                serde_json::json!(partition),
-            );
+            // Actually enforce the limit: previously this branch only
+            // stamped a "rejected" marker and still returned `Ok(())`, so
+            // the message was published regardless and the concurrency
+            // limit was never enforced.
+            return Err(BrokerError::OperationFailed(format!(
+                "Bulkhead limit reached for partition '{}': {} concurrent operations already in flight (max {})",
+                partition, self.max_concurrent, self.max_concurrent
+            )));
         }
+
+        message.headers.extra.insert(
+            "x-bulkhead-partition".to_string(),
+            serde_json::json!(partition),
+        );
         Ok(())
     }
 
@@ -983,18 +1254,33 @@ impl PriorityBoostMiddleware {
             }
         }
 
-        // Check message age (using timestamp if available)
+        // Check message age. Prefer an explicit `headers.extra["timestamp"]`
+        // override (epoch seconds) when present - callers that stamp their
+        // own timestamp for testing or custom clocking get exactly the
+        // behaviour they asked for - and otherwise fall back to the
+        // message's real `created_at` (via `get_age_seconds`), which is
+        // always populated by `Message::new` and requires no special
+        // wiring. Previously only the (never-populated-in-practice)
+        // `timestamp` header was read, so this branch was effectively dead
+        // in real deployments.
         if let Some(age_threshold) = self.age_threshold {
-            if let Some(timestamp_value) = message.headers.extra.get("timestamp") {
-                if let Some(timestamp_secs) = timestamp_value.as_f64() {
-                    let msg_age = std::time::SystemTime::now()
+            let msg_age_secs = message
+                .headers
+                .extra
+                .get("timestamp")
+                .and_then(|v| v.as_f64())
+                .map(|timestamp_secs| {
+                    let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .expect("SystemTime should be after UNIX_EPOCH")
-                        .as_secs_f64()
-                        - timestamp_secs;
-                    if msg_age > age_threshold.as_secs_f64() {
-                        priority = priority.max(self.age_boost_priority);
-                    }
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0);
+                    now_secs - timestamp_secs
+                })
+                .or_else(|| message.get_age_seconds().map(|secs| secs as f64));
+
+            if let Some(msg_age) = msg_age_secs {
+                if msg_age > age_threshold.as_secs_f64() {
+                    priority = priority.max(self.age_boost_priority);
                 }
             }
         }
@@ -1012,18 +1298,21 @@ impl Default for PriorityBoostMiddleware {
 #[async_trait]
 impl MessageMiddleware for PriorityBoostMiddleware {
     async fn before_publish(&self, message: &mut Message) -> Result<()> {
-        // Get current priority from message headers
-        let current_priority = message
-            .headers
-            .extra
-            .get("priority")
-            .and_then(|v| v.as_u64())
-            .map(|p| Priority::from_u8(p as u8))
-            .unwrap_or(Priority::Normal);
+        // Get current priority: prefer the typed `properties.priority`
+        // field (populated by `Message::with_priority` and the message
+        // builder - the field real priority-queue consumers read) falling
+        // back to a legacy `headers.extra["priority"]` marker.
+        let current_priority =
+            Priority::from_u8(effective_priority(message, Priority::Normal.as_u8()));
 
         let boosted_priority = self.calculate_priority(message, current_priority);
 
         if boosted_priority != current_priority {
+            // Write the boosted value back to both the typed field (so
+            // real priority-queue / broker code observes it) and the
+            // legacy header (for backward compatibility with anything
+            // still reading it there).
+            message.properties.priority = Some(boosted_priority.as_u8());
             message.headers.extra.insert(
                 "priority".to_string(),
                 serde_json::json!(boosted_priority.as_u8()),
@@ -1047,5 +1336,304 @@ impl MessageMiddleware for PriorityBoostMiddleware {
 
     fn name(&self) -> &str {
         "priority_boost"
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    // -------------------------------------------------------------------
+    // idx114 / idx125: priority and age must be read from the real fields.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn routing_key_from_task_and_priority_prefers_typed_priority_field() {
+        let middleware = RoutingKeyMiddleware::from_task_and_priority();
+        let mut msg = Message::new("my_task".to_string(), Uuid::new_v4(), vec![]);
+        // Only the typed field is set (not the legacy `headers.extra`
+        // marker); the routing key must reflect it rather than silently
+        // falling back to 0.
+        msg.properties.priority = Some(9);
+
+        middleware.before_publish(&mut msg).await.unwrap();
+
+        let routing_key = msg
+            .headers
+            .extra
+            .get("x-routing-key")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(routing_key, "tasks.my_task.priority_9");
+    }
+
+    #[tokio::test]
+    async fn priority_boost_before_publish_reads_and_writes_typed_priority() {
+        let middleware = PriorityBoostMiddleware::new().with_retry_boost(1, Priority::Highest);
+        let mut msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        msg.properties.priority = Some(Priority::Normal.as_u8());
+        msg.headers.retries = Some(5);
+
+        middleware.before_publish(&mut msg).await.unwrap();
+
+        assert_eq!(msg.properties.priority, Some(Priority::Highest.as_u8()));
+        assert!(msg.headers.extra.contains_key("x-priority-boosted"));
+    }
+
+    #[test]
+    fn priority_boost_age_boost_does_not_fire_for_a_fresh_message() {
+        // No `headers.extra["timestamp"]` override is set: the middleware
+        // falls back to the message's real creation time
+        // (`get_age_seconds`). A freshly constructed message is ~0 seconds
+        // old, so a generous threshold must not trigger the boost (and,
+        // importantly, the new fallback path must not panic/error).
+        let middleware = PriorityBoostMiddleware::new()
+            .with_age_boost(Duration::from_secs(3600), Priority::Highest);
+        let msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+
+        let boosted = middleware.calculate_priority(&msg, Priority::Normal);
+        assert_eq!(boosted, Priority::Normal);
+    }
+
+    #[tokio::test]
+    async fn priority_boost_age_boost_fires_once_message_actually_ages() {
+        // Real-clock based (no `headers.extra["timestamp"]` override, and
+        // `get_age_seconds` is backed by `chrono::Utc::now()`, which no
+        // mock clock in this dependency graph can fast-forward), so this
+        // waits for a real, short elapsed time rather than faking one.
+        // `get_age_seconds` truncates to whole seconds, hence the >1s wait
+        // against a threshold just below it.
+        let middleware = PriorityBoostMiddleware::new()
+            .with_age_boost(Duration::from_millis(500), Priority::Highest);
+        let msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let boosted = middleware.calculate_priority(&msg, Priority::Normal);
+        assert_eq!(boosted, Priority::Highest);
+    }
+
+    // -------------------------------------------------------------------
+    // idx121: BackoffMiddleware must read the typed retries field.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn backoff_middleware_reads_typed_retries_field() {
+        let middleware =
+            BackoffMiddleware::new(Duration::from_secs(1), Duration::from_secs(60), 2.0);
+        let mut msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        msg.headers.retries = Some(3);
+
+        middleware.after_consume(&mut msg).await.unwrap();
+
+        let delay_ms = msg
+            .headers
+            .extra
+            .get("x-backoff-delay")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        // base=1s, multiplier=2.0, retries=3 -> 8s plus 0-25% jitter.
+        assert!((8000..=10000).contains(&delay_ms));
+    }
+
+    // -------------------------------------------------------------------
+    // idx120: BulkheadMiddleware must actually enforce its limit and must
+    // not leak permits forever when only the publish side ever runs.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bulkhead_rejects_beyond_max_concurrent() {
+        let bulkhead = BulkheadMiddleware::new(2);
+        let mut msg1 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        let mut msg2 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        let mut msg3 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+
+        assert!(bulkhead.before_publish(&mut msg1).await.is_ok());
+        assert!(bulkhead.before_publish(&mut msg2).await.is_ok());
+        // Third concurrent publish for the same partition must be
+        // rejected, not silently allowed through.
+        let result = bulkhead.before_publish(&mut msg3).await;
+        assert!(result.is_err());
+        assert_eq!(
+            msg3.headers.extra.get("x-bulkhead-rejected"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn bulkhead_reclaims_expired_permits_instead_of_locking_up_forever() {
+        // A producer-only instance (never sees `after_consume`, e.g.
+        // because the consumer runs in a different process with its own
+        // `BulkheadMiddleware`) must not stay permanently rejecting once
+        // permits age out.
+        let bulkhead = BulkheadMiddleware::new(1).with_permit_ttl(Duration::from_millis(1));
+        let mut msg1 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        assert!(bulkhead.before_publish(&mut msg1).await.is_ok());
+
+        // Immediately over the limit (permit not yet expired).
+        let mut msg2 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        assert!(bulkhead.before_publish(&mut msg2).await.is_err());
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The first permit has now expired and must be reclaimed.
+        let mut msg3 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        assert!(bulkhead.before_publish(&mut msg3).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bulkhead_release_frees_a_slot_immediately() {
+        let bulkhead = BulkheadMiddleware::new(1);
+        let mut msg1 = Message::new("task".to_string(), Uuid::new_v4(), vec![]);
+        assert!(bulkhead.before_publish(&mut msg1).await.is_ok());
+
+        // Same-partition second publish is rejected while the first is
+        // still outstanding.
+        let mut msg2 = Message::new("task".to_string(), Uuid::new_v4(), vec![]);
+        assert!(bulkhead.before_publish(&mut msg2).await.is_err());
+
+        // Releasing (as `after_consume` does) frees the slot right away,
+        // with no need to wait for the TTL.
+        bulkhead.after_consume(&mut msg1).await.unwrap();
+        let mut msg3 = Message::new("task".to_string(), Uuid::new_v4(), vec![]);
+        assert!(bulkhead.before_publish(&mut msg3).await.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // idx141: CachingMiddleware's cache key must be able to hit at all.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn caching_middleware_key_matches_across_distinct_message_ids() {
+        let middleware = CachingMiddleware::with_defaults();
+        let body = b"same args".to_vec();
+
+        let msg_a = Message::new("my_task".to_string(), Uuid::new_v4(), body.clone());
+        let msg_b = Message::new("my_task".to_string(), Uuid::new_v4(), body);
+
+        // Two distinct messages (different IDs) representing "the same
+        // call" (same task, same body) must be able to share a cache
+        // entry - keying on the message ID (unique per message by
+        // construction) made this structurally impossible before.
+        middleware.store_result(&msg_a, b"cached".to_vec());
+        assert_eq!(middleware.get_cached(&msg_b), Some(b"cached".to_vec()));
+    }
+
+    #[test]
+    fn caching_middleware_key_differs_for_different_bodies() {
+        let middleware = CachingMiddleware::with_defaults();
+        let msg_a = Message::new("my_task".to_string(), Uuid::new_v4(), b"args1".to_vec());
+        let msg_b = Message::new("my_task".to_string(), Uuid::new_v4(), b"args2".to_vec());
+
+        middleware.store_result(&msg_a, b"cached".to_vec());
+        assert_eq!(middleware.get_cached(&msg_b), None);
+    }
+
+    // -------------------------------------------------------------------
+    // idx141: AuditMiddleware sink must receive entries alongside headers.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn audit_middleware_sink_receives_entries() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log_for_sink = log.clone();
+        let middleware = AuditMiddleware::new(false).with_sink(move |entry: &str| {
+            log_for_sink.lock().unwrap().push(entry.to_string());
+        });
+
+        let mut msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        middleware.before_publish(&mut msg).await.unwrap();
+        middleware.after_consume(&mut msg).await.unwrap();
+
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("PUBLISH"));
+        assert!(entries[1].contains("CONSUME"));
+
+        // Header stamping must still happen unchanged (existing
+        // contract), sink is additive.
+        assert!(msg.headers.extra.contains_key("audit-publish"));
+        assert!(msg.headers.extra.contains_key("audit-consume"));
+    }
+
+    // -------------------------------------------------------------------
+    // idx141: IdempotencyMiddleware must be able to actually enforce
+    // (not just detect and flag) when opted in, while leaving the default
+    // (detection-only) behaviour completely unchanged for existing callers.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn idempotency_default_behaviour_lets_duplicates_through_unchanged() {
+        let middleware = IdempotencyMiddleware::new(1000);
+        let task_id = Uuid::new_v4();
+
+        let mut msg1 = Message::new("t".to_string(), task_id, vec![]);
+        assert!(middleware.after_consume(&mut msg1).await.is_ok());
+
+        // Second delivery of the same message: still `Ok` by default - the
+        // caller opted into detection only, not enforcement.
+        let mut msg2 = Message::new("t".to_string(), task_id, vec![]);
+        assert!(middleware.after_consume(&mut msg2).await.is_ok());
+        assert_eq!(
+            msg2.headers.extra.get("x-already-processed"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_with_enforcement_rejects_repeat_delivery() {
+        let middleware = IdempotencyMiddleware::new(1000).with_enforcement(true);
+        let task_id = Uuid::new_v4();
+
+        let mut msg1 = Message::new("t".to_string(), task_id, vec![]);
+        assert!(middleware.after_consume(&mut msg1).await.is_ok());
+
+        // Second delivery of the same message must now be rejected.
+        let mut msg2 = Message::new("t".to_string(), task_id, vec![]);
+        assert!(middleware.after_consume(&mut msg2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn idempotency_with_enforcement_settles_repeat_as_a_drop_not_a_failure() {
+        let middleware = IdempotencyMiddleware::new(1000).with_enforcement(true);
+        let chain = crate::MiddlewareChain::new().with_middleware(Box::new(middleware));
+        let task_id = Uuid::new_v4();
+
+        let mut msg1 = Message::new("t".to_string(), task_id, vec![]);
+        assert!(chain
+            .process_after_consume(&mut msg1)
+            .await
+            .unwrap()
+            .is_accept());
+
+        // The repeat delivery must be classified as a designed drop (via
+        // `is_drop_signal`), so `MiddlewareConsumer::consume_with_middleware`
+        // settles it instead of requeuing it forever.
+        let mut msg2 = Message::new("t".to_string(), task_id, vec![]);
+        let decision = chain.process_after_consume(&mut msg2).await.unwrap();
+        assert!(decision.is_drop());
+    }
+
+    // -------------------------------------------------------------------
+    // idx152: IdempotencyMiddleware must evict the true oldest entries.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn idempotency_middleware_evicts_oldest_first() {
+        let middleware = IdempotencyMiddleware::new(5);
+        for i in 0..5 {
+            middleware.mark_processed(format!("id-{i}"));
+        }
+        assert_eq!(middleware.cache_size(), 5);
+
+        // Cache is now full; marking one more must evict the oldest 20%
+        // (max(5/5, 1) = 1 entry), i.e. "id-0", not an arbitrary one.
+        middleware.mark_processed("id-5".to_string());
+        assert!(!middleware.is_processed("id-0"));
+        assert!(middleware.is_processed("id-1"));
+        assert!(middleware.is_processed("id-5"));
     }
 }

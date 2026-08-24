@@ -13,7 +13,7 @@ MySQL database broker implementation for CeleRS - a high-performance Celery-comp
 - **Batch Operations**: High-throughput batch enqueue/dequeue/ack operations
 - **Queue Control**: Pause/resume queue processing at runtime
 - **Task Inspection**: Query task status, statistics, and worker assignments
-- **Result Storage**: Store and retrieve task execution results (not yet backed by a shipped migration — see TODO.md's schema-drift audit)
+- **Result Storage**: Store and retrieve task execution results (`celers_task_results`, migration `010_task_results.sql`)
 - **Worker Tracking**: Monitor which workers are processing which tasks
 - **Health Monitoring**: Database health checks and table size monitoring
 - **Maintenance Tools**: Task archiving, stuck task recovery, and selective purging
@@ -21,8 +21,46 @@ MySQL database broker implementation for CeleRS - a high-performance Celery-comp
 
 ## Requirements
 
-- **MySQL 8.0+** (requires `FOR UPDATE SKIP LOCKED` support)
+- **MySQL 8.0.1 or newer**, or **MariaDB 10.6 or newer**.
+
+  Every dequeue path uses `FOR UPDATE ... SKIP LOCKED`, which was introduced
+  in MySQL 8.0.1 and MariaDB 10.6. It does not exist in MySQL 5.7 or in any
+  earlier MariaDB release.
+
+  The server version is probed once when the broker connects
+  (`MysqlBroker::new`, `with_queue`, `with_config`,
+  `with_circuit_breaker_config`). An unsupported server is rejected there with
+  a `CelersError::Configuration` naming the required version, rather than
+  producing an opaque parse error on every dequeue. Version strings the probe
+  cannot recognise (proxies such as ProxySQL or RDS Proxy, and forks) are
+  logged and accepted.
+
 - Rust 2021 edition
+
+## Logical queues
+
+`MysqlBroker::with_queue(url, "payments")` scopes the broker to a logical
+queue, backed by the indexed `celers_tasks.queue_name` column. Enqueue,
+dequeue, `queue_size` and `get_statistics` are all queue-scoped, so several
+brokers can share one database without seeing each other's tasks.
+
+Operator-facing and destructive helpers are deliberately **database-wide**,
+not queue-scoped: `purge_all`, `purge_by_state`, `purge_by_task_name`,
+`archive_completed_tasks`, `recover_stuck_tasks`, `list_tasks`,
+`count_by_task_name`, and the DLQ helpers.
+
+## Testing against a real server
+
+The unit tests run with no database. To additionally exercise the integration
+suite, point `CELERS_TEST_MYSQL_URL` at a MySQL 8 / MariaDB 10.6 instance:
+
+```bash
+CELERS_TEST_MYSQL_URL=mysql://root:password@127.0.0.1:3306/celers_test \
+    cargo nextest run -p celers-broker-sql --all-features
+```
+
+Without the variable those tests return immediately, so the suite stays green
+on machines with no server.
 
 ## Installation
 

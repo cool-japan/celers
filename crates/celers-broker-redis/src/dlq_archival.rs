@@ -244,7 +244,28 @@ impl DLQArchivalManager {
         })
     }
 
-    /// Archive tasks older than the specified age (in seconds)
+    /// Archive tasks older than the specified age (in seconds).
+    ///
+    /// A task's age is measured from `task.metadata.updated_at` — the
+    /// closest real, non-fabricated timestamp available on a DLQ entry.
+    /// (`RedisBroker::reject()` currently pushes the task's existing
+    /// serialized handle onto the DLQ verbatim, without stamping a dedicated
+    /// "entered DLQ" timestamp — see the followup recorded against this
+    /// function for the ideal fix. Registering
+    /// [`crate::hooks::TimestampEnrichmentHook`] on the enqueue path keeps
+    /// `updated_at` fresh, which improves this proxy's accuracy.) Tasks
+    /// younger than `min_age_secs` are left untouched in the DLQ.
+    ///
+    /// Archiving one task and removing it from the DLQ are two separate
+    /// Redis calls and cannot be made atomic without a DLQ-side Lua script
+    /// (out of scope for a per-backend archiver that may write to the
+    /// filesystem or an external HTTP store). Instead this loop is made
+    /// *idempotent* and *fault-tolerant*: `archive_id` is derived
+    /// deterministically from the task id and its DLQ-entry timestamp, so
+    /// re-archiving the same entry after a partial failure overwrites the
+    /// same backend record rather than creating a duplicate, and a failure
+    /// on any single entry is logged and skipped rather than aborting the
+    /// whole batch (leaving already-processed entries duplicated or lost).
     pub async fn archive_old_tasks(&self, min_age_secs: u64) -> Result<usize> {
         let mut conn = self
             .client
@@ -260,30 +281,65 @@ impl DLQArchivalManager {
 
         let cutoff_timestamp = chrono::Utc::now().timestamp() - min_age_secs as i64;
         let mut archived_count = 0;
+        let mut error_count = 0;
 
         for task_data in tasks {
-            if let Ok(task) = serde_json::from_str::<SerializedTask>(&task_data) {
-                // In a real implementation, we'd check task timestamp
-                // For now, archive all tasks
-                let archive_id = self.generate_archive_id();
-                let archived_task = ArchivedTask {
-                    task: task.clone(),
-                    archived_at: chrono::Utc::now().timestamp(),
-                    archive_id: archive_id.clone(),
-                    compressed_size: None,
-                    dlq_timestamp: Some(cutoff_timestamp),
-                };
+            let task = match serde_json::from_str::<SerializedTask>(&task_data) {
+                Ok(task) => task,
+                Err(e) => {
+                    warn!("Skipping unparseable DLQ entry during archival: {}", e);
+                    continue;
+                }
+            };
 
-                // Store to backend
-                self.store_to_backend(&archived_task).await?;
-
-                // Remove from DLQ
-                let _removed: i64 = conn.lrem(&self.dlq_key, 1, &task_data).await.map_err(|e| {
-                    CelersError::Broker(format!("Failed to remove from DLQ: {}", e))
-                })?;
-
-                archived_count += 1;
+            // The task's own `updated_at` is the best real signal available
+            // for "when did this enter the DLQ" (see the doc comment above).
+            let entry_timestamp = task.metadata.updated_at.timestamp();
+            if entry_timestamp > cutoff_timestamp {
+                // Too young: leave it in the DLQ for a future run.
+                continue;
             }
+
+            let archive_id = self.deterministic_archive_id(&task, entry_timestamp);
+            let archived_task = ArchivedTask {
+                task: task.clone(),
+                archived_at: chrono::Utc::now().timestamp(),
+                archive_id: archive_id.clone(),
+                compressed_size: None,
+                dlq_timestamp: Some(entry_timestamp),
+            };
+
+            // Store to backend
+            if let Err(e) = self.store_to_backend(&archived_task).await {
+                warn!(
+                    "Failed to archive DLQ task {} (archive_id {}): {} — leaving it in the DLQ, will retry next run",
+                    task.metadata.id, archive_id, e
+                );
+                error_count += 1;
+                continue;
+            }
+
+            // Remove from DLQ. If this fails, the entry stays in the DLQ but
+            // the archive record is already written under a deterministic
+            // `archive_id`, so the next run's `store_to_backend` overwrites
+            // the same record instead of creating a duplicate archive.
+            match conn.lrem::<_, _, i64>(&self.dlq_key, 1, &task_data).await {
+                Ok(_) => archived_count += 1,
+                Err(e) => {
+                    warn!(
+                        "Archived DLQ task {} (archive_id {}) but failed to remove it from the DLQ: {} — safe to retry",
+                        task.metadata.id, archive_id, e
+                    );
+                    error_count += 1;
+                }
+            }
+        }
+
+        if error_count > 0 {
+            warn!(
+                "archive_old_tasks for DLQ '{}' completed with {} error(s); {} tasks archived successfully",
+                self.queue_name, error_count, archived_count
+            );
         }
 
         info!(
@@ -983,14 +1039,13 @@ impl DLQArchivalManager {
         Ok(objects)
     }
 
-    /// Generate a unique archive ID
-    fn generate_archive_id(&self) -> String {
-        use rand::RngExt;
-        let mut rng = rand::rng();
-        let random_suffix: String = (0..8)
-            .map(|_| format!("{:02x}", rng.random::<u8>()))
-            .collect();
-        format!("{}-{}", chrono::Utc::now().timestamp(), random_suffix)
+    /// Derive a stable archive ID from a task's identity and its DLQ-entry
+    /// timestamp, so archiving the same DLQ entry more than once (e.g. after
+    /// a `store_to_backend` succeeded but the following `LREM` failed, so the
+    /// entry is picked up again on the next run) overwrites the same backend
+    /// record instead of creating a duplicate.
+    fn deterministic_archive_id(&self, task: &SerializedTask, entry_timestamp: i64) -> String {
+        format!("{}-{}", task.metadata.id, entry_timestamp)
     }
 }
 
@@ -1016,6 +1071,80 @@ fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `archive_old_tasks` must honor its age parameter: only entries whose
+    /// real (`updated_at`-derived) DLQ timestamp is older than the cutoff
+    /// are archived and removed, and the archived record must carry that
+    /// real timestamp rather than a value derived from the cutoff/`now`.
+    #[tokio::test]
+    async fn test_archive_old_tasks_filters_by_entry_age_and_records_real_timestamp() {
+        let queue_name = format!("test-archival-age-{}", uuid::Uuid::new_v4());
+        let manager = DLQArchivalManager::new(
+            "redis://127.0.0.1:6379",
+            &queue_name,
+            ArchivalConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut conn = Client::open("redis://127.0.0.1:6379")
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let dlq_key = format!("{}:dlq", queue_name);
+
+        // A fresh task (just failed) must NOT be archived.
+        let mut fresh_task = SerializedTask::new("fresh_job".to_string(), vec![1, 2, 3]);
+        fresh_task.metadata.updated_at = chrono::Utc::now();
+        let fresh_data = serde_json::to_string(&fresh_task).unwrap();
+
+        // A task that entered the DLQ 10 days ago SHOULD be archived when
+        // sweeping for anything older than 7 days.
+        let mut old_task = SerializedTask::new("old_job".to_string(), vec![4, 5, 6]);
+        old_task.metadata.updated_at = chrono::Utc::now() - chrono::Duration::days(10);
+        let old_data = serde_json::to_string(&old_task).unwrap();
+
+        let _: () = conn.rpush(&dlq_key, &fresh_data).await.unwrap();
+        let _: () = conn.rpush(&dlq_key, &old_data).await.unwrap();
+
+        let archived = manager.archive_old_tasks(7 * 24 * 3600).await.unwrap();
+        assert_eq!(archived, 1, "only the 10-day-old entry should be archived");
+
+        // The fresh entry must still be sitting in the live DLQ.
+        let remaining: Vec<String> = conn.lrange(&dlq_key, 0, -1).await.unwrap();
+        assert_eq!(remaining, vec![fresh_data.clone()]);
+
+        // The archived record must carry the task's *real* entry timestamp,
+        // not a fabricated cutoff-derived value.
+        let archives = manager
+            .search_archives(ArchiveSearchCriteria {
+                task_name: Some("old_job".to_string()),
+                min_timestamp: None,
+                max_timestamp: None,
+                archive_id: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(
+            archives[0].dlq_timestamp,
+            Some(old_task.metadata.updated_at.timestamp())
+        );
+
+        // Re-running immediately is a safe no-op: the only remaining DLQ
+        // entry (the fresh one) is still too young to archive.
+        let archived_again = manager.archive_old_tasks(7 * 24 * 3600).await.unwrap();
+        assert_eq!(archived_again, 0);
+
+        // Cleanup.
+        manager
+            .delete_from_backend(&archives[0].archive_id)
+            .await
+            .unwrap();
+        let _: () = conn.del(&dlq_key).await.unwrap();
+    }
 
     #[test]
     fn test_archival_config_builder() {

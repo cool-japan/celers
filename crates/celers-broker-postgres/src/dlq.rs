@@ -2,7 +2,6 @@
 
 use celers_core::{CelersError, Result, TaskId};
 use chrono::Utc;
-use oxisql_core::Connection;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -21,10 +20,11 @@ impl PostgresBroker {
                 r#"
             SELECT id, task_id, task_name, retry_count, error_message, failed_at
             FROM celers_dead_letter_queue
+            WHERE queue_name = $1
             ORDER BY failed_at DESC
-            LIMIT $1 OFFSET $2
+            LIMIT $2 OFFSET $3
             "#,
-                &[&limit, &offset],
+                &[&self.queue_name, &limit, &offset],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to list DLQ: {}", e)))?;
@@ -57,8 +57,11 @@ impl PostgresBroker {
     ///
     /// This moves the task back to the main queue with reset retry count.
     pub async fn requeue_from_dlq(&self, dlq_id: &Uuid) -> Result<TaskId> {
-        let mut tx = self
-            .conn
+        // Two-step on a pooled broker: check out a connection, then open the
+        // transaction on it (the handle borrows `conn`, so the slot stays
+        // reserved for the transaction's whole lifetime).
+        let conn = self.connection().await?;
+        let mut tx = conn
             .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
@@ -70,9 +73,9 @@ impl PostgresBroker {
                 r#"
             SELECT task_id, task_name, payload, metadata
             FROM celers_dead_letter_queue
-            WHERE id = $1
+            WHERE id = $1 AND queue_name = $2
             "#,
-                &[&dlq_id_param],
+                &[&dlq_id_param, &self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to fetch DLQ task: {}", e)))?;
@@ -104,17 +107,21 @@ impl PostgresBroker {
         // Create new task in main queue
         let new_task_id = Uuid::new_v4();
         let new_task_id_param = uuid_param(&new_task_id);
+        // `queue_name` is mandatory: `dequeue()` is queue-scoped, so a
+        // requeued task written without it would land in the `default` queue
+        // and never be delivered to this broker.
         tx.execute(
             r#"
             INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, retry_count, max_retries, metadata, created_at, scheduled_at)
-            VALUES ($1, $2, $3, 'pending', 0, 0, 3, $4, NOW(), NOW())
+                (id, task_name, payload, state, priority, retry_count, max_retries, metadata, queue_name, created_at, scheduled_at)
+            VALUES ($1, $2, $3, 'pending', 0, 0, 3, $4::text::jsonb, $5, NOW(), NOW())
             "#,
             &[
                 &new_task_id_param,
                 &task_name,
                 &payload,
                 &metadata_param,
+                &self.queue_name,
             ],
         )
         .await
@@ -143,8 +150,8 @@ impl PostgresBroker {
         let affected = self
             .conn
             .execute(
-                "DELETE FROM celers_dead_letter_queue WHERE id = $1",
-                &[&dlq_id_param],
+                "DELETE FROM celers_dead_letter_queue WHERE id = $1 AND queue_name = $2",
+                &[&dlq_id_param, &self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge DLQ task: {}", e)))?;
@@ -156,7 +163,10 @@ impl PostgresBroker {
     pub async fn purge_all_dlq(&self) -> Result<u64> {
         let affected = self
             .conn
-            .execute("DELETE FROM celers_dead_letter_queue", &[])
+            .execute(
+                "DELETE FROM celers_dead_letter_queue WHERE queue_name = $1",
+                &[&self.queue_name],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to purge all DLQ: {}", e)))?;
 
@@ -168,10 +178,8 @@ impl PostgresBroker {
 
     /// Check database health
     ///
-    /// `connection_pool_size`/`idle_connections`: see the doc comment on
-    /// [`PostgresBroker::get_pool_metrics`] for why these are `0`/unknown
-    /// rather than a live pool snapshot (`oxisql_postgres::PgConnection` has
-    /// no pool-introspection API).
+    /// `connection_pool_size`/`idle_connections` are read from the broker's
+    /// real connection pool — see [`PostgresBroker::get_pool_metrics`].
     pub async fn check_health(&self) -> Result<HealthStatus> {
         // Test connection
         let rows = self
@@ -206,37 +214,34 @@ impl PostgresBroker {
     /// This provides comprehensive statistics about the connection pool state,
     /// useful for monitoring and capacity planning.
     ///
-    /// # Pool-introspection gap (oxisql migration)
+    /// # Measured, not fabricated
     ///
-    /// The pre-migration `sqlx`-backed version of this method read live
-    /// state off `sqlx::PgPool`/`PgPoolOptions` (`.size()`, `.num_idle()`,
-    /// `.options().get_max_connections()`). `oxisql_postgres::PgConnection`
-    /// — the connection type this crate's migrated task-delivery hot path
-    /// now uses — wraps a single multiplexed `tokio_postgres::Client`
-    /// (`Arc<Mutex<tokio_postgres::Client>>`; confirmed by reading
-    /// `oxisql-postgres` 0.3.2's `connection.rs`), not a real connection
-    /// pool, and exposes no equivalent introspection API of any kind.
+    /// Every field is read from the broker's real connection pool
+    /// ([`crate::pool::PgPool`]):
     ///
-    /// Rather than fabricate plausible-looking numbers or silently read
-    /// `self.pool` (the legacy `sqlx` pool this crate is migrating away
-    /// from — reading it here would make this method a hidden blocker to
-    /// that field's eventual removal), this reports `max_size`/`size`/`idle`
-    /// as `0` (unknown) and `in_use`/`waiting` as `0` for the same reason.
-    /// This is the same pattern already established for the sibling MySQL
-    /// migration (`celers-broker-sql`'s `MysqlBroker::get_connection_diagnostics`
-    /// / its `configured_max_connections` field doc): report the gap
-    /// explicitly rather than block the migration on it.
+    /// * `max_size` — configured slot count (`max_connections`)
+    /// * `size` — slots that currently hold an established connection
+    ///   (connections are opened lazily, so this grows towards `max_size`
+    ///   under load)
+    /// * `in_use` — slots currently checked out by an operation
+    /// * `idle` — established slots not checked out
+    /// * `waiting` — tasks blocked waiting for a free slot
+    ///
+    /// An earlier version returned hardcoded zeros for all of these because
+    /// the broker held a single `PgConnection` with no introspection API. The
+    /// consequence was worse than a gap: `monitor_pool_health()` divided by
+    /// `max_size == 0`, fell through every branch, and reported "Pool health
+    /// is optimal" unconditionally — a permanently green signal for anyone
+    /// wiring it into alerting.
     pub fn get_pool_metrics(&self) -> PoolMetrics {
-        let max_size = 0;
-        let size = 0;
-        let idle = 0;
+        let snapshot = self.conn.snapshot();
 
         PoolMetrics {
-            max_size,
-            size,
-            idle,
-            in_use: size.saturating_sub(idle),
-            waiting: 0, // unknown — see this method's doc comment
+            max_size: snapshot.max_size,
+            size: snapshot.established,
+            idle: snapshot.idle,
+            in_use: snapshot.in_use,
+            waiting: snapshot.waiting,
         }
     }
 

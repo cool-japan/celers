@@ -8,7 +8,8 @@ use crate::row_ext::RowExt;
 use crate::tls_mode;
 use crate::types::*;
 use crate::workflow::TaskHooks;
-use celers_core::{BrokerMessage, CelersError, Result, SerializedTask, TaskId};
+use crate::{server_version, sql_text};
+use celers_core::{CelersError, Result, SerializedTask, TaskId};
 use chrono::Utc;
 use oxisql_core::Connection;
 use oxisql_mysql::MyConnection;
@@ -17,9 +18,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
-
-#[cfg(feature = "metrics")]
-use celers_metrics::{TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL};
 
 /// MySQL-based broker implementation using SKIP LOCKED
 pub struct MysqlBroker {
@@ -35,23 +33,46 @@ pub struct MysqlBroker {
     /// (`get_connection_diagnostics`, `get_pool_health`) report this
     /// configured ceiling rather than a live idle/active connection count.
     pub(crate) configured_max_connections: u32,
-    /// Logical queue label for multi-tenancy.
+    /// Logical queue name for multi-tenancy.
     ///
-    /// This is stored as a JSON label inside task metadata at enqueue time,
-    /// NOT as a real column on the tasks table, and NOT as a table name.
+    /// This is a real, indexed `celers_tasks.queue_name` column (migration
+    /// `009_queue_name.sql`), bound by every enqueue path in this crate and
+    /// filtered on by every claim path (`dequeue`, `dequeue_batch`,
+    /// `dequeue_with_worker_id`) as well as `queue_size` and
+    /// `get_statistics`. Two brokers pointed at the same database with
+    /// different queue names therefore never see each other's tasks. It is
+    /// NOT a table name — all queues share one set of tables.
     ///
-    /// The core enqueue/dequeue spine correctly treats this as a metadata
-    /// label. Peripheral functions in this crate have NOT been exhaustively
-    /// audited yet for the same queue_name-as-column / queue_name-as-table-name
-    /// drift pattern found and partially tracked in the Postgres broker
-    /// (`celers-broker-postgres`). See `TODO.md` for known specific issues
-    /// and the outstanding audit item.
+    /// The same label is *also* still written into the task metadata JSON
+    /// document under `$.queue` for backwards compatibility with anything
+    /// reading metadata directly; the column is authoritative.
+    ///
+    /// Deliberately queue-blind, because silently narrowing a destructive or
+    /// operator-facing method would be worse than leaving it documented as
+    /// database-wide: `purge_all`, `purge_by_state`, `purge_by_task_name`,
+    /// `archive_completed_tasks`, `recover_stuck_tasks`, the operator-facing
+    /// listings (`list_tasks`, `count_by_task_name`, `query_tasks_by_metadata`),
+    /// and the DLQ inspection/purge helpers — the DLQ table has no
+    /// `queue_name` column of its own. See `TODO.md`.
     pub(crate) queue_name: String,
     pub(crate) paused: AtomicBool,
     pub(crate) enqueue_count: AtomicU64,
     pub(crate) enqueue_window_start_ms: AtomicI64,
     pub(crate) circuit_breaker: Arc<RwLock<CircuitBreakerStateInternal>>,
     pub(crate) hooks: Arc<tokio::sync::RwLock<TaskHooks>>,
+}
+
+/// Remove whole-line `--` comments from one `;`-delimited migration chunk.
+///
+/// Line-based on purpose: it never inspects the interior of a statement, so a
+/// `--` sequence inside a string literal or an identifier is untouched. Only
+/// lines whose first non-whitespace characters are `--` are dropped.
+pub(crate) fn strip_sql_line_comments(chunk: &str) -> String {
+    chunk
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl MysqlBroker {
@@ -78,22 +99,18 @@ impl MysqlBroker {
     /// reporting) for source compatibility, but its `min_connections`,
     /// `acquire_timeout_secs`, `max_lifetime_secs`, and `idle_timeout_secs`
     /// knobs are not wired through to the underlying pool post-migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CelersError::Configuration`] when the connected server is
+    /// older than **MySQL 8.0.1** / **MariaDB 10.6** — see
+    /// [`connect_checked`](Self::connect_checked).
     pub async fn with_config(
         database_url: &str,
         queue_name: &str,
         config: PoolConfig,
     ) -> Result<Self> {
-        // TLS mode is derived from `database_url`'s `ssl-mode`/`tls` query
-        // parameters (see `tls_mode.rs`): a URL with `ssl-mode=required` (or
-        // `tls=true`) gets a real TLS connection, matching the
-        // pre-`oxisql`-migration `sqlx` behavior. Absent/`ssl-mode=disabled`
-        // still resolves to `TlsMode::Disabled`, so plain-text callers are
-        // unaffected.
-        let tls = tls_mode::mysql_tls_mode_for_url(database_url)
-            .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {e}")))?;
-        let conn = MyConnection::connect(database_url, tls)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
+        let conn = Self::connect_checked(database_url).await?;
 
         Ok(Self {
             conn,
@@ -116,11 +133,7 @@ impl MysqlBroker {
         pool_config: PoolConfig,
         circuit_breaker_config: CircuitBreakerConfig,
     ) -> Result<Self> {
-        let tls = tls_mode::mysql_tls_mode_for_url(database_url)
-            .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {e}")))?;
-        let conn = MyConnection::connect(database_url, tls)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
+        let conn = Self::connect_checked(database_url).await?;
 
         Ok(Self {
             conn,
@@ -134,6 +147,52 @@ impl MysqlBroker {
             ))),
             hooks: Arc::new(tokio::sync::RwLock::new(TaskHooks::new())),
         })
+    }
+
+    /// Connect, then verify the server can actually run this broker's claim
+    /// spine.
+    ///
+    /// TLS mode is derived from `database_url`'s `ssl-mode`/`tls` query
+    /// parameters (see `tls_mode.rs`): a URL with `ssl-mode=required` (or
+    /// `tls=true`) gets a real TLS connection, matching the
+    /// pre-`oxisql`-migration `sqlx` behavior. Absent/`ssl-mode=disabled`
+    /// still resolves to `TlsMode::Disabled`, so plain-text callers are
+    /// unaffected.
+    ///
+    /// Every dequeue in this crate uses `FOR UPDATE ... SKIP LOCKED`, which
+    /// exists only on MySQL 8.0.1+ and MariaDB 10.6+. Without this probe an
+    /// unsupported server produced a bare `ERROR 1064` on every dequeue, with
+    /// nothing pointing at the server version as the cause. Both constructors
+    /// route through here so the probe cannot be bypassed.
+    ///
+    /// A version string this parser does not recognise (proxies, forks) is
+    /// logged and accepted rather than rejected — see
+    /// [`crate::server_version`].
+    async fn connect_checked(database_url: &str) -> Result<MyConnection> {
+        let tls = tls_mode::mysql_tls_mode_for_url(database_url)
+            .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {e}")))?;
+        let conn = MyConnection::connect(database_url, tls)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to connect to database: {}", e)))?;
+
+        let rows = conn
+            .query("SELECT VERSION() AS v", &[])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to read server version: {e}")))?;
+        let reported: Option<String> = rows
+            .first()
+            .map(|row| row.col("v"))
+            .transpose()
+            .map_err(|e| CelersError::Other(format!("Failed to read server version: {e}")))?;
+
+        match reported {
+            Some(version) => server_version::check_skip_locked_support(&version)?,
+            None => tracing::warn!(
+                "SELECT VERSION() returned no rows; skipping the SKIP LOCKED capability check"
+            ),
+        }
+
+        Ok(conn)
     }
 
     /// Run database migrations
@@ -182,6 +241,20 @@ impl MysqlBroker {
             "008",
             "production_features",
             include_str!("../migrations/008_production_features.sql"),
+        )
+        .await?;
+
+        self.run_migration_tracked(
+            "009",
+            "queue_name_column",
+            include_str!("../migrations/009_queue_name.sql"),
+        )
+        .await?;
+
+        self.run_migration_tracked(
+            "010",
+            "task_results_table",
+            include_str!("../migrations/010_task_results.sql"),
         )
         .await?;
 
@@ -268,14 +341,32 @@ impl MysqlBroker {
     /// break on a stored procedure body containing internal semicolons,
     /// which is exactly the hazard this hand-rolled DELIMITER-aware split
     /// exists to avoid.
+    ///
+    /// # Leading `--` comments
+    ///
+    /// Splitting on `;` puts each statement in the same chunk as the comment
+    /// block that precedes it, so a chunk normally *starts* with `--`. This
+    /// function previously skipped any chunk whose trimmed text started with
+    /// `--`, which discarded the statement along with its comment. Because
+    /// every migration file in this crate opens with a title comment, that
+    /// dropped the first statement of every file — including
+    /// `CREATE TABLE celers_migrations` in `000_migrations.sql`, which made
+    /// the very next `is_migration_applied` query fail against a table that
+    /// had never been created. `migrate()` therefore failed on every fresh
+    /// database.
+    ///
+    /// [`strip_sql_line_comments`] now removes the comment *lines* and keeps
+    /// the statement, and it runs **before** the `;` split rather than
+    /// per-chunk: a prose comment containing a semicolon would otherwise be
+    /// cut in half and its tail submitted to the server as a statement.
     async fn run_migration(&self, migration_sql: &str) -> Result<()> {
-        let statements: Vec<&str> = migration_sql.split("DELIMITER //").collect();
+        let sections: Vec<&str> = migration_sql.split("DELIMITER //").collect();
 
         // Execute the main DDL statements (before DELIMITER)
-        if let Some(main_sql) = statements.first() {
-            for statement in main_sql.split(';') {
+        if let Some(main_sql) = sections.first() {
+            for statement in strip_sql_line_comments(main_sql).split(';') {
                 let trimmed = statement.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with("--") {
+                if !trimmed.is_empty() {
                     self.conn
                         .execute(trimmed, &[])
                         .await
@@ -285,10 +376,14 @@ impl MysqlBroker {
         }
 
         // Execute the stored procedure (between DELIMITER // and DELIMITER ;)
-        if statements.len() > 1 {
-            let proc_section = statements[1];
+        if sections.len() > 1 {
+            let proc_section = sections[1];
             if let Some(proc_sql) = proc_section.split("DELIMITER ;").next() {
-                let trimmed = proc_sql.trim();
+                let stripped = strip_sql_line_comments(proc_sql);
+                // The body ends with the client-side `//` delimiter marker,
+                // which is not SQL: submitting `... END//` over
+                // COM_STMT_PREPARE is a syntax error.
+                let trimmed = stripped.trim().trim_end_matches("//").trim_end();
                 if !trimmed.is_empty() {
                     self.conn.execute(trimmed, &[]).await.map_err(|e| {
                         CelersError::Other(format!("Stored procedure creation failed: {}", e))
@@ -312,10 +407,75 @@ impl MysqlBroker {
         &self.conn
     }
 
-    /// Move a task to the Dead Letter Queue
-    pub(crate) async fn move_to_dlq(&self, task_id: &TaskId) -> Result<()> {
+    /// The logical queue this broker enqueues into and claims from.
+    ///
+    /// Backed by the real, indexed `celers_tasks.queue_name` column, so two
+    /// brokers sharing a database but configured with different queue names
+    /// never see each other's tasks.
+    pub fn queue_name(&self) -> &str {
+        &self.queue_name
+    }
+
+    /// Build the JSON document stored in `celers_tasks.metadata`.
+    ///
+    /// The document is this broker's own labels (`queue`, `enqueued_at`)
+    /// merged with the task's serialized [`celers_core::TaskMetadata`], with
+    /// `extra` overlaid last so a caller-supplied label (`trace_context`,
+    /// `dedup_key`, `retry_policy`, `scheduled_for`, ...) always survives.
+    ///
+    /// Serialization failures are propagated. Every enqueue path used to fall
+    /// back to the literal `"{}"` on error and insert the row anyway, which
+    /// silently discarded the queue label, the dedup key (defeating
+    /// `enqueue_deduplicated` entirely), the trace context and every merged
+    /// metadata field — with no error and no log.
+    ///
+    /// The dequeue side reads this document back to reconstruct the task's
+    /// metadata (see [`crate::task_row::build_serialized_task`]), so a
+    /// lobotomized document is a real data loss, not a cosmetic one.
+    pub(crate) fn build_task_metadata_document(
+        &self,
+        task: &SerializedTask,
+        extra: serde_json::Value,
+    ) -> Result<String> {
+        let mut document = json!({
+            "queue": self.queue_name,
+            "enqueued_at": Utc::now().to_rfc3339(),
+        });
+
+        let task_metadata = serde_json::to_value(&task.metadata).map_err(|e| {
+            CelersError::Serialization(format!(
+                "Failed to serialize metadata for task {}: {e}",
+                task.metadata.id
+            ))
+        })?;
+
+        if let Some(target) = document.as_object_mut() {
+            for source in [&task_metadata, &extra] {
+                if let Some(fields) = source.as_object() {
+                    for (key, value) in fields {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+
+        serde_json::to_string(&document).map_err(|e| {
+            CelersError::Serialization(format!(
+                "Failed to serialize metadata document for task {}: {e}",
+                task.metadata.id
+            ))
+        })
+    }
+
+    /// Move a task to the Dead Letter Queue, addressing the row by its
+    /// already-resolved primary key text.
+    ///
+    /// Takes the row id as text rather than a [`TaskId`] because `reject`
+    /// resolves the row id from the receipt handle first (see
+    /// [`crate::task_row::resolve_row_id`]).
+    pub(crate) async fn move_to_dlq_by_row_id(&self, row_id: &str) -> Result<()> {
         self.conn
-            .execute("CALL move_to_dlq(?)", &[&task_id.to_string()])
+            .execute("CALL move_to_dlq(?)", &[&row_id])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to move task to DLQ: {}", e)))?;
 
@@ -509,8 +669,9 @@ impl MysqlBroker {
                     SUM(CASE WHEN state = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
                     COUNT(*) as total
                 FROM celers_tasks
+                WHERE queue_name = ?
                 "#,
-                &[],
+                &[&self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get statistics: {}", e)))?;
@@ -662,10 +823,16 @@ impl MysqlBroker {
         tx.execute(
             r#"
             INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, retry_count, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', 0, 0, 3, ?, NOW(), NOW())
+                (id, queue_name, task_name, payload, state, priority, retry_count, max_retries, metadata, created_at, scheduled_at)
+            VALUES (?, ?, ?, ?, 'pending', 0, 0, 3, ?, NOW(), NOW())
             "#,
-            &[&new_task_id.to_string(), &task_name, &payload, &metadata],
+            &[
+                &new_task_id.to_string(),
+                &self.queue_name,
+                &task_name,
+                &payload,
+                &metadata,
+            ],
         )
         .await
         .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
@@ -810,157 +977,6 @@ impl MysqlBroker {
             .map_err(|e| CelersError::Other(format!("Failed to purge all tasks: {}", e)))?;
 
         tracing::warn!(count = affected, "Purged all tasks");
-        Ok(affected)
-    }
-
-    // ========== Task Result Storage ==========
-
-    /// Store a task result in the database
-    ///
-    /// This creates or updates the result for a given task ID.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn store_result(
-        &self,
-        task_id: &TaskId,
-        task_name: &str,
-        status: TaskResultStatus,
-        result: Option<serde_json::Value>,
-        error: Option<&str>,
-        traceback: Option<&str>,
-        runtime_ms: Option<i64>,
-    ) -> Result<()> {
-        let completed_at = match status {
-            TaskResultStatus::Success | TaskResultStatus::Failure | TaskResultStatus::Revoked => {
-                Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-            }
-            _ => None,
-        };
-        let result_str =
-            result.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string()));
-        let status_str = status.to_string();
-
-        // MySQL uses INSERT ... ON DUPLICATE KEY UPDATE instead of ON CONFLICT
-        self.conn
-            .execute(
-                r#"
-                INSERT INTO celers_task_results
-                    (task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms)
-                VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?)
-                ON DUPLICATE KEY UPDATE
-                    status = VALUES(status),
-                    result = VALUES(result),
-                    error = VALUES(error),
-                    traceback = VALUES(traceback),
-                    completed_at = VALUES(completed_at),
-                    runtime_ms = VALUES(runtime_ms)
-                "#,
-                &[
-                    &task_id.to_string(),
-                    &task_name,
-                    &status_str,
-                    &result_str,
-                    &error,
-                    &traceback,
-                    &completed_at,
-                    &runtime_ms,
-                ],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to store result: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Get a task result from the database
-    pub async fn get_result(&self, task_id: &TaskId) -> Result<Option<TaskResult>> {
-        let rows = self
-            .conn
-            .query(
-                r#"
-                SELECT task_id, task_name, status, result, error, traceback,
-                       created_at, completed_at, runtime_ms
-                FROM celers_task_results
-                WHERE task_id = ?
-                "#,
-                &[&task_id.to_string()],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to get result: {}", e)))?;
-
-        match rows.into_iter().next() {
-            Some(row) => {
-                let task_id_str: String = row
-                    .col("task_id")
-                    .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?;
-                let status_str: String = row
-                    .col("status")
-                    .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?;
-                let result_str: Option<String> = row
-                    .col("result")
-                    .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?;
-                Ok(Some(TaskResult {
-                    task_id: Uuid::parse_str(&task_id_str)
-                        .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
-                    task_name: row
-                        .col("task_name")
-                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
-                    status: status_str.parse()?,
-                    result: result_str.and_then(|s| serde_json::from_str(&s).ok()),
-                    error: row
-                        .col("error")
-                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
-                    traceback: row
-                        .col("traceback")
-                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
-                    created_at: row
-                        .col("created_at")
-                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
-                    completed_at: row
-                        .col("completed_at")
-                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
-                    runtime_ms: row
-                        .col("runtime_ms")
-                        .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
-                }))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Delete a task result from the database
-    pub async fn delete_result(&self, task_id: &TaskId) -> Result<bool> {
-        let affected = self
-            .conn
-            .execute(
-                "DELETE FROM celers_task_results WHERE task_id = ?",
-                &[&task_id.to_string()],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to delete result: {}", e)))?;
-
-        Ok(affected > 0)
-    }
-
-    /// Archive old task results
-    ///
-    /// Deletes results older than the specified duration.
-    pub async fn archive_results(&self, older_than: Duration) -> Result<u64> {
-        let cutoff = Utc::now() - chrono::Duration::seconds(older_than.as_secs() as i64);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-
-        let affected = self
-            .conn
-            .execute(
-                r#"
-                DELETE FROM celers_task_results
-                WHERE completed_at < ?
-                "#,
-                &[&cutoff_str],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to archive results: {}", e)))?;
-
-        tracing::info!(count = affected, cutoff = %cutoff, "Archived old results");
         Ok(affected)
     }
 
@@ -1315,86 +1331,6 @@ impl MysqlBroker {
 
         Ok(affected > 0)
     }
-
-    /// Dequeue a task and set the worker ID atomically
-    ///
-    /// This is a convenience method that dequeues a task and sets the worker ID
-    /// in a single transaction, which is useful for worker tracking.
-    pub async fn dequeue_with_worker_id(&self, worker_id: &str) -> Result<Option<BrokerMessage>> {
-        // Check if queue is paused
-        if self.paused.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-
-        let mut tx = self
-            .conn
-            .transaction()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
-
-        let rows = tx
-            .query(
-                r#"
-                SELECT id, task_name, payload, retry_count
-                FROM celers_tasks
-                WHERE state = 'pending'
-                  AND scheduled_at <= NOW()
-                ORDER BY priority DESC, created_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-                "#,
-                &[],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
-
-        if let Some(row) = rows.into_iter().next() {
-            let task_id_str: String = row
-                .col("id")
-                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
-            let _task_id = Uuid::parse_str(&task_id_str)
-                .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
-            let task_name: String = row
-                .col("task_name")
-                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
-            let payload: Vec<u8> = row
-                .col("payload")
-                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
-            let retry_count: i32 = row
-                .col("retry_count")
-                .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {e}")))?;
-
-            // Mark as processing with worker ID
-            tx.execute(
-                r#"
-                UPDATE celers_tasks
-                SET state = 'processing',
-                    started_at = NOW(),
-                    retry_count = retry_count + 1,
-                    worker_id = ?
-                WHERE id = ?
-                "#,
-                &[&worker_id, &task_id_str],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to mark task as processing: {}", e)))?;
-
-            tx.commit()
-                .await
-                .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
-
-            Ok(Some(BrokerMessage {
-                task: SerializedTask::new(task_name, payload),
-                receipt_handle: Some(retry_count.to_string()),
-            }))
-        } else {
-            tx.rollback().await.map_err(|e| {
-                CelersError::Other(format!("Failed to rollback transaction: {}", e))
-            })?;
-            Ok(None)
-        }
-    }
-
     // ========== Selective Cleanup ==========
 
     /// Purge tasks by state
@@ -1606,22 +1542,16 @@ impl MysqlBroker {
     ///
     /// Returns the MySQL EXPLAIN output for the dequeue query.
     /// Useful for query optimization and performance tuning.
+    ///
+    /// Explains the *actual* statement `dequeue` runs (built by
+    /// [`crate::sql_text::dequeue_select_sql`]), not a hand-copied
+    /// approximation of it — the previous copy had already drifted away from
+    /// the real query's clause order and predicates.
     pub async fn explain_dequeue(&self) -> Result<Vec<QueryPlan>> {
+        let explain_sql = format!("EXPLAIN {}", sql_text::dequeue_select_sql("1"));
         let rows = self
             .conn
-            .query(
-                r#"
-                EXPLAIN
-                SELECT id, task_name, payload, retry_count
-                FROM celers_tasks
-                WHERE state = 'pending'
-                  AND scheduled_at <= NOW()
-                ORDER BY priority DESC, created_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-                "#,
-                &[],
-            )
+            .query(&explain_sql, &[&self.queue_name])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
 
@@ -1713,7 +1643,14 @@ impl MysqlBroker {
             }
             if let Some(extra) = &plan.extra {
                 if extra.contains("Using filesort") {
-                    warnings.push("Dequeue query requires filesort - consider adding composite index on (state, priority, created_at)".to_string());
+                    warnings.push(
+                        "Dequeue query requires filesort - the \
+                         idx_tasks_queue_dequeue composite index on \
+                         (queue_name, state, scheduled_at, priority, created_at) \
+                         from migration 009 should cover it; check that \
+                         migrations are up to date and run ANALYZE TABLE"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -1859,193 +1796,5 @@ impl MysqlBroker {
         }
 
         Ok(variables)
-    }
-
-    /// Enqueue multiple tasks in a single transaction (batch operation)
-    ///
-    /// This is significantly faster than individual enqueue calls when
-    /// inserting many tasks. Uses a single transaction and prepared statement.
-    ///
-    /// # Returns
-    /// Vector of task IDs in the same order as input tasks
-    pub async fn enqueue_batch_impl(&self, tasks: Vec<SerializedTask>) -> Result<Vec<TaskId>> {
-        if tasks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut tx = self
-            .conn
-            .transaction()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
-
-        let mut task_ids = Vec::with_capacity(tasks.len());
-
-        for task in &tasks {
-            let task_id = task.metadata.id;
-            let mut db_metadata = json!({
-                "queue": self.queue_name,
-                "enqueued_at": chrono::Utc::now().to_rfc3339(),
-            });
-
-            // Merge task metadata if present
-            if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
-                if let Some(obj) = db_metadata.as_object_mut() {
-                    if let Some(meta_obj) = task_meta.as_object() {
-                        for (k, v) in meta_obj {
-                            obj.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-            let db_metadata_str =
-                serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
-
-            tx.execute(
-                r#"
-                INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
-                "#,
-                &[
-                    &task_id.to_string(),
-                    &task.metadata.name,
-                    &task.payload,
-                    &task.metadata.priority,
-                    &(task.metadata.max_retries as i32),
-                    &db_metadata_str,
-                ],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to enqueue task in batch: {}", e)))?;
-
-            task_ids.push(task_id);
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to commit batch enqueue: {}", e)))?;
-
-        #[cfg(feature = "metrics")]
-        {
-            TASKS_ENQUEUED_TOTAL.inc_by(tasks.len() as f64);
-
-            // Track per-task-type metrics
-            for task in &tasks {
-                TASKS_ENQUEUED_BY_TYPE
-                    .with_label_values(&[&task.metadata.name])
-                    .inc();
-            }
-        }
-
-        Ok(task_ids)
-    }
-
-    /// Dequeue multiple tasks atomically (batch operation)
-    ///
-    /// Fetches up to `limit` tasks in a single transaction using
-    /// FOR UPDATE SKIP LOCKED for distributed worker safety.
-    ///
-    /// # Arguments
-    /// * `limit` - Maximum number of tasks to dequeue
-    ///
-    /// # Returns
-    /// Vector of broker messages (may be less than limit if queue has fewer tasks)
-    pub async fn dequeue_batch_impl(&self, limit: usize) -> Result<Vec<BrokerMessage>> {
-        if limit == 0 || self.paused.load(Ordering::SeqCst) {
-            return Ok(Vec::new());
-        }
-
-        let mut tx = self
-            .conn
-            .transaction()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
-
-        let rows = tx
-            .query(
-                r#"
-                SELECT id, task_name, payload, retry_count
-                FROM celers_tasks
-                WHERE state = 'pending'
-                  AND scheduled_at <= NOW()
-                ORDER BY priority DESC, created_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT ?
-                "#,
-                &[&(limit as i64)],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {}", e)))?;
-
-        if rows.is_empty() {
-            tx.rollback().await.map_err(|e| {
-                CelersError::Other(format!("Failed to rollback transaction: {}", e))
-            })?;
-            return Ok(Vec::new());
-        }
-
-        let mut messages = Vec::with_capacity(rows.len());
-        let mut task_id_strings = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let task_id_str: String = row
-                .col("id")
-                .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {e}")))?;
-            let _task_id = Uuid::parse_str(&task_id_str)
-                .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?;
-            let task_name: String = row
-                .col("task_name")
-                .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {e}")))?;
-            let payload: Vec<u8> = row
-                .col("payload")
-                .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {e}")))?;
-            let retry_count: i32 = row
-                .col("retry_count")
-                .map_err(|e| CelersError::Other(format!("Failed to dequeue batch: {e}")))?;
-
-            messages.push(BrokerMessage {
-                task: SerializedTask::new(task_name, payload),
-                receipt_handle: Some(retry_count.to_string()),
-            });
-
-            task_id_strings.push(task_id_str);
-        }
-
-        // Mark all fetched tasks as processing
-        // MySQL doesn't support array parameters like PostgreSQL's ANY($1)
-        // So we need to use IN clause with placeholders
-        if !task_id_strings.is_empty() {
-            let placeholders = task_id_strings
-                .iter()
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(", ");
-            let update_query = format!(
-                r#"
-                UPDATE celers_tasks
-                SET state = 'processing',
-                    started_at = NOW(),
-                    retry_count = retry_count + 1
-                WHERE id IN ({})
-                "#,
-                placeholders
-            );
-
-            let param_refs: Vec<&dyn oxisql_core::ToSqlValue> = task_id_strings
-                .iter()
-                .map(|s| s as &dyn oxisql_core::ToSqlValue)
-                .collect();
-
-            tx.execute(&update_query, &param_refs).await.map_err(|e| {
-                CelersError::Other(format!("Failed to mark batch as processing: {}", e))
-            })?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to commit batch dequeue: {}", e)))?;
-
-        Ok(messages)
     }
 }

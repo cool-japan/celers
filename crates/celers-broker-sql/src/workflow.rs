@@ -311,7 +311,6 @@ impl TaskHooks {
     }
 
     /// Execute before_ack hooks
-    #[allow(dead_code)]
     pub(crate) async fn run_before_ack(
         &self,
         ctx: &HookContext,
@@ -324,7 +323,6 @@ impl TaskHooks {
     }
 
     /// Execute after_ack hooks
-    #[allow(dead_code)]
     pub(crate) async fn run_after_ack(
         &self,
         ctx: &HookContext,
@@ -337,7 +335,6 @@ impl TaskHooks {
     }
 
     /// Execute before_reject hooks
-    #[allow(dead_code)]
     pub(crate) async fn run_before_reject(
         &self,
         ctx: &HookContext,
@@ -350,7 +347,6 @@ impl TaskHooks {
     }
 
     /// Execute after_reject hooks
-    #[allow(dead_code)]
     pub(crate) async fn run_after_reject(
         &self,
         ctx: &HookContext,
@@ -362,8 +358,23 @@ impl TaskHooks {
         Ok(())
     }
 
+    /// Execute before_dequeue hooks
+    ///
+    /// Runs after the task row has been locked but before it is transitioned
+    /// to `processing`, so a hook returning `Err` aborts the claim and leaves
+    /// the task pending for another worker.
+    pub(crate) async fn run_before_dequeue(
+        &self,
+        ctx: &HookContext,
+        task: &SerializedTask,
+    ) -> Result<()> {
+        for hook in &self.before_dequeue {
+            hook(ctx, task).await?;
+        }
+        Ok(())
+    }
+
     /// Execute after_dequeue hooks
-    #[allow(dead_code)]
     pub(crate) async fn run_after_dequeue(
         &self,
         ctx: &HookContext,

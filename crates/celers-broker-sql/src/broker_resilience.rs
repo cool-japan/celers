@@ -60,33 +60,19 @@ impl MysqlBroker {
         let retry_policy_json = serde_json::to_value(&retry_policy)
             .map_err(|e| CelersError::Other(format!("Failed to serialize retry policy: {}", e)))?;
 
-        let mut metadata = json!({
-            "queue": self.queue_name,
-            "enqueued_at": chrono::Utc::now().to_rfc3339(),
-            "retry_policy": retry_policy_json,
-        });
-
-        // Merge task metadata
-        if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
-            if let Some(obj) = metadata.as_object_mut() {
-                if let Some(meta_obj) = task_meta.as_object() {
-                    for (k, v) in meta_obj {
-                        obj.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
-        let metadata_str = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+        let metadata_str =
+            self.build_task_metadata_document(&task, json!({ "retry_policy": retry_policy_json }))?;
 
         self.connection()
             .execute(
                 r#"
                 INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                    (id, queue_name, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
                 "#,
                 &[
                     &task_id.to_string(),
+                    &self.queue_name(),
                     &task.metadata.name,
                     &task.payload,
                     &task.metadata.priority,
@@ -267,6 +253,25 @@ impl MysqlBroker {
     /// Checks for recurring tasks that are due and enqueues them.
     /// Should be called periodically (e.g., every minute) by a scheduler.
     ///
+    /// # Distributed safety
+    ///
+    /// Safe to run from any number of scheduler ("beat") processes at once:
+    /// each due configuration is **claimed before it is enqueued** with a
+    /// compare-and-swap that swaps the whole stored JSON document for the one
+    /// carrying the advanced `next_run`, conditional on the document still
+    /// being byte-identical to what this process read
+    /// ([`crate::sql_text::RECURRING_CLAIM_SQL`]). Exactly one process
+    /// observes `rows_affected == 1` and enqueues; the rest skip.
+    ///
+    /// This previously used a plain `SELECT` with no claim of any kind, so
+    /// every scheduler instance enqueued every due task, and the write-back
+    /// that would have closed the window was `let _ = ...` — a failed UPDATE
+    /// left `next_run` in the past and re-enqueued the task on every
+    /// subsequent tick forever.
+    ///
+    /// Claiming before enqueuing means a failed enqueue skips one period
+    /// rather than duplicating the task; the failure is logged at error level.
+    ///
     /// # Returns
     /// Number of tasks enqueued
     ///
@@ -319,31 +324,41 @@ impl MysqlBroker {
                 continue;
             }
 
-            // Enqueue the task
+            // Advance the schedule, then claim the configuration by swapping
+            // the stored document for the advanced one. Only the scheduler
+            // whose swap actually lands may enqueue.
+            config.last_run = Some(now);
+            config.next_run = config.schedule.next_run_from(now);
+            let updated_json = serde_json::to_string(&config).map_err(|e| {
+                CelersError::Serialization(format!(
+                    "Failed to serialize recurring config {config_id}: {e}"
+                ))
+            })?;
+
+            let claimed = self
+                .connection()
+                .execute(
+                    crate::sql_text::RECURRING_CLAIM_SQL,
+                    &[&updated_json, &config_id, &config_json],
+                )
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to claim recurring task {config_id}: {e}"))
+                })?;
+
+            if claimed == 0 {
+                tracing::debug!(
+                    config_id = config_id,
+                    task_name = config.task_name,
+                    "Recurring task already claimed by another scheduler instance"
+                );
+                continue;
+            }
+
             let task = SerializedTask::new(config.task_name.clone(), config.payload.clone());
             match self.enqueue(task).await {
                 Ok(_) => {
                     enqueued += 1;
-
-                    // Update last_run and next_run
-                    config.last_run = Some(now);
-                    config.next_run = config.schedule.next_run_from(now);
-
-                    let updated_json = serde_json::to_string(&config).unwrap_or(config_json);
-
-                    // Update configuration
-                    let _ = self
-                        .connection()
-                        .execute(
-                            r#"
-                            UPDATE celers_task_results
-                            SET result = ?
-                            WHERE task_id = ?
-                            "#,
-                            &[&updated_json, &config_id],
-                        )
-                        .await;
-
                     tracing::debug!(
                         config_id = config_id,
                         task_name = config.task_name,
@@ -351,11 +366,16 @@ impl MysqlBroker {
                     );
                 }
                 Err(e) => {
+                    // The claim already advanced `next_run`, so this period is
+                    // skipped rather than retried in a tight loop. Loud on
+                    // purpose: this is a dropped scheduled execution.
                     tracing::error!(
                         config_id = config_id,
                         task_name = config.task_name,
+                        next_run = %config.next_run,
                         error = %e,
-                        "Failed to enqueue recurring task"
+                        "Claimed a due recurring task but failed to enqueue it; \
+                         this occurrence is skipped"
                     );
                 }
             }
@@ -632,12 +652,13 @@ impl MysqlBroker {
                 .execute(
                     r#"
                     INSERT INTO celers_tasks
-                        (id, task_name, payload, state, priority, retry_count, max_retries,
+                        (id, queue_name, task_name, payload, state, priority, retry_count, max_retries,
                          created_at, scheduled_at, started_at, completed_at, worker_id, error_message, metadata)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#,
                     &[
                         &id,
+                        &self.queue_name(),
                         &task_name,
                         &payload,
                         &state,
@@ -1031,6 +1052,17 @@ impl MysqlBroker {
         let task_id = Uuid::new_v4();
         let idempotency_id = Uuid::new_v4();
 
+        // This path mints its own row id rather than using `task.metadata.id`,
+        // so the metadata document must record the id actually stored —
+        // otherwise the dequeue side would rebuild the task around a
+        // different id than the row it came from.
+        let mut stored_task = task.clone();
+        stored_task.metadata.id = task_id;
+        let idempotent_metadata_str = self.build_task_metadata_document(
+            &stored_task,
+            json!({ "idempotency_key": idempotency_key }),
+        )?;
+
         // Begin transaction to ensure atomicity
         let mut tx = self
             .connection()
@@ -1042,23 +1074,32 @@ impl MysqlBroker {
         tx.execute(
             r#"
             INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES (?, ?, ?, 'pending', ?, ?, '{}', NOW(), NOW())
+                (id, queue_name, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
             "#,
             &[
                 &task_id.to_string(),
+                &self.queue_name(),
                 &task.metadata.name,
                 &task.payload,
                 &task.metadata.priority,
                 &(task.metadata.max_retries as i32),
+                &idempotent_metadata_str,
             ],
         )
         .await
         .map_err(|e| CelersError::Other(format!("Failed to enqueue task: {}", e)))?;
 
         // Insert idempotency record
-        let metadata_str =
-            metadata.map(|m| serde_json::to_string(&m).unwrap_or_else(|_| "{}".to_string()));
+        let metadata_str = metadata
+            .map(|m| {
+                serde_json::to_string(&m).map_err(|e| {
+                    CelersError::Serialization(format!(
+                        "Failed to serialize idempotency metadata: {e}"
+                    ))
+                })
+            })
+            .transpose()?;
         tx.execute(
             r#"
             INSERT INTO celers_task_idempotency

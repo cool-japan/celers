@@ -1,43 +1,73 @@
 //! gRPC/RPC result backend for CeleRS
 //!
 //! This crate provides gRPC-based result storage for distributed microservices architectures.
+//! It ships **both halves** of the RPC boundary:
+//!
+//! - [`GrpcResultBackend`] — a client implementing [`ResultBackend`] by calling out to a
+//!   remote service.
+//! - [`server::RpcBackendServer`] — a reference server that implements the generated
+//!   `ResultBackendService` gRPC trait by delegating to any local [`ResultBackend`]
+//!   (e.g. `RedisResultBackend`, a SQL-backed one, or an in-memory implementation).
+//!
+//! A client with nothing implementing the service on the other end is not useful on its
+//! own, so [`server::RpcBackendServer`] exists specifically so `GrpcResultBackend::connect(...)`
+//! has something to talk to without every user having to hand-roll the seven RPCs (including
+//! the chord-completion counter's atomicity) themselves.
 //!
 //! # Features
 //!
-//! - gRPC client for remote result storage
+//! - gRPC client ([`GrpcResultBackend`]) and reference server ([`server::RpcBackendServer`])
+//! - Per-call deadlines, connect timeouts, and message-size limits ([`GrpcConfig`])
+//! - Optional bearer-token authentication
+//! - Automatic retry with exponential backoff for transient (`Unavailable` /
+//!   `DeadlineExceeded`) failures
+//! - Client-side Prometheus-compatible metrics ([`RpcMetrics`])
 //! - Service mesh compatible
-//! - Real-time result streaming (future)
-//! - Distributed result storage
-//! - Load balancing ready
+//!
+//! TLS is deliberately **not** wired up via tonic's built-in `tls-*` Cargo features — see
+//! the [`GrpcConfig`] docs for why, and how to bring your own TLS-enabled channel via
+//! [`GrpcResultBackend::from_channel_with_config`].
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! use celers_backend_rpc::GrpcResultBackend;
-//! use celers_backend_redis::ResultBackend;
+//! use celers_backend_redis::{ResultBackend, TaskMeta};
+//! use uuid::Uuid;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut backend = GrpcResultBackend::connect("http://localhost:50051").await?;
 //!
 //! // Store result
+//! let task_id = Uuid::new_v4();
 //! let meta = TaskMeta::new(task_id, "my_task".to_string());
 //! backend.store_result(task_id, &meta).await?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! See [`server`] for how to run the other end of that connection.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
+pub mod config;
 pub mod metrics;
 pub mod result_store;
+pub mod server;
 
+mod codec;
+
+pub use config::GrpcConfig;
 pub use metrics::{OperationStats, RpcMetrics, RpcMetricsSnapshot, RpcOperation};
+pub use server::RpcBackendServer;
 
 use async_trait::async_trait;
 pub use celers_backend_redis::{
-    BackendError, ChordState, Result, ResultBackend, TaskMeta, TaskResult,
+    retry::RetryStrategy, BackendError, ChordState, Result, ResultBackend, TaskMeta, TaskResult,
 };
-use chrono::{TimeZone, Utc};
 use std::sync::Arc;
 use std::time::Duration;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -49,7 +79,7 @@ pub mod proto {
 use proto::{
     result_backend_service_client::ResultBackendServiceClient, ChordCompleteTaskRequest,
     ChordGetStateRequest, ChordInitRequest, DeleteResultRequest, GetResultRequest,
-    SetExpirationRequest, StoreResultRequest, TaskResultState,
+    SetExpirationRequest, StoreResultRequest,
 };
 
 /// gRPC result backend client
@@ -57,33 +87,65 @@ use proto::{
 pub struct GrpcResultBackend {
     client: ResultBackendServiceClient<Channel>,
     metrics: Arc<RpcMetrics>,
+    config: GrpcConfig,
 }
 
 impl GrpcResultBackend {
-    /// Connect to gRPC result backend service
+    /// Connect to a gRPC result backend service using the default
+    /// [`GrpcConfig`] (30s request timeout, 10s connect timeout, 16 MiB
+    /// message cap, no auth, standard retry policy).
     ///
     /// # Arguments
     /// * `endpoint` - gRPC server endpoint (e.g., "http://localhost:50051")
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let client = ResultBackendServiceClient::connect(endpoint.to_string())
-            .await
-            .map_err(|e| {
-                BackendError::Connection(format!("Failed to connect to gRPC server: {}", e))
-            })?;
-
-        Ok(Self {
-            client,
-            metrics: Arc::new(RpcMetrics::new()),
-        })
+        Self::connect_with_config(endpoint, GrpcConfig::default()).await
     }
 
-    /// Connect with custom channel
+    /// Connect to a gRPC result backend service with an explicit
+    /// [`GrpcConfig`], applying its connect timeout and request timeout to
+    /// the underlying [`tonic::transport::Endpoint`] before dialing.
+    pub async fn connect_with_config(endpoint: &str, config: GrpcConfig) -> Result<Self> {
+        let channel_endpoint = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+            .map_err(|e| {
+                BackendError::Connection(format!("Invalid gRPC endpoint {endpoint:?}: {e}"))
+            })?
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout);
+
+        let channel = channel_endpoint.connect().await.map_err(|e| {
+            BackendError::Connection(format!("Failed to connect to gRPC server: {}", e))
+        })?;
+
+        Ok(Self::from_channel_with_config(channel, config))
+    }
+
+    /// Connect with a custom channel (e.g. one configured with your own
+    /// TLS setup) and the default [`GrpcConfig`].
     pub fn from_channel(channel: Channel) -> Self {
-        let client = ResultBackendServiceClient::new(channel);
+        Self::from_channel_with_config(channel, GrpcConfig::default())
+    }
+
+    /// Connect with a custom channel and an explicit [`GrpcConfig`].
+    ///
+    /// This is the integration point for callers who need TLS: build a
+    /// `tonic::transport::Channel` however you like (including with your
+    /// own TLS stack) and hand it here — the deadline, message-size, and
+    /// auth-token hardening in `config` still applies to every request.
+    pub fn from_channel_with_config(channel: Channel, config: GrpcConfig) -> Self {
+        let client = ResultBackendServiceClient::new(channel)
+            .max_decoding_message_size(config.max_message_size)
+            .max_encoding_message_size(config.max_message_size);
+
         Self {
             client,
             metrics: Arc::new(RpcMetrics::new()),
+            config,
         }
+    }
+
+    /// The configuration this client was constructed with.
+    pub fn config(&self) -> &GrpcConfig {
+        &self.config
     }
 
     /// Return a point-in-time snapshot of all RPC metrics.
@@ -102,281 +164,296 @@ impl GrpcResultBackend {
         Arc::clone(&self.metrics)
     }
 
-    /// Convert TaskMeta to proto TaskMeta
-    fn to_proto_meta(&self, meta: &TaskMeta) -> proto::TaskMeta {
-        let (result_state, result_data, error_message, retry_count) = match &meta.result {
-            TaskResult::Pending => (TaskResultState::Pending, None, None, None),
-            TaskResult::Started => (TaskResultState::Started, None, None, None),
-            TaskResult::Success(data) => {
-                let json_str = serde_json::to_string(data).ok();
-                (TaskResultState::Success, json_str, None, None)
-            }
-            TaskResult::Failure(err) => (TaskResultState::Failure, None, Some(err.clone()), None),
-            TaskResult::Revoked => (TaskResultState::Revoked, None, None, None),
-            TaskResult::Retry(count) => (TaskResultState::Retry, None, None, Some(*count)),
-        };
+    /// Build a request carrying `message`, applying the configured
+    /// per-call deadline (as a `grpc-timeout` header, so the server can
+    /// honor it too) and, if configured, a bearer-token `authorization`
+    /// header. Used by every RPC method below so hardening lives in one
+    /// place instead of being copy-pasted seven times.
+    fn prepare_request<T>(&self, message: T) -> Result<tonic::Request<T>> {
+        let mut request = tonic::Request::new(message);
+        request.set_timeout(self.config.request_timeout);
 
-        proto::TaskMeta {
-            task_id: meta.task_id.to_string(),
-            task_name: meta.task_name.clone(),
-            result_state: result_state as i32,
-            result_data,
-            error_message,
-            retry_count,
-            created_at: meta.created_at.timestamp(),
-            started_at: meta.started_at.map(|dt| dt.timestamp()),
-            completed_at: meta.completed_at.map(|dt| dt.timestamp()),
-            worker: meta.worker.clone(),
+        if let Some(token) = &self.config.auth_token {
+            let value = MetadataValue::try_from(format!("Bearer {token}"))
+                .map_err(|e| BackendError::Connection(format!("invalid auth token: {e}")))?;
+            request.metadata_mut().insert("authorization", value);
         }
+
+        Ok(request)
     }
+}
 
-    /// Convert proto TaskMeta to TaskMeta
-    fn from_proto_meta(proto_meta: proto::TaskMeta) -> Result<TaskMeta> {
-        let result_state = TaskResultState::try_from(proto_meta.result_state)
-            .map_err(|_| BackendError::Serialization("Invalid result state".to_string()))?;
+/// Whether a gRPC status code represents a transient failure worth
+/// retrying, as opposed to e.g. `InvalidArgument` or `NotFound`, which
+/// will fail identically on every attempt.
+fn is_retryable_code(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
+}
 
-        let result = match result_state {
-            TaskResultState::Pending => TaskResult::Pending,
-            TaskResultState::Started => TaskResult::Started,
-            TaskResultState::Success => {
-                let data = proto_meta
-                    .result_data
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                TaskResult::Success(data)
-            }
-            TaskResultState::Failure => {
-                TaskResult::Failure(proto_meta.error_message.unwrap_or_default())
-            }
-            TaskResultState::Revoked => TaskResult::Revoked,
-            TaskResultState::Retry => TaskResult::Retry(proto_meta.retry_count.unwrap_or(0)),
-        };
+/// Outcome of evaluating whether a failed RPC attempt should be retried.
+#[derive(Debug)]
+enum RetryDecision {
+    /// Wait this long, then try again.
+    Retry(Duration),
+    /// Stop and surface this error to the caller.
+    GiveUp(BackendError),
+}
 
-        let task_id = Uuid::parse_str(&proto_meta.task_id)
-            .map_err(|e| BackendError::Serialization(format!("Invalid UUID: {}", e)))?;
-
-        let created_at = Utc
-            .timestamp_opt(proto_meta.created_at, 0)
-            .single()
-            .ok_or_else(|| {
-                BackendError::Serialization("Invalid created_at timestamp".to_string())
-            })?;
-
-        let started_at = proto_meta
-            .started_at
-            .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
-
-        let completed_at = proto_meta
-            .completed_at
-            .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
-
-        Ok(TaskMeta {
-            task_id,
-            task_name: proto_meta.task_name,
-            result,
-            created_at,
-            started_at,
-            completed_at,
-            worker: proto_meta.worker,
-            progress: None,
-            version: 0,
-            tags: Vec::new(),
-            metadata: std::collections::HashMap::new(),
-            worker_hostname: None,
-            runtime_ms: None,
-            memory_bytes: None,
-            retries: None,
-            queue: None,
-        })
+/// Decide whether the attempt that just failed with `status` (1-based
+/// `attempt` count, i.e. the count *including* the attempt that just
+/// failed) should be retried under `retry`.
+///
+/// Pure and synchronous by design: the actual backoff sleep happens in
+/// the caller, so this decision is fully unit-testable without an async
+/// runtime or a real gRPC server.
+fn decide_retry(retry: &RetryStrategy, attempt: u32, status: &tonic::Status) -> RetryDecision {
+    if attempt >= retry.max_attempts || !is_retryable_code(status.code()) {
+        RetryDecision::GiveUp(BackendError::Connection(format!("gRPC error: {status}")))
+    } else {
+        RetryDecision::Retry(retry.backoff_duration(attempt - 1))
     }
+}
 
-    /// Convert ChordState to proto ChordState
-    fn to_proto_chord(&self, state: &ChordState) -> proto::ChordState {
-        proto::ChordState {
-            chord_id: state.chord_id.to_string(),
-            total: state.total as u32,
-            completed: state.completed as u32,
-            callback: state.callback.clone(),
-            task_ids: state.task_ids.iter().map(|id| id.to_string()).collect(),
-            created_at: state.created_at.timestamp(),
-            timeout_seconds: state.timeout.map(|d| d.as_secs()),
-            cancelled: state.cancelled,
-            cancellation_reason: state.cancellation_reason.clone(),
-        }
-    }
-
-    /// Convert proto ChordState to ChordState
-    fn from_proto_chord(proto_state: proto::ChordState) -> Result<ChordState> {
-        let chord_id = Uuid::parse_str(&proto_state.chord_id)
-            .map_err(|e| BackendError::Serialization(format!("Invalid chord UUID: {}", e)))?;
-
-        let task_ids: Result<Vec<Uuid>> = proto_state
-            .task_ids
-            .iter()
-            .map(|s| {
-                Uuid::parse_str(s)
-                    .map_err(|e| BackendError::Serialization(format!("Invalid task UUID: {}", e)))
-            })
-            .collect();
-
-        Ok(ChordState {
-            chord_id,
-            total: proto_state.total as usize,
-            completed: proto_state.completed as usize,
-            callback: proto_state.callback,
-            task_ids: task_ids?,
-            created_at: Utc
-                .timestamp_opt(proto_state.created_at, 0)
-                .single()
-                .ok_or_else(|| BackendError::Serialization("Invalid timestamp".to_string()))?,
-            timeout: proto_state.timeout_seconds.map(Duration::from_secs),
-            cancelled: proto_state.cancelled,
-            cancellation_reason: proto_state.cancellation_reason,
-            retry_count: 0,
-            max_retries: None,
-        })
-    }
+/// Sleep for `backoff` before the next retry attempt, logging why.
+async fn wait_before_retry(
+    operation: &'static str,
+    attempt: u32,
+    backoff: Duration,
+    code: tonic::Code,
+) {
+    tracing::debug!(
+        operation,
+        attempt,
+        backoff_ms = backoff.as_millis(),
+        ?code,
+        "retrying gRPC call after backoff"
+    );
+    tokio::time::sleep(backoff).await;
 }
 
 #[async_trait]
 impl ResultBackend for GrpcResultBackend {
     async fn store_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<()> {
-        let request = tonic::Request::new(StoreResultRequest {
+        let proto_meta = codec::to_proto_meta(meta)?;
+        let message = StoreResultRequest {
             task_id: task_id.to_string(),
-            meta: Some(self.to_proto_meta(meta)),
-        });
+            meta: Some(proto_meta),
+        };
 
         let start = std::time::Instant::now();
-        let result = self
-            .client
-            .store_result(request)
-            .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let mut attempt = 0u32;
+        let result = loop {
+            let request = self.prepare_request(message.clone())?;
+            match self.client.store_result(request).await {
+                Ok(resp) => break Ok(resp),
+                Err(status) => {
+                    attempt += 1;
+                    match decide_retry(&self.config.retry, attempt, &status) {
+                        RetryDecision::GiveUp(err) => break Err(err),
+                        RetryDecision::Retry(backoff) => {
+                            wait_before_retry("store_result", attempt, backoff, status.code())
+                                .await;
+                        }
+                    }
+                }
+            }
+        };
         let elapsed = start.elapsed();
-        let is_error = result.is_err();
         self.metrics
-            .record(RpcOperation::StoreResult, elapsed, is_error);
+            .record(RpcOperation::StoreResult, elapsed, result.is_err());
 
         result.map(|_| ())
     }
 
     async fn get_result(&mut self, task_id: Uuid) -> Result<Option<TaskMeta>> {
-        let request = tonic::Request::new(GetResultRequest {
+        let message = GetResultRequest {
             task_id: task_id.to_string(),
-        });
+        };
 
         let start = std::time::Instant::now();
-        let result = self
-            .client
-            .get_result(request)
-            .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let mut attempt = 0u32;
+        let result = loop {
+            let request = self.prepare_request(message.clone())?;
+            match self.client.get_result(request).await {
+                Ok(resp) => break Ok(resp),
+                Err(status) => {
+                    attempt += 1;
+                    match decide_retry(&self.config.retry, attempt, &status) {
+                        RetryDecision::GiveUp(err) => break Err(err),
+                        RetryDecision::Retry(backoff) => {
+                            wait_before_retry("get_result", attempt, backoff, status.code()).await;
+                        }
+                    }
+                }
+            }
+        };
         let elapsed = start.elapsed();
-        let is_error = result.is_err();
         self.metrics
-            .record(RpcOperation::GetResult, elapsed, is_error);
+            .record(RpcOperation::GetResult, elapsed, result.is_err());
 
         match result?.into_inner().meta {
-            Some(proto_meta) => Ok(Some(Self::from_proto_meta(proto_meta)?)),
+            Some(proto_meta) => Ok(Some(codec::from_proto_meta(proto_meta)?)),
             None => Ok(None),
         }
     }
 
     async fn delete_result(&mut self, task_id: Uuid) -> Result<()> {
-        let request = tonic::Request::new(DeleteResultRequest {
+        let message = DeleteResultRequest {
             task_id: task_id.to_string(),
-        });
+        };
 
         let start = std::time::Instant::now();
-        let result = self
-            .client
-            .delete_result(request)
-            .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let mut attempt = 0u32;
+        let result = loop {
+            let request = self.prepare_request(message.clone())?;
+            match self.client.delete_result(request).await {
+                Ok(resp) => break Ok(resp),
+                Err(status) => {
+                    attempt += 1;
+                    match decide_retry(&self.config.retry, attempt, &status) {
+                        RetryDecision::GiveUp(err) => break Err(err),
+                        RetryDecision::Retry(backoff) => {
+                            wait_before_retry("delete_result", attempt, backoff, status.code())
+                                .await;
+                        }
+                    }
+                }
+            }
+        };
         let elapsed = start.elapsed();
-        let is_error = result.is_err();
         self.metrics
-            .record(RpcOperation::DeleteResult, elapsed, is_error);
+            .record(RpcOperation::DeleteResult, elapsed, result.is_err());
 
         result.map(|_| ())
     }
 
     async fn set_expiration(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
-        let request = tonic::Request::new(SetExpirationRequest {
+        let message = SetExpirationRequest {
             task_id: task_id.to_string(),
             ttl_seconds: ttl.as_secs(),
-        });
+        };
 
         let start = std::time::Instant::now();
-        let result = self
-            .client
-            .set_expiration(request)
-            .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let mut attempt = 0u32;
+        let result = loop {
+            let request = self.prepare_request(message.clone())?;
+            match self.client.set_expiration(request).await {
+                Ok(resp) => break Ok(resp),
+                Err(status) => {
+                    attempt += 1;
+                    match decide_retry(&self.config.retry, attempt, &status) {
+                        RetryDecision::GiveUp(err) => break Err(err),
+                        RetryDecision::Retry(backoff) => {
+                            wait_before_retry("set_expiration", attempt, backoff, status.code())
+                                .await;
+                        }
+                    }
+                }
+            }
+        };
         let elapsed = start.elapsed();
-        let is_error = result.is_err();
         self.metrics
-            .record(RpcOperation::SetExpiration, elapsed, is_error);
+            .record(RpcOperation::SetExpiration, elapsed, result.is_err());
 
         result.map(|_| ())
     }
 
     async fn chord_init(&mut self, state: ChordState) -> Result<()> {
-        let request = tonic::Request::new(ChordInitRequest {
-            state: Some(self.to_proto_chord(&state)),
-        });
+        let message = ChordInitRequest {
+            state: Some(codec::to_proto_chord(&state)),
+        };
 
         let start = std::time::Instant::now();
-        let result = self
-            .client
-            .chord_init(request)
-            .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let mut attempt = 0u32;
+        let result = loop {
+            let request = self.prepare_request(message.clone())?;
+            match self.client.chord_init(request).await {
+                Ok(resp) => break Ok(resp),
+                Err(status) => {
+                    attempt += 1;
+                    match decide_retry(&self.config.retry, attempt, &status) {
+                        RetryDecision::GiveUp(err) => break Err(err),
+                        RetryDecision::Retry(backoff) => {
+                            wait_before_retry("chord_init", attempt, backoff, status.code()).await;
+                        }
+                    }
+                }
+            }
+        };
         let elapsed = start.elapsed();
-        let is_error = result.is_err();
         self.metrics
-            .record(RpcOperation::ChordInit, elapsed, is_error);
+            .record(RpcOperation::ChordInit, elapsed, result.is_err());
 
         result.map(|_| ())
     }
 
     async fn chord_complete_task(&mut self, chord_id: Uuid) -> Result<usize> {
-        let request = tonic::Request::new(ChordCompleteTaskRequest {
+        let message = ChordCompleteTaskRequest {
             chord_id: chord_id.to_string(),
-        });
+        };
 
         let start = std::time::Instant::now();
-        let result = self
-            .client
-            .chord_complete_task(request)
-            .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let mut attempt = 0u32;
+        let result = loop {
+            let request = self.prepare_request(message.clone())?;
+            match self.client.chord_complete_task(request).await {
+                Ok(resp) => break Ok(resp),
+                Err(status) => {
+                    attempt += 1;
+                    match decide_retry(&self.config.retry, attempt, &status) {
+                        RetryDecision::GiveUp(err) => break Err(err),
+                        RetryDecision::Retry(backoff) => {
+                            wait_before_retry(
+                                "chord_complete_task",
+                                attempt,
+                                backoff,
+                                status.code(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        };
         let elapsed = start.elapsed();
-        let is_error = result.is_err();
         self.metrics
-            .record(RpcOperation::ChordCompleteTask, elapsed, is_error);
+            .record(RpcOperation::ChordCompleteTask, elapsed, result.is_err());
 
         Ok(result?.into_inner().completed_count as usize)
     }
 
     async fn chord_get_state(&mut self, chord_id: Uuid) -> Result<Option<ChordState>> {
-        let request = tonic::Request::new(ChordGetStateRequest {
+        let message = ChordGetStateRequest {
             chord_id: chord_id.to_string(),
-        });
+        };
 
         let start = std::time::Instant::now();
-        let result = self
-            .client
-            .chord_get_state(request)
-            .await
-            .map_err(|e| BackendError::Connection(format!("gRPC error: {}", e)));
+        let mut attempt = 0u32;
+        let result = loop {
+            let request = self.prepare_request(message.clone())?;
+            match self.client.chord_get_state(request).await {
+                Ok(resp) => break Ok(resp),
+                Err(status) => {
+                    attempt += 1;
+                    match decide_retry(&self.config.retry, attempt, &status) {
+                        RetryDecision::GiveUp(err) => break Err(err),
+                        RetryDecision::Retry(backoff) => {
+                            wait_before_retry("chord_get_state", attempt, backoff, status.code())
+                                .await;
+                        }
+                    }
+                }
+            }
+        };
         let elapsed = start.elapsed();
-        let is_error = result.is_err();
         self.metrics
-            .record(RpcOperation::ChordGetState, elapsed, is_error);
+            .record(RpcOperation::ChordGetState, elapsed, result.is_err());
 
         match result?.into_inner().state {
-            Some(proto_state) => Ok(Some(Self::from_proto_chord(proto_state)?)),
+            Some(proto_state) => Ok(Some(codec::from_proto_chord(proto_state)?)),
             None => Ok(None),
         }
     }
@@ -384,6 +461,8 @@ impl ResultBackend for GrpcResultBackend {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use chrono::Utc;
     use uuid::Uuid;
@@ -409,125 +488,164 @@ mod tests {
         }
     }
 
-    fn create_test_chord_state() -> ChordState {
-        ChordState {
-            chord_id: Uuid::new_v4(),
-            total: 5,
-            completed: 0,
-            callback: Some("callback_task".to_string()),
-            task_ids: vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()],
-            created_at: Utc::now(),
-            timeout: None,
-            cancelled: false,
-            cancellation_reason: None,
-            retry_count: 0,
-            max_retries: None,
-        }
-    }
-
-    // Helper to create a dummy backend for testing conversion methods
-    // Note: This doesn't actually connect to a server
+    // Helper to create a dummy backend for testing config/plumbing without
+    // a live server.
+    // Note: `connect_lazy()` does not actually connect to a server.
     fn create_dummy_backend() -> GrpcResultBackend {
-        // Create an endpoint but don't connect
         let channel =
             tonic::transport::Endpoint::from_static("http://localhost:50051").connect_lazy();
         GrpcResultBackend::from_channel(channel)
     }
 
+    fn create_dummy_backend_with_config(config: GrpcConfig) -> GrpcResultBackend {
+        let channel =
+            tonic::transport::Endpoint::from_static("http://localhost:50051").connect_lazy();
+        GrpcResultBackend::from_channel_with_config(channel, config)
+    }
+
+    // The four tests below construct a `GrpcResultBackend` via
+    // `connect_lazy()`, which (through hyper-util's executor) requires an
+    // active Tokio runtime even though nothing here performs I/O — hence
+    // `#[tokio::test]` rather than plain `#[test]`.
+
+    #[tokio::test]
+    async fn test_default_backend_uses_default_config() {
+        let backend = create_dummy_backend();
+        assert_eq!(
+            backend.config().request_timeout,
+            config::DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            backend.config().max_message_size,
+            config::DEFAULT_MAX_MESSAGE_SIZE
+        );
+        assert!(backend.config().auth_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_from_channel_with_config_applies_config() {
+        let config = GrpcConfig::new()
+            .with_request_timeout(Duration::from_secs(3))
+            .with_max_message_size(2048)
+            .with_auth_token("tok");
+        let backend = create_dummy_backend_with_config(config);
+
+        assert_eq!(backend.config().request_timeout, Duration::from_secs(3));
+        assert_eq!(backend.config().max_message_size, 2048);
+        assert_eq!(backend.config().auth_token.as_deref(), Some("tok"));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_request_sets_grpc_timeout_header() {
+        let backend = create_dummy_backend_with_config(
+            GrpcConfig::new().with_request_timeout(Duration::from_secs(7)),
+        );
+
+        let request = backend
+            .prepare_request(GetResultRequest {
+                task_id: "x".to_string(),
+            })
+            .unwrap();
+
+        // Matches tonic's own documented encoding for `Request::set_timeout`:
+        // microseconds with a `u` suffix.
+        assert_eq!(request.metadata().get("grpc-timeout").unwrap(), "7000000u");
+    }
+
+    #[tokio::test]
+    async fn test_prepare_request_sets_auth_header_when_configured() {
+        let backend = create_dummy_backend_with_config(GrpcConfig::new().with_auth_token("s3cr3t"));
+
+        let request = backend
+            .prepare_request(GetResultRequest {
+                task_id: "x".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer s3cr3t"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_request_omits_auth_header_by_default() {
+        let backend = create_dummy_backend();
+        let request = backend
+            .prepare_request(GetResultRequest {
+                task_id: "x".to_string(),
+            })
+            .unwrap();
+        assert!(request.metadata().get("authorization").is_none());
+    }
+
+    #[test]
+    fn test_decide_retry_backs_off_on_unavailable() {
+        let retry = RetryStrategy::new()
+            .with_max_attempts(3)
+            .with_initial_backoff(Duration::from_millis(50))
+            .with_multiplier(2.0)
+            .with_jitter(false);
+        let status = tonic::Status::unavailable("server down");
+
+        match decide_retry(&retry, 1, &status) {
+            RetryDecision::Retry(backoff) => assert_eq!(backoff, Duration::from_millis(50)),
+            RetryDecision::GiveUp(e) => panic!("expected a retry on attempt 1 of 3, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_retry_retries_on_deadline_exceeded() {
+        let retry = RetryStrategy::new().with_max_attempts(5);
+        let status = tonic::Status::deadline_exceeded("too slow");
+        match decide_retry(&retry, 1, &status) {
+            RetryDecision::Retry(_) => {}
+            RetryDecision::GiveUp(e) => panic!("DeadlineExceeded should be retried, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_retry_gives_up_after_max_attempts() {
+        let retry = RetryStrategy::new().with_max_attempts(2);
+        let status = tonic::Status::unavailable("still down");
+
+        match decide_retry(&retry, 2, &status) {
+            RetryDecision::GiveUp(BackendError::Connection(msg)) => {
+                assert!(msg.contains("gRPC error"));
+            }
+            other => panic!("expected GiveUp at attempt == max_attempts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_retry_never_retries_non_retryable_status() {
+        let retry = RetryStrategy::new().with_max_attempts(10);
+        let status = tonic::Status::invalid_argument("bad request");
+
+        match decide_retry(&retry, 1, &status) {
+            RetryDecision::GiveUp(_) => {}
+            RetryDecision::Retry(_) => panic!("InvalidArgument must never be retried"),
+        }
+    }
+
     #[tokio::test]
     async fn test_proto_meta_pending_conversion() {
-        let backend = create_dummy_backend();
-
         let meta = create_test_meta();
         let task_id = meta.task_id;
 
-        let proto_meta = backend.to_proto_meta(&meta);
+        let proto_meta = codec::to_proto_meta(&meta).unwrap();
         assert_eq!(proto_meta.task_id, task_id.to_string());
         assert_eq!(proto_meta.task_name, "test_task");
-        assert_eq!(proto_meta.result_state, TaskResultState::Pending as i32);
 
-        let converted = GrpcResultBackend::from_proto_meta(proto_meta).unwrap();
+        let converted = codec::from_proto_meta(proto_meta).unwrap();
         assert_eq!(converted.task_id, task_id);
         assert_eq!(converted.task_name, "test_task");
         assert!(matches!(converted.result, TaskResult::Pending));
-    }
-
-    #[tokio::test]
-    async fn test_proto_meta_success_conversion() {
-        let backend = create_dummy_backend();
-
-        let mut meta = create_test_meta();
-        meta.result = TaskResult::Success(serde_json::json!({"result": 42}));
-
-        let proto_meta = backend.to_proto_meta(&meta);
-        assert_eq!(proto_meta.result_state, TaskResultState::Success as i32);
-        assert!(proto_meta.result_data.is_some());
-
-        let converted = GrpcResultBackend::from_proto_meta(proto_meta).unwrap();
-        match converted.result {
-            TaskResult::Success(data) => {
-                assert_eq!(data["result"], 42);
-            }
-            _ => panic!("Expected Success result"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_proto_meta_failure_conversion() {
-        let backend = create_dummy_backend();
-
-        let mut meta = create_test_meta();
-        meta.result = TaskResult::Failure("task failed".to_string());
-
-        let proto_meta = backend.to_proto_meta(&meta);
-        assert_eq!(proto_meta.result_state, TaskResultState::Failure as i32);
-        assert_eq!(proto_meta.error_message, Some("task failed".to_string()));
-
-        let converted = GrpcResultBackend::from_proto_meta(proto_meta).unwrap();
-        match converted.result {
-            TaskResult::Failure(msg) => assert_eq!(msg, "task failed"),
-            _ => panic!("Expected Failure result"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_proto_meta_retry_conversion() {
-        let backend = create_dummy_backend();
-
-        let mut meta = create_test_meta();
-        meta.result = TaskResult::Retry(3);
-
-        let proto_meta = backend.to_proto_meta(&meta);
-        assert_eq!(proto_meta.result_state, TaskResultState::Retry as i32);
-        assert_eq!(proto_meta.retry_count, Some(3));
-
-        let converted = GrpcResultBackend::from_proto_meta(proto_meta).unwrap();
-        match converted.result {
-            TaskResult::Retry(count) => assert_eq!(count, 3),
-            _ => panic!("Expected Retry result"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_proto_chord_conversion() {
-        let backend = create_dummy_backend();
-
-        let chord_state = create_test_chord_state();
-        let chord_id = chord_state.chord_id;
-
-        let proto_chord = backend.to_proto_chord(&chord_state);
-        assert_eq!(proto_chord.chord_id, chord_id.to_string());
-        assert_eq!(proto_chord.total, 5);
-        assert_eq!(proto_chord.completed, 0);
-        assert_eq!(proto_chord.callback, Some("callback_task".to_string()));
-        assert_eq!(proto_chord.task_ids.len(), 3);
-
-        let converted = GrpcResultBackend::from_proto_chord(proto_chord).unwrap();
-        assert_eq!(converted.chord_id, chord_id);
-        assert_eq!(converted.total, 5);
-        assert_eq!(converted.completed, 0);
-        assert_eq!(converted.callback, Some("callback_task".to_string()));
-        assert_eq!(converted.task_ids.len(), 3);
     }
 
     #[tokio::test]

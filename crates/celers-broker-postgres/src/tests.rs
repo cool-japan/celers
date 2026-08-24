@@ -140,13 +140,34 @@ fn test_task_result_status_serialization() {
     assert_eq!(deserialized, status);
 }
 
-#[tokio::test]
-#[ignore] // Requires PostgreSQL running
-async fn test_postgres_broker_lifecycle() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+/// The connection string integration tests run against, if one is configured.
+///
+/// Gating on this variable rather than `#[ignore]` means the test runs by
+/// default wherever a database is available, instead of needing
+/// `-- --ignored` — which is why the delivery-identity bug went unnoticed for
+/// so long.
+fn integration_db_url() -> Option<String> {
+    match std::env::var("CELERS_TEST_POSTGRES_URL") {
+        Ok(url) if !url.trim().is_empty() => Some(url),
+        _ => None,
+    }
+}
 
-    let broker = PostgresBroker::new(&database_url).await.unwrap();
+/// A queue label private to one test run.
+fn integration_queue() -> String {
+    format!("itest_{}", Uuid::new_v4().simple())
+}
+
+#[tokio::test]
+async fn test_postgres_broker_lifecycle() {
+    let Some(database_url) = integration_db_url() else {
+        eprintln!("skipping test_postgres_broker_lifecycle: CELERS_TEST_POSTGRES_URL is not set");
+        return;
+    };
+
+    let broker = PostgresBroker::with_queue(&database_url, &integration_queue())
+        .await
+        .unwrap();
     broker.migrate().await.unwrap();
 
     // Test enqueue
@@ -158,13 +179,15 @@ async fn test_postgres_broker_lifecycle() {
 
     // Test queue size
     let size = broker.queue_size().await.unwrap();
-    assert!(size >= 1);
+    assert_eq!(size, 1);
 
     // Test dequeue
     let msg = broker.dequeue().await.unwrap();
     assert!(msg.is_some());
     let msg = msg.unwrap();
     assert_eq!(msg.task.metadata.name, "test_task");
+    // The delivered id must be the database row id, not a fresh UUID.
+    assert_eq!(msg.task.metadata.id, task_id);
 
     // Test ack
     broker
@@ -172,21 +195,32 @@ async fn test_postgres_broker_lifecycle() {
         .await
         .unwrap();
 
-    // Verify task is completed
+    // A task stuck in 'processing' would also make queue_size() zero, so
+    // assert on the row's actual state as well.
+    let stored = broker.get_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(stored.state, DbTaskState::Completed);
     let size = broker.queue_size().await.unwrap();
     assert_eq!(size, 0);
 }
 
 #[tokio::test]
-#[ignore] // Requires PostgreSQL running
 async fn test_skip_locked_concurrent_dequeue() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+    let Some(database_url) = integration_db_url() else {
+        eprintln!(
+            "skipping test_skip_locked_concurrent_dequeue: CELERS_TEST_POSTGRES_URL is not set"
+        );
+        return;
+    };
 
-    let broker1 = PostgresBroker::new(&database_url).await.unwrap();
+    let queue = integration_queue();
+    let broker1 = PostgresBroker::with_queue(&database_url, &queue)
+        .await
+        .unwrap();
     broker1.migrate().await.unwrap();
 
-    let broker2 = PostgresBroker::new(&database_url).await.unwrap();
+    let broker2 = PostgresBroker::with_queue(&database_url, &queue)
+        .await
+        .unwrap();
 
     // Enqueue multiple tasks
     for i in 0..10 {
@@ -197,16 +231,23 @@ async fn test_skip_locked_concurrent_dequeue() {
     // Dequeue concurrently
     let (msg1, msg2) = tokio::join!(broker1.dequeue(), broker2.dequeue());
 
-    let msg1 = msg1.unwrap();
-    let msg2 = msg2.unwrap();
+    let msg1 = msg1.unwrap().expect("claimer 1 should get a task");
+    let msg2 = msg2.unwrap().expect("claimer 2 should get a task");
 
-    // Both should get different tasks (SKIP LOCKED ensures no contention)
-    assert!(msg1.is_some());
-    assert!(msg2.is_some());
-    assert_ne!(
-        msg1.unwrap().task.metadata.id,
-        msg2.unwrap().task.metadata.id
-    );
+    // Assert on DATABASE identity. While `dequeue` minted a fresh
+    // `Uuid::new_v4()` per message this assertion passed vacuously — it would
+    // have held even if both claimers took the same row.
+    assert_ne!(msg1.task.metadata.id, msg2.task.metadata.id);
+    for id in [msg1.task.metadata.id, msg2.task.metadata.id] {
+        let stored = broker1
+            .get_task(&id)
+            .await
+            .unwrap()
+            .expect("claimed row must exist in celers_tasks");
+        assert_eq!(stored.state, DbTaskState::Processing);
+    }
+    // Exactly two of the ten were claimed.
+    assert_eq!(broker1.queue_size().await.unwrap(), 8);
 }
 
 #[test]
@@ -282,18 +323,22 @@ fn test_retry_strategy_default() {
 }
 
 #[tokio::test]
-#[ignore] // Requires PostgreSQL running
 async fn test_pool_metrics() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+    let Some(database_url) = integration_db_url() else {
+        eprintln!("skipping test_pool_metrics: CELERS_TEST_POSTGRES_URL is not set");
+        return;
+    };
 
-    let broker = PostgresBroker::new(&database_url).await.unwrap();
+    let broker = PostgresBroker::with_queue(&database_url, &integration_queue())
+        .await
+        .unwrap();
     broker.migrate().await.unwrap();
 
     let metrics = broker.get_pool_metrics();
 
-    // Pool should have some configuration
+    // Every field is now read from the real pool rather than hardcoded to 0.
     assert!(metrics.max_size > 0);
+    assert_eq!(metrics.max_size, broker.pool_size());
     assert!(metrics.size <= metrics.max_size);
     assert_eq!(metrics.size, metrics.idle + metrics.in_use);
 }
@@ -431,6 +476,7 @@ fn test_stage_status_serialization() {
         processing_tasks: 0,
         is_complete: false,
         dependencies_met: true,
+        unmet_dependencies: Vec::new(),
     };
 
     let json = serde_json::to_string(&status).unwrap();
@@ -439,6 +485,7 @@ fn test_stage_status_serialization() {
     assert_eq!(deserialized.stage_id, "stage1");
     assert_eq!(deserialized.total_tasks, 5);
     assert!(deserialized.dependencies_met);
+    assert!(deserialized.unmet_dependencies.is_empty());
     assert!(!deserialized.is_complete);
 }
 
@@ -453,6 +500,7 @@ fn test_workflow_status_serialization() {
         processing_tasks: 0,
         is_complete: true,
         dependencies_met: true,
+        unmet_dependencies: Vec::new(),
     };
 
     let status = WorkflowStatus {
@@ -1273,4 +1321,64 @@ async fn test_get_cancellation_reasons() {
     // 1. Cancel tasks with various reasons
     // 2. Call get_cancellation_reasons
     // 3. Verify reasons are grouped and counted correctly
+}
+
+// ========== Queue-label validation (no database required) ==========
+
+#[tokio::test]
+async fn test_broker_rejects_unsafe_queue_names_before_connecting() {
+    // Validation happens before any TLS resolution or socket work, so these
+    // assertions need no database — and they are the regression guard for the
+    // queue label ever reaching SQL text with quotes or a statement break in
+    // it. The connection string is deliberately unroutable: reaching the
+    // connect step at all would make the test hang or fail differently.
+    for bad in [
+        "",
+        "tasks'; DROP TABLE celers_tasks; --",
+        "public.celers_tasks",
+        "with space",
+        "queue\"name",
+    ] {
+        let result = PostgresBroker::with_queue("postgres://127.0.0.1:1/none", bad).await;
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("queue name {bad:?} should have been rejected"));
+        assert!(
+            err.to_string().contains("queue name"),
+            "expected a queue-name validation error for {bad:?}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_retry_strategy_backoff_sql_shapes() {
+    // The reject path evaluates the backoff server-side so the whole
+    // transition can be a single atomic statement; these expressions are what
+    // it splices in, and they must stay pure numeric SQL over `retry_count`.
+    assert_eq!(RetryStrategy::Immediate.backoff_sql(), "0::bigint");
+    assert_eq!(
+        RetryStrategy::Fixed { delay_secs: 30 }.backoff_sql(),
+        "30::bigint"
+    );
+    assert!(RetryStrategy::Linear {
+        base_delay_secs: 10,
+        max_delay_secs: 100,
+    }
+    .backoff_sql()
+    .contains("retry_count"));
+
+    let exponential = RetryStrategy::Exponential {
+        max_delay_secs: 3600,
+    }
+    .backoff_sql();
+    assert!(exponential.contains("3600::bigint"));
+    // Clamped so the bigint cast cannot overflow on a pathological
+    // retry_count, unlike the client-side `2_i64.pow(retry_count)`.
+    assert!(exponential.contains("LEAST(GREATEST(retry_count, 0), 62)"));
+
+    assert!(RetryStrategy::ExponentialWithJitter {
+        max_delay_secs: 3600,
+    }
+    .backoff_sql()
+    .contains("random()"));
 }

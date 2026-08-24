@@ -18,7 +18,7 @@ impl ResultBackend for RedisResultBackend {
     async fn store_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<()> {
         let start = std::time::Instant::now();
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
         let value =
             serde_json::to_string(meta).map_err(|e| BackendError::Serialization(e.to_string()))?;
@@ -120,7 +120,7 @@ impl ResultBackend for RedisResultBackend {
         // Cache miss, fetch from Redis
         self.metrics.record_cache_miss();
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
 
         let value: Option<Vec<u8>> = conn.get(&key).await?;
@@ -185,7 +185,7 @@ impl ResultBackend for RedisResultBackend {
     async fn delete_result(&mut self, task_id: Uuid) -> Result<()> {
         let start = std::time::Instant::now();
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
 
         // Clean up chunk keys if this was a chunked result (best-effort)
@@ -216,14 +216,14 @@ impl ResultBackend for RedisResultBackend {
     }
 
     async fn set_expiration(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
         conn.expire::<_, ()>(&key, ttl.as_secs() as i64).await?;
         Ok(())
     }
 
     async fn chord_init(&mut self, state: ChordState) -> Result<()> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.chord_key(state.chord_id);
         let counter_key = self.chord_counter_key(state.chord_id);
 
@@ -242,7 +242,7 @@ impl ResultBackend for RedisResultBackend {
     async fn chord_complete_task(&mut self, chord_id: Uuid) -> Result<usize> {
         let start = std::time::Instant::now();
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let counter_key = self.chord_counter_key(chord_id);
 
         // Atomically increment and return new value
@@ -256,7 +256,7 @@ impl ResultBackend for RedisResultBackend {
     }
 
     async fn chord_get_state(&mut self, chord_id: Uuid) -> Result<Option<ChordState>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let key = self.chord_key(chord_id);
 
         let value: Option<String> = conn.get(&key).await?;
@@ -287,7 +287,7 @@ impl ResultBackend for RedisResultBackend {
 
         let start = std::time::Instant::now();
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut pipe = redis::pipe();
 
         for (task_id, meta) in results {
@@ -329,7 +329,7 @@ impl ResultBackend for RedisResultBackend {
 
         let start = std::time::Instant::now();
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut pipe = redis::pipe();
 
         for task_id in task_ids {
@@ -379,7 +379,7 @@ impl ResultBackend for RedisResultBackend {
 
         let start = std::time::Instant::now();
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.connection().await?;
         let mut pipe = redis::pipe();
 
         for task_id in task_ids {

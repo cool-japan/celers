@@ -116,7 +116,9 @@ pub struct EventSnapshotBuilder {
     failed: u64,
     retried: u64,
     revoked: u64,
-    queue_depth: u64,
+    /// Explicit aggregate depth set via [`EventSnapshotBuilder::total_queue_depth`].
+    /// When absent, the aggregate is the sum of `queue_depths` at build time.
+    total_queue_depth: Option<u64>,
     queue_depths: HashMap<String, u64>,
     workers: std::collections::HashSet<String>,
     worker_count_override: Option<u64>,
@@ -185,19 +187,23 @@ impl EventSnapshotBuilder {
         self
     }
 
-    /// Set the depth for a specific queue (also adds to the total).
+    /// Set the depth for a specific queue.
+    ///
+    /// The aggregate depth is derived from the per-queue map at build time (see
+    /// [`EventSnapshotBuilder::build`]), so calls may be made in any order and
+    /// overwriting a queue's depth can never underflow the total.
     #[must_use]
     pub fn queue_depth(mut self, queue: impl Into<String>, depth: u64) -> Self {
-        let q = queue.into();
-        let prev = self.queue_depths.insert(q, depth).unwrap_or(0);
-        self.queue_depth = self.queue_depth + depth - prev;
+        self.queue_depths.insert(queue.into(), depth);
         self
     }
 
     /// Set the aggregate queue depth directly (when per-queue detail is absent).
+    ///
+    /// This overrides the sum of the per-queue depths.
     #[must_use]
     pub fn total_queue_depth(mut self, depth: u64) -> Self {
-        self.queue_depth = depth;
+        self.total_queue_depth = Some(depth);
         self
     }
 
@@ -246,6 +252,11 @@ impl EventSnapshotBuilder {
         let worker_count = self
             .worker_count_override
             .unwrap_or(self.workers.len() as u64);
+        let queue_depth = self.total_queue_depth.unwrap_or_else(|| {
+            self.queue_depths
+                .values()
+                .fold(0u64, |acc, depth| acc.saturating_add(*depth))
+        });
         EventSnapshot {
             timestamp: self.timestamp.unwrap_or_else(Utc::now),
             pending: self.pending,
@@ -254,7 +265,7 @@ impl EventSnapshotBuilder {
             failed: self.failed,
             retried: self.retried,
             revoked: self.revoked,
-            queue_depth: self.queue_depth,
+            queue_depth,
             worker_count,
             queue_depths: self.queue_depths,
         }
@@ -460,6 +471,13 @@ impl RuleAlert {
     }
 }
 
+/// Hard cap on the number of completion samples a single rule may retain.
+///
+/// Events arrive from many workers, so a single skewed-ahead clock could
+/// otherwise keep the window from ever draining. The cap bounds memory
+/// regardless of what timestamps arrive.
+pub const MAX_WINDOW_SAMPLES: usize = 10_000;
+
 /// Per-rule mutable evaluation state held by the evaluator.
 #[derive(Debug)]
 struct RuleState {
@@ -469,6 +487,9 @@ struct RuleState {
     last_fired: Option<DateTime<Utc>>,
     /// For failure-rate rules: recent completions as (timestamp, was_failure).
     completions: VecDeque<(DateTime<Utc>, bool)>,
+    /// Highest event timestamp seen so far, used as a monotonic "now" so that
+    /// an out-of-order (or clock-skewed) event cannot rewind the window.
+    max_seen_ts: Option<DateTime<Utc>>,
 }
 
 impl RuleState {
@@ -477,7 +498,18 @@ impl RuleState {
             firing: false,
             last_fired: None,
             completions: VecDeque::new(),
+            max_seen_ts: None,
         }
+    }
+
+    /// Fold `now` into the monotonic clock and return the effective "now".
+    fn observe_time(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
+        let effective = match self.max_seen_ts {
+            Some(seen) if seen > now => seen,
+            _ => now,
+        };
+        self.max_seen_ts = Some(effective);
+        effective
     }
 }
 
@@ -579,6 +611,10 @@ impl AlertEvaluator {
                     if let Some(is_failure) = completion {
                         state.completions.push_back((now, is_failure));
                     }
+                    // Events arrive from several workers, so timestamps are not
+                    // monotonic: evaluate against the highest timestamp seen so
+                    // far rather than this event's own.
+                    let now = state.observe_time(now);
                     Self::prune_completions(&mut state.completions, now, window);
                     let total = state.completions.len() as u64;
                     let failed = state.completions.iter().filter(|&&(_, f)| f).count() as u64;
@@ -788,19 +824,23 @@ impl AlertEvaluator {
         }
     }
 
-    /// Drop completions older than `window` from the front of the deque.
+    /// Drop completions that fall outside `window`, and enforce the hard cap.
+    ///
+    /// Pruning is order-independent (`retain`, not "pop while the *front* is
+    /// old"): entries arrive from multiple workers, so a single newer entry at
+    /// the front used to pin every older entry behind it in the window forever,
+    /// stretching the effective window far beyond the configured one.
     fn prune_completions(
         completions: &mut VecDeque<(DateTime<Utc>, bool)>,
         now: DateTime<Utc>,
         window: Duration,
     ) {
         let cutoff = now - chrono::Duration::milliseconds(window.as_millis() as i64);
-        while let Some(&(ts, _)) = completions.front() {
-            if ts < cutoff {
-                completions.pop_front();
-            } else {
-                break;
-            }
+        completions.retain(|(ts, _)| *ts >= cutoff);
+        // Belt and braces: a clock skewed far into the future would otherwise
+        // keep entries indefinitely, so the deque is also hard-capped.
+        while completions.len() > MAX_WINDOW_SAMPLES {
+            completions.pop_front();
         }
     }
 }
@@ -1090,5 +1130,80 @@ mod tests {
         }
         assert!(resolved);
         assert!(!eval.is_firing("fail"));
+    }
+
+    #[test]
+    fn test_queue_depth_builder_cannot_underflow() {
+        // Regression: the builder maintained a running u64 total with
+        // `total + depth - prev`, which panicked (debug) or wrapped to ~1.8e19
+        // (release) when `total_queue_depth` desynchronised it.
+        let snap = EventSnapshotBuilder::new()
+            .queue_depth("a", 10)
+            .total_queue_depth(5)
+            .queue_depth("a", 0)
+            .build();
+        assert_eq!(snap.queue_depth, 5, "explicit total wins");
+        assert_eq!(snap.queue_depths.get("a"), Some(&0));
+
+        // Without an explicit total, the aggregate is the sum of the map and is
+        // independent of call ordering.
+        let snap = EventSnapshotBuilder::new()
+            .queue_depth("a", 10)
+            .queue_depth("b", 4)
+            .queue_depth("a", 1)
+            .build();
+        assert_eq!(snap.queue_depth, 5);
+
+        // Overwriting a queue downwards is safe from any starting point.
+        let snap = EventSnapshotBuilder::new()
+            .queue_depth("a", u64::MAX)
+            .queue_depth("a", 0)
+            .build();
+        assert_eq!(snap.queue_depth, 0);
+    }
+
+    #[test]
+    fn test_failure_window_prunes_out_of_order_events() {
+        // Regression: pruning only popped from the *front*, so once a newer
+        // entry sat at the front every older entry behind it stayed in the
+        // window forever and the failure rate was computed over hours of data.
+        let rule = AlertRule::failure_rate("fail", AlertSeverity::Error, 0.9)
+            .with_window(Duration::from_secs(60))
+            .with_min_samples(1);
+        let mut eval = AlertEvaluator::new().with_rule(rule);
+
+        let now = Utc::now();
+        // A newer event arrives first (clock skew / delivery reordering)...
+        eval.observe_event(&succeeded_event(now));
+        // ...followed by a batch of older failures, all outside the window.
+        for i in 1..=20 {
+            eval.observe_event(&failed_event(now - chrono::Duration::seconds(600 + i)));
+        }
+
+        // Only the in-window sample survives, so the rule is not firing.
+        assert_eq!(eval.states[0].completions.len(), 1);
+        assert!(!eval.is_firing("fail"));
+    }
+
+    #[test]
+    fn test_failure_window_is_bounded_under_clock_skew() {
+        // A worker whose clock is far ahead must not be able to pin the window
+        // open: the deque is hard-capped regardless of timestamps.
+        let rule = AlertRule::failure_rate("fail", AlertSeverity::Error, 0.5)
+            .with_window(Duration::from_secs(1))
+            .with_min_samples(1);
+        let mut eval = AlertEvaluator::new().with_rule(rule);
+
+        let skewed = Utc::now() + chrono::Duration::days(3650);
+        // Push past the cap; every sample shares one (skewed) timestamp inside
+        // the window, so the hard cap is the only thing that can bound it.
+        for _ in 0..(MAX_WINDOW_SAMPLES + 250) {
+            eval.observe_event(&failed_event(skewed));
+        }
+        assert_eq!(eval.states[0].completions.len(), MAX_WINDOW_SAMPLES);
+
+        // A subsequent in-order event does not rewind the monotonic clock.
+        eval.observe_event(&succeeded_event(Utc::now()));
+        assert_eq!(eval.states[0].max_seen_ts, Some(skewed));
     }
 }

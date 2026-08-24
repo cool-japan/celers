@@ -6,8 +6,11 @@
 //! [`MysqlAnalytics`] expose the same five async methods but issue
 //! database-appropriate SQL internally.
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use crate::row_ext::RowExt;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use celers_backend_redis::BackendError;
+#[cfg(feature = "mysql")]
 use oxisql_core::Connection;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -128,10 +131,21 @@ pub struct StorageStats {
     pub total_rows: u64,
     /// Row count broken down by `result_state`.
     pub rows_by_state: HashMap<String, u64>,
-    /// Rough byte estimate for all stored `result_data` values.
+    /// Whole-table storage size estimate for `celers_task_results`, in bytes.
     ///
-    /// PostgreSQL: `SUM(octet_length(result_data::text))`.
-    /// MySQL: `SUM(LENGTH(result_data))`.
+    /// PostgreSQL: `pg_total_relation_size('celers_task_results')` (table +
+    /// indexes + TOAST, an O(1) catalog/filesystem read).
+    /// MySQL: `information_schema.tables.(data_length + index_length)` for
+    /// `celers_task_results` (an O(1) metadata read maintained by the
+    /// storage engine).
+    ///
+    /// This is a *whole-table* estimate, not a strict sum of `result_data`
+    /// payload bytes — deliberately, to avoid a full-table scan that
+    /// materializes every JSONB/JSON value as text just to measure it (on a
+    /// multi-million-row table that previous approach cost minutes of CPU
+    /// and I/O per call). It also better reflects actual disk usage
+    /// (including indexes and storage overhead), which is what operators
+    /// generally want out of a "storage stats" call.
     pub estimated_result_bytes: u64,
     /// Chords that have not yet reached `completed >= total`.
     pub active_chords: u64,
@@ -144,6 +158,7 @@ pub struct StorageStats {
 // ──────────────────────────────────────────────────────────────────
 
 /// Format a [`Duration`] as a PostgreSQL interval literal, e.g. `"3600 seconds"`.
+#[cfg(feature = "postgres")]
 fn pg_interval_secs(window: Duration) -> String {
     format!("{} seconds", window.as_secs())
 }
@@ -153,29 +168,31 @@ fn pg_interval_secs(window: Duration) -> String {
 // ──────────────────────────────────────────────────────────────────
 
 /// Analytics queries for a PostgreSQL result backend.
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 pub struct PostgresAnalytics {
-    conn: oxisql_postgres::PgConnection,
+    conn: crate::PgConnPool,
 }
 
-// Manual `Debug` impl: `oxisql_postgres::PgConnection` does not implement
-// `Debug` (unlike the previous `sqlx::PgPool`, which did), so `#[derive(Debug)]`
-// no longer applies directly. The connection handle carries no fields
-// meaningful to print (it wraps an `Arc<Mutex<tokio_postgres::Client>>`), so
-// this opaque placeholder preserves the type's `Debug` bound for any
-// generic code (`{:?}`-formatting callers, `assert_debug_snapshot!`, etc.)
-// without attempting to print connection internals.
+// Manual `Debug` impl: `crate::PgConnPool` does not implement `Debug` (it
+// wraps `oxisql_postgres::PgConnection`, which itself does not — unlike the
+// previous `sqlx::PgPool`, which did). The connection handle carries no
+// fields meaningful to print, so this opaque placeholder preserves the
+// type's `Debug` bound for any generic code (`{:?}`-formatting callers,
+// `assert_debug_snapshot!`, etc.) without attempting to print internals.
+#[cfg(feature = "postgres")]
 impl std::fmt::Debug for PostgresAnalytics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresAnalytics")
-            .field("conn", &"PgConnection { .. }")
+            .field("conn", &"PgConnPool { .. }")
             .finish()
     }
 }
 
+#[cfg(feature = "postgres")]
 impl PostgresAnalytics {
     /// Create a new analytics helper bound to `conn`.
-    pub fn new(conn: oxisql_postgres::PgConnection) -> Self {
+    pub fn new(conn: crate::PgConnPool) -> Self {
         Self { conn }
     }
 
@@ -199,7 +216,7 @@ impl PostgresAnalytics {
                     COUNT(*) FILTER (WHERE result_state = 'retry')        AS retry_count,
                     COUNT(*) FILTER (WHERE result_state = 'pending')      AS pending_count
                 FROM celers_task_results
-                WHERE created_at >= NOW() - $1::interval
+                WHERE created_at >= NOW() - $1::text::interval
                   AND ($2::text IS NULL OR task_name = $2)
                 "#,
                 &[&interval, &task_name],
@@ -263,7 +280,7 @@ impl PostgresAnalytics {
                 FROM celers_task_results
                 WHERE completed_at IS NOT NULL
                   AND started_at   IS NOT NULL
-                  AND created_at  >= NOW() - $1::interval
+                  AND created_at  >= NOW() - $1::text::interval
                   AND ($2::text IS NULL OR task_name = $2)
                   AND result_state IN ('success', 'failure')
                 "#,
@@ -277,22 +294,30 @@ impl PostgresAnalytics {
             BackendError::Connection("percentile_latencies query returned no rows".to_string())
         })?;
 
-        let p50: Option<f64> = row.col("p50").map_err(|e| {
+        // `EXTRACT(EPOCH FROM ...)` returns `numeric` (not `double precision`)
+        // since PostgreSQL 14, so `AVG`/`MIN`/`MAX` over it are `numeric` too
+        // and surface as `Value::Decimal`, which `row.col::<f64>` (via
+        // `FromValue`) cannot decode. `PERCENTILE_CONT(float8) WITHIN GROUP
+        // (ORDER BY float8)` is genuinely `float8` regardless of PG version,
+        // but `decimal_f64_from_row` (accepting F64/I64/Decimal uniformly) is
+        // used for every column here as the crate's canonical, version-
+        // independent numeric read.
+        let p50 = crate::row_ext::opt_decimal_f64_from_row(&row, "p50").map_err(|e| {
             BackendError::Connection(format!("percentile_latencies query failed: {e}"))
         })?;
-        let p95: Option<f64> = row.col("p95").map_err(|e| {
+        let p95 = crate::row_ext::opt_decimal_f64_from_row(&row, "p95").map_err(|e| {
             BackendError::Connection(format!("percentile_latencies query failed: {e}"))
         })?;
-        let p99: Option<f64> = row.col("p99").map_err(|e| {
+        let p99 = crate::row_ext::opt_decimal_f64_from_row(&row, "p99").map_err(|e| {
             BackendError::Connection(format!("percentile_latencies query failed: {e}"))
         })?;
-        let mean: Option<f64> = row.col("mean_secs").map_err(|e| {
+        let mean = crate::row_ext::opt_decimal_f64_from_row(&row, "mean_secs").map_err(|e| {
             BackendError::Connection(format!("percentile_latencies query failed: {e}"))
         })?;
-        let min: Option<f64> = row.col("min_secs").map_err(|e| {
+        let min = crate::row_ext::opt_decimal_f64_from_row(&row, "min_secs").map_err(|e| {
             BackendError::Connection(format!("percentile_latencies query failed: {e}"))
         })?;
-        let max: Option<f64> = row.col("max_secs").map_err(|e| {
+        let max = crate::row_ext::opt_decimal_f64_from_row(&row, "max_secs").map_err(|e| {
             BackendError::Connection(format!("percentile_latencies query failed: {e}"))
         })?;
 
@@ -326,7 +351,7 @@ impl PostgresAnalytics {
                                   AND started_at   IS NOT NULL)           AS avg_duration_secs
                 FROM celers_task_results
                 WHERE worker    IS NOT NULL
-                  AND created_at >= NOW() - $1::interval
+                  AND created_at >= NOW() - $1::text::interval
                 GROUP BY worker
                 ORDER BY total_tasks DESC
                 "#,
@@ -335,47 +360,58 @@ impl PostgresAnalytics {
             .await
             .map_err(|e| BackendError::Connection(format!("worker_stats query failed: {}", e)))?;
 
-        let stats = rows
-            .into_iter()
-            .map(|row| {
-                let total: i64 = row.col("total_tasks")?;
-                let success: i64 = row.col("success_tasks")?;
-                let failure: i64 = row.col("failure_tasks")?;
-                let avg_dur: Option<f64> = row.col("avg_duration_secs")?;
-                let tasks_per_hour = if window_hours > 0.0 {
-                    total as f64 / window_hours
-                } else {
-                    0.0
-                };
-                Ok(WorkerStat {
-                    worker: row.col("worker")?,
-                    total_tasks: total as u64,
-                    success_tasks: success as u64,
-                    failure_tasks: failure as u64,
-                    avg_duration_secs: avg_dur,
-                    tasks_per_hour,
-                })
-            })
-            .collect::<std::result::Result<Vec<WorkerStat>, oxisql_core::OxiSqlError>>()
-            .map_err(|e| {
+        let mut stats = Vec::with_capacity(rows.len());
+        for row in rows {
+            let total: i64 = row.col("total_tasks").map_err(|e| {
                 BackendError::Connection(format!("worker_stats row decode failed: {e}"))
             })?;
+            let success: i64 = row.col("success_tasks").map_err(|e| {
+                BackendError::Connection(format!("worker_stats row decode failed: {e}"))
+            })?;
+            let failure: i64 = row.col("failure_tasks").map_err(|e| {
+                BackendError::Connection(format!("worker_stats row decode failed: {e}"))
+            })?;
+            // See `percentile_latencies` above: EXTRACT(EPOCH ...) is
+            // `numeric` on PG >= 14, so this must accept `Value::Decimal`.
+            let avg_dur = crate::row_ext::opt_decimal_f64_from_row(&row, "avg_duration_secs")
+                .map_err(|e| {
+                    BackendError::Connection(format!("worker_stats row decode failed: {e}"))
+                })?;
+            let tasks_per_hour = if window_hours > 0.0 {
+                total as f64 / window_hours
+            } else {
+                0.0
+            };
+            stats.push(WorkerStat {
+                worker: row.col("worker").map_err(|e| {
+                    BackendError::Connection(format!("worker_stats row decode failed: {e}"))
+                })?,
+                total_tasks: total as u64,
+                success_tasks: success as u64,
+                failure_tasks: failure as u64,
+                avg_duration_secs: avg_dur,
+                tasks_per_hour,
+            });
+        }
 
         Ok(stats)
     }
 
-    /// Snapshot current storage utilisation: row counts per state, estimated
-    /// byte usage of `result_data`, and chord completion counters.
+    /// Snapshot current storage utilisation: row counts per state, an
+    /// O(1) whole-table byte-size estimate, and chord completion counters.
+    ///
+    /// See [`StorageStats::estimated_result_bytes`] for why this uses
+    /// `pg_total_relation_size` rather than summing `octet_length` over
+    /// every row (a full-table scan that materializes every JSONB value as
+    /// text — minutes of CPU/I/O on a multi-million-row table).
     pub async fn storage_stats(&self) -> Result<StorageStats, BackendError> {
-        // Per-state row counts and data size
+        // Per-state row counts (index-supported via idx_task_results_state,
+        // no octet_length materialization).
         let rows = self
             .conn
             .query(
                 r#"
-                SELECT
-                    result_state,
-                    COUNT(*)                                                      AS row_count,
-                    COALESCE(SUM(octet_length(result_data::text)), 0)::bigint     AS data_bytes
+                SELECT result_state, COUNT(*) AS row_count
                 FROM celers_task_results
                 GROUP BY result_state
                 "#,
@@ -386,7 +422,6 @@ impl PostgresAnalytics {
 
         let mut rows_by_state: HashMap<String, u64> = HashMap::new();
         let mut total_rows: u64 = 0;
-        let mut estimated_result_bytes: u64 = 0;
 
         for row in rows {
             let state: String = row.col("result_state").map_err(|e| {
@@ -395,13 +430,32 @@ impl PostgresAnalytics {
             let count: i64 = row.col("row_count").map_err(|e| {
                 BackendError::Connection(format!("storage_stats query failed: {e}"))
             })?;
-            let bytes: i64 = row.col("data_bytes").map_err(|e| {
-                BackendError::Connection(format!("storage_stats query failed: {e}"))
-            })?;
             rows_by_state.insert(state, count as u64);
             total_rows += count as u64;
-            estimated_result_bytes += bytes as u64;
         }
+
+        // O(1) whole-table size (table + indexes + TOAST) via catalog
+        // metadata — no row scan.
+        let size_rows = self
+            .conn
+            .query(
+                "SELECT pg_total_relation_size('celers_task_results') AS bytes",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                BackendError::Connection(format!("storage_stats size query failed: {}", e))
+            })?;
+        let estimated_result_bytes: i64 = size_rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                BackendError::Connection("storage_stats size query returned no rows".to_string())
+            })?
+            .col("bytes")
+            .map_err(|e| {
+                BackendError::Connection(format!("storage_stats size query failed: {e}"))
+            })?;
 
         // Chord completion counters
         let chord_rows = self
@@ -433,7 +487,7 @@ impl PostgresAnalytics {
         Ok(StorageStats {
             total_rows,
             rows_by_state,
-            estimated_result_bytes,
+            estimated_result_bytes: estimated_result_bytes as u64,
             active_chords: active_chords as u64,
             completed_chords: completed_chords as u64,
         })
@@ -454,7 +508,7 @@ impl PostgresAnalytics {
                     0.0
                 ) AS rate
                 FROM celers_chord_state
-                WHERE created_at >= NOW() - $1::interval
+                WHERE created_at >= NOW() - $1::text::interval
                 "#,
                 &[&interval],
             )
@@ -478,6 +532,7 @@ impl PostgresAnalytics {
 // ──────────────────────────────────────────────────────────────────
 
 /// Analytics queries for a MySQL result backend.
+#[cfg(feature = "mysql")]
 #[derive(Clone)]
 pub struct MysqlAnalytics {
     conn: oxisql_mysql::MyConnection,
@@ -486,6 +541,7 @@ pub struct MysqlAnalytics {
 // Manual `Debug` impl: `oxisql_mysql::MyConnection` does not implement
 // `Debug` (unlike the previous `sqlx::MySqlPool`, which did). See
 // `PostgresAnalytics`'s `Debug` impl above for the full rationale.
+#[cfg(feature = "mysql")]
 impl std::fmt::Debug for MysqlAnalytics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MysqlAnalytics")
@@ -494,6 +550,7 @@ impl std::fmt::Debug for MysqlAnalytics {
     }
 }
 
+#[cfg(feature = "mysql")]
 impl MysqlAnalytics {
     /// Create a new analytics helper bound to `conn`.
     pub fn new(conn: oxisql_mysql::MyConnection) -> Self {
@@ -534,20 +591,20 @@ impl MysqlAnalytics {
             BackendError::Connection("task_stats query returned no rows".to_string())
         })?;
 
+        // MySQL returns SUM()/AVG() over exact-value (integer/DECIMAL)
+        // arguments as DECIMAL — `total_count` is COUNT(*) (BIGINT, safe as
+        // i64 directly), but every SUM(CASE ...) here surfaces as
+        // `Value::Decimal`, which `row.col::<i64>` cannot decode.
         let total: i64 = row
             .col("total_count")
             .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
-        let success: i64 = row
-            .col("success_count")
+        let success = crate::row_ext::decimal_i64_from_row(&row, "success_count")
             .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
-        let failure: i64 = row
-            .col("failure_count")
+        let failure = crate::row_ext::decimal_i64_from_row(&row, "failure_count")
             .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
-        let retry: i64 = row
-            .col("retry_count")
+        let retry = crate::row_ext::decimal_i64_from_row(&row, "retry_count")
             .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
-        let pending: i64 = row
-            .col("pending_count")
+        let pending = crate::row_ext::decimal_i64_from_row(&row, "pending_count")
             .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
 
         Ok(TaskStats::from_counts(
@@ -608,15 +665,21 @@ impl MysqlAnalytics {
             return Ok(PercentileLatencies::empty());
         }
 
-        let mean: Option<f64> = count_row.col("mean_secs").map_err(|e| {
-            BackendError::Connection(format!("percentile_latencies count query failed: {e}"))
-        })?;
-        let min: Option<f64> = count_row.col("min_secs").map_err(|e| {
-            BackendError::Connection(format!("percentile_latencies count query failed: {e}"))
-        })?;
-        let max: Option<f64> = count_row.col("max_secs").map_err(|e| {
-            BackendError::Connection(format!("percentile_latencies count query failed: {e}"))
-        })?;
+        // `AVG(...)/1000000.0`, `MIN(...)/1000000.0`, `MAX(...)/1000000.0`
+        // are all DECIMAL (division involving a decimal literal), decoded
+        // via the canonical `opt_decimal_f64_from_row` helper.
+        let mean =
+            crate::row_ext::opt_decimal_f64_from_row(&count_row, "mean_secs").map_err(|e| {
+                BackendError::Connection(format!("percentile_latencies count query failed: {e}"))
+            })?;
+        let min =
+            crate::row_ext::opt_decimal_f64_from_row(&count_row, "min_secs").map_err(|e| {
+                BackendError::Connection(format!("percentile_latencies count query failed: {e}"))
+            })?;
+        let max =
+            crate::row_ext::opt_decimal_f64_from_row(&count_row, "max_secs").map_err(|e| {
+                BackendError::Connection(format!("percentile_latencies count query failed: {e}"))
+            })?;
 
         // Step 2: fetch each percentile via LIMIT 1 OFFSET
         let fetch_percentile = |fraction: f64| {
@@ -642,10 +705,9 @@ impl MysqlAnalytics {
             self.conn.query(&p50_sql, &[&tn, &tn]).await.map_err(|e| {
                 BackendError::Connection(format!("percentile p50 query failed: {}", e))
             })?;
-        let p50: Option<f64> = p50_rows
-            .into_iter()
-            .next()
-            .map(|r| r.col("dur_secs"))
+        let p50 = p50_rows
+            .first()
+            .map(|r| crate::row_ext::decimal_f64_from_row(r, "dur_secs"))
             .transpose()
             .map_err(|e| BackendError::Connection(format!("percentile p50 query failed: {e}")))?;
 
@@ -654,10 +716,9 @@ impl MysqlAnalytics {
             self.conn.query(&p95_sql, &[&tn, &tn]).await.map_err(|e| {
                 BackendError::Connection(format!("percentile p95 query failed: {}", e))
             })?;
-        let p95: Option<f64> = p95_rows
-            .into_iter()
-            .next()
-            .map(|r| r.col("dur_secs"))
+        let p95 = p95_rows
+            .first()
+            .map(|r| crate::row_ext::decimal_f64_from_row(r, "dur_secs"))
             .transpose()
             .map_err(|e| BackendError::Connection(format!("percentile p95 query failed: {e}")))?;
 
@@ -666,10 +727,9 @@ impl MysqlAnalytics {
             self.conn.query(&p99_sql, &[&tn, &tn]).await.map_err(|e| {
                 BackendError::Connection(format!("percentile p99 query failed: {}", e))
             })?;
-        let p99: Option<f64> = p99_rows
-            .into_iter()
-            .next()
-            .map(|r| r.col("dur_secs"))
+        let p99 = p99_rows
+            .first()
+            .map(|r| crate::row_ext::decimal_f64_from_row(r, "dur_secs"))
             .transpose()
             .map_err(|e| BackendError::Connection(format!("percentile p99 query failed: {e}")))?;
 
@@ -714,46 +774,56 @@ impl MysqlAnalytics {
                 BackendError::Connection(format!("worker_stats query failed: {}", e))
             })?;
 
-        let stats = rows
-            .into_iter()
-            .map(|row| {
-                let total: i64 = row.col("total_tasks")?;
-                let success: i64 = row.col("success_tasks")?;
-                let failure: i64 = row.col("failure_tasks")?;
-                let avg_dur: Option<f64> = row.col("avg_duration_secs")?;
-                let tasks_per_hour = if window_hours > 0.0 {
-                    total as f64 / window_hours
-                } else {
-                    0.0
-                };
-                Ok(WorkerStat {
-                    worker: row.col("worker")?,
-                    total_tasks: total as u64,
-                    success_tasks: success as u64,
-                    failure_tasks: failure as u64,
-                    avg_duration_secs: avg_dur,
-                    tasks_per_hour,
-                })
-            })
-            .collect::<std::result::Result<Vec<WorkerStat>, oxisql_core::OxiSqlError>>()
-            .map_err(|e| {
+        let mut stats = Vec::with_capacity(rows.len());
+        for row in rows {
+            let total: i64 = row.col("total_tasks").map_err(|e| {
                 BackendError::Connection(format!("worker_stats row decode failed: {e}"))
             })?;
+            let success =
+                crate::row_ext::decimal_i64_from_row(&row, "success_tasks").map_err(|e| {
+                    BackendError::Connection(format!("worker_stats row decode failed: {e}"))
+                })?;
+            let failure =
+                crate::row_ext::decimal_i64_from_row(&row, "failure_tasks").map_err(|e| {
+                    BackendError::Connection(format!("worker_stats row decode failed: {e}"))
+                })?;
+            let avg_dur = crate::row_ext::opt_decimal_f64_from_row(&row, "avg_duration_secs")
+                .map_err(|e| {
+                    BackendError::Connection(format!("worker_stats row decode failed: {e}"))
+                })?;
+            let tasks_per_hour = if window_hours > 0.0 {
+                total as f64 / window_hours
+            } else {
+                0.0
+            };
+            stats.push(WorkerStat {
+                worker: row.col("worker").map_err(|e| {
+                    BackendError::Connection(format!("worker_stats row decode failed: {e}"))
+                })?,
+                total_tasks: total as u64,
+                success_tasks: success as u64,
+                failure_tasks: failure as u64,
+                avg_duration_secs: avg_dur,
+                tasks_per_hour,
+            });
+        }
 
         Ok(stats)
     }
 
-    /// Snapshot current storage utilisation: row counts per state, estimated
-    /// byte usage of `result_data`, and chord completion counters.
+    /// Snapshot current storage utilisation: row counts per state, an O(1)
+    /// whole-table byte-size estimate, and chord completion counters.
+    ///
+    /// See [`StorageStats::estimated_result_bytes`] for why this reads
+    /// `information_schema.tables` (storage-engine-maintained metadata,
+    /// O(1)) rather than summing `LENGTH(result_data)` over every row (a
+    /// full-table scan).
     pub async fn storage_stats(&self) -> Result<StorageStats, BackendError> {
         let rows = self
             .conn
             .query(
                 r#"
-                SELECT
-                    result_state,
-                    COUNT(*)                                         AS row_count,
-                    COALESCE(SUM(LENGTH(result_data)), 0)            AS data_bytes
+                SELECT result_state, COUNT(*) AS row_count
                 FROM celers_task_results
                 GROUP BY result_state
                 "#,
@@ -764,7 +834,6 @@ impl MysqlAnalytics {
 
         let mut rows_by_state: HashMap<String, u64> = HashMap::new();
         let mut total_rows: u64 = 0;
-        let mut estimated_result_bytes: u64 = 0;
 
         for row in rows {
             let state: String = row.col("result_state").map_err(|e| {
@@ -773,13 +842,30 @@ impl MysqlAnalytics {
             let count: i64 = row.col("row_count").map_err(|e| {
                 BackendError::Connection(format!("storage_stats query failed: {e}"))
             })?;
-            let bytes: i64 = row.col("data_bytes").map_err(|e| {
-                BackendError::Connection(format!("storage_stats query failed: {e}"))
-            })?;
             rows_by_state.insert(state, count as u64);
             total_rows += count as u64;
-            estimated_result_bytes += bytes as u64;
         }
+
+        let size_rows = self
+            .conn
+            .query(
+                r#"
+                SELECT COALESCE(data_length, 0) + COALESCE(index_length, 0) AS bytes
+                FROM information_schema.tables
+                WHERE table_schema = DATABASE() AND table_name = 'celers_task_results'
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                BackendError::Connection(format!("storage_stats size query failed: {}", e))
+            })?;
+        let estimated_result_bytes = size_rows
+            .first()
+            .map(|r| crate::row_ext::decimal_i64_from_row(r, "bytes"))
+            .transpose()
+            .map_err(|e| BackendError::Connection(format!("storage_stats size query failed: {e}")))?
+            .unwrap_or(0);
 
         let chord_rows = self
             .conn
@@ -800,19 +886,24 @@ impl MysqlAnalytics {
             BackendError::Connection("chord storage_stats query returned no rows".to_string())
         })?;
 
-        let completed_chords: Option<i64> = chord_row.col("completed_chords").map_err(|e| {
-            BackendError::Connection(format!("chord storage_stats query failed: {e}"))
-        })?;
-        let active_chords: Option<i64> = chord_row.col("active_chords").map_err(|e| {
-            BackendError::Connection(format!("chord storage_stats query failed: {e}"))
-        })?;
+        let completed_chords =
+            crate::row_ext::opt_decimal_f64_from_row(&chord_row, "completed_chords")
+                .map_err(|e| {
+                    BackendError::Connection(format!("chord storage_stats query failed: {e}"))
+                })?
+                .unwrap_or(0.0);
+        let active_chords = crate::row_ext::opt_decimal_f64_from_row(&chord_row, "active_chords")
+            .map_err(|e| {
+                BackendError::Connection(format!("chord storage_stats query failed: {e}"))
+            })?
+            .unwrap_or(0.0);
 
         Ok(StorageStats {
             total_rows,
             rows_by_state,
-            estimated_result_bytes,
-            active_chords: active_chords.unwrap_or(0) as u64,
-            completed_chords: completed_chords.unwrap_or(0) as u64,
+            estimated_result_bytes: estimated_result_bytes as u64,
+            active_chords: active_chords as u64,
+            completed_chords: completed_chords as u64,
         })
     }
 
@@ -839,10 +930,14 @@ impl MysqlAnalytics {
             BackendError::Connection("chord_completion_rate query returned no rows".to_string())
         })?;
 
-        let rate: Option<f64> = row.col("rate").map_err(|e| {
-            BackendError::Connection(format!("chord_completion_rate query failed: {e}"))
-        })?;
-        Ok(rate.unwrap_or(0.0))
+        // The division `SUM(CASE ...) / NULLIF(COUNT(*), 0)` is DECIMAL/BIGINT
+        // -> DECIMAL in MySQL.
+        let rate = crate::row_ext::opt_decimal_f64_from_row(&row, "rate")
+            .map_err(|e| {
+                BackendError::Connection(format!("chord_completion_rate query failed: {e}"))
+            })?
+            .unwrap_or(0.0);
+        Ok(rate)
     }
 }
 
@@ -966,6 +1061,7 @@ mod tests {
 
     // ── pg_interval_secs helper ──────────────────────────────────
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn test_pg_interval_secs_formatting() {
         let s = pg_interval_secs(Duration::from_secs(3600));
@@ -977,15 +1073,16 @@ mod tests {
 
     // ── DB integration tests (require live DB, marked #[ignore]) ──
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     #[ignore] // Requires PostgreSQL running
     async fn test_pg_task_stats_live() {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
-        let conn = oxisql_postgres::PgConnection::connect(&url, oxisql_postgres::TlsMode::Disabled)
+        let backend = crate::PostgresResultBackend::new(&url)
             .await
             .expect("connect to live PostgreSQL");
-        let analytics = PostgresAnalytics::new(conn);
+        let analytics = backend.analytics();
         let stats = analytics
             .task_stats(Duration::from_secs(3600), None)
             .await
@@ -994,20 +1091,81 @@ mod tests {
         assert!(stats.success_rate >= 0.0 && stats.success_rate <= 1.0);
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     #[ignore] // Requires PostgreSQL running
     async fn test_pg_storage_stats_live() {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
-        let conn = oxisql_postgres::PgConnection::connect(&url, oxisql_postgres::TlsMode::Disabled)
+        let backend = crate::PostgresResultBackend::new(&url)
             .await
             .expect("connect to live PostgreSQL");
-        let analytics = PostgresAnalytics::new(conn);
+        backend.migrate().await.expect("migrate");
+        let analytics = backend.analytics();
         let stats = analytics
             .storage_stats()
             .await
             .expect("storage_stats query");
         // Row counts are non-negative by definition.
         let _ = stats.total_rows;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL running
+    async fn test_pg_percentile_latencies_live_decimal_safe() {
+        // Regression test for the NUMERIC-vs-double_precision EXTRACT(EPOCH)
+        // version drift (PostgreSQL >= 14 returns `numeric`): this must not
+        // fail with a TypeMismatch regardless of server version.
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let backend = crate::PostgresResultBackend::new(&url)
+            .await
+            .expect("connect to live PostgreSQL");
+        backend.migrate().await.expect("migrate");
+        let analytics = backend.analytics();
+        let result = analytics
+            .percentile_latencies(Duration::from_secs(3600), None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "percentile_latencies must not fail decoding NUMERIC/DECIMAL columns: {result:?}"
+        );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_mysql_task_stats_live_decimal_safe() {
+        // Regression test for the MySQL DECIMAL-read bug: every SUM(CASE...)
+        // column here surfaces as Value::Decimal, which the old
+        // `row.col::<i64>` read could not decode.
+        let url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let backend = crate::MysqlResultBackend::new(&url)
+            .await
+            .expect("connect to live MySQL");
+        backend.migrate().await.expect("migrate");
+        let analytics = backend.analytics();
+        let result = analytics.task_stats(Duration::from_secs(3600), None).await;
+        assert!(
+            result.is_ok(),
+            "task_stats must not fail decoding DECIMAL columns: {result:?}"
+        );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_mysql_storage_stats_live() {
+        let url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let backend = crate::MysqlResultBackend::new(&url)
+            .await
+            .expect("connect to live MySQL");
+        backend.migrate().await.expect("migrate");
+        let analytics = backend.analytics();
+        let result = analytics.storage_stats().await;
+        assert!(result.is_ok(), "storage_stats must not fail: {result:?}");
     }
 }

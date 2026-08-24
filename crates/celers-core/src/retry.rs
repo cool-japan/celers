@@ -1,16 +1,74 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_wrap
-)]
 //! Retry strategies for task execution
 //!
 //! This module provides various retry strategies that determine how long to wait
 //! between task retry attempts.
+//!
+//! All delay arithmetic saturates rather than overflowing, and every computed
+//! delay is clamped to at most [`MAX_RETRY_DELAY_SECS`], so no configuration —
+//! however absurd — can panic in debug, wrap in release, or produce a
+//! `u64::MAX`-second delay.
 
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+
+/// Hard ceiling applied to every computed retry delay: 30 days in seconds.
+///
+/// Used whenever a strategy has no explicit `max_delay`. Without it, an
+/// exponential strategy at a high retry count saturates `f64::INFINITY as u64` to
+/// `u64::MAX`, i.e. a delay of ~584 billion years — indistinguishable from the
+/// task never being retried at all, and impossible to represent downstream.
+pub const MAX_RETRY_DELAY_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// `2^64` as an `f64`, used as the saturation boundary for `f64 -> u64`.
+const U64_MAX_AS_F64: f64 = 18_446_744_073_709_551_616.0;
+
+/// Convert a computed floating-point delay to whole seconds without overflow.
+///
+/// Non-finite and negative values collapse to `0`; anything at or beyond `2^64`
+/// saturates to `u64::MAX` (and is then clamped by the caller).
+// Justification for the lossy cast: the value is checked for finiteness, clamped
+// at zero and compared against `2^64` immediately before the conversion.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[inline]
+fn seconds_from_f64(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= U64_MAX_AS_F64 {
+        u64::MAX
+    } else {
+        value as u64
+    }
+}
+
+/// Widen a `u64` delay for floating-point backoff math.
+// Justification: retry delays are seconds and far below `2^53` after clamping;
+// the widening is exact for every value the caller can observe.
+#[allow(clippy::cast_precision_loss)]
+#[inline]
+fn seconds_as_f64(seconds: u64) -> f64 {
+    seconds as f64
+}
+
+/// Raise `multiplier` to the power of `retry_count` without wrapping the exponent.
+///
+/// `powi` takes an `i32`; a `retry_count` above `i32::MAX` would wrap to a
+/// negative exponent and silently invert the backoff. Anything that large is
+/// clamped, and the result is saturated by the caller anyway.
+#[inline]
+fn multiplier_pow(multiplier: f64, retry_count: u32) -> f64 {
+    let exponent = i32::try_from(retry_count).unwrap_or(i32::MAX);
+    multiplier.powi(exponent)
+}
+
+/// Clamp a computed delay.
+///
+/// An explicit `max_delay` is always honoured, even if it is larger than
+/// [`MAX_RETRY_DELAY_SECS`]; when none is configured the default ceiling applies
+/// so an unbounded strategy cannot return a `u64::MAX`-second delay.
+#[inline]
+fn clamp_delay(delay: u64, max_delay: Option<u64>) -> u64 {
+    delay.min(max_delay.unwrap_or(MAX_RETRY_DELAY_SECS))
+}
 
 /// Retry strategy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,7 +280,11 @@ impl RetryStrategy {
     /// * `previous_delay` - Previous delay (used by decorrelated jitter)
     ///
     /// # Returns
-    /// Delay in seconds before the next retry
+    /// Delay in seconds before the next retry.
+    ///
+    /// Every arithmetic step saturates, and computed delays are clamped to the
+    /// strategy's `max_delay` or, when it has none, to [`MAX_RETRY_DELAY_SECS`].
+    /// No `retry_count` — including `u32::MAX` — can panic or wrap.
     #[must_use]
     pub fn calculate_delay(&self, retry_count: u32, previous_delay: Option<u64>) -> u64 {
         match self {
@@ -233,8 +295,9 @@ impl RetryStrategy {
                 increment,
                 max_delay,
             } => {
-                let delay = *initial + (*increment * u64::from(retry_count));
-                max_delay.map_or(delay, |max| delay.min(max))
+                let delay =
+                    initial.saturating_add(increment.saturating_mul(u64::from(retry_count)));
+                clamp_delay(delay, *max_delay)
             }
 
             Self::Exponential {
@@ -242,8 +305,10 @@ impl RetryStrategy {
                 multiplier,
                 max_delay,
             } => {
-                let delay = (*initial as f64 * multiplier.powi(retry_count as i32)) as u64;
-                max_delay.map_or(delay, |max| delay.min(max))
+                let delay = seconds_from_f64(
+                    seconds_as_f64(*initial) * multiplier_pow(*multiplier, retry_count),
+                );
+                clamp_delay(delay, *max_delay)
             }
 
             Self::Polynomial {
@@ -251,20 +316,23 @@ impl RetryStrategy {
                 power,
                 max_delay,
             } => {
-                let delay = (*initial as f64 * (f64::from(retry_count) + 1.0).powf(*power)) as u64;
-                max_delay.map_or(delay, |max| delay.min(max))
+                let delay = seconds_from_f64(
+                    seconds_as_f64(*initial) * (f64::from(retry_count) + 1.0).powf(*power),
+                );
+                clamp_delay(delay, *max_delay)
             }
 
             Self::Fibonacci { initial, max_delay } => {
                 // F(2)=1, F(3)=2, F(4)=3, F(5)=5, F(6)=8...
                 // Use retry_count + 2 to get the proper sequence starting at 1
-                let delay = *initial * fibonacci_number(retry_count + 2);
-                max_delay.map_or(delay, |max| delay.min(max))
+                let index = retry_count.saturating_add(2);
+                let delay = initial.saturating_mul(fibonacci_number(index));
+                clamp_delay(delay, *max_delay)
             }
 
             Self::DecorrelatedJitter { base, max_delay } => {
                 let prev = previous_delay.unwrap_or(*base);
-                let upper = (prev * 3).min(*max_delay);
+                let upper = prev.saturating_mul(3).min(*max_delay);
                 let lower = *base;
                 if upper <= lower {
                     lower
@@ -278,8 +346,10 @@ impl RetryStrategy {
                 multiplier,
                 max_delay,
             } => {
-                let exp_delay = (*initial as f64 * multiplier.powi(retry_count as i32)) as u64;
-                let capped = max_delay.map_or(exp_delay, |max| exp_delay.min(max));
+                let exp_delay = seconds_from_f64(
+                    seconds_as_f64(*initial) * multiplier_pow(*multiplier, retry_count),
+                );
+                let capped = clamp_delay(exp_delay, *max_delay);
                 if capped == 0 {
                     0
                 } else {
@@ -292,8 +362,10 @@ impl RetryStrategy {
                 multiplier,
                 max_delay,
             } => {
-                let exp_delay = (*initial as f64 * multiplier.powi(retry_count as i32)) as u64;
-                let capped = max_delay.map_or(exp_delay, |max| exp_delay.min(max));
+                let exp_delay = seconds_from_f64(
+                    seconds_as_f64(*initial) * multiplier_pow(*multiplier, retry_count),
+                );
+                let capped = clamp_delay(exp_delay, *max_delay);
                 let half = capped / 2;
                 if half == 0 {
                     half
@@ -302,8 +374,9 @@ impl RetryStrategy {
                 }
             }
 
-            Self::Custom { delays, fallback } => delays
-                .get(retry_count as usize)
+            Self::Custom { delays, fallback } => usize::try_from(retry_count)
+                .ok()
+                .and_then(|index| delays.get(index))
                 .copied()
                 .unwrap_or(*fallback),
 
@@ -377,7 +450,11 @@ impl std::fmt::Display for RetryStrategy {
     }
 }
 
-/// Calculate the nth Fibonacci number
+/// Calculate the nth Fibonacci number, saturating at `u64::MAX`.
+///
+/// `F(94)` already exceeds `u64::MAX`, so the naive accumulation panicked in
+/// debug builds and wrapped in release for `n >= 94` — reachable from a retry
+/// count of 92 with a `max_retries` config that has no upper bound.
 fn fibonacci_number(n: u32) -> u64 {
     if n <= 1 {
         return u64::from(n);
@@ -387,12 +464,83 @@ fn fibonacci_number(n: u32) -> u64 {
     let mut b = 1u64;
 
     for _ in 2..=n {
-        let temp = a + b;
+        let Some(next) = a.checked_add(b) else {
+            return u64::MAX;
+        };
         a = b;
-        b = temp;
+        b = next;
     }
 
     b
+}
+
+/// Coarse classification of a task failure, used to apply kind-specific retry
+/// rules such as [`RetryPolicy::retry_on_timeout`].
+///
+/// Celery keys `autoretry_for` off exception *types*; substring matching on the
+/// error message (which `retry_on` / `dont_retry_on` still use) is fragile by
+/// comparison, so this enum gives callers a structured alternative for the cases
+/// the policy treats specially.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryErrorKind {
+    /// The task exceeded its time limit.
+    Timeout,
+    /// The task was revoked; retrying is pointless.
+    Revoked,
+    /// A (de)serialization failure: deterministic, so retrying rarely helps.
+    Serialization,
+    /// A broker or transport failure: typically transient.
+    Broker,
+    /// A configuration failure: deterministic.
+    Configuration,
+    /// Anything else.
+    #[default]
+    Other,
+}
+
+impl RetryErrorKind {
+    /// Classify a [`crate::CelersError`].
+    #[must_use]
+    pub const fn from_error(error: &crate::CelersError) -> Self {
+        match error {
+            crate::CelersError::Timeout(_) => Self::Timeout,
+            crate::CelersError::TaskRevoked(_) => Self::Revoked,
+            crate::CelersError::Serialization(_) | crate::CelersError::Deserialization(_) => {
+                Self::Serialization
+            }
+            crate::CelersError::Broker(_) => Self::Broker,
+            crate::CelersError::Configuration(_) => Self::Configuration,
+            _ => Self::Other,
+        }
+    }
+
+    /// Best-effort classification of a free-form error message.
+    ///
+    /// Used by [`RetryPolicy::should_retry`], whose only input is a string. The
+    /// phrases below cover the messages produced by this workspace
+    /// (`CelersError::Timeout` renders as "Task timeout: ...") as well as the
+    /// common runtime wordings.
+    #[must_use]
+    pub fn classify(error: &str) -> Self {
+        let lowered = error.to_lowercase();
+        if lowered.contains("timeout")
+            || lowered.contains("timed out")
+            || lowered.contains("deadline exceeded")
+        {
+            Self::Timeout
+        } else if lowered.contains("revoked") {
+            Self::Revoked
+        } else if lowered.contains("serialization") || lowered.contains("deserialization") {
+            Self::Serialization
+        } else if lowered.contains("broker error") {
+            Self::Broker
+        } else if lowered.contains("configuration error") {
+            Self::Configuration
+        } else {
+            Self::Other
+        }
+    }
 }
 
 /// Retry policy configuration
@@ -494,11 +642,49 @@ impl RetryPolicy {
         self
     }
 
+    /// Set whether a permanently failed task is preserved instead of being moved
+    /// to the dead-letter queue.
+    #[must_use]
+    pub fn with_preserve_on_failure(mut self, preserve: bool) -> Self {
+        self.preserve_on_failure = preserve;
+        self
+    }
+
     /// Check if we should retry for the given error
+    ///
+    /// The error kind is inferred from the message with
+    /// [`RetryErrorKind::classify`]; use [`Self::should_retry_kind`] when the
+    /// caller already knows the kind, and [`Self::should_retry_error`] when it
+    /// holds a [`crate::CelersError`].
     #[must_use]
     pub fn should_retry(&self, error: &str, retry_count: u32) -> bool {
+        self.should_retry_kind(error, RetryErrorKind::classify(error), retry_count)
+    }
+
+    /// Check if we should retry a [`crate::CelersError`]
+    #[must_use]
+    pub fn should_retry_error(&self, error: &crate::CelersError, retry_count: u32) -> bool {
+        self.should_retry_kind(
+            &error.to_string(),
+            RetryErrorKind::from_error(error),
+            retry_count,
+        )
+    }
+
+    /// Check if we should retry, given an already-classified error kind
+    ///
+    /// This is where `retry_on_timeout` takes effect: a timeout is never retried
+    /// when the policy disables it, regardless of the `retry_on` patterns.
+    #[must_use]
+    pub fn should_retry_kind(&self, error: &str, kind: RetryErrorKind, retry_count: u32) -> bool {
         // Check if we've exceeded max retries
         if retry_count >= self.max_retries {
+            return false;
+        }
+
+        // A policy that opts out of timeout retries short-circuits everything
+        // else: the failure is by definition not transient for this task.
+        if kind == RetryErrorKind::Timeout && !self.retry_on_timeout {
             return false;
         }
 
@@ -522,6 +708,25 @@ impl RetryPolicy {
         }
 
         false
+    }
+
+    /// Whether a task that has exhausted its retries should be moved to the
+    /// dead-letter queue.
+    ///
+    /// Returns `false` when `preserve_on_failure` is set, which is the whole
+    /// point of that flag: the original task stays where it is instead of being
+    /// dead-lettered.
+    #[inline]
+    #[must_use]
+    pub const fn should_dead_letter(&self) -> bool {
+        !self.preserve_on_failure
+    }
+
+    /// Whether the original task must be preserved on permanent failure.
+    #[inline]
+    #[must_use]
+    pub const fn preserves_on_failure(&self) -> bool {
+        self.preserve_on_failure
     }
 
     /// Get the delay before the next retry
@@ -681,9 +886,227 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    fn all_strategies() -> Vec<RetryStrategy> {
+        vec![
+            RetryStrategy::Fixed { delay: 7 },
+            RetryStrategy::Linear {
+                initial: u64::MAX - 1,
+                increment: u64::MAX / 2,
+                max_delay: None,
+            },
+            RetryStrategy::Exponential {
+                initial: u64::MAX,
+                multiplier: 10.0,
+                max_delay: None,
+            },
+            RetryStrategy::Polynomial {
+                initial: u64::MAX,
+                power: 12.0,
+                max_delay: None,
+            },
+            RetryStrategy::Fibonacci {
+                initial: u64::MAX,
+                max_delay: None,
+            },
+            RetryStrategy::DecorrelatedJitter {
+                base: 1,
+                max_delay: 600,
+            },
+            RetryStrategy::FullJitter {
+                initial: u64::MAX,
+                multiplier: 3.0,
+                max_delay: None,
+            },
+            RetryStrategy::EqualJitter {
+                initial: u64::MAX,
+                multiplier: 3.0,
+                max_delay: None,
+            },
+            RetryStrategy::Custom {
+                delays: vec![1, 2, 3],
+                fallback: 9,
+            },
+            RetryStrategy::Immediate,
+        ]
+    }
+
+    /// Regression: `Fibonacci`, `Linear` and `DecorrelatedJitter` used unchecked
+    /// `+`/`*`, panicking in debug and wrapping in release at high retry counts.
+    #[test]
+    fn test_delay_arithmetic_never_overflows() {
+        let counts = [0u32, 1, 50, 91, 92, 93, 94, 1_000, u32::MAX - 1, u32::MAX];
+        for strategy in all_strategies() {
+            for &count in &counts {
+                // Feed a hostile previous_delay too (DecorrelatedJitter reads it).
+                for previous in [None, Some(0), Some(u64::MAX)] {
+                    let delay = strategy.calculate_delay(count, previous);
+                    assert!(
+                        delay < u64::MAX,
+                        "{strategy} at retry {count} produced a saturated delay"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_computed_delays_are_clamped_to_a_sane_ceiling() {
+        // Strategies without an explicit max_delay fall back to the default cap
+        // instead of yielding a u64::MAX-second delay.
+        let unbounded = [
+            RetryStrategy::Exponential {
+                initial: 1,
+                multiplier: 2.0,
+                max_delay: None,
+            },
+            RetryStrategy::Linear {
+                initial: 1,
+                increment: u64::MAX / 4,
+                max_delay: None,
+            },
+            RetryStrategy::Fibonacci {
+                initial: 1,
+                max_delay: None,
+            },
+            RetryStrategy::Polynomial {
+                initial: 1,
+                power: 20.0,
+                max_delay: None,
+            },
+        ];
+        for strategy in unbounded {
+            let delay = strategy.calculate_delay(200, None);
+            assert!(
+                delay <= MAX_RETRY_DELAY_SECS,
+                "{strategy} produced {delay}s, above the {MAX_RETRY_DELAY_SECS}s ceiling"
+            );
+        }
+
+        // An explicit max_delay is still honoured verbatim, even above the cap.
+        let explicit = RetryStrategy::Exponential {
+            initial: 1,
+            multiplier: 2.0,
+            max_delay: Some(MAX_RETRY_DELAY_SECS * 4),
+        };
+        assert_eq!(
+            explicit.calculate_delay(200, None),
+            MAX_RETRY_DELAY_SECS * 4
+        );
+    }
+
+    #[test]
+    fn test_fibonacci_number_saturates() {
+        assert_eq!(fibonacci_number(0), 0);
+        assert_eq!(fibonacci_number(1), 1);
+        assert_eq!(fibonacci_number(10), 55);
+        assert_eq!(fibonacci_number(93), 12_200_160_415_121_876_738);
+        // F(94) exceeds u64::MAX.
+        assert_eq!(fibonacci_number(94), u64::MAX);
+        assert_eq!(fibonacci_number(u32::MAX), u64::MAX);
+    }
+
+    /// Regression: `retry_on_timeout` was configurable but never read.
+    #[test]
+    fn test_retry_on_timeout_is_honoured() {
+        let policy = RetryPolicy::new(5, RetryStrategy::Immediate).with_retry_on_timeout(false);
+        assert!(!policy.should_retry("Task timeout: soft limit exceeded", 0));
+        assert!(!policy.should_retry("operation timed out", 0));
+        assert!(!policy.should_retry_kind("anything", RetryErrorKind::Timeout, 0));
+        assert!(
+            !policy.should_retry_error(&crate::CelersError::Timeout("hard limit".to_string()), 0)
+        );
+        // Non-timeout failures are unaffected.
+        assert!(policy.should_retry("connection reset", 0));
+
+        // The default policy still retries timeouts.
+        let default_policy = RetryPolicy::new(5, RetryStrategy::Immediate);
+        assert!(default_policy.should_retry("Task timeout: soft limit exceeded", 0));
+        assert!(default_policy.should_retry_kind("anything", RetryErrorKind::Timeout, 0));
+
+        // A disabled timeout retry beats an explicit retry_on match.
+        let explicit = RetryPolicy::new(5, RetryStrategy::Immediate)
+            .with_retry_on_timeout(false)
+            .retry_on(vec!["timeout".to_string()]);
+        assert!(!explicit.should_retry("Task timeout: soft limit exceeded", 0));
+    }
+
+    #[test]
+    fn test_preserve_on_failure_is_readable() {
+        let default_policy = RetryPolicy::default();
+        assert!(!default_policy.preserves_on_failure());
+        assert!(default_policy.should_dead_letter());
+
+        let preserving = RetryPolicy::default().with_preserve_on_failure(true);
+        assert!(preserving.preserves_on_failure());
+        assert!(
+            !preserving.should_dead_letter(),
+            "a preserving policy must not dead-letter the original task"
+        );
+    }
+
+    #[test]
+    fn test_retry_error_kind_classification() {
+        assert_eq!(
+            RetryErrorKind::from_error(&crate::CelersError::Timeout("x".into())),
+            RetryErrorKind::Timeout
+        );
+        assert_eq!(
+            RetryErrorKind::from_error(&crate::CelersError::Broker("x".into())),
+            RetryErrorKind::Broker
+        );
+        assert_eq!(
+            RetryErrorKind::from_error(&crate::CelersError::Serialization("x".into())),
+            RetryErrorKind::Serialization
+        );
+        assert_eq!(
+            RetryErrorKind::from_error(&crate::CelersError::Other("x".into())),
+            RetryErrorKind::Other
+        );
+
+        assert_eq!(
+            RetryErrorKind::classify("Task timeout: 30s"),
+            RetryErrorKind::Timeout
+        );
+        assert_eq!(
+            RetryErrorKind::classify("DEADLINE EXCEEDED"),
+            RetryErrorKind::Timeout
+        );
+        assert_eq!(
+            RetryErrorKind::classify("connection reset"),
+            RetryErrorKind::Other
+        );
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn test_no_strategy_panics_or_exceeds_ceiling(
+                attempt in 0u32..=u32::MAX,
+                previous in proptest::option::of(0u64..=u64::MAX),
+            ) {
+                for strategy in super::all_strategies() {
+                    let delay = strategy.calculate_delay(attempt, previous);
+                    // Only the caller-supplied Fixed/Custom values bypass the
+                    // ceiling; every computed strategy must respect it.
+                    if !matches!(
+                        strategy,
+                        RetryStrategy::Fixed { .. }
+                            | RetryStrategy::Custom { .. }
+                            | RetryStrategy::DecorrelatedJitter { .. }
+                    ) {
+                        prop_assert!(delay <= MAX_RETRY_DELAY_SECS);
+                    }
+                    prop_assert!(delay < u64::MAX);
+                }
+            }
+        }
 
         proptest! {
             #[test]

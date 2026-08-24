@@ -105,7 +105,7 @@ impl Priority {
 ///     .with_signing(b"secret-key".to_vec());
 /// assert!(secure_options.should_sign());
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct MessageOptions {
     /// Message priority
     pub priority: Option<Priority>,
@@ -123,14 +123,63 @@ pub struct MessageOptions {
     pub headers: HashMap<String, String>,
     /// Enable message signing (HMAC)
     pub sign: bool,
-    /// Signing key for HMAC (if signing is enabled)
+    /// Signing key for HMAC (if signing is enabled).
+    ///
+    /// Raw HMAC key material. `MessageOptions` derives `Serialize`/
+    /// `Deserialize` for general ergonomics, but this field opts out
+    /// (`#[serde(skip)]`) so a config dump, log, or on-the-wire transport
+    /// of `MessageOptions` never carries the key -- populate it in code
+    /// via [`MessageOptions::with_signing`] instead. It is also redacted
+    /// from `Debug` output (see the manual `impl Debug` below) and zeroed
+    /// in place when the options are dropped (see `Drop`).
+    #[serde(skip)]
     pub signing_key: Option<Vec<u8>>,
     /// Enable message encryption (AES-256-GCM)
     pub encrypt: bool,
-    /// Encryption key (32 bytes for AES-256)
+    /// Encryption key (32 bytes for AES-256).
+    ///
+    /// Same handling as `signing_key`: skipped by `Serialize`/
+    /// `Deserialize`, redacted from `Debug`, and zeroed on drop.
+    #[serde(skip)]
     pub encryption_key: Option<Vec<u8>>,
     /// Compression hint
     pub compress: bool,
+}
+
+impl std::fmt::Debug for MessageOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written so `signing_key`/`encryption_key` -- raw HMAC/
+        // AES-256 key material -- never appear in `{:?}` output (panic
+        // messages, log lines, error contexts). Presence is still shown
+        // (`Some(<redacted>)` vs `None`) since that's useful for
+        // debugging and leaks nothing.
+        f.debug_struct("MessageOptions")
+            .field("priority", &self.priority)
+            .field("ttl", &self.ttl)
+            .field("expires_at", &self.expires_at)
+            .field("delay", &self.delay)
+            .field("correlation_id", &self.correlation_id)
+            .field("reply_to", &self.reply_to)
+            .field("headers", &self.headers)
+            .field("sign", &self.sign)
+            .field(
+                "signing_key",
+                &self.signing_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("encrypt", &self.encrypt)
+            .field(
+                "encryption_key",
+                &self.encryption_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("compress", &self.compress)
+            .finish()
+    }
+}
+
+impl Drop for MessageOptions {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
 }
 
 impl MessageOptions {
@@ -225,6 +274,30 @@ impl MessageOptions {
     pub fn should_compress(&self) -> bool {
         self.compress
     }
+
+    /// Overwrite any held key material with zeros in place.
+    ///
+    /// Called from `Drop` so key bytes don't linger in freed heap memory;
+    /// exposed as its own method so the zeroing logic is unit-testable
+    /// directly (asserting on memory contents *after* an actual drop
+    /// would require reading freed memory, which is undefined behavior).
+    fn zeroize_secrets(&mut self) {
+        if let Some(key) = self.signing_key.as_mut() {
+            for byte in key.iter_mut() {
+                *byte = 0;
+            }
+            // Prevent the compiler from proving these writes are dead
+            // (the buffer may be freed immediately after) and eliding
+            // them.
+            std::hint::black_box(key.as_slice());
+        }
+        if let Some(key) = self.encryption_key.as_mut() {
+            for byte in key.iter_mut() {
+                *byte = 0;
+            }
+            std::hint::black_box(key.as_slice());
+        }
+    }
 }
 
 // =============================================================================
@@ -250,4 +323,84 @@ pub trait ExtendedProducer: Producer {
         message: Message,
         options: MessageOptions,
     ) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_options_serialization_omits_secret_key_bytes() {
+        let options = MessageOptions::new()
+            .with_signing(vec![0xAA, 0xBB, 0xCC, 0xDD])
+            .with_encryption(vec![0x11, 0x22, 0x33, 0x44]);
+
+        let json = serde_json::to_string(&options).expect("MessageOptions must serialize");
+
+        // Neither the field names nor the raw byte arrays should appear.
+        assert!(!json.contains("signing_key"));
+        assert!(!json.contains("encryption_key"));
+        assert!(!json.contains("[170,187,204,221]"));
+        assert!(!json.contains("[17,34,51,68]"));
+
+        // Round-tripping through JSON must not reconstruct the keys --
+        // they were never written out in the first place.
+        let round_tripped: MessageOptions =
+            serde_json::from_str(&json).expect("skip-serialized struct must still deserialize");
+        assert!(round_tripped.signing_key.is_none());
+        assert!(round_tripped.encryption_key.is_none());
+        // Non-secret fields must still round-trip normally.
+        assert!(round_tripped.sign);
+        assert!(round_tripped.encrypt);
+    }
+
+    #[test]
+    fn message_options_debug_redacts_secret_keys_but_shows_presence() {
+        let with_keys = MessageOptions::new()
+            .with_signing(vec![1, 2, 3, 4])
+            .with_encryption(vec![5, 6, 7, 8]);
+        let debug_output = format!("{with_keys:?}");
+        assert!(!debug_output.contains("1, 2, 3, 4"));
+        assert!(!debug_output.contains("5, 6, 7, 8"));
+        assert!(debug_output.contains("redacted"));
+        // Presence information (Some vs None) is still visible.
+        assert!(debug_output.contains("signing_key: Some"));
+        assert!(debug_output.contains("encryption_key: Some"));
+
+        let without_keys = MessageOptions::new();
+        let debug_output = format!("{without_keys:?}");
+        assert!(debug_output.contains("signing_key: None"));
+        assert!(debug_output.contains("encryption_key: None"));
+    }
+
+    #[test]
+    fn zeroize_secrets_clears_key_material_in_place() {
+        let mut options = MessageOptions::new()
+            .with_signing(vec![9, 9, 9, 9])
+            .with_encryption(vec![7, 7, 7]);
+
+        options.zeroize_secrets();
+
+        assert_eq!(options.signing_key, Some(vec![0, 0, 0, 0]));
+        assert_eq!(options.encryption_key, Some(vec![0, 0, 0]));
+    }
+
+    #[test]
+    fn zeroize_secrets_is_a_no_op_without_keys() {
+        // Must not panic when no keys are set.
+        let mut options = MessageOptions::new();
+        options.zeroize_secrets();
+        assert!(options.signing_key.is_none());
+        assert!(options.encryption_key.is_none());
+    }
+
+    #[test]
+    fn message_options_drop_does_not_panic() {
+        // Exercises the actual `Drop` impl (as opposed to calling
+        // `zeroize_secrets` directly).
+        let options = MessageOptions::new()
+            .with_signing(vec![1, 2, 3])
+            .with_encryption(vec![4, 5, 6]);
+        drop(options);
+    }
 }

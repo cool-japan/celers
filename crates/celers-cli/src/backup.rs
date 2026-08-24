@@ -182,6 +182,30 @@ pub async fn create_backup_incremental(
 
     let current = capture_broker_state(broker_url)?;
 
+    if current.queues.is_empty() && current.schedules.is_empty() {
+        // A disaster-recovery command that always "succeeds" while
+        // capturing nothing is worse than one that fails loudly (idx 314).
+        // This does not (yet) turn into a non-zero exit / require an
+        // `--allow-empty` opt-out -- that needs a new CLI flag threaded
+        // through `cli::dispatch`, outside this module -- but an operator
+        // staring at "Backup created successfully" with a suspiciously
+        // empty archive at least now gets an unmissable, explicit reason
+        // printed above it.
+        println!(
+            "{}",
+            "⚠ This backup captured ZERO queues and ZERO schedules."
+                .yellow()
+                .bold()
+        );
+        println!(
+            "  {}",
+            "Queues are enumerated from this deployment's configured `queues` list \
+             (celers.toml), not by scanning Redis -- if the broker is not actually \
+             empty, check that list includes every queue you expect backed up."
+                .dimmed()
+        );
+    }
+
     let backup = if let Some(prev_path) = previous_backup_path {
         if since.is_some() {
             println!(
@@ -239,6 +263,17 @@ pub async fn create_backup_incremental(
 /// This performs the live scan (queues, pending/DLQ/delayed tasks, scheduled tasks) that
 /// backs every [`create_backup_incremental`] call (full snapshot or incremental alike; it
 /// diffs or filters the captured snapshot before it is written out).
+///
+/// Queues are enumerated from the resolved configuration's `queues` list
+/// (the same list `celers.toml`'s `[queues]` array / `Config::default_config`
+/// already treat as authoritative for "which queues does this deployment
+/// have") rather than by pattern-matching Redis keys: `RedisBroker` names
+/// every queue-family key directly off the bare queue name (see
+/// `crate::keys`) with no shared prefix at all, so there is no `celers:*`-
+/// style pattern a `KEYS`/`SCAN` could reliably discover queues by -- the
+/// previous `KEYS celers:queue:*` implementation matched nothing any
+/// producer or worker ever wrote (idx 314), silently producing an
+/// always-empty backup.
 fn capture_broker_state(broker_url: &str) -> Result<Backup> {
     // Connect to Redis
     let client = redis::Client::open(broker_url).context("Failed to create Redis client")?;
@@ -246,41 +281,44 @@ fn capture_broker_state(broker_url: &str) -> Result<Backup> {
         .get_connection()
         .context("Failed to connect to Redis")?;
 
-    // Get all queue names
-    let queue_keys: Vec<String> = con
-        .keys("celers:queue:*")
-        .context("Failed to get queue keys")?;
+    let cfg = crate::config_layer::resolve_config(&crate::config_layer::CliConfigArgs::default())
+        .unwrap_or_else(|_| crate::config::Config::default_config());
+    let mut queue_names = cfg.queues;
+    queue_names.sort();
+    queue_names.dedup();
 
     let mut queues = Vec::new();
     let mut total_tasks = 0;
 
-    for key in queue_keys {
-        // Extract queue name from key
-        let queue_name = key
-            .strip_prefix("celers:queue:")
-            .unwrap_or(&key)
-            .to_string();
+    for queue_name in queue_names {
+        let main_key = crate::keys::main(&queue_name);
+        let main_type: String = redis::cmd("TYPE")
+            .arg(&main_key)
+            .query(&mut con)
+            .unwrap_or_else(|_| "none".to_string());
 
-        // Skip internal keys
-        if queue_name.contains(':') {
+        // A configured name nothing has ever enqueued to yet -- skip it
+        // rather than recording an empty queue in every backup.
+        if main_type == "none" {
             continue;
         }
 
         println!("  Backing up queue: {}", queue_name.yellow());
 
-        // Get pending tasks
-        let pending_tasks: Vec<String> = con
-            .lrange(format!("celers:queue:{queue_name}"), 0, -1)
-            .unwrap_or_default();
+        let pending_tasks: Vec<String> = match main_type.as_str() {
+            "list" => con.lrange(&main_key, 0, -1).unwrap_or_default(),
+            "zset" => con.zrange(&main_key, 0, -1).unwrap_or_default(),
+            _ => Vec::new(),
+        };
 
         // Get DLQ tasks
         let dlq_tasks: Vec<String> = con
-            .lrange(format!("celers:dlq:{queue_name}"), 0, -1)
+            .lrange(crate::keys::dlq(&queue_name), 0, -1)
             .unwrap_or_default();
 
         // Get delayed tasks
         let delayed_tasks: Vec<String> = con
-            .zrange(format!("celers:delayed:{queue_name}"), 0, -1)
+            .zrange(crate::keys::delayed(&queue_name), 0, -1)
             .unwrap_or_default();
 
         let task_count = pending_tasks.len() + dlq_tasks.len() + delayed_tasks.len();
@@ -296,20 +334,31 @@ fn capture_broker_state(broker_url: &str) -> Result<Backup> {
 
         queues.push(QueueBackup {
             name: queue_name,
-            queue_type: "fifo".to_string(), // Default to FIFO
+            queue_type: if main_type == "zset" {
+                "priority".to_string()
+            } else {
+                "fifo".to_string()
+            },
             pending_tasks,
             dlq_tasks,
             delayed_tasks,
         });
     }
 
-    // Get scheduled tasks
+    // Get scheduled tasks. `SCAN` (bounded per-call cost) rather than
+    // `KEYS` (a single unbounded O(N) command against the whole keyspace),
+    // and the key pattern `commands::schedule::add_schedule` actually
+    // writes (`celers:schedule:{name}`, see `crate::keys::schedule`) rather
+    // than the old `celers:beat:schedule:*`, which nothing wrote to.
     let mut schedules = Vec::new();
-    let schedule_keys: Vec<String> = con.keys("celers:beat:schedule:*").unwrap_or_default();
+    let schedule_keys: Vec<String> = con
+        .scan_match(crate::keys::SCHEDULE_SCAN_PATTERN)
+        .map(|iter| iter.filter_map(std::result::Result::ok).collect())
+        .unwrap_or_default();
 
     for key in schedule_keys {
         let schedule_name = key
-            .strip_prefix("celers:beat:schedule:")
+            .strip_prefix("celers:schedule:")
             .unwrap_or(&key)
             .to_string();
 
@@ -678,35 +727,48 @@ pub async fn restore_backup_with_policy(
             }
         };
 
+        // Keys matching `crate::keys` -- the real, bare-named layout
+        // `RedisBroker` reads/writes -- rather than the old `celers:queue:`/
+        // `celers:dlq:`/`celers:delayed:` namespace nothing ever wrote to
+        // (idx 314). Restoring to the wrong keys was the write-side twin of
+        // `capture_broker_state`'s read-side bug: even a backup that had
+        // captured real data would have restored it somewhere the broker
+        // could never see.
+        let main_key = crate::keys::main(&resolved.name);
+        let dlq_key = crate::keys::dlq(&resolved.name);
+        let delayed_key = crate::keys::delayed(&resolved.name);
+
         if had_conflict {
             // Clear existing keys before writing the resolved (overwrite or merged)
             // content, since Redis list/sorted-set writes are append-only.
-            let _: () = con.del(format!("celers:queue:{}", resolved.name))?;
-            let _: () = con.del(format!("celers:dlq:{}", resolved.name))?;
-            let _: () = con.del(format!("celers:delayed:{}", resolved.name))?;
+            let _: () = con.del(&main_key)?;
+            let _: () = con.del(&dlq_key)?;
+            let _: () = con.del(&delayed_key)?;
         }
 
         println!("  Restoring queue: {}", resolved.name.yellow());
 
-        // Restore pending tasks
+        // Restore pending tasks. `RPUSH` matches `RedisBroker::enqueue`'s
+        // own push direction for list-mode (FIFO) queues.
         for task in &resolved.pending_tasks {
-            let _: () = con.rpush(format!("celers:queue:{}", resolved.name), task)?;
+            let _: () = con.rpush(&main_key, task)?;
             restored_tasks += 1;
         }
 
         // Restore DLQ tasks
         for task in &resolved.dlq_tasks {
-            let _: () = con.rpush(format!("celers:dlq:{}", resolved.name), task)?;
+            let _: () = con.rpush(&dlq_key, task)?;
             restored_tasks += 1;
         }
 
-        // Restore delayed tasks
+        // Restore delayed tasks. NOTE: the original `execute_at` score is
+        // not currently captured by `capture_broker_state` (its `ZRANGE`
+        // does not request `WITHSCORES`), so this substitutes "now" --
+        // meaning a restored delayed task becomes immediately eligible
+        // rather than resuming its original schedule. See the crate-level
+        // followups for capturing/restoring the real score.
         for task in &resolved.delayed_tasks {
-            let _: () = con.zadd(
-                format!("celers:delayed:{}", resolved.name),
-                task,
-                chrono::Utc::now().timestamp(),
-            )?;
+            let _: () = con.zadd(&delayed_key, task, chrono::Utc::now().timestamp())?;
             restored_tasks += 1;
         }
 
@@ -730,15 +792,32 @@ pub async fn restore_backup_with_policy(
 /// Read the currently-live pending/DLQ/delayed tasks for `name` from the broker, if any
 /// exist. Returns `None` when the queue has no tasks in any of the three buckets, which is
 /// treated as "does not exist yet" for conflict-resolution purposes.
+///
+/// Keys come from `crate::keys` (idx 314) rather than the `celers:queue:`/
+/// `celers:dlq:`/`celers:delayed:` namespace nothing ever wrote to. The main
+/// key's actual Redis type is also checked before reading it: an
+/// unconditional `LRANGE` against a Priority-mode (ZSET) main queue would
+/// fail with `WRONGTYPE`, and the `unwrap_or_default()` below would then
+/// silently report "no pending tasks" for a queue that is, in fact, full --
+/// making `resolve_queue_conflict` treat a real conflict as "does not exist
+/// yet" and overwrite it outright regardless of `conflict_policy`.
 fn read_existing_queue(con: &mut redis::Connection, name: &str) -> Option<QueueBackup> {
-    let pending_tasks: Vec<String> = con
-        .lrange(format!("celers:queue:{name}"), 0, -1)
-        .unwrap_or_default();
+    let main_key = crate::keys::main(name);
+    let main_type: String = redis::cmd("TYPE")
+        .arg(&main_key)
+        .query(con)
+        .unwrap_or_else(|_| "none".to_string());
+
+    let pending_tasks: Vec<String> = match main_type.as_str() {
+        "list" => con.lrange(&main_key, 0, -1).unwrap_or_default(),
+        "zset" => con.zrange(&main_key, 0, -1).unwrap_or_default(),
+        _ => Vec::new(),
+    };
     let dlq_tasks: Vec<String> = con
-        .lrange(format!("celers:dlq:{name}"), 0, -1)
+        .lrange(crate::keys::dlq(name), 0, -1)
         .unwrap_or_default();
     let delayed_tasks: Vec<String> = con
-        .zrange(format!("celers:delayed:{name}"), 0, -1)
+        .zrange(crate::keys::delayed(name), 0, -1)
         .unwrap_or_default();
 
     if pending_tasks.is_empty() && dlq_tasks.is_empty() && delayed_tasks.is_empty() {
@@ -746,7 +825,11 @@ fn read_existing_queue(con: &mut redis::Connection, name: &str) -> Option<QueueB
     } else {
         Some(QueueBackup {
             name: name.to_string(),
-            queue_type: "fifo".to_string(),
+            queue_type: if main_type == "zset" {
+                "priority".to_string()
+            } else {
+                "fifo".to_string()
+            },
             pending_tasks,
             dlq_tasks,
             delayed_tasks,
@@ -821,6 +904,101 @@ fn task_identity(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celers_core::Broker;
+
+    /// Regression test for idx 314: `capture_broker_state` used to scan
+    /// `celers:queue:*`/`celers:dlq:*`/`celers:delayed:*`, a namespace
+    /// nothing wrote to, so every backup always captured zero queues and
+    /// zero tasks regardless of what was actually enqueued. This proves a
+    /// backup taken right after enqueuing a real task via `RedisBroker`
+    /// actually captures it -- using whichever queue name the resolved
+    /// configuration's `queues` list gives (the exact source
+    /// `capture_broker_state` itself consults), rather than a hardcoded
+    /// name, so this test agrees with the function under test regardless of
+    /// this repository's `celers.toml` contents.
+    #[tokio::test]
+    async fn backup_captures_real_data_enqueued_via_redis_broker() {
+        let broker_url = "redis://127.0.0.1:6379";
+
+        let cfg =
+            crate::config_layer::resolve_config(&crate::config_layer::CliConfigArgs::default())
+                .unwrap_or_else(|_| crate::config::Config::default_config());
+        let queue_name =
+            cfg.queues.first().cloned().expect(
+                "resolved config always has at least one queue (default_config's fallback)",
+            );
+
+        let broker =
+            celers_broker_redis::RedisBroker::new(broker_url, &queue_name).expect("broker");
+
+        // A marker task, so this test finds *its own* data even if the
+        // shared queue already has unrelated content from other
+        // concurrently-running processes against the same Redis instance.
+        let marker_name = format!("backup-marker-{}", uuid::Uuid::new_v4());
+        broker
+            .enqueue(celers_core::SerializedTask::new(
+                marker_name.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("enqueue marker task");
+
+        let output_path = std::env::temp_dir().join(format!(
+            "celers_cli_backup_test_{}.tar.gz",
+            uuid::Uuid::new_v4()
+        ));
+        let output_path_str = output_path.to_str().expect("utf8 temp path");
+
+        create_backup_incremental(broker_url, output_path_str, None, None)
+            .await
+            .expect("backup");
+
+        let backup = read_backup_archive(output_path_str).expect("read back the archive");
+
+        assert!(
+            backup.metadata.task_count > 0,
+            "a backup taken right after enqueuing a real task via RedisBroker must not report \
+             zero tasks"
+        );
+
+        let queue_backup = backup
+            .queues
+            .iter()
+            .find(|q| q.name == queue_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "queue '{queue_name}' (from the resolved config) must be present in the backup"
+                )
+            });
+        let marker_entry = queue_backup
+            .pending_tasks
+            .iter()
+            .find(|raw| raw.contains(&marker_name))
+            .cloned();
+        assert!(
+            marker_entry.is_some(),
+            "the specific task just enqueued via RedisBroker must be present in the backup"
+        );
+
+        // Targeted cleanup: LREM removes only a byte-exact match, so this
+        // cannot disturb unrelated content another concurrently-running
+        // test/process might have in the same shared queue.
+        if let Some(raw) = marker_entry {
+            let client = redis::Client::open(broker_url).expect("client");
+            let mut conn = client
+                .get_multiplexed_async_connection()
+                .await
+                .expect("conn");
+            let _: usize = redis::cmd("LREM")
+                .arg(crate::keys::main(&queue_name))
+                .arg(1)
+                .arg(&raw)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(0);
+        }
+        let _ = std::fs::remove_file(&output_path);
+    }
 
     fn task_json(id: &str, timestamp: &str) -> String {
         format!(

@@ -1,5 +1,6 @@
+use crate::dispatch::{self, MAX_COUNTDOWN_SECS};
 use crate::{CanvasError, Signature};
-use celers_core::{Broker, SerializedTask};
+use celers_core::Broker;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -35,6 +36,16 @@ impl Group {
     }
 
     /// Apply the group by enqueuing all tasks to the broker
+    ///
+    /// Every member is built first and the whole set is then handed to
+    /// [`Broker::enqueue_batch`] in a single call, so a 1000-task group costs
+    /// one round trip rather than 1000 sequential ones (Redis pipelines it,
+    /// Postgres wraps it in one transaction, SQS publishes it as a batch).
+    ///
+    /// Members carrying a [`countdown`](crate::TaskOptions::countdown) or
+    /// [`eta`](crate::TaskOptions::eta) cannot ride in the immediate batch —
+    /// they are dispatched individually through the broker's scheduling
+    /// variants so `skew`/`jitter`/`with_rate_limit` actually stagger the group.
     pub async fn apply<B: Broker>(self, broker: &B) -> Result<Uuid, CanvasError> {
         if self.tasks.is_empty() {
             return Err(CanvasError::Invalid("Group cannot be empty".to_string()));
@@ -42,34 +53,27 @@ impl Group {
 
         let group_id = self.group_id.unwrap_or_else(Uuid::new_v4);
 
-        // Enqueue all tasks in parallel
-        for sig in self.tasks {
-            // Convert signature to SerializedTask
-            let args_json = serde_json::json!({
-                "args": sig.args,
-                "kwargs": sig.kwargs
-            });
-            let args_bytes = serde_json::to_vec(&args_json)
-                .map_err(|e| CanvasError::Serialization(e.to_string()))?;
-
-            let mut task = SerializedTask::new(sig.task.clone(), args_bytes);
-
-            // Set priority if specified
-            if let Some(priority) = sig.options.priority {
-                task = task.with_priority(priority.into());
-            }
-
-            // Set group_id in metadata (for tracking)
-            task.metadata.group_id = Some(group_id);
-
-            // Enqueue the task
-            broker
-                .enqueue(task)
-                .await
-                .map_err(|e| CanvasError::Broker(e.to_string()))?;
-        }
+        let built = dispatch::build_fanout(&self.tasks, Some(group_id), None)?;
+        dispatch::dispatch_all(broker, built).await?;
 
         Ok(group_id)
+    }
+
+    /// Apply the group as one parallel branch of an enclosing workflow,
+    /// stamping every member with the caller-supplied `group_id`.
+    ///
+    /// Returns the ids of the enqueued member tasks in declaration order.
+    pub(crate) async fn apply_within<B: Broker>(
+        &self,
+        broker: &B,
+        group_id: Uuid,
+    ) -> Result<Vec<Uuid>, CanvasError> {
+        if self.tasks.is_empty() {
+            return Err(CanvasError::Invalid("Group cannot be empty".to_string()));
+        }
+
+        let built = dispatch::build_fanout(&self.tasks, Some(group_id), None)?;
+        dispatch::dispatch_all(broker, built).await
     }
 }
 
@@ -178,10 +182,22 @@ impl Group {
     /// assert_eq!(group.tasks[1].options.countdown, Some(1));
     /// assert_eq!(group.tasks[2].options.countdown, Some(2));
     /// ```
+    ///
+    /// Countdowns are clamped to [`MAX_COUNTDOWN_SECS`]; negative or
+    /// non-finite inputs collapse to `0` rather than producing a nonsensical
+    /// delay.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn skew(mut self, start: f64, step: f64) -> Self {
         let mut countdown = start;
         for task in &mut self.tasks {
-            task.options.countdown = Some(countdown as u64);
+            // `as u64` saturates at the bounds and maps NaN to 0 in Rust, but
+            // clamp explicitly so the intent is on the page.
+            let secs = if countdown.is_finite() && countdown > 0.0 {
+                (countdown as u64).min(MAX_COUNTDOWN_SECS)
+            } else {
+                0
+            };
+            task.options.countdown = Some(secs);
             countdown += step;
         }
         self
@@ -193,10 +209,19 @@ impl Group {
     /// This provides more even load distribution than linear skew.
     ///
     /// # Arguments
-    /// * `max_delay` - Maximum countdown in seconds
+    /// * `max_delay` - Maximum countdown in seconds, clamped to
+    ///   [`MAX_COUNTDOWN_SECS`]
+    ///
+    /// The modulus is computed with saturating arithmetic: a `max_delay` of
+    /// `u64::MAX` used to overflow `max_delay + 1` (a debug panic) and wrap to a
+    /// modulus of zero (a division-by-zero panic in release).
     pub fn jitter(mut self, max_delay: u64) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
+
+        // `+ 1` makes the range inclusive of `max_delay`; saturating add and a
+        // `max(1)` floor keep the modulus non-zero for every input.
+        let modulus = max_delay.min(MAX_COUNTDOWN_SECS).saturating_add(1).max(1);
 
         for (i, task) in self.tasks.iter_mut().enumerate() {
             // Use a deterministic "random" based on task index and name
@@ -204,7 +229,7 @@ impl Group {
             i.hash(&mut hasher);
             task.task.hash(&mut hasher);
             let hash = hasher.finish();
-            let delay = hash % (max_delay + 1);
+            let delay = hash % modulus;
             task.options.countdown = Some(delay);
         }
         self
@@ -777,5 +802,274 @@ impl FromIterator<Signature> for Group {
             tasks: iter.into_iter().collect(),
             group_id: Some(Uuid::new_v4()),
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use celers_core::SerializedTask;
+    use std::sync::{Arc, Mutex};
+
+    /// How a task reached the broker.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Arrival {
+        /// Part of a single `enqueue_batch` call, identified by batch number.
+        Batch(usize),
+        /// Delivered on its own with a relative delay.
+        After(u64),
+    }
+
+    /// Broker distinguishing batched enqueues from scheduled ones.
+    #[derive(Clone, Default)]
+    struct BatchAwareBroker {
+        entries: Arc<Mutex<Vec<(SerializedTask, Arrival)>>>,
+        batches: Arc<Mutex<usize>>,
+    }
+
+    impl BatchAwareBroker {
+        fn entries(&self) -> Vec<(SerializedTask, Arrival)> {
+            self.entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn batch_count(&self) -> usize {
+            *self
+                .batches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn arrivals(&self) -> Vec<(String, Arrival)> {
+            self.entries()
+                .into_iter()
+                .map(|(task, arrival)| (task.metadata.name, arrival))
+                .collect()
+        }
+
+        fn push(&self, task: SerializedTask, arrival: Arrival) -> celers_core::TaskId {
+            let id = task.metadata.id;
+            self.entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((task, arrival));
+            id
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for BatchAwareBroker {
+        async fn enqueue(&self, task: SerializedTask) -> celers_core::Result<celers_core::TaskId> {
+            // A lone `enqueue` counts as its own single-item batch.
+            let batch = {
+                let mut batches = self
+                    .batches
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *batches += 1;
+                *batches
+            };
+            Ok(self.push(task, Arrival::Batch(batch)))
+        }
+
+        async fn enqueue_batch(
+            &self,
+            tasks: Vec<SerializedTask>,
+        ) -> celers_core::Result<Vec<celers_core::TaskId>> {
+            let batch = {
+                let mut batches = self
+                    .batches
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *batches += 1;
+                *batches
+            };
+            Ok(tasks
+                .into_iter()
+                .map(|task| self.push(task, Arrival::Batch(batch)))
+                .collect())
+        }
+
+        async fn enqueue_after(
+            &self,
+            task: SerializedTask,
+            delay_secs: u64,
+        ) -> celers_core::Result<celers_core::TaskId> {
+            Ok(self.push(task, Arrival::After(delay_secs)))
+        }
+
+        async fn dequeue(&self) -> celers_core::Result<Option<celers_core::BrokerMessage>> {
+            Ok(None)
+        }
+
+        async fn ack(
+            &self,
+            _task_id: &celers_core::TaskId,
+            _receipt_handle: Option<&str>,
+        ) -> celers_core::Result<()> {
+            Ok(())
+        }
+
+        async fn reject(
+            &self,
+            _task_id: &celers_core::TaskId,
+            _receipt_handle: Option<&str>,
+            _requeue: bool,
+        ) -> celers_core::Result<()> {
+            Ok(())
+        }
+
+        async fn queue_size(&self) -> celers_core::Result<usize> {
+            Ok(self.entries().len())
+        }
+
+        async fn cancel(&self, _task_id: &celers_core::TaskId) -> celers_core::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// A group of immediate members must cost exactly one broker round trip,
+    /// not one per member.
+    #[tokio::test]
+    async fn apply_uses_a_single_batch_for_immediate_members() {
+        let broker = BatchAwareBroker::default();
+
+        let group = Group::new()
+            .add("m1", vec![])
+            .add("m2", vec![])
+            .add("m3", vec![]);
+
+        let group_id = group.apply(&broker).await.expect("group dispatches");
+
+        assert_eq!(
+            broker.batch_count(),
+            1,
+            "the whole group must go out in one batched call"
+        );
+        assert_eq!(
+            broker.arrivals(),
+            vec![
+                ("m1".to_string(), Arrival::Batch(1)),
+                ("m2".to_string(), Arrival::Batch(1)),
+                ("m3".to_string(), Arrival::Batch(1)),
+            ]
+        );
+        for (task, _) in broker.entries() {
+            assert_eq!(task.metadata.group_id, Some(group_id));
+        }
+    }
+
+    /// Staggered members must actually be staggered: their countdowns select
+    /// the delayed-enqueue path instead of being dropped.
+    #[tokio::test]
+    async fn skewed_members_are_dispatched_through_the_scheduling_path() {
+        let broker = BatchAwareBroker::default();
+
+        Group::new()
+            .add("first", vec![])
+            .add("second", vec![])
+            .add("third", vec![])
+            .skew(0.0, 10.0)
+            .apply(&broker)
+            .await
+            .expect("group dispatches");
+
+        assert_eq!(
+            broker.arrivals(),
+            vec![
+                ("first".to_string(), Arrival::Batch(1)),
+                ("second".to_string(), Arrival::After(10)),
+                ("third".to_string(), Arrival::After(20)),
+            ],
+            "only the zero-countdown member rides the immediate batch"
+        );
+    }
+
+    /// Rate-limited groups get the same treatment.
+    #[tokio::test]
+    async fn rate_limited_members_are_staggered_at_dispatch() {
+        let broker = BatchAwareBroker::default();
+        let config = celers_core::RateLimitConfig::new(1.0).with_burst(1);
+
+        Group::new()
+            .add("a", vec![])
+            .add("b", vec![])
+            .add("c", vec![])
+            .with_rate_limit(&config)
+            .apply(&broker)
+            .await
+            .expect("group dispatches");
+
+        assert_eq!(
+            broker.arrivals(),
+            vec![
+                ("a".to_string(), Arrival::Batch(1)),
+                ("b".to_string(), Arrival::After(1)),
+                ("c".to_string(), Arrival::After(2)),
+            ],
+            "the rate-derived countdowns must reach the broker"
+        );
+    }
+
+    /// `jitter(u64::MAX)` used to overflow `max_delay + 1` (a debug panic) and
+    /// wrap to a zero modulus (a release division-by-zero panic).
+    #[test]
+    fn jitter_does_not_overflow_at_the_extreme() {
+        let group = Group::new()
+            .add("a", vec![])
+            .add("b", vec![])
+            .jitter(u64::MAX);
+
+        for task in &group.tasks {
+            let countdown = task.options.countdown.expect("jitter sets a countdown");
+            assert!(
+                countdown <= MAX_COUNTDOWN_SECS,
+                "jitter must clamp to the documented ceiling, got {countdown}"
+            );
+        }
+    }
+
+    /// Jitter must stay deterministic and inside the requested bound.
+    #[test]
+    fn jitter_is_deterministic_and_bounded() {
+        let build = || {
+            Group::new()
+                .add("alpha", vec![])
+                .add("beta", vec![])
+                .jitter(30)
+        };
+
+        let first: Vec<Option<u64>> = build().tasks.iter().map(|t| t.options.countdown).collect();
+        let second: Vec<Option<u64>> = build().tasks.iter().map(|t| t.options.countdown).collect();
+
+        assert_eq!(first, second, "jitter must be reproducible");
+        for countdown in first.into_iter().flatten() {
+            assert!(countdown <= 30);
+        }
+    }
+
+    /// `skew` must not produce nonsense for negative or non-finite inputs.
+    #[test]
+    fn skew_clamps_negative_and_non_finite_inputs() {
+        let group = Group::new()
+            .add("a", vec![])
+            .add("b", vec![])
+            .skew(-100.0, 50.0);
+
+        assert_eq!(group.tasks[0].options.countdown, Some(0));
+        assert_eq!(group.tasks[1].options.countdown, Some(0));
+
+        let nan_group = Group::new().add("a", vec![]).skew(f64::NAN, 1.0);
+        assert_eq!(nan_group.tasks[0].options.countdown, Some(0));
+    }
+
+    /// An empty group is not dispatchable.
+    #[tokio::test]
+    async fn empty_group_is_rejected() {
+        let broker = BatchAwareBroker::default();
+        assert!(Group::new().apply(&broker).await.is_err());
+        assert_eq!(broker.entries().len(), 0);
     }
 }

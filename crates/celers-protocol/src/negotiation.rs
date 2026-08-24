@@ -7,7 +7,17 @@
 //!
 //! - **Protocol v1**: Legacy format (Celery 3.x and earlier) - Not supported
 //! - **Protocol v2**: Current stable format (Celery 4.x+) - Fully supported
-//! - **Protocol v5**: Extended format (Celery 5.x+) - Fully supported
+//! - **Protocol "v5"**: A **CeleRS-internal extension identifier**, not a Celery
+//!   protocol version. Python Celery defines protocols 1 and 2 only, and
+//!   `task_protocol` defaults to 2; there is no `protocol = 5` in Celery.
+//!   CeleRS uses the `v5` label for the same wire envelope as v2 carrying two
+//!   extra header stamps (`protocol_version` and `delivery_priority`, see
+//!   [`crate::v5`]). Because the envelope and the feature set are identical,
+//!   [`ProtocolCapabilities::v2`] and [`ProtocolCapabilities::v5`] deliberately
+//!   report the same capabilities -- the version only affects header stamping,
+//!   never what a message may express. Anything sent to a Python worker must be
+//!   valid protocol 2, which the v5 envelope is (Celery ignores unknown
+//!   headers).
 //!
 //! # Example
 //!
@@ -228,19 +238,43 @@ impl ProtocolNegotiator {
 
 /// Detect protocol version from a JSON message
 ///
-/// Analyzes the message structure to determine which protocol version it uses.
+/// Detection is ordered from *explicit* to *structural*:
+///
+/// 1. The [`PROTOCOL_VERSION_KEY`] header stamp (`protocol_version`) -- the key
+///    written by [`crate::v5::build_v5_message`], [`crate::v5::to_v5_wire`] and
+///    [`crate::migration::ProtocolMigrator::migrate`]. This is the only stamp
+///    this crate ever *writes*, so it must be the first thing read back;
+///    confidence 1.0.
+/// 2. Celery's own numeric `protocol` header, when a producer chooses to emit
+///    it. Its value is the Celery `task_protocol` number, so `2` means protocol
+///    v2 -- it is *not* a v5 marker; confidence 1.0.
+/// 3. Structural heuristics: a `lang` header (protocol v2 introduced it), then
+///    the `{headers, properties, body}` envelope shape.
+/// 4. Otherwise v2, the Celery default, with low confidence.
 pub fn detect_protocol(json: &serde_json::Value) -> ProtocolDetection {
-    // Check for protocol header (v5 style)
     if let Some(headers) = json.get("headers") {
-        if headers.get("protocol").is_some() {
+        // 1. Explicit `protocol_version` stamp (what this crate writes).
+        if let Some(version) = headers
+            .get(PROTOCOL_VERSION_KEY)
+            .and_then(version_from_json)
+        {
             return ProtocolDetection {
-                version: ProtocolVersion::V5,
+                version,
                 confidence: 1.0,
                 method: DetectionMethod::Headers,
             };
         }
 
-        // v2 has lang header
+        // 2. Celery's numeric `task_protocol` header, when present.
+        if let Some(version) = headers.get("protocol").and_then(version_from_json) {
+            return ProtocolDetection {
+                version,
+                confidence: 1.0,
+                method: DetectionMethod::Headers,
+            };
+        }
+
+        // 3. v2 has lang header
         if headers.get("lang").is_some() {
             return ProtocolDetection {
                 version: ProtocolVersion::V2,
@@ -421,7 +455,28 @@ pub fn encode_version(version: ProtocolVersion) -> &'static str {
 pub fn parse_version_from_headers(
     headers: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Option<ProtocolVersion> {
-    let value = headers.get(PROTOCOL_VERSION_KEY)?;
+    version_from_json(headers.get(PROTOCOL_VERSION_KEY)?)
+}
+
+/// Parse a [`ProtocolVersion`] from a raw JSON header value.
+///
+/// Accepts the string form (`"5"`, `"v5"`) and the numeric form (`5`), which is
+/// how a header value may arrive depending on the producer. Returns [`None`] for
+/// any other JSON type or unrecognised value.
+///
+/// # Example
+///
+/// ```
+/// use celers_protocol::negotiation::version_from_json;
+/// use celers_protocol::ProtocolVersion;
+/// use serde_json::json;
+///
+/// assert_eq!(version_from_json(&json!("5")), Some(ProtocolVersion::V5));
+/// assert_eq!(version_from_json(&json!(2)), Some(ProtocolVersion::V2));
+/// assert_eq!(version_from_json(&json!(9)), None);
+/// assert_eq!(version_from_json(&json!(null)), None);
+/// ```
+pub fn version_from_json(value: &serde_json::Value) -> Option<ProtocolVersion> {
     match value {
         serde_json::Value::String(s) => parse_version(s),
         serde_json::Value::Number(n) => n.as_u64().and_then(|num| match num {
@@ -591,11 +646,14 @@ mod tests {
 
     #[test]
     fn test_detect_protocol_v5() {
+        // The `protocol_version` stamp is the key this crate writes (see
+        // `v5::build_v5_message` / `migration::migrate`), in its canonical
+        // string form.
         let msg = json!({
             "headers": {
                 "task": "test",
                 "id": "123",
-                "protocol": 2
+                "protocol_version": "5"
             },
             "properties": {},
             "body": "test"
@@ -603,6 +661,76 @@ mod tests {
 
         let detection = detect_protocol(&msg);
         assert_eq!(detection.version, ProtocolVersion::V5);
+        assert_eq!(detection.confidence, 1.0);
+        assert_eq!(detection.method, DetectionMethod::Headers);
+    }
+
+    /// Regression: the detector used to return `V5` for *any* `protocol` header
+    /// regardless of its value, so a message stamped with Celery's own
+    /// `protocol: 2` (the `task_protocol` default) was reported as v5.
+    #[test]
+    fn test_detect_protocol_numeric_protocol_header_is_task_protocol() {
+        let msg = json!({
+            "headers": { "task": "test", "id": "123", "protocol": 2 },
+            "properties": {},
+            "body": "test"
+        });
+
+        let detection = detect_protocol(&msg);
+        assert_eq!(detection.version, ProtocolVersion::V2);
+        assert_eq!(detection.confidence, 1.0);
+
+        // A numeric `protocol_version` stamp is understood as well.
+        let msg = json!({
+            "headers": { "task": "test", "id": "123", "protocol_version": 5 },
+            "properties": {},
+            "body": "test"
+        });
+        assert_eq!(detect_protocol(&msg).version, ProtocolVersion::V5);
+
+        // An unrecognised value falls through to the structural heuristics
+        // rather than being reported with confidence 1.0.
+        let msg = json!({
+            "headers": { "task": "test", "id": "123", "protocol": 99, "lang": "py" },
+            "properties": {},
+            "body": "test"
+        });
+        let detection = detect_protocol(&msg);
+        assert_eq!(detection.version, ProtocolVersion::V2);
+        assert!(detection.confidence < 1.0);
+    }
+
+    /// Regression: the detector must recognise this crate's *own* output. A
+    /// message built by `v5::build_v5_message` was previously classified as v2
+    /// (confidence 0.9) because detection never looked at `protocol_version`.
+    #[test]
+    fn test_detect_protocol_recognises_own_v5_output() {
+        let wire = crate::v5::V5MessageSpec::new("tasks.add", uuid::Uuid::new_v4())
+            .with_args(vec![json!(1), json!(2)])
+            .build()
+            .expect("v5 build must succeed")
+            .to_wire_value()
+            .expect("v5 wire value must render");
+
+        let detection = detect_protocol(&wire);
+        assert_eq!(detection.version, ProtocolVersion::V5);
+        assert_eq!(detection.confidence, 1.0);
+        assert_eq!(detection.method, DetectionMethod::Headers);
+
+        // And a message migrated to v2 is detected as v2, not as v5 -- even
+        // though it carries the same `lang: "rust"` header.
+        let task_id = uuid::Uuid::new_v4();
+        let body = serde_json::to_vec(&crate::TaskArgs::new()).expect("encode body");
+        let message = crate::Message::new("tasks.add".to_string(), task_id, body);
+        let migrated = crate::migration::ProtocolMigrator::new(
+            crate::migration::MigrationStrategy::Conservative,
+        )
+        .migrate(message, ProtocolVersion::V2)
+        .expect("migration must succeed");
+        let wire = serde_json::to_value(&migrated).expect("serialize migrated message");
+
+        let detection = detect_protocol(&wire);
+        assert_eq!(detection.version, ProtocolVersion::V2);
         assert_eq!(detection.confidence, 1.0);
     }
 

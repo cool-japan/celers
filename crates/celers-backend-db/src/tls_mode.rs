@@ -75,6 +75,7 @@
 use std::sync::Arc;
 
 /// Whether a PostgreSQL connection URL requests TLS.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgTlsWanted {
     /// No `sslmode` was present, or it was explicitly `disable`.
@@ -85,6 +86,7 @@ pub enum PgTlsWanted {
 }
 
 /// Whether a MySQL connection URL requests TLS.
+#[cfg_attr(not(feature = "mysql"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlTlsWanted {
     /// Neither `ssl-mode` nor `tls` requested TLS.
@@ -141,6 +143,7 @@ fn find_query_param(query: &str, key: &str) -> Option<String> {
 /// `sslmode` query parameter.
 ///
 /// See the [module docs](self) for the exact rules.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 #[must_use]
 pub fn pg_tls_wanted(url: &str) -> PgTlsWanted {
     let Some(query) = query_string(url) else {
@@ -157,6 +160,7 @@ pub fn pg_tls_wanted(url: &str) -> PgTlsWanted {
 /// `ssl-mode`/`tls` query parameters.
 ///
 /// See the [module docs](self) for the exact rules.
+#[cfg_attr(not(feature = "mysql"), allow(dead_code))]
 #[must_use]
 pub fn mysql_tls_wanted(url: &str) -> MySqlTlsWanted {
     let Some(query) = query_string(url) else {
@@ -207,6 +211,7 @@ pub fn standard_rustls_config() -> Result<Arc<rustls::ClientConfig>, oxitls::Tls
 /// Returns an error (wrapped for [`anyhow`] callers) only when TLS *is*
 /// requested and the standard `rustls::ClientConfig` fails to build; a URL
 /// that does not request TLS never fails here.
+#[cfg(feature = "postgres")]
 pub fn pg_tls_mode_for_url(url: &str) -> anyhow::Result<oxisql_postgres::TlsMode> {
     match pg_tls_wanted(url) {
         PgTlsWanted::No => Ok(oxisql_postgres::TlsMode::Disabled),
@@ -226,6 +231,7 @@ pub fn pg_tls_mode_for_url(url: &str) -> anyhow::Result<oxisql_postgres::TlsMode
 /// Returns an error (wrapped for [`anyhow`] callers) only when TLS *is*
 /// requested and the standard `rustls::ClientConfig` fails to build; a URL
 /// that does not request TLS never fails here.
+#[cfg(feature = "mysql")]
 pub fn mysql_tls_mode_for_url(url: &str) -> anyhow::Result<oxisql_mysql::TlsMode> {
     match mysql_tls_wanted(url) {
         MySqlTlsWanted::No => Ok(oxisql_mysql::TlsMode::Disabled),
@@ -325,6 +331,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn pg_tls_mode_for_url_disabled_when_not_requested() {
         let mode =
@@ -332,6 +339,7 @@ mod tests {
         assert!(matches!(mode, oxisql_postgres::TlsMode::Disabled));
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn pg_tls_mode_for_url_rustls_when_requested() {
         let mode = pg_tls_mode_for_url("postgres://localhost/db?sslmode=require")
@@ -423,6 +431,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mysql")]
     #[test]
     fn mysql_tls_mode_for_url_disabled_when_not_requested() {
         let mode =
@@ -430,6 +439,7 @@ mod tests {
         assert!(matches!(mode, oxisql_mysql::TlsMode::Disabled));
     }
 
+    #[cfg(feature = "mysql")]
     #[test]
     fn mysql_tls_mode_for_url_rustls_when_requested() {
         let mode = mysql_tls_mode_for_url("mysql://localhost/db?ssl-mode=required")

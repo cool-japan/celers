@@ -22,26 +22,22 @@ tokio = { workspace = true }
 
 # SQL clients (OxiSQL, Pure Rust) supporting both PostgreSQL and MySQL.
 #
-# NOTE on feature gating: this crate's `postgres`/`mysql` Cargo features
-# (see [features] below) are NOT wired to any `#[cfg(feature = ...)]` in the
-# source — `PostgresResultBackend`/`PostgresAnalytics` and
-# `MysqlResultBackend`/`MysqlAnalytics` are both compiled unconditionally
-# today (confirmed: `grep -n "cfg(feature" src/*.rs` shows only the
-# unrelated `distributed-locks` gate on the `lock` module). That was already
-# true pre-migration — `sqlx = { workspace = true }` pulled in the
-# workspace's `sqlx` with both its `postgres` and `mysql` sqlx-features
-# always enabled, regardless of which of *this crate's* `postgres`/`mysql`
-# features were selected. `oxisql-postgres`/`oxisql-mysql` are therefore
-# kept as required (non-optional) dependencies here too, matching that same
-# "always both, unconditionally" shape — making them `optional = true` and
-# tying them to `dep:oxisql-postgres`/`dep:oxisql-mysql` would break the
-# build the moment only one of `postgres`/`mysql` is selected, since the
-# unconditional source code references both crates either way. Introducing
-# real `#[cfg(feature = ...)]` gating on the Postgres-only/MySQL-only code
-# blocks is a separate, larger change outside this migration's scope.
+# `oxisql-postgres`/`oxisql-mysql` are `optional = true`, each tied to this
+# crate's own `postgres`/`mysql` feature (see [features] below) via
+# `dep:oxisql-postgres`/`dep:oxisql-mysql`. Every Postgres-only item
+# (`PostgresResultBackend`, `PostgresAnalytics`, the `event_persistence` and
+# `lock` modules, ...) is behind `#[cfg(feature = "postgres")]`, and every
+# MySQL-only item (`MysqlResultBackend`, `MysqlAnalytics`) is behind
+# `#[cfg(feature = "mysql")]` — selecting only one of the two features
+# excludes the other backend's entire dependency tree (compile time, binary
+# size, dependency surface) rather than compiling and linking it
+# unconditionally regardless of selection, as this crate did before. `default
+# = ["postgres", "mysql"]` keeps both enabled unless a consumer explicitly
+# opts out with `default-features = false`, so this is purely additive: no
+# existing caller (all of which rely on the default) sees any change.
 oxisql-core = { workspace = true }
-oxisql-postgres = { workspace = true }
-oxisql-mysql = { workspace = true }
+oxisql-postgres = { workspace = true, optional = true }
+oxisql-mysql = { workspace = true, optional = true }
 oxitls = { workspace = true }
 rustls = { workspace = true }
 anyhow = { workspace = true }
@@ -55,9 +51,18 @@ celers-protocol = { workspace = true }
 celers-backend-redis = { workspace = true }
 
 [features]
-default = ["postgres"]
-postgres = []
-mysql = []
+default = ["postgres", "mysql"]
+postgres = ["dep:oxisql-postgres"]
+mysql = ["dep:oxisql-mysql"]
+# Distributed-lock backend (`DbLockBackend`); also requires `postgres`
+# (the `lock` module hardcodes `oxisql_postgres::PgConnection`) — see its
+# `#[cfg(all(feature = "distributed-locks", feature = "postgres"))]` gate.
 distributed-locks = []
 
 [dev-dependencies]
+# `tokio::time::pause`/`advance` (used by the deterministic, no-sleep
+# background-flush-ticker test in `event_persistence.rs`) live behind
+# tokio's `test-util` feature, which the workspace's `full`-feature `tokio`
+# dependency does not enable — added here (dev-only) rather than on the
+# main `[dependencies]` entry so it never reaches a non-test build.
+tokio = { workspace = true, features = ["test-util"] }

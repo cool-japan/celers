@@ -518,8 +518,43 @@ impl CeleryConfig {
     ///
     /// Supports all standard `CELERY_*` and `CELERYD_*` environment variables.
     /// Boolean values accept: `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`.
+    ///
+    /// A value that cannot be parsed (`CELERYD_CONCURRENCY=eight`) is logged at
+    /// `warn` level and the default is kept. Use
+    /// [`CeleryConfig::from_env_checked`] to turn such a value into an error
+    /// instead of starting on a silently different configuration.
     #[must_use]
     pub fn from_env() -> Self {
+        let (config, errors) = Self::load_env();
+        for error in errors {
+            tracing::warn!(
+                field = %error.field,
+                message = %error.message,
+                "Ignoring unparseable environment variable; using the default instead"
+            );
+        }
+        config
+    }
+
+    /// Load configuration from environment variables, failing on any value that
+    /// cannot be parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns every malformed environment variable, so a typo cannot silently
+    /// downgrade the process to a default it was never configured with.
+    pub fn from_env_checked() -> Result<Self, Vec<ConfigError>> {
+        let (config, errors) = Self::load_env();
+        if errors.is_empty() {
+            Ok(config)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Shared environment loading: returns the config plus any parse failures.
+    fn load_env() -> (Self, Vec<ConfigError>) {
+        let mut errors: Vec<ConfigError> = Vec::new();
         let mut config = Self::default();
 
         // String env vars
@@ -551,57 +586,148 @@ impl CeleryConfig {
             config.task_default_routing_key = routing_key;
         }
 
+        if let Ok(content) = std::env::var("CELERY_ACCEPT_CONTENT") {
+            let entries: Vec<String> = content
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect();
+            if entries.is_empty() {
+                errors.push(env_error(
+                    "CELERY_ACCEPT_CONTENT",
+                    &content,
+                    "a comma-separated list of content types",
+                ));
+            } else {
+                config.accept_content = entries;
+            }
+        }
+
         // Boolean env vars
-        if let Some(val) = parse_env_bool("CELERY_ENABLE_UTC") {
-            config.enable_utc = val;
-        }
-        if let Some(val) = parse_env_bool("CELERY_TASK_TRACK_STARTED") {
-            config.task_track_started = val;
-        }
-        if let Some(val) = parse_env_bool("CELERY_TASK_SEND_SENT_EVENT") {
-            config.task_send_sent_event = val;
-        }
-        if let Some(val) = parse_env_bool("CELERY_TASK_ACKS_LATE") {
-            config.task_acks_late = val;
-        }
-        if let Some(val) = parse_env_bool("CELERY_TASK_REJECT_ON_WORKER_LOST") {
-            config.task_reject_on_worker_lost = val;
+        {
+            let mut load_bool = |var: &str, slot: &mut bool| match parse_env_bool_checked(var) {
+                Ok(Some(val)) => *slot = val,
+                Ok(None) => {}
+                Err(raw) => errors.push(env_error(var, &raw, "true/false, 1/0, yes/no, on/off")),
+            };
+            load_bool("CELERY_ENABLE_UTC", &mut config.enable_utc);
+            load_bool("CELERY_TASK_TRACK_STARTED", &mut config.task_track_started);
+            load_bool(
+                "CELERY_TASK_SEND_SENT_EVENT",
+                &mut config.task_send_sent_event,
+            );
+            load_bool("CELERY_TASK_ACKS_LATE", &mut config.task_acks_late);
+            load_bool(
+                "CELERY_TASK_REJECT_ON_WORKER_LOST",
+                &mut config.task_reject_on_worker_lost,
+            );
         }
 
         // Numeric env vars
-        if let Ok(concurrency) = std::env::var("CELERYD_CONCURRENCY") {
-            if let Ok(val) = concurrency.parse() {
-                config.worker_concurrency = val;
-            }
+        match parse_env_number::<usize>("CELERYD_CONCURRENCY") {
+            Ok(Some(val)) => config.worker_concurrency = val,
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error("CELERYD_CONCURRENCY", &raw, "a positive integer")),
         }
-        if let Some(val) = parse_env_usize("CELERYD_PREFETCH_MULTIPLIER") {
-            config.worker_prefetch_multiplier = val;
+        match parse_env_number::<usize>("CELERYD_PREFETCH_MULTIPLIER") {
+            Ok(Some(val)) => config.worker_prefetch_multiplier = val,
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error("CELERYD_PREFETCH_MULTIPLIER", &raw, "an integer")),
         }
-        if let Some(val) = parse_env_usize("CELERYD_MAX_TASKS_PER_CHILD") {
-            config.worker_max_tasks_per_child = Some(val);
+        match parse_env_number::<usize>("CELERYD_MAX_TASKS_PER_CHILD") {
+            Ok(Some(val)) => config.worker_max_tasks_per_child = Some(val),
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error("CELERYD_MAX_TASKS_PER_CHILD", &raw, "an integer")),
         }
-        if let Some(val) = parse_env_usize("CELERYD_MAX_MEMORY_PER_CHILD") {
-            config.worker_max_memory_per_child = Some(val);
+        match parse_env_number::<usize>("CELERYD_MAX_MEMORY_PER_CHILD") {
+            Ok(Some(val)) => config.worker_max_memory_per_child = Some(val),
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error(
+                "CELERYD_MAX_MEMORY_PER_CHILD",
+                &raw,
+                "an integer (KiB)",
+            )),
         }
 
         // Duration / numeric env vars (seconds)
-        if let Some(val) = parse_env_u64("CELERY_TASK_TIME_LIMIT") {
-            config.task_time_limit = Some(val);
+        match parse_env_number::<u64>("CELERY_TASK_TIME_LIMIT") {
+            Ok(Some(val)) => config.task_time_limit = Some(val),
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error("CELERY_TASK_TIME_LIMIT", &raw, "seconds")),
         }
-        if let Some(val) = parse_env_u64("CELERY_TASK_SOFT_TIME_LIMIT") {
-            config.task_soft_time_limit = Some(val);
+        match parse_env_number::<u64>("CELERY_TASK_SOFT_TIME_LIMIT") {
+            Ok(Some(val)) => config.task_soft_time_limit = Some(val),
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error("CELERY_TASK_SOFT_TIME_LIMIT", &raw, "seconds")),
         }
-        if let Some(val) = parse_env_u64("CELERY_TASK_DEFAULT_RETRY_DELAY") {
-            config.task_default_retry_delay = val;
+        match parse_env_number::<u64>("CELERY_TASK_DEFAULT_RETRY_DELAY") {
+            Ok(Some(val)) => config.task_default_retry_delay = val,
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error(
+                "CELERY_TASK_DEFAULT_RETRY_DELAY",
+                &raw,
+                "seconds",
+            )),
         }
-        if let Some(val) = parse_env_u32("CELERY_TASK_MAX_RETRIES") {
-            config.task_max_retries = val;
+        match parse_env_number::<u32>("CELERY_TASK_MAX_RETRIES") {
+            Ok(Some(val)) => config.task_max_retries = val,
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error("CELERY_TASK_MAX_RETRIES", &raw, "an integer")),
         }
-        if let Some(val) = parse_env_u64("CELERY_RESULT_EXPIRES") {
-            config.result_expires = val;
+        match parse_env_number::<u64>("CELERY_RESULT_EXPIRES") {
+            Ok(Some(val)) => config.result_expires = val,
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error("CELERY_RESULT_EXPIRES", &raw, "seconds")),
+        }
+        match parse_env_number::<u64>("CELERY_WORKER_HEARTBEAT") {
+            Ok(Some(val)) => config.worker_heartbeat = val,
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error("CELERY_WORKER_HEARTBEAT", &raw, "seconds")),
+        }
+        if let Ok(compression) = std::env::var("CELERY_RESULT_COMPRESSION") {
+            config.result_compression = Some(compression);
+        }
+        match parse_env_number::<usize>("CELERY_RESULT_COMPRESSION_THRESHOLD") {
+            Ok(Some(val)) => config.result_compression_threshold = val,
+            Ok(None) => {}
+            Err(raw) => errors.push(env_error(
+                "CELERY_RESULT_COMPRESSION_THRESHOLD",
+                &raw,
+                "a byte count",
+            )),
         }
 
-        config
+        (config, errors)
+    }
+
+    /// Returns `true` if `content_type` is allowed by `accept_content`.
+    ///
+    /// This is the enforcement point for Celery's content-type allowlist: a
+    /// message whose declared content type is not accepted must be rejected
+    /// **before** its body is deserialized. Both the short serializer name
+    /// (`json`) and the wire MIME type (`application/json`) are recognised, MIME
+    /// parameters (`; charset=utf-8`) are ignored, and matching is
+    /// case-insensitive.
+    #[must_use]
+    pub fn is_content_type_accepted(&self, content_type: &str) -> bool {
+        let Some(name) = normalize_content_type(content_type) else {
+            return false;
+        };
+        self.accept_content
+            .iter()
+            .filter_map(|accepted| normalize_content_type(accepted))
+            .any(|accepted| accepted == name)
+    }
+
+    /// The accepted content types, normalized to short serializer names.
+    #[must_use]
+    pub fn accepted_serializer_names(&self) -> Vec<String> {
+        self.accept_content
+            .iter()
+            .filter_map(|accepted| normalize_content_type(accepted))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Perform detailed configuration validation, returning structured errors and warnings
@@ -648,20 +774,87 @@ impl CeleryConfig {
             }
         }
 
-        // Validate serializers
-        let valid_serializers = ["json", "msgpack", "yaml", "pickle", "bson", "protobuf"];
-        if !valid_serializers.contains(&self.task_serializer.as_str()) {
+        // Validate serializers. `pickle` is deliberately absent: this workspace
+        // does not provide a pickle serializer (see
+        // `celers-protocol/src/serializer.rs`), so accepting it here would give
+        // operators a false sense that it works — and it is precisely the
+        // serializer whose exclusion matters most for safety.
+        for (field, serializer) in [
+            ("task_serializer", &self.task_serializer),
+            ("result_serializer", &self.result_serializer),
+        ] {
+            if serializer.eq_ignore_ascii_case("pickle") {
+                validation.add_error(
+                    field,
+                    "pickle is not supported: no pickle serializer is provided (arbitrary code \
+                     execution risk)",
+                    Some(format!("use one of: {}", SUPPORTED_SERIALIZERS.join(", "))),
+                );
+            } else if normalize_content_type(serializer).is_none() {
+                validation.add_error(
+                    field,
+                    format!("unknown serializer: {serializer}"),
+                    Some(format!("use one of: {}", SUPPORTED_SERIALIZERS.join(", "))),
+                );
+            }
+        }
+
+        // Validate the content-type allowlist itself.
+        if self.accept_content.is_empty() {
             validation.add_error(
-                "task_serializer",
-                format!("unknown serializer: {}", self.task_serializer),
-                Some(format!("use one of: {}", valid_serializers.join(", "))),
+                "accept_content",
+                "accept_content is empty: no message content type would be accepted",
+                Some("list at least the serializer you use, e.g. [\"json\"]".to_string()),
             );
         }
-        if !valid_serializers.contains(&self.result_serializer.as_str()) {
-            validation.add_error(
-                "result_serializer",
-                format!("unknown serializer: {}", self.result_serializer),
-                Some(format!("use one of: {}", valid_serializers.join(", "))),
+        for entry in &self.accept_content {
+            if entry.eq_ignore_ascii_case("pickle") {
+                validation.add_error(
+                    "accept_content",
+                    "pickle is not supported and must not be accepted (arbitrary code execution \
+                     risk)",
+                    Some("remove \"pickle\" from accept_content".to_string()),
+                );
+            } else if normalize_content_type(entry).is_none() {
+                validation.add_error(
+                    "accept_content",
+                    format!("unknown content type: {entry}"),
+                    Some(format!(
+                        "use serializer names or MIME types, one of: {}",
+                        SUPPORTED_SERIALIZERS.join(", ")
+                    )),
+                );
+            }
+        }
+        // A serializer the worker is configured to *produce* must also be
+        // accepted, otherwise the messages it writes are rejected on receipt.
+        for (field, serializer) in [
+            ("task_serializer", &self.task_serializer),
+            ("result_serializer", &self.result_serializer),
+        ] {
+            if !self.accept_content.is_empty()
+                && normalize_content_type(serializer).is_some()
+                && !self.is_content_type_accepted(serializer)
+            {
+                validation.add_error(
+                    field,
+                    format!("{serializer} is not listed in accept_content"),
+                    Some(format!("add \"{serializer}\" to accept_content")),
+                );
+            }
+        }
+
+        // Surface unrecognised keys: `#[serde(flatten)] custom` silently absorbs
+        // typos such as `worker_concurency`, which then never take effect.
+        for key in self.custom.keys() {
+            let suggestion = closest_known_field(key)
+                .map(|field| format!("did you mean \"{field}\"?"))
+                .unwrap_or_else(|| {
+                    "remove it or move it under an explicitly namespaced key".to_string()
+                });
+            validation.add_warning(
+                "custom",
+                format!("unrecognised configuration key \"{key}\": {suggestion}"),
             );
         }
 
@@ -716,6 +909,13 @@ impl CeleryConfig {
     }
 
     /// Export configuration as environment variable key-value pairs
+    ///
+    /// Every scalar setting that [`CeleryConfig::from_env`] understands is
+    /// exported, so `from_env` after applying these variables reproduces the
+    /// scalar configuration. Structured settings (`task_routes`,
+    /// `task_annotations`, `beat_schedule`, `task_configs`) have no environment
+    /// representation and are intentionally omitted — persist those as a config
+    /// file instead.
     pub fn to_env_vars(&self) -> Vec<(String, String)> {
         let mut vars = Vec::new();
 
@@ -796,6 +996,21 @@ impl CeleryConfig {
         vars.push((
             "CELERY_RESULT_EXPIRES".to_string(),
             self.result_expires.to_string(),
+        ));
+        vars.push((
+            "CELERY_WORKER_HEARTBEAT".to_string(),
+            self.worker_heartbeat.to_string(),
+        ));
+        vars.push((
+            "CELERY_ACCEPT_CONTENT".to_string(),
+            self.accept_content.join(","),
+        ));
+        if let Some(ref compression) = self.result_compression {
+            vars.push(("CELERY_RESULT_COMPRESSION".to_string(), compression.clone()));
+        }
+        vars.push((
+            "CELERY_RESULT_COMPRESSION_THRESHOLD".to_string(),
+            self.result_compression_threshold.to_string(),
         ));
 
         vars
@@ -895,27 +1110,118 @@ impl CeleryConfig {
 
     /// Validate configuration
     ///
+    /// Thin wrapper over [`CeleryConfig::validate_detailed`] so there is a
+    /// single source of truth for what "valid" means; it returns the first
+    /// error as a string.
+    ///
     /// # Errors
     ///
     /// Returns an error if the configuration is invalid (e.g., empty broker URL, invalid concurrency, unsupported serializer).
     pub fn validate(&self) -> Result<(), String> {
-        if self.broker_url.is_empty() {
-            return Err("broker_url is required".to_string());
+        let validation = self.validate_detailed();
+        match validation.errors.first() {
+            Some(error) => Err(error.to_string()),
+            None => Ok(()),
         }
-
-        if self.worker_concurrency == 0 {
-            return Err("worker_concurrency must be greater than 0".to_string());
-        }
-
-        if !["json", "msgpack", "yaml", "pickle"].contains(&self.task_serializer.as_str()) {
-            return Err(format!(
-                "Unsupported task_serializer: {}",
-                self.task_serializer
-            ));
-        }
-
-        Ok(())
     }
+}
+
+/// Serializer names this build recognises (`pickle` is intentionally absent).
+pub const SUPPORTED_SERIALIZERS: [&str; 5] = ["json", "msgpack", "yaml", "bson", "protobuf"];
+
+/// Normalize a content type or serializer name to its short serializer name.
+///
+/// Accepts short names (`json`) and wire MIME types (`application/json`,
+/// `application/x-msgpack`, …), ignores MIME parameters and case. Returns
+/// `None` for anything this build does not support — including `pickle`.
+fn normalize_content_type(value: &str) -> Option<&'static str> {
+    let value = value.split(';').next().unwrap_or(value).trim();
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "json" | "application/json" | "text/json" => Some("json"),
+        "msgpack" | "messagepack" | "application/x-msgpack" | "application/msgpack" => {
+            Some("msgpack")
+        }
+        "yaml" | "application/x-yaml" | "application/yaml" | "text/yaml" => Some("yaml"),
+        "bson" | "application/bson" | "application/x-bson" => Some("bson"),
+        "protobuf" | "application/protobuf" | "application/x-protobuf" => Some("protobuf"),
+        _ => None,
+    }
+}
+
+/// Known top-level configuration keys, used to suggest fixes for typos that
+/// `#[serde(flatten)] custom` would otherwise swallow.
+const KNOWN_CONFIG_FIELDS: [&str; 26] = [
+    "broker_url",
+    "result_backend",
+    "task_serializer",
+    "result_serializer",
+    "accept_content",
+    "timezone",
+    "enable_utc",
+    "task_track_started",
+    "task_send_sent_event",
+    "task_acks_late",
+    "task_reject_on_worker_lost",
+    "worker_concurrency",
+    "worker_prefetch_multiplier",
+    "worker_max_tasks_per_child",
+    "worker_max_memory_per_child",
+    "worker_heartbeat",
+    "task_default_queue",
+    "task_default_exchange",
+    "task_default_exchange_type",
+    "task_default_routing_key",
+    "task_time_limit",
+    "task_soft_time_limit",
+    "task_default_retry_delay",
+    "task_max_retries",
+    "result_expires",
+    "beat_schedule",
+];
+
+/// Return the known configuration field closest to `key`, if any is close
+/// enough to be a plausible typo.
+fn closest_known_field(key: &str) -> Option<&'static str> {
+    let key_lower = key.to_ascii_lowercase();
+    let mut best: Option<(usize, &'static str)> = None;
+    for field in KNOWN_CONFIG_FIELDS {
+        let distance = edit_distance(&key_lower, field);
+        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+            best = Some((distance, field));
+        }
+    }
+    // Only suggest when the strings really are close (a third of the length,
+    // capped at 3 edits).
+    best.and_then(|(distance, field)| {
+        let threshold = (key_lower.len() / 3).clamp(1, 3);
+        (distance <= threshold).then_some(field)
+    })
+}
+
+/// Levenshtein edit distance between two ASCII strings.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<u8> = a.bytes().collect();
+    let b: Vec<u8> = b.bytes().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            current[j + 1] = (previous[j] + cost)
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
 }
 
 // Default value functions
@@ -973,29 +1279,38 @@ fn default_compression_threshold() -> usize {
 
 // --- Environment variable parsing helpers ---
 
-/// Parse an environment variable as a boolean.
-///
-/// Accepts: `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` (case-insensitive).
-fn parse_env_bool(var: &str) -> Option<bool> {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| match v.to_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Some(true),
-            "false" | "0" | "no" | "off" => Some(false),
-            _ => None,
-        })
+/// Parse an environment variable as a boolean, distinguishing "unset"
+/// (`Ok(None)`) from "set to something unparseable" (`Err(raw_value)`).
+fn parse_env_bool_checked(var: &str) -> Result<Option<bool>, String> {
+    let Ok(raw) = std::env::var(var) else {
+        return Ok(None);
+    };
+    match raw.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(Some(true)),
+        "false" | "0" | "no" | "off" => Ok(Some(false)),
+        _ => Err(raw),
+    }
 }
 
-fn parse_env_u64(var: &str) -> Option<u64> {
-    std::env::var(var).ok().and_then(|v| v.parse().ok())
+/// Parse an environment variable as a number, distinguishing "unset" from "set
+/// to something unparseable".
+fn parse_env_number<T: std::str::FromStr>(var: &str) -> Result<Option<T>, String> {
+    let Ok(raw) = std::env::var(var) else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<T>() {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Err(raw),
+    }
 }
 
-fn parse_env_u32(var: &str) -> Option<u32> {
-    std::env::var(var).ok().and_then(|v| v.parse().ok())
-}
-
-fn parse_env_usize(var: &str) -> Option<usize> {
-    std::env::var(var).ok().and_then(|v| v.parse().ok())
+/// Build a [`ConfigError`] describing a malformed environment variable.
+fn env_error(var: &str, raw: &str, expected: &str) -> ConfigError {
+    ConfigError {
+        field: var.to_string(),
+        message: format!("invalid value {raw:?}"),
+        suggestion: Some(format!("expected {expected}")),
+    }
 }
 
 // --- Detailed configuration validation types ---
@@ -1093,464 +1408,4 @@ impl std::fmt::Display for ConfigWarning {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    // Mutex to serialize env-var-mutating tests (env vars are process-global)
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Helper to set env vars safely in tests.
-    /// SAFETY: These are test-only calls. We hold ENV_LOCK to prevent races.
-    fn set_env(key: &str, val: &str) {
-        unsafe { std::env::set_var(key, val) };
-    }
-
-    /// Helper to remove env vars safely in tests.
-    fn remove_env(key: &str) {
-        unsafe { std::env::remove_var(key) };
-    }
-
-    /// List of all CELERY_* env var keys used by from_env(), for cleanup.
-    const ALL_ENV_KEYS: &[&str] = &[
-        "CELERY_BROKER_URL",
-        "CELERY_RESULT_BACKEND",
-        "CELERY_TASK_SERIALIZER",
-        "CELERY_RESULT_SERIALIZER",
-        "CELERY_TIMEZONE",
-        "CELERY_DEFAULT_QUEUE",
-        "CELERY_DEFAULT_EXCHANGE",
-        "CELERY_DEFAULT_EXCHANGE_TYPE",
-        "CELERY_DEFAULT_ROUTING_KEY",
-        "CELERY_ENABLE_UTC",
-        "CELERY_TASK_TRACK_STARTED",
-        "CELERY_TASK_SEND_SENT_EVENT",
-        "CELERY_TASK_ACKS_LATE",
-        "CELERY_TASK_REJECT_ON_WORKER_LOST",
-        "CELERYD_CONCURRENCY",
-        "CELERYD_PREFETCH_MULTIPLIER",
-        "CELERYD_MAX_TASKS_PER_CHILD",
-        "CELERYD_MAX_MEMORY_PER_CHILD",
-        "CELERY_TASK_TIME_LIMIT",
-        "CELERY_TASK_SOFT_TIME_LIMIT",
-        "CELERY_TASK_DEFAULT_RETRY_DELAY",
-        "CELERY_TASK_MAX_RETRIES",
-        "CELERY_RESULT_EXPIRES",
-    ];
-
-    fn cleanup_env() {
-        for key in ALL_ENV_KEYS {
-            remove_env(key);
-        }
-    }
-
-    #[test]
-    fn test_default_config() {
-        let config = CeleryConfig::default();
-        assert_eq!(config.broker_url, "redis://localhost:6379/0");
-        assert_eq!(config.task_serializer, "json");
-        assert_eq!(config.timezone, "UTC");
-        assert!(config.enable_utc);
-    }
-
-    #[test]
-    fn test_config_builder() {
-        let config = CeleryConfig::new("redis://localhost:6379/0")
-            .with_result_backend("redis://localhost:6379/1")
-            .with_worker_concurrency(8)
-            .with_default_queue("my_queue");
-
-        assert_eq!(config.worker_concurrency, 8);
-        assert_eq!(config.task_default_queue, "my_queue");
-    }
-
-    #[test]
-    fn test_config_validation() {
-        let config = CeleryConfig::default();
-        assert!(config.validate().is_ok());
-
-        let invalid = CeleryConfig {
-            broker_url: String::new(),
-            ..Default::default()
-        };
-        assert!(invalid.validate().is_err());
-    }
-
-    #[test]
-    fn test_task_route() {
-        let route = TaskRoute {
-            queue: "high_priority".to_string(),
-            exchange: Some("tasks".to_string()),
-            routing_key: Some("task.high".to_string()),
-            priority: Some(9),
-        };
-
-        let config = CeleryConfig::default().with_task_route("important_task", route);
-
-        assert!(config.get_task_route("important_task").is_some());
-    }
-
-    #[test]
-    fn test_duration_conversions() {
-        let config = CeleryConfig::default();
-        assert_eq!(config.result_expires_duration(), Duration::from_secs(86400));
-    }
-
-    #[test]
-    fn test_from_env_boolean_vars() {
-        let _guard = ENV_LOCK.lock();
-        cleanup_env();
-
-        set_env("CELERY_ENABLE_UTC", "true");
-        set_env("CELERY_TASK_TRACK_STARTED", "1");
-        set_env("CELERY_TASK_SEND_SENT_EVENT", "yes");
-        set_env("CELERY_TASK_ACKS_LATE", "on");
-        set_env("CELERY_TASK_REJECT_ON_WORKER_LOST", "false");
-
-        let config = CeleryConfig::from_env();
-        assert!(config.enable_utc);
-        assert!(config.task_track_started);
-        assert!(config.task_send_sent_event);
-        assert!(config.task_acks_late);
-        assert!(!config.task_reject_on_worker_lost);
-
-        cleanup_env();
-    }
-
-    #[test]
-    fn test_from_env_numeric_vars() {
-        let _guard = ENV_LOCK.lock();
-        cleanup_env();
-
-        set_env("CELERYD_PREFETCH_MULTIPLIER", "8");
-        set_env("CELERYD_CONCURRENCY", "16");
-        set_env("CELERYD_MAX_TASKS_PER_CHILD", "1000");
-        set_env("CELERYD_MAX_MEMORY_PER_CHILD", "524288");
-
-        let config = CeleryConfig::from_env();
-        assert_eq!(config.worker_prefetch_multiplier, 8);
-        assert_eq!(config.worker_concurrency, 16);
-        assert_eq!(config.worker_max_tasks_per_child, Some(1000));
-        assert_eq!(config.worker_max_memory_per_child, Some(524288));
-
-        cleanup_env();
-    }
-
-    #[test]
-    fn test_from_env_string_vars() {
-        let _guard = ENV_LOCK.lock();
-        cleanup_env();
-
-        set_env("CELERY_DEFAULT_QUEUE", "myqueue");
-        set_env("CELERY_DEFAULT_EXCHANGE", "myexchange");
-        set_env("CELERY_DEFAULT_EXCHANGE_TYPE", "topic");
-        set_env("CELERY_DEFAULT_ROUTING_KEY", "task.default");
-        set_env("CELERY_RESULT_SERIALIZER", "msgpack");
-
-        let config = CeleryConfig::from_env();
-        assert_eq!(config.task_default_queue, "myqueue");
-        assert_eq!(config.task_default_exchange, "myexchange");
-        assert_eq!(config.task_default_exchange_type, "topic");
-        assert_eq!(config.task_default_routing_key, "task.default");
-        assert_eq!(config.result_serializer, "msgpack");
-
-        cleanup_env();
-    }
-
-    #[test]
-    fn test_from_env_duration_vars() {
-        let _guard = ENV_LOCK.lock();
-        cleanup_env();
-
-        set_env("CELERY_TASK_TIME_LIMIT", "300");
-        set_env("CELERY_TASK_SOFT_TIME_LIMIT", "240");
-        set_env("CELERY_TASK_DEFAULT_RETRY_DELAY", "60");
-        set_env("CELERY_TASK_MAX_RETRIES", "5");
-        set_env("CELERY_RESULT_EXPIRES", "3600");
-
-        let config = CeleryConfig::from_env();
-        assert_eq!(config.task_time_limit, Some(300));
-        assert_eq!(config.task_soft_time_limit, Some(240));
-        assert_eq!(config.task_default_retry_delay, 60);
-        assert_eq!(config.task_max_retries, 5);
-        assert_eq!(config.result_expires, 3600);
-
-        cleanup_env();
-    }
-
-    #[test]
-    fn test_parse_env_bool_variants() {
-        let _guard = ENV_LOCK.lock();
-        cleanup_env();
-
-        // Truthy values
-        for val in &["true", "TRUE", "True", "1", "yes", "YES", "on", "ON"] {
-            set_env("CELERY_ENABLE_UTC", val);
-            assert_eq!(
-                parse_env_bool("CELERY_ENABLE_UTC"),
-                Some(true),
-                "failed for {}",
-                val
-            );
-        }
-
-        // Falsy values
-        for val in &["false", "FALSE", "False", "0", "no", "NO", "off", "OFF"] {
-            set_env("CELERY_ENABLE_UTC", val);
-            assert_eq!(
-                parse_env_bool("CELERY_ENABLE_UTC"),
-                Some(false),
-                "failed for {}",
-                val
-            );
-        }
-
-        // Invalid values return None
-        set_env("CELERY_ENABLE_UTC", "maybe");
-        assert_eq!(parse_env_bool("CELERY_ENABLE_UTC"), None);
-
-        // Missing var returns None
-        remove_env("CELERY_ENABLE_UTC");
-        assert_eq!(parse_env_bool("CELERY_ENABLE_UTC"), None);
-
-        cleanup_env();
-    }
-
-    #[test]
-    fn test_validate_detailed_valid_config() {
-        let config = CeleryConfig::default();
-        let validation = config.validate_detailed();
-        assert!(validation.is_valid());
-        assert_eq!(validation.error_count(), 0);
-    }
-
-    #[test]
-    fn test_validate_detailed_invalid_broker_url() {
-        let config = CeleryConfig {
-            broker_url: "ftp://bad-scheme".to_string(),
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(!validation.is_valid());
-        assert!(validation.errors.iter().any(|e| e.field == "broker_url"));
-    }
-
-    #[test]
-    fn test_validate_detailed_invalid_serializer() {
-        let config = CeleryConfig {
-            task_serializer: "xml".to_string(),
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(!validation.is_valid());
-        assert!(validation
-            .errors
-            .iter()
-            .any(|e| e.field == "task_serializer"));
-    }
-
-    #[test]
-    fn test_validate_detailed_zero_concurrency() {
-        let config = CeleryConfig {
-            worker_concurrency: 0,
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(!validation.is_valid());
-        assert!(validation
-            .errors
-            .iter()
-            .any(|e| e.field == "worker_concurrency"));
-    }
-
-    #[test]
-    fn test_validate_detailed_time_limit_warning() {
-        let config = CeleryConfig {
-            task_time_limit: Some(60),
-            task_soft_time_limit: Some(120), // soft >= hard
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(validation.has_warnings());
-        assert!(validation
-            .warnings
-            .iter()
-            .any(|w| w.field == "task_soft_time_limit"));
-    }
-
-    #[test]
-    fn test_to_env_vars_roundtrip() {
-        let config = CeleryConfig::new("amqp://localhost:5672")
-            .with_result_backend("redis://localhost:6379/1")
-            .with_task_serializer("msgpack")
-            .with_result_serializer("json")
-            .with_timezone("US/Eastern")
-            .with_enable_utc(false)
-            .with_worker_concurrency(12)
-            .with_prefetch_multiplier(2)
-            .with_default_queue("tasks");
-
-        let vars = config.to_env_vars();
-
-        // Check that key env vars are present with correct values
-        let find_var = |key: &str| -> Option<String> {
-            vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-        };
-
-        assert_eq!(
-            find_var("CELERY_BROKER_URL").as_deref(),
-            Some("amqp://localhost:5672")
-        );
-        assert_eq!(
-            find_var("CELERY_RESULT_BACKEND").as_deref(),
-            Some("redis://localhost:6379/1")
-        );
-        assert_eq!(
-            find_var("CELERY_TASK_SERIALIZER").as_deref(),
-            Some("msgpack")
-        );
-        assert_eq!(
-            find_var("CELERY_RESULT_SERIALIZER").as_deref(),
-            Some("json")
-        );
-        assert_eq!(find_var("CELERY_TIMEZONE").as_deref(), Some("US/Eastern"));
-        assert_eq!(find_var("CELERY_ENABLE_UTC").as_deref(), Some("false"));
-        assert_eq!(find_var("CELERYD_CONCURRENCY").as_deref(), Some("12"));
-        assert_eq!(
-            find_var("CELERYD_PREFETCH_MULTIPLIER").as_deref(),
-            Some("2")
-        );
-        assert_eq!(find_var("CELERY_DEFAULT_QUEUE").as_deref(), Some("tasks"));
-    }
-
-    #[test]
-    fn test_dump_output() {
-        let config = CeleryConfig::default();
-        let output = config.dump();
-
-        assert!(output.starts_with("CeleRS Configuration:\n"));
-        assert!(output.contains("broker_url:"));
-        assert!(output.contains("task_serializer:"));
-        assert!(output.contains("worker_concurrency:"));
-        assert!(output.contains("result_expires:"));
-        assert!(output.contains("task_routes:"));
-        assert!(output.contains("beat_schedule:"));
-    }
-
-    #[test]
-    fn test_config_validation_display() {
-        let error = ConfigError {
-            field: "broker_url".to_string(),
-            message: "invalid URL".to_string(),
-            suggestion: Some("use redis://".to_string()),
-        };
-        let display = format!("{}", error);
-        assert!(display.contains("[broker_url]"));
-        assert!(display.contains("invalid URL"));
-        assert!(display.contains("suggestion: use redis://"));
-
-        let error_no_suggestion = ConfigError {
-            field: "concurrency".to_string(),
-            message: "must be positive".to_string(),
-            suggestion: None,
-        };
-        let display2 = format!("{}", error_no_suggestion);
-        assert!(display2.contains("[concurrency]"));
-        assert!(display2.contains("must be positive"));
-        assert!(!display2.contains("suggestion"));
-
-        let warning = ConfigWarning {
-            field: "prefetch".to_string(),
-            message: "value too high".to_string(),
-        };
-        let display3 = format!("{}", warning);
-        assert!(display3.contains("[prefetch]"));
-        assert!(display3.contains("value too high"));
-    }
-
-    #[test]
-    fn test_validate_detailed_high_concurrency_warning() {
-        let config = CeleryConfig {
-            worker_concurrency: 2048,
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(validation.has_warnings());
-        assert!(validation
-            .warnings
-            .iter()
-            .any(|w| w.field == "worker_concurrency"));
-    }
-
-    #[test]
-    fn test_validate_detailed_prefetch_zero_warning() {
-        let config = CeleryConfig {
-            worker_prefetch_multiplier: 0,
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(validation.has_warnings());
-        assert!(validation
-            .warnings
-            .iter()
-            .any(|w| w.field == "worker_prefetch_multiplier"));
-    }
-
-    #[test]
-    fn test_validate_detailed_high_retries_warning() {
-        let config = CeleryConfig {
-            task_max_retries: 200,
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(validation.has_warnings());
-        assert!(validation
-            .warnings
-            .iter()
-            .any(|w| w.field == "task_max_retries"));
-    }
-
-    #[test]
-    fn test_validate_detailed_invalid_result_backend() {
-        let config = CeleryConfig {
-            result_backend: Some("ftp://invalid".to_string()),
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(!validation.is_valid());
-        assert!(validation
-            .errors
-            .iter()
-            .any(|e| e.field == "result_backend"));
-    }
-
-    #[test]
-    fn test_validate_detailed_invalid_result_serializer() {
-        let config = CeleryConfig {
-            result_serializer: "xml".to_string(),
-            ..Default::default()
-        };
-        let validation = config.validate_detailed();
-        assert!(!validation.is_valid());
-        assert!(validation
-            .errors
-            .iter()
-            .any(|e| e.field == "result_serializer"));
-    }
-
-    #[test]
-    fn test_config_validation_counts() {
-        let mut validation = ConfigValidation::new();
-        assert!(validation.is_valid());
-        assert!(!validation.has_warnings());
-        assert_eq!(validation.error_count(), 0);
-        assert_eq!(validation.warning_count(), 0);
-
-        validation.add_error("f1", "e1", None);
-        validation.add_warning("f2", "w1");
-        assert!(!validation.is_valid());
-        assert!(validation.has_warnings());
-        assert_eq!(validation.error_count(), 1);
-        assert_eq!(validation.warning_count(), 1);
-    }
-}
+mod tests;

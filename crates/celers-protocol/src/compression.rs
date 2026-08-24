@@ -441,12 +441,25 @@ pub fn detect_compression(data: &[u8]) -> CompressionType {
         return CompressionType::Gzip;
     }
 
-    // Zlib header: first byte is typically 0x78 (CMF byte)
-    // 0x78 0x01 = no/low compression, 0x78 0x9C = default, 0x78 0xDA = best
+    // Zlib header (RFC 1950): CMF byte + FLG byte. A header is valid
+    // whenever CM (the low nibble of CMF) is 8 ("deflate", the only method
+    // zlib defines), CINFO (the high nibble of CMF, encoding window size)
+    // is at most 7, and `(CMF << 8 | FLG) % 31 == 0` (the spec's checksum
+    // over the two header bytes). Checking only `CMF == 0x78` with four
+    // hardcoded FLG values recognizes just the default 32 KiB window with
+    // no preset dictionary; it misses smaller window sizes (CINFO < 7) and
+    // any header with the FDICT bit set, silently classifying those
+    // streams as uncompressed instead.
     #[cfg(feature = "zlib")]
-    if data[0] == 0x78 && (data[1] == 0x01 || data[1] == 0x5E || data[1] == 0x9C || data[1] == 0xDA)
     {
-        return CompressionType::Zlib;
+        let cmf = data[0];
+        let flg = data[1];
+        if (cmf & 0x0f) == 8
+            && (cmf >> 4) <= 7
+            && (((cmf as u16) << 8) | flg as u16).is_multiple_of(31)
+        {
+            return CompressionType::Zlib;
+        }
     }
 
     // Zstd magic number: 28 b5 2f fd
@@ -677,6 +690,69 @@ mod tests {
     fn test_detect_no_compression() {
         let data = b"Plain text data";
         assert_eq!(detect_compression(data), CompressionType::None);
+    }
+
+    #[cfg(feature = "zlib")]
+    #[test]
+    fn test_detect_zlib_original_hardcoded_headers_still_match() {
+        // The four FLG values the original hardcoded check recognized must
+        // still be detected after switching to the RFC 1950 checksum test.
+        for flg in [0x01u8, 0x5E, 0x9C, 0xDA] {
+            let data: &[u8] = &[0x78, flg];
+            assert_eq!(
+                detect_compression(data),
+                CompressionType::Zlib,
+                "CMF=0x78 FLG={flg:#x} should be detected as zlib"
+            );
+        }
+    }
+
+    #[cfg(feature = "zlib")]
+    #[test]
+    fn test_detect_zlib_small_window_size_header() {
+        // Regression: a valid zlib stream with a smaller window size
+        // (CINFO = 6, i.e. CMF = 0x68) was previously classified as
+        // CompressionType::None because the check required CMF == 0x78
+        // exactly. FLG = 0x05 satisfies the RFC 1950 checksum for CMF=0x68
+        // with FDICT unset: (0x68 << 8 | 0x05) % 31 == 0.
+        let data: &[u8] = &[0x68, 0x05];
+        assert_eq!(detect_compression(data), CompressionType::Zlib);
+    }
+
+    #[cfg(feature = "zlib")]
+    #[test]
+    fn test_detect_zlib_rejects_invalid_checksum() {
+        // CMF=0x78 (valid CM/CINFO) but FLG=0x00 fails the RFC 1950
+        // checksum, so this is not a valid zlib header and must not be
+        // detected as one.
+        let data: &[u8] = &[0x78, 0x00];
+        assert_ne!(detect_compression(data), CompressionType::Zlib);
+    }
+
+    #[cfg(feature = "zlib")]
+    #[test]
+    fn test_detect_zlib_rejects_non_deflate_compression_method() {
+        // CM (low nibble) must be 8 ("deflate"). CMF=0x77 has CM=7, but
+        // FLG=0x09 is chosen so the RFC 1950 checksum
+        // `(CMF << 8 | FLG) % 31 == 0` *does* pass - isolating that the CM
+        // check, not just an incidental checksum failure, is what rejects
+        // this header.
+        let data: &[u8] = &[0x77, 0x09];
+        assert_eq!((0x77u16 << 8 | 0x09) % 31, 0, "test fixture sanity check");
+        assert_ne!(detect_compression(data), CompressionType::Zlib);
+    }
+
+    #[cfg(feature = "zlib")]
+    #[test]
+    fn test_detect_zlib_round_trip_with_real_compressor_output() {
+        // The compressor's own real output must always be detected,
+        // regardless of the exact FLG byte oxiarc-deflate chooses.
+        let compressor = Compressor::new(CompressionType::Zlib).with_level(6);
+        let data = b"Hello, World!".repeat(50);
+        let compressed = compressor
+            .compress(&data)
+            .expect("zlib compress should succeed");
+        assert_eq!(detect_compression(&compressed), CompressionType::Zlib);
     }
 
     #[test]

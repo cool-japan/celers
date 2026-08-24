@@ -89,8 +89,14 @@ impl RetryStrategy {
                 increment_secs,
                 max_delay_secs,
             } => {
-                let delay =
-                    (initial_delay_secs + increment_secs * retry_count).min(*max_delay_secs);
+                // Saturating arithmetic: `increment_secs * retry_count` (and
+                // the subsequent addition) can overflow u32 for a large
+                // retry_count well before the max-delay cap is applied,
+                // which would panic in debug builds and silently wrap to a
+                // tiny delay in release builds.
+                let delay = initial_delay_secs
+                    .saturating_add(increment_secs.saturating_mul(retry_count))
+                    .min(*max_delay_secs);
                 Some(Duration::seconds(delay as i64))
             }
             RetryStrategy::Custom { delays } => delays
@@ -110,6 +116,23 @@ impl Default for RetryStrategy {
     fn default() -> Self {
         Self::exponential(1, 3600) // 1 second base, 1 hour max
     }
+}
+
+/// Coarse classification of why a task attempt failed.
+///
+/// Used by [`RetryPolicy::should_retry_for`] to decide whether a retry is
+/// appropriate under the policy's `retry_on_timeout` / `retry_on_rate_limit`
+/// flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailureCause {
+    /// The attempt failed because it exceeded a timeout.
+    Timeout,
+    /// The attempt failed because the target was rate-limiting requests.
+    RateLimited,
+    /// Any failure not covered by a more specific, gated category. Always
+    /// eligible for retry (subject to `max_retries`), matching
+    /// [`RetryPolicy::should_retry`]'s behavior.
+    Other,
 }
 
 /// Retry policy with maximum retry limits
@@ -146,10 +169,29 @@ impl RetryPolicy {
         self
     }
 
-    /// Check if a message should be retried
+    /// Check if a message should be retried, without regard to the cause of
+    /// the failure.
+    ///
+    /// Equivalent to `should_retry_for(message, FailureCause::Other)`, so
+    /// `retry_on_timeout` / `retry_on_rate_limit` are not consulted. Prefer
+    /// [`RetryPolicy::should_retry_for`] when the failure cause is known.
     pub fn should_retry(&self, message: &Message) -> bool {
+        self.should_retry_for(message, FailureCause::Other)
+    }
+
+    /// Check if a message should be retried for a specific failure cause,
+    /// honoring `retry_on_timeout` and `retry_on_rate_limit` in addition to
+    /// `max_retries`.
+    pub fn should_retry_for(&self, message: &Message, cause: FailureCause) -> bool {
         let current_retries = message.headers.retries.unwrap_or(0);
-        current_retries < self.max_retries
+        if current_retries >= self.max_retries {
+            return false;
+        }
+        match cause {
+            FailureCause::Timeout => self.retry_on_timeout,
+            FailureCause::RateLimited => self.retry_on_rate_limit,
+            FailureCause::Other => true,
+        }
     }
 
     /// Calculate the next ETA for a retry
@@ -352,6 +394,58 @@ mod tests {
         // Use approximate equality for floating point
         let rate = stats.success_rate();
         assert!((rate - 66.66666666666667).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_linear_retry_strategy_no_overflow_at_high_retry_counts() {
+        // Regression: `initial_delay_secs + increment_secs * retry_count`
+        // used to overflow u32 (panic in debug, wrap in release) before the
+        // max-delay cap was applied.
+        let strategy = RetryStrategy::linear(5, 10, 100);
+        assert_eq!(
+            strategy.calculate_delay(u32::MAX),
+            Some(Duration::seconds(100))
+        );
+        assert_eq!(
+            strategy.calculate_delay(1_000_000),
+            Some(Duration::seconds(100))
+        );
+    }
+
+    #[test]
+    fn test_should_retry_for_honors_retry_on_timeout_flag() {
+        // Regression: retry_on_timeout was stored but never consulted.
+        let policy = RetryPolicy::new(RetryStrategy::fixed(5), 3).with_retry_on_timeout(false);
+        let msg = create_test_message();
+
+        assert!(!policy.should_retry_for(&msg, FailureCause::Timeout));
+        // Other causes are unaffected by the timeout flag.
+        assert!(policy.should_retry_for(&msg, FailureCause::Other));
+        assert!(policy.should_retry_for(&msg, FailureCause::RateLimited));
+        // The cause-agnostic should_retry() also keeps working as before.
+        assert!(policy.should_retry(&msg));
+    }
+
+    #[test]
+    fn test_should_retry_for_honors_retry_on_rate_limit_flag() {
+        // Regression: retry_on_rate_limit was stored but never consulted.
+        let policy = RetryPolicy::new(RetryStrategy::fixed(5), 3).with_retry_on_rate_limit(false);
+        let msg = create_test_message();
+
+        assert!(!policy.should_retry_for(&msg, FailureCause::RateLimited));
+        assert!(policy.should_retry_for(&msg, FailureCause::Timeout));
+        assert!(policy.should_retry_for(&msg, FailureCause::Other));
+    }
+
+    #[test]
+    fn test_should_retry_for_still_respects_max_retries() {
+        let policy = RetryPolicy::new(RetryStrategy::fixed(5), 3);
+        let mut msg = create_test_message();
+        msg.headers.retries = Some(3);
+
+        assert!(!policy.should_retry_for(&msg, FailureCause::Timeout));
+        assert!(!policy.should_retry_for(&msg, FailureCause::RateLimited));
+        assert!(!policy.should_retry_for(&msg, FailureCause::Other));
     }
 
     #[test]

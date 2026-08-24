@@ -65,6 +65,17 @@ pub struct PoisonPillConfig {
     /// the cap is exceeded the oldest quarantine entries are evicted. `None`
     /// means unbounded.
     pub max_quarantine: Option<usize>,
+    /// Hard cap on the number of *tracked-but-not-yet-quarantined* task ids
+    /// retained in the active accounting map. When the cap is exceeded the
+    /// least-recently-struck record is evicted, mirroring how
+    /// `max_quarantine` bounds the quarantine set. Without this, a task id
+    /// that strikes a few times below `threshold` and is then never
+    /// observed again (dropped, abandoned, never retried) leaves a
+    /// permanent entry: on a long-running deployment this would otherwise
+    /// be a memory leak proportional to the number of distinct
+    /// below-threshold-failing tasks ever seen. `None` means unbounded.
+    /// Defaults to `Some(10_000)`.
+    pub max_tracked: Option<usize>,
     /// Whether the detector is enabled. When disabled every observation is a
     /// no-op and nothing is ever quarantined.
     pub enabled: bool,
@@ -72,12 +83,14 @@ pub struct PoisonPillConfig {
 
 impl PoisonPillConfig {
     /// Create a new configuration with sensible defaults (threshold of 5,
-    /// no decay window, an unbounded quarantine set, enabled).
+    /// no decay window, an unbounded quarantine set, a tracked-record cap of
+    /// 10,000, enabled).
     pub fn new() -> Self {
         Self {
             threshold: 5,
             decay_window: None,
             max_quarantine: None,
+            max_tracked: Some(10_000),
             enabled: true,
         }
     }
@@ -106,6 +119,20 @@ impl PoisonPillConfig {
         self
     }
 
+    /// Cap the number of tracked (not-yet-quarantined) records retained.
+    pub fn with_max_tracked(mut self, max: usize) -> Self {
+        self.max_tracked = Some(max);
+        self
+    }
+
+    /// Remove the tracked-record cap (unbounded growth; not recommended for
+    /// long-running detectors without a `decay_window` and a scheduled
+    /// [`PoisonPillDetector::prune_stale`]/[`PoisonPillDetector::spawn_pruner`]).
+    pub fn without_max_tracked(mut self) -> Self {
+        self.max_tracked = None;
+        self
+    }
+
     /// Enable or disable the detector.
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -125,6 +152,11 @@ impl PoisonPillConfig {
         if let Some(max) = self.max_quarantine {
             if max == 0 {
                 return Err("Poison-pill max_quarantine must be at least 1".to_string());
+            }
+        }
+        if let Some(max) = self.max_tracked {
+            if max == 0 {
+                return Err("Poison-pill max_tracked must be at least 1".to_string());
             }
         }
         Ok(())
@@ -412,8 +444,42 @@ impl PoisonPillDetector {
             );
             PoisonPillVerdict::Quarantined { strikes: total }
         } else {
+            self.enforce_max_tracked(&mut state);
             debug!(%task_id, strikes = total, "Recorded poison-pill strike");
             PoisonPillVerdict::Healthy { strikes: total }
+        }
+    }
+
+    /// Evict the least-recently-struck tracked record if `max_tracked` is
+    /// configured and exceeded.
+    ///
+    /// Keyed on `last_strike` (an explicit least-recently-used policy)
+    /// rather than insertion order: what actually matters for deciding
+    /// which record is safe to forget is how long it has been since that
+    /// task id last misbehaved, not which one happened to be observed
+    /// first. Implemented as a linear scan for the minimum, which is fine
+    /// here -- eviction only runs at all once the map is already at
+    /// capacity, and removes exactly one entry per call.
+    fn enforce_max_tracked(&self, state: &mut DetectorState) {
+        let Some(max) = self.config.max_tracked else {
+            return;
+        };
+        while state.records.len() > max {
+            let oldest = state
+                .records
+                .iter()
+                .min_by_key(|(_, record)| record.last_strike)
+                .map(|(id, _)| *id);
+            match oldest {
+                Some(id) => {
+                    state.records.remove(&id);
+                    debug!(
+                        task_id = %id,
+                        "Evicted least-recently-struck tracked record (max_tracked reached)"
+                    );
+                }
+                None => break,
+            }
         }
     }
 
@@ -544,17 +610,51 @@ impl PoisonPillDetector {
     /// of stale records pruned. This is an optional housekeeping helper for
     /// long-running detectors so the tracking map does not grow unbounded with
     /// one-off failures that never reach the threshold.
+    ///
+    /// Nothing calls this automatically unless you spawn
+    /// [`spawn_pruner`](Self::spawn_pruner) or call it yourself on a
+    /// schedule (e.g. from the same timer that drives worker heartbeats):
+    /// a record for a task id that is simply never observed again (as
+    /// opposed to one that *is* observed again after going stale, which
+    /// self-resets on that next observation) is otherwise never reclaimed.
     pub async fn prune_stale(&self) -> usize {
-        let window = match self.config.decay_window {
-            Some(w) => w,
-            None => return 0,
-        };
-        let mut state = self.state.write().await;
-        let before = state.records.len();
-        state
-            .records
-            .retain(|_, record| record.last_strike.elapsed() <= window);
-        before - state.records.len()
+        prune_stale_locked(&self.config, &self.state).await
+    }
+
+    /// Spawn a background task that periodically calls
+    /// [`prune_stale`](Self::prune_stale) so stale tracking records
+    /// actually expire over time instead of merely resetting if (and
+    /// only if) the same task id happens to be observed again later.
+    ///
+    /// Returns `None` (spawning nothing) if no `decay_window` is
+    /// configured, since `prune_stale` would be a permanent no-op anyway
+    /// -- safe to call even outside a Tokio runtime in that case. With a
+    /// `decay_window` configured, this **must** be called from within a
+    /// Tokio runtime (it is not spawned automatically from
+    /// [`PoisonPillDetector::new`], which is a plain synchronous
+    /// constructor that may run before any runtime exists).
+    ///
+    /// The spawned task holds only a *weak* reference to the detector's
+    /// shared state, so it notices once every clone of this detector has
+    /// been dropped and exits on its own rather than running forever as
+    /// an orphaned background task.
+    pub fn spawn_pruner(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = self.config.decay_window?;
+        let weak_state = Arc::downgrade(&self.state);
+        let config = self.config.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(state) = weak_state.upgrade() else {
+                    debug!("Poison-pill pruner stopping: detector is no longer referenced");
+                    return;
+                };
+                let pruned = prune_stale_locked(&config, &state).await;
+                if pruned > 0 {
+                    debug!(pruned, "Poison-pill pruner removed stale tracking records");
+                }
+            }
+        }))
     }
 
     /// Snapshot of aggregate statistics.
@@ -576,6 +676,26 @@ impl PoisonPillDetector {
         let mut state = self.state.write().await;
         *state = DetectorState::default();
     }
+}
+
+/// Shared body of [`PoisonPillDetector::prune_stale`], usable from both
+/// the detector's own method and the background task spawned by
+/// [`PoisonPillDetector::spawn_pruner`] (which only holds a weak
+/// reference to the state, not a full detector).
+async fn prune_stale_locked(
+    config: &PoisonPillConfig,
+    state: &Arc<RwLock<DetectorState>>,
+) -> usize {
+    let window = match config.decay_window {
+        Some(w) => w,
+        None => return 0,
+    };
+    let mut state = state.write().await;
+    let before = state.records.len();
+    state
+        .records
+        .retain(|_, record| record.last_strike.elapsed() <= window);
+    before - state.records.len()
 }
 
 /// Current Unix time in seconds, saturating to 0 on clock errors.
@@ -912,5 +1032,160 @@ mod tests {
         assert_eq!(d2.strike_count(&id).await, 1);
         d2.record_failure(id, "boom").await;
         assert!(d.is_poison(&id).await);
+    }
+
+    // --- Regression tests (idx 188) -----------------------------------------
+
+    #[test]
+    fn test_max_tracked_defaults_to_bounded() {
+        assert_eq!(PoisonPillConfig::new().max_tracked, Some(10_000));
+        assert_eq!(PoisonPillConfig::default().max_tracked, Some(10_000));
+    }
+
+    #[test]
+    fn test_max_tracked_builder_and_validate() {
+        let cfg = PoisonPillConfig::new().with_max_tracked(50);
+        assert_eq!(cfg.max_tracked, Some(50));
+        assert!(cfg.validate().is_ok());
+
+        let cfg = cfg.without_max_tracked();
+        assert_eq!(cfg.max_tracked, None);
+        assert!(cfg.validate().is_ok());
+
+        let mut cfg = PoisonPillConfig::new();
+        cfg.max_tracked = Some(0);
+        assert!(cfg.validate().is_err());
+    }
+
+    /// The central regression test for the unbounded-growth half of this
+    /// fix: without a cap, a distinct-task-id-per-call loop like this
+    /// would leave one permanent `records` entry per call, proportional
+    /// to the total number of distinct failing tasks ever seen over the
+    /// process lifetime.
+    #[tokio::test]
+    async fn test_records_map_stays_bounded_under_many_distinct_task_ids() {
+        let d = PoisonPillDetector::new(
+            PoisonPillConfig::new()
+                .with_threshold(100) // never trips quarantine
+                .with_max_tracked(10),
+        );
+        for _ in 0..500 {
+            let id = TaskId::new_v4();
+            d.record_failure(id, "boom").await;
+        }
+        assert_eq!(
+            d.stats().await.tracked_tasks,
+            10,
+            "tracked records must never exceed max_tracked regardless of how many distinct task ids are seen"
+        );
+    }
+
+    /// Eviction must be a genuine least-recently-*struck* policy, not
+    /// merely insertion order (which would be the wrong behavior: a task
+    /// id that keeps misbehaving should be the last thing evicted, no
+    /// matter when it first appeared).
+    #[tokio::test]
+    async fn test_max_tracked_evicts_least_recently_struck_not_first_inserted() {
+        let d = PoisonPillDetector::new(
+            PoisonPillConfig::new()
+                .with_threshold(10) // high enough that nothing quarantines here
+                .with_max_tracked(2),
+        );
+        let a = TaskId::new_v4();
+        let b = TaskId::new_v4();
+        let c = TaskId::new_v4();
+
+        d.record_failure(a, "a1").await; // records: {a}
+        d.record_failure(b, "b1").await; // records: {a, b}
+        d.record_failure(a, "a2").await; // records: {a(2, refreshed), b} -- a is now most-recently-struck
+        d.record_failure(c, "c1").await; // over cap: evicts the least-recently-struck entry
+
+        assert_eq!(
+            d.strike_count(&a).await,
+            2,
+            "a was struck again after b and must survive eviction"
+        );
+        assert_eq!(
+            d.strike_count(&b).await,
+            0,
+            "b is least-recently-struck and must be evicted, even though a was inserted first"
+        );
+        assert_eq!(d.strike_count(&c).await, 1);
+        assert_eq!(d.stats().await.tracked_tasks, 2);
+    }
+
+    /// `spawn_pruner` must not require an active Tokio runtime when there
+    /// is nothing to prune: `PoisonPillDetector::new` is itself a plain
+    /// synchronous constructor that may run before any runtime exists, so
+    /// a caller must be able to at least *try* spawning a pruner (and get
+    /// `None` back) in the same synchronous context.
+    #[test]
+    fn test_spawn_pruner_returns_none_without_decay_window_and_no_runtime_needed() {
+        let d = detector(5); // no decay_window configured
+        assert!(d.spawn_pruner().is_none());
+    }
+
+    /// The central regression test for the "prune_stale is never
+    /// scheduled" half of this fix: a background pruner must actually
+    /// remove stale records on its own, without the caller ever calling
+    /// `prune_stale()` manually.
+    #[tokio::test]
+    async fn test_spawn_pruner_removes_stale_records_without_manual_prune_stale_call() {
+        let d = PoisonPillDetector::new(
+            PoisonPillConfig::new()
+                .with_threshold(10)
+                .with_decay_window(Duration::from_millis(30)),
+        );
+        let id = TaskId::new_v4();
+        d.record_failure(id, "boom").await;
+        assert_eq!(d.stats().await.tracked_tasks, 1);
+
+        let handle = d
+            .spawn_pruner()
+            .expect("a decay_window is configured, so a pruner must be spawned");
+
+        // Wait past the decay window plus one pruner sweep, without ever
+        // calling prune_stale() ourselves.
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        assert_eq!(
+            d.stats().await.tracked_tasks,
+            0,
+            "the background pruner must have removed the stale record on its own"
+        );
+
+        handle.abort();
+    }
+
+    /// The spawned pruner must not run forever once nothing references
+    /// the detector anymore: it should notice (via its weak reference)
+    /// and exit on its own rather than leaking as an orphaned background
+    /// task.
+    #[tokio::test]
+    async fn test_spawn_pruner_stops_once_detector_is_dropped() {
+        let d = PoisonPillDetector::new(
+            PoisonPillConfig::new().with_decay_window(Duration::from_millis(20)),
+        );
+        let handle = d.spawn_pruner().expect("decay_window is configured");
+
+        drop(d); // drop the only strong reference to the shared state
+
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("pruner task should exit once the detector is dropped")
+            .expect("pruner task should not panic");
+    }
+
+    /// A detector that is disabled never creates tracking records in the
+    /// first place, so the cap/eviction machinery has nothing to do --
+    /// confirms this doesn't somehow misbehave (e.g. panic on an empty
+    /// map) when disabled.
+    #[tokio::test]
+    async fn test_max_tracked_eviction_is_a_noop_when_disabled() {
+        let d = PoisonPillDetector::new(PoisonPillConfig::new().with_max_tracked(1).enabled(false));
+        for _ in 0..10 {
+            d.record_failure(TaskId::new_v4(), "boom").await;
+        }
+        assert_eq!(d.stats().await.tracked_tasks, 0);
     }
 }

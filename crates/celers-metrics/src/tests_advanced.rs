@@ -172,84 +172,94 @@ fn test_cost_per_task() {
 }
 
 // --- Tests for Metric Forecasting ---
+//
+// These inject deterministic timestamps via `record_batch` instead of
+// `thread::sleep`-separated `record()` calls: real-clock second-resolution
+// timestamps at raw-Unix-epoch magnitude (~1.7e9) are exactly the case that
+// used to collapse the regression denominator to precisely 0.0 (see
+// `forecast_metric`'s doc comment), so a forecast being available at all --
+// not just tolerated as optional -- is itself part of the regression.
+
 #[test]
 fn test_forecast_metric_linear_trend() {
-    use std::thread;
-    use std::time::Duration;
-
     let history = MetricHistory::new(10);
 
-    // Create a linear increasing trend with 1 second intervals
-    for i in 1..=5 {
-        history.record((i * 10) as f64);
-        thread::sleep(Duration::from_secs(1));
-    }
+    // Perfect linear trend of 10.0/s starting at a realistic Unix timestamp.
+    let base = 1_758_700_000_u64;
+    let batch: Vec<(u64, f64)> = (0..5).map(|i| (base + i, ((i + 1) * 10) as f64)).collect();
+    history.record_batch(&batch);
 
-    let forecast = forecast_metric(&history, 60);
+    let result = forecast_metric(&history, 60).expect("deterministic linear input must forecast");
 
-    // If forecast is available, validate it
-    if let Some(result) = forecast {
-        // Predicted value should be reasonable and finite
-        assert!(result.predicted_value.is_finite());
-        // Confidence should be between 0 and 1
-        assert!(result.confidence >= 0.0 && result.confidence <= 1.0);
-        // Trend should be finite (direction may vary due to timestamp precision)
-        assert!(result.trend.is_finite());
-    }
-    // If forecast is None, it might be due to timestamp granularity
-    // which is acceptable for this test
+    assert!(result.predicted_value.is_finite());
+    assert!((0.0..=1.0).contains(&result.confidence));
+    assert!(result.trend.is_finite());
+
+    // Exact: values are 10,20,...,50 at t=base..base+4, so the fit is a
+    // perfect line of slope 10.0/s with R^2 == 1.0.
+    assert!(
+        (result.trend - 10.0).abs() < 1e-6,
+        "trend was {}",
+        result.trend
+    );
+    assert!(
+        (result.confidence - 1.0).abs() < 1e-6,
+        "confidence was {}",
+        result.confidence
+    );
+    // 60s after the latest sample (value 50 at t=base+4): 50 + 60*10 = 650.
+    assert!(
+        (result.predicted_value - 650.0).abs() < 1e-6,
+        "predicted_value was {}",
+        result.predicted_value
+    );
 }
 
 #[test]
 fn test_forecast_metric_stable_values() {
-    use std::thread;
-    use std::time::Duration;
-
     let history = MetricHistory::new(10);
 
-    // Create mostly stable values with slight variations and time separation
+    // Mostly stable values with slight variations, one second apart.
+    let base = 1_758_700_000_u64;
     let values = [100.0, 101.0, 99.0, 100.0, 100.5];
-    for &val in &values {
-        history.record(val);
-        thread::sleep(Duration::from_secs(1));
-    }
+    let batch: Vec<(u64, f64)> = values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (base + i as u64, v))
+        .collect();
+    history.record_batch(&batch);
 
-    let forecast = forecast_metric(&history, 60);
+    let result = forecast_metric(&history, 60).expect("deterministic input must forecast");
 
-    // If forecast is available, validate it
-    if let Some(result) = forecast {
-        // Should predict approximately the same value (around 100)
-        assert!((result.predicted_value - 100.0).abs() < 50.0);
-        // Trend should be near zero (very small variations)
-        assert!(result.trend.abs() < 5.0);
-    }
-    // If forecast is None, it might be due to timestamp granularity
-    // which is acceptable for this test
+    // Should predict approximately the same value (around 100).
+    assert!((result.predicted_value - 100.0).abs() < 50.0);
+    // Trend should be near zero (very small variations).
+    assert!(result.trend.abs() < 5.0);
+    assert!((0.0..=1.0).contains(&result.confidence));
 }
 
 #[test]
 fn test_forecast_result_fields() {
-    use std::thread;
-    use std::time::Duration;
-
     let history = MetricHistory::new(10);
 
-    for i in 1..=5 {
-        history.record(10.0 + (i as f64 * 5.0));
-        thread::sleep(Duration::from_secs(1));
-    }
+    let base = 1_758_700_000_u64;
+    let batch: Vec<(u64, f64)> = (0..5)
+        .map(|i| (base + i, 10.0 + ((i + 1) as f64 * 5.0)))
+        .collect();
+    history.record_batch(&batch);
 
-    let forecast = forecast_metric(&history, 60);
+    let result = forecast_metric(&history, 60).expect("deterministic input must forecast");
 
-    // If forecast is available, validate field constraints
-    if let Some(result) = forecast {
-        // All fields should be present and valid
-        assert!(result.predicted_value.is_finite());
-        assert!(result.confidence >= 0.0 && result.confidence <= 1.0);
-        assert!(result.trend.is_finite());
-    }
-    // If forecast is None, it might be due to timestamp granularity
-    // which is acceptable for this test
+    // All fields should be present and valid.
+    assert!(result.predicted_value.is_finite());
+    assert!((0.0..=1.0).contains(&result.confidence));
+    assert!(result.trend.is_finite());
+    // Perfect linear trend of 5.0/s.
+    assert!(
+        (result.trend - 5.0).abs() < 1e-6,
+        "trend was {}",
+        result.trend
+    );
 }
 
 // --- Tests for Cardinality Limiter ---

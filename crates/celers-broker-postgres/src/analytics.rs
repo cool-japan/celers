@@ -2,7 +2,6 @@
 
 use celers_core::{CelersError, Result};
 use chrono::{DateTime, Utc};
-use oxisql_core::Connection;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -62,8 +61,11 @@ impl PostgresBroker {
             return Ok(0);
         }
 
-        let mut tx = self
-            .conn
+        // Two-step on a pooled broker: check out a connection, then open the
+        // transaction on it (the handle borrows `conn`, so the slot stays
+        // reserved for the transaction's whole lifetime).
+        let conn = self.connection().await?;
+        let mut tx = conn
             .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
@@ -436,11 +438,11 @@ impl PostgresBroker {
             .execute(
                 r#"
             INSERT INTO celers_tasks
-                (task_name, payload, queue_name, state, priority, retry_count, max_retries,
-                 timeout_secs, scheduled_at, metadata)
+                (id, task_name, payload, queue_name, state, priority, retry_count, max_retries,
+                 scheduled_at, metadata)
             SELECT
-                task_name, payload, $1 as queue_name, 'pending' as state, priority,
-                0 as retry_count, max_retries, timeout_secs, scheduled_at, metadata
+                gen_random_uuid(), task_name, payload, $1, 'pending', priority,
+                0, max_retries, scheduled_at, metadata
             FROM celers_tasks
             WHERE queue_name = $2
               AND state = 'pending'
@@ -594,11 +596,11 @@ impl PostgresBroker {
             .execute(
                 r#"
             INSERT INTO celers_tasks
-                (task_name, payload, queue_name, state, priority, retry_count, max_retries,
-                 timeout_secs, scheduled_at, metadata)
+                (id, task_name, payload, queue_name, state, priority, retry_count, max_retries,
+                 scheduled_at, metadata)
             SELECT
-                task_name, payload, queue_name, 'pending' as state, priority,
-                0 as retry_count, max_retries, timeout_secs, NOW() as scheduled_at, metadata
+                gen_random_uuid(), task_name, payload, queue_name, 'pending', priority,
+                0, max_retries, NOW(), metadata
             FROM celers_tasks
             WHERE queue_name = $1
               AND state = $2
@@ -976,8 +978,8 @@ impl PostgresBroker {
             .execute(
                 r#"
             INSERT INTO celers_tasks
-                (task_name, payload, queue_name, state, metadata)
-            VALUES ('__baseline__', '[]'::jsonb, $1, 'completed', $2)
+                (id, task_name, payload, queue_name, state, metadata, completed_at)
+            VALUES (gen_random_uuid(), '__baseline__', ''::bytea, $1, 'completed', $2::text::jsonb, NOW())
             "#,
                 &[&self.queue_name, &baseline_data_param],
             )

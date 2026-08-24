@@ -97,7 +97,15 @@ impl OperationMetrics {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
 
-        let mut guard = self.latencies_us.lock().expect("latencies_us poisoned");
+        // A poisoned lock still holds a perfectly usable ring buffer of
+        // latency samples (metrics are best-effort observability data, not
+        // correctness-critical state), so recover it instead of letting one
+        // panicking thread turn every subsequent `record()` call — i.e.
+        // every RPC on this backend — into a panic too.
+        let mut guard = self
+            .latencies_us
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.len() >= MAX_SAMPLES {
             guard.pop_front();
         }
@@ -112,7 +120,10 @@ impl OperationMetrics {
         let requests = self.requests.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
 
-        let guard = self.latencies_us.lock().expect("latencies_us poisoned");
+        let guard = self
+            .latencies_us
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sorted = if guard.is_empty() {
             None
         } else {
@@ -128,7 +139,10 @@ impl OperationMetrics {
     fn reset(&self) {
         self.requests.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
-        let mut guard = self.latencies_us.lock().expect("latencies_us poisoned");
+        let mut guard = self
+            .latencies_us
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.clear();
     }
 }
@@ -178,17 +192,15 @@ pub fn percentile(sorted: &[u64], p: f64) -> u64 {
 /// Central metrics object — `Arc`-shared between `GrpcResultBackend` instances
 /// and callers who need to read or reset the metrics.
 ///
-/// All fields are thread-safe; `RpcMetrics` is `Send + Sync`.
+/// All fields (`HashMap<RpcOperation, OperationMetrics>`, where
+/// `OperationMetrics` holds only `AtomicU64`s and a `Mutex<VecDeque<u64>>`)
+/// are already `Send + Sync` on their own, so `RpcMetrics` derives both
+/// automatically — no `unsafe impl` needed. See `test_rpc_metrics_is_send_sync`
+/// below for a compile-time check that stays enforced if a future field
+/// changes that.
 pub struct RpcMetrics {
     per_op: HashMap<RpcOperation, OperationMetrics>,
 }
-
-// SAFETY: `OperationMetrics` contains only `AtomicU64` (Send+Sync) and
-// `Mutex<VecDeque<u64>>` (Send+Sync).  The `HashMap` itself is not inherently
-// `Sync`, but because we never mutate it after construction (only its values
-// via interior mutability) it is safe to share.
-unsafe impl Sync for RpcMetrics {}
-unsafe impl Send for RpcMetrics {}
 
 impl RpcMetrics {
     /// Create a new `RpcMetrics` with all operation counters zeroed.
@@ -272,10 +284,59 @@ impl Default for RpcMetrics {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     fn fresh() -> RpcMetrics {
         RpcMetrics::new()
+    }
+
+    /// Compile-time check that `RpcMetrics` is `Send + Sync` via its
+    /// fields' own auto-trait derivation (no `unsafe impl` involved). If a
+    /// future field addition breaks this — e.g. an `Rc` or raw pointer
+    /// sneaks in — this fails to *compile*, which is exactly the
+    /// protection a hand-written `unsafe impl Send + Sync` would silently
+    /// remove.
+    #[test]
+    fn test_rpc_metrics_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RpcMetrics>();
+    }
+
+    /// Regression test for the poisoning-intolerant `.expect("latencies_us
+    /// poisoned")` this crate used to carry on `record()`/`snapshot()`/
+    /// `reset()`. Deliberately poison the ring-buffer mutex by panicking
+    /// while holding it on another thread, then confirm every subsequent
+    /// operation on the *same* `RpcMetrics` still works instead of
+    /// panicking too (which is exactly what would happen if a single
+    /// transient panic anywhere in the process turned into every future
+    /// RPC on the backend panicking forever).
+    #[test]
+    fn test_metrics_survive_poisoned_lock() {
+        let metrics = std::sync::Arc::new(fresh());
+        metrics.record(RpcOperation::GetResult, Duration::from_millis(1), false);
+
+        // Poison the `latencies_us` mutex from another thread by panicking
+        // while the lock is held.
+        let poisoning = std::sync::Arc::clone(&metrics);
+        let joined = std::thread::spawn(move || {
+            let op_metrics = poisoning.per_op.get(&RpcOperation::GetResult).unwrap();
+            let _guard = op_metrics.latencies_us.lock().unwrap();
+            panic!("deliberately poisoning the lock for the regression test");
+        })
+        .join();
+        assert!(joined.is_err(), "the spawned thread must have panicked");
+
+        // Every operation that touches the now-poisoned mutex must still
+        // work — recovering the guard instead of propagating the poison as
+        // a panic on this (uninvolved) thread.
+        metrics.record(RpcOperation::GetResult, Duration::from_millis(2), false);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.operations[&RpcOperation::GetResult].requests, 2);
+        metrics.reset();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.operations[&RpcOperation::GetResult].requests, 0);
     }
 
     #[test]

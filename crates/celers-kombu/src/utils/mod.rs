@@ -318,8 +318,16 @@ pub fn calculate_backoff_delay(
     // Apply jitter if specified
     if jitter_factor > 0.0 {
         let jitter = (capped as f64 * jitter_factor.clamp(0.0, 1.0)) as u64;
-        // Simple deterministic jitter based on attempt number
-        let jitter_amount = jitter / 2 + (attempt as u64 * 17) % (jitter / 2 + 1);
+        // Randomized jitter, *not* a function of `attempt`: the previous
+        // formula (`(attempt * 17) % ...`) was a pure function of the
+        // attempt number, so every client retrying the same attempt after
+        // a shared broker outage computed the exact same delay and they
+        // all retried in lockstep -- the thundering-herd problem jitter
+        // exists to prevent. `half` is a floor so a jittered delay never
+        // collapses all the way to zero; the random component covers the
+        // other half of the jitter budget.
+        let half = jitter / 2;
+        let jitter_amount = half + (rand::random::<f64>() * (half as f64 + 1.0)) as u64;
         capped.saturating_sub(jitter_amount)
     } else {
         capped
@@ -431,13 +439,47 @@ pub fn calculate_optimal_workers(
 /// assert_ne!(id1, id3); // Different inputs = different ID
 /// ```
 pub fn generate_deduplication_id(task_name: &str, args: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    // `std::collections::hash_map::DefaultHasher` is explicitly documented
+    // as *not* guaranteed to be stable across Rust releases (its algorithm
+    // can and does change between compiler versions). That instability is
+    // fatal here: the digest becomes part of a message's deduplication
+    // identity, so a toolchain upgrade would silently change every dedup
+    // ID and make previously-seen messages look brand new. FNV-1a's
+    // definition never changes, so the same bytes always produce the same
+    // digest on every Rust toolchain, forever.
+    //
+    // `task_name` and `args` are length-prefixed before hashing (rather
+    // than concatenated directly) so that distinct pairs which would
+    // otherwise concatenate to the same byte stream -- e.g.
+    // `("ab", b"cd")` vs. `("abc", b"d")` -- can never collide.
+    let mut buf = Vec::with_capacity(task_name.len() + args.len() + 16);
+    buf.extend_from_slice(&(task_name.len() as u64).to_le_bytes());
+    buf.extend_from_slice(task_name.as_bytes());
+    buf.extend_from_slice(&(args.len() as u64).to_le_bytes());
+    buf.extend_from_slice(args);
 
-    let mut hasher = DefaultHasher::new();
-    task_name.hash(&mut hasher);
-    args.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    format!("{:x}", fnv1a_hash(&buf))
+}
+
+/// FNV-1a (Fowler-Noll-Vo) 64-bit hash.
+///
+/// A small, dependency-free, non-cryptographic hash with a fixed,
+/// versioned definition -- unlike `DefaultHasher`, its output is stable
+/// across Rust releases and platforms, which matters anywhere the digest
+/// is persisted or compared across a toolchain upgrade (deduplication
+/// IDs, consistent partitioning). See
+/// <http://www.isthe.com/chongo/tech/comp/fnv/> for the reference
+/// algorithm and constants.
+pub(crate) fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Analyze connection pool health and efficiency.
@@ -541,32 +583,56 @@ pub fn calculate_load_distribution(
             .collect();
     }
 
-    // Distribute proportionally based on queue size
-    let mut distribution: Vec<(usize, usize)> = queue_sizes
+    // Distribute proportionally using largest-remainder (Hamilton)
+    // apportionment: give each queue the floor of its exact proportional
+    // share, then hand the few leftover workers (always fewer than
+    // `queue_sizes.len()`, one per queue) to the queues whose fractional
+    // share was closest to rounding up. This is the standard way to round
+    // a set of proportions to integers that sum to an exact target.
+    //
+    // The previous approach rounded each share independently
+    // (`.round()`), which can round *up* for every queue simultaneously
+    // and let the total exceed `total_workers` (e.g. `[1, 1]` workers=3
+    // gives `1.5.round() == 2` for both queues, summing to 4). Its
+    // reconciliation step only handled *under*-allocation, and even then
+    // recomputed the same `max_by_key` queue on every iteration of the
+    // loop, piling every surplus worker onto a single queue instead of
+    // spreading them.
+    let exact_shares: Vec<f64> = queue_sizes
         .iter()
-        .enumerate()
-        .map(|(idx, &size)| {
-            let proportion = size as f64 / total_messages as f64;
-            let workers = (proportion * total_workers as f64).round() as usize;
-            (idx, workers)
-        })
+        .map(|&size| (size as f64 / total_messages as f64) * total_workers as f64)
         .collect();
 
-    // Adjust to ensure total equals total_workers
+    let mut distribution: Vec<(usize, usize)> = exact_shares
+        .iter()
+        .enumerate()
+        .map(|(idx, &share)| (idx, share.floor() as usize))
+        .collect();
+
     let assigned: usize = distribution.iter().map(|(_, w)| w).sum();
-    if assigned < total_workers {
-        // Give remaining workers to largest queues
-        let diff = total_workers - assigned;
-        let dist_len = distribution.len();
-        for _i in 0..diff {
-            if let Some(max_queue) = queue_sizes
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, &size)| size)
-                .map(|(idx, _)| idx)
-            {
-                distribution[max_queue % dist_len].1 += 1;
-            }
+    let remainder = total_workers.saturating_sub(assigned);
+
+    if remainder > 0 {
+        use std::cmp::Ordering;
+
+        // Rank queues by the size of their fractional remainder (largest
+        // first); ties broken by queue index for determinism. This is
+        // always well-defined and never takes more entries than exist:
+        // each floor loses less than 1.0 of share, so the total loss
+        // across `n` queues is strictly less than `n`, which bounds
+        // `remainder` below `queue_sizes.len()`.
+        let mut by_fraction: Vec<usize> = (0..queue_sizes.len()).collect();
+        by_fraction.sort_by(|&a, &b| {
+            let frac_a = exact_shares[a] - exact_shares[a].floor();
+            let frac_b = exact_shares[b] - exact_shares[b].floor();
+            frac_b
+                .partial_cmp(&frac_a)
+                .unwrap_or(Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+
+        for &idx in by_fraction.iter().take(remainder) {
+            distribution[idx].1 += 1;
         }
     }
 
@@ -1368,16 +1434,19 @@ pub fn suggest_worker_scaling(
         return (current_workers.max(1), "maintain");
     }
 
-    // Calculate required throughput: messages that need processing within target latency
-    let messages_per_worker_per_sec = 1000 / avg_processing_time_ms.max(1);
+    // Calculate required throughput: messages that need processing within
+    // target latency. Computed in floating point throughout -- integer
+    // division here (`1000 / avg_processing_time_ms`) truncates to 0 for
+    // any task slower than one second, which previously made the `else`
+    // branch below recommend `current_workers` scaled *up* by the 20%
+    // headroom, always suggesting "add" regardless of actual queue depth
+    // (even an empty queue).
+    let messages_per_worker_per_sec = 1000.0 / avg_processing_time_ms as f64;
 
     // Calculate required workers to process queue within target latency
-    let required_throughput = (queue_size as f64 / target_latency_secs as f64).ceil() as u64;
-    let recommended_workers = if messages_per_worker_per_sec > 0 {
-        ((required_throughput as f64 / messages_per_worker_per_sec as f64).ceil() as usize).max(1)
-    } else {
-        current_workers.max(1)
-    };
+    let required_throughput = queue_size as f64 / target_latency_secs as f64;
+    let recommended_workers =
+        ((required_throughput / messages_per_worker_per_sec).ceil() as usize).max(1);
 
     // Add safety margin (20% headroom)
     let recommended_workers = ((recommended_workers as f64 * 1.2).ceil() as usize).max(1);
@@ -1475,14 +1544,25 @@ pub fn estimate_processing_capacity(
         return (0, 0, 0);
     }
 
-    // Messages per second per concurrent task
-    let msgs_per_sec_per_task = 1000 / avg_processing_time_ms;
+    // Messages per second per concurrent task, in floating point so a task
+    // slower than one second (avg_processing_time_ms > 1000) doesn't
+    // truncate to a rate of exactly 0 -- integer division
+    // (`1000 / avg_processing_time_ms`) previously did exactly that,
+    // reporting zero capacity for any such workload.
+    let msgs_per_sec_per_task = 1000.0 / avg_processing_time_ms as f64;
+    let total_tasks = (num_workers * concurrency_per_worker) as f64;
+    let capacity_per_sec_exact = msgs_per_sec_per_task * total_tasks;
 
-    // Total capacity
-    let total_tasks = num_workers * concurrency_per_worker;
-    let capacity_per_sec = msgs_per_sec_per_task * total_tasks as u64;
-    let capacity_per_min = capacity_per_sec * 60;
-    let capacity_per_hour = capacity_per_min * 60;
+    // Derive minute/hour capacity from the exact per-second rate rather
+    // than from the already-rounded `u64` per-second figure: for a
+    // sub-1-msg/sec rate, `capacity_per_sec` alone correctly rounds down
+    // to 0, but deriving `capacity_per_min`/`capacity_per_hour` from that
+    // truncated 0 would compound the error into an all-zero result even
+    // though the workload clearly processes a nonzero number of messages
+    // per minute/hour.
+    let capacity_per_sec = capacity_per_sec_exact as u64;
+    let capacity_per_min = (capacity_per_sec_exact * 60.0) as u64;
+    let capacity_per_hour = (capacity_per_sec_exact * 3600.0) as u64;
 
     (capacity_per_sec, capacity_per_min, capacity_per_hour)
 }
@@ -1534,7 +1614,21 @@ pub fn detect_anomalies(
     let threshold = baseline_stddev * threshold_multiplier;
 
     if deviation > threshold {
-        let severity = (deviation / (baseline_stddev * 3.0)).min(1.0);
+        let severity = if baseline_stddev > 0.0 {
+            (deviation / (baseline_stddev * 3.0)).min(1.0)
+        } else {
+            // The baseline had zero variance (every sample identical), so
+            // there is no stddev to normalize against. Falling through to
+            // `deviation / 0.0 = inf -> 1.0` would report *maximum*
+            // severity for even a one-unit blip off a flat baseline.
+            // Scale by the deviation's size relative to the baseline
+            // average instead (floored at 1.0 to stay finite when the
+            // baseline average is itself ~0), so a small change off a
+            // flat baseline reads as low severity and only a change
+            // comparable to (or larger than) the baseline level reads as
+            // severe.
+            (deviation / baseline_avg.abs().max(1.0)).min(1.0)
+        };
         let direction = if current_avg > baseline_avg {
             "spike"
         } else {
@@ -1785,3 +1879,9 @@ pub fn calculate_consumer_efficiency(
 
     (efficiency_percentage, recommendation)
 }
+
+// Regression tests for the functions above live in `utils/tests.rs`,
+// split into its own file to keep this one under the workspace's
+// 2000-line-per-file policy.
+#[cfg(test)]
+mod tests;

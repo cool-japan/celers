@@ -32,6 +32,9 @@ pub use error::*;
 mod signature;
 pub use signature::*;
 
+pub mod dispatch;
+pub use dispatch::{ChainStep, Schedule, CHAIN_TAIL_KEY, MAX_COUNTDOWN_SECS};
+
 mod chain;
 pub use chain::*;
 
@@ -104,8 +107,14 @@ pub use versioning::*;
 // `dynamic` only adds inherent methods to `Chain`/`Group` (no items to re-export).
 mod dynamic;
 
+#[cfg(all(test, feature = "backend-redis"))]
+mod tests_backend;
+
 #[cfg(test)]
 mod tests_basic;
 
 #[cfg(test)]
 mod tests_advanced;
+
+#[cfg(test)]
+mod tests_nested;

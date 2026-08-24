@@ -1,4 +1,4 @@
-use crate::{Result, SerializedTask, TaskId};
+use crate::{CelersError, Result, SerializedTask, TaskId};
 
 /// Message envelope for broker operations
 #[derive(Debug, Clone)]
@@ -76,7 +76,11 @@ impl std::fmt::Display for BrokerMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "BrokerMessage[task={}]", self.task)?;
         if let Some(ref handle) = self.receipt_handle {
-            write!(f, " receipt={}", &handle[..handle.len().min(8)])?;
+            // Take characters, not bytes: byte-slicing a non-ASCII receipt
+            // handle would panic inside a `Display` impl (typically reached
+            // from logging).
+            let prefix: String = handle.chars().take(8).collect();
+            write!(f, " receipt={prefix}")?;
         }
         Ok(())
     }
@@ -122,18 +126,56 @@ pub trait Broker: Send + Sync {
         Ok(task_ids)
     }
 
+    /// Try to dequeue a task without waiting for one to arrive.
+    ///
+    /// Returns `Ok(None)` immediately when no message is currently available.
+    /// This is the non-blocking counterpart of [`Broker::dequeue`] and is what
+    /// [`Broker::dequeue_batch`] uses to drain a batch without ever parking.
+    ///
+    /// The default implementation polls `dequeue()` exactly once and treats a
+    /// pending poll as "nothing available", which is correct for brokers whose
+    /// `dequeue` returns immediately when the queue is empty. Brokers whose
+    /// `dequeue` waits for a message (and brokers whose `dequeue` is not
+    /// cancel-safe) **should override this** with a genuinely non-blocking
+    /// implementation.
+    async fn try_dequeue(&self) -> Result<Option<BrokerMessage>> {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let fut = self.dequeue();
+        tokio::pin!(fut);
+        std::future::poll_fn(move |cx| match fut.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            // The broker would have to wait: report "nothing available" rather
+            // than parking the caller.
+            Poll::Pending => Poll::Ready(Ok(None)),
+        })
+        .await
+    }
+
     /// Dequeue multiple tasks in a single operation (batch)
     ///
     /// Returns up to `count` messages from the queue.
-    /// Default implementation calls `dequeue()` multiple times.
+    ///
+    /// The default implementation waits (via [`Broker::dequeue`]) for the first
+    /// message and then drains any further immediately-available messages with
+    /// [`Broker::try_dequeue`], so it returns as soon as the queue runs dry
+    /// instead of blocking forever inside the loop.
     /// Brokers should override this for better performance.
     async fn dequeue_batch(&self, count: usize) -> Result<Vec<BrokerMessage>> {
-        let mut messages = Vec::with_capacity(count);
-        for _ in 0..count {
-            if let Some(msg) = self.dequeue().await? {
-                messages.push(msg);
-            } else {
-                break;
+        let mut messages = Vec::with_capacity(count.min(64));
+        if count == 0 {
+            return Ok(messages);
+        }
+        // The first message may be waited for; the remainder must not block.
+        match self.dequeue().await? {
+            Some(msg) => messages.push(msg),
+            None => return Ok(messages),
+        }
+        for _ in 1..count {
+            match self.try_dequeue().await? {
+                Some(msg) => messages.push(msg),
+                None => break,
             }
         }
         Ok(messages)
@@ -153,20 +195,29 @@ pub trait Broker: Send + Sync {
 
     /// Schedule a task for execution at a specific Unix timestamp (seconds)
     ///
-    /// Default implementation executes the task immediately via `enqueue()`.
-    /// Brokers with scheduling support should override this.
-    async fn enqueue_at(&self, task: SerializedTask, _execute_at: i64) -> Result<TaskId> {
-        // Default: execute immediately
-        self.enqueue(task).await
+    /// # Errors
+    ///
+    /// The default implementation returns [`CelersError::Broker`] because a
+    /// broker that cannot hold the task back must not silently run it *now*:
+    /// dropping the schedule would turn "next week" into "immediately" with no
+    /// diagnostic. Brokers with scheduling support override this.
+    async fn enqueue_at(&self, _task: SerializedTask, _execute_at: i64) -> Result<TaskId> {
+        Err(CelersError::Broker(
+            "this broker does not support delayed execution (enqueue_at)".to_string(),
+        ))
     }
 
     /// Schedule a task for execution after a delay (seconds)
     ///
-    /// Default implementation executes the task immediately via `enqueue()`.
-    /// Brokers with scheduling support should override this.
-    async fn enqueue_after(&self, task: SerializedTask, _delay_secs: u64) -> Result<TaskId> {
-        // Default: execute immediately
-        self.enqueue(task).await
+    /// # Errors
+    ///
+    /// The default implementation returns [`CelersError::Broker`]; see
+    /// [`Broker::enqueue_at`] for why scheduling is never silently downgraded to
+    /// immediate execution. Brokers with scheduling support override this.
+    async fn enqueue_after(&self, _task: SerializedTask, _delay_secs: u64) -> Result<TaskId> {
+        Err(CelersError::Broker(
+            "this broker does not support delayed execution (enqueue_after)".to_string(),
+        ))
     }
 }
 
@@ -391,6 +442,102 @@ mod tests {
         let display = format!("{msg}");
         assert!(display.contains("BrokerMessage"));
         assert!(display.contains("task="));
+    }
+
+    #[test]
+    fn test_broker_message_display_non_ascii_receipt() {
+        // Regression: the receipt prefix used to be byte-sliced, which panics
+        // when the 8-byte boundary falls inside a multi-byte character.
+        let task = create_test_task();
+        let msg = BrokerMessage::with_receipt_handle(task, "日本語のレシート".to_string());
+        let display = format!("{msg}");
+        assert!(display.contains("receipt=日本語のレシート"));
+    }
+
+    /// A minimal broker whose `dequeue` never yields a message, used to prove
+    /// the trait defaults neither block nor silently drop a schedule.
+    struct BlockingBroker {
+        queue: tokio::sync::Mutex<Vec<SerializedTask>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for BlockingBroker {
+        async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
+            let id = task.metadata.id;
+            self.queue.lock().await.push(task);
+            Ok(id)
+        }
+
+        async fn dequeue(&self) -> Result<Option<BrokerMessage>> {
+            {
+                let mut queue = self.queue.lock().await;
+                if !queue.is_empty() {
+                    return Ok(Some(BrokerMessage::new(queue.remove(0))));
+                }
+            }
+            // Empty: a real broker would wait here. Never resolves.
+            std::future::pending::<()>().await;
+            unreachable!("pending future never completes")
+        }
+
+        async fn ack(&self, _task_id: &TaskId, _receipt_handle: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reject(
+            &self,
+            _task_id: &TaskId,
+            _receipt_handle: Option<&str>,
+            _requeue: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn queue_size(&self) -> Result<usize> {
+            Ok(self.queue.lock().await.len())
+        }
+
+        async fn cancel(&self, _task_id: &TaskId) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_dequeue_batch_returns_when_queue_drains() {
+        // Regression: the default `dequeue_batch` looped on the *blocking*
+        // `dequeue`, so it parked forever instead of returning the messages it
+        // had already collected.
+        let broker = BlockingBroker {
+            queue: tokio::sync::Mutex::new(Vec::new()),
+        };
+        broker.enqueue(create_test_task()).await.unwrap();
+        broker.enqueue(create_test_task()).await.unwrap();
+
+        let messages = broker.dequeue_batch(10).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(broker.queue_size().await.unwrap(), 0);
+
+        // And `try_dequeue` reports "nothing available" rather than parking.
+        assert!(broker.try_dequeue().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn default_schedule_is_an_error_not_immediate_execution() {
+        let broker = BlockingBroker {
+            queue: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let err = broker
+            .enqueue_at(create_test_task(), 4_102_444_800)
+            .await
+            .unwrap_err();
+        assert!(err.is_broker());
+        let err = broker
+            .enqueue_after(create_test_task(), 3600)
+            .await
+            .unwrap_err();
+        assert!(err.is_broker());
+        // Crucially, nothing was executed immediately.
+        assert_eq!(broker.queue_size().await.unwrap(), 0);
     }
 
     #[test]

@@ -1,5 +1,6 @@
+use crate::dispatch::{self, MAX_COUNTDOWN_SECS};
 use crate::{CanvasError, Signature};
-use celers_core::{Broker, SerializedTask};
+use celers_core::Broker;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -28,61 +29,40 @@ impl Chain {
         self
     }
 
-    /// Apply the chain by enqueuing the first task with links to subsequent tasks
+    /// Apply the chain by enqueuing the first task with the rest of the chain
+    /// attached to it.
+    ///
+    /// Only the head task is enqueued now; steps 2..N ride along inside the head
+    /// task's payload (see [`crate::dispatch`] for the wire format) and the
+    /// immediate successor's name is written into
+    /// [`on_success_link`](celers_core::TaskMetadata::on_success_link). When the
+    /// head succeeds, the worker pops the next step off that tail, applies the
+    /// head's result to it and re-dispatches it with the remainder still
+    /// attached — so all N steps run, in order, each with its own args, kwargs,
+    /// priority and countdown intact.
+    ///
+    /// The head's [`countdown`](crate::TaskOptions::countdown) /
+    /// [`eta`](crate::TaskOptions::eta) select the broker's scheduling enqueue
+    /// variant, so a deferred chain really is deferred.
+    ///
+    /// Returns the id of the head task.
     pub async fn apply<B: Broker>(self, broker: &B) -> Result<Uuid, CanvasError> {
         if self.tasks.is_empty() {
             return Err(CanvasError::Invalid("Chain cannot be empty".to_string()));
         }
 
-        // Build chain backwards: last task -> second-to-last -> ... -> first
-        let mut chain_iter = self.tasks.into_iter().rev();
-        let mut next_sig: Option<Signature> = None;
+        let mut tasks = self.tasks;
+        // `tasks` is non-empty, so the split always yields a head.
+        let tail: Vec<dispatch::ChainStep> = tasks
+            .split_off(1)
+            .into_iter()
+            .map(dispatch::ChainStep::Task)
+            .collect();
+        let Some(head) = tasks.pop() else {
+            return Err(CanvasError::Invalid("Failed to build chain".to_string()));
+        };
 
-        // Start from the last task (no link)
-        if let Some(last_task) = chain_iter.next() {
-            // Last task has no link
-            next_sig = Some(last_task);
-
-            // Link remaining tasks backwards
-            for mut task in chain_iter {
-                task.options.link = next_sig.map(Box::new);
-                next_sig = Some(task);
-            }
-        }
-
-        // Enqueue the first task (which is now in next_sig)
-        if let Some(first_sig) = next_sig {
-            let task_id = Self::enqueue_signature(broker, &first_sig).await?;
-            Ok(task_id)
-        } else {
-            Err(CanvasError::Invalid("Failed to build chain".to_string()))
-        }
-    }
-
-    async fn enqueue_signature<B: Broker>(
-        broker: &B,
-        sig: &Signature,
-    ) -> Result<Uuid, CanvasError> {
-        let args_json = serde_json::json!({
-            "args": sig.args,
-            "kwargs": sig.kwargs
-        });
-        let args_bytes = serde_json::to_vec(&args_json)
-            .map_err(|e| CanvasError::Serialization(e.to_string()))?;
-
-        let mut task = SerializedTask::new(sig.task.clone(), args_bytes);
-
-        if let Some(priority) = sig.options.priority {
-            task = task.with_priority(priority.into());
-        }
-
-        let task_id = task.metadata.id;
-        broker
-            .enqueue(task)
-            .await
-            .map_err(|e| CanvasError::Broker(e.to_string()))?;
-
-        Ok(task_id)
+        dispatch::dispatch_signature(broker, &head, &tail).await
     }
 }
 
@@ -195,8 +175,10 @@ impl Chain {
 
     /// Apply the chain with an ETA (execution time as Unix timestamp)
     ///
-    /// The first task will be scheduled for execution at the specified ETA.
-    /// Subsequent tasks are linked and will execute after the previous completes.
+    /// The first task is scheduled for execution at the specified ETA via
+    /// [`Broker::enqueue_at`], so the absolute instant is preserved rather than
+    /// being rounded through a relative countdown. Subsequent tasks are linked
+    /// and execute after the previous one completes.
     ///
     /// # Example
     /// ```ignore
@@ -220,17 +202,14 @@ impl Chain {
             return Err(CanvasError::Invalid("Chain cannot be empty".to_string()));
         }
 
-        // Calculate countdown from ETA
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Clamp to the signed range the broker scheduling API uses; timestamps
+        // beyond i64::MAX seconds are not representable and are treated as
+        // "as far in the future as the transport can express".
+        let eta_secs = i64::try_from(eta).unwrap_or(i64::MAX);
 
-        let countdown = eta.saturating_sub(now);
-
-        // Set countdown on the first task
+        // Schedule the first task at the absolute ETA.
         if let Some(first) = self.tasks.first_mut() {
-            first.options.countdown = Some(countdown);
+            first.options.eta = Some(eta_secs);
         }
 
         self.apply(broker).await
@@ -238,16 +217,19 @@ impl Chain {
 
     /// Set countdown on all tasks in the chain (staggered execution)
     ///
-    /// Each task gets a progressively larger countdown.
+    /// Each task gets a progressively larger countdown. The accumulation
+    /// saturates instead of overflowing, and each countdown is clamped to
+    /// [`MAX_COUNTDOWN_SECS`] so a pathological `step` cannot produce a delay
+    /// no broker could honour.
     ///
     /// # Arguments
     /// * `start` - Initial countdown for first task
     /// * `step` - Additional delay added for each subsequent task
     pub fn with_staggered_countdown(mut self, start: u64, step: u64) -> Self {
-        let mut countdown = start;
+        let mut countdown = start.min(MAX_COUNTDOWN_SECS);
         for task in &mut self.tasks {
             task.options.countdown = Some(countdown);
-            countdown += step;
+            countdown = countdown.saturating_add(step).min(MAX_COUNTDOWN_SECS);
         }
         self
     }
@@ -777,5 +759,250 @@ impl FromIterator<Signature> for Chain {
         Self {
             tasks: iter.into_iter().collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use celers_core::SerializedTask;
+    use std::sync::{Arc, Mutex};
+
+    /// One recorded dispatch: the task, its relative delay, its absolute ETA.
+    type Entry = (SerializedTask, Option<u64>, Option<i64>);
+
+    /// Broker recording each task together with how it was enqueued.
+    #[derive(Clone, Default)]
+    struct RecordingBroker {
+        entries: Arc<Mutex<Vec<Entry>>>,
+    }
+
+    impl RecordingBroker {
+        fn entries(&self) -> Vec<Entry> {
+            self.entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn only(&self) -> Entry {
+            let entries = self.entries();
+            assert_eq!(entries.len(), 1, "expected exactly one enqueued task");
+            entries[0].clone()
+        }
+
+        fn record(
+            &self,
+            task: SerializedTask,
+            after: Option<u64>,
+            at: Option<i64>,
+        ) -> celers_core::Result<celers_core::TaskId> {
+            let id = task.metadata.id;
+            self.entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((task, after, at));
+            Ok(id)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for RecordingBroker {
+        async fn enqueue(&self, task: SerializedTask) -> celers_core::Result<celers_core::TaskId> {
+            self.record(task, None, None)
+        }
+
+        async fn dequeue(&self) -> celers_core::Result<Option<celers_core::BrokerMessage>> {
+            Ok(None)
+        }
+
+        async fn ack(
+            &self,
+            _task_id: &celers_core::TaskId,
+            _receipt_handle: Option<&str>,
+        ) -> celers_core::Result<()> {
+            Ok(())
+        }
+
+        async fn reject(
+            &self,
+            _task_id: &celers_core::TaskId,
+            _receipt_handle: Option<&str>,
+            _requeue: bool,
+        ) -> celers_core::Result<()> {
+            Ok(())
+        }
+
+        async fn queue_size(&self) -> celers_core::Result<usize> {
+            Ok(self.entries().len())
+        }
+
+        async fn cancel(&self, _task_id: &celers_core::TaskId) -> celers_core::Result<bool> {
+            Ok(false)
+        }
+
+        async fn enqueue_after(
+            &self,
+            task: SerializedTask,
+            delay_secs: u64,
+        ) -> celers_core::Result<celers_core::TaskId> {
+            self.record(task, Some(delay_secs), None)
+        }
+
+        async fn enqueue_at(
+            &self,
+            task: SerializedTask,
+            execute_at: i64,
+        ) -> celers_core::Result<celers_core::TaskId> {
+            self.record(task, None, Some(execute_at))
+        }
+    }
+
+    fn tail_names(task: &SerializedTask) -> Vec<String> {
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&task.payload).expect("payload is JSON");
+        envelope
+            .get(crate::CHAIN_TAIL_KEY)
+            .and_then(|tail| tail.as_array())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|step| {
+                        step["task"]
+                            .as_str()
+                            .expect("task steps carry a name")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The whole tail of an N-task chain must travel with the head, and the
+    /// immediate successor must be linked by name. Previously the link was
+    /// built and then thrown away, so tasks 2..N were silently dropped.
+    #[tokio::test]
+    async fn apply_carries_every_later_step_with_the_head() {
+        let broker = RecordingBroker::default();
+
+        let chain = Chain::new()
+            .then("a", vec![serde_json::json!(1)])
+            .then("b", vec![])
+            .then("c", vec![]);
+
+        chain.apply(&broker).await.expect("chain dispatches");
+
+        let (task, after, at) = broker.only();
+        assert_eq!(task.metadata.name, "a");
+        assert_eq!(after, None);
+        assert_eq!(at, None);
+        assert_eq!(task.metadata.on_success_link.as_deref(), Some("b"));
+        assert_eq!(tail_names(&task), vec!["b".to_string(), "c".to_string()]);
+    }
+
+    /// A later step's own args, kwargs and options must survive the trip; the
+    /// `on_success_link` name alone cannot carry them.
+    #[tokio::test]
+    async fn later_steps_keep_their_arguments_and_options() {
+        let broker = RecordingBroker::default();
+
+        let mut kwargs = std::collections::HashMap::new();
+        kwargs.insert("mode".to_string(), serde_json::json!("fast"));
+
+        let chain = Chain::new().then("head", vec![]).then_signature(
+            Signature::new("tail".to_string())
+                .with_args(vec![serde_json::json!("own")])
+                .with_kwargs(kwargs)
+                .with_priority(7),
+        );
+
+        chain.apply(&broker).await.expect("chain dispatches");
+
+        let (task, _, _) = broker.only();
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&task.payload).expect("payload is JSON");
+        let step = &envelope[crate::CHAIN_TAIL_KEY][0];
+        assert_eq!(step["args"], serde_json::json!(["own"]));
+        assert_eq!(step["kwargs"]["mode"], "fast");
+        assert_eq!(step["options"]["priority"], 7);
+    }
+
+    /// An empty chain is not dispatchable.
+    #[tokio::test]
+    async fn empty_chain_is_rejected() {
+        let broker = RecordingBroker::default();
+        assert!(Chain::new().apply(&broker).await.is_err());
+        assert_eq!(broker.entries().len(), 0);
+    }
+
+    /// A countdown must select the delayed-enqueue variant rather than being
+    /// silently discarded.
+    #[tokio::test]
+    async fn apply_with_countdown_uses_the_delayed_enqueue_path() {
+        let broker = RecordingBroker::default();
+
+        Chain::new()
+            .then("head", vec![])
+            .then("tail", vec![])
+            .apply_with_countdown(&broker, 45)
+            .await
+            .expect("countdown chain dispatches");
+
+        let (task, after, at) = broker.only();
+        assert_eq!(task.metadata.name, "head");
+        assert_eq!(after, Some(45), "the countdown must reach the broker");
+        assert_eq!(at, None);
+    }
+
+    /// An ETA must select the absolute-scheduling variant.
+    #[tokio::test]
+    async fn apply_with_eta_uses_the_absolute_enqueue_path() {
+        let broker = RecordingBroker::default();
+
+        Chain::new()
+            .then("head", vec![])
+            .apply_with_eta(&broker, 1_900_000_000)
+            .await
+            .expect("eta chain dispatches");
+
+        let (_, after, at) = broker.only();
+        assert_eq!(after, None);
+        assert_eq!(at, Some(1_900_000_000));
+    }
+
+    /// A huge `step` must clamp rather than overflow-panic.
+    #[test]
+    fn staggered_countdown_saturates_instead_of_overflowing() {
+        let chain = Chain::new()
+            .then("a", vec![])
+            .then("b", vec![])
+            .then("c", vec![])
+            .with_staggered_countdown(u64::MAX, u64::MAX);
+
+        let countdowns: Vec<Option<u64>> =
+            chain.tasks.iter().map(|t| t.options.countdown).collect();
+        assert_eq!(
+            countdowns,
+            vec![
+                Some(MAX_COUNTDOWN_SECS),
+                Some(MAX_COUNTDOWN_SECS),
+                Some(MAX_COUNTDOWN_SECS)
+            ],
+            "countdowns clamp to the documented ceiling"
+        );
+    }
+
+    /// The ordinary staggering case still increments as documented.
+    #[test]
+    fn staggered_countdown_increments_normally() {
+        let chain = Chain::new()
+            .then("a", vec![])
+            .then("b", vec![])
+            .then("c", vec![])
+            .with_staggered_countdown(10, 5);
+
+        let countdowns: Vec<Option<u64>> =
+            chain.tasks.iter().map(|t| t.options.countdown).collect();
+        assert_eq!(countdowns, vec![Some(10), Some(15), Some(20)]);
     }
 }

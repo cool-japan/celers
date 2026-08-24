@@ -15,10 +15,12 @@ prometheus = { workspace = true }
 tokio = { workspace = true }
 lazy_static = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }
 criterion = { workspace = true }
+oxicode = { workspace = true }
 
 [[bench]]
 name = "metrics_bench"

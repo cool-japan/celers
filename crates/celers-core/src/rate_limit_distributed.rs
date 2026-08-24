@@ -1,9 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_wrap
-)]
 //! Distributed rate limiting across workers.
 //!
 //! This module provides a *pluggable backend* abstraction for enforcing rate
@@ -54,6 +48,7 @@
 use crate::rate_limit::RateLimitConfig;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -115,8 +110,55 @@ impl RateLimitParams {
     #[inline]
     #[must_use]
     pub fn max_window_events(&self) -> u64 {
-        (self.rate * self.window_secs as f64).ceil().max(0.0) as u64
+        if !self.rate.is_finite() || self.rate <= 0.0 {
+            return 0;
+        }
+        // Window sizes beyond `u32::MAX` seconds (~136 years) are clamped: the
+        // product would be meaningless anyway and the clamp keeps the widening
+        // conversion exact.
+        let window = u32::try_from(self.window_secs).map_or(f64::from(u32::MAX), f64::from);
+        cost_to_permits(self.rate * window)
     }
+}
+
+/// `2^64` as an `f64`, used as the saturation boundary for `f64 -> u64`.
+const U64_MAX_AS_F64: f64 = 18_446_744_073_709_551_616.0;
+
+/// Round a permit cost up to a whole number of permits, saturating at `u64::MAX`.
+///
+/// Non-finite and non-positive costs yield `0`.
+// Justification for the lossy cast: the value is checked for finiteness, clamped
+// at zero and compared against `2^64` immediately before the conversion, so
+// neither truncation nor sign loss can occur.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[inline]
+fn cost_to_permits(cost: f64) -> u64 {
+    let ceiled = cost.ceil();
+    if !ceiled.is_finite() || ceiled <= 0.0 {
+        0
+    } else if ceiled >= U64_MAX_AS_F64 {
+        u64::MAX
+    } else {
+        ceiled as u64
+    }
+}
+
+/// Widen a permit count for reporting in [`AcquireOutcome::remaining`].
+// Justification: permit counts are far below `2^53` in any realistic
+// configuration, and `remaining` is a diagnostic estimate, not an exact ledger.
+#[allow(clippy::cast_precision_loss)]
+#[inline]
+fn permits_as_f64(count: u64) -> f64 {
+    count as f64
+}
+
+/// Convert a `Duration` from seconds without ever panicking.
+///
+/// `Duration::from_secs_f64` panics on negative, NaN, or overflowing inputs;
+/// those all mean "effectively never" here, so they saturate to [`Duration::MAX`].
+#[inline]
+fn duration_from_secs_saturating(secs: f64) -> Duration {
+    Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
 }
 
 /// Outcome of an atomic acquire against a distributed backend.
@@ -207,6 +249,22 @@ pub trait DistributedRateLimitBackend: Send + Sync {
     /// Returns an error if the underlying store is unavailable.
     async fn reset(&self, key: &str) -> crate::Result<()>;
 
+    /// Evict every key that has not been touched for at least `idle_for`,
+    /// returning the number of keys removed.
+    ///
+    /// Limiter keys are commonly derived from task names or tenant identifiers,
+    /// which are attacker-influenced in multi-tenant deployments, so a store
+    /// without expiry grows without bound. Backends with native expiry (Redis
+    /// `EX`, for instance) already reclaim keys themselves and can keep the
+    /// default no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying store is unavailable.
+    async fn sweep_idle(&self, _idle_for: Duration) -> crate::Result<usize> {
+        Ok(0)
+    }
+
     /// Backend name, for diagnostics.
     fn backend_name(&self) -> &str;
 }
@@ -220,6 +278,27 @@ enum KeyState {
     Window { stamps: Vec<Instant> },
 }
 
+/// A tracked key plus the bookkeeping needed to reclaim it.
+#[derive(Debug, Clone)]
+struct KeyEntry {
+    state: KeyState,
+    /// Last time this key was read or written, used for idle eviction.
+    last_touched: Instant,
+    /// Monotonic touch counter, used for capacity eviction.
+    ///
+    /// Ordering by `Instant` alone is unreliable: two touches can land on the
+    /// same clock tick, making the eviction victim arbitrary. A counter gives a
+    /// total order regardless of clock resolution.
+    touch_seq: u64,
+}
+
+/// Default upper bound on the number of distinct limiter keys retained.
+///
+/// Mirrors the order of magnitude Celery uses for its revoked-task set: large
+/// enough that legitimate deployments never notice, small enough that a stream
+/// of attacker-chosen keys cannot exhaust memory.
+pub const DEFAULT_MAX_TRACKED_KEYS: usize = 50_000;
+
 /// In-process distributed rate-limit backend.
 ///
 /// Uses a single [`tokio::sync::Mutex`] guarding a `HashMap` so that the entire
@@ -230,23 +309,81 @@ enum KeyState {
 /// Although it shares one mutex across all keys (simple and contention-safe for
 /// tests and single-process deployments), the public contract only promises
 /// per-key atomicity, so a future sharded implementation remains compatible.
-#[derive(Debug, Default)]
+///
+/// The key map is bounded: it holds at most [`DEFAULT_MAX_TRACKED_KEYS`] entries
+/// (configurable via [`InMemoryDistributedBackend::with_max_keys`]), evicting the
+/// least recently touched key when full, and
+/// [`sweep_idle`](DistributedRateLimitBackend::sweep_idle) reclaims idle keys on
+/// demand. Evicting a key resets its limiter to a full allowance, which is why
+/// the bound is deliberately generous.
+#[derive(Debug)]
 pub struct InMemoryDistributedBackend {
-    state: Mutex<HashMap<String, KeyState>>,
+    state: Mutex<HashMap<String, KeyEntry>>,
+    max_keys: usize,
+    /// Source of the monotonic touch counter used for capacity eviction.
+    touch_counter: AtomicU64,
+}
+
+impl Default for InMemoryDistributedBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryDistributedBackend {
-    /// Create a new empty in-memory backend.
+    /// Create a new empty in-memory backend with the default key bound.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_keys(DEFAULT_MAX_TRACKED_KEYS)
+    }
+
+    /// Create a backend tracking at most `max_keys` distinct limiter keys.
+    ///
+    /// A value of `0` is treated as `1`: the map always holds the key currently
+    /// being operated on.
+    #[must_use]
+    pub fn with_max_keys(max_keys: usize) -> Self {
         Self {
             state: Mutex::new(HashMap::new()),
+            max_keys: max_keys.max(1),
+            touch_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Next value of the monotonic touch counter.
+    #[inline]
+    fn next_touch_seq(&self) -> u64 {
+        self.touch_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Number of keys currently tracked (primarily for tests/diagnostics).
     pub async fn key_count(&self) -> usize {
         self.state.lock().await.len()
+    }
+
+    /// Maximum number of keys this backend retains.
+    #[inline]
+    #[must_use]
+    pub fn max_keys(&self) -> usize {
+        self.max_keys
+    }
+
+    /// Evict the least recently touched entries until `map` has room for one more
+    /// key beyond those already present.
+    fn enforce_capacity(map: &mut HashMap<String, KeyEntry>, max_keys: usize, incoming: &str) {
+        if map.contains_key(incoming) {
+            return;
+        }
+        while map.len() >= max_keys {
+            let Some(victim) = map
+                .iter()
+                .min_by_key(|(_, entry)| entry.touch_seq)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            map.remove(&victim);
+        }
     }
 
     /// Refill a token-bucket value in place, returning the updated tokens.
@@ -285,19 +422,25 @@ impl DistributedRateLimitBackend for InMemoryDistributedBackend {
             ));
         }
         let now = Instant::now();
+        let touch_seq = self.next_touch_seq();
         let mut guard = self.state.lock().await;
+        Self::enforce_capacity(&mut guard, self.max_keys, key);
 
         match params.algorithm {
             DistributedAlgorithm::TokenBucket => {
-                let entry = guard
-                    .entry(key.to_string())
-                    .or_insert_with(|| KeyState::Bucket {
+                let entry = guard.entry(key.to_string()).or_insert_with(|| KeyEntry {
+                    state: KeyState::Bucket {
                         tokens: params.burst,
                         last_refill: now,
-                    });
+                    },
+                    last_touched: now,
+                    touch_seq,
+                });
+                entry.last_touched = now;
+                entry.touch_seq = touch_seq;
                 // If a key was previously used with a different algorithm, reset it.
-                if !matches!(entry, KeyState::Bucket { .. }) {
-                    *entry = KeyState::Bucket {
+                if !matches!(entry.state, KeyState::Bucket { .. }) {
+                    entry.state = KeyState::Bucket {
                         tokens: params.burst,
                         last_refill: now,
                     };
@@ -305,7 +448,7 @@ impl DistributedRateLimitBackend for InMemoryDistributedBackend {
                 let KeyState::Bucket {
                     tokens,
                     last_refill,
-                } = entry
+                } = &mut entry.state
                 else {
                     unreachable!("entry coerced to Bucket above")
                 };
@@ -317,7 +460,7 @@ impl DistributedRateLimitBackend for InMemoryDistributedBackend {
                 } else {
                     let deficit = cost - *tokens;
                     let retry_after = if params.rate > 0.0 {
-                        Duration::from_secs_f64(deficit / params.rate)
+                        duration_from_secs_saturating(deficit / params.rate)
                     } else {
                         Duration::MAX
                     };
@@ -325,32 +468,39 @@ impl DistributedRateLimitBackend for InMemoryDistributedBackend {
                 }
             }
             DistributedAlgorithm::SlidingWindow => {
-                let entry = guard
-                    .entry(key.to_string())
-                    .or_insert_with(|| KeyState::Window { stamps: Vec::new() });
-                if !matches!(entry, KeyState::Window { .. }) {
-                    *entry = KeyState::Window { stamps: Vec::new() };
+                let entry = guard.entry(key.to_string()).or_insert_with(|| KeyEntry {
+                    state: KeyState::Window { stamps: Vec::new() },
+                    last_touched: now,
+                    touch_seq,
+                });
+                entry.last_touched = now;
+                entry.touch_seq = touch_seq;
+                if !matches!(entry.state, KeyState::Window { .. }) {
+                    entry.state = KeyState::Window { stamps: Vec::new() };
                 }
-                let KeyState::Window { stamps } = entry else {
+                let KeyState::Window { stamps } = &mut entry.state else {
                     unreachable!("entry coerced to Window above")
                 };
                 Self::prune_window(stamps, now, params);
                 let max = params.max_window_events();
-                let needed = cost.ceil() as u64;
-                let used = stamps.len() as u64;
-                if used + needed <= max {
+                let needed = cost_to_permits(cost);
+                let used = u64::try_from(stamps.len()).unwrap_or(u64::MAX);
+                if used.saturating_add(needed) <= max {
                     for _ in 0..needed {
                         stamps.push(now);
                     }
-                    let remaining = max.saturating_sub(used + needed) as f64;
-                    Ok(AcquireOutcome::allowed(remaining))
+                    let remaining = max.saturating_sub(used.saturating_add(needed));
+                    Ok(AcquireOutcome::allowed(permits_as_f64(remaining)))
                 } else {
-                    let remaining = max.saturating_sub(used) as f64;
+                    let remaining = max.saturating_sub(used);
                     let retry_after = stamps.first().map_or(Duration::ZERO, |&oldest| {
                         let expires = oldest + Duration::from_secs(params.window_secs);
                         expires.saturating_duration_since(now)
                     });
-                    Ok(AcquireOutcome::denied(remaining, retry_after))
+                    Ok(AcquireOutcome::denied(
+                        permits_as_f64(remaining),
+                        retry_after,
+                    ))
                 }
             }
         }
@@ -361,27 +511,46 @@ impl DistributedRateLimitBackend for InMemoryDistributedBackend {
         let mut guard = self.state.lock().await;
         match params.algorithm {
             DistributedAlgorithm::TokenBucket => match guard.get_mut(key) {
-                Some(KeyState::Bucket {
-                    tokens,
-                    last_refill,
+                Some(KeyEntry {
+                    state:
+                        KeyState::Bucket {
+                            tokens,
+                            last_refill,
+                        },
+                    last_touched,
+                    ..
                 }) => {
                     *tokens = Self::refill_bucket(*tokens, *last_refill, now, params);
                     *last_refill = now;
+                    *last_touched = now;
                     Ok(*tokens)
                 }
                 _ => Ok(params.burst),
             },
             DistributedAlgorithm::SlidingWindow => {
-                let max = params.max_window_events() as f64;
+                let max = permits_as_f64(params.max_window_events());
                 match guard.get_mut(key) {
-                    Some(KeyState::Window { stamps }) => {
+                    Some(KeyEntry {
+                        state: KeyState::Window { stamps },
+                        last_touched,
+                        ..
+                    }) => {
                         Self::prune_window(stamps, now, params);
-                        Ok(max - stamps.len() as f64)
+                        *last_touched = now;
+                        Ok(max - permits_as_f64(u64::try_from(stamps.len()).unwrap_or(u64::MAX)))
                     }
                     _ => Ok(max),
                 }
             }
         }
+    }
+
+    async fn sweep_idle(&self, idle_for: Duration) -> crate::Result<usize> {
+        let now = Instant::now();
+        let mut guard = self.state.lock().await;
+        let before = guard.len();
+        guard.retain(|_, entry| now.saturating_duration_since(entry.last_touched) < idle_for);
+        Ok(before - guard.len())
     }
 
     async fn time_until_available(
@@ -395,12 +564,18 @@ impl DistributedRateLimitBackend for InMemoryDistributedBackend {
         match params.algorithm {
             DistributedAlgorithm::TokenBucket => {
                 let tokens = match guard.get_mut(key) {
-                    Some(KeyState::Bucket {
-                        tokens,
-                        last_refill,
+                    Some(KeyEntry {
+                        state:
+                            KeyState::Bucket {
+                                tokens,
+                                last_refill,
+                            },
+                        last_touched,
+                        ..
                     }) => {
                         *tokens = Self::refill_bucket(*tokens, *last_refill, now, params);
                         *last_refill = now;
+                        *last_touched = now;
                         *tokens
                     }
                     _ => params.burst,
@@ -408,18 +583,24 @@ impl DistributedRateLimitBackend for InMemoryDistributedBackend {
                 if tokens + f64::EPSILON >= cost {
                     Ok(Duration::ZERO)
                 } else if params.rate > 0.0 {
-                    Ok(Duration::from_secs_f64((cost - tokens) / params.rate))
+                    Ok(duration_from_secs_saturating((cost - tokens) / params.rate))
                 } else {
                     Ok(Duration::MAX)
                 }
             }
             DistributedAlgorithm::SlidingWindow => {
                 let max = params.max_window_events();
-                let needed = cost.ceil() as u64;
+                let needed = cost_to_permits(cost);
                 match guard.get_mut(key) {
-                    Some(KeyState::Window { stamps }) => {
+                    Some(KeyEntry {
+                        state: KeyState::Window { stamps },
+                        last_touched,
+                        ..
+                    }) => {
                         Self::prune_window(stamps, now, params);
-                        if stamps.len() as u64 + needed <= max {
+                        *last_touched = now;
+                        let used = u64::try_from(stamps.len()).unwrap_or(u64::MAX);
+                        if used.saturating_add(needed) <= max {
                             Ok(Duration::ZERO)
                         } else {
                             Ok(stamps.first().map_or(Duration::ZERO, |&oldest| {
@@ -540,6 +721,22 @@ impl DistributedRateLimiter {
         self.backend.acquire(&self.key, cost, self.params).await
     }
 
+    /// Whether a *denied* acquisition could ever be granted by waiting.
+    ///
+    /// A token bucket with a non-positive refill rate never regains tokens once
+    /// exhausted, and a sliding window admitting zero events never opens up: in
+    /// both cases waiting is futile and the caller must be told so rather than
+    /// left spinning.
+    #[must_use]
+    fn can_recover_after_denial(&self) -> bool {
+        match self.params.algorithm {
+            DistributedAlgorithm::TokenBucket => {
+                self.params.rate.is_finite() && self.params.rate > 0.0
+            }
+            DistributedAlgorithm::SlidingWindow => self.params.max_window_events() >= 1,
+        }
+    }
+
     /// Acquire a single permit, awaiting (with bounded sleeps) until granted.
     ///
     /// Returns the total time waited. Each retry sleeps for the backend's
@@ -548,18 +745,59 @@ impl DistributedRateLimiter {
     ///
     /// # Errors
     ///
-    /// Returns an error if the backend store is unavailable.
+    /// Returns an error if the backend store is unavailable, or if the limiter is
+    /// configured such that a permit can never become available (see
+    /// [`Self::acquire_with_deadline`]).
     pub async fn acquire(&self, max_sleep: Duration) -> crate::Result<Duration> {
+        // With no deadline the loop only ever exits via `Some` or an error.
+        Ok(self
+            .acquire_with_deadline(max_sleep, None)
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Acquire a single permit, giving up after `deadline` has elapsed.
+    ///
+    /// Returns `Ok(Some(waited))` when a permit was granted and `Ok(None)` when
+    /// the deadline expired first. Passing `None` waits indefinitely, exactly like
+    /// [`Self::acquire`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend store is unavailable, or if the limiter can
+    /// never grant a permit no matter how long the caller waits (a token bucket
+    /// with a non-positive rate, or a sliding window admitting zero events) — that
+    /// is a configuration mistake, and reporting it beats spinning forever.
+    pub async fn acquire_with_deadline(
+        &self,
+        max_sleep: Duration,
+        deadline: Option<Duration>,
+    ) -> crate::Result<Option<Duration>> {
         let start = Instant::now();
         loop {
             let outcome = self.backend.acquire(&self.key, 1.0, self.params).await?;
             if outcome.allowed {
-                return Ok(start.elapsed());
+                return Ok(Some(start.elapsed()));
             }
-            let sleep_for = outcome
+            if !self.can_recover_after_denial() {
+                return Err(crate::CelersError::Configuration(format!(
+                    "rate limiter '{}' can never grant a permit (rate={}, window={}s): waiting would block forever",
+                    self.key, self.params.rate, self.params.window_secs
+                )));
+            }
+            let elapsed = start.elapsed();
+            if let Some(limit) = deadline {
+                if elapsed >= limit {
+                    return Ok(None);
+                }
+            }
+            let mut sleep_for = outcome
                 .retry_after
                 .min(max_sleep)
                 .max(Duration::from_millis(1));
+            if let Some(limit) = deadline {
+                sleep_for = sleep_for.min(limit - elapsed);
+            }
             tokio::time::sleep(sleep_for).await;
         }
     }
@@ -777,6 +1015,187 @@ mod tests {
         let config = RateLimitConfig::new(10.0).with_burst(5);
         let limiter = DistributedRateLimiter::new(backend, "task", config);
         assert!(limiter.try_acquire_n(-1.0).await.is_err());
+    }
+
+    /// Regression: the in-memory backend retained one map entry per limiter key
+    /// for the process lifetime, with no expiry and no capacity bound.
+    #[tokio::test]
+    async fn test_sweep_idle_reclaims_untouched_keys() {
+        let backend = InMemoryDistributedBackend::new();
+        let params = RateLimitParams::from_config(&RateLimitConfig::new(10.0).with_burst(5));
+
+        for i in 0..10 {
+            backend
+                .acquire(&format!("key-{i}"), 1.0, params)
+                .await
+                .expect("acquire should succeed");
+        }
+        assert_eq!(backend.key_count().await, 10);
+
+        // A generous idle window keeps everything: nothing has aged out yet.
+        let swept = backend
+            .sweep_idle(Duration::from_secs(3600))
+            .await
+            .expect("sweep should succeed");
+        assert_eq!(swept, 0);
+        assert_eq!(backend.key_count().await, 10);
+
+        // Back-date half the entries so they fall outside a 30s window, without
+        // depending on wall-clock progress.
+        {
+            let mut guard = backend.state.lock().await;
+            let now = Instant::now();
+            for i in 0..5 {
+                if let Some(entry) = guard.get_mut(&format!("key-{i}")) {
+                    entry.last_touched = now
+                        .checked_sub(Duration::from_secs(60))
+                        .unwrap_or(entry.last_touched);
+                }
+            }
+        }
+
+        let swept = backend
+            .sweep_idle(Duration::from_secs(30))
+            .await
+            .expect("sweep should succeed");
+        assert_eq!(swept, 5, "aged-out keys must be reclaimed");
+        assert_eq!(backend.key_count().await, 5);
+
+        // A zero window reclaims everything.
+        let swept = backend
+            .sweep_idle(Duration::ZERO)
+            .await
+            .expect("sweep should succeed");
+        assert_eq!(swept, 5);
+        assert_eq!(backend.key_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_key_map_is_capacity_bounded_with_lru_eviction() {
+        let backend = InMemoryDistributedBackend::with_max_keys(3);
+        assert_eq!(backend.max_keys(), 3);
+        let params = RateLimitParams::from_config(&RateLimitConfig::new(0.0).with_burst(5));
+
+        for i in 0..3 {
+            backend
+                .acquire(&format!("key-{i}"), 1.0, params)
+                .await
+                .expect("acquire should succeed");
+        }
+        assert_eq!(backend.key_count().await, 3);
+
+        // Touch key-0 so key-1 becomes the least recently used.
+        backend
+            .acquire("key-0", 1.0, params)
+            .await
+            .expect("acquire should succeed");
+
+        backend
+            .acquire("key-3", 1.0, params)
+            .await
+            .expect("acquire should succeed");
+        assert_eq!(backend.key_count().await, 3);
+
+        // key-1 was evicted, so it starts from a full burst again; key-0 and
+        // key-2 retain their consumed tokens (rate 0 means no refill).
+        let evicted = backend
+            .available("key-1", params)
+            .await
+            .expect("available should succeed");
+        assert!(
+            (evicted - 5.0).abs() < 1e-6,
+            "key-1 should have been evicted, saw {evicted} tokens"
+        );
+        let retained = backend
+            .available("key-2", params)
+            .await
+            .expect("available should succeed");
+        assert!(
+            (retained - 4.0).abs() < 1e-6,
+            "key-2 should have been retained, saw {retained} tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_keys_zero_is_clamped_to_one() {
+        let backend = InMemoryDistributedBackend::with_max_keys(0);
+        assert_eq!(backend.max_keys(), 1);
+        let params = RateLimitParams::from_config(&RateLimitConfig::new(10.0).with_burst(5));
+        backend
+            .acquire("a", 1.0, params)
+            .await
+            .expect("acquire should succeed");
+        backend
+            .acquire("b", 1.0, params)
+            .await
+            .expect("acquire should succeed");
+        assert_eq!(backend.key_count().await, 1);
+    }
+
+    /// Regression: `acquire` looped forever with a rate of 0, because the backend
+    /// reports `retry_after = Duration::MAX` which was silently clamped to
+    /// `max_sleep`, so the caller spun at `max_sleep` cadence with no way out.
+    #[tokio::test]
+    async fn test_acquire_errors_instead_of_spinning_at_zero_rate() {
+        let backend = Arc::new(InMemoryDistributedBackend::new());
+        let config = RateLimitConfig::new(0.0).with_burst(1);
+        let limiter = DistributedRateLimiter::new(backend, "task", config);
+
+        assert!(limiter.try_acquire().await.expect("first acquire"));
+        // Returns immediately, without a single sleep.
+        let err = limiter
+            .acquire(Duration::from_millis(10))
+            .await
+            .expect_err("a zero-rate limiter can never grant another permit");
+        assert!(
+            err.to_string().contains("can never grant a permit"),
+            "unexpected error: {err}"
+        );
+
+        // The same holds for a sliding window that admits nothing.
+        let backend = Arc::new(InMemoryDistributedBackend::new());
+        let window = DistributedRateLimiter::new(
+            backend,
+            "task",
+            RateLimitConfig::new(0.0).with_sliding_window(10),
+        );
+        assert!(window.acquire(Duration::from_millis(10)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_with_deadline_gives_up() {
+        let backend = Arc::new(InMemoryDistributedBackend::new());
+        // 1 permit per 100 seconds: no refill can arrive within the deadline.
+        let config = RateLimitConfig::new(0.01).with_burst(1);
+        let limiter = DistributedRateLimiter::new(backend, "task", config);
+
+        assert!(limiter.try_acquire().await.expect("first acquire"));
+        // A zero deadline gives up on the first denial, without sleeping.
+        let outcome = limiter
+            .acquire_with_deadline(Duration::from_millis(50), Some(Duration::ZERO))
+            .await
+            .expect("acquire_with_deadline should not error");
+        assert!(outcome.is_none(), "deadline should have expired");
+
+        // A short but non-zero deadline also gives up rather than hanging.
+        let outcome = limiter
+            .acquire_with_deadline(Duration::from_millis(1), Some(Duration::from_millis(2)))
+            .await
+            .expect("acquire_with_deadline should not error");
+        assert!(outcome.is_none(), "deadline should have expired");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_with_deadline_succeeds_when_permits_are_available() {
+        let backend = Arc::new(InMemoryDistributedBackend::new());
+        let config = RateLimitConfig::new(50.0).with_burst(2);
+        let limiter = DistributedRateLimiter::new(backend, "task", config);
+
+        let outcome = limiter
+            .acquire_with_deadline(Duration::from_millis(50), Some(Duration::from_secs(5)))
+            .await
+            .expect("acquire_with_deadline should not error");
+        assert!(outcome.is_some(), "a permit was available immediately");
     }
 
     #[tokio::test]

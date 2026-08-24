@@ -20,6 +20,33 @@
 
 use std::collections::HashSet;
 
+/// Content types that carry a Python `pickle` payload.
+///
+/// Deserializing any of these executes arbitrary code inside the consumer, so
+/// every built-in whitelist blocks all of them unconditionally.
+///
+/// `application/x-python-serialize` is the spelling **kombu registers for the
+/// `pickle` serializer** (`kombu.serialization.register_pickle`), i.e. the one
+/// that actually appears on the wire when a Python producer is configured with
+/// `task_serializer = 'pickle'`. The remaining spellings are emitted by
+/// third-party producers and older kombu releases and are blocked for the same
+/// reason.
+pub const UNSAFE_CONTENT_TYPES: &[&str] = &[
+    // kombu's registered pickle content type -- the one seen on the wire.
+    "application/x-python-serialize",
+    "application/x-python-pickle",
+    "application/python-pickle",
+    "application/x-pickle",
+];
+
+/// Build the set of always-blocked content types.
+fn unsafe_content_type_set() -> HashSet<String> {
+    UNSAFE_CONTENT_TYPES
+        .iter()
+        .map(|ct| (*ct).to_string())
+        .collect()
+}
+
 /// Content-type whitelist for allowed serialization formats
 #[derive(Debug, Clone)]
 pub struct ContentTypeWhitelist {
@@ -45,32 +72,35 @@ impl ContentTypeWhitelist {
     }
 
     /// Create a whitelist with safe defaults (JSON, MessagePack)
+    ///
+    /// `application/octet-stream` is allowed because it is the content type of
+    /// this crate's own `binary` serializer (see [`crate::ContentType::Binary`]);
+    /// the payload is an opaque byte string that is never *executed*, unlike a
+    /// pickle payload. Every content type in [`UNSAFE_CONTENT_TYPES`] is blocked,
+    /// and blocking takes precedence over allowing.
     pub fn safe() -> Self {
         let mut allowed = HashSet::new();
         allowed.insert("application/json".to_string());
         allowed.insert("application/x-msgpack".to_string());
         allowed.insert("application/octet-stream".to_string());
 
-        let mut blocked = HashSet::new();
-        // Block pickle - security risk (arbitrary code execution)
-        blocked.insert("application/x-python-pickle".to_string());
-        blocked.insert("application/python-pickle".to_string());
-        blocked.insert("application/x-pickle".to_string());
-
-        Self { allowed, blocked }
+        // Block pickle - security risk (arbitrary code execution).
+        Self {
+            allowed,
+            blocked: unsafe_content_type_set(),
+        }
     }
 
     /// Create a permissive whitelist (allows all except blocked)
+    ///
+    /// The allow list is empty, so anything that is not explicitly blocked is
+    /// accepted -- which makes the completeness of [`UNSAFE_CONTENT_TYPES`]
+    /// load-bearing here: a pickle content type missing from that list would
+    /// sail straight through.
     pub fn permissive() -> Self {
-        let mut blocked = HashSet::new();
-        // Still block pickle
-        blocked.insert("application/x-python-pickle".to_string());
-        blocked.insert("application/python-pickle".to_string());
-        blocked.insert("application/x-pickle".to_string());
-
         Self {
             allowed: HashSet::new(), // Empty means check blocked list only
-            blocked,
+            blocked: unsafe_content_type_set(),
         }
     }
 
@@ -81,7 +111,7 @@ impl ContentTypeWhitelist {
 
         Self {
             allowed,
-            blocked: HashSet::new(),
+            blocked: unsafe_content_type_set(),
         }
     }
 
@@ -354,13 +384,7 @@ impl SecurityPolicy {
 /// Check if a content type is known to be unsafe
 pub fn is_unsafe_content_type(content_type: &str) -> bool {
     let normalized = normalize_content_type(content_type);
-    matches!(
-        normalized.as_str(),
-        "application/x-python-pickle"
-            | "application/python-pickle"
-            | "application/x-pickle"
-            | "application/x-python-serialize"
-    )
+    UNSAFE_CONTENT_TYPES.contains(&normalized.as_str())
 }
 
 #[cfg(test)]
@@ -474,6 +498,57 @@ mod tests {
         assert!(is_unsafe_content_type("application/x-python-pickle"));
         assert!(is_unsafe_content_type("application/python-pickle"));
         assert!(!is_unsafe_content_type("application/json"));
+    }
+
+    /// Regression: `application/x-python-serialize` is the content type kombu
+    /// registers for the `pickle` serializer, so it is the spelling that
+    /// actually arrives on the wire from a Python producer configured with
+    /// `task_serializer = 'pickle'`. It used to be missing from the whitelists
+    /// (while `is_unsafe_content_type` already listed it), which let a pickle
+    /// payload through `permissive()` -- whose empty allow list accepts
+    /// anything that is not explicitly blocked.
+    #[test]
+    fn test_python_serialize_is_blocked_by_every_whitelist() {
+        const KOMBU_PICKLE: &str = "application/x-python-serialize";
+
+        assert!(!ContentTypeWhitelist::safe().is_allowed(KOMBU_PICKLE));
+        assert!(!ContentTypeWhitelist::permissive().is_allowed(KOMBU_PICKLE));
+        assert!(!ContentTypeWhitelist::strict().is_allowed(KOMBU_PICKLE));
+        assert!(!ContentTypeWhitelist::default().is_allowed(KOMBU_PICKLE));
+
+        assert!(!SecurityPolicy::standard().is_content_type_allowed(KOMBU_PICKLE));
+        assert!(!SecurityPolicy::permissive().is_content_type_allowed(KOMBU_PICKLE));
+        assert!(!SecurityPolicy::strict().is_content_type_allowed(KOMBU_PICKLE));
+
+        // Content-type parameters and casing must not defeat the block.
+        assert!(!ContentTypeWhitelist::permissive()
+            .is_allowed("APPLICATION/X-PYTHON-SERIALIZE; charset=binary"));
+    }
+
+    /// The whitelists and `is_unsafe_content_type` must agree: both are driven
+    /// by the single `UNSAFE_CONTENT_TYPES` list.
+    #[test]
+    fn test_unsafe_content_types_are_consistent_everywhere() {
+        for content_type in UNSAFE_CONTENT_TYPES {
+            assert!(
+                is_unsafe_content_type(content_type),
+                "{content_type} must be reported unsafe"
+            );
+            for whitelist in [
+                ContentTypeWhitelist::safe(),
+                ContentTypeWhitelist::permissive(),
+                ContentTypeWhitelist::strict(),
+            ] {
+                assert!(
+                    !whitelist.is_allowed(content_type),
+                    "{content_type} must never be allowed"
+                );
+            }
+        }
+
+        // JSON stays allowed by the non-strict whitelists.
+        assert!(ContentTypeWhitelist::safe().is_allowed("application/json"));
+        assert!(ContentTypeWhitelist::permissive().is_allowed("application/json"));
     }
 
     #[test]

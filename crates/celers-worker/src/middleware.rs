@@ -20,6 +20,12 @@
 //!   ↓
 //! [ACK to Broker]
 //! ```
+//!
+//! Regression guard for the fix in idx 190/187 (`expect()` on the
+//! `MetricsMiddleware` duration-measurement path): denies
+//! `clippy::unwrap_used`/`clippy::expect_used` outside the test module so
+//! a future change cannot silently reintroduce a panic here.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use async_trait::async_trait;
 use std::fmt;
@@ -180,6 +186,27 @@ impl Middleware for TracingMiddleware {
     }
 }
 
+/// Compute the elapsed seconds (as an `f64`) between a `start_time_ns`
+/// value (epoch nanoseconds, string-encoded, as stored by
+/// [`MetricsMiddleware::before_task`]) and now.
+///
+/// Returns `None` if `start_time_ns` cannot be parsed. Never panics: a
+/// backwards wall-clock step between the two samples (an NTP correction
+/// landing between `before_task` and `after_task`) saturates to a
+/// duration of zero instead of underflowing the raw subtraction, which
+/// would otherwise panic in debug builds / wrap to an enormous value in
+/// release and permanently corrupt the cumulative Prometheus histogram
+/// sum for the process's lifetime.
+#[cfg(feature = "metrics")]
+fn elapsed_secs_since_ns(start_time_ns: &str) -> Option<f64> {
+    let start_ns: u128 = start_time_ns.parse().ok()?;
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(now_ns.saturating_sub(start_ns) as f64 / 1_000_000_000.0)
+}
+
 /// Metrics middleware (Prometheus)
 #[cfg(feature = "metrics")]
 pub struct MetricsMiddleware;
@@ -188,12 +215,24 @@ pub struct MetricsMiddleware;
 #[async_trait]
 impl Middleware for MetricsMiddleware {
     async fn before_task(&self, ctx: &mut TaskContext) -> MiddlewareResult<()> {
+        // Nanosecond-precision, string-encoded start time.
+        //
+        // Ideally this would be a monotonic `std::time::Instant` field on
+        // `TaskContext`, but `TaskContext` is built via a plain struct
+        // literal at its one construction site (`worker_core.rs`) outside
+        // this module, so adding a field there is not a self-contained
+        // change here. Storing epoch *nanoseconds* (rather than whole
+        // seconds) instead of a monotonic instant still fixes both
+        // observed defects without changing `TaskContext`'s shape:
+        // - granularity: sub-second tasks no longer all report 0.0.
+        // - `unwrap_or(0)` (rather than `expect`) means a clock set before
+        //   the Unix epoch can't panic this path.
         ctx.metadata.insert(
-            "start_time".to_string(),
+            "start_time_ns".to_string(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("SystemTime should be after UNIX_EPOCH")
-                .as_secs()
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
                 .to_string(),
         );
         Ok(())
@@ -216,19 +255,14 @@ impl Middleware for MetricsMiddleware {
             .with_label_values(&[&ctx.task_name])
             .inc();
 
-        if let Some(start_time) = ctx.metadata.get("start_time") {
-            if let Ok(start) = start_time.parse::<u64>() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("SystemTime should be after UNIX_EPOCH")
-                    .as_secs();
-                let duration = now - start;
-                TASK_EXECUTION_TIME.observe(duration as f64);
+        if let Some(start_time) = ctx.metadata.get("start_time_ns") {
+            if let Some(duration_secs) = elapsed_secs_since_ns(start_time) {
+                TASK_EXECUTION_TIME.observe(duration_secs);
 
                 // Track per-task-type execution time
                 TASK_EXECUTION_TIME_BY_TYPE
                     .with_label_values(&[&ctx.task_name])
-                    .observe(duration as f64);
+                    .observe(duration_secs);
             }
         }
 
@@ -328,6 +362,7 @@ impl Default for MiddlewareStack {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -352,6 +387,93 @@ mod tests {
         middleware.before_task(&mut ctx).await.unwrap();
         middleware
             .after_task(&ctx, &serde_json::json!(null))
+            .await
+            .unwrap();
+    }
+
+    // --- Regression tests for MetricsMiddleware duration measurement ------
+
+    /// Regression test: the previous implementation truncated to whole
+    /// seconds, so every task under 1s (the common case) recorded a
+    /// duration of exactly 0.0. Nanosecond precision must be able to
+    /// represent sub-second durations.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_elapsed_secs_since_ns_sub_second_precision() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let start_ns = now_ns - 250_000_000; // 250ms in the past
+        let elapsed =
+            elapsed_secs_since_ns(&start_ns.to_string()).expect("valid start_time_ns must parse");
+        assert!(
+            (0.15..0.6).contains(&elapsed),
+            "expected roughly 0.25s of sub-second precision, got {elapsed}"
+        );
+    }
+
+    /// Regression test: `now - start` on raw `u64`/whole-second wall-clock
+    /// values could panic (debug) or wrap to ~1.8e19 (release) if the
+    /// clock stepped backwards between `before_task` and `after_task`.
+    /// The fixed computation must saturate to a duration of zero instead.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_elapsed_secs_since_ns_never_panics_on_backwards_clock() {
+        // A "start" timestamp far in the future relative to "now" stands
+        // in for a backwards NTP correction landing between the two
+        // `SystemTime::now()` samples.
+        let far_future_ns = u128::MAX;
+        let elapsed = elapsed_secs_since_ns(&far_future_ns.to_string())
+            .expect("a syntactically valid start_time_ns must still parse");
+        assert_eq!(
+            elapsed, 0.0,
+            "backwards clock step must saturate to 0, not underflow"
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_elapsed_secs_since_ns_invalid_input_returns_none() {
+        assert!(elapsed_secs_since_ns("not-a-number").is_none());
+        assert!(elapsed_secs_since_ns("").is_none());
+    }
+
+    /// `before_task` must record a value that decodes as nanoseconds, not
+    /// the old whole-second string.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_before_task_stores_nanosecond_precision_start_time() {
+        let middleware = MetricsMiddleware;
+        let mut ctx = TaskContext::new("t-1".to_string(), "task".to_string());
+        middleware.before_task(&mut ctx).await.unwrap();
+
+        let stored = ctx
+            .metadata
+            .get("start_time_ns")
+            .expect("before_task must record a start_time_ns entry");
+        let start_ns: u128 = stored.parse().expect("start_time_ns must be numeric");
+
+        // A nanosecond epoch timestamp for "now" is at least 10^18 (the
+        // year-2001 boundary in ns); a whole-second value would be at
+        // most ~10^10, so this also guards against a granularity
+        // regression back to seconds.
+        assert!(start_ns > 1_000_000_000_000_000_000);
+    }
+
+    /// End-to-end: after_task must not panic when start_time_ns is
+    /// present, whatever its value, including the pathological
+    /// "backwards clock" case.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_after_task_does_not_panic_with_backwards_clock_start_time() {
+        let middleware = MetricsMiddleware;
+        let mut ctx = TaskContext::new("t-2".to_string(), "task".to_string());
+        ctx.metadata
+            .insert("start_time_ns".to_string(), u128::MAX.to_string());
+
+        middleware
+            .after_task(&ctx, &serde_json::json!({"ok": true}))
             .await
             .unwrap();
     }

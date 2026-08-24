@@ -596,17 +596,23 @@ impl MysqlBroker {
 
         for task in tasks {
             let task_id = Uuid::new_v4();
-            let group_metadata_str = serde_json::to_string(&json!({"group_id": group_id}))
-                .unwrap_or_else(|_| "{}".to_string());
+            let group_metadata_str = serde_json::to_string(&json!({
+                "queue": self.queue_name(),
+                "group_id": group_id,
+            }))
+            .map_err(|e| {
+                CelersError::Serialization(format!("Failed to serialize group metadata: {e}"))
+            })?;
 
             tx.execute(
                 r#"
                 INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, retry_count, max_retries, created_at, scheduled_at, metadata)
-                VALUES (?, ?, ?, 'pending', ?, 0, ?, NOW(), NOW(), ?)
+                    (id, queue_name, task_name, payload, state, priority, retry_count, max_retries, created_at, scheduled_at, metadata)
+                VALUES (?, ?, ?, ?, 'pending', ?, 0, ?, NOW(), NOW(), ?)
                 "#,
                 &[
                     &task_id.to_string(),
+                    &self.queue_name(),
                     &task.metadata.name,
                     &task.payload,
                     &task.metadata.priority,

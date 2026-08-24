@@ -121,8 +121,11 @@ impl MysqlBroker {
                                 CelersError::Other(format!("Failed to move task to DLQ: {}", e))
                             })?;
                     } else {
-                        // Requeue with exponential backoff
-                        let backoff_seconds = 2_i64.pow(retry_count as u32).min(3600); // Max 1 hour
+                        // Requeue with exponential backoff. Shared with
+                        // `Broker::reject`; clamps the exponent before
+                        // shifting so a large or negative `retry_count`
+                        // cannot overflow and panic.
+                        let backoff_seconds = crate::backoff::retry_backoff_seconds(retry_count);
 
                         tx.execute(
                             r#"

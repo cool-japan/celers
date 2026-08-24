@@ -62,46 +62,37 @@ impl MysqlBroker {
             hooks.run_before_enqueue(&hook_ctx, &task).await?;
         }
 
-        let mut db_metadata = json!({
-            "queue": self.queue_name,
-            "enqueued_at": chrono::Utc::now().to_rfc3339(),
-            "trace_context": {
-                "trace_id": trace_ctx.trace_id,
-                "span_id": trace_ctx.span_id,
-                "trace_flags": trace_ctx.trace_flags,
-                "trace_state": trace_ctx.trace_state,
-            }
-        });
-
-        // Merge task metadata if present
-        if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
-            if let Some(obj) = db_metadata.as_object_mut() {
-                if let Some(meta_obj) = task_meta.as_object() {
-                    for (k, v) in meta_obj {
-                        if k != "trace_context" {
-                            // Don't override trace context
-                            obj.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-        }
         // oxisql-core has no `ToSqlValue` impl for `serde_json::Value`
         // itself (unlike sqlx's `json` feature, which allowed binding
         // `db_metadata` directly) — serialize to text first, matching the
         // `json_param` convention documented in `row_ext.rs`.
-        let db_metadata_str =
-            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
+        //
+        // `build_task_metadata_document` overlays the `extra` document last,
+        // so the trace context can never be clobbered by a same-named field
+        // inside the task's own metadata, and a serialization failure is
+        // propagated instead of silently degrading the row to `{}`.
+        let db_metadata_str = self.build_task_metadata_document(
+            &task,
+            json!({
+                "trace_context": {
+                    "trace_id": trace_ctx.trace_id,
+                    "span_id": trace_ctx.span_id,
+                    "trace_flags": trace_ctx.trace_flags,
+                    "trace_state": trace_ctx.trace_state,
+                }
+            }),
+        )?;
 
         self.connection()
             .execute(
                 r#"
                 INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                    (id, queue_name, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
                 "#,
                 &[
                     &task_id.to_string(),
+                    &self.queue_name,
                     &task.metadata.name,
                     &task.payload,
                     &task.metadata.priority,
@@ -242,7 +233,8 @@ impl MysqlBroker {
     /// # Available Hook Types
     /// * `BeforeEnqueue` - Before a task is enqueued
     /// * `AfterEnqueue` - After a task is successfully enqueued
-    /// * `BeforeDequeue` - Before a task is dequeued (reserved)
+    /// * `BeforeDequeue` - After a task row is locked, before it is claimed
+    ///   (an error aborts the claim and leaves the task pending)
     /// * `AfterDequeue` - After a task is dequeued
     /// * `BeforeAck` - Before a task is acknowledged
     /// * `AfterAck` - After a task is acknowledged
@@ -303,5 +295,143 @@ impl MysqlBroker {
     pub async fn clear_hooks(&self) {
         let mut hooks = self.hooks.write().await;
         hooks.clear();
+    }
+
+    // ========== Hook dispatch ==========
+    //
+    // Every `TaskHook` variant `add_hook` accepts is dispatched from one of
+    // the helpers below. Registering an `AfterAck` (or `BeforeDequeue`,
+    // `AfterDequeue`, `BeforeAck`, `BeforeReject`, `AfterReject`) hook used
+    // to be a silent no-op: the closure was stored and never read, so
+    // auditing, metrics and workflow-chaining hooks simply never ran.
+
+    /// Build the context handed to every lifecycle hook.
+    fn hook_context(&self, task: &SerializedTask) -> HookContext {
+        HookContext {
+            queue_name: self.queue_name.clone(),
+            task_id: Some(task.metadata.id),
+            timestamp: Utc::now(),
+            metadata: json!({}),
+        }
+    }
+
+    /// Run `BeforeDequeue` hooks for a locked-but-not-yet-claimed task.
+    pub(crate) async fn fire_before_dequeue(&self, task: &SerializedTask) -> Result<()> {
+        let hooks = self.hooks.read().await;
+        if hooks.before_dequeue.is_empty() {
+            return Ok(());
+        }
+        let ctx = self.hook_context(task);
+        hooks.run_before_dequeue(&ctx, task).await
+    }
+
+    /// Run `AfterDequeue` hooks for a committed claim.
+    pub(crate) async fn fire_after_dequeue(&self, task: &SerializedTask) -> Result<()> {
+        let hooks = self.hooks.read().await;
+        if hooks.after_dequeue.is_empty() {
+            return Ok(());
+        }
+        let ctx = self.hook_context(task);
+        hooks.run_after_dequeue(&ctx, task).await
+    }
+
+    /// Run `BeforeAck` hooks.
+    pub(crate) async fn fire_before_ack(&self, task: &SerializedTask) -> Result<()> {
+        let hooks = self.hooks.read().await;
+        if hooks.before_ack.is_empty() {
+            return Ok(());
+        }
+        let ctx = self.hook_context(task);
+        hooks.run_before_ack(&ctx, task).await
+    }
+
+    /// Run `AfterAck` hooks.
+    pub(crate) async fn fire_after_ack(&self, task: &SerializedTask) -> Result<()> {
+        let hooks = self.hooks.read().await;
+        if hooks.after_ack.is_empty() {
+            return Ok(());
+        }
+        let ctx = self.hook_context(task);
+        hooks.run_after_ack(&ctx, task).await
+    }
+
+    /// Run `BeforeReject` hooks.
+    pub(crate) async fn fire_before_reject(&self, task: &SerializedTask) -> Result<()> {
+        let hooks = self.hooks.read().await;
+        if hooks.before_reject.is_empty() {
+            return Ok(());
+        }
+        let ctx = self.hook_context(task);
+        hooks.run_before_reject(&ctx, task).await
+    }
+
+    /// Run `AfterReject` hooks.
+    pub(crate) async fn fire_after_reject(&self, task: &SerializedTask) -> Result<()> {
+        let hooks = self.hooks.read().await;
+        if hooks.after_reject.is_empty() {
+            return Ok(());
+        }
+        let ctx = self.hook_context(task);
+        hooks.run_after_reject(&ctx, task).await
+    }
+
+    /// Load the task an ack is about, but only when an ack hook is registered.
+    ///
+    /// `Broker::ack` receives an id, not a task, so the hooks' `&SerializedTask`
+    /// argument has to be read back from the row. The registration check keeps
+    /// that extra `SELECT` off the hot path for the overwhelmingly common case
+    /// of no ack hooks at all.
+    pub(crate) async fn load_task_for_ack_hooks(
+        &self,
+        row_id: &str,
+    ) -> Result<Option<SerializedTask>> {
+        let needed = {
+            let hooks = self.hooks.read().await;
+            !hooks.before_ack.is_empty() || !hooks.after_ack.is_empty()
+        };
+        if !needed {
+            return Ok(None);
+        }
+        self.load_task_by_row_id(row_id).await
+    }
+
+    /// Load the task a reject is about, but only when a reject hook is
+    /// registered.
+    ///
+    /// Always called *before* the state change: exceeding `max_retries` moves
+    /// the task to the DLQ, which deletes the row, so a later load would find
+    /// nothing.
+    pub(crate) async fn load_task_for_reject_hooks(
+        &self,
+        row_id: &str,
+    ) -> Result<Option<SerializedTask>> {
+        let needed = {
+            let hooks = self.hooks.read().await;
+            !hooks.before_reject.is_empty() || !hooks.after_reject.is_empty()
+        };
+        if !needed {
+            return Ok(None);
+        }
+        self.load_task_by_row_id(row_id).await
+    }
+
+    /// Rebuild a [`SerializedTask`] from its `celers_tasks` row.
+    async fn load_task_by_row_id(&self, row_id: &str) -> Result<Option<SerializedTask>> {
+        let sql = format!(
+            "SELECT {} FROM celers_tasks WHERE id = ?",
+            crate::sql_text::DEQUEUE_COLUMNS
+        );
+        let rows = self
+            .connection()
+            .query(&sql, &[&row_id])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to load task for hooks: {e}")))?;
+
+        rows.first()
+            .map(|row| {
+                crate::task_row::read_dequeued_row(row)
+                    .map(|dequeued| crate::task_row::build_serialized_task(&dequeued))
+            })
+            .transpose()
     }
 }

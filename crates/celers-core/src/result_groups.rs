@@ -45,7 +45,7 @@
 use crate::result::TaskResultValue;
 use crate::TaskId;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Per-child slot inside a [`ResultGroup`].
 ///
@@ -159,6 +159,14 @@ pub struct ResultGroup {
     /// Child task ids in registration order. This is the canonical ordering.
     order: Vec<TaskId>,
 
+    /// Membership index over `order`.
+    ///
+    /// De-duplicating with `order.contains(..)` is a linear scan per child, so
+    /// building a group of `n` children — or registering results for them one at
+    /// a time — was `O(n^2)` UUID comparisons. Celery groups of tens of
+    /// thousands of tasks are routine.
+    membership: HashSet<TaskId>,
+
     /// Latest known result per child (sparse until children report).
     results: HashMap<TaskId, TaskResultValue>,
 }
@@ -170,14 +178,16 @@ impl ResultGroup {
     #[must_use]
     pub fn new(group_id: TaskId, children: Vec<TaskId>) -> Self {
         let mut order = Vec::with_capacity(children.len());
+        let mut membership = HashSet::with_capacity(children.len());
         for child in children {
-            if !order.contains(&child) {
+            if membership.insert(child) {
                 order.push(child);
             }
         }
         Self {
             group_id,
             order,
+            membership,
             results: HashMap::new(),
         }
     }
@@ -188,6 +198,7 @@ impl ResultGroup {
         Self {
             group_id,
             order: Vec::new(),
+            membership: HashSet::new(),
             results: HashMap::new(),
         }
     }
@@ -224,9 +235,16 @@ impl ResultGroup {
     ///
     /// No-op if the child is already registered (order is preserved).
     pub fn add_child(&mut self, task_id: TaskId) {
-        if !self.order.contains(&task_id) {
+        if self.membership.insert(task_id) {
             self.order.push(task_id);
         }
+    }
+
+    /// Returns `true` if `task_id` is already registered as a child.
+    #[inline]
+    #[must_use]
+    pub fn contains_child(&self, task_id: TaskId) -> bool {
+        self.membership.contains(&task_id)
     }
 
     /// Register an additional child together with its result.
@@ -611,5 +629,81 @@ mod tests {
             Some(&json!(7))
         );
         assert!(group.result_for(Uuid::new_v4()).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests
+    // ------------------------------------------------------------------
+
+    /// Regression: de-duplication used a linear `Vec::contains` scan per child,
+    /// making construction and incremental registration quadratic. 50k children
+    /// meant ~1.25 billion UUID comparisons; this must complete quickly.
+    #[test]
+    fn large_group_registration_is_not_quadratic() {
+        const CHILDREN: usize = 50_000;
+        let ids: Vec<TaskId> = (0..CHILDREN).map(|_| Uuid::new_v4()).collect();
+
+        let start = std::time::Instant::now();
+        let group = ResultGroup::new(Uuid::new_v4(), ids.clone());
+        let bulk = start.elapsed();
+        assert_eq!(group.len(), CHILDREN);
+        assert!(
+            bulk < std::time::Duration::from_secs(5),
+            "bulk construction took {bulk:?}"
+        );
+
+        let start = std::time::Instant::now();
+        let mut incremental = ResultGroup::empty(Uuid::new_v4());
+        for id in &ids {
+            incremental.add_child(*id);
+        }
+        let one_by_one = start.elapsed();
+        assert_eq!(incremental.len(), CHILDREN);
+        assert!(
+            one_by_one < std::time::Duration::from_secs(5),
+            "incremental registration took {one_by_one:?}"
+        );
+
+        // Setting a result for each child is likewise linear overall.
+        let start = std::time::Instant::now();
+        for id in &ids {
+            incremental.set_result(*id, TaskResultValue::Success(Value::from(1)));
+        }
+        let results = start.elapsed();
+        assert_eq!(incremental.len(), CHILDREN);
+        assert!(
+            results < std::time::Duration::from_secs(5),
+            "result registration took {results:?}"
+        );
+    }
+
+    #[test]
+    fn membership_index_matches_the_order() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+
+        // Duplicates collapse, first occurrence keeps its position.
+        let mut group = ResultGroup::new(Uuid::new_v4(), vec![a, b, a, c, b]);
+        assert_eq!(group.child_ids(), &[a, b, c]);
+        assert!(group.contains_child(a));
+        assert!(group.contains_child(c));
+
+        let d = Uuid::new_v4();
+        assert!(!group.contains_child(d));
+        group.add_child(d);
+        assert!(group.contains_child(d));
+        assert_eq!(group.child_ids(), &[a, b, c, d]);
+
+        // Re-adding is a no-op.
+        group.add_child(a);
+        assert_eq!(group.child_ids(), &[a, b, c, d]);
+
+        // set_result on an unknown child still appends exactly once.
+        let e = Uuid::new_v4();
+        group.set_result(e, TaskResultValue::Success(Value::from(1)));
+        group.set_result(e, TaskResultValue::Success(Value::from(2)));
+        assert_eq!(group.child_ids(), &[a, b, c, d, e]);
+        assert_eq!(group.len(), 5);
     }
 }

@@ -53,6 +53,16 @@ pub fn analyze_message_flow_pattern(
     let last_value = window[window.len() - 1] as f64;
     let deviation = (last_value - mean).abs();
 
+    if std_dev == 0.0 {
+        // Every sample in the window is identical (e.g. an idle queue
+        // reporting `[0, 0, 0]`, or any perfectly steady traffic). There is
+        // no variation to measure a deviation against, so falling through
+        // to `deviation >= 3.0 * std_dev` would reduce to `0.0 >= 0.0` and
+        // misreport a perfectly flat series as a severe anomaly -- exactly
+        // backwards.
+        return (false, "none", "normal");
+    }
+
     if deviation >= 3.0 * std_dev {
         // Severe anomaly
         let pattern = if last_value > mean {
@@ -656,11 +666,24 @@ pub fn analyze_retry_effectiveness(
         return (100.0, 100.0, "no_failures_retries_not_needed".to_string());
     }
 
+    if total_messages == 0 {
+        // `failed_messages > 0` (checked above) but `total_messages == 0`:
+        // an inconsistent input, e.g. counters aggregated from mismatched
+        // time windows. There is no meaningful success rate to report;
+        // report full ineffectiveness rather than dividing by zero into
+        // NaN/inf below.
+        return (0.0, 0.0, "invalid_input_zero_total_messages".to_string());
+    }
+
     // Calculate retry effectiveness (% of failures recovered by retry)
     let effectiveness = (retry_successes as f64 / failed_messages as f64) * 100.0;
 
-    // Calculate overall success rate
-    let total_successes = total_messages - final_failures;
+    // Calculate overall success rate. Saturating: caller-supplied counters
+    // aggregated from different time windows can report more final
+    // failures than total messages, which would otherwise underflow this
+    // `usize` subtraction (panicking in debug builds, wrapping to roughly
+    // `u64::MAX` in release).
+    let total_successes = total_messages.saturating_sub(final_failures);
     let success_rate = (total_successes as f64 / total_messages as f64) * 100.0;
 
     // Generate recommendation
@@ -1028,4 +1051,78 @@ pub fn estimate_broker_capacity(
     };
 
     (safe_max, headroom_pct, recommendation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- analyze_message_flow_pattern ---------------------------------------
+
+    #[test]
+    fn flat_zero_series_is_not_reported_as_anomaly() {
+        let (is_anomaly, severity, pattern) = analyze_message_flow_pattern(&[0, 0, 0], 5);
+        assert!(!is_anomaly);
+        assert_eq!(severity, "none");
+        assert_eq!(pattern, "normal");
+    }
+
+    #[test]
+    fn flat_nonzero_series_is_not_reported_as_anomaly() {
+        let (is_anomaly, severity, pattern) = analyze_message_flow_pattern(&[100, 100, 100], 5);
+        assert!(!is_anomaly);
+        assert_eq!(severity, "none");
+        assert_eq!(pattern, "normal");
+    }
+
+    #[test]
+    fn flat_series_longer_than_window_is_not_an_anomaly() {
+        let (is_anomaly, _, _) = analyze_message_flow_pattern(&[7, 7, 7, 7, 7, 7], 4);
+        assert!(!is_anomaly);
+    }
+
+    #[test]
+    fn genuine_spike_is_still_detected() {
+        // For a window of `n` samples, the maximum possible
+        // `deviation / std_dev` for any single point is bounded by
+        // `sqrt(n - 1)` (attained by "one outlier among otherwise-equal
+        // values"), so a short window can never reach the `>= 3.0`
+        // "high"-severity threshold no matter how extreme the outlier is.
+        // Use a wide-enough window (14 steady values + 1 huge spike, so
+        // the bound is `sqrt(14) ~= 3.74`) to comfortably clear it.
+        let mut window = vec![100usize; 14];
+        window.push(100_000);
+        let (is_anomaly, severity, pattern) = analyze_message_flow_pattern(&window, window.len());
+        assert!(is_anomaly);
+        assert_eq!(severity, "high");
+        assert_eq!(pattern, "sudden_spike");
+    }
+
+    // --- analyze_retry_effectiveness ----------------------------------------
+
+    #[test]
+    fn retry_effectiveness_does_not_underflow_when_final_failures_exceed_total() {
+        // Regression test: `total_messages - final_failures` used to be an
+        // unchecked `usize` subtraction that panics in debug builds (or
+        // wraps to ~1.8e19 in release) whenever caller-supplied counters
+        // from different time windows produce `final_failures >
+        // total_messages`.
+        let (effectiveness, success_rate, recommendation) = analyze_retry_effectiveness(0, 5, 0, 5);
+        assert_eq!(effectiveness, 0.0);
+        assert_eq!(success_rate, 0.0);
+        assert_eq!(recommendation, "invalid_input_zero_total_messages");
+
+        let (effectiveness, success_rate, _) = analyze_retry_effectiveness(10, 5, 2, 20);
+        assert!(!effectiveness.is_nan());
+        assert!(!success_rate.is_nan());
+        assert_eq!(success_rate, 0.0); // saturating_sub(20) from 10 -> 0 successes
+    }
+
+    #[test]
+    fn retry_effectiveness_normal_case_unaffected() {
+        let (eff, rate, rec) = analyze_retry_effectiveness(1000, 100, 80, 20);
+        assert!(eff > 50.0);
+        assert!(rec.contains("effective"));
+        assert_eq!(rate, 98.0);
+    }
 }

@@ -197,31 +197,65 @@ impl TaskException {
         }
     }
 
+    /// Maximum number of `source()` hops captured when converting a Rust error
+    /// chain, so a cyclic or pathologically deep chain cannot recurse forever.
+    pub const MAX_CAUSE_DEPTH: usize = 32;
+
     /// Create from a Rust error
     pub fn from_error<E: std::error::Error>(error: &E) -> Self {
-        let exc_type = std::any::type_name::<E>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("Error")
-            .to_string();
+        let exc_type = short_type_name(std::any::type_name::<E>());
 
         let mut exception = Self::new(exc_type, error.to_string());
 
         // Capture error chain as cause
         if let Some(source) = error.source() {
-            exception.cause = Some(Box::new(Self::from_error_dyn(source)));
+            exception.cause = Some(Box::new(Self::from_error_dyn_at_depth(source, 1)));
         }
 
         exception
     }
 
-    /// Create from a dynamic error reference
-    fn from_error_dyn(error: &dyn std::error::Error) -> Self {
-        let exc_type = "Error".to_string();
-        let mut exception = Self::new(exc_type, error.to_string());
+    /// Create from a dynamic error reference, deriving the exception type from
+    /// the error's own `Debug` representation.
+    ///
+    /// [`ExceptionPolicy`] dispatches purely on `exc_type`, so hardcoding
+    /// `"Error"` for every cause (as this used to) made a whole error chain
+    /// unclassifiable and useless for operator diagnosis. Rust's derived
+    /// `Debug` starts with the concrete type/variant name, which recovers a
+    /// meaningful identity for the overwhelming majority of errors; callers that
+    /// know better can use
+    /// [`TaskException::from_error_dyn_with_type`].
+    #[must_use]
+    pub fn from_error_dyn(error: &dyn std::error::Error) -> Self {
+        Self::from_error_dyn_at_depth(error, 1)
+    }
 
+    /// Create from a dynamic error reference with an explicit type name.
+    ///
+    /// Use this when the concrete type is known at the call site (or when a
+    /// domain-specific naming scheme should be applied) so policy matching on
+    /// `exc_type` keeps working across the chain.
+    #[must_use]
+    pub fn from_error_dyn_with_type(
+        error: &dyn std::error::Error,
+        exc_type: impl Into<String>,
+    ) -> Self {
+        let mut exception = Self::new(exc_type, error.to_string());
         if let Some(source) = error.source() {
-            exception.cause = Some(Box::new(Self::from_error_dyn(source)));
+            exception.cause = Some(Box::new(Self::from_error_dyn_at_depth(source, 1)));
+        }
+        exception
+    }
+
+    /// Recursive worker for the dynamic conversion, bounded by
+    /// [`TaskException::MAX_CAUSE_DEPTH`].
+    fn from_error_dyn_at_depth(error: &dyn std::error::Error, depth: usize) -> Self {
+        let mut exception = Self::new(type_name_from_debug(error), error.to_string());
+
+        if depth < Self::MAX_CAUSE_DEPTH {
+            if let Some(source) = error.source() {
+                exception.cause = Some(Box::new(Self::from_error_dyn_at_depth(source, depth + 1)));
+            }
         }
 
         exception
@@ -841,6 +875,39 @@ pub mod exception_types {
     ];
 }
 
+/// Reduce a fully-qualified Rust type name to its last path segment, dropping
+/// any generic arguments (`std::io::Error` -> `Error`, `Wrapper<Inner>` ->
+/// `Wrapper`).
+fn short_type_name(type_name: &str) -> String {
+    let without_generics = type_name.split('<').next().unwrap_or(type_name);
+    without_generics
+        .rsplit("::")
+        .next()
+        .unwrap_or(type_name)
+        .trim()
+        .to_string()
+}
+
+/// Derive a usable exception type name from an error's `Debug` output.
+///
+/// `std::any::type_name_of_val` on a `&dyn Error` reports the trait object, not
+/// the concrete type, so the derived `Debug` representation — which starts with
+/// the concrete type or variant name for every `#[derive(Debug)]` type and for
+/// `thiserror`-generated errors — is the best identity available on stable Rust.
+/// Falls back to `"Error"` when the representation does not start with an
+/// identifier (e.g. a plain string payload).
+fn type_name_from_debug(error: &dyn std::error::Error) -> String {
+    let debug = format!("{error:?}");
+    let ident: String = debug
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    match ident.chars().next() {
+        Some(first) if first.is_alphabetic() => ident,
+        _ => "Error".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,5 +1156,105 @@ mod tests {
 
         assert_eq!(handler.handle(&timeout), ExceptionAction::Retry);
         assert_eq!(handler.handle(&validation), ExceptionAction::Fail);
+    }
+
+    #[derive(Debug)]
+    struct ConnectionError {
+        source: Option<Box<TimeoutError>>,
+    }
+
+    #[derive(Debug)]
+    struct TimeoutError;
+
+    impl std::fmt::Display for ConnectionError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("connection failed")
+        }
+    }
+
+    impl std::error::Error for ConnectionError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_ref()
+                .map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    impl std::fmt::Display for TimeoutError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("timed out")
+        }
+    }
+
+    impl std::error::Error for TimeoutError {}
+
+    #[test]
+    fn test_error_chain_preserves_cause_type_names() {
+        // Regression: every cause in the chain was hardcoded to "Error", so a
+        // policy configured with retry_on = ["TimeoutError"] could never match a
+        // cause and `exception_chain()` was useless for diagnosis.
+        let error = ConnectionError {
+            source: Some(Box::new(TimeoutError)),
+        };
+        let exception = TaskException::from_error(&error);
+
+        assert_eq!(exception.exc_type, "ConnectionError");
+        let cause = exception.cause.as_ref().expect("cause captured");
+        assert_eq!(cause.exc_type, "TimeoutError");
+        assert_eq!(cause.exc_message, "timed out");
+
+        // The recovered type name is what policy matching dispatches on.
+        let policy = ExceptionPolicy::new().retry_on(&["TimeoutError"]);
+        assert_eq!(policy.get_action(cause), ExceptionAction::Retry);
+
+        let chain = exception.exception_chain();
+        assert_eq!(chain.len(), 2);
+        assert!(chain.iter().any(|e| e.exc_type == "TimeoutError"));
+    }
+
+    #[test]
+    fn test_from_error_dyn_with_explicit_type() {
+        let error = ConnectionError { source: None };
+        let exception =
+            TaskException::from_error_dyn_with_type(&error, "kombu.exceptions.OperationalError");
+        assert_eq!(exception.exc_type, "kombu.exceptions.OperationalError");
+        assert_eq!(exception.exc_message, "connection failed");
+    }
+
+    #[test]
+    fn test_error_chain_depth_is_bounded() {
+        /// A self-referential error chain: `source()` always yields another
+        /// error, which would recurse forever without a depth limit.
+        #[derive(Debug)]
+        struct Endless;
+
+        impl std::fmt::Display for Endless {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("endless")
+            }
+        }
+
+        impl std::error::Error for Endless {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                static ENDLESS: Endless = Endless;
+                Some(&ENDLESS)
+            }
+        }
+
+        let exception = TaskException::from_error(&Endless);
+        let mut depth = 0usize;
+        let mut current = exception.cause.as_deref();
+        while let Some(cause) = current {
+            depth += 1;
+            current = cause.cause.as_deref();
+        }
+        assert_eq!(depth, TaskException::MAX_CAUSE_DEPTH);
+    }
+
+    #[test]
+    fn test_short_type_name_strips_paths_and_generics() {
+        assert_eq!(short_type_name("std::io::Error"), "Error");
+        assert_eq!(short_type_name("my_crate::Wrapper<Inner>"), "Wrapper");
+        assert_eq!(short_type_name("Bare"), "Bare");
     }
 }

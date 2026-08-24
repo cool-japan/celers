@@ -2,7 +2,6 @@
 
 use celers_core::{CelersError, Result};
 use chrono::{DateTime, Utc};
-use oxisql_core::Connection;
 
 use crate::row_ext::RowExt;
 use crate::types::PartitionInfo;

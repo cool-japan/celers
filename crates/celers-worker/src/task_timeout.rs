@@ -11,6 +11,23 @@
 //! - Timeout context with task metadata
 //! - Multiple cleanup handlers per task
 //!
+//! # Timeout strategies
+//!
+//! Both strategies *stop* the task; they differ in how much warning it gets.
+//!
+//! - [`TimeoutStrategy::Graceful`] (default) trips the task's
+//!   [`CancellationToken`] so cooperative code can unwind, waits up to
+//!   [`TimeoutConfig::grace_period`], and only then aborts the task's
+//!   [`JoinHandle`]. A task that ignores cancellation is still killed — a
+//!   timeout that leaves the work running would defeat the whole point of
+//!   bounding task runtime.
+//! - [`TimeoutStrategy::Forceful`] aborts immediately, without the grace
+//!   window.
+//!
+//! Aborting only works for tasks registered with their [`JoinHandle`] (see
+//! [`TimeoutManager::register_task_with_handle`]); a task registered without
+//! one can only be signalled through its cancellation token.
+//!
 //! # Example
 //!
 //! ```
@@ -33,6 +50,8 @@
 //! # }
 //! ```
 
+use crate::cancellation::CancellationToken;
+use celers_core::TaskId;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -226,6 +245,13 @@ struct TaskHandleEntry {
     context: TimeoutContext,
     /// Task join handle for forced termination
     handle: Option<JoinHandle<()>>,
+    /// Cooperative cancellation signal handed to the running task.
+    ///
+    /// Tripped before any abort so that a task which polls
+    /// [`CancellationToken::is_cancelled`] (or awaits
+    /// [`CancellationToken::cancelled`]) can unwind and release resources
+    /// during the grace period.
+    cancel: CancellationToken,
 }
 
 /// Timeout manager that tracks task timeouts and executes cleanup hooks
@@ -254,6 +280,10 @@ impl TimeoutManager {
     }
 
     /// Register a task for timeout monitoring
+    ///
+    /// Returns the task's [`TimeoutContext`]; use
+    /// [`TimeoutManager::cancellation_token`] to obtain the cooperative
+    /// cancellation signal that a timeout will trip.
     pub async fn register_task(
         &self,
         task_id: String,
@@ -266,7 +296,8 @@ impl TimeoutManager {
 
     /// Register a task for timeout monitoring with an optional task handle
     ///
-    /// The task handle is used for forced termination when the forceful timeout strategy is enabled.
+    /// The task handle is what makes a timeout enforceable: without one, a
+    /// task that ignores its cancellation token cannot be stopped.
     pub async fn register_task_with_handle(
         &self,
         task_id: String,
@@ -274,8 +305,41 @@ impl TimeoutManager {
         timeout: Option<Duration>,
         handle: Option<JoinHandle<()>>,
     ) -> TimeoutContext {
+        let (ctx, _token) = self
+            .register_task_with_cancellation(task_id, task_name, timeout, handle, None)
+            .await;
+        ctx
+    }
+
+    /// Register a task, supplying (or receiving) its cancellation token.
+    ///
+    /// Pass `token` when the task already owns one — typically the token from
+    /// [`crate::cancellation::CancellationRegistry`] used for broker-driven
+    /// revocation — so that a timeout and a revocation trip the *same*
+    /// signal. Pass `None` to have the manager mint one; either way the token
+    /// in use is returned so the caller can hand it to the running task.
+    ///
+    /// When [`TimeoutConfig::enabled`] is `false` the task is not tracked at
+    /// all, and the returned token is never tripped by this manager.
+    pub async fn register_task_with_cancellation(
+        &self,
+        task_id: String,
+        task_name: String,
+        timeout: Option<Duration>,
+        handle: Option<JoinHandle<()>>,
+        token: Option<CancellationToken>,
+    ) -> (TimeoutContext, CancellationToken) {
         let timeout_duration = timeout.unwrap_or(self.config.default_timeout);
         let ctx = TimeoutContext::new(task_id.clone(), task_name, timeout_duration);
+        let token = token.unwrap_or_else(|| CancellationToken::new(uuid_for(&task_id)));
+
+        if !self.config.enabled {
+            debug!(
+                "Timeout monitoring is disabled; not tracking task {}",
+                task_id
+            );
+            return (ctx, token);
+        }
 
         let mut tasks = self.active_tasks.write().await;
         tasks.insert(
@@ -283,10 +347,20 @@ impl TimeoutManager {
             TaskHandleEntry {
                 context: ctx.clone(),
                 handle,
+                cancel: token.clone(),
             },
         );
 
-        ctx
+        (ctx, token)
+    }
+
+    /// Get the cancellation token associated with a tracked task.
+    pub async fn cancellation_token(&self, task_id: &str) -> Option<CancellationToken> {
+        self.active_tasks
+            .read()
+            .await
+            .get(task_id)
+            .map(|entry| entry.cancel.clone())
     }
 
     /// Unregister a task (called when task completes successfully)
@@ -295,8 +369,32 @@ impl TimeoutManager {
         tasks.remove(task_id);
     }
 
-    /// Handle a task timeout - execute cleanup hooks and optionally force termination
+    /// Handle a task timeout: signal, escalate, and run cleanup hooks.
+    ///
+    /// The escalation depends on [`TimeoutConfig::strategy`]:
+    ///
+    /// * [`TimeoutStrategy::Graceful`] trips the cancellation token, waits up
+    ///   to [`TimeoutConfig::grace_period`] for the task to finish on its own
+    ///   and aborts it if it does not.
+    /// * [`TimeoutStrategy::Forceful`] trips the token and aborts
+    ///   immediately.
+    ///
+    /// Cleanup hooks run afterwards in both cases. Returns `Ok(())` without
+    /// doing anything when [`TimeoutConfig::enabled`] is `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the task is not tracked, or if any cleanup hook
+    /// failed (the escalation still happened in that case).
     pub async fn handle_timeout(&self, task_id: &str) -> Result<(), String> {
+        if !self.config.enabled {
+            debug!(
+                "Timeout monitoring is disabled; ignoring timeout for task {}",
+                task_id
+            );
+            return Ok(());
+        }
+
         // Get the task context and handle
         let mut tasks = self.active_tasks.write().await;
         let entry = match tasks.remove(task_id) {
@@ -310,6 +408,7 @@ impl TimeoutManager {
         let mut ctx = entry.context;
         ctx.update_elapsed();
         let handle = entry.handle;
+        let cancel = entry.cancel;
 
         // Drop the write lock before executing hooks
         drop(tasks);
@@ -319,18 +418,60 @@ impl TimeoutManager {
             task_id, ctx.elapsed, self.config.strategy
         );
 
-        // Handle forceful termination
-        if self.config.strategy == TimeoutStrategy::Forceful {
-            if let Some(handle) = handle {
-                warn!("Forcefully terminating task {}", task_id);
-                handle.abort();
-                info!("Task {} forcefully terminated", task_id);
-            } else {
-                warn!(
-                    "Forceful termination requested for task {} but no handle available",
+        // Always signal cooperative cancellation first: a task that polls its
+        // token can unwind cleanly instead of being killed mid-write.
+        cancel.cancel();
+
+        match self.config.strategy {
+            TimeoutStrategy::Forceful => match handle {
+                Some(handle) => {
+                    warn!("Forcefully terminating task {}", task_id);
+                    handle.abort();
+                    info!("Task {} forcefully terminated", task_id);
+                }
+                None => warn!(
+                    "Forceful termination requested for task {} but no handle available; \
+                     the task was signalled through its cancellation token only",
                     task_id
-                );
-            }
+                ),
+            },
+            TimeoutStrategy::Graceful => match handle {
+                Some(mut handle) => {
+                    let grace = self.config.grace_period;
+                    debug!(
+                        "Waiting up to {:?} for task {} to stop cooperatively",
+                        grace, task_id
+                    );
+                    // `JoinHandle` is a `Unpin` future, so awaiting `&mut
+                    // handle` under a timeout gives the task its grace window
+                    // *without* consuming the handle -- consuming it would
+                    // drop it on expiry, and a dropped `JoinHandle` detaches
+                    // the task instead of stopping it.
+                    match tokio::time::timeout(grace, &mut handle).await {
+                        Ok(Ok(())) => {
+                            info!("Task {} stopped gracefully after cancellation", task_id);
+                        }
+                        Ok(Err(join_err)) => {
+                            if join_err.is_cancelled() {
+                                info!("Task {} was already cancelled", task_id);
+                            } else {
+                                warn!("Task {} panicked while stopping: {}", task_id, join_err);
+                            }
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Task {} ignored cancellation for {:?}; aborting",
+                                task_id, grace
+                            );
+                            handle.abort();
+                        }
+                    }
+                }
+                None => debug!(
+                    "No join handle for task {}; relying on cooperative cancellation",
+                    task_id
+                ),
+            },
         }
 
         // Execute cleanup hooks (even for forceful termination)
@@ -406,6 +547,10 @@ impl TimeoutManager {
 
     /// Check all active tasks and handle any that have timed out
     async fn check_and_handle_timeouts(&self) {
+        if !self.config.enabled {
+            return;
+        }
+
         let timed_out_tasks: Vec<String> = {
             let tasks = self.active_tasks.read().await;
             tasks
@@ -427,6 +572,32 @@ impl TimeoutManager {
     pub fn config(&self) -> &TimeoutConfig {
         &self.config
     }
+}
+
+/// Derive a [`TaskId`] for a cancellation token from the manager's string
+/// task id.
+///
+/// Task ids are Celery-style UUID strings in practice, so they parse
+/// directly; anything else (a synthetic id from a test or an embedding
+/// application) is hashed into a stable identifier so that two tokens minted
+/// for the same task id still carry the same [`TaskId`].
+fn uuid_for(task_id: &str) -> TaskId {
+    if let Ok(parsed) = TaskId::parse_str(task_id) {
+        return parsed;
+    }
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut high = DefaultHasher::new();
+    task_id.hash(&mut high);
+    let mut low = DefaultHasher::new();
+    (task_id, 0xA5_u8).hash(&mut low);
+
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&high.finish().to_be_bytes());
+    bytes[8..].copy_from_slice(&low.finish().to_be_bytes());
+    TaskId::from_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -727,6 +898,215 @@ mod tests {
         // Cancel monitoring
         cancel_fn();
         monitor_handle.await.unwrap();
+    }
+
+    // --- Regression tests for the inert Graceful strategy (idx 171) ---
+
+    #[tokio::test(start_paused = true)]
+    async fn test_graceful_timeout_aborts_uncooperative_task() {
+        let config = TimeoutConfig::new(Duration::from_millis(100))
+            .with_strategy(TimeoutStrategy::Graceful)
+            .with_grace_period(Duration::from_secs(5));
+        let manager = TimeoutManager::new(config);
+
+        // A task that never completes and never checks its token: the grace
+        // period must expire and the manager must abort it. The drop guard
+        // fires when the aborted future is dropped by the runtime, which is a
+        // sturdier signal than polling `is_finished`.
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        manager
+            .register_task_with_handle(
+                "task-graceful".to_string(),
+                "stubborn".to_string(),
+                Some(Duration::from_millis(100)),
+                Some(handle),
+            )
+            .await;
+
+        manager
+            .handle_timeout("task-graceful")
+            .await
+            .expect("timeout handling should succeed");
+
+        // Yield so the runtime can process the abort (no sleeps: the loop
+        // just gives the scheduler ticks).
+        for _ in 0..16 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "a Graceful timeout must still stop a task that ignores cancellation"
+        );
+        assert_eq!(manager.active_count().await, 0);
+    }
+
+    /// Sets its flag when dropped; used to observe task aborts without sleeps.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_graceful_timeout_lets_cooperative_task_finish() {
+        let config = TimeoutConfig::new(Duration::from_millis(100))
+            .with_strategy(TimeoutStrategy::Graceful)
+            .with_grace_period(Duration::from_secs(5));
+        let manager = TimeoutManager::new(config);
+
+        let unwound = Arc::new(AtomicBool::new(false));
+        let unwound_clone = Arc::clone(&unwound);
+
+        let token = CancellationToken::new(uuid::Uuid::new_v4());
+        let token_id = token.task_id();
+        let task_token = token.clone();
+        let handle = tokio::spawn(async move {
+            task_token.cancelled().await;
+            unwound_clone.store(true, Ordering::SeqCst);
+        });
+
+        let (_ctx, returned) = manager
+            .register_task_with_cancellation(
+                "task-coop".to_string(),
+                "cooperative".to_string(),
+                Some(Duration::from_millis(100)),
+                Some(handle),
+                Some(token),
+            )
+            .await;
+        assert_eq!(
+            returned.task_id(),
+            token_id,
+            "a caller-supplied token must be adopted, not replaced"
+        );
+
+        manager
+            .handle_timeout("task-coop")
+            .await
+            .expect("timeout handling should succeed");
+
+        assert!(
+            unwound.load(Ordering::SeqCst),
+            "the cancellation token must be tripped so the task can unwind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forceful_timeout_aborts_immediately() {
+        let config = TimeoutConfig::new(Duration::from_millis(100))
+            .with_strategy(TimeoutStrategy::Forceful)
+            .with_grace_period(Duration::from_secs(3600));
+        let manager = TimeoutManager::new(config);
+
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let abort_probe = handle.abort_handle();
+
+        manager
+            .register_task_with_handle(
+                "task-forceful".to_string(),
+                "stubborn".to_string(),
+                Some(Duration::from_millis(100)),
+                Some(handle),
+            )
+            .await;
+
+        // Must not wait out the (deliberately huge) grace period.
+        manager
+            .handle_timeout("task-forceful")
+            .await
+            .expect("timeout handling should succeed");
+
+        tokio::task::yield_now().await;
+        assert!(abort_probe.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_disabled_config_disables_tracking_and_handling() {
+        let config = TimeoutConfig::new(Duration::from_millis(1)).enabled(false);
+        let manager = TimeoutManager::new(config);
+
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let abort_probe = handle.abort_handle();
+
+        manager
+            .register_task_with_handle(
+                "task-disabled".to_string(),
+                "ignored".to_string(),
+                Some(Duration::from_millis(1)),
+                Some(handle),
+            )
+            .await;
+
+        assert_eq!(
+            manager.active_count().await,
+            0,
+            "a disabled manager must not track tasks"
+        );
+        // Handling a timeout is a no-op rather than an error.
+        assert!(manager.handle_timeout("task-disabled").await.is_ok());
+        tokio::task::yield_now().await;
+        assert!(
+            !abort_probe.is_finished(),
+            "a disabled manager must not abort anything"
+        );
+
+        abort_probe.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_token_is_exposed() {
+        let manager = TimeoutManager::new(TimeoutConfig::default());
+        let (_ctx, token) = manager
+            .register_task_with_cancellation(
+                "task-token".to_string(),
+                "test".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let looked_up = manager
+            .cancellation_token("task-token")
+            .await
+            .expect("token should be tracked");
+        assert_eq!(looked_up.task_id(), token.task_id());
+        assert!(!looked_up.is_cancelled());
+
+        manager
+            .handle_timeout("task-token")
+            .await
+            .expect("timeout handling should succeed");
+        assert!(
+            token.is_cancelled(),
+            "a timeout must trip the task's cancellation token"
+        );
+    }
+
+    #[test]
+    fn test_uuid_for_is_stable() {
+        let a = uuid_for("not-a-uuid");
+        let b = uuid_for("not-a-uuid");
+        assert_eq!(a, b);
+        assert_ne!(a, uuid_for("other-id"));
+
+        let real = uuid::Uuid::new_v4();
+        assert_eq!(uuid_for(&real.to_string()), real);
     }
 
     #[tokio::test]

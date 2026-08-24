@@ -7,9 +7,22 @@
 //! # Features
 //!
 //! - **Redis-based coordination**: Use Redis for distributed token bucket tracking
-//! - **Sliding window rate limiting**: Track requests in time windows
+//! - **Atomic accounting**: the refill-and-consume step runs as a single Lua
+//!   script inside Redis, so concurrent workers cannot over-grant permits
 //! - **Automatic token refill**: Tokens are refilled based on configured rates
 //! - **Multi-worker coordination**: Rate limits apply across all workers
+//!
+//! # Why a Lua script
+//!
+//! A token bucket implemented as `GET` → compute in the client → `SET` is not
+//! a rate limiter under contention: two workers that both read `available = 1`
+//! both pass the check and both write `0`, so a one-permit budget grants two
+//! permits — and the failure mode appears precisely when the limiter is
+//! needed. [`DistributedRateLimiter`] therefore performs the whole
+//! refill/compare/decrement sequence inside Redis via [`redis::Script`], where
+//! it is serialised against every other worker by Redis's single-threaded
+//! command execution. [`InMemoryDistributedRateLimiter`] applies the same
+//! algorithm under a single write lock.
 //!
 //! # Example
 //!
@@ -193,6 +206,169 @@ impl RateLimitStats {
     }
 }
 
+/// Current wall-clock time as fractional seconds since the Unix epoch.
+///
+/// A clock that predates the epoch yields `0.0` rather than panicking; the
+/// bucket treats non-positive elapsed time as "no refill", so a nonsensical
+/// clock can never mint tokens.
+fn now_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// How long it takes to accumulate `wanted` tokens starting from `available`.
+///
+/// Returns [`Duration::ZERO`] when the tokens are already there and
+/// [`Duration::MAX`] when no refill rate is configured (they never arrive).
+fn time_to_accumulate(wanted: u64, available: u64, refill_rate: f64) -> Duration {
+    let deficit = wanted.saturating_sub(available);
+    if deficit == 0 {
+        return Duration::ZERO;
+    }
+    if refill_rate > 0.0 {
+        Duration::from_secs_f64(deficit as f64 / refill_rate)
+    } else {
+        Duration::MAX
+    }
+}
+
+/// Result of a single token-bucket acquisition attempt.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcquireOutcome {
+    /// Whether the requested tokens were granted.
+    pub allowed: bool,
+    /// Whole tokens left in the bucket afterwards.
+    pub remaining: u64,
+    /// How long to wait before a retry could succeed. Zero when allowed.
+    pub retry_after: Duration,
+}
+
+/// A continuous token bucket.
+///
+/// Tokens are tracked as a `f64` on purpose: flooring the refill to whole
+/// tokens and advancing the timestamp anyway would starve a bucket polled
+/// more often than one token per interval (each poll credits `floor(small
+/// elapsed * rate) == 0` and throws the elapsed time away). This is the exact
+/// algorithm the Redis Lua script implements, kept here so it can be tested
+/// without a server.
+#[derive(Debug, Clone, Copy)]
+struct TokenBucket {
+    tokens: f64,
+    last_refill: f64,
+}
+
+impl TokenBucket {
+    fn new(capacity: u64, now: f64) -> Self {
+        Self {
+            tokens: capacity as f64,
+            last_refill: now,
+        }
+    }
+
+    /// Credit elapsed time, capped at `capacity`.
+    fn refill(&mut self, capacity: u64, refill_rate: f64, now: f64) {
+        // Guard against clock skew between workers: never credit negative time.
+        let elapsed = (now - self.last_refill).max(0.0);
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * refill_rate).min(capacity as f64);
+            self.last_refill = now;
+        }
+    }
+
+    /// Refill and, if the budget allows, consume `cost` tokens.
+    fn try_consume(
+        &mut self,
+        capacity: u64,
+        refill_rate: f64,
+        now: f64,
+        cost: u64,
+    ) -> AcquireOutcome {
+        self.refill(capacity, refill_rate, now);
+
+        let cost_f = cost as f64;
+        if self.tokens >= cost_f {
+            self.tokens -= cost_f;
+            AcquireOutcome {
+                allowed: true,
+                remaining: self.whole_tokens(),
+                retry_after: Duration::ZERO,
+            }
+        } else {
+            let deficit = cost_f - self.tokens;
+            let retry_after = if refill_rate > 0.0 {
+                Duration::from_secs_f64(deficit / refill_rate)
+            } else {
+                Duration::MAX
+            };
+            AcquireOutcome {
+                allowed: false,
+                remaining: self.whole_tokens(),
+                retry_after,
+            }
+        }
+    }
+
+    fn whole_tokens(&self) -> u64 {
+        if self.tokens <= 0.0 {
+            0
+        } else {
+            self.tokens as u64
+        }
+    }
+}
+
+/// Atomic token-bucket refill-and-consume, executed server-side by Redis.
+///
+/// `KEYS[1]` is the token count, `KEYS[2]` the last-refill timestamp.
+/// `ARGV` is `capacity, refill_rate, now, cost, ttl_seconds`. Returns
+/// `{allowed, remaining_whole_tokens, retry_after_ms}` where `retry_after_ms`
+/// is `-1` when no refill rate is configured (i.e. never).
+///
+/// Redis executes a script atomically with respect to every other client, so
+/// the read, the comparison and the write cannot interleave with another
+/// worker's — which is the entire point of the exercise.
+#[cfg(feature = "redis")]
+const TOKEN_BUCKET_SCRIPT: &str = r"
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+
+local tokens = tonumber(redis.call('GET', KEYS[1]))
+local last = tonumber(redis.call('GET', KEYS[2]))
+if tokens == nil then tokens = capacity end
+if last == nil then last = now end
+
+-- Never credit negative elapsed time: worker clocks can disagree.
+local elapsed = now - last
+if elapsed < 0 then elapsed = 0 end
+if elapsed > 0 then
+  tokens = math.min(capacity, tokens + elapsed * rate)
+  last = now
+end
+
+local allowed = 0
+local retry_after_ms = 0
+if tokens >= cost then
+  tokens = tokens - cost
+  allowed = 1
+elseif rate > 0 then
+  retry_after_ms = math.ceil(((cost - tokens) / rate) * 1000)
+else
+  retry_after_ms = -1
+end
+
+redis.call('SET', KEYS[1], tokens, 'EX', ttl)
+redis.call('SET', KEYS[2], last, 'EX', ttl)
+
+local remaining = math.floor(tokens)
+if remaining < 0 then remaining = 0 end
+return {allowed, remaining, retry_after_ms}
+";
+
 #[cfg(feature = "redis")]
 /// Redis-based distributed rate limiter
 pub struct DistributedRateLimiter {
@@ -250,59 +426,55 @@ impl DistributedRateLimiter {
         format!("{}:stats:{}", self.config.key_prefix, task_type)
     }
 
-    /// Refill tokens based on elapsed time
-    async fn refill_tokens(&self, task_type: &str) -> Result<u64> {
+    /// Run the atomic token-bucket script for `task_type`.
+    ///
+    /// A `cost` of zero performs the refill and reports the balance without
+    /// consuming anything, which is how [`Self::available_tokens`] observes
+    /// the bucket without perturbing it.
+    async fn run_bucket_script(&self, task_type: &str, cost: u64) -> Result<AcquireOutcome> {
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| CelersError::Other(format!("Redis connection error: {}", e)))?;
 
-        let bucket_key = self.bucket_key(task_type);
-        let refill_key = self.refill_key(task_type);
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_secs_f64();
-
-        // Get current tokens and last refill time
-        let (current_tokens, last_refill): (Option<u64>, Option<f64>) = redis::pipe()
-            .get(&bucket_key)
-            .get(&refill_key)
-            .query_async(&mut conn)
+        let script = redis::Script::new(TOKEN_BUCKET_SCRIPT);
+        let (allowed, remaining, retry_after_ms): (i64, i64, i64) = script
+            .key(self.bucket_key(task_type))
+            .key(self.refill_key(task_type))
+            .arg(self.config.capacity)
+            .arg(self.config.refill_rate)
+            .arg(now_secs())
+            .arg(cost)
+            .arg(self.ttl_secs())
+            .invoke_async(&mut conn)
             .await
-            .map_err(|e| CelersError::Other(format!("Redis pipeline error: {}", e)))?;
+            .map_err(|e| CelersError::Other(format!("Redis script error: {}", e)))?;
 
-        let current_tokens = current_tokens.unwrap_or(self.config.capacity);
-        let last_refill = last_refill.unwrap_or(now);
+        Ok(AcquireOutcome {
+            allowed: allowed == 1,
+            remaining: remaining.max(0) as u64,
+            retry_after: if retry_after_ms < 0 {
+                Duration::MAX
+            } else {
+                Duration::from_millis(retry_after_ms as u64)
+            },
+        })
+    }
 
-        // Calculate tokens to add
-        let elapsed = now - last_refill;
-        let tokens_to_add = (elapsed * self.config.refill_rate).floor() as u64;
-
-        if tokens_to_add > 0 {
-            let new_tokens = (current_tokens + tokens_to_add).min(self.config.capacity);
-
-            // Update tokens and refill time
-            redis::pipe()
-                .set(&bucket_key, new_tokens)
-                .set(&refill_key, now)
-                .expire(&bucket_key, self.config.window_size_secs as i64)
-                .expire(&refill_key, self.config.window_size_secs as i64)
-                .query_async::<()>(&mut conn)
-                .await
-                .map_err(|e| CelersError::Other(format!("Redis pipeline error: {}", e)))?;
-
-            debug!(
-                "Refilled {} tokens for task type '{}' (now: {})",
-                tokens_to_add, task_type, new_tokens
-            );
-
-            Ok(new_tokens)
+    /// Key expiry for the bucket, in seconds.
+    ///
+    /// The bucket must survive long enough for an empty bucket to refill
+    /// completely, otherwise expiry silently resets it to full capacity and
+    /// hands out a free burst. Take the larger of the configured window and
+    /// the full-refill time.
+    fn ttl_secs(&self) -> u64 {
+        let full_refill = if self.config.refill_rate > 0.0 {
+            (self.config.capacity as f64 / self.config.refill_rate).ceil() as u64
         } else {
-            Ok(current_tokens)
-        }
+            self.config.window_size_secs
+        };
+        self.config.window_size_secs.max(full_refill).max(1)
     }
 
     /// Update local statistics
@@ -327,72 +499,48 @@ impl DistributedRateLimiter {
 #[async_trait]
 impl DistributedRateLimiterTrait for DistributedRateLimiter {
     async fn try_acquire(&self, task_type: &str, tokens: u64) -> Result<bool> {
-        use redis::AsyncCommands;
-
         if tokens == 0 {
             return Ok(true);
         }
 
-        // Refill tokens first
-        let available = self.refill_tokens(task_type).await?;
+        // One round trip; the refill, the comparison and the decrement all
+        // happen inside Redis so concurrent workers cannot over-grant.
+        let outcome = self.run_bucket_script(task_type, tokens).await?;
 
-        if available >= tokens {
-            // We have enough tokens, consume them
-            let mut conn = self
-                .client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| CelersError::Other(format!("Redis connection error: {}", e)))?;
+        self.update_stats(task_type, outcome.allowed, outcome.remaining)
+            .await;
 
-            let bucket_key = self.bucket_key(task_type);
-            let new_tokens = available - tokens;
-
-            let _: () = conn
-                .set(&bucket_key, new_tokens)
-                .await
-                .map_err(|e| CelersError::Other(format!("Redis set error: {}", e)))?;
-
-            let _: () = conn
-                .expire(&bucket_key, self.config.window_size_secs as i64)
-                .await
-                .map_err(|e| CelersError::Other(format!("Redis expire error: {}", e)))?;
-
-            self.update_stats(task_type, true, new_tokens).await;
-
+        if outcome.allowed {
             debug!(
                 "Acquired {} tokens for task type '{}' (remaining: {})",
-                tokens, task_type, new_tokens
+                tokens, task_type, outcome.remaining
             );
-
-            Ok(true)
         } else {
-            self.update_stats(task_type, false, available).await;
-
             debug!(
-                "Rate limit exceeded for task type '{}' (available: {}, requested: {})",
-                task_type, available, tokens
+                "Rate limit exceeded for task type '{}' (available: {}, requested: {}, retry in {:?})",
+                task_type, outcome.remaining, tokens, outcome.retry_after
             );
-
-            Ok(false)
         }
+
+        Ok(outcome.allowed)
     }
 
     async fn available_tokens(&self, task_type: &str) -> Result<u64> {
-        self.refill_tokens(task_type).await
+        Ok(self.run_bucket_script(task_type, 0).await?.remaining)
     }
 
     async fn time_until_next_token(&self, task_type: &str) -> Result<Duration> {
-        let available = self.available_tokens(task_type).await?;
-
-        if available >= self.config.capacity {
-            return Ok(Duration::from_secs(0));
+        // Ask the bucket what a one-token request would have to wait for,
+        // without consuming anything.
+        let outcome = self.run_bucket_script(task_type, 0).await?;
+        if outcome.remaining >= 1 {
+            return Ok(Duration::ZERO);
         }
-
-        // Calculate time needed to refill one token
-        let time_per_token = 1.0 / self.config.refill_rate;
-        let secs = time_per_token.ceil() as u64;
-
-        Ok(Duration::from_secs(secs))
+        Ok(time_to_accumulate(
+            1,
+            outcome.remaining,
+            self.config.refill_rate,
+        ))
     }
 
     async fn reset(&self, task_type: &str) -> Result<()> {
@@ -434,17 +582,12 @@ impl DistributedRateLimiterTrait for DistributedRateLimiter {
     }
 }
 
-/// In-memory distributed rate limiter (for testing without Redis)
+/// In-memory distributed rate limiter (single-process; also used to exercise
+/// the bucket algorithm without a Redis server)
 pub struct InMemoryDistributedRateLimiter {
     config: DistributedRateLimitConfig,
     buckets: Arc<RwLock<HashMap<String, TokenBucket>>>,
     stats: Arc<RwLock<HashMap<String, RateLimitStats>>>,
-}
-
-#[derive(Debug, Clone)]
-struct TokenBucket {
-    tokens: u64,
-    last_refill: f64,
 }
 
 impl InMemoryDistributedRateLimiter {
@@ -457,28 +600,22 @@ impl InMemoryDistributedRateLimiter {
         }
     }
 
-    /// Refill tokens for a task type
-    async fn refill_tokens(&self, task_type: &str) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_secs_f64();
+    /// Refill and (when `cost > 0`) consume, under a single write lock.
+    ///
+    /// Holding the lock across the whole read-modify-write is what makes this
+    /// a limiter: releasing it between the refill and the decrement would let
+    /// two callers that each observed one available token both consume it —
+    /// over-granting, and underflowing the balance.
+    async fn acquire(&self, task_type: &str, cost: u64) -> AcquireOutcome {
+        let now = now_secs();
+        let capacity = self.config.capacity;
+        let rate = self.config.refill_rate;
 
         let mut buckets = self.buckets.write().await;
-        let bucket = buckets.entry(task_type.to_string()).or_insert(TokenBucket {
-            tokens: self.config.capacity,
-            last_refill: now,
-        });
-
-        let elapsed = now - bucket.last_refill;
-        let tokens_to_add = (elapsed * self.config.refill_rate).floor() as u64;
-
-        if tokens_to_add > 0 {
-            bucket.tokens = (bucket.tokens + tokens_to_add).min(self.config.capacity);
-            bucket.last_refill = now;
-        }
-
-        bucket.tokens
+        let bucket = buckets
+            .entry(task_type.to_string())
+            .or_insert_with(|| TokenBucket::new(capacity, now));
+        bucket.try_consume(capacity, rate, now, cost)
     }
 
     /// Update statistics
@@ -506,38 +643,19 @@ impl DistributedRateLimiterTrait for InMemoryDistributedRateLimiter {
             return Ok(true);
         }
 
-        let available = self.refill_tokens(task_type).await;
-
-        if available >= tokens {
-            let mut buckets = self.buckets.write().await;
-            if let Some(bucket) = buckets.get_mut(task_type) {
-                bucket.tokens -= tokens;
-                self.update_stats(task_type, true, bucket.tokens).await;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        } else {
-            self.update_stats(task_type, false, available).await;
-            Ok(false)
-        }
+        let outcome = self.acquire(task_type, tokens).await;
+        self.update_stats(task_type, outcome.allowed, outcome.remaining)
+            .await;
+        Ok(outcome.allowed)
     }
 
     async fn available_tokens(&self, task_type: &str) -> Result<u64> {
-        Ok(self.refill_tokens(task_type).await)
+        Ok(self.acquire(task_type, 0).await.remaining)
     }
 
     async fn time_until_next_token(&self, task_type: &str) -> Result<Duration> {
-        let available = self.available_tokens(task_type).await?;
-
-        if available >= self.config.capacity {
-            return Ok(Duration::from_secs(0));
-        }
-
-        let time_per_token = 1.0 / self.config.refill_rate;
-        let secs = time_per_token.ceil() as u64;
-
-        Ok(Duration::from_secs(secs))
+        let available = self.acquire(task_type, 0).await.remaining;
+        Ok(time_to_accumulate(1, available, self.config.refill_rate))
     }
 
     async fn reset(&self, task_type: &str) -> Result<()> {
@@ -633,5 +751,183 @@ mod tests {
         // Should have full capacity again
         let available = limiter.available_tokens("test_task").await.unwrap();
         assert_eq!(available, 10);
+    }
+
+    // --- Regression tests for the non-atomic bucket (idx 164) ---
+
+    /// The audit's headline scenario: a burst budget of exactly one permit
+    /// contended by many concurrent callers must grant exactly one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_burst_of_one_grants_exactly_one_permit() {
+        let config = DistributedRateLimitConfig::default()
+            .with_capacity(1)
+            // Slow enough that no token can be credited while the test runs.
+            .with_refill_rate(1e-9);
+        let limiter = Arc::new(InMemoryDistributedRateLimiter::new(config));
+
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let limiter = Arc::clone(&limiter);
+            handles.push(tokio::spawn(async move {
+                limiter
+                    .try_acquire("burst", 1)
+                    .await
+                    .expect("in-memory limiter never fails")
+            }));
+        }
+
+        let mut granted = 0;
+        for handle in handles {
+            if handle.await.expect("task should not panic") {
+                granted += 1;
+            }
+        }
+
+        assert_eq!(
+            granted, 1,
+            "a one-permit bucket must grant exactly one permit under contention"
+        );
+        assert_eq!(limiter.available_tokens("burst").await.unwrap(), 0);
+
+        let stats = limiter.get_stats("burst").await.unwrap();
+        assert_eq!(stats.total_requests, 64);
+        assert_eq!(stats.allowed_requests, 1);
+        assert_eq!(stats.rejected_requests, 63);
+    }
+
+    /// Before the fix the consume step subtracted without re-checking the
+    /// balance, so contention could underflow the `u64` token count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_contention_never_underflows_the_balance() {
+        let config = DistributedRateLimitConfig::default()
+            .with_capacity(4)
+            .with_refill_rate(1e-9);
+        let limiter = Arc::new(InMemoryDistributedRateLimiter::new(config));
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let limiter = Arc::clone(&limiter);
+            handles.push(tokio::spawn(async move {
+                limiter.try_acquire("underflow", 2).await.unwrap_or(false)
+            }));
+        }
+
+        let mut granted = 0;
+        for handle in handles {
+            if handle.await.expect("task should not panic") {
+                granted += 1;
+            }
+        }
+
+        assert_eq!(granted, 2, "capacity 4 with cost 2 must grant twice");
+        assert_eq!(limiter.available_tokens("underflow").await.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_bucket_does_not_lose_fractional_refill() {
+        // 1 token/second polled every 100ms: flooring each poll to whole
+        // tokens *and* advancing the timestamp would credit nothing, ever.
+        let mut bucket = TokenBucket {
+            tokens: 0.0,
+            last_refill: 0.0,
+        };
+
+        for step in 1..=10 {
+            bucket.refill(10, 1.0, step as f64 * 0.1);
+        }
+
+        assert!(
+            (bucket.tokens - 1.0).abs() < 1e-9,
+            "expected ~1 token after 1s at 1 token/s, got {}",
+            bucket.tokens
+        );
+    }
+
+    #[test]
+    fn test_bucket_caps_at_capacity_and_ignores_backwards_clock() {
+        let mut bucket = TokenBucket {
+            tokens: 0.0,
+            last_refill: 100.0,
+        };
+
+        // A worker whose clock is behind must not mint tokens.
+        bucket.refill(5, 10.0, 90.0);
+        assert_eq!(bucket.tokens, 0.0);
+        assert_eq!(bucket.last_refill, 100.0);
+
+        // A long idle period saturates at capacity, never beyond.
+        bucket.refill(5, 10.0, 1_000.0);
+        assert_eq!(bucket.tokens, 5.0);
+    }
+
+    #[test]
+    fn test_bucket_reports_retry_after_when_empty() {
+        let mut bucket = TokenBucket {
+            tokens: 0.0,
+            last_refill: 0.0,
+        };
+
+        let outcome = bucket.try_consume(10, 2.0, 0.0, 1);
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.remaining, 0);
+        // 1 token at 2 tokens/second == 500ms.
+        assert_eq!(outcome.retry_after, Duration::from_millis(500));
+
+        // Zero refill rate means "never".
+        let mut stalled = TokenBucket {
+            tokens: 0.0,
+            last_refill: 0.0,
+        };
+        assert_eq!(
+            stalled.try_consume(10, 0.0, 0.0, 1).retry_after,
+            Duration::MAX
+        );
+    }
+
+    #[test]
+    fn test_time_to_accumulate() {
+        assert_eq!(time_to_accumulate(1, 5, 1.0), Duration::ZERO);
+        assert_eq!(time_to_accumulate(4, 2, 1.0), Duration::from_secs(2));
+        assert_eq!(time_to_accumulate(1, 0, 0.0), Duration::MAX);
+    }
+
+    /// Exercises the Lua script against a real server when one is offered
+    /// through `CELERS_TEST_REDIS_URL`; skipped otherwise so the suite stays
+    /// hermetic.
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn test_redis_script_is_atomic_when_a_server_is_available() {
+        let Ok(url) = std::env::var("CELERS_TEST_REDIS_URL") else {
+            return;
+        };
+
+        let prefix = format!("celers:test:rate_limit:{}", uuid::Uuid::new_v4());
+        let config = DistributedRateLimitConfig::new(url)
+            .with_capacity(1)
+            .with_refill_rate(1e-9)
+            .with_key_prefix(prefix);
+
+        let Ok(limiter) = DistributedRateLimiter::new(config).await else {
+            return;
+        };
+        let limiter = Arc::new(limiter);
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let limiter = Arc::clone(&limiter);
+            handles.push(tokio::spawn(async move {
+                limiter.try_acquire("burst", 1).await.unwrap_or(false)
+            }));
+        }
+
+        let mut granted = 0;
+        for handle in handles {
+            if handle.await.expect("task should not panic") {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 1);
+
+        limiter.reset("burst").await.expect("reset should succeed");
     }
 }

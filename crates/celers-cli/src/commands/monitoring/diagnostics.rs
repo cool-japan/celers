@@ -3,10 +3,66 @@
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
 use super::super::task::inspect_task;
+use super::report::scan_worker_heartbeat_keys;
 use celers_broker_redis::RedisBroker;
 use celers_core::Broker;
 use colored::Colorize;
 use tabled::{settings::Style, Table, Tabled};
+
+/// Broker memory usage (as a percentage of `maxmemory`) at or above which
+/// `doctor` reports a critical issue rather than a mere warning.
+const DOCTOR_MEMORY_CRITICAL_PCT: f64 = 90.0;
+
+/// Broker memory usage (as a percentage of `maxmemory`) at or above which
+/// `doctor` reports a warning.
+const DOCTOR_MEMORY_WARNING_PCT: f64 = 75.0;
+
+/// Pure: classify a `used_memory` / `maxmemory` (bytes) pair into a
+/// doctor verdict.
+///
+/// Extracted from `doctor`'s memory check so the threshold arithmetic is
+/// unit-testable without a broker. `maxmemory == 0` is Redis's convention
+/// for "no configured limit" -- there is nothing to verify usage against,
+/// which is a distinct outcome from both "healthy" and "critical" and must
+/// not be silently reported as either.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MemoryVerdict {
+    /// No `maxmemory` ceiling is configured; usage cannot be evaluated
+    /// against a limit.
+    Unbounded,
+    /// Below the warning threshold.
+    Acceptable { pct_of_max: f64 },
+    /// At or above the warning threshold but below critical.
+    Warning { pct_of_max: f64 },
+    /// At or above the critical threshold.
+    Critical { pct_of_max: f64 },
+}
+
+#[must_use]
+fn classify_memory_usage(used_memory_bytes: u64, max_memory_bytes: u64) -> MemoryVerdict {
+    if max_memory_bytes == 0 {
+        return MemoryVerdict::Unbounded;
+    }
+    let pct_of_max = (used_memory_bytes as f64 / max_memory_bytes as f64) * 100.0;
+    if pct_of_max >= DOCTOR_MEMORY_CRITICAL_PCT {
+        MemoryVerdict::Critical { pct_of_max }
+    } else if pct_of_max >= DOCTOR_MEMORY_WARNING_PCT {
+        MemoryVerdict::Warning { pct_of_max }
+    } else {
+        MemoryVerdict::Acceptable { pct_of_max }
+    }
+}
+
+/// Pure: parse the `used_memory:`/`maxmemory:` byte counters out of a Redis
+/// `INFO memory` payload. Returns `None` for a field that is missing or
+/// unparseable rather than guessing.
+#[must_use]
+fn parse_memory_bytes(info: &str, field: &str) -> Option<u64> {
+    let prefix = format!("{field}:");
+    info.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
 
 /// Run system health diagnostics
 pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
@@ -344,7 +400,54 @@ pub async fn doctor(broker_url: &str, queue: &str) -> anyhow::Result<()> {
                     }
                 }
             }
-            println!("  {} Memory usage is acceptable", "✓".green());
+
+            // Compute the verdict for real instead of printing a canned
+            // "acceptable" after any successful INFO call.
+            match (
+                parse_memory_bytes(&info, "used_memory"),
+                parse_memory_bytes(&info, "maxmemory"),
+            ) {
+                (Some(used), Some(max)) => match classify_memory_usage(used, max) {
+                    MemoryVerdict::Unbounded => {
+                        println!(
+                            "  {} No maxmemory configured; usage cannot be verified against a limit",
+                            "ℹ".cyan()
+                        );
+                    }
+                    MemoryVerdict::Acceptable { pct_of_max } => {
+                        println!(
+                            "  {} Memory usage is acceptable ({pct_of_max:.1}% of maxmemory)",
+                            "✓".green()
+                        );
+                    }
+                    MemoryVerdict::Warning { pct_of_max } => {
+                        warnings.push(format!(
+                            "Broker memory usage is high: {pct_of_max:.1}% of maxmemory"
+                        ));
+                        println!(
+                            "  {} Memory usage is high ({pct_of_max:.1}% of maxmemory)",
+                            "⚠".yellow()
+                        );
+                    }
+                    MemoryVerdict::Critical { pct_of_max } => {
+                        issues.push(format!(
+                            "Broker memory usage is critical: {pct_of_max:.1}% of maxmemory"
+                        ));
+                        recommendations
+                            .push("Increase maxmemory or evict/trim old data".to_string());
+                        println!(
+                            "  {} Memory usage is critical ({pct_of_max:.1}% of maxmemory)",
+                            "✗".red()
+                        );
+                    }
+                },
+                _ => {
+                    println!(
+                        "  {} Could not parse used_memory/maxmemory from broker INFO output",
+                        "⚠".yellow()
+                    );
+                }
+            }
         }
         Err(_) => {
             println!("  {} Memory info unavailable", "⚠".yellow());
@@ -401,6 +504,18 @@ pub async fn doctor(broker_url: &str, queue: &str) -> anyhow::Result<()> {
                     .bold()
             );
         }
+    }
+
+    // `doctor` must agree with its sibling `health_check` (which already
+    // returns `Err` on critical issues, see above): a command meant to gate
+    // CI/monitoring is useless if it always exits 0 regardless of what it
+    // found. Warnings alone still exit 0 (matching `health_check`).
+    if !issues.is_empty() {
+        anyhow::bail!(
+            "doctor detected {} critical issue(s): {}",
+            issues.len(),
+            issues.join("; ")
+        );
     }
 
     Ok(())
@@ -730,10 +845,7 @@ pub async fn analyze_bottlenecks(broker_url: &str, queue: &str) -> anyhow::Resul
         _ => 0,
     };
 
-    let worker_keys: Vec<String> = redis::cmd("KEYS")
-        .arg("celers:worker:*:heartbeat")
-        .query_async(&mut conn)
-        .await?;
+    let worker_keys = scan_worker_heartbeat_keys(&mut conn).await?;
     let worker_count = worker_keys.len();
 
     let dlq_key = format!("celers:{queue}:dlq");
@@ -910,32 +1022,38 @@ pub async fn worker_logs(
     println!("{}", "=== Following logs (Ctrl+C to stop) ===".dimmed());
     println!();
 
-    let mut last_length: isize = redis::cmd("LLEN")
+    // Content-based tail tracking rather than an absolute `LLEN` index:
+    // `celers:worker:{id}:logs` is trimmed in practice (bounded log lists),
+    // and once a trim shrinks the list, `current_length` can drop below a
+    // remembered `last_length` -- the old index-based check
+    // (`current_length > last_length`) then stays false forever (or, after
+    // the list grows back past the old length, resumes reading from a
+    // now-stale/wrong index). Re-fetching a bounded tail window each poll
+    // and diffing it by content (`LogTailState::advance`) is robust to
+    // trims in either direction and never requires a worker-side change.
+    let mut tail_state = LogTailState::default();
+    let seed_window: Vec<String> = redis::cmd("LRANGE")
         .arg(&logs_key)
+        .arg(-(FOLLOW_TAIL_WINDOW as isize))
+        .arg(-1)
         .query_async(&mut conn)
         .await?;
+    // Seed silently: `seed_window` overlaps what the initial dump above
+    // already printed, so it must not be re-emitted as "new".
+    tail_state.advance(seed_window);
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        let current_length: isize = redis::cmd("LLEN")
+        let fresh_window: Vec<String> = redis::cmd("LRANGE")
             .arg(&logs_key)
+            .arg(-(FOLLOW_TAIL_WINDOW as isize))
+            .arg(-1)
             .query_async(&mut conn)
             .await?;
 
-        if current_length > last_length {
-            let new_logs: Vec<String> = redis::cmd("LRANGE")
-                .arg(&logs_key)
-                .arg(last_length)
-                .arg(-1)
-                .query_async(&mut conn)
-                .await?;
-
-            for log in &new_logs {
-                display_log_line(log, level_filter);
-            }
-
-            last_length = current_length;
+        for log in tail_state.advance(fresh_window) {
+            display_log_line(&log, level_filter);
         }
 
         let still_exists: bool = redis::cmd("EXISTS")
@@ -951,6 +1069,66 @@ pub async fn worker_logs(
     }
 
     Ok(())
+}
+
+/// Tail window size used to poll `celers:worker:{id}:logs` in follow mode
+/// (see [`LogTailState`]). Large enough to give
+/// [`LogTailState::advance`] a comfortable overlap margin against a
+/// moderate trim between two 500ms polls, small enough to keep each poll
+/// cheap.
+const FOLLOW_TAIL_WINDOW: usize = 200;
+
+/// Sliding-window tail state for `worker_logs --follow`.
+///
+/// Rather than trusting a remembered `LLEN` as an absolute read offset
+/// (broken by list trims -- see [`worker_logs`]'s doc comment above), each
+/// poll re-fetches the list's last `N` entries and this pure diff decides
+/// which of them are new since the previous poll, by content rather than
+/// by index.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LogTailState {
+    /// The most recently fetched tail window, oldest first (as returned by
+    /// `LRANGE logs_key -N -1`).
+    last_window: Vec<String>,
+}
+
+impl LogTailState {
+    /// Given a freshly fetched tail window (oldest first), return the
+    /// entries that are new since the previous call, in order, and update
+    /// the internal state to `fresh_window`.
+    ///
+    /// Because both the previous and fresh windows are suffixes of the same
+    /// append-mostly list, any entry present in both keeps its relative
+    /// order: the longest suffix of the previous window that reappears as a
+    /// prefix of the fresh window marks how much "carries over"; everything
+    /// in the fresh window after that point is new. If no overlap is found
+    /// at all (a burst larger than the window, or the list was cleared),
+    /// the entire fresh window is treated as new -- over-printing a few
+    /// entries again is far less harmful than the original bug (going
+    /// silent forever after a trim).
+    fn advance(&mut self, fresh_window: Vec<String>) -> Vec<String> {
+        let new_entries = match find_overlap_start(&self.last_window, &fresh_window) {
+            Some(overlap_start) => fresh_window[overlap_start..].to_vec(),
+            None => fresh_window.clone(),
+        };
+        self.last_window = fresh_window;
+        new_entries
+    }
+}
+
+/// Pure: find the index in `fresh` at which `previous`'s tail stops
+/// overlapping, i.e. the length of the longest suffix of `previous` that
+/// equals a prefix of `fresh`. Returns `None` when there is no overlap at
+/// all (including when `previous` is empty).
+#[must_use]
+fn find_overlap_start(previous: &[String], fresh: &[String]) -> Option<usize> {
+    let max_overlap = previous.len().min(fresh.len());
+    for overlap in (1..=max_overlap).rev() {
+        if previous[previous.len() - overlap..] == fresh[..overlap] {
+            return Some(overlap);
+        }
+    }
+    None
 }
 
 /// Helper function to display a log line with optional filtering
@@ -985,5 +1163,181 @@ fn display_log_line(log: &str, level_filter: Option<&str>) {
         println!("[{}] {} {}", timestamp.dimmed(), level_colored, message);
     } else if level_filter.is_none() {
         println!("{log}");
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    // ---- parse_memory_bytes ------------------------------------------------
+
+    #[test]
+    fn parse_memory_bytes_extracts_known_fields() {
+        let info = "\
+# Memory
+used_memory:1048576
+used_memory_human:1.00M
+maxmemory:10485760
+maxmemory_human:10.00M
+";
+        assert_eq!(parse_memory_bytes(info, "used_memory"), Some(1_048_576));
+        assert_eq!(parse_memory_bytes(info, "maxmemory"), Some(10_485_760));
+    }
+
+    #[test]
+    fn parse_memory_bytes_missing_field_is_none() {
+        let info = "used_memory:1024\n";
+        assert_eq!(parse_memory_bytes(info, "maxmemory"), None);
+    }
+
+    #[test]
+    fn parse_memory_bytes_does_not_match_human_variant() {
+        // `used_memory_human:` must not be mistaken for `used_memory:`.
+        let info = "used_memory_human:1.00M\n";
+        assert_eq!(parse_memory_bytes(info, "used_memory"), None);
+    }
+
+    #[test]
+    fn parse_memory_bytes_rejects_unparseable_value() {
+        let info = "used_memory:not-a-number\n";
+        assert_eq!(parse_memory_bytes(info, "used_memory"), None);
+    }
+
+    // ---- classify_memory_usage ----------------------------------------------
+
+    #[test]
+    fn classify_memory_zero_maxmemory_is_unbounded() {
+        assert_eq!(
+            classify_memory_usage(999_999_999, 0),
+            MemoryVerdict::Unbounded
+        );
+    }
+
+    #[test]
+    fn classify_memory_low_usage_is_acceptable() {
+        let verdict = classify_memory_usage(10, 1000); // 1%
+        assert!(matches!(verdict, MemoryVerdict::Acceptable { .. }));
+    }
+
+    #[test]
+    fn classify_memory_at_warning_threshold() {
+        let verdict = classify_memory_usage(750, 1000); // 75%
+        assert!(matches!(verdict, MemoryVerdict::Warning { .. }));
+    }
+
+    #[test]
+    fn classify_memory_just_below_warning_is_acceptable() {
+        let verdict = classify_memory_usage(749, 1000); // 74.9%
+        assert!(matches!(verdict, MemoryVerdict::Acceptable { .. }));
+    }
+
+    #[test]
+    fn classify_memory_at_critical_threshold() {
+        let verdict = classify_memory_usage(900, 1000); // 90%
+        assert!(matches!(verdict, MemoryVerdict::Critical { .. }));
+    }
+
+    #[test]
+    fn classify_memory_over_capacity_is_critical() {
+        let verdict = classify_memory_usage(2000, 1000); // 200%
+        match verdict {
+            MemoryVerdict::Critical { pct_of_max } => assert!((pct_of_max - 200.0).abs() < 1e-9),
+            other => panic!("expected Critical, got {other:?}"),
+        }
+    }
+
+    // ---- LogTailState / find_overlap_start -----------------------------------
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn overlap_start_finds_full_previous_as_prefix_of_fresh() {
+        let previous = s(&["a", "b", "c"]);
+        let fresh = s(&["a", "b", "c", "d", "e"]);
+        assert_eq!(find_overlap_start(&previous, &fresh), Some(3));
+    }
+
+    #[test]
+    fn overlap_start_finds_partial_suffix_after_shrink() {
+        // Only "b", "c" of `previous` survived (e.g. "a" aged/trimmed out),
+        // and one new entry "d" was appended.
+        let previous = s(&["a", "b", "c"]);
+        let fresh = s(&["b", "c", "d"]);
+        assert_eq!(find_overlap_start(&previous, &fresh), Some(2));
+    }
+
+    #[test]
+    fn overlap_start_none_when_previous_empty() {
+        let previous: Vec<String> = Vec::new();
+        let fresh = s(&["a", "b"]);
+        assert_eq!(find_overlap_start(&previous, &fresh), None);
+    }
+
+    #[test]
+    fn overlap_start_none_when_disjoint() {
+        let previous = s(&["a", "b", "c"]);
+        let fresh = s(&["x", "y", "z"]);
+        assert_eq!(find_overlap_start(&previous, &fresh), None);
+    }
+
+    #[test]
+    fn log_tail_state_first_advance_yields_nothing_when_used_as_seed() {
+        // The real call site discards the first `advance`'s return value
+        // (it duplicates what the pre-follow dump already printed); confirm
+        // that after seeding, a no-op poll reports no new entries.
+        let mut state = LogTailState::default();
+        let seed = s(&["l1", "l2", "l3"]);
+        let _ = state.advance(seed.clone());
+
+        let unchanged = state.advance(seed);
+        assert!(unchanged.is_empty());
+    }
+
+    #[test]
+    fn log_tail_state_reports_only_appended_entries() {
+        let mut state = LogTailState::default();
+        let _ = state.advance(s(&["l1", "l2", "l3"]));
+
+        let new_entries = state.advance(s(&["l1", "l2", "l3", "l4", "l5"]));
+        assert_eq!(new_entries, s(&["l4", "l5"]));
+    }
+
+    #[test]
+    fn log_tail_state_survives_a_trim_that_shrinks_the_window() {
+        // This is the exact scenario that broke the old `LLEN`-index-based
+        // tracker: the list is trimmed (shrinks) between polls, so an
+        // absolute length comparison would see `current_length < last_length`
+        // and stop emitting new lines -- potentially forever.
+        let mut state = LogTailState::default();
+        let _ = state.advance(s(&["l1", "l2", "l3", "l4", "l5"]));
+
+        // Trimmed to the last 2 entries, then one new entry appended.
+        let new_entries = state.advance(s(&["l4", "l5", "l6"]));
+        assert_eq!(new_entries, s(&["l6"]));
+    }
+
+    #[test]
+    fn log_tail_state_treats_total_replacement_as_all_new() {
+        // A burst bigger than the tracked window (or the list being
+        // cleared and refilled): no overlap is found, so the whole fresh
+        // window is reported. Over-printing a few lines is far less
+        // harmful than the original "goes silent forever" bug.
+        let mut state = LogTailState::default();
+        let _ = state.advance(s(&["l1", "l2", "l3"]));
+
+        let new_entries = state.advance(s(&["l100", "l101", "l102"]));
+        assert_eq!(new_entries, s(&["l100", "l101", "l102"]));
+    }
+
+    #[test]
+    fn log_tail_state_no_change_reports_nothing() {
+        let mut state = LogTailState::default();
+        let window = s(&["l1", "l2"]);
+        let _ = state.advance(window.clone());
+
+        assert!(state.advance(window).is_empty());
     }
 }

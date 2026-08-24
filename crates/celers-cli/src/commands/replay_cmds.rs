@@ -222,6 +222,10 @@ pub fn plan_replay(
 /// Render a human-readable summary of a replay plan to stdout.
 ///
 /// Used by both the dry-run and live paths so the printed plan is identical.
+/// Only the first and last few entries are listed for large plans (a scan
+/// window can hold up to [`DEFAULT_SCAN_LIMIT`] entries, which at one 4-line
+/// block per task would otherwise print thousands of lines) to keep output
+/// manageable; the full count and matched/limited summary are always shown.
 fn print_plan(plan: &ReplayPlan, dry_run: bool) {
     let header = if dry_run {
         "=== Replay Plan (dry run) ===".bold().cyan()
@@ -236,11 +240,30 @@ fn print_plan(plan: &ReplayPlan, dry_run: bool) {
         return;
     }
 
-    for (idx, entry) in plan.entries.iter().enumerate() {
+    // Show at most this many leading and trailing entries.
+    const PREVIEW: usize = 5;
+    let n = plan.entries.len();
+    let show_all = n <= PREVIEW * 2;
+
+    let print_entry = |idx: usize, entry: &ReplayCandidate| {
         println!("{}", format!("Task #{}", idx + 1).bold());
         println!("  ID: {}", entry.id.to_string().cyan());
         println!("  Name: {}", entry.name.yellow());
         println!("  DLQ position: {}", entry.dlq_index);
+    };
+
+    if show_all {
+        for (idx, entry) in plan.entries.iter().enumerate() {
+            print_entry(idx, entry);
+        }
+    } else {
+        for (idx, entry) in plan.entries[..PREVIEW].iter().enumerate() {
+            print_entry(idx, entry);
+        }
+        println!("  {}", format!("... {} more ...", n - PREVIEW * 2).dimmed());
+        for (idx, entry) in plan.entries[n - PREVIEW..].iter().enumerate() {
+            print_entry(n - PREVIEW + idx, entry);
+        }
     }
 
     println!();
@@ -327,8 +350,21 @@ pub async fn replay_dlq(
         return Ok(());
     }
 
+    // `--all` (no dry-run) drains the whole DLQ across as many
+    // `DEFAULT_SCAN_LIMIT`-sized batches as it takes, rather than silently
+    // considering only the first scan window: each replayed batch removes
+    // its entries from the DLQ, so the next `inspect_dlq` call naturally
+    // reveals what was previously hidden behind it. `--pattern`/`--id` (and
+    // `--all --dry-run`, which cannot "drain" anything without mutating)
+    // stay single-window below, with an explicit truncation warning instead
+    // of pretending the window was the whole DLQ.
+    if matches!(filter, ReplayFilter::All) && !dry_run {
+        return replay_all_draining(&broker, dlq_size, limit).await;
+    }
+
     // Thin broker read: pull DLQ entries, then hand off to the pure planner.
     let tasks = broker.inspect_dlq(DEFAULT_SCAN_LIMIT).await?;
+    let scan_window = tasks.len();
     let candidates: Vec<ReplayCandidate> = tasks
         .iter()
         .enumerate()
@@ -337,6 +373,31 @@ pub async fn replay_dlq(
 
     let plan = plan_replay(&candidates, filter, limit);
 
+    if dlq_size > scan_window {
+        println!(
+            "{}",
+            format!(
+                "⚠ Note: scanning first {scan_window} of {dlq_size} DLQ entries; \
+                 matches beyond this window were not considered."
+            )
+            .yellow()
+        );
+        if matches!(filter, ReplayFilter::All) {
+            // Only reachable for `--all --dry-run` (the live `--all` path
+            // returned via `replay_all_draining` above).
+            println!(
+                "{}",
+                "  This dry-run preview covers one scan window; drop --dry-run to drain the full DLQ across multiple batches."
+                    .dimmed()
+            );
+        } else {
+            println!(
+                "{}",
+                "  Re-run after this batch completes to reach the rest.".dimmed()
+            );
+        }
+    }
+
     print_plan(&plan, dry_run);
 
     if dry_run || plan.is_empty() {
@@ -344,14 +405,28 @@ pub async fn replay_dlq(
     }
 
     println!();
+    let (replayed, missing) = execute_replay_plan(&broker, &plan).await?;
+    print_replay_summary(replayed, missing);
+
+    Ok(())
+}
+
+/// Re-enqueue every candidate in `plan` via `broker.replay_from_dlq`.
+///
+/// Returns `(replayed_count, missing_count)`; `missing` counts tasks that
+/// vanished between scan and replay (e.g. a concurrent operation drained
+/// them) -- reported to the operator but not treated as a hard failure,
+/// matching the pre-existing single-window behaviour.
+async fn execute_replay_plan(
+    broker: &RedisBroker,
+    plan: &ReplayPlan,
+) -> anyhow::Result<(usize, usize)> {
     let mut replayed = 0usize;
     let mut missing = 0usize;
     for entry in &plan.entries {
         if broker.replay_from_dlq(&entry.id).await? {
             replayed += 1;
         } else {
-            // The task vanished between scan and replay (e.g. a concurrent
-            // operation drained it). Report it but keep going.
             missing += 1;
             println!(
                 "{}",
@@ -359,7 +434,10 @@ pub async fn replay_dlq(
             );
         }
     }
+    Ok((replayed, missing))
+}
 
+fn print_replay_summary(replayed: usize, missing: usize) {
     println!(
         "{}",
         format!("✓ Replayed {replayed} task(s) from DLQ")
@@ -373,6 +451,88 @@ pub async fn replay_dlq(
         );
     }
     println!("  Replayed tasks will be processed again by workers");
+}
+
+/// Pure: how many more replays the next batch may perform, given the
+/// overall `limit` (`None` = unlimited) and how many have already been
+/// replayed across earlier batches.
+///
+/// Extracted from [`replay_all_draining`]'s loop so the limit-across-batches
+/// arithmetic is unit-testable without a live broker (the accompanying
+/// `replay_all_drains_beyond_one_scan_window` live-broker test already
+/// covers the unlimited/full-drain path end-to-end at real scale; this
+/// covers the `--limit` interaction cheaply).
+#[must_use]
+fn next_batch_limit(limit: Option<usize>, total_replayed: usize) -> Option<usize> {
+    limit.map(|l| l.saturating_sub(total_replayed))
+}
+
+/// Drive `celers replay --all` (without `--dry-run`) to completion: scan and
+/// replay batches of up to [`DEFAULT_SCAN_LIMIT`] DLQ entries repeatedly
+/// until the DLQ is drained, the optional `limit` is reached, or a batch
+/// makes no forward progress (a safety stop against spinning forever on a
+/// DLQ that is being refilled at least as fast as it drains).
+async fn replay_all_draining(
+    broker: &RedisBroker,
+    initial_dlq_size: usize,
+    limit: Option<usize>,
+) -> anyhow::Result<()> {
+    println!("{}", "=== Replaying Tasks from DLQ ===".bold().cyan());
+    println!();
+    println!(
+        "{}",
+        format!("Draining up to {initial_dlq_size} DLQ entry/entries in batches of {DEFAULT_SCAN_LIMIT}...")
+            .dimmed()
+    );
+    println!();
+
+    let mut total_replayed = 0usize;
+    let mut total_missing = 0usize;
+    let mut batch_no = 0usize;
+
+    loop {
+        let remaining_limit = next_batch_limit(limit, total_replayed);
+        if remaining_limit == Some(0) {
+            break;
+        }
+
+        let tasks = broker.inspect_dlq(DEFAULT_SCAN_LIMIT).await?;
+        if tasks.is_empty() {
+            break;
+        }
+
+        let candidates: Vec<ReplayCandidate> = tasks
+            .iter()
+            .enumerate()
+            .map(|(idx, task)| ReplayCandidate::from_serialized(task, idx))
+            .collect();
+        let plan = plan_replay(&candidates, &ReplayFilter::All, remaining_limit);
+
+        if plan.is_empty() {
+            // `--all` matches every scanned candidate, so this only happens
+            // when `remaining_limit` is 0 (already handled above) -- kept
+            // as an explicit guard so this loop always terminates.
+            break;
+        }
+
+        batch_no += 1;
+        println!(
+            "{}",
+            format!("Batch {batch_no}: replaying {} task(s)...", plan.len()).cyan()
+        );
+        let (replayed, missing) = execute_replay_plan(broker, &plan).await?;
+        total_replayed += replayed;
+        total_missing += missing;
+
+        if replayed == 0 {
+            // No progress this batch (every candidate had already
+            // vanished) -- stop rather than spin.
+            break;
+        }
+    }
+
+    println!();
+    print_replay_summary(total_replayed, total_missing);
 
     Ok(())
 }
@@ -380,6 +540,10 @@ pub async fn replay_dlq(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only needed by the live-broker tests below (`broker.queue_size()`,
+    // `dlq_size`/`inspect_dlq`/`replay_from_dlq` are `RedisBroker` inherent
+    // methods and do not need this import).
+    use celers_core::Broker as _;
 
     fn candidate(id: Uuid, name: &str, dlq_index: usize) -> ReplayCandidate {
         ReplayCandidate {
@@ -666,5 +830,109 @@ mod tests {
         assert_eq!(plan.matched, 0);
         assert_eq!(plan.limit, None);
         assert!(!plan.truncated());
+    }
+
+    // ---- live-broker regression tests (idx 333) -------------------------
+    //
+    // Local Redis used by this module's live-broker regression tests, same
+    // convention as `commands::task`'s. Every test scopes its own queue
+    // name with a fresh UUID so concurrent test runs never collide.
+    const TEST_BROKER_URL: &str = "redis://127.0.0.1:6379";
+
+    fn raw_task(id: Uuid, name: &str) -> String {
+        let mut task = SerializedTask::new(name.to_string(), Vec::new());
+        task.metadata.id = id;
+        serde_json::to_string(&task).expect("SerializedTask always serializes")
+    }
+
+    /// Seed `count` raw DLQ entries directly (bypassing broker enqueue) so
+    /// the DLQ starts out larger than [`DEFAULT_SCAN_LIMIT`].
+    async fn seed_dlq(conn: &mut redis::aio::MultiplexedConnection, queue: &str, count: usize) {
+        let dlq_key = crate::keys::dlq(queue);
+        for i in 0..count {
+            let task_json = raw_task(Uuid::new_v4(), &format!("seed-task-{i}"));
+            let _: i64 = redis::cmd("RPUSH")
+                .arg(&dlq_key)
+                .arg(&task_json)
+                .query_async(conn)
+                .await
+                .expect("seed dlq entry");
+        }
+    }
+
+    /// Regression test for idx 333: `celers replay --all` used to read
+    /// exactly `DEFAULT_SCAN_LIMIT` (1000) DLQ entries and stop there,
+    /// printing "Replayed 1000 task(s)" even when far more remained.
+    /// Seeds a DLQ with more than one scan window's worth of entries and
+    /// confirms `--all` drains it completely, across multiple batches.
+    #[tokio::test]
+    async fn replay_all_drains_beyond_one_scan_window() {
+        let queue_name = format!("test-replay-all-drain-{}", Uuid::new_v4());
+        let total_entries = DEFAULT_SCAN_LIMIT as usize + 5;
+
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("conn");
+        seed_dlq(&mut conn, &queue_name, total_entries).await;
+
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+        assert_eq!(
+            broker.dlq_size().await.expect("dlq_size before"),
+            total_entries
+        );
+
+        replay_dlq(
+            TEST_BROKER_URL,
+            &queue_name,
+            &ReplayFilter::All,
+            None,
+            false,
+        )
+        .await
+        .expect("replay_dlq --all");
+
+        assert_eq!(
+            broker.dlq_size().await.expect("dlq_size after"),
+            0,
+            "--all must drain the entire DLQ across batches, not just the first \
+             DEFAULT_SCAN_LIMIT entries"
+        );
+        assert_eq!(
+            broker.queue_size().await.expect("queue_size after"),
+            total_entries,
+            "every drained task must have been re-enqueued onto the main queue"
+        );
+
+        // Cleanup: this test's own keys only.
+        let _: i64 = redis::cmd("DEL")
+            .arg(&queue_name)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(0);
+    }
+
+    // ---- next_batch_limit (pure) -----------------------------------------
+
+    #[test]
+    fn next_batch_limit_unlimited_stays_none() {
+        assert_eq!(next_batch_limit(None, 0), None);
+        assert_eq!(next_batch_limit(None, 5_000), None);
+    }
+
+    #[test]
+    fn next_batch_limit_decreases_as_replays_accumulate() {
+        assert_eq!(next_batch_limit(Some(1002), 0), Some(1002));
+        assert_eq!(next_batch_limit(Some(1002), 1000), Some(2));
+    }
+
+    #[test]
+    fn next_batch_limit_reaches_zero_and_does_not_underflow() {
+        assert_eq!(next_batch_limit(Some(1002), 1002), Some(0));
+        // Already over-replayed relative to the limit (should not happen in
+        // practice, since the loop stops at `Some(0)`) must still saturate
+        // rather than wrap around to a huge `usize`.
+        assert_eq!(next_batch_limit(Some(5), 10), Some(0));
     }
 }

@@ -16,6 +16,14 @@ use uuid::Uuid;
 #[cfg(feature = "metrics")]
 use celers_metrics::{TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL};
 
+/// Future returned by a [`MysqlBroker::with_transaction`] callback.
+///
+/// The callback borrows the transaction for `'tx` and must produce a boxed,
+/// `Send` future tied to that borrow — the shape that lets the wrapper, not
+/// the callback, own the commit/rollback decision.
+pub type TransactionFuture<'tx, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'tx>>;
+
 // ========== Enhancement Methods ==========
 impl MysqlBroker {
     /// Cancel multiple tasks atomically
@@ -662,45 +670,84 @@ impl MysqlBroker {
 
     /// Execute multiple operations within a single transaction
     ///
-    /// This method provides a transaction wrapper for executing complex multi-step
-    /// operations atomically. The callback receives a transaction handle that can
-    /// be used for database operations.
+    /// This method provides a transaction wrapper for executing complex
+    /// multi-step operations atomically. The closure borrows the transaction
+    /// and **this method owns the outcome**: it commits when the closure
+    /// returns `Ok` and rolls back when it returns `Err`.
+    ///
+    /// # History
+    ///
+    /// This wrapper previously handed the transaction to the closure *by
+    /// value* and then returned without committing. The box was dropped, and
+    /// `mysql_async` rolls an unfinished transaction back implicitly, so
+    /// every write performed inside was discarded — silently, with `Ok`
+    /// returned to the caller. The documented example (`|_tx| async { Ok(())
+    /// }`) was exactly that data-losing shape. The closure can no longer
+    /// commit or drop the transaction, so the failure mode is gone by
+    /// construction.
     ///
     /// # Arguments
-    /// * `f` - Async callback function that performs operations within the transaction
+    /// * `f` - Callback that performs operations on the borrowed transaction
     ///
     /// # Returns
-    /// The result of the callback function
+    /// The value produced by the callback, after a successful commit.
     ///
     /// # Example
     /// ```no_run
     /// # use celers_broker_sql::MysqlBroker;
-    /// # use celers_core::{Broker, SerializedTask};
+    /// # use celers_core::CelersError;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let broker = MysqlBroker::new("mysql://localhost/celers").await?;
     ///
-    /// // Execute multiple enqueues atomically
-    /// broker.with_transaction(|_tx| async {
-    ///     // Your transaction logic here
-    ///     Ok(())
-    /// }).await?;
+    /// // Both statements commit together, or neither does.
+    /// let bumped: u64 = broker
+    ///     .with_transaction(|tx| {
+    ///         Box::pin(async move {
+    ///             let n = tx
+    ///                 .execute(
+    ///                     "UPDATE celers_tasks SET priority = priority + 1 WHERE state = 'pending'",
+    ///                     &[],
+    ///                 )
+    ///                 .await
+    ///                 .map_err(|e| CelersError::Other(e.to_string()))?;
+    ///             tx.execute("DELETE FROM celers_tasks WHERE state = 'cancelled'", &[])
+    ///                 .await
+    ///                 .map_err(|e| CelersError::Other(e.to_string()))?;
+    ///             Ok(n)
+    ///         })
+    ///     })
+    ///     .await?;
+    /// # let _ = bumped;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn with_transaction<F, T, Fut>(&self, f: F) -> Result<T>
+    pub async fn with_transaction<'a, F, T>(&'a self, f: F) -> Result<T>
     where
-        F: FnOnce(Box<dyn Transaction + '_>) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
+        F: for<'tx> FnOnce(&'tx mut (dyn Transaction + 'a)) -> TransactionFuture<'tx, T>,
     {
-        let tx = self
+        let mut tx = self
             .connection()
             .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
 
-        let result = f(tx).await?;
-
-        Ok(result)
+        match f(&mut *tx).await {
+            Ok(value) => {
+                tx.commit().await.map_err(|e| {
+                    CelersError::Other(format!("Failed to commit transaction: {}", e))
+                })?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::warn!(
+                        error = %rollback_error,
+                        "Failed to roll back transaction after a callback error"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Query tasks by metadata JSON field
@@ -862,34 +909,24 @@ impl MysqlBroker {
 
         // Create metadata with dedup key
         let task_id = task.metadata.id;
-        let mut db_metadata = json!({
-            "queue": self.queue_name,
-            "enqueued_at": chrono::Utc::now().to_rfc3339(),
-            "dedup_key": dedup_key,
-        });
-
-        // Merge task metadata if present
-        if let Ok(task_meta) = serde_json::to_value(&task.metadata) {
-            if let Some(obj) = db_metadata.as_object_mut() {
-                if let Some(meta_obj) = task_meta.as_object() {
-                    for (k, v) in meta_obj {
-                        obj.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
+        // A failed metadata serialization used to degrade the document to
+        // `{}`, dropping `dedup_key` and defeating deduplication entirely on
+        // the very next call. `build_task_metadata_document` propagates the
+        // error instead, and overlays `dedup_key` last so the task's own
+        // metadata cannot shadow it.
         let db_metadata_str =
-            serde_json::to_string(&db_metadata).unwrap_or_else(|_| "{}".to_string());
+            self.build_task_metadata_document(&task, json!({ "dedup_key": dedup_key }))?;
 
         self.connection()
             .execute(
                 r#"
                 INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
+                    (id, queue_name, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, NOW(), NOW())
                 "#,
                 &[
                     &task_id.to_string(),
+                    &self.queue_name,
                     &task.metadata.name,
                     &task.payload,
                     &task.metadata.priority,

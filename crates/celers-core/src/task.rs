@@ -419,7 +419,16 @@ pub struct TaskMetadata {
     /// Maximum number of retry attempts
     pub max_retries: u32,
 
-    /// Task timeout in seconds
+    /// Task *execution* timeout in seconds.
+    ///
+    /// This bounds how long the task may run once a worker starts it
+    /// (`celers-worker` wraps execution in a `tokio::time::timeout` of this
+    /// length, measured from when the task starts).
+    ///
+    /// Celery keeps message expiry (`expires`) and the execution limit
+    /// (`time_limit`) separate; this type does not yet have a distinct
+    /// `expires_at`, so [`TaskMetadata::is_expired`] currently reads this field
+    /// as a creation-relative message expiry. See that method's documentation.
     pub timeout_secs: Option<u64>,
 
     /// Task priority (higher = more important)
@@ -440,6 +449,47 @@ pub struct TaskMetadata {
     /// Task dependencies (tasks that must complete before this task can execute)
     #[serde(skip_serializing_if = "HashSet::is_empty", default)]
     pub dependencies: HashSet<TaskId>,
+}
+
+/// Configurable bounds applied by [`TaskMetadata::validate_with_limits`].
+///
+/// The defaults reproduce the historical hard-coded caps. They exist as a struct
+/// so a deployment can raise them: a legitimate multi-day batch job used to fail
+/// validation with a message the caller had no way to override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationLimits {
+    /// Maximum permitted `max_retries`.
+    pub max_retries: u32,
+    /// Maximum permitted `timeout_secs`.
+    pub max_timeout_secs: u64,
+}
+
+impl ValidationLimits {
+    /// The historical default caps: 1000 retries, 24 hours of execution.
+    pub const DEFAULT: Self = Self {
+        max_retries: 1000,
+        max_timeout_secs: 86_400,
+    };
+
+    /// Set the maximum permitted `max_retries`.
+    #[must_use]
+    pub const fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Set the maximum permitted `timeout_secs`.
+    #[must_use]
+    pub const fn with_max_timeout_secs(mut self, max_timeout_secs: u64) -> Self {
+        self.max_timeout_secs = max_timeout_secs;
+        self
+    }
+}
+
+impl Default for ValidationLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 impl TaskMetadata {
@@ -515,17 +565,40 @@ impl TaskMetadata {
         Utc::now() - self.created_at
     }
 
-    /// Check if the task has expired based on its timeout
+    /// Whether more than `timeout_secs` has elapsed since the task was
+    /// **created**.
+    ///
+    /// This is the honest name for what [`Self::is_expired`] computes. Note that
+    /// `celers-worker` measures the same `timeout_secs` field from the moment
+    /// the task *starts running*, so the two readings disagree for any task that
+    /// spends time in a queue.
     #[inline]
     #[must_use]
-    #[allow(clippy::cast_possible_wrap)]
-    pub fn is_expired(&self) -> bool {
-        if let Some(timeout_secs) = self.timeout_secs {
+    pub fn execution_time_elapsed(&self) -> bool {
+        self.timeout_secs.is_some_and(|timeout| {
             let elapsed = (Utc::now() - self.created_at).num_seconds();
-            elapsed > timeout_secs as i64
-        } else {
-            false
-        }
+            elapsed > i64::try_from(timeout).unwrap_or(i64::MAX)
+        })
+    }
+
+    /// Check if the task has expired based on its timeout.
+    ///
+    /// # Semantics
+    ///
+    /// This measures `timeout_secs` from `created_at`, i.e. it treats the
+    /// *execution* time limit as a *message* expiry. Celery keeps the two
+    /// separate (`expires` vs `time_limit`), and so should this type: a task
+    /// that waits in a queue longer than its execution timeout is reported
+    /// expired here even though it has not started running. Separating them
+    /// requires a distinct `expires_at` field on this struct, which is a
+    /// source-breaking addition for exhaustive struct literals and is tracked as
+    /// follow-up work; until then this is an alias of
+    /// [`Self::execution_time_elapsed`], and callers that want the execution
+    /// limit should measure it from the start of execution as the worker does.
+    #[inline]
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.execution_time_elapsed()
     }
 
     /// Check if the task is in a terminal state (Succeeded or Failed)
@@ -545,32 +618,46 @@ impl TaskMetadata {
         )
     }
 
-    /// Validate the task metadata
+    /// Validate the task metadata against the default [`ValidationLimits`].
     ///
     /// Returns an error if any of the metadata fields are invalid:
     /// - Name must not be empty
-    /// - Max retries must be reasonable (< 1000)
-    /// - Timeout must be at least 1 second if set
-    /// - Priority must be in valid range (-2147483648 to 2147483647)
+    /// - Max retries must not exceed the configured maximum
+    /// - Timeout must be at least 1 second and within the configured maximum
+    ///
+    /// Use [`Self::validate_with_limits`] when a deployment legitimately needs
+    /// looser bounds — a batch job that runs for more than 24 hours, say.
     ///
     /// # Errors
     ///
     /// Returns an error if validation fails.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_limits(&ValidationLimits::default())
+    }
+
+    /// Validate the task metadata against explicit limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails.
+    pub fn validate_with_limits(&self, limits: &ValidationLimits) -> Result<(), String> {
         if self.name.is_empty() {
             return Err("Task name cannot be empty".to_string());
         }
 
-        if self.max_retries > 1000 {
-            return Err("Max retries cannot exceed 1000".to_string());
+        if self.max_retries > limits.max_retries {
+            return Err(format!("Max retries cannot exceed {}", limits.max_retries));
         }
 
         if let Some(timeout) = self.timeout_secs {
             if timeout == 0 {
                 return Err("Timeout must be at least 1 second".to_string());
             }
-            if timeout > 86400 {
-                return Err("Timeout cannot exceed 24 hours (86400 seconds)".to_string());
+            if timeout > limits.max_timeout_secs {
+                return Err(format!(
+                    "Timeout cannot exceed {} seconds",
+                    limits.max_timeout_secs
+                ));
             }
         }
 
@@ -1077,11 +1164,20 @@ impl SerializedTask {
         self.metadata.age()
     }
 
-    /// Check if the task has expired based on its timeout
+    /// Check if the task has expired based on its timeout.
+    ///
+    /// See [`TaskMetadata::is_expired`] for the (currently conflated) semantics.
     #[inline]
     #[must_use]
     pub fn is_expired(&self) -> bool {
         self.metadata.is_expired()
+    }
+
+    /// Whether more than `timeout_secs` has elapsed since the task was created.
+    #[inline]
+    #[must_use]
+    pub fn execution_time_elapsed(&self) -> bool {
+        self.metadata.execution_time_elapsed()
     }
 
     /// Check if the task is in a terminal state (Success or Failure)
@@ -1700,18 +1796,21 @@ mod tests {
 
         #[test]
         fn test_task_expiration_lifecycle() {
-            // Create task with 1 second timeout
-            let task =
+            // Fresh task with a 1s timeout is not yet expired.
+            let mut task =
                 SerializedTask::new("expiring_task".to_string(), vec![1, 2, 3]).with_timeout(1);
-
-            // Task should not be expired immediately
             assert!(!task.is_expired());
+            assert!(!task.execution_time_elapsed());
 
-            // Wait for task to expire
-            std::thread::sleep(std::time::Duration::from_secs(2));
-
-            // Task should now be expired
+            // Back-date creation instead of sleeping: deterministic and instant.
+            task.metadata.created_at = Utc::now() - chrono::Duration::seconds(5);
             assert!(task.is_expired());
+            assert!(task.execution_time_elapsed());
+
+            // A task with no timeout never expires.
+            let mut forever = SerializedTask::new("forever".to_string(), vec![1]);
+            forever.metadata.created_at = Utc::now() - chrono::Duration::days(365);
+            assert!(!forever.is_expired());
         }
 
         #[test]

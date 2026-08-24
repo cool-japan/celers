@@ -1704,6 +1704,42 @@ These advanced monitoring features provide:
 **Test coverage: 172 tests** (68 unit + 104 doc tests)
 **Code quality: Zero warnings, Clippy clean**
 
+## Hardening pass (0.3.1) — what changed
+
+Superseding parts of the two audit sections below:
+
+- **`queue_name` is now a real column.** Migration `009_queue_name.sql` adds an
+  indexed `celers_tasks.queue_name`, backfilled from the JSON `$.queue` label.
+  Every enqueue path binds it; `dequeue`, `dequeue_batch`,
+  `dequeue_with_worker_id`, `queue_size` and `get_statistics` filter on it.
+  Section 1 below ("used only as a logical JSON label") is therefore
+  **obsolete** — the label is still written for compatibility, but the column
+  is authoritative.
+- **`celers_task_results` now has a migration** (`010_task_results.sql`).
+  Section 2's missing-table census is reduced by one.
+- **The migration runner was broken and is fixed.** `run_migration` skipped
+  any `;`-chunk starting with `--`, which discarded the first statement of
+  every migration file — including `CREATE TABLE celers_migrations` — so
+  `migrate()` failed on every fresh database. Comments are now stripped
+  line-wise before the `;` split, and the stored-procedure body's trailing
+  `//` delimiter marker is removed before submission.
+- **`broker_core.rs` is under the 2000-line limit** (`broker_dequeue.rs` and
+  `broker_results.rs` split out). The "broker_core.rs size" section below is
+  resolved.
+
+### Still open (queue scoping)
+
+Deliberately **not** queue-scoped, documented rather than silently narrowed:
+`purge_all`, `purge_by_state`, `purge_by_task_name`, `archive_completed_tasks`,
+`recover_stuck_tasks`, `list_tasks`, `count_by_task_name`,
+`query_tasks_by_metadata`, and every DLQ helper (the DLQ table has no
+`queue_name` column of its own). Adding a `queue_name` column to
+`celers_dead_letter_queue` and a scoped variant of each destructive helper is
+a follow-up.
+
+Also still open: `celers_queue_config`, `celers_worker_heartbeat`,
+`celers_task_groups` and `celers_task_idempotency` remain without migrations.
+
 ## queue_name schema drift audit (2026-07)
 
 This section is a documentation-only note, mirroring the equivalent audit performed this

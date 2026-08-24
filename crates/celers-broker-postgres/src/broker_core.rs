@@ -2,40 +2,44 @@
 
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use chrono::Utc;
-use oxisql_core::Connection;
-use oxisql_postgres::PgConnection;
 use serde_json::json;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::pool::{PgPool, PooledConnection, DEFAULT_POOL_SIZE};
 use crate::row_ext::{json_from_row, json_param, uuid_param};
+use crate::sql;
 use crate::tls_mode;
-use crate::types::{HookContext, RetryStrategy, TaskHook, TaskHooks, TraceContext};
+use crate::types::{
+    HookContext, RetentionConfig, RetryStrategy, TaskHook, TaskHooks, TraceContext,
+};
 
 #[cfg(feature = "metrics")]
 use celers_metrics::{TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL};
 
 /// PostgreSQL-based broker implementation using SKIP LOCKED
 pub struct PostgresBroker {
-    /// The OxiSQL connection used throughout this crate's task-delivery hot
-    /// path (`broker_trait.rs`'s `Broker` impl, `queue_ops.rs`, `results.rs`)
-    /// and — as of this migration's final cleanup — this file's own
-    /// internal migration-runner and `move_to_dlq` stored-function call too.
+    /// The connection pool backing every statement this crate runs.
     ///
-    /// This struct used to also carry a `pool: PgPool` field (the legacy
-    /// `sqlx` connection pool) for exactly those two remaining call sites;
-    /// it has been removed now that they are migrated, completing this
-    /// crate's sqlx→oxisql migration and allowing the `sqlx` dependency to
-    /// be dropped entirely.
+    /// This used to be a single `oxisql_postgres::PgConnection`. That type is
+    /// `Clone` but internally `Arc<Mutex<tokio_postgres::Client>>`, so every
+    /// clone shared ONE connection: all database work in the process was
+    /// serialised behind one mutex, and because
+    /// `Connection::transaction()` takes an *owned* guard held until
+    /// commit/rollback, a single `dequeue()` blocked every concurrent
+    /// enqueue/ack/monitoring query for four network round trips. That
+    /// defeated `FOR UPDATE SKIP LOCKED` within a process and made
+    /// [`PostgresBroker::with_pool_config`]'s `max_connections` argument a
+    /// no-op.
     ///
-    /// `oxisql_postgres::PgConnection` is `Clone` and internally
-    /// `Arc<Mutex<tokio_postgres::Client>>` — cheap to clone, but unlike
-    /// `sqlx::PgPool` all clones share ONE underlying connection rather than
-    /// drawing from a pool of up to `max_connections`. This is a real
-    /// behavioral change from the previous sqlx-based pool and is accepted
-    /// for now per the migration plan as a deferred performance item.
-    pub(crate) conn: PgConnection,
+    /// [`PgPool`] owns `pool_size` independent connections and hands one out
+    /// per operation, with per-slot broken-connection detection and
+    /// reconnect-with-backoff, so a dropped connection no longer bricks the
+    /// broker for the process lifetime. Its API is method-compatible with the
+    /// old field (`execute`/`query`/`execute_batch`), with transactions taken
+    /// through an explicit `acquire()` first.
+    pub(crate) conn: PgPool,
     /// The connection string this broker was constructed with.
     ///
     /// Retained so `notifications.rs` can open its own dedicated
@@ -44,15 +48,13 @@ pub struct PostgresBroker {
     pub(crate) database_url: String,
     /// Logical queue label for multi-tenancy.
     ///
-    /// This is stored as a JSON label inside `celers_tasks.metadata->>'queue'`
-    /// at enqueue time (see `broker_trait.rs`'s `enqueue()`), NOT as a real
-    /// column on `celers_tasks`, and NOT as a table name.
-    ///
-    /// Several peripheral APIs in this crate currently incorrectly assume one
-    /// or the other (filtering `celers_tasks`/`celers_dead_letter_queue` on a
-    /// nonexistent `queue_name` column, or interpolating this value as if it
-    /// were a SQL table name via `format!("... FROM {} ...", self.queue_name)`).
-    /// See `TODO.md` (`## queue_name schema drift`) for the full tracked list.
+    /// As of migration `007_queue_identity.sql` this is a REAL column on
+    /// `celers_tasks` and `celers_dead_letter_queue` (backfilled from the
+    /// legacy `metadata->>'queue'` label, which is still written for
+    /// backwards compatibility). Every query in this crate scopes itself to it
+    /// by binding it as a parameter — it is never spliced into SQL text as a
+    /// table name, and it is validated at construction
+    /// (`[A-Za-z0-9_-]{1,64}`) so it cannot carry SQL syntax anywhere.
     pub(crate) queue_name: String,
     pub(crate) paused: AtomicBool,
     pub(crate) retry_strategy: RetryStrategy,
@@ -70,7 +72,46 @@ impl PostgresBroker {
     }
 
     /// Create a new PostgreSQL broker with a specific queue name
+    ///
+    /// Uses [`crate::pool::DEFAULT_POOL_SIZE`] connections; call
+    /// [`PostgresBroker::with_pool_config`] to size the pool explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `queue_name` is not a valid queue label
+    /// (`[A-Za-z0-9_-]`, 1..=64 characters) or if the database is
+    /// unreachable.
     pub async fn with_queue(database_url: &str, queue_name: &str) -> Result<Self> {
+        Self::with_pool_config(database_url, queue_name, DEFAULT_POOL_SIZE, 30).await
+    }
+
+    /// Create a new PostgreSQL broker with custom pool configuration
+    ///
+    /// # Arguments
+    /// * `database_url` - PostgreSQL connection string
+    /// * `queue_name` - Logical queue name, `[A-Za-z0-9_-]{1,64}`
+    /// * `max_connections` - Number of independent connections the broker
+    ///   opens. This is now honoured: the broker keeps that many connection
+    ///   slots and hands one out per operation, so concurrent `dequeue`s
+    ///   really do run in parallel and `FOR UPDATE SKIP LOCKED` buys
+    ///   in-process concurrency instead of only cross-process concurrency.
+    ///   Clamped to `1..=`[`crate::pool::MAX_POOL_SIZE`]. One connection is
+    ///   opened eagerly (so a bad URL still fails here); the rest are opened
+    ///   on first use.
+    /// * `acquire_timeout_secs` - Timeout applied to establishing a
+    ///   connection (seconds)
+    pub async fn with_pool_config(
+        database_url: &str,
+        queue_name: &str,
+        max_connections: u32,
+        acquire_timeout_secs: u64,
+    ) -> Result<Self> {
+        // Validate the queue label once, here, so that no downstream query
+        // can ever be handed a name carrying SQL syntax — regardless of
+        // whether the caller derived it from a tenant id, a header or a
+        // config file.
+        sql::validate_queue_name(queue_name).map_err(CelersError::Other)?;
+
         // TLS mode is derived from `database_url`'s `sslmode` query
         // parameter (see `tls_mode.rs`): a URL with `sslmode=require` (or
         // `verify-ca`/`verify-full`/`prefer`/`allow`) gets a real TLS
@@ -79,49 +120,12 @@ impl PostgresBroker {
         // so plain-text callers are unaffected.
         let tls_mode = tls_mode::pg_tls_mode_for_url(database_url)
             .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {}", e)))?;
-        let conn = PgConnection::connect(database_url, tls_mode)
-            .await
-            .map_err(|e| {
-                CelersError::Other(format!("Failed to connect to database (oxisql): {}", e))
-            })?;
 
-        Ok(Self {
-            conn,
-            database_url: database_url.to_string(),
-            queue_name: queue_name.to_string(),
-            paused: AtomicBool::new(false),
-            retry_strategy: RetryStrategy::default(),
-            hooks: Arc::new(tokio::sync::RwLock::new(TaskHooks::new())),
-        })
-    }
-
-    /// Create a new PostgreSQL broker with custom pool configuration
-    ///
-    /// # Arguments
-    /// * `database_url` - PostgreSQL connection string
-    /// * `queue_name` - Logical queue name
-    /// * `max_connections` - Maximum number of connections in the pool. Kept
-    ///   in the public signature for API compatibility, but unused now that
-    ///   the legacy `sqlx::PgPool` construction has been removed:
-    ///   `oxisql_postgres::PgConnection` wraps a single multiplexed
-    ///   `tokio_postgres::Client` (see the doc comment on
-    ///   `PostgresBroker::conn`), not a real connection pool, so there is
-    ///   no pool size to configure.
-    /// * `acquire_timeout_secs` - Timeout for acquiring a connection (seconds)
-    pub async fn with_pool_config(
-        database_url: &str,
-        queue_name: &str,
-        _max_connections: u32,
-        acquire_timeout_secs: u64,
-    ) -> Result<Self> {
-        // See `with_queue` above for how the TLS mode is derived from
-        // `database_url`'s `sslmode` query parameter.
-        let tls_mode = tls_mode::pg_tls_mode_for_url(database_url)
-            .map_err(|e| CelersError::Other(format!("Failed to resolve TLS mode: {}", e)))?;
-        let conn = PgConnection::connect_with_timeout(
+        let conn = PgPool::connect(
             database_url,
             tls_mode,
-            Duration::from_secs(acquire_timeout_secs),
+            max_connections,
+            Some(Duration::from_secs(acquire_timeout_secs)),
         )
         .await
         .map_err(|e| {
@@ -270,20 +274,16 @@ impl PostgresBroker {
             }
         }
 
-        // Byte-for-byte identical SQL text to the pre-migration sqlx version.
-        // UUID -> uuid_param, JSON metadata -> json_param, everything else is
-        // an already-primitive ToSqlValue (String, Vec<u8>, i32). Mirrors
-        // `broker_trait.rs`'s `enqueue()`, this crate's proven pilot for this
-        // exact INSERT shape.
+        // Shares `sql::INSERT_TASK_NOW` with `broker_trait.rs`'s `enqueue()`
+        // so the two can never drift apart: same column list (including the
+        // real `queue_name` column, without which the task would be invisible
+        // to this broker's queue-scoped `dequeue`), same `$6::text::jsonb`
+        // cast for the metadata parameter.
         let task_id_param = uuid_param(&task_id);
         let metadata_param = json_param(&db_metadata);
         self.conn
             .execute(
-                r#"
-            INSERT INTO celers_tasks
-                (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-            VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), NOW())
-            "#,
+                sql::INSERT_TASK_NOW,
                 &[
                     &task_id_param,
                     &task.metadata.name,
@@ -291,6 +291,7 @@ impl PostgresBroker {
                     &task.metadata.priority,
                     &(task.metadata.max_retries as i32),
                     &metadata_param,
+                    &self.queue_name,
                 ],
             )
             .await
@@ -456,20 +457,181 @@ impl PostgresBroker {
                 CelersError::Other(format!("Migration 006_deduplication_columns failed: {}", e))
             })?;
 
+        // Queue identity (real `queue_name` column), delivery accounting
+        // (`attempt_count`), idempotent DLQ promotion, and the periodic
+        // schedule / task group tables.
+        let queue_identity_sql = include_str!("../migrations/007_queue_identity.sql");
+        self.conn
+            .execute_batch(queue_identity_sql)
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Migration 007_queue_identity failed: {}", e))
+            })?;
+
         Ok(())
     }
 
-    /// Get the underlying OxiSQL connection used by the migrated
-    /// task-delivery hot path.
+    /// Check out one pooled connection.
     ///
-    /// Renamed from the previous `pool()` getter (which returned
-    /// `&sqlx::PgPool`) as part of the sqlx→oxisql migration — this is a
-    /// breaking change for any external caller of the old name. No callers
-    /// of `.pool()` on `PostgresBroker` were found anywhere else in the
-    /// `celers` workspace (grepped `crates/**/*.rs` for `.pool()`), so no
-    /// other crate needed updating.
-    pub fn connection(&self) -> &PgConnection {
-        &self.conn
+    /// Previously returned `&PgConnection`, which cannot survive the move to
+    /// a real pool: there is no single connection to lend a reference to.
+    /// The returned guard keeps its pool slot reserved until dropped, and is
+    /// the entry point for running an explicit transaction:
+    ///
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # async fn example() -> celers_core::Result<()> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let conn = broker.connection().await?;
+    /// let mut tx = conn
+    ///     .transaction()
+    ///     .await
+    ///     .map_err(|e| celers_core::CelersError::Other(e.to_string()))?;
+    /// tx.execute("SELECT 1", &[])
+    ///     .await
+    ///     .map_err(|e| celers_core::CelersError::Other(e.to_string()))?;
+    /// tx.commit()
+    ///     .await
+    ///     .map_err(|e| celers_core::CelersError::Other(e.to_string()))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connection(&self) -> Result<PooledConnection> {
+        self.conn
+            .acquire()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to acquire connection: {}", e)))
+    }
+
+    /// Number of connection slots this broker's pool was built with.
+    #[must_use]
+    pub fn pool_size(&self) -> u32 {
+        self.conn.size()
+    }
+
+    /// Probe the database over a pooled connection.
+    ///
+    /// A slot whose connection has died is transparently reconnected by the
+    /// pool, so a `true` here means the broker really can reach the database
+    /// right now — supervisors can use this to distinguish "wedged" from
+    /// "idle" without restarting the process.
+    pub async fn health_check(&self) -> Result<()> {
+        self.conn
+            .ping()
+            .await
+            .map_err(|e| CelersError::Other(format!("Database health check failed: {}", e)))
+    }
+
+    /// Delete terminal tasks older than `retain_for`, in bounded chunks.
+    ///
+    /// `ack` intentionally leaves completed rows in `celers_tasks` for
+    /// auditing, but `celers_tasks` is also the table every `dequeue` scans:
+    /// without pruning it grows with lifetime throughput, and both
+    /// `queue_size()` and the statistics queries degrade linearly. This is the
+    /// manual form; [`PostgresBroker::spawn_retention_task`] runs it on a
+    /// schedule.
+    ///
+    /// Returns the number of rows deleted. Each statement deletes at most
+    /// `batch_size` rows (chosen through an `id IN (SELECT ... LIMIT n)`
+    /// sub-select) so no single sweep holds long-lived row locks, and the
+    /// loop stops early once a batch comes back short.
+    pub async fn purge_terminal_tasks(
+        &self,
+        retain_for: Duration,
+        batch_size: i64,
+        max_batches: u32,
+    ) -> Result<u64> {
+        let batch_size = batch_size.clamp(1, 100_000);
+        let age_secs = i64::try_from(retain_for.as_secs()).unwrap_or(i64::MAX);
+        let statement = sql::purge_terminal_sql(batch_size);
+
+        let mut deleted_total = 0u64;
+        for _ in 0..max_batches {
+            let deleted = self
+                .conn
+                .execute(&statement, &[&self.queue_name, &age_secs])
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to purge terminal tasks: {}", e))
+                })?;
+            deleted_total = deleted_total.saturating_add(deleted);
+            if deleted < batch_size as u64 {
+                break;
+            }
+        }
+
+        if deleted_total > 0 {
+            tracing::info!(
+                queue = %self.queue_name,
+                deleted = deleted_total,
+                "Purged terminal tasks from the dispatch table"
+            );
+        }
+        Ok(deleted_total)
+    }
+
+    /// Start a background retention sweep for this broker's queue.
+    ///
+    /// Deliberately opt-in rather than started from the constructor:
+    /// deleting a deployment's audit history is not something a library may
+    /// decide on its own. Drop the returned handle — or call
+    /// [`tokio::task::JoinHandle::abort`] on it — to stop sweeping.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use celers_broker_postgres::{PostgresBroker, RetentionConfig};
+    /// # async fn example() -> celers_core::Result<()> {
+    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
+    /// let sweeper = broker.spawn_retention_task(RetentionConfig::default());
+    /// // ... later ...
+    /// sweeper.abort();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn spawn_retention_task(&self, config: RetentionConfig) -> tokio::task::JoinHandle<()> {
+        // The task borrows nothing from `self`: the pool handle and queue
+        // label are cloned, so the sweeper outlives this borrow and does not
+        // force the broker into an `Arc`.
+        let pool = self.conn.clone();
+        let queue_name = self.queue_name.clone();
+        let batch_size = config.batch_size.clamp(1, 100_000);
+        let age_secs = i64::try_from(config.retain_for.as_secs()).unwrap_or(i64::MAX);
+        let statement = sql::purge_terminal_sql(batch_size);
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(config.sweep_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let mut deleted_total = 0u64;
+                for _ in 0..config.max_batches_per_sweep {
+                    match pool.execute(&statement, &[&queue_name, &age_secs]).await {
+                        Ok(deleted) => {
+                            deleted_total = deleted_total.saturating_add(deleted);
+                            if deleted < batch_size as u64 {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                queue = %queue_name,
+                                error = %e,
+                                "Retention sweep failed; will retry on the next tick"
+                            );
+                            break;
+                        }
+                    }
+                }
+                if deleted_total > 0 {
+                    tracing::info!(
+                        queue = %queue_name,
+                        deleted = deleted_total,
+                        "Retention sweep pruned terminal tasks"
+                    );
+                }
+            }
+        })
     }
 
     /// Get the queue name

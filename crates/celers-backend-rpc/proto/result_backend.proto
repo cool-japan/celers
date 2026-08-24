@@ -48,6 +48,15 @@ message TaskMeta {
   optional int64 started_at = 8;
   optional int64 completed_at = 9;
   optional string worker = 10;
+  // Nanosecond component (0..=999_999_999) of the corresponding timestamp
+  // field above, preserving sub-second precision across the wire. Always 0
+  // (and safe to ignore) when the parent seconds field is absent. Added
+  // after the original fields so messages from older writers that don't
+  // set them still decode correctly, at whole-second precision exactly as
+  // before these fields existed.
+  uint32 created_at_nanos = 11;
+  uint32 started_at_nanos = 12;
+  uint32 completed_at_nanos = 13;
 }
 
 // Chord state
@@ -61,6 +70,8 @@ message ChordState {
   optional uint64 timeout_seconds = 7;
   bool cancelled = 8;
   optional string cancellation_reason = 9;
+  // Nanosecond component of `created_at` (see TaskMeta.created_at_nanos).
+  uint32 created_at_nanos = 10;
 }
 
 // Store result request/response

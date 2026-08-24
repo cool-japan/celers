@@ -13,6 +13,19 @@ use syn::{
 use crate::task_attr::TaskAttr;
 use crate::validation::{is_option_type, FieldValidation};
 
+/// True if `tokens` contains an identifier exactly equal to `name` anywhere,
+/// including inside nested delimited groups (`<...>`, `(...)`, `[...]`,
+/// `{...}`). Used to work out which of a task fn's generic parameters are
+/// actually referenced by its extracted output type; see the output type
+/// alias generation in [`task_macro_impl`] for why this matters.
+fn token_stream_mentions_ident(tokens: &proc_macro2::TokenStream, name: &str) -> bool {
+    tokens.clone().into_iter().any(|tt| match tt {
+        proc_macro2::TokenTree::Ident(ident) => ident == name,
+        proc_macro2::TokenTree::Group(group) => token_stream_mentions_ident(&group.stream(), name),
+        proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => false,
+    })
+}
+
 /// Implementation of the `#[task]` attribute macro.
 ///
 /// This function is called from the proc_macro entry point in lib.rs.
@@ -172,17 +185,117 @@ pub(crate) fn task_macro_impl(attr: TokenStream, item: TokenStream) -> TokenStre
         quote! { #[derive(Default)] }
     };
 
-    // Add Default implementation for generic structs
+    // A generic `#[task]` fn (e.g. `async fn process<T>(items: Vec<T>) -> ...`)
+    // generates a marker `#struct_name<T>` task struct that carries no real
+    // data of its own (the function's parameters become fields of the
+    // *input* struct, not this one). Declaring it as a plain unit struct
+    // `struct ProcessTask<T>;` would leave every type/lifetime parameter
+    // completely unused, which is a hard error (E0392 "parameter `T` is
+    // never used"). Give it a `PhantomData` marker field that references
+    // every parameter instead, so the struct compiles for any `T` without
+    // implying any auto-trait bound on `T` itself: `fn() -> T` is `Send +
+    // Sync + Copy` regardless of what `T` is, since the field never
+    // actually stores a `T` value. Const generics can't be woven into a
+    // marker type this way in general, so surface a clear compile error
+    // for that case instead of emitting code that will not build.
+    let mut marker_members: Vec<proc_macro2::TokenStream> = Vec::new();
+    if has_generics {
+        for param in &fn_generics.params {
+            match param {
+                syn::GenericParam::Type(type_param) => {
+                    let ident = &type_param.ident;
+                    marker_members.push(quote! { fn() -> #ident });
+                }
+                syn::GenericParam::Lifetime(lifetime_param) => {
+                    let lifetime = &lifetime_param.lifetime;
+                    marker_members.push(quote! { & #lifetime () });
+                }
+                syn::GenericParam::Const(const_param) => {
+                    let error = syn::Error::new_spanned(
+                        const_param,
+                        "#[task] does not support const generic parameters yet",
+                    );
+                    return error.to_compile_error().into();
+                }
+            }
+        }
+    }
+
+    // Struct definition: a plain unit struct when there are no generics
+    // (unchanged from before), or a struct with a hidden PhantomData marker
+    // field when there are.
+    let struct_def = if has_generics {
+        quote! {
+            #fn_vis struct #struct_name #impl_generics #where_clause {
+                #[doc(hidden)]
+                _marker: ::core::marker::PhantomData<(#(#marker_members,)*)>,
+            }
+        }
+    } else {
+        quote! {
+            #fn_vis struct #struct_name #impl_generics #where_clause;
+        }
+    };
+
+    // Add Default implementation for generic structs (this is *not*
+    // `#[derive(Default)]`-able in general, since deriving would require
+    // `T: Default` even though the marker field never holds a `T`).
     let default_impl = if has_generics {
         quote! {
             impl #impl_generics Default for #struct_name #ty_generics #where_clause {
                 fn default() -> Self {
-                    #struct_name
+                    #struct_name {
+                        _marker: ::core::marker::PhantomData,
+                    }
                 }
             }
         }
     } else {
         quote! {}
+    };
+
+    // Only give the output type alias the generic parameters its own
+    // definition actually needs (e.g. `Vec<T>` needs `T`; a fixed `usize`
+    // needs none) -- this is *not* just a style choice. A type alias
+    // parameter that is not referenced anywhere in its definition is
+    // `error[E0091]: type parameter is never used`, a hard error, not a
+    // lint. Restating every one of the fn's bounds here (as `impl_generics`
+    // would) makes a would-be-unused parameter "used" for E0091's purposes,
+    // but reintroduces the `type_alias_bounds` warning this fix is also
+    // meant to avoid; using `ty_generics` unconditionally instead trades
+    // that warning straight back into E0091 whenever the output type
+    // happens not to mention a parameter -- exactly the case for the
+    // documented `async fn process<T>(items: Vec<T>) -> Result<usize>`
+    // example, whose `usize` output never references `T`. Filtering down to
+    // only the parameters actually mentioned in `output_type` avoids both.
+    let output_alias_params: Vec<proc_macro2::TokenStream> = if has_generics {
+        fn_generics
+            .params
+            .iter()
+            .filter_map(|param| match param {
+                syn::GenericParam::Type(type_param) => {
+                    let ident = &type_param.ident;
+                    token_stream_mentions_ident(&output_type, &ident.to_string())
+                        .then(|| quote! { #ident })
+                }
+                syn::GenericParam::Lifetime(lifetime_param) => {
+                    let lifetime = &lifetime_param.lifetime;
+                    token_stream_mentions_ident(&output_type, &lifetime.ident.to_string())
+                        .then(|| quote! { #lifetime })
+                }
+                // Const generics are rejected earlier (see `marker_members`
+                // above), so this arm is unreachable in practice -- kept
+                // only for match exhaustiveness.
+                syn::GenericParam::Const(_) => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let output_alias_generics = if output_alias_params.is_empty() {
+        quote! {}
+    } else {
+        quote! { < #(#output_alias_params),* > }
     };
 
     // Generate validation code for fields that have validation rules
@@ -199,22 +312,41 @@ pub(crate) fn task_macro_impl(attr: TokenStream, item: TokenStream) -> TokenStre
         /// Input struct for the task
         ///
         /// Generated by the `#[task]` macro
+        //
+        // Deliberately does *not* repeat `#where_clause` here (unlike the
+        // marker struct and impl blocks below, which do need it). This
+        // struct only ever holds data and is (de)serialized -- it never
+        // calls any of the original fn's bounded methods -- so it does not
+        // itself need the fn's where-clause, and `#[derive(Serialize,
+        // Deserialize)]` already infers its own per-field bounds
+        // automatically. Repeating a bound here that also mentions
+        // `Serialize`/`Deserialize` (as any task moving real generic data
+        // through validation or storage would need on the `Task` impl
+        // below) collides with that auto-inferred bound and produces
+        // `error[E0283]: type annotations needed ... multiple impls or
+        // where clauses satisfying ... found` -- an unhelpful, hard-to-
+        // diagnose ambiguity rather than a normal compile error.
         #input_derives
-        #fn_vis struct #input_struct_name #impl_generics #where_clause {
+        #fn_vis struct #input_struct_name #impl_generics {
             #(#input_fields),*
         }
 
         /// Output type for the task
         ///
         /// Generated by the `#[task]` macro
-        #fn_vis type #output_struct_name #impl_generics = #output_type;
+        //
+        // `output_alias_generics` carries only the parameters `output_type`
+        // actually mentions, with no bounds -- see the comment where it is
+        // computed above for why (avoids both `error[E0091]` and the
+        // `type_alias_bounds` warning).
+        #fn_vis type #output_struct_name #output_alias_generics = #output_type;
 
         /// Task struct
         ///
         /// Generated by the `#[task]` macro from the function definition
         #(#fn_attrs)*
         #task_struct_derives
-        #fn_vis struct #struct_name #impl_generics #where_clause;
+        #struct_def
 
         #default_impl
 

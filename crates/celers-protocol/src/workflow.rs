@@ -3,10 +3,21 @@
 //! This module provides helpers for building and managing task workflows,
 //! chains, and directed acyclic graphs (DAGs) of tasks.
 
-use crate::{builder::MessageBuilder, Message};
+use crate::builder::{BuilderResult, MessageBuilder};
+use crate::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
+
+/// Header key under which the full list of upstream dependency task IDs is
+/// recorded, in addition to the single `parent_id` header.
+///
+/// The Celery message envelope has room for only one `parent_id`, so when a
+/// task depends on more than one predecessor (a fan-in / join), the first
+/// dependency is still used as `parent_id` (for ordinary chain-style
+/// consumers), but the *complete* dependency list is mirrored here so
+/// fan-in information is never silently dropped.
+pub const DEPENDENCIES_HEADER: &str = "dependencies";
 
 /// A task in a workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +75,17 @@ impl WorkflowTask {
     }
 
     /// Convert to a Message with workflow metadata
-    pub fn to_message(&self, root_id: Option<Uuid>, parent_id: Option<Uuid>) -> Message {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::builder::BuilderError`] if the underlying
+    /// [`MessageBuilder`] fails to build the message (for example, if body
+    /// serialization fails).
+    pub fn to_message(
+        &self,
+        root_id: Option<Uuid>,
+        parent_id: Option<Uuid>,
+    ) -> BuilderResult<Message> {
         let mut builder = MessageBuilder::new(&self.task_name)
             .id(self.id)
             .args(self.args.clone())
@@ -78,7 +99,19 @@ impl WorkflowTask {
             builder = builder.parent(parent);
         }
 
-        builder.build().expect("Failed to build message")
+        // A task with more than one dependency loses all but the first once
+        // it is squeezed into the single `parent_id` header; mirror the full
+        // list into a dedicated header so fan-in information survives.
+        if !self.dependencies.is_empty() {
+            let deps: Vec<serde_json::Value> = self
+                .dependencies
+                .iter()
+                .map(|id| serde_json::Value::String(id.to_string()))
+                .collect();
+            builder = builder.header(DEPENDENCIES_HEADER, serde_json::Value::Array(deps));
+        }
+
+        builder.build()
     }
 }
 
@@ -243,23 +276,26 @@ impl Workflow {
     /// Convert workflow to messages in execution order
     pub fn to_messages(&self) -> Result<Vec<Message>, String> {
         let order = self.topological_sort()?;
+        if order.is_empty() {
+            // An empty workflow has no root task; indexing `order[0]` below
+            // would otherwise panic.
+            return Ok(Vec::new());
+        }
         let root_id = self.root_id.unwrap_or_else(|| order[0]);
 
-        let messages = order
+        order
             .into_iter()
-            .filter_map(|task_id| {
-                self.tasks.get(&task_id).map(|task| {
-                    let parent_id = if task.dependencies.is_empty() {
-                        None
-                    } else {
-                        task.dependencies.first().copied()
-                    };
-                    task.to_message(Some(root_id), parent_id)
+            .filter_map(|task_id| self.tasks.get(&task_id))
+            .map(|task| {
+                let parent_id = task.dependencies.first().copied();
+                task.to_message(Some(root_id), parent_id).map_err(|e| {
+                    format!(
+                        "Failed to build message for task '{}': {}",
+                        task.task_name, e
+                    )
                 })
             })
-            .collect();
-
-        Ok(messages)
+            .collect()
     }
 
     /// Get the workflow name
@@ -371,13 +407,23 @@ impl Group {
     }
 
     /// Convert to messages with group ID
-    pub fn to_messages(&self) -> Vec<Message> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if any task fails to build (see
+    /// [`WorkflowTask::to_message`]).
+    pub fn to_messages(&self) -> Result<Vec<Message>, String> {
         self.tasks
             .iter()
             .map(|task| {
-                let mut msg = task.to_message(None, None);
+                let mut msg = task.to_message(None, None).map_err(|e| {
+                    format!(
+                        "Failed to build message for task '{}': {}",
+                        task.task_name, e
+                    )
+                })?;
                 msg.headers.group = Some(self.group_id);
-                msg
+                Ok(msg)
             })
             .collect()
     }
@@ -581,7 +627,7 @@ mod tests {
     fn test_group_to_messages() {
         let group = Group::new().add_task("task1").add_task("task2");
 
-        let messages = group.to_messages();
+        let messages = group.to_messages().unwrap();
         assert_eq!(messages.len(), 2);
 
         // All messages should have the same group ID
@@ -596,10 +642,75 @@ mod tests {
         let root_id = Uuid::new_v4();
         let parent_id = Uuid::new_v4();
 
-        let message = task.to_message(Some(root_id), Some(parent_id));
+        let message = task.to_message(Some(root_id), Some(parent_id)).unwrap();
 
         assert_eq!(message.headers.task, "tasks.test");
         assert_eq!(message.headers.root_id, Some(root_id));
         assert_eq!(message.headers.parent_id, Some(parent_id));
+    }
+
+    #[test]
+    fn test_empty_workflow_to_messages_does_not_panic() {
+        // Regression: an empty workflow used to panic (`order[0]` on an
+        // empty Vec) instead of returning an empty message list.
+        let workflow = Workflow::new("empty");
+        assert!(workflow.is_empty());
+
+        let messages = workflow.to_messages().unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_workflow_multi_dependency_keeps_first_as_parent_and_records_all_in_header() {
+        let mut workflow = Workflow::new("fan-in");
+
+        let task1 = WorkflowTask::new("task1");
+        let task1_id = task1.id;
+        let task2 = WorkflowTask::new("task2");
+        let task2_id = task2.id;
+        let task3 = WorkflowTask::new("task3");
+        let task3_id = task3.id;
+        workflow.add_task(task1);
+        workflow.add_task(task2);
+        workflow.add_task(task3);
+
+        // task4 fans in from all three predecessors.
+        let task4 = WorkflowTask::new("task4").depends_on_many(vec![task1_id, task2_id, task3_id]);
+        let task4_id = task4.id;
+        workflow.add_task(task4);
+
+        let messages = workflow.to_messages().unwrap();
+        let msg4 = messages
+            .iter()
+            .find(|m| m.headers.id == task4_id)
+            .expect("task4 message should be present");
+
+        // parent_id keeps only the first dependency...
+        assert_eq!(msg4.headers.parent_id, Some(task1_id));
+
+        // ...but the dedicated header preserves every dependency, so nothing
+        // is silently lost.
+        let deps = msg4
+            .headers
+            .extra
+            .get(DEPENDENCIES_HEADER)
+            .and_then(|v| v.as_array())
+            .expect("dependencies header should be a JSON array");
+        let dep_ids: Vec<Uuid> = deps
+            .iter()
+            .map(|v| v.as_str().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(
+            dep_ids,
+            vec![task1_id, task2_id, task3_id],
+            "dependencies header must list every dependency in order"
+        );
+    }
+
+    #[test]
+    fn test_workflow_task_without_dependencies_omits_dependencies_header() {
+        let task = WorkflowTask::new("tasks.root");
+        let message = task.to_message(None, None).unwrap();
+        assert!(!message.headers.extra.contains_key(DEPENDENCIES_HEADER));
     }
 }

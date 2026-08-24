@@ -97,7 +97,9 @@
 // Core modules
 mod broker_core;
 mod broker_trait;
+pub mod pool;
 pub mod row_ext;
+mod sql;
 pub mod tls_mode;
 pub mod types;
 
@@ -129,3 +131,6 @@ pub use workflows::TenantBroker;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_pg;

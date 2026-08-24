@@ -134,18 +134,39 @@ impl DedupCache {
         self.insert(key)
     }
 
-    /// Remove expired entries from the cache
+    /// Remove expired entries from the cache.
+    ///
+    /// `insertion_order` is maintained in strict insertion order and every
+    /// entry shares the same fixed `ttl`, so the entry closest to expiring
+    /// is always at the front. Popping from the front while it is expired
+    /// is therefore equivalent to (and far cheaper than) scanning every
+    /// entry on every call: amortised O(1) rather than the O(n) full sweep
+    /// this used to perform via `HashMap::retain` on both `entries` and
+    /// `insertion_order` - on every single `contains`/`insert` call.
     fn cleanup_expired(&mut self) {
         let now = Instant::now();
         let ttl = self.ttl;
 
-        // Remove expired entries
-        self.entries
-            .retain(|_, entry| now.duration_since(entry.inserted_at) < ttl);
+        loop {
+            let should_pop = match self.insertion_order.front() {
+                Some(key) => match self.entries.get(key) {
+                    Some(entry) => now.duration_since(entry.inserted_at) >= ttl,
+                    // `insertion_order` and `entries` should always stay in
+                    // sync, but if a stale key were ever left behind, drop
+                    // it and keep scanning rather than getting stuck.
+                    None => true,
+                },
+                None => false,
+            };
 
-        // Clean up insertion order
-        self.insertion_order
-            .retain(|key| self.entries.contains_key(key));
+            if !should_pop {
+                break;
+            }
+
+            if let Some(key) = self.insertion_order.pop_front() {
+                self.entries.remove(&key);
+            }
+        }
     }
 
     /// Clear all entries from the cache
@@ -389,6 +410,38 @@ mod tests {
 
         // msg1 and msg2 have same content, should be deduplicated
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_dedup_cache_cleanup_expires_only_the_expired_prefix() {
+        // Regression: cleanup must lazily pop only the (already-expired)
+        // front of insertion_order rather than doing a full scan, and must
+        // still expire exactly the right entries - no more, no less.
+        let ttl = Duration::from_millis(50);
+        let mut cache = DedupCache::new(100, ttl);
+
+        // Insert three entries in order, then deterministically backdate
+        // the first two past the TTL (no real sleeping involved).
+        for i in 0..3 {
+            cache.insert(DedupKey::custom(format!("k{i}")));
+        }
+        for i in 0..2 {
+            let key = DedupKey::custom(format!("k{i}"));
+            if let Some(entry) = cache.entries.get_mut(&key) {
+                entry.inserted_at = Instant::now() - Duration::from_secs(10);
+            }
+        }
+        assert_eq!(cache.len(), 3);
+
+        // Triggering cleanup (via `contains`) must expire only the two
+        // backdated entries and stop as soon as it reaches the fresh one.
+        assert!(cache.contains(&DedupKey::custom("k2")));
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.entries.contains_key(&DedupKey::custom("k0")));
+        assert!(!cache.entries.contains_key(&DedupKey::custom("k1")));
+        assert!(cache.entries.contains_key(&DedupKey::custom("k2")));
+        // insertion_order must have been kept in sync with entries.
+        assert_eq!(cache.insertion_order.len(), 1);
     }
 
     #[test]

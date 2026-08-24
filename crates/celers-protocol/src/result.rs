@@ -118,19 +118,78 @@ impl std::str::FromStr for TaskStatus {
 }
 
 /// Exception information for failed tasks
+///
+/// This is Celery's exception dict, the value stored under the `result` key of
+/// a `FAILURE` meta record:
+///
+/// ```text
+/// {"exc_type": "ValueError", "exc_message": ["bad input"], "exc_module": "builtins"}
+/// ```
+///
+/// `celery.backends.base.Backend.exception_to_python` reads all three keys:
+/// `exc_module` + `exc_type` are used to import (or synthesize) the exception
+/// class, and `exc_message` is splatted into the constructor as `*args` -- which
+/// is why it is a **list** on the wire even for a single message.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ExceptionInfo {
-    /// Exception type name
+    /// Exception type name (e.g. `"ValueError"`)
     #[serde(rename = "exc_type")]
     pub exc_type: String,
 
-    /// Exception message
-    #[serde(rename = "exc_message")]
+    /// Exception message.
+    ///
+    /// Serialized as a one-element list to match Python's `exc.args`;
+    /// deserialization accepts both the list form and a bare string (joining a
+    /// multi-element list with `", "`).
+    #[serde(
+        rename = "exc_message",
+        serialize_with = "serialize_exc_message",
+        deserialize_with = "deserialize_exc_message"
+    )]
     pub exc_message: String,
 
+    /// Python module the exception class lives in (e.g. `"builtins"`).
+    ///
+    /// Required by `celery.utils.serialization.create_exception_cls` to
+    /// reconstruct the original exception type; a `null` makes Celery fall back
+    /// to a synthesized class. The key is always emitted, matching Celery's own
+    /// `prepare_exception` output.
+    #[serde(default)]
+    pub exc_module: Option<String>,
+
     /// Full traceback (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceback: Option<String>,
+}
+
+/// Serialize an exception message as Python's `exc.args` list.
+fn serialize_exc_message<S: serde::Serializer>(
+    message: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = serializer.serialize_seq(Some(1))?;
+    seq.serialize_element(message)?;
+    seq.end()
+}
+
+/// Deserialize an exception message from either the list or the string form.
+fn deserialize_exc_message<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(message) => Ok(message),
+        serde_json::Value::Array(items) => Ok(items
+            .iter()
+            .map(|item| match item {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")),
+        serde_json::Value::Null => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
 }
 
 impl ExceptionInfo {
@@ -139,6 +198,7 @@ impl ExceptionInfo {
         Self {
             exc_type: exc_type.into(),
             exc_message: exc_message.into(),
+            exc_module: None,
             traceback: None,
         }
     }
@@ -149,10 +209,59 @@ impl ExceptionInfo {
         self.traceback = Some(traceback.into());
         self
     }
+
+    /// Set the Python module the exception class belongs to.
+    ///
+    /// Use `"builtins"` for the standard Python exceptions (`ValueError`,
+    /// `RuntimeError`, ...) so that a Python client's `AsyncResult.get()`
+    /// re-raises the real type instead of a synthesized stand-in.
+    #[must_use]
+    pub fn with_exc_module(mut self, exc_module: impl Into<String>) -> Self {
+        self.exc_module = Some(exc_module.into());
+        self
+    }
+
+    /// Rebuild an [`ExceptionInfo`] from Celery's exception dict.
+    ///
+    /// Returns [`None`] when the value is not an exception dict (no `exc_type`
+    /// string), so an ordinary task result stored on a `FAILURE` record is left
+    /// untouched.
+    fn from_celery_value(value: &serde_json::Value) -> Option<Self> {
+        let object = value.as_object()?;
+        if !object
+            .get("exc_type")
+            .is_some_and(serde_json::Value::is_string)
+        {
+            return None;
+        }
+        serde_json::from_value(value.clone()).ok()
+    }
 }
 
 /// Task result message (Celery-compatible format)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// # Failure format
+///
+/// Celery's result backend stores a failed task as
+///
+/// ```text
+/// {"status": "FAILURE",
+///  "result": {"exc_type": "ValueError", "exc_message": ["bad input"], "exc_module": "builtins"},
+///  "traceback": "Traceback (most recent call last): ...",
+///  "children": []}
+/// ```
+///
+/// -- the exception dict lives **inside** `result`, because
+/// `AsyncResult.get()` calls `meta['result']` through `exception_to_python`.
+/// A record whose `result` is `null` therefore cannot re-raise anything on the
+/// Python side.
+///
+/// [`ResultMessage`] keeps the typed [`ResultMessage::exception`] field for
+/// Rust-side ergonomics *and* mirrors it into `result` when the status is
+/// [`TaskStatus::Failure`], so both consumers are served by one record.
+/// Deserialization reverses the mirroring: a `FAILURE` record whose `result`
+/// holds an exception dict is parsed back into the typed field.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResultMessage {
     /// Task ID
     pub task_id: Uuid,
@@ -161,52 +270,203 @@ pub struct ResultMessage {
     pub status: TaskStatus,
 
     /// Result value (for SUCCESS)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// On the wire this key also carries the exception dict for `FAILURE`; see
+    /// the type-level docs.
     pub result: Option<serde_json::Value>,
 
     /// Traceback (for FAILURE)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub traceback: Option<String>,
 
     /// Exception info (for FAILURE)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub exception: Option<ExceptionInfo>,
 
     /// Timestamp when result was created
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub date_done: Option<DateTime<Utc>>,
 
     /// Task name
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
 
     /// Worker that executed the task
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<String>,
 
     /// Retry count
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
 
     /// Parent task ID (for workflows)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
 
     /// Root task ID (for workflows)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub root_id: Option<Uuid>,
 
     /// Group ID (for grouped tasks)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<Uuid>,
 
     /// Children task IDs
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Uuid>,
 
     /// Additional metadata
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub meta: HashMap<String, serde_json::Value>,
+}
+
+/// Serialization shape of [`ResultMessage`].
+///
+/// Borrows from the live message; the only computed field is `result`, which
+/// carries the exception dict on `FAILURE`.
+#[derive(Serialize)]
+struct ResultMessageRepr<'a> {
+    task_id: &'a Uuid,
+    status: TaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<ResultField<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    traceback: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exception: Option<&'a ExceptionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    date_done: Option<&'a DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<&'a Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_id: Option<&'a Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_id: Option<&'a Uuid>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: &'a Vec<Uuid>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    meta: &'a HashMap<String, serde_json::Value>,
+}
+
+/// The `result` key: an exception dict for `FAILURE`, otherwise the value.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ResultField<'a> {
+    /// Celery's `{exc_type, exc_message, exc_module}` dict.
+    Exception(&'a ExceptionInfo),
+    /// An ordinary task return value.
+    Value(&'a serde_json::Value),
+}
+
+/// Deserialization shape of [`ResultMessage`].
+#[derive(Deserialize)]
+struct ResultMessageDe {
+    task_id: Uuid,
+    status: TaskStatus,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+    #[serde(default)]
+    traceback: Option<String>,
+    #[serde(default)]
+    exception: Option<ExceptionInfo>,
+    #[serde(default)]
+    date_done: Option<DateTime<Utc>>,
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    worker: Option<String>,
+    #[serde(default)]
+    retries: Option<u32>,
+    #[serde(default)]
+    parent_id: Option<Uuid>,
+    #[serde(default)]
+    root_id: Option<Uuid>,
+    #[serde(default)]
+    group_id: Option<Uuid>,
+    #[serde(default)]
+    children: Vec<Uuid>,
+    #[serde(default)]
+    meta: HashMap<String, serde_json::Value>,
+}
+
+impl Serialize for ResultMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // On FAILURE the exception dict *is* the result, which is what
+        // `AsyncResult.get()` feeds to `exception_to_python`.
+        let result = match (self.status, self.exception.as_ref()) {
+            (TaskStatus::Failure, Some(exception)) => Some(ResultField::Exception(exception)),
+            _ => self.result.as_ref().map(ResultField::Value),
+        };
+
+        // Celery keeps the traceback as a sibling string; fall back to the one
+        // captured on the exception so it is never silently dropped.
+        let traceback = self
+            .traceback
+            .as_ref()
+            .or_else(|| self.exception.as_ref().and_then(|e| e.traceback.as_ref()));
+
+        ResultMessageRepr {
+            task_id: &self.task_id,
+            status: self.status,
+            result,
+            traceback,
+            exception: self.exception.as_ref(),
+            date_done: self.date_done.as_ref(),
+            task: self.task.as_ref(),
+            worker: self.worker.as_ref(),
+            retries: self.retries,
+            parent_id: self.parent_id.as_ref(),
+            root_id: self.root_id.as_ref(),
+            group_id: self.group_id.as_ref(),
+            children: &self.children,
+            meta: &self.meta,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResultMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = ResultMessageDe::deserialize(deserializer)?;
+
+        let mut message = Self {
+            task_id: repr.task_id,
+            status: repr.status,
+            result: repr.result,
+            traceback: repr.traceback,
+            exception: repr.exception,
+            date_done: repr.date_done,
+            task: repr.task,
+            worker: repr.worker,
+            retries: repr.retries,
+            parent_id: repr.parent_id,
+            root_id: repr.root_id,
+            group_id: repr.group_id,
+            children: repr.children,
+            meta: repr.meta,
+        };
+
+        // Undo the failure mirroring: on the wire a FAILURE record carries the
+        // exception dict in `result`, whether it was written by Celery or by
+        // the `Serialize` impl above.
+        if message.status == TaskStatus::Failure {
+            if let Some(value) = message.result.take() {
+                match ExceptionInfo::from_celery_value(&value) {
+                    Some(mut exception) => {
+                        if message.exception.is_none() {
+                            // Celery keeps the traceback as a sibling key.
+                            if exception.traceback.is_none() {
+                                exception.traceback = message.traceback.clone();
+                            }
+                            message.exception = Some(exception);
+                        }
+                        // Otherwise `result` was just the mirror of the typed
+                        // `exception` field: drop it so the round-trip is
+                        // lossless.
+                    }
+                    // Not an exception dict -- keep it as an ordinary result.
+                    None => message.result = Some(value),
+                }
+            }
+        }
+
+        Ok(message)
+    }
 }
 
 impl ResultMessage {
@@ -248,6 +508,20 @@ impl ResultMessage {
     pub fn failure(task_id: Uuid, exc_type: &str, exc_message: &str) -> Self {
         Self {
             exception: Some(ExceptionInfo::new(exc_type, exc_message)),
+            date_done: Some(Utc::now()),
+            ..Self::new(task_id, TaskStatus::Failure)
+        }
+    }
+
+    /// Create a failure result from a fully-specified exception.
+    ///
+    /// Prefer this when the exception's Python module is known
+    /// ([`ExceptionInfo::with_exc_module`]), since it lets a Python client
+    /// re-raise the original exception type rather than a synthesized one.
+    pub fn failure_with_exception(task_id: Uuid, exception: ExceptionInfo) -> Self {
+        Self {
+            traceback: exception.traceback.clone(),
+            exception: Some(exception),
             date_done: Some(Utc::now()),
             ..Self::new(task_id, TaskStatus::Failure)
         }
@@ -650,6 +924,167 @@ mod tests {
         assert!(value.get("status").is_some());
         assert!(value.get("result").is_some());
         assert_eq!(value["status"], "SUCCESS");
+    }
+
+    /// Golden fixture: the meta record Celery's result backend writes for a
+    /// failed task (`celery.backends.base.Backend._get_result_meta`).
+    ///
+    /// Field semantics:
+    /// * `result` -- the **exception dict**, not `null`. `AsyncResult.get()`
+    ///   passes `meta['result']` to `exception_to_python`, so a failure whose
+    ///   `result` is null cannot re-raise anything.
+    /// * `exc_message` -- a list, because it is splatted into the exception
+    ///   constructor as `*args`.
+    /// * `exc_module` -- used by `create_exception_cls` to import the real
+    ///   exception class.
+    /// * `traceback` -- a plain string, a sibling of `result`.
+    const CELERY_FAILURE_META: &str = r#"{
+        "status": "FAILURE",
+        "result": {
+            "exc_type": "ValueError",
+            "exc_message": ["Invalid input"],
+            "exc_module": "builtins"
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"tasks.py\", line 7\nValueError: Invalid input",
+        "children": [],
+        "task_id": "6d5b1f1e-6a4f-4a3c-9b6c-1f8f5f1a2b3c",
+        "date_done": "2024-01-01T00:00:00Z"
+    }"#;
+
+    /// Regression: a failure written by CeleRS used to leave `result` at
+    /// `None` and put the exception in a separate `exception` key with
+    /// `exc_message` as a plain string and no `exc_module`, so a Python
+    /// `AsyncResult.get()` saw `result = None` and could not reconstruct the
+    /// exception.
+    #[test]
+    fn test_failure_serializes_in_celery_result_backend_format() {
+        let task_id = Uuid::new_v4();
+        let traceback = "Traceback (most recent call last):\n  File \"tasks.py\", line 7";
+        let result = ResultMessage::failure_with_exception(
+            task_id,
+            ExceptionInfo::new("ValueError", "Invalid input")
+                .with_exc_module("builtins")
+                .with_traceback(traceback),
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&result.to_json().expect("serialize")).expect("parse");
+
+        assert_eq!(value["status"], json!("FAILURE"));
+        // The exception dict lives *in* `result`.
+        assert_eq!(value["result"]["exc_type"], json!("ValueError"));
+        assert_eq!(value["result"]["exc_module"], json!("builtins"));
+        // `exc_message` is a list (Python's `exc.args`).
+        assert_eq!(value["result"]["exc_message"], json!(["Invalid input"]));
+        // The traceback is a sibling string.
+        assert_eq!(value["traceback"], json!(traceback));
+        assert_eq!(value["task_id"], json!(task_id.to_string()));
+    }
+
+    /// A traceback set only on the exception must still surface as the
+    /// top-level `traceback` key Celery reads.
+    #[test]
+    fn test_failure_traceback_is_never_dropped() {
+        let exception =
+            ExceptionInfo::new("RuntimeError", "boom").with_traceback("Traceback: boom");
+        let mut result = ResultMessage::new(Uuid::new_v4(), TaskStatus::Failure);
+        result.exception = Some(exception);
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&result.to_json().expect("serialize")).expect("parse");
+        assert_eq!(value["traceback"], json!("Traceback: boom"));
+    }
+
+    /// A failure record written by Python Celery must parse back into the
+    /// typed representation.
+    #[test]
+    fn test_parses_celery_failure_meta() {
+        let result = ResultMessage::from_json(CELERY_FAILURE_META.as_bytes())
+            .expect("a real Celery FAILURE meta must deserialize");
+
+        assert!(result.is_failure());
+        assert_eq!(
+            result.task_id,
+            Uuid::parse_str("6d5b1f1e-6a4f-4a3c-9b6c-1f8f5f1a2b3c").expect("uuid")
+        );
+
+        let exception = result.get_exception().expect("exception reconstructed");
+        assert_eq!(exception.exc_type, "ValueError");
+        // The one-element `exc_message` list collapses back to a string.
+        assert_eq!(exception.exc_message, "Invalid input");
+        assert_eq!(exception.exc_module.as_deref(), Some("builtins"));
+        // The sibling traceback is attached to the exception too.
+        assert!(exception
+            .traceback
+            .as_deref()
+            .is_some_and(|tb| tb.contains("ValueError: Invalid input")));
+
+        // `result` no longer holds the exception dict once it is typed.
+        assert_eq!(result.result, None);
+    }
+
+    /// A multi-argument Python exception (`exc.args` with several entries)
+    /// and the legacy bare-string form must both be accepted.
+    #[test]
+    fn test_exc_message_accepts_list_and_string_forms() {
+        let multi: ExceptionInfo = serde_json::from_str(
+            r#"{"exc_type":"TypeError","exc_message":["expected int","got str"],"exc_module":"builtins"}"#,
+        )
+        .expect("multi-arg exc_message must parse");
+        assert_eq!(multi.exc_message, "expected int, got str");
+
+        let legacy: ExceptionInfo =
+            serde_json::from_str(r#"{"exc_type":"ValueError","exc_message":"plain string"}"#)
+                .expect("legacy string exc_message must parse");
+        assert_eq!(legacy.exc_message, "plain string");
+        assert_eq!(legacy.exc_module, None);
+    }
+
+    /// The failure mirroring must be lossless in both directions.
+    #[test]
+    fn test_failure_round_trip_is_lossless() {
+        let original = ResultMessage::failure_with_traceback(
+            Uuid::new_v4(),
+            "RuntimeError",
+            "Test failed",
+            "Traceback (most recent call last): ...",
+        )
+        .with_task("tasks.process")
+        .with_worker("worker-1");
+
+        let decoded =
+            ResultMessage::from_json(&original.to_json().expect("serialize")).expect("deserialize");
+
+        assert_eq!(decoded, original);
+    }
+
+    /// A `FAILURE` record whose `result` is an ordinary value (not an
+    /// exception dict) must not be mistaken for an exception.
+    #[test]
+    fn test_failure_with_non_exception_result_is_preserved() {
+        let decoded = ResultMessage::from_json(
+            br#"{"task_id":"6d5b1f1e-6a4f-4a3c-9b6c-1f8f5f1a2b3c","status":"FAILURE","result":{"partial":42}}"#,
+        )
+        .expect("deserialize");
+
+        assert_eq!(decoded.exception, None);
+        assert_eq!(decoded.result, Some(json!({"partial": 42})));
+    }
+
+    /// Success records are untouched by the failure mirroring.
+    #[test]
+    fn test_success_result_is_the_plain_value() {
+        let result = ResultMessage::success(Uuid::new_v4(), json!({"answer": 42}));
+        let value: serde_json::Value =
+            serde_json::from_slice(&result.to_json().expect("serialize")).expect("parse");
+
+        assert_eq!(value["status"], json!("SUCCESS"));
+        assert_eq!(value["result"], json!({"answer": 42}));
+        assert!(value.get("exception").is_none());
+
+        let decoded =
+            ResultMessage::from_json(&result.to_json().expect("serialize")).expect("deserialize");
+        assert_eq!(decoded, result);
     }
 
     #[test]

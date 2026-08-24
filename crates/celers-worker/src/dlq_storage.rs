@@ -21,7 +21,7 @@ use async_trait::async_trait;
 #[allow(unused_imports)]
 use celers_core::{CelersError, Result, TaskId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 #[allow(unused_imports)]
@@ -65,6 +65,26 @@ pub trait DlqStorage: Send + Sync {
 
     /// Check storage health
     async fn health_check(&self) -> Result<bool>;
+
+    /// Remove and return the oldest entry, or `None` when the store is empty.
+    ///
+    /// Used to enforce a bounded dead-letter queue: when the cap is reached
+    /// the oldest entry makes room for the newest. The default implementation
+    /// scans for the entry with the smallest `dlq_timestamp`; backends with an
+    /// intrinsic ordering (a `VecDeque`, a Redis list, a `SERIAL` primary key)
+    /// should override it with an O(1) pop.
+    async fn evict_oldest(&self) -> Result<Option<DlqEntry>> {
+        let entries = self.get_all().await?;
+        let Some(oldest) = entries.into_iter().min_by_key(|e| e.dlq_timestamp) else {
+            return Ok(None);
+        };
+        if self.remove(&oldest.task_id).await? {
+            Ok(Some(oldest))
+        } else {
+            // Another writer took it first; nothing was evicted here.
+            Ok(None)
+        }
+    }
 }
 
 /// Statistics for a specific task type in the DLQ
@@ -99,15 +119,19 @@ impl TaskStats {
 }
 
 /// In-memory DLQ storage (non-persistent)
+///
+/// Backed by a [`VecDeque`] so that the oldest-first eviction a bounded DLQ
+/// performs ([`DlqStorage::evict_oldest`]) is O(1) rather than an O(n)
+/// `Vec::remove(0)`.
 pub struct MemoryDlqStorage {
-    entries: Arc<RwLock<Vec<DlqEntry>>>,
+    entries: Arc<RwLock<VecDeque<DlqEntry>>>,
 }
 
 impl MemoryDlqStorage {
     /// Create a new in-memory storage
     pub fn new() -> Self {
         Self {
-            entries: Arc::new(RwLock::new(Vec::new())),
+            entries: Arc::new(RwLock::new(VecDeque::new())),
         }
     }
 }
@@ -122,7 +146,7 @@ impl Default for MemoryDlqStorage {
 impl DlqStorage for MemoryDlqStorage {
     async fn add(&self, entry: DlqEntry) -> Result<()> {
         let mut entries = self.entries.write().await;
-        entries.push(entry);
+        entries.push_back(entry);
         Ok(())
     }
 
@@ -132,7 +156,7 @@ impl DlqStorage for MemoryDlqStorage {
     }
 
     async fn get_all(&self) -> Result<Vec<DlqEntry>> {
-        Ok(self.entries.read().await.clone())
+        Ok(self.entries.read().await.iter().cloned().collect())
     }
 
     async fn remove(&self, task_id: &TaskId) -> Result<bool> {
@@ -222,6 +246,11 @@ impl DlqStorage for MemoryDlqStorage {
     async fn health_check(&self) -> Result<bool> {
         // Memory storage is always healthy
         Ok(true)
+    }
+
+    async fn evict_oldest(&self) -> Result<Option<DlqEntry>> {
+        // Entries are appended in arrival order, so the front is the oldest.
+        Ok(self.entries.write().await.pop_front())
     }
 }
 
@@ -380,16 +409,11 @@ impl DlqStorage for RedisDlqStorage {
             })?;
 
         // Get entry first to know the task name
-        let entry = self.get(task_id).await?;
-        if entry.is_none() {
+        let Some(entry) = self.get(task_id).await? else {
             return Ok(false);
-        }
+        };
 
-        let task_name = entry
-            .expect("entry validated to be Some just above")
-            .task
-            .metadata
-            .name;
+        let task_name = entry.task.metadata.name;
         let task_key = self.task_key(task_id);
         let index_key = self.index_key();
         let task_name_index = self.task_name_index_key(&task_name);
@@ -949,7 +973,7 @@ impl DlqStorage for PostgresDlqStorage {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
+            .unwrap_or_default()
             .as_secs();
         let cutoff = now.saturating_sub(age_seconds);
 
@@ -1091,7 +1115,7 @@ impl DlqStorage for PostgresDlqStorage {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
+            .unwrap_or_default()
             .as_secs();
         let cutoff = now.saturating_sub(ttl_seconds);
 
@@ -1140,7 +1164,7 @@ impl DlqStorage for PostgresDlqStorage {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
+            .unwrap_or_default()
             .as_secs();
 
         let mut task_stats = HashMap::new();
@@ -1271,5 +1295,28 @@ mod tests {
     async fn test_memory_storage_health_check() {
         let storage = MemoryDlqStorage::new();
         assert!(storage.health_check().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_memory_storage_evicts_oldest_first() {
+        let storage = MemoryDlqStorage::new();
+
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let entry = create_test_entry();
+            ids.push(entry.task_id);
+            storage.add(entry).await.unwrap();
+        }
+
+        let evicted = storage
+            .evict_oldest()
+            .await
+            .unwrap()
+            .expect("store is not empty");
+        assert_eq!(evicted.task_id, ids[0], "eviction must be oldest-first");
+        assert_eq!(storage.size().await.unwrap(), 2);
+
+        storage.clear().await.unwrap();
+        assert!(storage.evict_oldest().await.unwrap().is_none());
     }
 }

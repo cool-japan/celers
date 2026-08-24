@@ -36,7 +36,7 @@
 //!     .with_priority(7);
 //!
 //! let wire = build_v5_message(&spec).expect("v5 build");
-//! let value = wire.to_wire_value();
+//! let value = wire.to_wire_value().expect("v5 render");
 //!
 //! // The protocol version is stamped, and priority is mirrored into headers.
 //! assert_eq!(value["headers"]["protocol_version"], json!("5"));
@@ -305,12 +305,18 @@ impl V5Message {
     /// `{headers, properties, content-type, content-encoding, body}` where
     /// `body` is the base64-encoded `[args, kwargs, embed]` tuple — identical in
     /// structure to v2, but carrying the v5-specific header stamps.
-    pub fn to_wire_value(&self) -> Value {
+    ///
+    /// Mirrors [`V5Message::to_wire_bytes`] in returning the serialization
+    /// error rather than a stand-in value: the documented usage pattern indexes
+    /// straight into the result (`value["headers"]["protocol_version"]`), and
+    /// indexing a `Value::Null` yields `Null` instead of failing, so a failed
+    /// render would masquerade as a valid-shaped but empty message.
+    pub fn to_wire_value(&self) -> Result<Value, V5BuildError> {
         // Lowering to `Message` and serializing guarantees the wire layout stays
         // byte-for-byte identical to the canonical envelope (same field renames,
         // same base64 body encoding) without duplicating that logic here.
         let message: Message = self.clone().into_message();
-        serde_json::to_value(&message).unwrap_or(Value::Null)
+        serde_json::to_value(&message).map_err(|e| V5BuildError::BodyEncoding(e.to_string()))
     }
 
     /// Render the message to on-the-wire JSON bytes.
@@ -568,7 +574,12 @@ mod tests {
             .build()
             .expect("v5 build must succeed");
 
-        let wire = msg.to_wire_value();
+        // Regression: this used to be an infallible `Value` that collapsed a
+        // serialization failure into `Value::Null`, which then answered every
+        // `wire["headers"][...]` index with `Null` instead of erroring.
+        let wire = msg
+            .to_wire_value()
+            .expect("rendering a well-formed v5 message must succeed");
 
         // Canonical Celery envelope fields.
         assert!(wire.get("headers").is_some());
@@ -582,8 +593,15 @@ mod tests {
         assert_eq!(wire["headers"]["delivery_priority"], json!(3));
         assert_eq!(wire["properties"]["priority"], json!(3));
         assert_eq!(wire["properties"]["correlation_id"], json!("corr-1"));
-        // Body is a base64 string (canonical body encoding).
+        // Body is a base64 string, and the envelope says so, which is what
+        // makes a kombu consumer decode it.
         assert!(wire["body"].is_string());
+        assert_eq!(wire["properties"]["body_encoding"], json!("base64"));
+
+        // `to_wire_value` and `to_wire_bytes` must agree.
+        let bytes = msg.to_wire_bytes().expect("wire bytes");
+        let parsed: Value = serde_json::from_slice(&bytes).expect("parse wire bytes");
+        assert_eq!(parsed, wire);
     }
 
     #[test]

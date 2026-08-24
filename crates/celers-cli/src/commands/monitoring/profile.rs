@@ -276,10 +276,7 @@ pub async fn profile_resources(
         }
         _ => 0,
     };
-    let worker_keys: Vec<String> = redis::cmd("KEYS")
-        .arg("celers:worker:*:heartbeat")
-        .query_async(&mut conn)
-        .await?;
+    let worker_keys = scan_worker_heartbeat_keys(&mut conn).await?;
     let dlq_size: u64 = redis::cmd("LLEN")
         .arg(format!("{queue_key}:dlq"))
         .query_async(&mut conn)

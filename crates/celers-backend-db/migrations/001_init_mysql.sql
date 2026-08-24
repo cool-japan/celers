@@ -14,6 +14,14 @@ CREATE TABLE IF NOT EXISTS celers_task_results (
     completed_at TIMESTAMP NULL,
     worker VARCHAR(255),
     expires_at TIMESTAMP NULL,
+    -- Serialized tail of TaskMeta not covered by a dedicated column above
+    -- (progress, version, tags, metadata, worker_hostname, runtime_ms,
+    -- memory_bytes, retries, queue) -- see `task_meta_extra.rs`. Databases
+    -- migrated before this column existed get it added in Rust code (see
+    -- `MysqlResultBackend::migrate`'s `information_schema.columns` check)
+    -- rather than an `ADD COLUMN IF NOT EXISTS` here, since that syntax
+    -- requires MySQL 8.0.29+/newer MariaDB and this schema targets 5.7+.
+    extra JSON,
     CONSTRAINT chk_result_state CHECK (result_state IN ('pending', 'started', 'success', 'failure', 'revoked', 'retry'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

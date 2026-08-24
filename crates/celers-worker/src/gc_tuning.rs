@@ -310,25 +310,27 @@ impl GcTuner {
         }
 
         let window = Duration::from_secs(self.config.rate_window_secs);
-        let cutoff = Instant::now() - window;
+        // `Instant` subtraction panics if the result would be earlier than
+        // the earliest representable instant -- reachable in practice
+        // because `Instant`'s origin is platform-defined (e.g. boot time on
+        // Linux) and `rate_window_secs` is operator-supplied. A `None` from
+        // `checked_sub` means the configured window covers the whole
+        // process lifetime, so every sample counts as "recent" rather than
+        // panicking the allocation-rate calculation.
+        let recent_samples: Vec<_> = match Instant::now().checked_sub(window) {
+            Some(cutoff) => samples.iter().filter(|s| s.timestamp > cutoff).collect(),
+            None => samples.iter().collect(),
+        };
 
-        let recent_samples: Vec<_> = samples.iter().filter(|s| s.timestamp > cutoff).collect();
-
-        if recent_samples.is_empty() {
+        // Avoid the two guarded `expect`s (COOLJAPAN no-expect policy) by
+        // pattern-matching instead of relying on the preceding
+        // `is_empty()` check to justify the invariant.
+        let (Some(first), Some(last)) = (recent_samples.first(), recent_samples.last()) else {
             return 0.0;
-        }
+        };
 
         let total_bytes: usize = recent_samples.iter().map(|s| s.size).sum();
-        let duration = recent_samples
-            .last()
-            .expect("recent_samples validated to be non-empty")
-            .timestamp
-            .duration_since(
-                recent_samples
-                    .first()
-                    .expect("recent_samples validated to be non-empty")
-                    .timestamp,
-            );
+        let duration = last.timestamp.duration_since(first.timestamp);
 
         if duration.as_secs_f64() == 0.0 {
             return 0.0;
@@ -572,6 +574,42 @@ mod tests {
 
         let stats = tuner.get_stats().await;
         assert_eq!(stats.gc_recommendations, 1);
+    }
+
+    /// Regression test: `Instant::now() - window` panics if the result
+    /// would be earlier than the earliest representable `Instant`.
+    /// `Instant`'s origin is platform-defined (e.g. boot time on Linux),
+    /// so an operator-supplied `rate_window_secs` that is astronomically
+    /// large (or even just larger than the process/machine uptime) must
+    /// not be able to panic the allocation-rate calculation. We inject
+    /// samples directly (bypassing the `tokio::spawn` inside
+    /// `record_allocation`, which is racy to await deterministically) to
+    /// exercise `calculate_allocation_rate` precisely.
+    #[tokio::test]
+    async fn test_allocation_rate_extreme_window_does_not_panic() {
+        let config = GcConfig {
+            rate_window_secs: u64::MAX,
+            ..Default::default()
+        };
+        let tuner = GcTuner::new(config);
+
+        {
+            let mut samples = tuner.allocation_samples.write().await;
+            samples.push(AllocationSample {
+                timestamp: Instant::now(),
+                size: 100,
+            });
+            samples.push(AllocationSample {
+                timestamp: Instant::now(),
+                size: 200,
+            });
+        }
+
+        // Must not panic: `Instant::now() - Duration::from_secs(u64::MAX)`
+        // would underflow the monotonic clock's representable range on
+        // every real machine.
+        let rate = tuner.calculate_allocation_rate().await;
+        assert!(rate >= 0.0);
     }
 
     #[tokio::test]

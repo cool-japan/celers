@@ -2,7 +2,7 @@
 
 use celers_core::{CelersError, Result, TaskId};
 use chrono::Utc;
-use oxisql_core::{Connection, ToSqlValue};
+use oxisql_core::ToSqlValue;
 use std::time::Duration;
 
 use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};

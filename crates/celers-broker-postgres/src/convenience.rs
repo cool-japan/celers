@@ -1,7 +1,7 @@
 //! Convenience helper methods for common patterns
 
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
-use oxisql_core::{Connection, ToSqlValue};
+use oxisql_core::ToSqlValue;
 use std::time::Duration;
 
 use crate::row_ext::{uuid_from_row, uuid_param, RowExt};
@@ -359,25 +359,23 @@ impl PostgresBroker {
         max_priority: i32,
         limit: i64,
     ) -> Result<Vec<TaskInfo>> {
-        // `self.queue_name` is spliced here as a TABLE NAME (pre-existing
-        // `queue_name`-as-table-name schema drift documented in
-        // `broker_core.rs`'s field doc comment / TODO.md), not as a bound
-        // value — this is static-text splicing, not user-data interpolation,
-        // and is preserved byte-for-byte from the pre-migration
-        // `sqlx::AssertSqlSafe(format!(...))` version. `sqlx::AssertSqlSafe`
-        // itself drops away: oxisql's `query` takes `&str` directly.
-        let query_str = format!(
-            "SELECT id, task_name, state, priority, retry_count, max_retries,
+        // `self.queue_name` is a queue LABEL, not a table name. It used to be
+        // spliced into the FROM clause, which pointed the statement at a
+        // table that does not exist; it is now a bound predicate against the
+        // real `queue_name` column added by migration 007.
+        let query_str = "SELECT id, task_name, state, priority, retry_count, max_retries,
                         created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-                 FROM {}
-                 WHERE priority BETWEEN $1 AND $2 AND state = 'pending'
+                 FROM celers_tasks
+                 WHERE queue_name = $1
+                   AND priority BETWEEN $2 AND $3 AND state = 'pending'
                  ORDER BY priority DESC, created_at ASC
-                 LIMIT $3",
-            self.queue_name
-        );
+                 LIMIT $4";
         let rows = self
             .conn
-            .query(&query_str, &[&min_priority, &max_priority, &limit])
+            .query(
+                query_str,
+                &[&self.queue_name, &min_priority, &max_priority, &limit],
+            )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to find tasks by priority: {}", e)))?;
 
@@ -408,17 +406,15 @@ impl PostgresBroker {
             - chrono::Duration::from_std(older_than)
                 .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
 
-        // Same table-name splice as `find_tasks_by_priority_range` above;
-        // `cutoff` (the actual user-relevant value) is still bound as `$1`.
-        let query_str = format!(
-            "UPDATE {} SET state = 'cancelled', completed_at = NOW()
-                 WHERE state = 'pending' AND created_at < $1::text::timestamptz",
-            self.queue_name
-        );
+        // Queue-scoped by bound label, not by table name — see
+        // `find_tasks_by_priority_range` above.
+        let query_str = "UPDATE celers_tasks SET state = 'cancelled', completed_at = NOW()
+                 WHERE queue_name = $1
+                   AND state = 'pending' AND created_at < $2::text::timestamptz";
         let cutoff_param = cutoff.to_rfc3339();
         let rows_affected = self
             .conn
-            .execute(&query_str, &[&cutoff_param])
+            .execute(query_str, &[&self.queue_name, &cutoff_param])
             .await
             .map_err(|e| CelersError::Other(format!("Cancel old pending failed: {}", e)))?;
 
@@ -445,20 +441,21 @@ impl PostgresBroker {
         }
 
         // `id = ANY($1)` -> `IN ($1, .., $N)` rewrite (oxisql has no array
-        // `ToSqlValue`); `self.queue_name` splice is the same pre-existing
-        // table-name convention as above, now at the tail since the `IN`
-        // placeholders occupy the leading `$n` slots.
+        // `ToSqlValue`). The queue label is bound in the trailing slot, after
+        // the `IN` placeholders — it is a value, never a table name.
         let placeholders = in_clause_placeholders(1, task_ids.len());
+        let queue_idx = task_ids.len() + 1;
         let query_str = format!(
-            "UPDATE {} SET state = 'cancelled', completed_at = NOW()
-                 WHERE id IN ({}) AND state IN ('pending', 'processing')",
-            self.queue_name, placeholders
+            "UPDATE celers_tasks SET state = 'cancelled', completed_at = NOW()
+                 WHERE id IN ({placeholders}) AND queue_name = ${queue_idx}
+                   AND state IN ('pending', 'processing')"
         );
         let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
-        let param_refs: Vec<&dyn ToSqlValue> = task_id_params
+        let mut param_refs: Vec<&dyn ToSqlValue> = task_id_params
             .iter()
             .map(|p| p as &dyn ToSqlValue)
             .collect();
+        param_refs.push(&self.queue_name);
         let rows_affected = self
             .conn
             .execute(&query_str, &param_refs)
@@ -487,18 +484,16 @@ impl PostgresBroker {
             - chrono::Duration::from_std(threshold)
                 .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
 
-        let query_str = format!(
-            "SELECT id, task_name, state, priority, retry_count, max_retries,
+        let query_str = "SELECT id, task_name, state, priority, retry_count, max_retries,
                         created_at, scheduled_at, started_at, completed_at, worker_id, error_message
-                 FROM {}
-                 WHERE state = 'processing' AND started_at < $1::text::timestamptz
-                 ORDER BY started_at ASC",
-            self.queue_name
-        );
+                 FROM celers_tasks
+                 WHERE queue_name = $1
+                   AND state = 'processing' AND started_at < $2::text::timestamptz
+                 ORDER BY started_at ASC";
         let cutoff_param = cutoff.to_rfc3339();
         let rows = self
             .conn
-            .query(&query_str, &[&cutoff_param])
+            .query(query_str, &[&self.queue_name, &cutoff_param])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to find stuck tasks: {}", e)))?;
 
@@ -531,15 +526,14 @@ impl PostgresBroker {
             - chrono::Duration::from_std(threshold)
                 .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
 
-        let query_str = format!(
-            "UPDATE {} SET state = 'pending', started_at = NULL, worker_id = NULL
-                 WHERE state = 'processing' AND started_at < $1::text::timestamptz",
-            self.queue_name
-        );
+        let query_str =
+            "UPDATE celers_tasks SET state = 'pending', started_at = NULL, worker_id = NULL
+                 WHERE queue_name = $1
+                   AND state = 'processing' AND started_at < $2::text::timestamptz";
         let cutoff_param = cutoff.to_rfc3339();
         let rows_affected = self
             .conn
-            .execute(&query_str, &[&cutoff_param])
+            .execute(query_str, &[&self.queue_name, &cutoff_param])
             .await
             .map_err(|e| CelersError::Other(format!("Requeue stuck tasks failed: {}", e)))?;
 
@@ -563,17 +557,14 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_queue_depth_by_priority(&self) -> Result<std::collections::HashMap<i32, i64>> {
-        let query_str = format!(
-            "SELECT priority, COUNT(*) as count
-                 FROM {}
-                 WHERE state = 'pending'
+        let query_str = "SELECT priority, COUNT(*) as count
+                 FROM celers_tasks
+                 WHERE queue_name = $1 AND state = 'pending'
                  GROUP BY priority
-                 ORDER BY priority DESC",
-            self.queue_name
-        );
+                 ORDER BY priority DESC";
         let rows = self
             .conn
-            .query(&query_str, &[])
+            .query(query_str, &[&self.queue_name])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get queue depth: {}", e)))?;
 
@@ -614,13 +605,14 @@ impl PostgresBroker {
         // `.unwrap_or(0)` on error (silently swallowing failures); preserved
         // exactly via `.ok()` + `.and_then(...)` + `.unwrap_or(0)` below.
         let one_hour_ago_param = one_hour_ago.to_rfc3339();
-        let last_hour_query = format!(
-            "SELECT COUNT(*) FROM {} WHERE state = 'completed' AND completed_at > $1::text::timestamptz",
-            self.queue_name
-        );
+        let completed_since_query = "SELECT COUNT(*) FROM celers_tasks \
+             WHERE queue_name = $1 AND state = 'completed' AND completed_at > $2::text::timestamptz";
         let last_hour: i64 = self
             .conn
-            .query(&last_hour_query, &[&one_hour_ago_param])
+            .query(
+                completed_since_query,
+                &[&self.queue_name, &one_hour_ago_param],
+            )
             .await
             .ok()
             .and_then(|rows| rows.into_iter().next())
@@ -629,13 +621,12 @@ impl PostgresBroker {
 
         // Tasks completed in last day
         let one_day_ago_param = one_day_ago.to_rfc3339();
-        let last_day_query = format!(
-            "SELECT COUNT(*) FROM {} WHERE state = 'completed' AND completed_at > $1::text::timestamptz",
-            self.queue_name
-        );
         let last_day: i64 = self
             .conn
-            .query(&last_day_query, &[&one_day_ago_param])
+            .query(
+                completed_since_query,
+                &[&self.queue_name, &one_day_ago_param],
+            )
             .await
             .ok()
             .and_then(|rows| rows.into_iter().next())
@@ -671,18 +662,16 @@ impl PostgresBroker {
     pub async fn get_avg_task_duration_by_name(
         &self,
     ) -> Result<std::collections::HashMap<String, f64>> {
-        let query_str = format!(
-            "SELECT task_name,
+        let query_str = "SELECT task_name,
                         AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) as avg_duration_ms
-                 FROM {}
-                 WHERE state = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                 FROM celers_tasks
+                 WHERE queue_name = $1
+                   AND state = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
                  GROUP BY task_name
-                 ORDER BY avg_duration_ms DESC",
-            self.queue_name
-        );
+                 ORDER BY avg_duration_ms DESC";
         let rows = self
             .conn
-            .query(&query_str, &[])
+            .query(query_str, &[&self.queue_name])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get avg duration: {}", e)))?;
 
@@ -1320,7 +1309,9 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_dlq_stats_by_task(&self) -> Result<std::collections::HashMap<String, i64>> {
-        // TODO(queue-name-drift): also filters on a queue_name column celers_dead_letter_queue doesn't have — see TODO.md
+        // `queue_name` is a real column on `celers_dead_letter_queue` as of
+        // migration 007 (backfilled from the legacy `metadata->>'queue'`
+        // label), and `move_to_dlq()` carries it across from `celers_tasks`.
         let rows = self
             .conn
             .query(
@@ -1370,7 +1361,9 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_dlq_error_patterns(&self, limit: i64) -> Result<Vec<(Option<String>, i64)>> {
-        // TODO(queue-name-drift): also filters on a queue_name column celers_dead_letter_queue doesn't have — see TODO.md
+        // `queue_name` is a real column on `celers_dead_letter_queue` as of
+        // migration 007 (backfilled from the legacy `metadata->>'queue'`
+        // label), and `move_to_dlq()` carries it across from `celers_tasks`.
         let rows = self
             .conn
             .query(
@@ -1420,7 +1413,9 @@ impl PostgresBroker {
     /// # }
     /// ```
     pub async fn get_recent_dlq_tasks(&self, window_secs: i64) -> Result<Vec<DlqTaskInfo>> {
-        // TODO(queue-name-drift): also filters on a queue_name column celers_dead_letter_queue doesn't have — see TODO.md
+        // `queue_name` is a real column on `celers_dead_letter_queue` as of
+        // migration 007 (backfilled from the legacy `metadata->>'queue'`
+        // label), and `move_to_dlq()` carries it across from `celers_tasks`.
         let rows = self
             .conn
             .query(

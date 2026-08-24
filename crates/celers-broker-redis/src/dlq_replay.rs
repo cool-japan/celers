@@ -30,19 +30,24 @@
 //! let policy = ReplayPolicy::rate_limited(10, Duration::from_secs(60));
 //! scheduler.add_policy("gradual", policy).await?;
 //!
-//! // Start the scheduler
+//! // Start the scheduler. `run`/`stop` both take `&self`, so `stop()` can be
+//! // called from another handle to the same (e.g. `Arc`-shared) scheduler
+//! // while `run()` is executing on a spawned task.
 //! scheduler.run().await?;
 //! # Ok(())
 //! # }
 //! ```
 
+use crate::QueueMode;
 use celers_core::{CelersError, Result, SerializedTask, TaskState};
-use redis::{AsyncCommands, Client};
+use redis::{AsyncCommands, Client, Script};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, sleep};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Extract the human-readable failure reason recorded on a task, if any.
 ///
@@ -144,14 +149,42 @@ impl FailureKind {
     }
 }
 
+/// A named, registrable predicate for [`ReplayCondition::Custom`].
+type CustomPredicate = Arc<dyn Fn(&SerializedTask) -> bool + Send + Sync>;
+
 /// DLQ replay policy scheduler
-#[derive(Debug)]
 pub struct ReplayScheduler {
     client: Client,
     queue_name: String,
     dlq_key: String,
+    /// Must match the mode of the queue being replayed into: a `Priority`
+    /// queue is a Redis sorted set, so replay must `ZADD` rather than
+    /// `RPUSH` (which fails with `WRONGTYPE` against a sorted set).
+    mode: QueueMode,
     policies: HashMap<String, ReplayPolicy>,
-    running: bool,
+    /// Registry backing [`ReplayCondition::Custom`] — see
+    /// [`Self::register_predicate`].
+    predicates: HashMap<String, CustomPredicate>,
+    /// How often [`Self::run`] wakes up to call [`Self::execute_once`].
+    poll_interval: Duration,
+    running: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for ReplayScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayScheduler")
+            .field("queue_name", &self.queue_name)
+            .field("dlq_key", &self.dlq_key)
+            .field("mode", &self.mode)
+            .field("policies", &self.policies)
+            .field(
+                "registered_predicates",
+                &self.predicates.keys().collect::<Vec<_>>(),
+            )
+            .field("poll_interval", &self.poll_interval)
+            .field("running", &self.running.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 /// Replay policy configuration
@@ -211,7 +244,9 @@ pub enum ReplayCondition {
     All(Vec<ReplayCondition>),
     /// Match any condition (OR)
     Any(Vec<ReplayCondition>),
-    /// Custom predicate (serialized as string)
+    /// Custom predicate, looked up by name in the owning
+    /// [`ReplayScheduler`]'s predicate registry — see
+    /// [`ReplayScheduler::register_predicate`].
     Custom(String),
 }
 
@@ -315,8 +350,36 @@ impl ReplayPolicy {
 }
 
 impl ReplayCondition {
-    /// Check if a task matches this condition
-    pub fn matches(&self, task: &SerializedTask) -> bool {
+    /// Collect every `Custom` predicate name referenced anywhere within this
+    /// condition (recursing into `All`/`Any`).
+    fn custom_predicate_names(&self, out: &mut Vec<String>) {
+        match self {
+            ReplayCondition::Custom(name) => out.push(name.clone()),
+            ReplayCondition::All(conditions) | ReplayCondition::Any(conditions) => {
+                for c in conditions {
+                    c.custom_predicate_names(out);
+                }
+            }
+            ReplayCondition::ErrorType(_) | ReplayCondition::TaskName(_) => {}
+        }
+    }
+
+    /// Check if a task matches this condition.
+    ///
+    /// `predicates` is the registry of named callables backing
+    /// [`ReplayCondition::Custom`] (see
+    /// [`ReplayScheduler::register_predicate`]). A `Custom` name with no
+    /// registered predicate is treated as non-matching (and logged) rather
+    /// than panicking or silently succeeding —
+    /// [`ReplayScheduler::add_policy`] is the primary enforcement point and
+    /// rejects a policy referencing an unknown name *before* it is ever
+    /// evaluated here; this is a defensive fallback for a predicate that was
+    /// unregistered after a policy referencing it was already added.
+    pub fn matches(
+        &self,
+        task: &SerializedTask,
+        predicates: &HashMap<String, CustomPredicate>,
+    ) -> bool {
         match self {
             ReplayCondition::ErrorType(error_type) => {
                 // Match against the recorded failure reason (the real error
@@ -331,19 +394,92 @@ impl ReplayCondition {
                 task.metadata.name.to_lowercase().contains(&needle)
             }
             ReplayCondition::TaskName(pattern) => task.metadata.name.contains(pattern),
-            ReplayCondition::All(conditions) => conditions.iter().all(|c| c.matches(task)),
-            ReplayCondition::Any(conditions) => conditions.iter().any(|c| c.matches(task)),
-            ReplayCondition::Custom(_) => {
-                // Custom predicates would be evaluated here
-                false
+            ReplayCondition::All(conditions) => {
+                conditions.iter().all(|c| c.matches(task, predicates))
             }
+            ReplayCondition::Any(conditions) => {
+                conditions.iter().any(|c| c.matches(task, predicates))
+            }
+            ReplayCondition::Custom(name) => match predicates.get(name) {
+                Some(predicate) => predicate(task),
+                None => {
+                    warn!(
+                        "ReplayCondition::Custom(\"{name}\") has no registered predicate — \
+                         treating as non-match. This should have been caught by \
+                         ReplayScheduler::add_policy at registration time."
+                    );
+                    false
+                }
+            },
         }
     }
 }
 
+/// Outcome of attempting to move one DLQ entry into the live queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayOutcome {
+    /// Moved from the DLQ into the live queue.
+    Replayed,
+    /// The exact entry was no longer present in the DLQ (already moved by a
+    /// concurrent replay, or already removed) — not an error.
+    NotFound,
+    /// The per-policy retry budget (`ReplayPolicy::max_retries`) for this
+    /// task has already been spent; left in the DLQ untouched.
+    Exhausted,
+}
+
+/// Atomically gate on the per-`(policy, task)` retry budget, then move a DLQ
+/// entry into the live queue.
+///
+/// `KEYS[1]` = DLQ key, `KEYS[2]` = destination queue key, `KEYS[3]` =
+/// per-policy replay-attempts hash key. `ARGV[1]` = the exact DLQ entry
+/// payload, `ARGV[2]` = `"1"` for priority mode (`ZADD`) or `"0"` for FIFO
+/// (`RPUSH`), `ARGV[3]` = the ZADD score (ignored in FIFO mode), `ARGV[4]` =
+/// the task id (attempts-hash field), `ARGV[5]` = max retries.
+///
+/// Returns `1` (replayed), `0` (entry not found in the DLQ — a concurrent
+/// replay already claimed it), or `-1` (retry budget exhausted). Doing the
+/// budget check, the `LREM`, the attempt-count increment, and the
+/// destination push in one `EVAL` is what makes this atomic: unlike a
+/// separate `RPUSH` followed by a separate `LREM`, there is no window in
+/// which a task could be duplicated (present in both the DLQ and the live
+/// queue) or double-counted against its retry budget.
+const REPLAY_MOVE_SCRIPT: &str = r#"
+local attempts = tonumber(redis.call('HGET', KEYS[3], ARGV[4]) or '0')
+if attempts >= tonumber(ARGV[5]) then
+    return -1
+end
+local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+if removed == 0 then
+    return 0
+end
+redis.call('HINCRBY', KEYS[3], ARGV[4], 1)
+if ARGV[2] == '1' then
+    redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+else
+    redis.call('RPUSH', KEYS[2], ARGV[1])
+end
+return 1
+"#;
+
 impl ReplayScheduler {
-    /// Create a new replay scheduler
+    /// Create a new replay scheduler for a FIFO-mode queue.
+    ///
+    /// Use [`Self::with_mode`] for a queue running in
+    /// [`QueueMode::Priority`] — replaying into a priority queue with FIFO
+    /// semantics issues `RPUSH` against what is actually a Redis sorted set,
+    /// which fails with `WRONGTYPE`.
     pub async fn new(redis_url: &str, queue_name: &str) -> Result<Self> {
+        Self::with_mode(redis_url, queue_name, QueueMode::Fifo).await
+    }
+
+    /// Create a new replay scheduler for a queue running in `mode`.
+    ///
+    /// `mode` must match the mode the target queue actually uses (the same
+    /// value passed to `RedisBroker::with_mode`), since a `Priority` queue
+    /// is a Redis sorted set and replay must `ZADD` into it rather than
+    /// `RPUSH`.
+    pub async fn with_mode(redis_url: &str, queue_name: &str, mode: QueueMode) -> Result<Self> {
         let client = Client::open(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
@@ -351,13 +487,57 @@ impl ReplayScheduler {
             client,
             queue_name: queue_name.to_string(),
             dlq_key: format!("{}:dlq", queue_name),
+            mode,
             policies: HashMap::new(),
-            running: false,
+            predicates: HashMap::new(),
+            poll_interval: Duration::from_secs(60),
+            running: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Add a replay policy
+    /// Set how often [`Self::run`] wakes up to execute policies (default: 60s).
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    /// Register a named predicate usable by `ReplayCondition::Custom(name)`.
+    ///
+    /// Must be called before [`Self::add_policy`] for any policy
+    /// referencing `name` — `add_policy` validates every `Custom` name
+    /// against this registry and returns `Err` for one that is not yet
+    /// registered, instead of silently accepting a policy that could never
+    /// match anything.
+    pub fn register_predicate<F>(&mut self, name: &str, predicate: F)
+    where
+        F: Fn(&SerializedTask) -> bool + Send + Sync + 'static,
+    {
+        self.predicates
+            .insert(name.to_string(), Arc::new(predicate));
+    }
+
+    /// Add a replay policy.
+    ///
+    /// Returns `Err` if `policy` is a [`ReplayPolicyType::Conditional`]
+    /// whose condition references a [`ReplayCondition::Custom`] name that
+    /// has not been registered via [`Self::register_predicate`] — this
+    /// makes an unknown predicate name fail loudly at registration time
+    /// rather than silently evaluating to "never matches" forever.
     pub async fn add_policy(&mut self, name: &str, policy: ReplayPolicy) -> Result<()> {
+        if let ReplayPolicyType::Conditional { condition, .. } = &policy.policy_type {
+            let mut custom_names = Vec::new();
+            condition.custom_predicate_names(&mut custom_names);
+            for predicate_name in custom_names {
+                if !self.predicates.contains_key(&predicate_name) {
+                    return Err(CelersError::Broker(format!(
+                        "Policy '{}' references unregistered custom replay predicate '{}': \
+                         call register_predicate(\"{}\", ...) before adding this policy",
+                        name, predicate_name, predicate_name
+                    )));
+                }
+            }
+        }
+
         self.policies.insert(name.to_string(), policy);
         debug!("Added replay policy: {}", name);
         Ok(())
@@ -423,20 +603,25 @@ impl ReplayScheduler {
         Ok(results)
     }
 
-    /// Run the scheduler continuously
-    pub async fn run(&mut self) -> Result<()> {
-        self.running = true;
+    /// Run the scheduler continuously.
+    ///
+    /// Takes `&self` (not `&mut self`) specifically so [`Self::stop`] can be
+    /// called from a different handle to the same scheduler (e.g. wrap it in
+    /// an `Arc`, clone the `Arc` before spawning `run()` on a task, and call
+    /// `stop()` on the original) while `run()` is executing.
+    pub async fn run(&self) -> Result<()> {
+        self.running.store(true, Ordering::SeqCst);
         info!(
             "Starting DLQ replay scheduler for queue: {}",
             self.queue_name
         );
 
-        let mut tick = interval(Duration::from_secs(60)); // Check every minute
+        let mut tick = interval(self.poll_interval);
 
         loop {
             tick.tick().await;
 
-            if !self.running {
+            if !self.running.load(Ordering::SeqCst) {
                 break;
             }
 
@@ -448,10 +633,15 @@ impl ReplayScheduler {
         Ok(())
     }
 
-    /// Stop the scheduler
-    pub fn stop(&mut self) {
-        self.running = false;
+    /// Stop the scheduler. See [`Self::run`] for why this takes `&self`.
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
         info!("Stopping DLQ replay scheduler");
+    }
+
+    /// Whether the scheduler is currently (or was most recently) running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
     }
 
     /// Execute a specific policy
@@ -481,37 +671,116 @@ impl ReplayScheduler {
 
         match &policy.policy_type {
             ReplayPolicyType::TimeBased { delay, max_age } => {
-                self.execute_time_based(&mut conn, name, *delay, *max_age, start)
-                    .await
+                self.execute_time_based(
+                    &mut conn,
+                    name,
+                    policy.max_retries,
+                    *delay,
+                    *max_age,
+                    start,
+                )
+                .await
             }
             ReplayPolicyType::Conditional { condition, delay } => {
-                self.execute_conditional(&mut conn, name, condition, *delay, start)
-                    .await
+                self.execute_conditional(
+                    &mut conn,
+                    name,
+                    condition,
+                    policy.max_retries,
+                    *delay,
+                    start,
+                )
+                .await
             }
             ReplayPolicyType::RateLimited {
                 max_tasks_per_window,
                 window,
             } => {
-                self.execute_rate_limited(&mut conn, name, *max_tasks_per_window, *window, start)
-                    .await
+                self.execute_rate_limited(
+                    &mut conn,
+                    name,
+                    policy.max_retries,
+                    *max_tasks_per_window,
+                    *window,
+                    start,
+                )
+                .await
             }
             ReplayPolicyType::Smart {
                 adaptive,
                 base_delay,
             } => {
-                self.execute_smart(&mut conn, name, *adaptive, *base_delay, start)
-                    .await
+                self.execute_smart(
+                    &mut conn,
+                    name,
+                    policy.max_retries,
+                    *adaptive,
+                    *base_delay,
+                    start,
+                )
+                .await
             }
         }
     }
 
-    /// Execute time-based replay
+    /// Atomically move one DLQ entry (`raw`, the exact serialized payload
+    /// present in the DLQ list) into the live queue, respecting queue mode,
+    /// the per-policy retry budget, and DLQ/queue consistency. See
+    /// [`REPLAY_MOVE_SCRIPT`].
+    async fn move_dlq_entry_to_queue(
+        &self,
+        conn: &mut redis::aio::MultiplexedConnection,
+        policy_name: &str,
+        raw: &str,
+        task: &SerializedTask,
+        max_retries: usize,
+    ) -> Result<ReplayOutcome> {
+        let attempts_key = format!("{}:dlq:replay_attempts:{}", self.queue_name, policy_name);
+        let is_priority = matches!(self.mode, QueueMode::Priority);
+        // Mirrors `RedisBroker::enqueue`'s scoring convention: negate
+        // priority so a higher-priority task sorts first (ZSET pops lowest
+        // score first).
+        let score = -(task.metadata.priority as f64);
+
+        let script = Script::new(REPLAY_MOVE_SCRIPT);
+        let result: i64 = script
+            .key(&self.dlq_key)
+            .key(&self.queue_name)
+            .key(&attempts_key)
+            .arg(raw)
+            .arg(if is_priority { "1" } else { "0" })
+            .arg(score)
+            .arg(task.metadata.id.to_string())
+            .arg(max_retries)
+            .invoke_async(conn)
+            .await
+            .map_err(|e| {
+                CelersError::Broker(format!("Failed to move DLQ entry to queue: {}", e))
+            })?;
+
+        Ok(match result {
+            1 => ReplayOutcome::Replayed,
+            0 => ReplayOutcome::NotFound,
+            _ => ReplayOutcome::Exhausted,
+        })
+    }
+
+    /// Execute time-based replay.
+    ///
+    /// Honors `delay` (a task must have been in the DLQ for at least this
+    /// long, measured from `task.metadata.updated_at` — the best available
+    /// real timestamp; see the `dlq_archival` module for the same caveat)
+    /// and `max_age` (a task older than this is left in the DLQ rather than
+    /// replayed forever), and enforces `max_retries` via
+    /// [`Self::move_dlq_entry_to_queue`].
+    #[allow(clippy::too_many_arguments)]
     async fn execute_time_based(
         &self,
         conn: &mut redis::aio::MultiplexedConnection,
         policy_name: &str,
-        _delay: Duration,
-        _max_age: Option<Duration>,
+        max_retries: usize,
+        delay: Duration,
+        max_age: Option<Duration>,
         start: std::time::Instant,
     ) -> Result<ReplayResult> {
         // Get up to 100 tasks from DLQ
@@ -523,23 +792,44 @@ impl ReplayScheduler {
         let mut replayed = 0;
         let mut skipped = 0;
         let mut failed = 0;
+        let now = chrono::Utc::now().timestamp();
+        let delay_secs = delay.as_secs() as i64;
+        let max_age_secs = max_age.map(|d| d.as_secs() as i64);
 
         for task_data in tasks {
-            if let Ok(_task) = serde_json::from_str::<SerializedTask>(&task_data) {
-                // Move from DLQ back to main queue
-                let main_queue_key = &self.queue_name;
-                match conn.rpush::<_, _, ()>(main_queue_key, &task_data).await {
-                    Ok(_) => {
-                        // Remove from DLQ
-                        let _: () = conn.lrem(&self.dlq_key, 1, &task_data).await.unwrap_or(());
-                        replayed += 1;
-                    }
-                    Err(_) => {
-                        failed += 1;
-                    }
+            let task = match serde_json::from_str::<SerializedTask>(&task_data) {
+                Ok(task) => task,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
                 }
-            } else {
-                skipped += 1;
+            };
+
+            let age_secs = now - task.metadata.updated_at.timestamp();
+            if age_secs < delay_secs {
+                skipped += 1; // not old enough yet
+                continue;
+            }
+            if let Some(max_age_secs) = max_age_secs {
+                if age_secs > max_age_secs {
+                    skipped += 1; // too old: expire rather than replay forever
+                    continue;
+                }
+            }
+
+            match self
+                .move_dlq_entry_to_queue(conn, policy_name, &task_data, &task, max_retries)
+                .await
+            {
+                Ok(ReplayOutcome::Replayed) => replayed += 1,
+                Ok(ReplayOutcome::NotFound | ReplayOutcome::Exhausted) => skipped += 1,
+                Err(e) => {
+                    warn!(
+                        "Failed to replay DLQ task {} under policy '{}': {}",
+                        task.metadata.id, policy_name, e
+                    );
+                    failed += 1;
+                }
             }
         }
 
@@ -552,13 +842,16 @@ impl ReplayScheduler {
         })
     }
 
-    /// Execute conditional replay
+    /// Execute conditional replay. Honors `delay` the same way as
+    /// [`Self::execute_time_based`], and enforces `max_retries`.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_conditional(
         &self,
         conn: &mut redis::aio::MultiplexedConnection,
         policy_name: &str,
         condition: &ReplayCondition,
-        _delay: Duration,
+        max_retries: usize,
+        delay: Duration,
         start: std::time::Instant,
     ) -> Result<ReplayResult> {
         let tasks: Vec<String> = conn
@@ -569,25 +862,42 @@ impl ReplayScheduler {
         let mut replayed = 0;
         let mut skipped = 0;
         let mut failed = 0;
+        let now = chrono::Utc::now().timestamp();
+        let delay_secs = delay.as_secs() as i64;
 
         for task_data in tasks {
-            if let Ok(task) = serde_json::from_str::<SerializedTask>(&task_data) {
-                if condition.matches(&task) {
-                    let main_queue_key = &self.queue_name;
-                    match conn.rpush::<_, _, ()>(main_queue_key, &task_data).await {
-                        Ok(_) => {
-                            let _: () = conn.lrem(&self.dlq_key, 1, &task_data).await.unwrap_or(());
-                            replayed += 1;
-                        }
-                        Err(_) => {
-                            failed += 1;
-                        }
-                    }
-                } else {
+            let task = match serde_json::from_str::<SerializedTask>(&task_data) {
+                Ok(task) => task,
+                Err(_) => {
                     skipped += 1;
+                    continue;
                 }
-            } else {
+            };
+
+            if !condition.matches(&task, &self.predicates) {
                 skipped += 1;
+                continue;
+            }
+
+            let age_secs = now - task.metadata.updated_at.timestamp();
+            if age_secs < delay_secs {
+                skipped += 1; // matches, but not old enough yet
+                continue;
+            }
+
+            match self
+                .move_dlq_entry_to_queue(conn, policy_name, &task_data, &task, max_retries)
+                .await
+            {
+                Ok(ReplayOutcome::Replayed) => replayed += 1,
+                Ok(ReplayOutcome::NotFound | ReplayOutcome::Exhausted) => skipped += 1,
+                Err(e) => {
+                    warn!(
+                        "Failed to replay DLQ task {} under policy '{}': {}",
+                        task.metadata.id, policy_name, e
+                    );
+                    failed += 1;
+                }
             }
         }
 
@@ -605,6 +915,7 @@ impl ReplayScheduler {
         &self,
         conn: &mut redis::aio::MultiplexedConnection,
         policy_name: &str,
+        max_retries: usize,
         max_tasks_per_window: usize,
         window: Duration,
         start: std::time::Instant,
@@ -616,22 +927,36 @@ impl ReplayScheduler {
             .map_err(|e| CelersError::Broker(format!("Failed to read DLQ: {}", e)))?;
 
         let mut replayed = 0;
+        let mut skipped = 0;
         let mut failed = 0;
 
         for task_data in tasks.iter().take(max_tasks_per_window) {
-            let main_queue_key = &self.queue_name;
-            match conn.rpush::<_, _, ()>(main_queue_key, task_data).await {
-                Ok(_) => {
-                    let _: () = conn.lrem(&self.dlq_key, 1, task_data).await.unwrap_or(());
-                    replayed += 1;
+            let task = match serde_json::from_str::<SerializedTask>(task_data) {
+                Ok(task) => task,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
 
+            match self
+                .move_dlq_entry_to_queue(conn, policy_name, task_data, &task, max_retries)
+                .await
+            {
+                Ok(ReplayOutcome::Replayed) => {
+                    replayed += 1;
                     // Add small delay between tasks
                     if replayed < max_tasks_per_window {
                         let delay_per_task = window.as_millis() / max_tasks_per_window as u128;
                         sleep(Duration::from_millis(delay_per_task as u64)).await;
                     }
                 }
-                Err(_) => {
+                Ok(ReplayOutcome::NotFound | ReplayOutcome::Exhausted) => skipped += 1,
+                Err(e) => {
+                    warn!(
+                        "Failed to replay DLQ task {} under policy '{}': {}",
+                        task.metadata.id, policy_name, e
+                    );
                     failed += 1;
                 }
             }
@@ -639,7 +964,7 @@ impl ReplayScheduler {
 
         Ok(ReplayResult {
             replayed_count: replayed,
-            skipped_count: tasks.len() - replayed - failed,
+            skipped_count: skipped,
             failed_count: failed,
             policy_name: policy_name.to_string(),
             duration: start.elapsed(),
@@ -664,11 +989,14 @@ impl ReplayScheduler {
     ///   caused the failures.
     ///
     /// When `adaptive` is `false` it degrades to a fixed-order, fixed-delay
-    /// replay using `base_delay`.
+    /// replay using `base_delay`. `max_retries` is enforced the same way as
+    /// every other execution path.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_smart(
         &self,
         conn: &mut redis::aio::MultiplexedConnection,
         policy_name: &str,
+        max_retries: usize,
         adaptive: bool,
         base_delay: Duration,
         start: std::time::Instant,
@@ -682,14 +1010,16 @@ impl ReplayScheduler {
         let mut skipped = 0;
         let mut failed = 0;
 
-        // Classify every task, keeping the raw payload so we can re-enqueue it
-        // byte-for-byte. Unparseable payloads are counted as skipped.
-        let mut classified: Vec<(String, FailureKind)> = Vec::with_capacity(task_data.len());
+        // Classify every task, keeping the parsed task (and its raw payload,
+        // needed byte-for-byte to identify the DLQ entry) so we can re-enqueue
+        // it. Unparseable payloads are counted as skipped.
+        let mut classified: Vec<(String, SerializedTask, FailureKind)> =
+            Vec::with_capacity(task_data.len());
         for raw in task_data {
             match serde_json::from_str::<SerializedTask>(&raw) {
                 Ok(task) => {
                     let kind = FailureKind::classify(&task);
-                    classified.push((raw, kind));
+                    classified.push((raw, task, kind));
                 }
                 Err(_) => {
                     skipped += 1;
@@ -700,10 +1030,10 @@ impl ReplayScheduler {
         // Order by likelihood of success when adaptive, so transient failures
         // (most likely to recover) are replayed first.
         if adaptive {
-            classified.sort_by_key(|(_, kind)| kind.replay_priority());
+            classified.sort_by_key(|(_, _, kind)| kind.replay_priority());
         }
 
-        for (raw, kind) in classified {
+        for (raw, task, kind) in classified {
             // Permanent failures will not benefit from replay; surface them
             // instead of churning the queue.
             if adaptive && kind == FailureKind::Permanent {
@@ -715,10 +1045,11 @@ impl ReplayScheduler {
                 continue;
             }
 
-            let main_queue_key = &self.queue_name;
-            match conn.rpush::<_, _, ()>(main_queue_key, &raw).await {
-                Ok(_) => {
-                    let _: () = conn.lrem(&self.dlq_key, 1, &raw).await.unwrap_or(());
+            match self
+                .move_dlq_entry_to_queue(conn, policy_name, &raw, &task, max_retries)
+                .await
+            {
+                Ok(ReplayOutcome::Replayed) => {
                     replayed += 1;
 
                     // Adaptive backoff: stagger replays according to the failure
@@ -729,7 +1060,12 @@ impl ReplayScheduler {
                         sleep(wait).await;
                     }
                 }
-                Err(_) => {
+                Ok(ReplayOutcome::NotFound | ReplayOutcome::Exhausted) => skipped += 1,
+                Err(e) => {
+                    warn!(
+                        "Failed to replay DLQ task {} under policy '{}': {}",
+                        task.metadata.id, policy_name, e
+                    );
                     failed += 1;
                 }
             }
@@ -748,6 +1084,11 @@ impl ReplayScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Redis connection URL used by the integration-style tests below. A
+    /// local Redis is expected to be reachable in this crate's test
+    /// environment (see the crate's other Redis-backed modules).
+    const TEST_REDIS_URL: &str = "redis://127.0.0.1:6379";
 
     #[test]
     fn test_replay_policy_time_based() {
@@ -786,46 +1127,49 @@ mod tests {
     #[test]
     fn test_replay_condition_matches() {
         let task = SerializedTask::new("process_network_request".to_string(), vec![]);
+        let predicates = HashMap::new();
 
         let condition = ReplayCondition::TaskName("network".to_string());
-        assert!(condition.matches(&task));
+        assert!(condition.matches(&task, &predicates));
 
         let condition = ReplayCondition::TaskName("database".to_string());
-        assert!(!condition.matches(&task));
+        assert!(!condition.matches(&task, &predicates));
     }
 
     #[test]
     fn test_replay_condition_all() {
         let task = SerializedTask::new("process_network_request".to_string(), vec![]);
+        let predicates = HashMap::new();
 
         let condition = ReplayCondition::All(vec![
             ReplayCondition::TaskName("network".to_string()),
             ReplayCondition::TaskName("process".to_string()),
         ]);
-        assert!(condition.matches(&task));
+        assert!(condition.matches(&task, &predicates));
 
         let condition = ReplayCondition::All(vec![
             ReplayCondition::TaskName("network".to_string()),
             ReplayCondition::TaskName("database".to_string()),
         ]);
-        assert!(!condition.matches(&task));
+        assert!(!condition.matches(&task, &predicates));
     }
 
     #[test]
     fn test_replay_condition_any() {
         let task = SerializedTask::new("process_network_request".to_string(), vec![]);
+        let predicates = HashMap::new();
 
         let condition = ReplayCondition::Any(vec![
             ReplayCondition::TaskName("database".to_string()),
             ReplayCondition::TaskName("network".to_string()),
         ]);
-        assert!(condition.matches(&task));
+        assert!(condition.matches(&task, &predicates));
 
         let condition = ReplayCondition::Any(vec![
             ReplayCondition::TaskName("database".to_string()),
             ReplayCondition::TaskName("cache".to_string()),
         ]);
-        assert!(!condition.matches(&task));
+        assert!(!condition.matches(&task, &predicates));
     }
 
     /// Build a failed task whose state carries a specific error message.
@@ -892,10 +1236,296 @@ mod tests {
         // The task name does not mention the network, but the recorded error
         // does — the condition must still match by inspecting the real reason.
         let task = failed_task("process_order", "NetworkError: host unreachable");
+        let predicates = HashMap::new();
         let condition = ReplayCondition::ErrorType("network".to_string());
-        assert!(condition.matches(&task));
+        assert!(condition.matches(&task, &predicates));
 
         let condition = ReplayCondition::ErrorType("validation".to_string());
-        assert!(!condition.matches(&task));
+        assert!(!condition.matches(&task, &predicates));
+    }
+
+    async fn test_conn() -> redis::aio::MultiplexedConnection {
+        Client::open(TEST_REDIS_URL)
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_execute_time_based_honors_delay_and_max_age() {
+        let queue_name = format!("test-replay-delay-{}", uuid::Uuid::new_v4());
+        let mut scheduler =
+            ReplayScheduler::with_mode(TEST_REDIS_URL, &queue_name, QueueMode::Fifo)
+                .await
+                .unwrap();
+        let policy = ReplayPolicy {
+            policy_type: ReplayPolicyType::TimeBased {
+                delay: Duration::from_secs(3600),             // >= 1h old
+                max_age: Some(Duration::from_secs(2 * 3600)), // <= 2h old
+            },
+            max_retries: 3,
+            enabled: true,
+            priority: 50,
+        };
+        scheduler.add_policy("hourly", policy).await.unwrap();
+
+        let mut conn = test_conn().await;
+        let dlq_key = format!("{}:dlq", queue_name);
+
+        // Too young: only 10 minutes old, delay requires >= 1 hour.
+        let mut young = SerializedTask::new("young_job".to_string(), vec![]);
+        young.metadata.updated_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let young_data = serde_json::to_string(&young).unwrap();
+
+        // Just right: 90 minutes old (within [1h, 2h]).
+        let mut ready = SerializedTask::new("ready_job".to_string(), vec![]);
+        ready.metadata.updated_at = chrono::Utc::now() - chrono::Duration::minutes(90);
+        let ready_data = serde_json::to_string(&ready).unwrap();
+
+        // Too old: 5 hours old, past the 2-hour max_age.
+        let mut expired = SerializedTask::new("expired_job".to_string(), vec![]);
+        expired.metadata.updated_at = chrono::Utc::now() - chrono::Duration::hours(5);
+        let expired_data = serde_json::to_string(&expired).unwrap();
+
+        for data in [&young_data, &ready_data, &expired_data] {
+            let _: () = conn.rpush(&dlq_key, data).await.unwrap();
+        }
+
+        let results = scheduler.execute_once().await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].replayed_count, 1,
+            "only the 90-minute-old task falls within [delay, max_age]"
+        );
+        assert_eq!(results[0].skipped_count, 2);
+
+        let remaining: Vec<String> = conn.lrange(&dlq_key, 0, -1).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining.contains(&young_data),
+            "too-young task must stay in the DLQ"
+        );
+        assert!(
+            remaining.contains(&expired_data),
+            "expired task must stay in the DLQ"
+        );
+
+        // cleanup
+        let _: () = conn.del(&dlq_key).await.unwrap();
+        let _: () = conn.del(&queue_name).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_uses_zadd_not_rpush() {
+        let queue_name = format!("test-replay-priority-{}", uuid::Uuid::new_v4());
+        let mut scheduler =
+            ReplayScheduler::with_mode(TEST_REDIS_URL, &queue_name, QueueMode::Priority)
+                .await
+                .unwrap();
+        scheduler
+            .add_policy(
+                "immediate",
+                ReplayPolicy::time_based(Duration::from_secs(0)),
+            )
+            .await
+            .unwrap();
+
+        let mut conn = test_conn().await;
+        let dlq_key = format!("{}:dlq", queue_name);
+
+        let mut task = SerializedTask::new("priority_job".to_string(), vec![]);
+        task.metadata.priority = 7;
+        task.metadata.updated_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let data = serde_json::to_string(&task).unwrap();
+        let _: () = conn.rpush(&dlq_key, &data).await.unwrap();
+
+        // Before the fix this would RPUSH into what the broker treats as a
+        // sorted set, failing with WRONGTYPE (silently counted as `failed`).
+        let results = scheduler.execute_once().await.unwrap();
+        assert_eq!(
+            results[0].failed_count, 0,
+            "must not WRONGTYPE-fail in priority mode"
+        );
+        assert_eq!(results[0].replayed_count, 1);
+
+        // It must land in the queue as a ZSET member with the
+        // negated-priority score matching `RedisBroker::enqueue`.
+        let score: Option<f64> = conn.zscore(&queue_name, &data).await.unwrap();
+        assert_eq!(score, Some(-7.0));
+
+        let dlq_len: i64 = conn.llen(&dlq_key).await.unwrap();
+        assert_eq!(dlq_len, 0);
+
+        // cleanup
+        let _: () = conn.del(&queue_name).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_max_retries_enforced_across_replays() {
+        let queue_name = format!("test-replay-maxretries-{}", uuid::Uuid::new_v4());
+        let mut scheduler =
+            ReplayScheduler::with_mode(TEST_REDIS_URL, &queue_name, QueueMode::Fifo)
+                .await
+                .unwrap();
+        let policy = ReplayPolicy::time_based(Duration::from_secs(0)).with_max_retries(2);
+        scheduler.add_policy("limited", policy).await.unwrap();
+
+        let mut conn = test_conn().await;
+        let dlq_key = format!("{}:dlq", queue_name);
+
+        let mut task = SerializedTask::new("flaky_job".to_string(), vec![]);
+        task.metadata.updated_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let data = serde_json::to_string(&task).unwrap();
+
+        // Simulate the same task id repeatedly failing, landing back in the
+        // DLQ, and being reconsidered for replay.
+        for attempt in 1..=3 {
+            let _: () = conn.rpush(&dlq_key, &data).await.unwrap();
+            let results = scheduler.execute_once().await.unwrap();
+            let result = &results[0];
+
+            if attempt <= 2 {
+                assert_eq!(
+                    result.replayed_count, 1,
+                    "attempt {attempt} is within max_retries=2 and should replay"
+                );
+                // Pull it back out of the live queue and pretend it failed
+                // again on the next iteration's RPUSH.
+                let _: Option<String> = conn.lpop(&queue_name, None).await.unwrap();
+            } else {
+                assert_eq!(
+                    result.replayed_count, 0,
+                    "3rd attempt must be blocked: max_retries=2 already spent"
+                );
+                assert_eq!(result.skipped_count, 1);
+            }
+        }
+
+        // cleanup
+        let _: () = conn.del(&dlq_key).await.unwrap();
+        let _: () = conn.del(&queue_name).await.unwrap();
+        let _: () = conn
+            .del(format!("{}:dlq:replay_attempts:limited", queue_name))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_add_policy_rejects_unregistered_custom_predicate() {
+        let queue_name = format!("test-replay-custom-reject-{}", uuid::Uuid::new_v4());
+        let mut scheduler = ReplayScheduler::new(TEST_REDIS_URL, &queue_name)
+            .await
+            .unwrap();
+
+        let policy = ReplayPolicy::conditional(
+            ReplayCondition::Custom("transient_network".to_string()),
+            Duration::from_secs(0),
+        );
+        let result = scheduler.add_policy("custom_unregistered", policy).await;
+        assert!(
+            result.is_err(),
+            "add_policy must reject a policy referencing an unregistered custom predicate"
+        );
+
+        // Composed inside All/Any must also be caught.
+        let composed = ReplayPolicy::conditional(
+            ReplayCondition::All(vec![
+                ReplayCondition::TaskName("x".to_string()),
+                ReplayCondition::Custom("still_unregistered".to_string()),
+            ]),
+            Duration::from_secs(0),
+        );
+        assert!(scheduler.add_policy("composed", composed).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_registered_custom_predicate_is_actually_evaluated() {
+        let queue_name = format!("test-replay-custom-eval-{}", uuid::Uuid::new_v4());
+        let mut scheduler = ReplayScheduler::new(TEST_REDIS_URL, &queue_name)
+            .await
+            .unwrap();
+
+        scheduler.register_predicate("is_priority_job", |task: &SerializedTask| {
+            task.metadata.name.starts_with("priority_")
+        });
+
+        let policy = ReplayPolicy::conditional(
+            ReplayCondition::Custom("is_priority_job".to_string()),
+            Duration::from_secs(3600),
+        );
+        scheduler
+            .add_policy("custom_registered", policy)
+            .await
+            .unwrap();
+
+        let mut conn = test_conn().await;
+        let dlq_key = format!("{}:dlq", queue_name);
+
+        // Matches the predicate AND old enough: should replay.
+        let mut ready = SerializedTask::new("priority_job".to_string(), vec![]);
+        ready.metadata.updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        let ready_data = serde_json::to_string(&ready).unwrap();
+
+        // Matches the predicate but too young: delay not satisfied yet.
+        let mut young = SerializedTask::new("priority_job_2".to_string(), vec![]);
+        young.metadata.updated_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let young_data = serde_json::to_string(&young).unwrap();
+
+        // Old enough but does not match the predicate at all.
+        let mut non_matching = SerializedTask::new("regular_job".to_string(), vec![]);
+        non_matching.metadata.updated_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        let non_matching_data = serde_json::to_string(&non_matching).unwrap();
+
+        for data in [&ready_data, &young_data, &non_matching_data] {
+            let _: () = conn.rpush(&dlq_key, data).await.unwrap();
+        }
+
+        let results = scheduler.execute_once().await.unwrap();
+        assert_eq!(results[0].replayed_count, 1);
+        assert_eq!(results[0].skipped_count, 2);
+
+        let remaining: Vec<String> = conn.lrange(&dlq_key, 0, -1).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&young_data));
+        assert!(remaining.contains(&non_matching_data));
+
+        // cleanup
+        let _: () = conn.del(&dlq_key).await.unwrap();
+        let _: () = conn.del(&queue_name).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_returns_after_stop_called_concurrently() {
+        // `run`/`stop` both take `&self` specifically so this pattern
+        // compiles and works: share the scheduler via `Arc`, run it on a
+        // spawned task, and stop it from the original handle while it is
+        // executing. Before the fix both methods needed `&mut self`, which
+        // made this impossible to even write.
+        let queue_name = format!("test-replay-runstop-{}", uuid::Uuid::new_v4());
+        let scheduler = Arc::new(
+            ReplayScheduler::with_mode(TEST_REDIS_URL, &queue_name, QueueMode::Fifo)
+                .await
+                .unwrap()
+                .with_poll_interval(Duration::from_millis(5)),
+        );
+
+        let runner = Arc::clone(&scheduler);
+        let handle = tokio::spawn(async move { runner.run().await });
+
+        // Let a few ticks fire before stopping (a short real sleep is used
+        // only to yield to the spawned task — the pass/fail assertion below
+        // is bounded by a generous timeout, not by this sleep's duration).
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(scheduler.is_running());
+        scheduler.stop();
+        assert!(!scheduler.is_running());
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            result.is_ok(),
+            "run() did not return within 2s of stop() being called"
+        );
+        assert!(result.unwrap().unwrap().is_ok());
     }
 }

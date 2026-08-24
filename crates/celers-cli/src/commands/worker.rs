@@ -78,6 +78,24 @@ fn invalidate_worker_caches(broker_url: &str, worker_id: &str) {
     worker_list_cache().invalidate(&broker_url.to_string());
 }
 
+/// Grace period [`start_worker`] waits for in-flight tasks to finish during
+/// shutdown before giving up and exiting anyway.
+///
+/// Configurable via `CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS` (falls back to 30
+/// seconds). There is intentionally no `--shutdown-timeout` CLI flag wired
+/// to this yet -- adding one requires a change to the `Commands::Worker`
+/// struct and its `cli::dispatch` handler, both outside this module (see
+/// the crate-level followups) -- but every caller of [`start_worker`] still
+/// benefits from bounded, honest shutdown behavior via this default.
+fn worker_shutdown_timeout() -> std::time::Duration {
+    let secs = std::env::var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Start a worker with the given configuration.
 ///
 /// Creates and runs a worker that processes tasks from the specified queue.
@@ -133,6 +151,7 @@ pub async fn start_worker(
 
     // Create broker
     let broker = RedisBroker::with_mode(broker_url, queue, queue_mode)?;
+    let visibility_timeout_secs = broker.visibility_timeout();
     println!("✓ Connected to Redis: {}", broker_url.cyan());
     println!("✓ Queue: {} (mode: {})", queue.cyan(), mode.cyan());
 
@@ -156,27 +175,70 @@ pub async fn start_worker(
     println!("  Timeout: {}s", timeout.to_string().yellow());
     println!();
 
-    // Create worker
+    // Create worker and start it with a real shutdown handshake:
+    // `run_with_shutdown` returns a `WorkerHandle` whose `drain()` stops the
+    // worker from dequeuing anything new and waits for every already
+    // in-flight task to finish before the run loop exits. This replaces the
+    // previous "abort()` the moment Ctrl+C is pressed" shutdown, which
+    // printed "Shutting down gracefully..." and then dropped every
+    // in-flight task mid-execution with no ack/nack/requeue -- recovery
+    // depended entirely on the broker's visibility timeout expiring (idx
+    // 336).
     let worker = Worker::new(broker, registry, config);
+    let handle = worker.run_with_shutdown().await?;
     println!("{}", "✓ Worker started successfully".green().bold());
     println!("{}", "  Press Ctrl+C to stop gracefully".dimmed());
     println!();
 
-    // Set up signal handler
-    let worker_task = tokio::spawn(async move {
-        if let Err(e) = worker.run().await {
-            eprintln!("Worker error: {e}");
-        }
-    });
-
     // Wait for shutdown signal
     wait_for_signal().await;
 
+    let shutdown_timeout = worker_shutdown_timeout();
     println!();
-    println!("{}", "Shutting down gracefully...".yellow());
-    worker_task.abort();
+    println!(
+        "{}",
+        format!(
+            "Shutting down gracefully (waiting up to {}s for in-flight tasks to finish)...",
+            shutdown_timeout.as_secs()
+        )
+        .yellow()
+    );
 
-    println!("{}", "✓ Worker stopped".green());
+    match tokio::time::timeout(shutdown_timeout, handle.drain()).await {
+        Ok(Ok(())) => {
+            println!(
+                "{}",
+                "✓ Worker stopped (all in-flight tasks completed)".green()
+            );
+        }
+        Ok(Err(e)) => {
+            eprintln!(
+                "{} {e}",
+                "⚠ Worker reported an error while draining:".yellow().bold()
+            );
+        }
+        Err(_) => {
+            let still_active = handle.stats().active();
+            eprintln!(
+                "{}",
+                format!(
+                    "⚠ Shutdown timed out after {}s with {still_active} task(s) still \
+                     in flight; exiting anyway. Those tasks were NOT acked, nacked, or \
+                     requeued by this command -- they remain claimed in the broker's \
+                     processing queue until its visibility timeout ({visibility_timeout_secs}s) \
+                     recovers them. Increase --shutdown-timeout (or the \
+                     CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS env var) if this happens routinely.",
+                    shutdown_timeout.as_secs(),
+                )
+                .red()
+                .bold()
+            );
+            // Best-effort: ask the (still-running, now-detached) worker loop
+            // to stop at its next check, even though this command can no
+            // longer wait for that to happen.
+            let _ = handle.shutdown().await;
+        }
+    }
 
     Ok(())
 }
@@ -542,7 +604,15 @@ pub async fn stop_worker(broker_url: &str, worker_id: &str, graceful: bool) -> a
     Ok(())
 }
 
-/// Pause task processing for a worker
+/// Pause task processing for a worker.
+///
+/// Records the pause flag in Redis and, mirroring [`stop_worker`]'s
+/// shutdown channels, publishes a notification and reports the *actual*
+/// subscriber count instead of an unconditional "✓". No component in
+/// `celers-worker` currently subscribes to a pause channel or reads
+/// `pause_key` at all -- see the crate-level followups -- so, until that
+/// lands, an honest "no worker is listening" is the only truthful thing
+/// this command can report (idx 324).
 pub async fn pause_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
@@ -555,26 +625,47 @@ pub async fn pause_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         .arg(&timestamp)
         .query_async(&mut conn)
         .await?;
+
+    let channel = format!("celers:worker:{worker_id}:pause");
+    let subscribers: usize = redis::cmd("PUBLISH")
+        .arg(&channel)
+        .arg("PAUSE")
+        .query_async(&mut conn)
+        .await?;
     invalidate_worker_caches(broker_url, worker_id);
 
-    println!(
-        "{}",
-        format!("✓ Worker '{worker_id}' has been paused")
-            .green()
-            .bold()
-    );
-    println!();
-    println!("{}", "Note:".yellow().bold());
-    println!("  • Worker will stop accepting new tasks");
-    println!("  • Current tasks will continue to completion");
-    println!("  • Use 'celers worker-mgmt resume' to resume");
-    println!();
-    println!("  Paused at: {}", timestamp.cyan());
+    if subscribers > 0 {
+        println!(
+            "{}",
+            format!("✓ Worker '{worker_id}' has been paused")
+                .green()
+                .bold()
+        );
+        println!();
+        println!("{}", "Note:".yellow().bold());
+        println!("  • Worker will stop accepting new tasks");
+        println!("  • Current tasks will continue to completion");
+        println!("  • Use 'celers worker-mgmt resume' to resume");
+        println!();
+        println!("  Paused at: {}", timestamp.cyan());
+    } else {
+        println!(
+            "{}",
+            format!("⚠ Pause flag recorded for worker '{worker_id}', but no worker is listening")
+                .yellow()
+                .bold()
+        );
+        println!();
+        println!("The pause flag was written to Redis (key: {pause_key}), but no running");
+        println!("worker process subscribed to its pause channel -- celers-worker does not");
+        println!("yet act on it, so this has no effect on task processing.");
+    }
 
     Ok(())
 }
 
-/// Resume task processing for a worker
+/// Resume task processing for a worker. See [`pause_worker`] for why this
+/// reports the real subscriber count instead of an unconditional "✓".
 pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
@@ -600,19 +691,36 @@ pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<
         .arg(&pause_key)
         .query_async(&mut conn)
         .await?;
+
+    let channel = format!("celers:worker:{worker_id}:resume");
+    let subscribers: usize = redis::cmd("PUBLISH")
+        .arg(&channel)
+        .arg("RESUME")
+        .query_async(&mut conn)
+        .await?;
     invalidate_worker_caches(broker_url, worker_id);
 
-    println!(
-        "{}",
-        format!("✓ Worker '{worker_id}' has been resumed")
-            .green()
-            .bold()
-    );
-    println!();
-    println!("{}", "Note:".yellow().bold());
-    println!("  • Worker will now accept new tasks");
-    if let Some(paused_at) = paused {
-        println!("  • Was paused at: {}", paused_at.dimmed());
+    if subscribers > 0 {
+        println!(
+            "{}",
+            format!("✓ Worker '{worker_id}' has been resumed")
+                .green()
+                .bold()
+        );
+        println!();
+        println!("{}", "Note:".yellow().bold());
+        println!("  • Worker will now accept new tasks");
+        if let Some(paused_at) = paused {
+            println!("  • Was paused at: {}", paused_at.dimmed());
+        }
+    } else {
+        println!(
+            "{}",
+            format!("⚠ Pause flag cleared for worker '{worker_id}', but no worker is listening")
+                .yellow()
+                .bold()
+        );
+        println!("(no running worker process subscribed to its resume channel)");
     }
 
     Ok(())
@@ -720,22 +828,45 @@ pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
         .arg(86400)
         .query_async::<()>(&mut conn)
         .await?;
+
+    // Mirror `pause_worker`/`stop_worker`: publish and report the real
+    // subscriber count rather than an unconditional "✓" (idx 324). No
+    // component in `celers-worker` currently subscribes to a drain channel.
+    let channel = format!("celers:worker:{worker_id}:drain");
+    let subscribers: usize = redis::cmd("PUBLISH")
+        .arg(&channel)
+        .arg("DRAIN")
+        .query_async(&mut conn)
+        .await?;
     invalidate_worker_caches(broker_url, worker_id);
 
-    println!(
-        "{}",
-        format!("✓ Worker '{worker_id}' is now draining")
-            .green()
-            .bold()
-    );
-    println!();
-    println!("The worker will:");
-    println!("  • Stop accepting new tasks");
-    println!("  • Complete currently running tasks");
-    println!("  • Shut down automatically when all tasks complete");
-    println!();
-    println!("To resume normal operation:");
-    println!("  celers worker-mgmt resume {worker_id}");
+    if subscribers > 0 {
+        println!(
+            "{}",
+            format!("✓ Worker '{worker_id}' is now draining")
+                .green()
+                .bold()
+        );
+        println!();
+        println!("The worker will:");
+        println!("  • Stop accepting new tasks");
+        println!("  • Complete currently running tasks");
+        println!("  • Shut down automatically when all tasks complete");
+        println!();
+        println!("To resume normal operation:");
+        println!("  celers worker-mgmt resume {worker_id}");
+    } else {
+        println!(
+            "{}",
+            format!("⚠ Drain flag recorded for worker '{worker_id}', but no worker is listening")
+                .yellow()
+                .bold()
+        );
+        println!();
+        println!("The drain flag was written to Redis (key: {drain_key}), but no running");
+        println!("worker process subscribed to its drain channel -- celers-worker does not");
+        println!("yet act on it, so this has no effect on task processing.");
+    }
 
     Ok(())
 }
@@ -743,6 +874,116 @@ pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Local Redis used by this module's live-broker regression tests.
+    const TEST_BROKER_URL: &str = "redis://127.0.0.1:6379";
+
+    /// Serializes tests that mutate the process-wide
+    /// `CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS` environment variable. Only
+    /// matters for the plain `cargo test` fallback runner (nextest, this
+    /// crate's primary runner, isolates each test in its own process).
+    fn shutdown_timeout_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Regression test for the `--shutdown-timeout` half of idx 336:
+    /// `worker_shutdown_timeout` must honor a valid override, fall back to
+    /// a sane default (30s) when unset, and never panic or silently produce
+    /// a zero-length timeout (which would make shutdown behave exactly like
+    /// the old unconditional `abort()` again) on a malformed value.
+    #[test]
+    fn worker_shutdown_timeout_reads_env_with_sane_fallback() {
+        let _guard = shutdown_timeout_env_guard();
+
+        std::env::remove_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS");
+        assert_eq!(
+            worker_shutdown_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+
+        std::env::set_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS", "5");
+        assert_eq!(worker_shutdown_timeout(), std::time::Duration::from_secs(5));
+
+        std::env::set_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS", "not-a-number");
+        assert_eq!(
+            worker_shutdown_timeout(),
+            std::time::Duration::from_secs(30),
+            "an unparseable override must fall back to the default"
+        );
+
+        std::env::set_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS", "0");
+        assert_eq!(
+            worker_shutdown_timeout(),
+            std::time::Duration::from_secs(30),
+            "a zero timeout would make every shutdown behave like an immediate hard-abort again"
+        );
+
+        std::env::remove_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS");
+    }
+
+    /// Regression test for idx 336's core mechanism: `start_worker` now
+    /// shuts down via `WorkerHandle::drain()` (set draining, wait for
+    /// `stats.active() == 0`) wrapped in a bounded `tokio::time::timeout`,
+    /// instead of an unconditional `worker_task.abort()`. This proves that
+    /// exact sequence -- `run_with_shutdown` -> `drain()` under a timeout --
+    /// completes promptly (well inside the bound) and leaves `active() ==
+    /// 0` when there is no in-flight work, i.e. the happy path a graceful
+    /// shutdown should always hit does not hang or spuriously time out.
+    #[tokio::test]
+    async fn worker_handle_drain_completes_promptly_with_no_in_flight_tasks() {
+        let queue_name = format!("test-worker-drain-{}", uuid::Uuid::new_v4());
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+        let registry = celers_core::TaskRegistry::new();
+        let config = WorkerConfig::default();
+
+        let worker = Worker::new(broker, registry, config);
+        let handle = worker
+            .run_with_shutdown()
+            .await
+            .expect("run_with_shutdown must hand back a WorkerHandle");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.drain()).await;
+        assert!(
+            result.is_ok(),
+            "drain() must complete well within the shutdown timeout when nothing is in flight"
+        );
+        assert_eq!(handle.stats().active(), 0);
+    }
+
+    /// Regression test for idx 324 (worker pause/drain honesty): proves
+    /// `pause_worker` actually `PUBLISH`es to a real, discoverable channel
+    /// (`celers:worker:{id}:pause`) rather than only ever writing a key
+    /// nothing reads -- the same mechanism `stop_worker` already used, now
+    /// extended to pause/resume/drain so a future `celers-worker`
+    /// subscriber has something real to listen for, and so this command's
+    /// "no worker is listening" branch is backed by a genuine subscriber
+    /// count rather than a hardcoded guess.
+    #[tokio::test]
+    async fn pause_worker_publishes_to_a_discoverable_pause_channel() {
+        use futures::StreamExt;
+
+        let worker_id = format!("test-worker-pause-{}", uuid::Uuid::new_v4());
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+
+        let mut pubsub = client.get_async_pubsub().await.expect("pubsub");
+        let channel = format!("celers:worker:{worker_id}:pause");
+        pubsub.subscribe(&channel).await.expect("subscribe");
+        let mut messages = pubsub.on_message();
+
+        pause_worker(TEST_BROKER_URL, &worker_id)
+            .await
+            .expect("pause_worker");
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), messages.next())
+            .await
+            .expect("must receive the PUBLISH within the timeout")
+            .expect("subscribed channel must yield a message");
+        let payload: String = msg.get_payload().expect("payload is a UTF-8 string");
+        assert_eq!(payload, "PAUSE");
+    }
 
     /// Stand-in for a per-worker broker round trip (e.g. heartbeat `GET`):
     /// deterministic and independent of every other call, exactly the shape

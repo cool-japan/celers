@@ -181,6 +181,19 @@ impl<T: Clone> ClientPool<T> {
         guard.remove(key);
     }
 
+    /// Cheaply check whether `key` currently has a pooled entry, without
+    /// creating one on a miss or affecting hit/miss counters.
+    ///
+    /// Lets a caller distinguish "the handle [`ClientPool::get_or_connect`]
+    /// is about to hand back is freshly connected" (known-good by
+    /// construction) from "it is a reused, potentially stale entry" (may
+    /// have gone bad since it was cached) without duplicating this pool's
+    /// locking -- see [`pooled_redis_connection`]'s liveness probe.
+    #[must_use]
+    pub fn contains(&self, key: &str) -> bool {
+        lock(&self.entries).contains_key(key)
+    }
+
     /// Current utilization/reuse snapshot.
     #[must_use]
     pub fn stats(&self) -> PoolStats {
@@ -222,6 +235,27 @@ pub fn redis_connection_pool() -> &'static ClientPool<redis::aio::MultiplexedCon
     POOL.get_or_init(|| ClientPool::new(configured_max_size()))
 }
 
+/// Whether a `redis::RedisError` observed on a pooled connection means that
+/// connection is no longer usable and should be replaced, as opposed to an
+/// application-level error (a bad command, `WRONGTYPE`, ...) that says
+/// nothing about the connection's own health.
+fn is_dead_pooled_connection(e: &redis::RedisError) -> bool {
+    e.is_connection_dropped() || e.is_io_error() || e.is_timeout() || e.is_connection_refusal()
+}
+
+/// Connect (or reconnect) `broker_url` and cache the result in `pool`.
+async fn connect_and_cache(
+    pool: &ClientPool<redis::aio::MultiplexedConnection>,
+    broker_url: &str,
+) -> anyhow::Result<redis::aio::MultiplexedConnection> {
+    pool.get_or_connect(broker_url, || async {
+        let client = redis::Client::open(broker_url)?;
+        client.get_multiplexed_async_connection().await
+    })
+    .await
+    .map_err(anyhow::Error::from)
+}
+
 /// Obtain a pooled multiplexed connection for `broker_url`, connecting (and
 /// caching the result) on a miss.
 ///
@@ -232,6 +266,16 @@ pub fn redis_connection_pool() -> &'static ClientPool<redis::aio::MultiplexedCon
 /// `false`, the shared pool's cached entry for `broker_url` (if any) is
 /// dropped first so every call reconnects, matching the "pooling disabled"
 /// contract.
+///
+/// A *reused* (pool-hit) handle is additionally validated with a cheap
+/// `PING` before being handed back: in a long-lived process (`celers
+/// interactive`, or library use of this crate), nothing previously
+/// invalidated a pooled handle on failure, so a Redis restart or a dropped
+/// TCP connection left the dead handle cached and every subsequent command
+/// in that process failed until the process itself restarted (idx 339). A
+/// freshly-connected handle (a pool miss) skips this probe -- it is
+/// known-good by construction, so probing it would only add a redundant
+/// round trip.
 ///
 /// # Errors
 ///
@@ -244,12 +288,24 @@ pub async fn pooled_redis_connection(
     if !crate::config::PoolConfig::from_env_or_default().reuse_enabled {
         pool.invalidate(broker_url);
     }
-    pool.get_or_connect(broker_url, || async {
-        let client = redis::Client::open(broker_url)?;
-        client.get_multiplexed_async_connection().await
-    })
-    .await
-    .map_err(anyhow::Error::from)
+
+    let reused = pool.contains(broker_url);
+    let mut conn = connect_and_cache(pool, broker_url).await?;
+
+    if reused {
+        if let Err(e) = redis::cmd("PING").query_async::<String>(&mut conn).await {
+            if is_dead_pooled_connection(&e) {
+                tracing::warn!(
+                    "Pooled Redis connection for {} appears dead ({e}); reconnecting",
+                    crate::commands::utils::mask_password(broker_url)
+                );
+                pool.invalidate(broker_url);
+                conn = connect_and_cache(pool, broker_url).await?;
+            }
+        }
+    }
+
+    Ok(conn)
 }
 
 /// Print the shared Redis connection pool's configured capacity and the
@@ -337,6 +393,58 @@ fn format_cache_entry_line(label: &str, entries: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for idx 339: `is_dead_pooled_connection` must
+    /// classify a transport-level failure (here: an `ErrorKind::Io` error,
+    /// exactly the class a dropped socket or a Redis restart produces) as
+    /// dead, so `pooled_redis_connection` invalidates and reconnects
+    /// instead of continuing to hand out a socket that will fail on every
+    /// use until the whole process restarts.
+    #[test]
+    fn is_dead_pooled_connection_classifies_transport_errors_as_dead() {
+        let io_err: redis::RedisError = (redis::ErrorKind::Io, "simulated io failure").into();
+        assert!(is_dead_pooled_connection(&io_err));
+    }
+
+    /// An application-level error (a bad command, a type mismatch, ...)
+    /// says nothing about the connection's own health and must NOT trigger
+    /// an invalidate+reconnect -- doing so on every ordinary command error
+    /// would defeat pooling for no reason.
+    #[test]
+    fn is_dead_pooled_connection_does_not_treat_application_errors_as_dead() {
+        let app_err: redis::RedisError =
+            (redis::ErrorKind::UnexpectedReturnType, "wrong type").into();
+        assert!(!is_dead_pooled_connection(&app_err));
+    }
+
+    /// Regression test for idx 339's happy path: a *reused* (pool-hit)
+    /// connection that is, in fact, perfectly healthy must still come back
+    /// from `pooled_redis_connection` as a working connection -- the new
+    /// PING liveness probe must not itself break ordinary reuse.
+    #[tokio::test]
+    async fn pooled_redis_connection_reuses_and_validates_a_live_cached_connection() {
+        let broker_url = "redis://127.0.0.1:6379";
+        let pool = redis_connection_pool();
+        pool.invalidate(broker_url);
+        assert!(!pool.contains(broker_url));
+
+        let _first = pooled_redis_connection(broker_url)
+            .await
+            .expect("first (miss) connect");
+        assert!(
+            pool.contains(broker_url),
+            "a successful connect must be cached"
+        );
+
+        let mut second = pooled_redis_connection(broker_url)
+            .await
+            .expect("second (hit) connect must still succeed");
+        let pong: String = redis::cmd("PING")
+            .query_async(&mut second)
+            .await
+            .expect("the reused, PING-validated connection must still work");
+        assert_eq!(pong, "PONG");
+    }
 
     #[tokio::test]
     async fn get_or_connect_reuses_existing_entry() {

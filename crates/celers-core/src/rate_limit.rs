@@ -1,9 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_wrap
-)]
 //! Rate Limiting for Task Execution
 //!
 //! This module provides rate limiting capabilities for controlling task execution rates.
@@ -81,10 +75,62 @@ impl RateLimitConfig {
     }
 
     /// Get the effective burst capacity
+    // Justification for the lossy cast: the value is range-checked against
+    // `u32::MAX` and rejected when non-finite or non-positive immediately before
+    // the conversion, so neither truncation nor sign loss can occur here.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     #[must_use]
     #[inline]
     pub fn effective_burst(&self) -> u32 {
-        self.burst.unwrap_or(self.rate.ceil() as u32)
+        if let Some(burst) = self.burst {
+            return burst;
+        }
+        if !self.rate.is_finite() || self.rate <= 0.0 {
+            return 0;
+        }
+        let ceiling = self.rate.ceil();
+        if ceiling >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            ceiling as u32
+        }
+    }
+
+    /// Get the effective sliding-window size in seconds.
+    ///
+    /// A window size of `0` would make every window empty (and therefore reject
+    /// every request), which is never a useful configuration, so it is treated as
+    /// the smallest sensible window of one second.
+    #[must_use]
+    #[inline]
+    pub fn effective_window_size(&self) -> u64 {
+        self.window_size.max(1)
+    }
+}
+
+/// Maximum number of executions permitted inside one sliding window.
+///
+/// Saturates at `usize::MAX` rather than wrapping for absurd configurations, and
+/// yields `0` for non-positive or non-finite rates.
+// Justification for the lossy casts: `window` is bounded by `u32::MAX` before the
+// widening conversion and `exact` is explicitly compared against `usize::MAX` and
+// known to be non-negative and finite before the narrowing one.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn max_executions_for(config: &RateLimitConfig) -> usize {
+    if !config.rate.is_finite() || config.rate <= 0.0 {
+        return 0;
+    }
+    let window =
+        u32::try_from(config.effective_window_size()).map_or(f64::from(u32::MAX), f64::from);
+    let exact = (config.rate * window).ceil();
+    if exact >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        exact as usize
     }
 }
 
@@ -202,12 +248,25 @@ impl RateLimiter for TokenBucket {
         } else {
             let tokens_needed = 1.0 - self.tokens;
             let seconds = tokens_needed / self.config.rate;
-            Duration::from_secs_f64(seconds)
+            // A non-positive or non-finite rate means a permit will never become
+            // available; `try_from_secs_f64` rejects those values instead of
+            // panicking the way `from_secs_f64` would.
+            Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
         }
     }
 
+    // Justification for the lossy cast: `tokens` is range-checked against
+    // `u32::MAX` and clamped at zero immediately before the conversion.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn available_permits(&self) -> u32 {
-        self.tokens.floor() as u32
+        let floored = self.tokens.floor();
+        if !floored.is_finite() || floored <= 0.0 {
+            0
+        } else if floored >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            floored as u32
+        }
     }
 
     fn reset(&mut self) {
@@ -255,17 +314,20 @@ impl SlidingWindow {
     /// Clean up old timestamps outside the window
     #[inline]
     fn cleanup(&mut self) {
-        let window = Duration::from_secs(self.config.window_size);
-        let cutoff = Instant::now()
-            .checked_sub(window)
-            .expect("window duration should be valid for subtraction");
-        self.timestamps.retain(|&t| t > cutoff);
+        let window = Duration::from_secs(self.config.effective_window_size());
+        // `Instant` is monotonic from an arbitrary epoch (process/boot start on most
+        // platforms), so subtracting a window larger than the current uptime yields
+        // `None`. In that case nothing recorded so far can possibly be older than the
+        // window, so there is nothing to prune.
+        if let Some(cutoff) = Instant::now().checked_sub(window) {
+            self.timestamps.retain(|&t| t > cutoff);
+        }
     }
 
     /// Get the maximum allowed executions in the window
     #[inline]
     fn max_executions(&self) -> usize {
-        (self.config.rate * self.config.window_size as f64).ceil() as usize
+        max_executions_for(&self.config)
     }
 }
 
@@ -295,7 +357,7 @@ impl RateLimiter for SlidingWindow {
         if self.timestamps.len() < self.max_executions() {
             Duration::ZERO
         } else if let Some(&oldest) = self.timestamps.first() {
-            let window = Duration::from_secs(self.config.window_size);
+            let window = Duration::from_secs(self.config.effective_window_size());
             let expires = oldest + window;
             let now = Instant::now();
             if expires > now {
@@ -311,7 +373,7 @@ impl RateLimiter for SlidingWindow {
     fn available_permits(&self) -> u32 {
         let max = self.max_executions();
         let current = self.timestamps.len();
-        (max.saturating_sub(current)) as u32
+        u32::try_from(max.saturating_sub(current)).unwrap_or(u32::MAX)
     }
 
     fn reset(&mut self) {
@@ -934,7 +996,7 @@ impl DistributedSlidingWindowSpec {
             else
                 return 0
             end
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        end
         "
     }
 
@@ -942,7 +1004,7 @@ impl DistributedSlidingWindowSpec {
     #[must_use]
     #[inline]
     pub fn max_executions(&self) -> usize {
-        (self.state.config.rate * self.state.config.window_size as f64).ceil() as usize
+        max_executions_for(&self.state.config)
     }
 
     /// Get the state for implementing the distributed backend
@@ -997,6 +1059,14 @@ pub struct DistributedRateLimiterCoordinator {
     token_buckets: Arc<RwLock<HashMap<String, DistributedTokenBucketSpec>>>,
     /// Per-task sliding window specs
     sliding_windows: Arc<RwLock<HashMap<String, DistributedSlidingWindowSpec>>>,
+    /// Specs materialised on demand from [`Self::default_config`].
+    ///
+    /// These are kept separate from the explicitly configured maps so that
+    /// `get_token_bucket_spec`/`has_rate_limit` still distinguish "configured for
+    /// this task" from "covered by the default", while the local fallback bucket
+    /// state persists across calls instead of being rebuilt (and therefore
+    /// refilled to full burst) on every acquisition.
+    default_specs: Arc<RwLock<HashMap<String, DistributedTokenBucketSpec>>>,
     /// Default configuration for tasks without specific limits
     default_config: Option<RateLimitConfig>,
 }
@@ -1012,6 +1082,7 @@ impl DistributedRateLimiterCoordinator {
             namespace: namespace.into(),
             token_buckets: Arc::new(RwLock::new(HashMap::new())),
             sliding_windows: Arc::new(RwLock::new(HashMap::new())),
+            default_specs: Arc::new(RwLock::new(HashMap::new())),
             default_config: None,
         }
     }
@@ -1022,6 +1093,7 @@ impl DistributedRateLimiterCoordinator {
             namespace: namespace.into(),
             token_buckets: Arc::new(RwLock::new(HashMap::new())),
             sliding_windows: Arc::new(RwLock::new(HashMap::new())),
+            default_specs: Arc::new(RwLock::new(HashMap::new())),
             default_config: Some(config),
         }
     }
@@ -1034,12 +1106,29 @@ impl DistributedRateLimiterCoordinator {
         let name = task_name.into();
         let key = format!("{}:ratelimit:{}", self.namespace, name);
 
+        // A task uses exactly one algorithm at a time: dropping the stale entry from
+        // the other map is what makes switching algorithms actually take effect
+        // (`try_acquire_fallback` consults the token-bucket map first).
         if config.sliding_window {
+            if let Ok(mut guard) = self.token_buckets.write() {
+                guard.remove(&name);
+            }
             if let Ok(mut guard) = self.sliding_windows.write() {
                 guard.insert(name.clone(), DistributedSlidingWindowSpec::new(key, config));
             }
-        } else if let Ok(mut guard) = self.token_buckets.write() {
-            guard.insert(name.clone(), DistributedTokenBucketSpec::new(key, config));
+        } else {
+            if let Ok(mut guard) = self.sliding_windows.write() {
+                guard.remove(&name);
+            }
+            if let Ok(mut guard) = self.token_buckets.write() {
+                guard.insert(name.clone(), DistributedTokenBucketSpec::new(key, config));
+            }
+        }
+
+        // An explicit configuration supersedes any spec materialised from the
+        // default configuration.
+        if let Ok(mut guard) = self.default_specs.write() {
+            guard.remove(&name);
         }
     }
 
@@ -1049,6 +1138,9 @@ impl DistributedRateLimiterCoordinator {
             guard.remove(task_name);
         }
         if let Ok(mut guard) = self.sliding_windows.write() {
+            guard.remove(task_name);
+        }
+        if let Ok(mut guard) = self.default_specs.write() {
             guard.remove(task_name);
         }
     }
@@ -1109,15 +1201,35 @@ impl DistributedRateLimiterCoordinator {
             return spec.try_acquire_fallback();
         }
 
-        // Use default config if available
+        // Use default config if available. The spec (and therefore the local token
+        // bucket backing it) is cached per task name: building a fresh one on every
+        // call would hand out a full burst each time, making the default rate limit
+        // a silent no-op.
         if let Some(ref config) = self.default_config {
-            let key = format!("{}:ratelimit:{}", self.namespace, task_name);
-            let spec = DistributedTokenBucketSpec::new(key, config.clone());
-            return spec.try_acquire_fallback();
+            if let Ok(mut guard) = self.default_specs.write() {
+                let spec = guard.entry(task_name.to_string()).or_insert_with(|| {
+                    let key = format!("{}:ratelimit:{}", self.namespace, task_name);
+                    DistributedTokenBucketSpec::new(key, config.clone())
+                });
+                return spec.try_acquire_fallback();
+            }
+            // Registry lock poisoned: fall back to allowing execution rather than
+            // blocking the worker outright.
+            return true;
         }
 
         // No rate limit configured
         true
+    }
+
+    /// Reset every locally materialised fallback bucket.
+    ///
+    /// Useful in tests and after a configuration reload; the distributed state in
+    /// the backend is untouched.
+    pub fn reset_fallbacks(&self) {
+        if let Ok(mut guard) = self.default_specs.write() {
+            guard.clear();
+        }
     }
 
     /// Get the Redis key for a task's rate limiter
@@ -1295,6 +1407,224 @@ mod tests {
         // Update rate
         limiter.set_rate(100.0);
         assert!((limiter.config().rate - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// Net block depth of a Lua chunk: every `then` (outside `elseif`), `do` and
+    /// `function` opens a block, every `end` closes one. A balanced chunk is `0`.
+    fn lua_block_balance(script: &str) -> i32 {
+        let mut depth = 0i32;
+        let mut in_elseif = false;
+        for word in script.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            match word {
+                "if" => in_elseif = false,
+                "elseif" => in_elseif = true,
+                "then" => {
+                    if !in_elseif {
+                        depth += 1;
+                    }
+                    in_elseif = false;
+                }
+                "do" | "function" => depth += 1,
+                "end" => depth -= 1,
+                _ => {}
+            }
+        }
+        depth
+    }
+
+    fn all_lua_scripts() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "token_bucket::acquire",
+                DistributedTokenBucketSpec::lua_acquire_script(),
+            ),
+            (
+                "token_bucket::available",
+                DistributedTokenBucketSpec::lua_available_script(),
+            ),
+            (
+                "sliding_window::acquire",
+                DistributedSlidingWindowSpec::lua_acquire_script(),
+            ),
+            (
+                "sliding_window::available",
+                DistributedSlidingWindowSpec::lua_available_script(),
+            ),
+            (
+                "sliding_window::time_until",
+                DistributedSlidingWindowSpec::lua_time_until_script(),
+            ),
+        ]
+    }
+
+    /// Regression: an automated attribute pass once injected a literal Rust
+    /// `#[allow(...)]` line into `lua_time_until_script`, replacing the two `end`
+    /// keywords that closed its `if`/`else` blocks. Redis rejected the script with
+    /// "Error compiling script".
+    #[test]
+    fn test_lua_scripts_contain_no_rust_tokens() {
+        for (name, script) in all_lua_scripts() {
+            assert!(
+                !script.contains("#["),
+                "{name}: Lua script contains a Rust attribute: {script}"
+            );
+            assert!(
+                !script.contains("clippy::"),
+                "{name}: Lua script contains a Rust lint path: {script}"
+            );
+            assert!(
+                !script.contains("::"),
+                "{name}: Lua script contains a Rust path separator: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lua_scripts_have_balanced_blocks() {
+        for (name, script) in all_lua_scripts() {
+            assert_eq!(
+                lua_block_balance(script),
+                0,
+                "{name}: unbalanced Lua blocks in script: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lua_block_balance_detects_missing_end() {
+        assert_eq!(lua_block_balance("if x then return 1 end"), 0);
+        assert_eq!(lua_block_balance("if x then return 1"), 1);
+        assert_eq!(
+            lua_block_balance("if a then if b then return 1 else return 0 end end"),
+            0
+        );
+        assert_eq!(
+            lua_block_balance("if a then return 1 elseif b then return 2 end"),
+            0
+        );
+    }
+
+    /// Regression for the sliding window panicking when the configured window is
+    /// longer than the process/machine uptime (`Instant::checked_sub` -> `None`).
+    #[test]
+    fn test_sliding_window_huge_window_does_not_panic() {
+        // ~31 years of window: comfortably longer than any machine's uptime, so
+        // `Instant::now().checked_sub(window)` returns `None`.
+        let config = RateLimitConfig::new(2e-9).with_sliding_window(1_000_000_000);
+        let mut limiter = SlidingWindow::new(config);
+        assert_eq!(limiter.max_executions(), 2);
+
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        // Window is effectively unbounded, so the third acquisition is denied
+        // rather than panicking.
+        assert!(!limiter.try_acquire());
+        assert_eq!(limiter.available_permits(), 0);
+    }
+
+    #[test]
+    fn test_sliding_window_zero_window_size_is_clamped() {
+        let mut config = RateLimitConfig::new(3.0);
+        config.sliding_window = true;
+        config.window_size = 0;
+        let mut limiter = SlidingWindow::new(config);
+
+        // A zero window would admit nothing at all; it is clamped to one second.
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+    }
+
+    /// Regression: the coordinator rebuilt a fresh (full) token bucket on every
+    /// call when only a default config was set, so the default rate limit never
+    /// denied anything.
+    #[test]
+    fn test_coordinator_default_config_actually_limits() {
+        // A very low rate keeps refill negligible for the duration of the test.
+        let coordinator = DistributedRateLimiterCoordinator::with_default(
+            "app",
+            RateLimitConfig::new(0.1).with_burst(3),
+        );
+
+        assert!(coordinator.try_acquire_fallback("send_email"));
+        assert!(coordinator.try_acquire_fallback("send_email"));
+        assert!(coordinator.try_acquire_fallback("send_email"));
+        assert!(!coordinator.try_acquire_fallback("send_email"));
+
+        // State is per task name, so a different task still has its full burst.
+        assert!(coordinator.try_acquire_fallback("send_sms"));
+    }
+
+    /// Regression: `set_task_rate` left the previous algorithm's spec in the other
+    /// map, and `try_acquire_fallback` consults token buckets first, so switching a
+    /// task from token bucket to sliding window kept enforcing the old config.
+    #[test]
+    fn test_coordinator_switching_algorithm_takes_effect() {
+        let coordinator = DistributedRateLimiterCoordinator::new("app");
+
+        coordinator.set_task_rate("report", RateLimitConfig::new(0.1).with_burst(1));
+        assert!(coordinator.get_token_bucket_spec("report").is_some());
+        assert!(coordinator.get_sliding_window_spec("report").is_none());
+
+        coordinator.set_task_rate("report", RateLimitConfig::new(5.0).with_sliding_window(60));
+        assert!(
+            coordinator.get_token_bucket_spec("report").is_none(),
+            "stale token bucket must be dropped when switching to a sliding window"
+        );
+        let spec = coordinator
+            .get_sliding_window_spec("report")
+            .expect("sliding window spec should be registered");
+        assert_eq!(spec.max_executions(), 300);
+
+        // And back again.
+        coordinator.set_task_rate("report", RateLimitConfig::new(0.1).with_burst(1));
+        assert!(coordinator.get_sliding_window_spec("report").is_none());
+        assert!(coordinator.get_token_bucket_spec("report").is_some());
+    }
+
+    #[test]
+    fn test_coordinator_explicit_rate_supersedes_default_spec() {
+        let coordinator = DistributedRateLimiterCoordinator::with_default(
+            "app",
+            RateLimitConfig::new(0.1).with_burst(1),
+        );
+
+        assert!(coordinator.try_acquire_fallback("task"));
+        assert!(!coordinator.try_acquire_fallback("task"));
+
+        // Reconfiguring the task must drop the cached default-derived bucket.
+        coordinator.set_task_rate("task", RateLimitConfig::new(0.1).with_burst(2));
+        assert!(coordinator.try_acquire_fallback("task"));
+        assert!(coordinator.try_acquire_fallback("task"));
+        assert!(!coordinator.try_acquire_fallback("task"));
+    }
+
+    #[test]
+    fn test_effective_burst_and_window_are_saturating() {
+        let config = RateLimitConfig::new(f64::INFINITY);
+        assert_eq!(config.effective_burst(), 0);
+
+        let config = RateLimitConfig::new(-5.0);
+        assert_eq!(config.effective_burst(), 0);
+
+        let config = RateLimitConfig::new(1e30);
+        assert_eq!(config.effective_burst(), u32::MAX);
+
+        let mut config = RateLimitConfig::new(1.0);
+        config.window_size = 0;
+        assert_eq!(config.effective_window_size(), 1);
+    }
+
+    #[test]
+    fn test_token_bucket_zero_rate_never_available() {
+        let config = RateLimitConfig::new(0.0).with_burst(1);
+        let mut limiter = TokenBucket::new(config);
+
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+        // Must not panic on the infinite wait computation.
+        assert_eq!(limiter.time_until_available(), Duration::MAX);
     }
 
     #[test]

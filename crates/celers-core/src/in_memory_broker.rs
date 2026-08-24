@@ -71,7 +71,9 @@ use crate::state::TaskState;
 use crate::{BrokerMessage, CelersError, Result, SerializedTask, TaskId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, Notify};
+use std::time::Duration;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 /// A single entry in the in-memory ready queue.
@@ -87,11 +89,22 @@ struct QueueEntry {
     seq: u64,
 }
 
+/// A task held back until its scheduled delivery time.
+#[derive(Debug)]
+struct ScheduledEntry {
+    /// The instant at which the task becomes deliverable.
+    due_at: Instant,
+    /// The queue entry to move into the ready queue when due.
+    entry: QueueEntry,
+}
+
 /// Internal queue state guarded by a single [`tokio::sync::Mutex`].
 #[derive(Debug, Default)]
 struct BrokerState {
     /// Tasks that are ready to be delivered, kept sorted on every push.
     ready: Vec<QueueEntry>,
+    /// Tasks scheduled for future delivery, kept sorted by ascending due time.
+    scheduled: Vec<ScheduledEntry>,
     /// Tasks that have been delivered but not yet acknowledged, keyed by their
     /// receipt handle. Used to support `ack`/`reject` semantics.
     in_flight: HashMap<String, SerializedTask>,
@@ -105,7 +118,11 @@ impl BrokerState {
     /// Insert a task into the ready queue, preserving the priority + FIFO
     /// ordering invariant.
     fn push_ready(&mut self, task: SerializedTask, seq: u64) {
-        let entry = QueueEntry { task, seq };
+        self.push_ready_entry(QueueEntry { task, seq });
+    }
+
+    /// Insert an already-built entry into the ready queue.
+    fn push_ready_entry(&mut self, entry: QueueEntry) {
         // Find the insertion point that keeps `ready` sorted by descending
         // priority and ascending sequence. `partition_point` gives the first
         // index for which the predicate is false.
@@ -115,6 +132,38 @@ impl BrokerState {
                     && existing.seq < entry.seq)
         });
         self.ready.insert(idx, entry);
+    }
+
+    /// Insert a task into the scheduled set, keeping it sorted by due time.
+    fn push_scheduled(&mut self, task: SerializedTask, seq: u64, due_at: Instant) {
+        let scheduled = ScheduledEntry {
+            due_at,
+            entry: QueueEntry { task, seq },
+        };
+        let idx = self
+            .scheduled
+            .partition_point(|existing| existing.due_at <= scheduled.due_at);
+        self.scheduled.insert(idx, scheduled);
+    }
+
+    /// Move every scheduled task whose due time has arrived into the ready
+    /// queue, returning how many were promoted (one ready permit must be
+    /// released per promoted task).
+    fn promote_due(&mut self, now: Instant) -> usize {
+        let ready_count = self.scheduled.partition_point(|entry| entry.due_at <= now);
+        if ready_count == 0 {
+            return 0;
+        }
+        let due: Vec<ScheduledEntry> = self.scheduled.drain(0..ready_count).collect();
+        for scheduled in due {
+            self.push_ready_entry(scheduled.entry);
+        }
+        ready_count
+    }
+
+    /// The earliest due time among scheduled tasks, if any.
+    fn next_due(&self) -> Option<Instant> {
+        self.scheduled.first().map(|entry| entry.due_at)
     }
 }
 
@@ -128,17 +177,34 @@ impl BrokerState {
 /// [`cancel`](crate::Broker::cancel).
 ///
 /// Higher-priority tasks are delivered first; within the same priority tasks are
-/// delivered in FIFO (insertion) order.
+/// delivered in FIFO (insertion) order. Delayed delivery
+/// ([`enqueue_at`](crate::Broker::enqueue_at) /
+/// [`enqueue_after`](crate::Broker::enqueue_after)) is supported natively: a
+/// scheduled task is held back until its due time and only then becomes
+/// deliverable.
 ///
-/// The broker is cheap to [`Clone`]; clones share the same underlying queue.
-#[derive(Debug, Default)]
+/// The broker is *not* `Clone`; share it across tasks via
+/// `Arc<InMemoryBroker>`, which is what all of the crate's own tests and
+/// examples do.
+#[derive(Debug)]
 pub struct InMemoryBroker {
     /// Shared mutable state.
     state: Mutex<BrokerState>,
-    /// Notifier used to wake waiters blocked in [`InMemoryBroker::dequeue`].
-    notify: Notify,
+    /// One permit per entry pushed onto the ready queue.
+    ///
+    /// Using a counting semaphore (rather than a `Notify`) makes wakeups
+    /// impossible to lose: a permit released by a producer survives even when
+    /// no consumer is registered yet, and a batch enqueue releases one permit
+    /// per task so *every* waiting consumer can make progress.
+    ready_permits: Semaphore,
     /// Monotonic sequence counter for FIFO tie-breaking.
     seq: AtomicU64,
+}
+
+impl Default for InMemoryBroker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryBroker {
@@ -147,7 +213,7 @@ impl InMemoryBroker {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(BrokerState::default()),
-            notify: Notify::new(),
+            ready_permits: Semaphore::new(0),
             seq: AtomicU64::new(0),
         }
     }
@@ -159,19 +225,96 @@ impl InMemoryBroker {
         self.state.lock().await.in_flight.len()
     }
 
-    /// Returns `true` if there are no ready and no in-flight tasks.
-    pub async fn is_empty(&self) -> bool {
-        let guard = self.state.lock().await;
-        guard.ready.is_empty() && guard.in_flight.is_empty()
+    /// Number of tasks scheduled for future delivery that are not yet due.
+    pub async fn scheduled_len(&self) -> usize {
+        let mut guard = self.state.lock().await;
+        let promoted = guard.promote_due(Instant::now());
+        drop(guard);
+        self.ready_permits.add_permits(promoted);
+        self.state.lock().await.scheduled.len()
     }
 
-    /// Remove every task from the broker (ready, in-flight, and cancellation
-    /// markers). Mainly intended for resetting state between tests.
+    /// Number of live cancellation markers held for in-flight tasks.
+    ///
+    /// Markers are dropped when the task is acknowledged, rejected, or
+    /// re-delivered, so this should stay bounded by the number of outstanding
+    /// cancellations. Primarily useful for tests and diagnostics.
+    pub async fn cancelled_len(&self) -> usize {
+        self.state.lock().await.cancelled.len()
+    }
+
+    /// Returns `true` if there are no ready, scheduled, or in-flight tasks.
+    pub async fn is_empty(&self) -> bool {
+        let guard = self.state.lock().await;
+        guard.ready.is_empty() && guard.in_flight.is_empty() && guard.scheduled.is_empty()
+    }
+
+    /// Remove every task from the broker (ready, scheduled, in-flight, and
+    /// cancellation markers). Mainly intended for resetting state between tests.
     pub async fn clear(&self) {
         let mut guard = self.state.lock().await;
         guard.ready.clear();
+        guard.scheduled.clear();
         guard.in_flight.clear();
         guard.cancelled.clear();
+    }
+
+    /// Release `count` ready permits (one per newly deliverable entry).
+    fn release_permits(&self, count: usize) {
+        if count > 0 {
+            self.ready_permits.add_permits(count);
+        }
+    }
+
+    /// Consume one ready permit, waiting until one is available.
+    async fn acquire_permit(&self) -> Result<()> {
+        match self.ready_permits.acquire().await {
+            Ok(permit) => {
+                // The permit is consumed by the dequeue attempt that follows.
+                permit.forget();
+                Ok(())
+            }
+            Err(_) => Err(CelersError::Broker(
+                "in-memory broker has been shut down".to_string(),
+            )),
+        }
+    }
+
+    /// Consume one ready permit if one happens to be available.
+    ///
+    /// Every entry that leaves the ready queue balances the permit its enqueue
+    /// released. Failing to acquire is harmless (it only leaves a spare permit,
+    /// which costs a waiter one extra, immediately-retried loop iteration).
+    fn consume_permit_best_effort(&self) {
+        if let Ok(permit) = self.ready_permits.try_acquire() {
+            permit.forget();
+        }
+    }
+
+    /// Promote any due scheduled tasks and attempt an immediate dequeue.
+    ///
+    /// Returns the message when one was available, along with the earliest
+    /// pending due time (used by [`Self::dequeue`] to time its wait).
+    async fn poll_once(&self) -> (Option<BrokerMessage>, Option<Instant>) {
+        let (promoted, removed, message, next_due) = {
+            let mut guard = self.state.lock().await;
+            let promoted = guard.promote_due(Instant::now());
+            let before = guard.ready.len();
+            let message = Self::try_dequeue_locked(&mut guard);
+            let removed = before - guard.ready.len();
+            let next_due = guard.next_due();
+            (promoted, removed, message, next_due)
+        };
+        self.release_permits(promoted);
+        for _ in 0..removed {
+            self.consume_permit_best_effort();
+        }
+        (message, next_due)
+    }
+
+    /// Convert a delay in seconds into a deadline on the tokio clock.
+    fn deadline_after(delay_secs: u64) -> Instant {
+        Instant::now() + Duration::from_secs(delay_secs)
     }
 
     /// Pop the next deliverable ready entry, skipping (and discarding) any
@@ -210,25 +353,34 @@ impl crate::Broker for InMemoryBroker {
             let mut guard = self.state.lock().await;
             guard.push_ready(task, seq);
         }
-        // Wake a single waiter (if any) that may be blocked in `dequeue`.
-        self.notify.notify_one();
+        // Release one permit per ready entry so no wakeup can be lost.
+        self.release_permits(1);
         Ok(task_id)
     }
 
     async fn dequeue(&self) -> Result<Option<BrokerMessage>> {
         loop {
-            // Register interest *before* checking the queue to avoid a lost
-            // wakeup between the check and the await.
-            let notified = self.notify.notified();
-            {
-                let mut guard = self.state.lock().await;
-                if let Some(msg) = Self::try_dequeue_locked(&mut guard) {
-                    return Ok(Some(msg));
-                }
+            let (message, next_due) = self.poll_once().await;
+            if let Some(msg) = message {
+                return Ok(Some(msg));
             }
-            // Queue empty: wait until something is enqueued, then retry.
-            notified.await;
+            // Nothing deliverable right now. Wait for a producer to release a
+            // permit, bounded by the next scheduled task's due time so a
+            // delayed task is delivered on time even without new enqueues.
+            match next_due {
+                Some(deadline) => {
+                    // A timeout here simply retries the loop, which promotes
+                    // the now-due scheduled task.
+                    let _ = tokio::time::timeout_at(deadline, self.acquire_permit()).await;
+                }
+                None => self.acquire_permit().await?,
+            }
         }
+    }
+
+    async fn try_dequeue(&self) -> Result<Option<BrokerMessage>> {
+        let (message, _) = self.poll_once().await;
+        Ok(message)
     }
 
     async fn ack(&self, _task_id: &TaskId, receipt_handle: Option<&str>) -> Result<()> {
@@ -238,11 +390,16 @@ impl crate::Broker for InMemoryBroker {
             ));
         };
         let mut guard = self.state.lock().await;
-        if guard.in_flight.remove(handle).is_none() {
+        let Some(task) = guard.in_flight.remove(handle) else {
             return Err(CelersError::Broker(format!(
                 "unknown receipt handle on ack: {handle}"
             )));
-        }
+        };
+        // The task completed, so any cancellation marker recorded while it was
+        // in flight is now moot. Dropping it here keeps `cancelled` bounded by
+        // the number of *live* cancellations instead of leaking one entry per
+        // cancelled-then-acknowledged task.
+        guard.cancelled.remove(&task.metadata.id);
         Ok(())
     }
 
@@ -283,11 +440,18 @@ impl crate::Broker for InMemoryBroker {
             }
             guard.push_ready(task, seq);
         }
-        self.notify.notify_one();
+        self.release_permits(1);
         Ok(())
     }
 
     async fn queue_size(&self) -> Result<usize> {
+        // Promote anything that has come due so the reported size reflects what
+        // a `dequeue` would actually deliver right now.
+        let promoted = {
+            let mut guard = self.state.lock().await;
+            guard.promote_due(Instant::now())
+        };
+        self.release_permits(promoted);
         Ok(self.state.lock().await.ready.len())
     }
 
@@ -301,6 +465,20 @@ impl crate::Broker for InMemoryBroker {
         {
             guard.ready.remove(pos);
             // Also drop any stale cancellation marker for this id.
+            guard.cancelled.remove(task_id);
+            drop(guard);
+            self.consume_permit_best_effort();
+            return Ok(true);
+        }
+
+        // A task still waiting for its scheduled delivery time can simply be
+        // dropped; it never released a ready permit.
+        if let Some(pos) = guard
+            .scheduled
+            .iter()
+            .position(|scheduled| scheduled.entry.task.metadata.id == *task_id)
+        {
+            guard.scheduled.remove(pos);
             guard.cancelled.remove(task_id);
             return Ok(true);
         }
@@ -325,6 +503,7 @@ impl crate::Broker for InMemoryBroker {
             return Ok(Vec::new());
         }
         let mut ids = Vec::with_capacity(tasks.len());
+        let pushed = tasks.len();
         {
             let mut guard = self.state.lock().await;
             for task in tasks {
@@ -333,25 +512,61 @@ impl crate::Broker for InMemoryBroker {
                 guard.push_ready(task, seq);
             }
         }
-        // Wake potentially several waiters.
-        self.notify.notify_waiters();
+        // One permit per pushed task, so *every* waiting consumer can proceed
+        // (a `notify_waiters()`-style wakeup would both miss unregistered
+        // waiters and wake at most the currently-parked ones).
+        self.release_permits(pushed);
         Ok(ids)
     }
 
     async fn dequeue_batch(&self, count: usize) -> Result<Vec<BrokerMessage>> {
-        // Unlike the trait default (which calls the *blocking* `dequeue` in a
-        // loop), this override drains up to `count` immediately-available
-        // messages and returns straight away when the queue runs dry, so it
-        // never blocks waiting for more tasks to arrive.
-        let mut messages = Vec::with_capacity(count.min(64));
-        let mut guard = self.state.lock().await;
-        for _ in 0..count {
-            match Self::try_dequeue_locked(&mut guard) {
-                Some(msg) => messages.push(msg),
-                None => break,
+        // Unlike the trait default (which calls the *blocking* `dequeue` for the
+        // first message), this override drains up to `count` immediately-
+        // available messages and returns straight away when the queue runs dry,
+        // so it never blocks waiting for more tasks to arrive.
+        let (promoted, removed, messages) = {
+            let mut guard = self.state.lock().await;
+            let promoted = guard.promote_due(Instant::now());
+            let before = guard.ready.len();
+            let mut messages = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                match Self::try_dequeue_locked(&mut guard) {
+                    Some(msg) => messages.push(msg),
+                    None => break,
+                }
             }
+            (promoted, before - guard.ready.len(), messages)
+        };
+        self.release_permits(promoted);
+        for _ in 0..removed {
+            self.consume_permit_best_effort();
         }
         Ok(messages)
+    }
+
+    async fn enqueue_at(&self, task: SerializedTask, execute_at: i64) -> Result<TaskId> {
+        let now_unix = chrono::Utc::now().timestamp();
+        let delay_secs = execute_at.saturating_sub(now_unix).max(0).unsigned_abs();
+        self.enqueue_after(task, delay_secs).await
+    }
+
+    async fn enqueue_after(&self, task: SerializedTask, delay_secs: u64) -> Result<TaskId> {
+        if delay_secs == 0 {
+            return self.enqueue(task).await;
+        }
+        let task_id = task.metadata.id;
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let due_at = Self::deadline_after(delay_secs);
+        {
+            let mut guard = self.state.lock().await;
+            guard.push_scheduled(task, seq, due_at);
+        }
+        // Nudge one consumer so a `dequeue` that is parked without a deadline
+        // re-evaluates and starts waiting until this task's due time. The extra
+        // permit is harmless: a consumer that finds the ready queue empty simply
+        // loops and waits again.
+        self.release_permits(1);
+        Ok(task_id)
     }
 }
 
@@ -380,7 +595,8 @@ struct BackendState {
 /// provides native support for the optional tombstone hooks so that a forgotten
 /// result can be distinguished from one that never existed.
 ///
-/// The backend is cheap to [`Clone`]; clones share the same underlying storage.
+/// The backend is *not* `Clone`; share it across tasks via
+/// `Arc<InMemoryResultBackend>`.
 #[derive(Debug, Default)]
 pub struct InMemoryResultBackend {
     /// Shared mutable state.
@@ -661,6 +877,124 @@ mod tests {
         let msgs = broker.dequeue_batch(10).await.unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(broker.queue_size().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_wakes_every_waiting_consumer() {
+        // Regression: `enqueue_batch` used to call `notify_waiters()`, which
+        // stores no permit when no waiter is registered yet, so consumers that
+        // had already checked the (empty) queue parked forever with tasks
+        // sitting in `ready`. Two consumers + a batch of two must both return.
+        let broker = std::sync::Arc::new(InMemoryBroker::new());
+
+        let c1 = broker.clone();
+        let c2 = broker.clone();
+        let h1 = tokio::spawn(async move { c1.dequeue().await });
+        let h2 = tokio::spawn(async move { c2.dequeue().await });
+
+        // Let both consumers reach their (empty) queue check.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        let ids = broker
+            .enqueue_batch(vec![task("a"), task("b")])
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+
+        let m1 = h1.await.unwrap().unwrap().expect("first consumer message");
+        let m2 = h2.await.unwrap().unwrap().expect("second consumer message");
+        let mut got = vec![m1.task_id(), m2.task_id()];
+        got.sort();
+        let mut expected = ids;
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn concurrent_single_enqueues_wake_all_consumers() {
+        // Two consumers, two separate `enqueue` calls: each enqueue must make a
+        // permit available so neither consumer is stranded.
+        let broker = std::sync::Arc::new(InMemoryBroker::new());
+        let c1 = broker.clone();
+        let c2 = broker.clone();
+        let h1 = tokio::spawn(async move { c1.dequeue().await });
+        let h2 = tokio::spawn(async move { c2.dequeue().await });
+
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        broker.enqueue(task("a")).await.unwrap();
+        broker.enqueue(task("b")).await.unwrap();
+
+        assert!(h1.await.unwrap().unwrap().is_some());
+        assert!(h2.await.unwrap().unwrap().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_after_delays_delivery() {
+        let broker = std::sync::Arc::new(InMemoryBroker::new());
+        let id = broker.enqueue_after(task("later"), 30).await.unwrap();
+
+        // Not deliverable yet.
+        assert_eq!(broker.queue_size().await.unwrap(), 0);
+        assert_eq!(broker.scheduled_len().await, 1);
+        assert!(broker.try_dequeue().await.unwrap().is_none());
+        assert!(!broker.is_empty().await);
+
+        // A blocked consumer wakes up exactly when the task comes due.
+        let consumer = broker.clone();
+        let handle = tokio::spawn(async move { consumer.dequeue().await });
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        let msg = handle.await.unwrap().unwrap().expect("delayed message");
+        assert_eq!(msg.task_id(), id);
+        assert_eq!(broker.scheduled_len().await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_at_in_the_past_is_immediate() {
+        let broker = InMemoryBroker::new();
+        let past = chrono::Utc::now().timestamp() - 60;
+        let id = broker.enqueue_at(task("now"), past).await.unwrap();
+        assert_eq!(broker.queue_size().await.unwrap(), 1);
+        let msg = broker.dequeue().await.unwrap().unwrap();
+        assert_eq!(msg.task_id(), id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_scheduled_task() {
+        let broker = InMemoryBroker::new();
+        let id = broker.enqueue_after(task("later"), 60).await.unwrap();
+        assert!(broker.cancel(&id).await.unwrap());
+        assert_eq!(broker.scheduled_len().await, 0);
+        assert!(broker.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn ack_clears_cancellation_marker() {
+        // Regression: cancelling an in-flight task recorded a marker that `ack`
+        // never removed, leaking one entry per cancelled-then-completed task.
+        let broker = InMemoryBroker::new();
+        let id = broker.enqueue(task("a")).await.unwrap();
+        let msg = broker.dequeue().await.unwrap().unwrap();
+        assert!(broker.cancel(&id).await.unwrap());
+
+        broker
+            .ack(&id, msg.receipt_handle.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(broker.cancelled_len().await, 0);
+
+        // And a fresh enqueue of the same id is delivered (not suppressed by a
+        // stale marker).
+        let mut again = task("a");
+        again.metadata.id = id;
+        broker.enqueue(again).await.unwrap();
+        let msg2 = broker.dequeue().await.unwrap().expect("redelivered");
+        assert_eq!(msg2.task_id(), id);
     }
 
     #[tokio::test]

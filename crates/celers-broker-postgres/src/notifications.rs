@@ -1,7 +1,6 @@
 //! LISTEN/NOTIFY support for real-time task event notifications
 
 use celers_core::{CelersError, Result};
-use oxisql_core::Connection;
 use oxisql_postgres::{NotificationStream, PgConnection};
 use std::time::Duration;
 
@@ -236,16 +235,17 @@ impl PostgresBroker {
         if enabled {
             // Create trigger function if it doesn't exist.
             //
-            // `channel` is interpolated directly into `pg_notify('{}', ...)`
-            // via `format!`, exactly as the pre-migration `sqlx::AssertSqlSafe`
-            // version did — this is a pre-existing, unchanged discipline
-            // question (not introduced by this migration): `channel` is
-            // built from `self.queue_name`, which is caller-supplied at
-            // `PostgresBroker::with_queue(..)` construction time, not a
-            // request-time value, and is never itself parameterized as a
-            // `$n` anywhere in this file either before or after this
-            // migration. Preserved byte-for-byte; not a new
-            // value-interpolation site introduced by this task.
+            // `channel` is interpolated into `pg_notify('{}', ...)` because
+            // a NOTIFY channel name cannot be a bind parameter. It is built
+            // from `self.queue_name`, which `PostgresBroker::with_pool_config`
+            // validates at construction against `[A-Za-z0-9_-]{1,64}` — so it
+            // cannot carry a quote, a semicolon or a comment marker into this
+            // literal no matter where the caller sourced the label from.
+            //
+            // The DDL below goes through `execute_batch` (simple-query
+            // protocol): the function body is dollar-quoted and the trigger
+            // block is two `;`-separated statements, neither of which the
+            // extended/prepared-statement path accepts.
             let function_sql = format!(
                 r#"
                 CREATE OR REPLACE FUNCTION notify_task_enqueued()
@@ -256,7 +256,7 @@ impl PostgresBroker {
                     payload := json_build_object(
                         'task_id', NEW.id,
                         'task_name', NEW.task_name,
-                        'queue_name', NEW.metadata->>'queue',
+                        'queue_name', NEW.queue_name,
                         'priority', NEW.priority,
                         'enqueued_at', NEW.created_at
                     );
@@ -268,7 +268,7 @@ impl PostgresBroker {
                 channel
             );
 
-            self.conn.execute(&function_sql, &[]).await.map_err(|e| {
+            self.conn.execute_batch(&function_sql).await.map_err(|e| {
                 CelersError::Other(format!("Failed to create notification function: {}", e))
             })?;
 
@@ -281,7 +281,7 @@ impl PostgresBroker {
                     EXECUTE FUNCTION notify_task_enqueued();
                 "#;
 
-            self.conn.execute(trigger_sql, &[]).await.map_err(|e| {
+            self.conn.execute_batch(trigger_sql).await.map_err(|e| {
                 CelersError::Other(format!("Failed to create notification trigger: {}", e))
             })?;
 
@@ -292,7 +292,7 @@ impl PostgresBroker {
                 DROP TRIGGER IF EXISTS trigger_notify_task_enqueued ON celers_tasks;
                 "#;
 
-            self.conn.execute(drop_sql, &[]).await.map_err(|e| {
+            self.conn.execute_batch(drop_sql).await.map_err(|e| {
                 CelersError::Other(format!("Failed to disable notification trigger: {}", e))
             })?;
 

@@ -67,6 +67,63 @@ fn known_command_names() -> Vec<String> {
     names
 }
 
+/// Whether REPL history (both loading a previous `~/.celers_history` on
+/// startup and persisting the current session's commands to it on exit) is
+/// disabled for this process, via the `CELERS_NO_HISTORY` environment
+/// variable.
+///
+/// Follows the common Unix convention (e.g. `NO_COLOR`) of treating the
+/// variable's mere presence as "on", regardless of its value.
+fn history_disabled() -> bool {
+    std::env::var_os("CELERS_NO_HISTORY").is_some()
+}
+
+/// Redact credentials from every URL-shaped token in `line` before it is
+/// recorded in REPL history.
+///
+/// The REPL's own `broker <url>` command invites pasting a connection
+/// string, which commonly embeds credentials
+/// (`redis://user:pass@host`, `postgres://user:pass@host/db`); rustyline
+/// persists whatever is passed to `add_history_entry` verbatim to
+/// `~/.celers_history` on exit, with no redaction of its own (idx 348).
+///
+/// Every whitespace-separated token containing `://` is treated as a URL
+/// and passed through [`crate::commands::utils::mask_password`], so
+/// `broker redis://user:pass@host` is recorded as `broker
+/// redis://user:****@host`. This covers the `broker <url>` command
+/// specifically -- the only place a full connection string is typed at the
+/// prompt today -- without hardcoding a check on the command name, so any
+/// future command accepting a credentialed URL is covered automatically.
+fn redact_line_for_history(line: &str) -> String {
+    line.split_whitespace()
+        .map(|token| {
+            if token.contains("://") {
+                crate::commands::utils::mask_password(token)
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Restrict `path`'s file permissions to owner-read/write only (`0600`) on
+/// Unix, best-effort. Called immediately after saving REPL history, which
+/// may now contain a broker URL's masked-but-still-partially-identifying
+/// host/user (idx 348) -- there is inherently a brief window between
+/// rustyline creating the file and this call where it may carry more
+/// permissive default permissions, since rustyline's `save_history` does
+/// not itself accept a mode, but this closes that window as tightly as
+/// possible without forking rustyline.
+#[cfg(unix)]
+fn restrict_history_file_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_history_file_permissions(_path: &std::path::Path) {}
+
 /// Format one [`CacheStats`] snapshot as an indented `label: ...` line.
 ///
 /// Pulled out as a pure, unit-testable formatter -- as opposed to a
@@ -99,14 +156,17 @@ impl InteractiveSession {
     pub fn new(config: Config) -> RustylineResult<Self> {
         let mut editor = Editor::<(), DefaultHistory>::new()?;
 
-        // Load command history if it exists
+        // Load command history if it exists (unless CELERS_NO_HISTORY opts
+        // out of history entirely -- see `history_disabled`).
         let history_path = dirs::home_dir().map(|mut p| {
             p.push(".celers_history");
             p
         });
 
-        if let Some(ref path) = history_path {
-            let _ = editor.load_history(path);
+        if !history_disabled() {
+            if let Some(ref path) = history_path {
+                let _ = editor.load_history(path);
+            }
         }
 
         let broker_url = config.broker.url;
@@ -152,8 +212,12 @@ impl InteractiveSession {
                         continue;
                     }
 
-                    // Add to history
-                    let _ = self.editor.add_history_entry(line);
+                    // Add to history, redacting any URL-shaped token's
+                    // credentials first (idx 348) -- unless
+                    // CELERS_NO_HISTORY opts out of history entirely.
+                    if !history_disabled() {
+                        let _ = self.editor.add_history_entry(redact_line_for_history(line));
+                    }
 
                     // Handle exit commands
                     if matches!(line, "exit" | "quit" | "q") {
@@ -181,10 +245,17 @@ impl InteractiveSession {
             }
         }
 
-        // Save history
-        if let Some(mut path) = dirs::home_dir() {
-            path.push(".celers_history");
-            let _ = self.editor.save_history(&path);
+        // Save history (unless CELERS_NO_HISTORY opts out entirely), then
+        // restrict its permissions to owner-only (idx 348) -- every entry
+        // added above already had URL credentials redacted, but the file
+        // itself should not be world-readable regardless.
+        if !history_disabled() {
+            if let Some(mut path) = dirs::home_dir() {
+                path.push(".celers_history");
+                if self.editor.save_history(&path).is_ok() {
+                    restrict_history_file_permissions(&path);
+                }
+            }
         }
 
         Ok(())
@@ -394,6 +465,78 @@ pub async fn start_interactive(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate the process-wide `CELERS_NO_HISTORY`
+    /// environment variable. Only matters for the plain `cargo test`
+    /// fallback runner (nextest, this crate's primary runner, isolates each
+    /// test in its own process).
+    fn no_history_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Regression test for idx 348: a `broker <url>` command carrying
+    /// embedded credentials must never reach `~/.celers_history` verbatim.
+    #[test]
+    fn redact_line_for_history_masks_password_in_url_shaped_tokens() {
+        let redacted = redact_line_for_history("broker redis://user:s3cr3t@host:6379");
+        assert_eq!(redacted, "broker redis://user:****@host:6379");
+        assert!(!redacted.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn redact_line_for_history_leaves_plain_commands_unchanged() {
+        assert_eq!(redact_line_for_history("status"), "status");
+        assert_eq!(redact_line_for_history("use my_queue"), "use my_queue");
+    }
+
+    #[test]
+    fn redact_line_for_history_masks_only_the_url_shaped_token_among_several() {
+        let redacted = redact_line_for_history("dlq inspect redis://user:s3cr3t@host 10");
+        assert!(redacted.contains("dlq inspect"));
+        assert!(redacted.contains("10"));
+        assert!(!redacted.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn history_disabled_reflects_celers_no_history_env_var() {
+        let _guard = no_history_env_guard();
+
+        std::env::remove_var("CELERS_NO_HISTORY");
+        assert!(!history_disabled());
+
+        std::env::set_var("CELERS_NO_HISTORY", "1");
+        assert!(history_disabled());
+
+        std::env::remove_var("CELERS_NO_HISTORY");
+        assert!(!history_disabled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_history_file_permissions_sets_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "celers_cli_history_perm_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "dummy history").expect("write temp file");
+        // Start from something more permissive so the assertion below
+        // actually proves this function tightened it, rather than the file
+        // happening to already be 0600 from umask defaults.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen perms");
+
+        restrict_history_file_permissions(&path);
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "history file must be owner-read/write only");
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn format_cache_stats_line_includes_all_fields() {

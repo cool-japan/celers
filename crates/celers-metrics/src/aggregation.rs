@@ -1,5 +1,6 @@
 //! Metric pre-aggregation, custom labels, and distributed aggregation.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ============================================================================
 
 /// Pre-aggregated metric statistics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricStats {
     /// Count of observations
     pub count: u64,
@@ -135,7 +136,7 @@ impl Default for MetricAggregator {
 
 /// Custom labels for metrics
 /// Allows adding arbitrary key-value labels to metrics for more granular tracking
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CustomLabels {
     labels: HashMap<String, String>,
 }
@@ -271,7 +272,14 @@ impl Default for CustomMetricBuilder {
 // ============================================================================
 
 /// Metric snapshot with timestamp for distributed aggregation
-#[derive(Debug, Clone)]
+///
+/// Derives [`Serialize`]/[`Deserialize`] so a snapshot taken on one process
+/// can be shipped over whatever transport the caller has available (Redis,
+/// a message queue, a plain HTTP push, `oxicode`/`serde_json`/... for the
+/// wire format) and fed into a peer's [`DistributedAggregator`] via
+/// [`DistributedAggregator::update`]. This crate does not ship that
+/// transport itself -- see [`DistributedAggregator`]'s documentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricSnapshot {
     /// Timestamp when the snapshot was taken
     pub timestamp: u64,
@@ -304,17 +312,42 @@ impl MetricSnapshot {
     }
 
     /// Check if snapshot is stale (older than threshold in seconds)
+    ///
+    /// A snapshot whose `timestamp` is ahead of the local clock (a peer with
+    /// a fast clock, or ordinary NTP skew) is never considered stale rather
+    /// than underflowing the `now - timestamp` subtraction: a `u64`
+    /// underflow here would panic in debug builds, or in release wrap to a
+    /// value near `u64::MAX` that is always greater than any real
+    /// `threshold_seconds`, permanently and silently marking the snapshot
+    /// stale.
     pub fn is_stale(&self, threshold_seconds: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("SystemTime should be after UNIX_EPOCH")
             .as_secs();
-        (now - self.timestamp) > threshold_seconds
+        now.saturating_sub(self.timestamp) > threshold_seconds
     }
 }
 
-/// Distributed metric aggregator
-/// Aggregates metrics from multiple workers/nodes
+/// Process-local aggregator over [`MetricSnapshot`]s keyed by `worker_id`.
+///
+/// Despite the name (kept for API stability) and the "multiple
+/// workers/nodes" framing below, this type itself has **no network
+/// transport, no broker integration, and no cross-process communication of
+/// any kind** -- it is a `Mutex<HashMap<String, MetricSnapshot>>` scoped to
+/// this one process. It genuinely aggregates statistics *across snapshots*
+/// (which may represent different workers), but getting a snapshot from
+/// another worker's process into this `HashMap` is entirely the caller's
+/// responsibility.
+///
+/// To build real cross-process aggregation: serialize each worker's
+/// [`MetricSnapshot`] (it derives [`Serialize`]/[`Deserialize`]) via
+/// `oxicode`/`serde_json`/etc., ship it to the aggregating process over your
+/// own transport (Redis, a message queue, a scrape endpoint, ...), and call
+/// [`Self::update`] there after deserializing it back.
+///
+/// Aggregates metrics from multiple workers/nodes (once you've delivered
+/// their snapshots here yourself).
 #[derive(Debug)]
 pub struct DistributedAggregator {
     snapshots: Mutex<HashMap<String, MetricSnapshot>>,
@@ -388,5 +421,90 @@ impl DistributedAggregator {
 impl Default for DistributedAggregator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_stale_future_timestamp_does_not_underflow() {
+        // A snapshot timestamped ahead of the local clock (peer clock skew,
+        // e.g. NTP) must not underflow the `now - timestamp` subtraction.
+        let stats = MetricStats::new();
+        let mut snapshot = MetricSnapshot::new("worker-1", stats);
+        snapshot.timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_secs()
+            + 3600; // 1 hour in the future
+
+        // Must not panic, and a snapshot from the future is not "stale".
+        assert!(!snapshot.is_stale(60));
+    }
+
+    #[test]
+    fn is_stale_still_flags_genuinely_old_snapshots() {
+        let stats = MetricStats::new();
+        let mut snapshot = MetricSnapshot::new("worker-1", stats);
+        snapshot.timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_secs()
+            .saturating_sub(120);
+
+        assert!(snapshot.is_stale(60));
+        assert!(!snapshot.is_stale(3600));
+    }
+
+    #[test]
+    fn metric_snapshot_and_stats_round_trip_serde() {
+        // `DistributedAggregator` has no transport of its own; a real
+        // cross-process user ships a serialized `MetricSnapshot` over their
+        // own transport and feeds it back in via `update()`. That requires
+        // the snapshot to actually be (de)serializable.
+        let mut stats = MetricStats::new();
+        stats.observe(10.0);
+        stats.observe(20.0);
+        let snapshot = MetricSnapshot::new("worker-1", stats)
+            .with_labels(CustomLabels::new().with_label("region", "us-east-1"));
+
+        let encoded =
+            oxicode::serde::encode_serde(&snapshot).expect("MetricSnapshot must be serializable");
+        let decoded: MetricSnapshot =
+            oxicode::serde::decode_serde(&encoded).expect("MetricSnapshot must be deserializable");
+
+        assert_eq!(decoded.worker_id, snapshot.worker_id);
+        assert_eq!(decoded.timestamp, snapshot.timestamp);
+        assert_eq!(decoded.stats.count, snapshot.stats.count);
+        assert_eq!(decoded.stats.sum, snapshot.stats.sum);
+        assert_eq!(decoded.stats.min, snapshot.stats.min);
+        assert_eq!(decoded.stats.max, snapshot.stats.max);
+        assert_eq!(decoded.labels.get("region"), Some("us-east-1"));
+    }
+
+    #[test]
+    fn distributed_aggregator_aggregates_snapshots_delivered_from_elsewhere() {
+        // Documents the honest contract: the aggregator combines whatever
+        // snapshots `update()` was called with; it does not fetch them from
+        // other workers itself. Simulate "delivery" as a round trip through
+        // serialization, standing in for a real transport.
+        let aggregator = DistributedAggregator::new();
+
+        for (worker, value) in [("worker-1", 10.0), ("worker-2", 30.0)] {
+            let mut stats = MetricStats::new();
+            stats.observe(value);
+            let snapshot = MetricSnapshot::new(worker, stats);
+            let wire = oxicode::serde::encode_serde(&snapshot).expect("serializable");
+            let delivered: MetricSnapshot =
+                oxicode::serde::decode_serde(&wire).expect("deserializable");
+            aggregator.update(delivered);
+        }
+
+        let combined = aggregator.aggregate();
+        assert_eq!(combined.count, 2);
+        assert_eq!(combined.sum, 40.0);
+        assert_eq!(aggregator.active_worker_count(), 2);
     }
 }

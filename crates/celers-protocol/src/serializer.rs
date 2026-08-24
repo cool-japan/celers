@@ -438,25 +438,49 @@ impl SerializerRegistry {
         ]
     }
 
-    /// Detect serialization format from raw bytes using magic numbers and heuristics.
+    /// Detect serialization format from raw bytes using magic numbers,
+    /// structural heuristics, and - where a first byte alone would be
+    /// ambiguous - a real trial parse.
     ///
-    /// This performs best-effort detection by examining byte patterns:
-    /// - JSON: starts with `{` or `[` (after optional whitespace)
+    /// - JSON: after optional leading whitespace, the data must both start
+    ///   with `{`/`[` *and* parse as a complete, valid JSON value. A
+    ///   first-byte-only check would misclassify a single-byte MessagePack
+    ///   positive fixint payload as JSON, since `0x7b`/`0x5b` (the fixints
+    ///   for 123/91) are also the ASCII codes for `{`/`[`.
     /// - YAML: starts with `---` document marker
     /// - BSON: 4-byte LE size header matching data length, trailing `0x00`
-    /// - MessagePack: binary type markers in the `0x80..=0x9f` / `0xc0..=0xdf` ranges
-    /// - Protobuf: valid wire-type and field-number in the first tag byte (weak heuristic)
+    /// - MessagePack: structural type markers that can never begin JSON or
+    ///   plain ASCII text - fixmap/fixarray/fixstr (`0x80..=0xbf`) and
+    ///   nil/bool/bin/ext/float/int/str8-32/array16-32/map16-32
+    ///   (`0xc0..=0xdf`) - checked first as a cheap fast path, then (for the
+    ///   ambiguous fixint ranges `0x00..=0x7f` / `0xe0..=0xff`, which
+    ///   overlap with plain ASCII text and are deliberately excluded from
+    ///   the fast path) a full, consumption-verified MessagePack parse:
+    ///   classified as MessagePack only if the *entire* buffer decodes as
+    ///   one self-describing value, not merely because the first byte falls
+    ///   in a fixint range.
+    /// - Protobuf: valid wire-type and field-number in the first tag byte
+    ///   (weak heuristic; tried last since it has no way to verify a match)
     ///
-    /// Returns `None` if the format cannot be determined.
+    /// Returns `None` if the format cannot be determined. Like the rest of
+    /// this heuristic, callers should treat this as a hint for e.g.
+    /// diagnostics or default-format selection, not as a substitute for an
+    /// explicit, trusted content-type when deserializing untrusted input.
     pub fn detect_format(data: &[u8]) -> Option<SerializerType> {
         if data.is_empty() {
             return None;
         }
 
-        // JSON: starts with '{' or '[' (after optional whitespace)
+        // JSON: gate on a cheap first-byte check, then confirm with a real,
+        // full-buffer parse (`serde_json` already rejects incomplete input
+        // and trailing garbage, and tolerates surrounding whitespace on its
+        // own - see the module tests - so no manual trimming is needed for
+        // the parse itself).
         let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
         if let Some(pos) = trimmed {
-            if data[pos] == b'{' || data[pos] == b'[' {
+            if (data[pos] == b'{' || data[pos] == b'[')
+                && serde_json::from_slice::<serde::de::IgnoredAny>(data).is_ok()
+            {
                 return Some(SerializerType::Json);
             }
         }
@@ -476,15 +500,29 @@ impl SerializerRegistry {
             }
         }
 
-        // MessagePack: various type markers
-        // fixmap (0x80-0x8f), fixarray (0x90-0x9f), nil/bool/bin/ext/float/int/str/array/map
+        // MessagePack (structural fast path): fixmap (0x80-0x8f), fixarray
+        // (0x90-0x9f), fixstr (0xa0-0xbf), and the nil/bool/bin/ext/float/
+        // int/str8-32/array16-32/map16-32 markers (0xc0-0xdf). None of
+        // these bytes can begin valid JSON or plain ASCII/UTF-8 text, so
+        // there is no ambiguity left to resolve with a real parse here.
         #[cfg(feature = "msgpack")]
-        if matches!(
-            data[0],
-            0x80..=0x9f | 0xc0..=0xd3 | 0xd4..=0xd8 | 0xd9..=0xdf
-        ) {
-            // Additional heuristic: not valid JSON start
-            if data[0] != b'{' && data[0] != b'[' {
+        if matches!(data[0], 0x80..=0xdf) {
+            return Some(SerializerType::MessagePack);
+        }
+
+        // MessagePack (fixint fallback): the positive/negative fixint
+        // ranges (0x00-0x7f / 0xe0-0xff) are deliberately excluded from the
+        // structural check above because they overlap with plain ASCII
+        // text and UTF-8 lead bytes - blindly matching them would turn this
+        // heuristic into a near-blanket MessagePack match. Instead, such a
+        // byte is classified as MessagePack only if the whole buffer is a
+        // single, fully-consumed, self-describing MessagePack value.
+        #[cfg(feature = "msgpack")]
+        {
+            let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(data));
+            let parsed: Result<serde::de::IgnoredAny, _> =
+                serde::de::Deserialize::deserialize(&mut de);
+            if parsed.is_ok() && de.position() as usize == data.len() {
                 return Some(SerializerType::MessagePack);
             }
         }
@@ -494,6 +532,8 @@ impl SerializerRegistry {
         // Wire type 0-5, field number > 0
         // Require at least 2 bytes (tag + value) and the first byte must not be
         // plain ASCII whitespace or printable text (to avoid false positives).
+        // Tried last: unlike the checks above, this heuristic cannot verify
+        // its guess against the rest of the buffer.
         #[cfg(feature = "protobuf")]
         if data.len() >= 2 {
             let first = data[0];
@@ -1110,6 +1150,83 @@ mod tests {
         assert_eq!(
             SerializerRegistry::detect_format(data),
             Some(SerializerType::MessagePack)
+        );
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_detect_format_msgpack_fixstr_top_level() {
+        // Regression: fixstr (0xa0-0xbf) was previously omitted from the
+        // MessagePack detection range, so a top-level MessagePack string
+        // was never detected.
+        let data: &[u8] = &[0xa5, b'h', b'e', b'l', b'l', b'o']; // fixstr "hello"
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::MessagePack)
+        );
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_detect_format_msgpack_single_positive_fixint_not_misdetected_as_json() {
+        // Regression: 0x7b is both the ASCII code for '{' and a valid
+        // MessagePack positive fixint (123). A lone byte 0x7b is *not*
+        // valid JSON (an unterminated object), so it must be classified as
+        // MessagePack, not JSON.
+        let data: &[u8] = &[0x7b];
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::MessagePack)
+        );
+
+        // Same story for 0x5b ('[' / fixint 91).
+        let data: &[u8] = &[0x5b];
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::MessagePack)
+        );
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_detect_format_msgpack_single_negative_fixint() {
+        // 0xff is a valid MessagePack negative fixint (-1), previously
+        // never detected since the fixint ranges were omitted entirely.
+        let data: &[u8] = &[0xff];
+        assert_eq!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::MessagePack)
+        );
+    }
+
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn test_detect_format_msgpack_fixint_fallback_does_not_misdetect_plain_text() {
+        // The fixint fallback must not turn into a blanket MessagePack
+        // match for ordinary multi-byte ASCII text: only the first byte
+        // would parse as a (single-byte) fixint, leaving the rest of the
+        // buffer unconsumed, so the full-consumption check must reject it.
+        let data = b"hello world, this is plain ascii text";
+        assert_ne!(
+            SerializerRegistry::detect_format(data),
+            Some(SerializerType::MessagePack)
+        );
+    }
+
+    #[test]
+    fn test_detect_format_json_still_wins_for_real_json_starting_with_brace_or_bracket() {
+        // Full JSON objects/arrays must still be classified as JSON, not
+        // swept up by the new MessagePack fixint fallback (this holds
+        // regardless of which optional features are enabled, since a real
+        // JSON document is never also a single, fully-consumed MessagePack
+        // value).
+        assert_eq!(
+            SerializerRegistry::detect_format(br#"{"key": "value"}"#),
+            Some(SerializerType::Json)
+        );
+        assert_eq!(
+            SerializerRegistry::detect_format(b"[1,2,3]"),
+            Some(SerializerType::Json)
         );
     }
 

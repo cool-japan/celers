@@ -1,7 +1,17 @@
 //! Cron-based task scheduling for recurring tasks
 //!
 //! This module provides cron-like scheduling for tasks that need to run
-//! on a regular schedule.
+//! on a regular schedule, with Redis-backed distributed dispatch locking:
+//! each process holds its own in-memory copy of the schedule (so `is_due()`
+//! checks are cheap and local), but actually *firing* a due occurrence is
+//! gated by a Redis `SET key value NX PX ttl` claim keyed by
+//! `(job_id, scheduled_fire_instant)`. Because `next_run` values are
+//! calendar-grid-aligned (computed by the `cron` crate, not `now + interval`),
+//! independent processes holding the same schedule converge on the same
+//! claim key for the same logical occurrence even if their local clocks or
+//! registration times differ slightly, so exactly one process wins the claim
+//! and fires each occurrence regardless of how many workers run the same
+//! schedule.
 //!
 //! # Example
 //!
@@ -11,22 +21,28 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let scheduler = CronScheduler::new();
+//!     // `namespace` scopes the Redis dispatch-claim keys: every process
+//!     // that should coordinate over the same jobs uses the same namespace.
+//!     let scheduler = CronScheduler::new("redis://localhost:6379", "my_app")?;
 //!
 //!     // Schedule a task to run every hour
 //!     let task = SerializedTask::new("cleanup".to_string(), vec![]);
 //!     scheduler.schedule("cleanup_job", "0 * * * *", task)?;
 //!
-//!     // Get tasks that are due to run
-//!     let due_tasks = scheduler.get_due_tasks()?;
+//!     // Get tasks that are due to run. Running this scheduler in multiple
+//!     // worker processes (same namespace, same registered jobs) still
+//!     // fires each occurrence exactly once.
+//!     let due_tasks = scheduler.get_due_tasks().await?;
 //!
 //!     Ok(())
 //! }
 //! ```
 
-use celers_core::{CelersError, Result, SerializedTask};
+use celers_core::{CelersError, Result, SerializedTask, TaskState};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tracing::{debug, warn};
+use uuid::Uuid;
 
 /// Return the current time as a Unix timestamp in seconds.
 ///
@@ -104,6 +120,26 @@ fn map_unix_dow(token: &str) -> Option<u32> {
     Some((value % 7) + 1)
 }
 
+/// Normalize a standard 5-field Unix cron expression into the 7-field form
+/// the `cron` crate expects: `"sec min hour day_of_month month day_of_week
+/// year"`. Uses `"0"` for seconds (fire at the top of the minute) and `"*"`
+/// for year, and translates the day-of-week field from Unix to Quartz
+/// convention (see [`translate_day_of_week`]). An expression that already
+/// has 6 or 7 fields (explicit seconds, optionally a year) is passed through
+/// unchanged.
+fn normalize_cron_expression(expression: &str) -> String {
+    let parts: Vec<&str> = expression.split_whitespace().collect();
+    if parts.len() == 5 {
+        let day_of_week = translate_day_of_week(parts[4]);
+        format!(
+            "0 {} {} {} {} {} *",
+            parts[0], parts[1], parts[2], parts[3], day_of_week
+        )
+    } else {
+        expression.to_string()
+    }
+}
+
 /// A cron expression for scheduling
 #[derive(Debug, Clone)]
 pub struct CronExpression {
@@ -119,7 +155,13 @@ impl CronExpression {
         Ok(Self { expression })
     }
 
-    /// Validate a cron expression format
+    /// Validate a cron expression format.
+    ///
+    /// Checks both field count *and* that the expression actually parses via
+    /// the real `cron` crate — a structurally 5-field expression with
+    /// out-of-range values (e.g. `"99 99 99 99 99"`) is rejected here rather
+    /// than being silently accepted and later degrading to a fixed
+    /// once-a-minute fallback the first time `calculate_next_run` is called.
     fn validate(expr: &str) -> Result<()> {
         let parts: Vec<&str> = expr.split_whitespace().collect();
         if parts.len() != 5 {
@@ -128,6 +170,14 @@ impl CronExpression {
                 parts.len()
             )));
         }
+
+        use cron::Schedule as CronSchedule;
+        use std::str::FromStr;
+        let normalized = normalize_cron_expression(expr);
+        CronSchedule::from_str(&normalized).map_err(|e| {
+            CelersError::Other(format!("Invalid cron expression '{}': {}", expr, e))
+        })?;
+
         Ok(())
     }
 
@@ -214,7 +264,12 @@ impl ScheduledTask {
     ///
     /// If parsing fails or no future occurrence can be found, this falls back
     /// to a sensible fixed interval (matching the original heuristic for the
-    /// well-known presets, otherwise one minute) so the function never panics.
+    /// well-known presets, otherwise one minute) so the function never
+    /// panics. In practice this fallback is unreachable through the public
+    /// API today, since [`CronExpression::new`] already rejects anything
+    /// that fails to parse — it remains as defense-in-depth (e.g. for a
+    /// schedule with no future occurrence at all) and is exercised directly
+    /// in this module's tests.
     fn calculate_next_run(cron: &CronExpression, from: Option<i64>) -> i64 {
         let now = from.unwrap_or_else(current_unix_secs);
 
@@ -232,27 +287,7 @@ impl ScheduledTask {
         use cron::Schedule as CronSchedule;
         use std::str::FromStr;
 
-        // Normalize a standard 5-field Unix expression into the 7-field form the
-        // `cron` crate expects: "sec min hour day_of_month month day_of_week year".
-        // We use "0" for seconds (fire at the top of the minute) and "*" for year.
-        //
-        // The day-of-week field must also be translated: standard Unix cron uses
-        // 0-6 with 0 = Sunday (and 7 = Sunday), whereas the `cron` crate uses the
-        // Quartz convention 1-7 with 1 = Sunday. Without translation, "1-5"
-        // (Mon-Fri in Unix) would be interpreted as Sun-Thu.
-        let parts: Vec<&str> = expression.split_whitespace().collect();
-        let normalized = if parts.len() == 5 {
-            let day_of_week = translate_day_of_week(parts[4]);
-            format!(
-                "0 {} {} {} {} {} *",
-                parts[0], parts[1], parts[2], parts[3], day_of_week
-            )
-        } else {
-            // Already includes seconds (6 fields) or seconds + year (7 fields):
-            // pass through unchanged so explicit expressions still work.
-            expression.to_string()
-        };
-
+        let normalized = normalize_cron_expression(expression);
         let schedule = CronSchedule::from_str(&normalized).ok()?;
         let after = chrono::DateTime::<chrono::Utc>::from_timestamp(from, 0)?;
         let next = schedule.after(&after).next()?;
@@ -275,12 +310,21 @@ impl ScheduledTask {
         }
     }
 
-    /// Update the next run time after execution
+    /// Update the next run time after execution.
+    ///
+    /// Computes from the *scheduled* previous `next_run`, not from `now`, so
+    /// the cadence does not drift later on every firing by however late the
+    /// poll happened to run. If the scheduler fell behind (the previous
+    /// `next_run` is far in the past — e.g. after downtime), this naturally
+    /// produces one occurrence per missed tick on subsequent polls rather
+    /// than silently skipping straight to "now"; paired with
+    /// [`CronScheduler`]'s per-occurrence Redis claim, that catch-up is safe
+    /// even with multiple worker processes racing to fire it.
     pub fn update_after_run(&mut self) {
         let now = current_unix_secs();
 
         self.last_run = Some(now);
-        self.next_run = Self::calculate_next_run(&self.cron, Some(now));
+        self.next_run = Self::calculate_next_run(&self.cron, Some(self.next_run));
     }
 
     /// Check if this task is due to run
@@ -295,17 +339,78 @@ impl ScheduledTask {
     }
 }
 
-/// Cron-based task scheduler
+/// Cron-based task scheduler. See the module documentation for the
+/// distributed dispatch-locking design.
 pub struct CronScheduler {
     tasks: Arc<RwLock<HashMap<String, ScheduledTask>>>,
+    client: redis::Client,
+    /// Scopes the Redis keys used for per-occurrence dispatch claims.
+    /// Every process that should coordinate over the same jobs must use the
+    /// same namespace (and register equivalent job ids/expressions).
+    namespace: String,
+    /// TTL (milliseconds) of the per-occurrence dispatch claim. Should be at
+    /// least the polling interval so a claim from one tick cannot expire and
+    /// be re-won by another process before the winner had a chance to hand
+    /// the fired task off.
+    claim_ttl_ms: u64,
 }
 
 impl CronScheduler {
-    /// Create a new cron scheduler
-    pub fn new() -> Self {
-        Self {
+    /// Create a new distributed cron scheduler.
+    ///
+    /// `namespace` scopes the Redis keys used for dispatch claims (typically
+    /// the queue or application name) — every process that should coordinate
+    /// over the same set of jobs must use the same `namespace` and register
+    /// the same job ids with equivalent cron expressions.
+    pub fn new(redis_url: &str, namespace: impl Into<String>) -> Result<Self> {
+        let client = redis::Client::open(redis_url)
+            .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
+
+        Ok(Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
-        }
+            client,
+            namespace: namespace.into(),
+            claim_ttl_ms: 5 * 60 * 1000,
+        })
+    }
+
+    /// Set the dispatch-claim TTL in milliseconds (default: 5 minutes).
+    pub fn with_claim_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.claim_ttl_ms = ttl_ms;
+        self
+    }
+
+    /// The Redis key used to claim exclusive dispatch rights for one
+    /// occurrence of `job_id` scheduled to fire at `fire_instant`.
+    fn claim_key(&self, job_id: &str, fire_instant: i64) -> String {
+        format!("{}:cron:claim:{}:{}", self.namespace, job_id, fire_instant)
+    }
+
+    /// Attempt to claim exclusive dispatch rights for one occurrence of a
+    /// job via an atomic `SET key value NX PX ttl`.
+    ///
+    /// Returns `true` for exactly one caller racing this for the same
+    /// `(job_id, fire_instant)` pair across any number of processes sharing
+    /// this scheduler's `namespace`; every other racer gets `false`.
+    async fn claim_occurrence(&self, job_id: &str, fire_instant: i64) -> Result<bool> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
+
+        let key = self.claim_key(job_id, fire_instant);
+        let claimed: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(1)
+            .arg("NX")
+            .arg("PX")
+            .arg(self.claim_ttl_ms)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to claim cron occurrence: {}", e)))?;
+
+        Ok(claimed.is_some())
     }
 
     /// Schedule a new task
@@ -368,23 +473,95 @@ impl CronScheduler {
         }
     }
 
-    /// Get all tasks that are due to run
-    pub fn get_due_tasks(&self) -> Result<Vec<SerializedTask>> {
+    /// Force a scheduled job to be considered due on the next
+    /// [`Self::get_due_tasks`] call, regardless of its cron schedule (a "run
+    /// now" trigger). Does not change the job's cron expression; after this
+    /// firing, `next_run` is recalculated from the cron expression as usual.
+    ///
+    /// Note: the dispatch claim (see [`Self::claim_occurrence`]) is keyed by
+    /// `(job_id, next_run)` at one-second resolution, so calling this twice
+    /// for the same job within the same wall-clock second — before the
+    /// first firing's `get_due_tasks` call — dispatches only once; the
+    /// second call is deduplicated as the same occurrence rather than
+    /// producing a second, distinct firing.
+    pub fn trigger_now(&self, id: &str) -> Result<()> {
         let mut tasks = self
             .tasks
             .write()
             .map_err(|e| CelersError::Other(format!("Failed to acquire write lock: {}", e)))?;
 
-        let mut due_tasks = Vec::new();
+        let task = tasks
+            .get_mut(id)
+            .ok_or_else(|| CelersError::Other(format!("Task not found: {}", id)))?;
+        task.next_run = current_unix_secs();
+        Ok(())
+    }
 
-        for task in tasks.values_mut() {
-            if task.is_due() {
-                due_tasks.push(task.task_template.clone());
-                task.update_after_run();
+    /// Get all tasks that are due to run, claiming exclusive dispatch rights
+    /// for each via Redis so that only one process — of however many share
+    /// this scheduler's `namespace` and job set — actually fires each
+    /// occurrence. Every firing gets a fresh task id (and fresh
+    /// created_at/updated_at/state), so downstream systems keyed on task id
+    /// (dedup, result backends, databases) do not collide across
+    /// occurrences of the same recurring job.
+    ///
+    /// On a Redis error, this fails *open* (fires locally anyway, logging a
+    /// warning) rather than *closed*: a scheduled job silently never firing
+    /// during a Redis outage is judged worse than an occasional duplicate
+    /// firing during that same outage. Every process still advances its own
+    /// local schedule regardless of whether it wins the claim, so a losing
+    /// process's next `is_due()` check reflects the *next* occurrence rather
+    /// than retrying the same one forever.
+    pub async fn get_due_tasks(&self) -> Result<Vec<SerializedTask>> {
+        let due: Vec<(String, i64, SerializedTask)> = {
+            let mut tasks = self
+                .tasks
+                .write()
+                .map_err(|e| CelersError::Other(format!("Failed to acquire write lock: {}", e)))?;
+
+            let mut due = Vec::new();
+            for task in tasks.values_mut() {
+                if task.is_due() {
+                    due.push((task.id.clone(), task.next_run, task.task_template.clone()));
+                    task.update_after_run();
+                }
+            }
+            due
+        };
+
+        let mut due_tasks = Vec::with_capacity(due.len());
+        for (job_id, fire_instant, template) in due {
+            match self.claim_occurrence(&job_id, fire_instant).await {
+                Ok(true) => due_tasks.push(Self::instantiate_firing(template)),
+                Ok(false) => {
+                    debug!(
+                        "Skipping cron occurrence {}@{}: claimed by another process",
+                        job_id, fire_instant
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to claim cron occurrence {}@{}: {} — firing locally to avoid \
+                         silently dropping a scheduled occurrence",
+                        job_id, fire_instant, e
+                    );
+                    due_tasks.push(Self::instantiate_firing(template));
+                }
             }
         }
 
         Ok(due_tasks)
+    }
+
+    /// Produce a fresh, independently-identified task instance for one
+    /// firing of a recurring job.
+    fn instantiate_firing(mut template: SerializedTask) -> SerializedTask {
+        let now = chrono::Utc::now();
+        template.metadata.id = Uuid::new_v4();
+        template.metadata.state = TaskState::Pending;
+        template.metadata.created_at = now;
+        template.metadata.updated_at = now;
+        template
     }
 
     /// Get all scheduled tasks
@@ -429,16 +606,13 @@ impl CronScheduler {
     }
 }
 
-impl Default for CronScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Clone for CronScheduler {
     fn clone(&self) -> Self {
         Self {
             tasks: Arc::clone(&self.tasks),
+            client: self.client.clone(),
+            namespace: self.namespace.clone(),
+            claim_ttl_ms: self.claim_ttl_ms,
         }
     }
 }
@@ -448,11 +622,20 @@ mod tests {
     use super::*;
     use celers_core::TaskMetadata;
 
+    /// Redis connection URL used by the integration-style tests below. A
+    /// local Redis is expected to be reachable in this crate's test
+    /// environment (see the crate's other Redis-backed modules).
+    const TEST_REDIS_URL: &str = "redis://127.0.0.1:6379";
+
     fn create_test_task() -> SerializedTask {
         SerializedTask {
             metadata: TaskMetadata::new("test_task".to_string()),
             payload: vec![],
         }
+    }
+
+    fn test_scheduler(namespace: &str) -> CronScheduler {
+        CronScheduler::new(TEST_REDIS_URL, namespace).unwrap()
     }
 
     #[test]
@@ -461,6 +644,10 @@ mod tests {
         assert!(CronExpression::new("0 * * * *").is_ok());
         assert!(CronExpression::new("invalid").is_err());
         assert!(CronExpression::new("* * *").is_err());
+        // Structurally 5 fields but semantically nonsense (every field out
+        // of range) must be rejected too, not silently accepted and later
+        // silently degraded to a 60-second fallback interval.
+        assert!(CronExpression::new("99 99 99 99 99").is_err());
     }
 
     #[test]
@@ -485,8 +672,22 @@ mod tests {
     }
 
     #[test]
+    fn test_update_after_run_computes_from_scheduled_time_not_now() {
+        let cron = CronExpression::every_minute();
+        let task = create_test_task();
+        let mut scheduled = ScheduledTask::new("job".to_string(), cron, task);
+
+        let original_next_run = scheduled.next_run; // grid-aligned to a minute boundary
+        scheduled.update_after_run();
+
+        // Must be exactly 60s after the *scheduled* time, not "now + 60s"
+        // (which would drift later by however long this call took).
+        assert_eq!(scheduled.next_run, original_next_run + 60);
+    }
+
+    #[test]
     fn test_cron_scheduler_schedule() {
-        let scheduler = CronScheduler::new();
+        let scheduler = test_scheduler("test-ns-schedule");
         let task = create_test_task();
 
         assert!(scheduler.schedule("job1", "* * * * *", task).is_ok());
@@ -495,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_cron_scheduler_unschedule() {
-        let scheduler = CronScheduler::new();
+        let scheduler = test_scheduler("test-ns-unschedule");
         let task = create_test_task();
 
         scheduler.schedule("job1", "* * * * *", task).unwrap();
@@ -507,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_cron_scheduler_enable_disable() {
-        let scheduler = CronScheduler::new();
+        let scheduler = test_scheduler("test-ns-enable-disable");
         let task = create_test_task();
 
         scheduler.schedule("job1", "* * * * *", task).unwrap();
@@ -523,7 +724,7 @@ mod tests {
 
     #[test]
     fn test_cron_scheduler_list_all() {
-        let scheduler = CronScheduler::new();
+        let scheduler = test_scheduler("test-ns-list-all");
         let task1 = create_test_task();
         let task2 = create_test_task();
 
@@ -536,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_cron_scheduler_clear() {
-        let scheduler = CronScheduler::new();
+        let scheduler = test_scheduler("test-ns-clear");
         let task = create_test_task();
 
         scheduler
@@ -551,13 +752,121 @@ mod tests {
 
     #[test]
     fn test_cron_scheduler_clone() {
-        let scheduler = CronScheduler::new();
+        let scheduler = test_scheduler("test-ns-clone");
         let task = create_test_task();
 
         scheduler.schedule("job1", "* * * * *", task).unwrap();
 
         let cloned = scheduler.clone();
         assert_eq!(cloned.count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_due_tasks_assigns_fresh_id_per_firing() {
+        let scheduler = test_scheduler(&format!("test-cron-freshid-{}", Uuid::new_v4()));
+        let template = create_test_task();
+        let template_id = template.metadata.id;
+        scheduler.schedule("job1", "* * * * *", template).unwrap();
+
+        scheduler.trigger_now("job1").unwrap();
+        let due1 = scheduler.get_due_tasks().await.unwrap();
+        assert_eq!(due1.len(), 1);
+        assert_ne!(
+            due1[0].metadata.id, template_id,
+            "each firing must get a fresh id, not the template's"
+        );
+        assert_eq!(due1[0].metadata.state, TaskState::Pending);
+    }
+
+    /// Two firings issued for the exact same wall-clock second are, by
+    /// design, treated as the same dispatch occurrence and deduplicated by
+    /// the Redis claim (see `test_claim_occurrence_is_exclusive_...`) — so
+    /// "successive firings get distinct ids" is tested directly against
+    /// `instantiate_firing`, independent of claim timing, rather than by
+    /// racing two real `trigger_now` calls within the same second.
+    #[test]
+    fn test_instantiate_firing_assigns_fresh_id_and_resets_state() {
+        let template = create_test_task();
+        let template_id = template.metadata.id;
+
+        let fired1 = CronScheduler::instantiate_firing(template.clone());
+        let fired2 = CronScheduler::instantiate_firing(template.clone());
+
+        assert_ne!(fired1.metadata.id, template_id);
+        assert_ne!(fired2.metadata.id, template_id);
+        assert_ne!(
+            fired1.metadata.id, fired2.metadata.id,
+            "successive firings of the same recurring job must not share an id"
+        );
+        assert_eq!(fired1.metadata.state, TaskState::Pending);
+        assert_eq!(fired2.metadata.state, TaskState::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_claim_occurrence_is_exclusive_across_independent_schedulers() {
+        // Two independently constructed `CronScheduler`s sharing a namespace
+        // simulate two worker processes racing to fire the exact same
+        // logical occurrence of a job.
+        let namespace = format!("test-cron-claim-{}", Uuid::new_v4());
+        let scheduler_a = test_scheduler(&namespace);
+        let scheduler_b = test_scheduler(&namespace);
+
+        let fire_instant = 1_700_000_000i64; // arbitrary fixed occurrence
+
+        let won_a = scheduler_a
+            .claim_occurrence("shared_job", fire_instant)
+            .await
+            .unwrap();
+        let won_b = scheduler_b
+            .claim_occurrence("shared_job", fire_instant)
+            .await
+            .unwrap();
+
+        assert!(won_a, "the first claimant should win");
+        assert!(
+            !won_b,
+            "a second, independent scheduler racing the SAME occurrence must lose the claim"
+        );
+
+        // A different occurrence (different fire_instant) is independent.
+        let won_a_next = scheduler_a
+            .claim_occurrence("shared_job", fire_instant + 60)
+            .await
+            .unwrap();
+        assert!(won_a_next, "a different occurrence has its own claim");
+    }
+
+    #[tokio::test]
+    async fn test_get_due_tasks_skips_occurrence_already_claimed_by_another_process() {
+        let scheduler = test_scheduler(&format!("test-cron-e2e-{}", Uuid::new_v4()));
+        scheduler
+            .schedule("job1", "* * * * *", create_test_task())
+            .unwrap();
+        scheduler.trigger_now("job1").unwrap();
+
+        let fire_instant = scheduler.get("job1").unwrap().unwrap().next_run;
+
+        // Simulate another process having already won the claim for this
+        // exact occurrence before we call get_due_tasks.
+        let pre_claimed = scheduler
+            .claim_occurrence("job1", fire_instant)
+            .await
+            .unwrap();
+        assert!(pre_claimed);
+
+        let due = scheduler.get_due_tasks().await.unwrap();
+        assert!(
+            due.is_empty(),
+            "an occurrence already claimed by another process must not fire again here"
+        );
+
+        // The local schedule must still advance so the next poll reflects
+        // the *next* occurrence rather than retrying this one forever.
+        let advanced = scheduler.get("job1").unwrap().unwrap();
+        assert!(
+            advanced.next_run > fire_instant,
+            "schedule must advance even when the claim is lost"
+        );
     }
 
     /// Convert a UTC date/time into a Unix timestamp for deterministic tests.
@@ -664,9 +973,15 @@ mod tests {
 
     #[test]
     fn test_calculate_next_run_falls_back_gracefully() {
-        // A structurally valid 5-field expression that the parser rejects must
-        // not panic; it falls back to a positive future timestamp.
-        let cron = CronExpression::new("99 99 99 99 99").unwrap();
+        // `CronExpression::new` now rejects this expression outright (see
+        // `test_cron_expression_validation`), so bypass it via direct
+        // struct construction — available to tests in the same module tree
+        // — to exercise `calculate_next_run`'s defensive fallback path
+        // directly: it must never panic even given an expression that could
+        // not have passed validation.
+        let cron = CronExpression {
+            expression: "99 99 99 99 99".to_string(),
+        };
         let from = ts(2021, 1, 1, 0, 0, 0);
         let next = ScheduledTask::calculate_next_run(&cron, Some(from));
         assert!(next > from);

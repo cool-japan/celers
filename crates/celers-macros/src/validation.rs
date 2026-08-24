@@ -27,7 +27,7 @@ pub(crate) fn generate_lazy_regex_validation(
                 regex::Regex::new(#pattern).expect("Invalid regex pattern")
             });
             if !#static_name.is_match(&#field_name) {
-                return Err(celers_core::CelersError(#error_msg_tokens));
+                return Err(celers_core::CelersError::TaskExecution(#error_msg_tokens));
             }
         }
     }
@@ -46,8 +46,18 @@ pub(crate) fn is_option_type(ty: &Type) -> bool {
 /// Field validation configuration
 ///
 /// Infrastructure for validation attribute support with custom error messages
+//
+// Deliberately does *not* derive `Debug`: the `custom` field holds a
+// `syn::Path`, and `syn`'s `Debug` impls for its AST types are gated behind
+// its `extra-traits` Cargo feature, which this crate's `syn` dependency does
+// not request (only `derive`, `parsing`, `printing`, `proc-macro`,
+// `clone-impls` via `full`). Deriving `Debug` here would compile only by
+// accident, whenever some *other* crate elsewhere in the same build graph
+// happens to enable `syn/extra-traits` for the same `syn` version and
+// Cargo's feature unification carries it over -- not something to depend
+// on. Nothing in this crate actually `{:?}`-prints a `FieldValidation`.
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct FieldValidation {
     min_value: Option<i64>,
     max_value: Option<i64>,
@@ -96,8 +106,12 @@ pub(crate) struct FieldValidation {
     ethereum_address: bool,
     isbn: bool,
     password_strength: bool,
-    // Custom validator function
-    custom: Option<String>,
+    // Custom validator function. Stored as a parsed `syn::Path` (rather than
+    // a raw `String`) so a module-qualified validator (e.g. `"my_mod::check"`)
+    // works, and so an invalid path is caught as a clean, spanned compile
+    // error at attribute-parse time instead of panicking later when the
+    // codegen stage tried to build a plain `syn::Ident` out of it.
+    custom: Option<syn::Path>,
 }
 
 #[allow(dead_code)]
@@ -253,7 +267,22 @@ impl FieldValidation {
                         validation.password_strength = true;
                     } else if meta.path.is_ident("custom") {
                         let value: syn::LitStr = meta.value()?.parse()?;
-                        validation.custom = Some(value.value());
+                        // Parse the string literal's *contents* as a `syn::Path`,
+                        // at the literal's own span. This accepts both bare
+                        // function names ("check") and module-qualified paths
+                        // ("my_mod::check"), and turns a malformed value into a
+                        // proper compile error pointing at the attribute instead
+                        // of a proc-macro panic during codegen.
+                        let path: syn::Path = value.parse().map_err(|e| {
+                            syn::Error::new(
+                                value.span(),
+                                format!(
+                                    "invalid custom validator path '{}': {e}",
+                                    value.value()
+                                ),
+                            )
+                        })?;
+                        validation.custom = Some(path);
                     } else {
                         return Err(meta.error(format!(
                             "unknown validation parameter '{}'. Valid parameters: min, max, min_length, max_length, pattern, message, email, url, phone, not_empty, positive, negative, alphabetic, alphanumeric, numeric, uuid, ipv4, hexadecimal, ipv6, slug, mac_address, json, base64, color_hex, semver, domain, ascii, lowercase, uppercase, time_24h, date_iso8601, credit_card, latitude, longitude, iso_country, iso_language, us_zip, ca_postal, iban, bitcoin_address, ethereum_address, isbn, password_strength, custom",
@@ -296,7 +325,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if (#field_name as i64) < #min {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -317,7 +346,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if (#field_name as i64) > #max {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -340,7 +369,7 @@ impl FieldValidation {
 
                 validations.push(quote! {
                     if #field_name.len() < #min {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 });
             }
@@ -361,7 +390,7 @@ impl FieldValidation {
 
                 validations.push(quote! {
                     if #field_name.len() > #max {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 });
             }
@@ -383,14 +412,14 @@ impl FieldValidation {
             validations.push(quote! {
                 {
                     let regex = regex::Regex::new(#pattern).map_err(|e| {
-                        celers_core::CelersError(format!(
+                        celers_core::CelersError::TaskExecution(format!(
                             "Invalid regex pattern for field '{}': {}",
                             stringify!(#field_name),
                             e
                         ))
                     })?;
                     if !regex.is_match(&#field_name) {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 }
             });
@@ -468,7 +497,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if #field_name.is_empty() {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -488,7 +517,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if #field_name <= 0 {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -508,7 +537,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if #field_name >= 0 {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -528,7 +557,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if !#field_name.chars().all(|c| c.is_alphabetic()) {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -548,7 +577,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if !#field_name.chars().all(|c| c.is_alphanumeric()) {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -568,7 +597,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if !#field_name.chars().all(|c| c.is_numeric()) {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -627,7 +656,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if !#field_name.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -708,7 +737,7 @@ impl FieldValidation {
             validations.push(quote! {
                 {
                     if serde_json::from_str::<serde_json::Value>(&#field_name).is_err() {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 }
             });
@@ -734,7 +763,7 @@ impl FieldValidation {
                         regex::Regex::new(r"^[A-Za-z0-9+/]*={0,2}$").expect("Invalid regex pattern")
                     });
                     if !REGEX_BASE64.is_match(&#field_name) || (#field_name.len() % 4 != 0) {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 }
             });
@@ -815,7 +844,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if !#field_name.is_ascii() {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -835,7 +864,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if !#field_name.chars().all(|c| c.is_lowercase() || !c.is_alphabetic()) {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -855,7 +884,7 @@ impl FieldValidation {
 
             validations.push(quote! {
                 if !#field_name.chars().all(|c| c.is_uppercase() || !c.is_alphabetic()) {
-                    return Err(celers_core::CelersError(#error_msg));
+                    return Err(celers_core::CelersError::TaskExecution(#error_msg));
                 }
             });
         }
@@ -921,7 +950,7 @@ impl FieldValidation {
 
                     // Check length (13-19 digits for most cards)
                     if cleaned.len() < 13 || cleaned.len() > 19 {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
 
                     // Luhn algorithm
@@ -940,7 +969,7 @@ impl FieldValidation {
                     }
 
                     if sum % 10 != 0 {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 }
             });
@@ -962,10 +991,10 @@ impl FieldValidation {
             validations.push(quote! {
                 {
                     let lat: f64 = #field_name.parse().map_err(|_| {
-                        celers_core::CelersError(#error_msg.clone())
+                        celers_core::CelersError::TaskExecution(#error_msg.clone())
                     })?;
                     if !(-90.0..=90.0).contains(&lat) {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 }
             });
@@ -987,10 +1016,10 @@ impl FieldValidation {
             validations.push(quote! {
                 {
                     let lon: f64 = #field_name.parse().map_err(|_| {
-                        celers_core::CelersError(#error_msg.clone())
+                        celers_core::CelersError::TaskExecution(#error_msg.clone())
                     })?;
                     if !(-180.0..=180.0).contains(&lon) {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 }
             });
@@ -1169,7 +1198,7 @@ impl FieldValidation {
                     if cleaned.len() == 10 {
                         // ISBN-10 validation with checksum
                         if !cleaned.chars().take(9).all(|c| c.is_numeric()) {
-                            return Err(celers_core::CelersError(#error_msg));
+                            return Err(celers_core::CelersError::TaskExecution(#error_msg));
                         }
 
                         let mut sum = 0;
@@ -1185,12 +1214,12 @@ impl FieldValidation {
                         };
 
                         if (sum + check_digit) % 11 != 0 {
-                            return Err(celers_core::CelersError(#error_msg));
+                            return Err(celers_core::CelersError::TaskExecution(#error_msg));
                         }
                     } else if cleaned.len() == 13 {
                         // ISBN-13 validation with checksum
                         if !cleaned.chars().all(|c| c.is_numeric()) {
-                            return Err(celers_core::CelersError(#error_msg));
+                            return Err(celers_core::CelersError::TaskExecution(#error_msg));
                         }
 
                         let mut sum = 0;
@@ -1200,10 +1229,10 @@ impl FieldValidation {
                         }
 
                         if sum % 10 != 0 {
-                            return Err(celers_core::CelersError(#error_msg));
+                            return Err(celers_core::CelersError::TaskExecution(#error_msg));
                         }
                     } else {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 }
             });
@@ -1225,7 +1254,7 @@ impl FieldValidation {
             validations.push(quote! {
                 {
                     if #field_name.len() < 8 {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
 
                     let has_uppercase = #field_name.chars().any(|c| c.is_uppercase());
@@ -1234,19 +1263,21 @@ impl FieldValidation {
                     let has_special = #field_name.chars().any(|c| !c.is_alphanumeric());
 
                     if !has_uppercase || !has_lowercase || !has_digit || !has_special {
-                        return Err(celers_core::CelersError(#error_msg));
+                        return Err(celers_core::CelersError::TaskExecution(#error_msg));
                     }
                 }
             });
         }
 
-        // Custom validator function
-        if let Some(custom_fn) = &self.custom {
-            let custom_fn_ident = syn::Ident::new(custom_fn, proc_macro2::Span::call_site());
-
+        // Custom validator function. `custom_fn_path` was already validated as
+        // a real `syn::Path` while parsing the attribute (see `from_attributes`),
+        // so it can be spliced directly into a call expression without any
+        // risk of the `syn::Ident::new` panic this used to hit for
+        // module-qualified paths such as `#[validate(custom = "my_mod::check")]`.
+        if let Some(custom_fn_path) = &self.custom {
             validations.push(quote! {
-                if let Err(e) = #custom_fn_ident(&#field_name) {
-                    return Err(celers_core::CelersError(e));
+                if let Err(e) = #custom_fn_path(&#field_name) {
+                    return Err(celers_core::CelersError::TaskExecution(e));
                 }
             });
         }

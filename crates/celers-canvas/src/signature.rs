@@ -279,6 +279,14 @@ impl Signature {
         self
     }
 
+    /// Set an absolute execution time (Unix timestamp in seconds)
+    ///
+    /// An ETA takes precedence over a countdown at dispatch time.
+    pub fn with_eta(mut self, eta: i64) -> Self {
+        self.options.eta = Some(eta);
+        self
+    }
+
     /// Set retry policy
     pub fn with_retries(mut self, max_retries: u32) -> Self {
         self.options.max_retries = Some(max_retries);
@@ -640,6 +648,15 @@ pub struct TaskOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub countdown: Option<u64>,
 
+    /// Absolute execution time as a Unix timestamp in seconds
+    ///
+    /// Takes precedence over [`countdown`](Self::countdown) at dispatch time:
+    /// the task is handed to
+    /// [`Broker::enqueue_at`](celers_core::Broker::enqueue_at) instead of
+    /// [`Broker::enqueue_after`](celers_core::Broker::enqueue_after).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta: Option<i64>,
+
     /// Maximum number of retries
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
@@ -712,6 +729,11 @@ impl TaskOptions {
     /// Check if countdown is set
     pub fn has_countdown(&self) -> bool {
         self.countdown.is_some()
+    }
+
+    /// Check if an absolute ETA is set
+    pub fn has_eta(&self) -> bool {
+        self.eta.is_some()
     }
 
     /// Check if max_retries is set
@@ -842,6 +864,9 @@ impl std::fmt::Display for TaskOptions {
         }
         if let Some(countdown) = self.countdown {
             parts.push(format!("countdown={}s", countdown));
+        }
+        if let Some(eta) = self.eta {
+            parts.push(format!("eta={}", eta));
         }
         if let Some(max_retries) = self.max_retries {
             parts.push(format!("retries={}", max_retries));

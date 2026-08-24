@@ -797,10 +797,18 @@ pub struct QueryPlanAnalysis {
     pub suggestions: Vec<String>,
 }
 
-/// Analyze a query execution plan for performance issues
+/// Estimate whether a query *shape* will hit performance problems
 ///
-/// Parses EXPLAIN output (simplified) to identify common performance problems.
-/// This is a heuristic-based analysis, not a full EXPLAIN parser.
+/// Works entirely from the caller-supplied table statistics below and
+/// PostgreSQL's default planner cost constants (`seq_page_cost = 1.0`,
+/// `random_page_cost = 4.0`). It does **not** connect to the database and it
+/// does **not** parse `EXPLAIN` output, so `estimated_cost` is a modelled
+/// number rather than the planner's own — treat it as a design-time sanity
+/// check on an index/selectivity trade-off, not as ground truth.
+///
+/// For the planner's actual plan and costs, run
+/// [`crate::PostgresBroker::explain_dequeue_query`], which executes a real
+/// `EXPLAIN (ANALYZE, BUFFERS)` against the live database.
 ///
 /// # Arguments
 ///

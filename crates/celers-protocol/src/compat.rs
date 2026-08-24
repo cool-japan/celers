@@ -1,14 +1,70 @@
-//! Python Celery Protocol Compatibility Tests
+//! Python Celery protocol v2 wire-format checks
 //!
-//! This module provides verification that CeleRS messages are wire-compatible
-//! with Python Celery's protocol v2/v5 format.
+//! This module checks a [`Message`] against the concrete shape Python Celery
+//! puts on the wire for protocol v2, and provides the canonical Celery envelope
+//! as a fixture for deserialization tests.
+//!
+//! # Scope
+//!
+//! [`verify_message_format`] is a *structural* check: it validates the envelope
+//! layout, the required header keys, and that the body really is a base64
+//! `[args, kwargs, embed]` tuple with the canonical embed dict. It cannot prove
+//! interoperability with a particular Celery release -- only an end-to-end test
+//! against a running Python worker can do that -- but, unlike a bare
+//! key-presence check, it *can* fail: a message with an opaque body, a missing
+//! `body_encoding`, or a malformed embed dict is rejected.
+//!
+//! The reference for every rule below is `celery.app.amqp.AMQP.as_task_v2` and
+//! `kombu.transport.virtual.base`.
 
-use crate::Message;
+use crate::embed::EmbeddedBody;
+use crate::{Message, BODY_ENCODING_BASE64};
 use base64::Engine;
 use serde_json::json;
 use uuid::Uuid;
 
+/// Header keys Python Celery always writes for protocol v2.
+///
+/// Celery emits these unconditionally (with `null` when unused), so a consumer
+/// may index them directly. CeleRS omits the null-valued optional ones, which is
+/// safe because Celery's own worker reads headers with `.get()`; only the three
+/// listed in [`REQUIRED_V2_HEADERS`] are load-bearing.
+pub const CELERY_V2_HEADERS: &[&str] = &[
+    "task",
+    "id",
+    "lang",
+    "root_id",
+    "parent_id",
+    "group",
+    "retries",
+    "eta",
+    "expires",
+    "timelimit",
+    "argsrepr",
+    "kwargsrepr",
+    "origin",
+    "shadow",
+    "ignore_result",
+];
+
+/// Header keys without which a Celery worker cannot dispatch the task.
+pub const REQUIRED_V2_HEADERS: &[&str] = &["task", "id", "lang"];
+
 /// Verify that a CeleRS message serializes to Celery-compatible JSON
+///
+/// Checks, in order:
+///
+/// 1. The envelope carries `headers`, `properties`, `body`, `content-type` and
+///    `content-encoding` (kombu's hyphenated spellings).
+/// 2. Every key in [`REQUIRED_V2_HEADERS`] is present in `headers`.
+/// 3. `properties.delivery_mode` is 1 or 2, and `properties.body_encoding` is
+///    `"base64"` -- without which a kombu consumer never base64-decodes the
+///    body and hands the encoded text to the content-type deserializer.
+/// 4. `body` is a base64 string that decodes to the protocol v2 tuple
+///    `[args, kwargs, embed]`: a list, an object, and an embed object. This
+///    step applies only when `content-type` is `application/json`; other
+///    serializations frame the same tuple in their own encoding, which this
+///    function does not decode.
 pub fn verify_message_format(msg: &Message) -> Result<(), String> {
     // Serialize to JSON
     let json_str = serde_json::to_string(msg).map_err(|e| format!("Serialization error: {}", e))?;
@@ -16,71 +72,151 @@ pub fn verify_message_format(msg: &Message) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| format!("Parse error: {}", e))?;
 
-    // Verify required fields exist
-    if value.get("headers").is_none() {
-        return Err("Missing 'headers' field".to_string());
+    // 1. Envelope layout.
+    for field in [
+        "headers",
+        "properties",
+        "body",
+        "content-type",
+        "content-encoding",
+    ] {
+        if value.get(field).is_none() {
+            return Err(format!("Missing '{}' field", field));
+        }
     }
 
-    if value.get("properties").is_none() {
-        return Err("Missing 'properties' field".to_string());
+    // 2. Required headers.
+    let headers = value
+        .get("headers")
+        .ok_or_else(|| "Missing 'headers' field".to_string())?;
+    for header in REQUIRED_V2_HEADERS {
+        if headers.get(header).is_none() {
+            return Err(format!("Missing 'headers.{}' field", header));
+        }
     }
 
-    if value.get("body").is_none() {
-        return Err("Missing 'body' field".to_string());
+    // 3. Properties that govern how the body is read.
+    let properties = value
+        .get("properties")
+        .ok_or_else(|| "Missing 'properties' field".to_string())?;
+    match properties.get("delivery_mode").and_then(|v| v.as_u64()) {
+        Some(1) | Some(2) => {}
+        other => {
+            return Err(format!(
+                "Invalid 'properties.delivery_mode': expected 1 or 2, got {:?}",
+                other
+            ))
+        }
+    }
+    match properties.get("body_encoding").and_then(|v| v.as_str()) {
+        Some(BODY_ENCODING_BASE64) => {}
+        other => {
+            return Err(format!(
+                "Invalid 'properties.body_encoding': expected {:?}, got {:?}. \
+                 kombu only base64-decodes the body when this property says so.",
+                BODY_ENCODING_BASE64, other
+            ))
+        }
     }
 
-    if value.get("content-type").is_none() {
-        return Err("Missing 'content-type' field".to_string());
+    // 4. The body must be the protocol v2 [args, kwargs, embed] tuple.
+    let body = value
+        .get("body")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "'body' must be a base64 string".to_string())?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|e| format!("'body' is not valid base64: {}", e))?;
+
+    // The tuple check only applies to a JSON-serialized body; msgpack and other
+    // content types encode the same three-element tuple in their own framing,
+    // which this function does not decode.
+    if msg.content_type != crate::CONTENT_TYPE_JSON {
+        return Ok(());
     }
 
-    if value.get("content-encoding").is_none() {
-        return Err("Missing 'content-encoding' field".to_string());
+    let tuple: serde_json::Value = serde_json::from_slice(&decoded)
+        .map_err(|e| format!("Body is not valid protocol v2 JSON: {}", e))?;
+    let elements = tuple
+        .as_array()
+        .ok_or_else(|| "Body must be the [args, kwargs, embed] tuple".to_string())?;
+    if elements.len() != 3 {
+        return Err(format!(
+            "Body must have exactly 3 elements [args, kwargs, embed], got {}",
+            elements.len()
+        ));
+    }
+    if !elements[0].is_array() {
+        return Err("Body element 0 (args) must be a list".to_string());
+    }
+    if !elements[1].is_object() {
+        return Err("Body element 1 (kwargs) must be an object".to_string());
+    }
+    if !elements[2].is_object() && !elements[2].is_null() {
+        return Err("Body element 2 (embed) must be an object".to_string());
     }
 
-    // Verify headers structure
-    let headers = value.get("headers").expect("headers field should exist");
-    if headers.get("task").is_none() {
-        return Err("Missing 'headers.task' field".to_string());
-    }
-
-    if headers.get("id").is_none() {
-        return Err("Missing 'headers.id' field".to_string());
-    }
-
-    if headers.get("lang").is_none() {
-        return Err("Missing 'headers.lang' field".to_string());
-    }
+    EmbeddedBody::decode(&decoded).map_err(|e| format!("Body embed dict is malformed: {}", e))?;
 
     Ok(())
 }
 
-/// Create a Python Celery-compatible message (for testing deserialization)
+/// Build the canonical Python Celery protocol v2 envelope (for testing
+/// deserialization).
+///
+/// This mirrors `celery.app.amqp.AMQP.as_task_v2` plus the kombu
+/// virtual-transport envelope, including the parts CeleRS itself omits:
+///
+/// * every v2 header, with explicit `null` for the unused ones, and
+///   `timelimit` as the `[soft, hard]` pair;
+/// * `properties.body_encoding`, which tells kombu to base64-decode the body;
+/// * the embed dict with all four workflow keys present
+///   (`{'callbacks': None, 'errbacks': None, 'chain': None, 'chord': None}`),
+///   which is what Python emits even when no workflow is attached.
 pub fn create_python_celery_message(
     task_name: &str,
     task_id: Uuid,
     args: Vec<serde_json::Value>,
     kwargs: serde_json::Value,
 ) -> serde_json::Value {
-    // This is the exact format Python Celery uses for Protocol v2
+    let embed = json!({
+        "callbacks": null,
+        "errbacks": null,
+        "chain": null,
+        "chord": null
+    });
+
     json!({
         "headers": {
             "task": task_name,
             "id": task_id.to_string(),
             "lang": "py",
-            "root_id": null,
+            "root_id": task_id.to_string(),
             "parent_id": null,
-            "group": null
+            "group": null,
+            "retries": 0,
+            "eta": null,
+            "expires": null,
+            "timelimit": [null, null],
+            "argsrepr": format!("{:?}", args),
+            "kwargsrepr": kwargs.to_string(),
+            "origin": "1234@celers-test",
+            "shadow": null,
+            "ignore_result": false
         },
         "properties": {
             "correlation_id": task_id.to_string(),
-            "reply_to": null,
+            "reply_to": Uuid::nil().to_string(),
             "delivery_mode": 2,
-            "priority": null
+            "priority": 0,
+            "body_encoding": BODY_ENCODING_BASE64,
+            "delivery_tag": Uuid::nil().to_string(),
+            "delivery_info": {"exchange": "", "routing_key": "celery"}
         },
         "content-type": "application/json",
         "content-encoding": "utf-8",
         "body": base64::engine::general_purpose::STANDARD.encode(
-            serde_json::to_vec(&json!([args, kwargs, {}])).expect("serialization should not fail")
+            serde_json::to_vec(&json!([args, kwargs, embed])).expect("serialization should not fail")
         )
     })
 }
@@ -107,6 +243,75 @@ mod tests {
         verify_message_format(&msg).expect("Message format should be compatible");
     }
 
+    /// Regression: `verify_message_format` used to check nothing but the
+    /// presence of a handful of keys, so every message this crate could
+    /// produce passed and no real incompatibility could ever be detected.
+    #[test]
+    fn test_verify_message_format_rejects_incompatible_messages() {
+        let task_id = Uuid::new_v4();
+
+        // An opaque body is not a protocol v2 [args, kwargs, embed] tuple.
+        let opaque = Message::new("tasks.add".to_string(), task_id, b"not json".to_vec());
+        let err = verify_message_format(&opaque)
+            .expect_err("an opaque body must be rejected as protocol v2");
+        assert!(
+            err.contains("protocol v2 JSON"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A JSON body that is not the 3-tuple is rejected too.
+        let two_tuple = Message::new(
+            "tasks.add".to_string(),
+            task_id,
+            serde_json::to_vec(&json!([[1, 2], {}])).expect("encode"),
+        );
+        let err = verify_message_format(&two_tuple).expect_err("a 2-tuple body must be rejected");
+        assert!(
+            err.contains("exactly 3 elements"),
+            "unexpected error: {}",
+            err
+        );
+
+        // args must be a list, kwargs an object -- the Python calling
+        // convention, not a free-form pair.
+        let swapped = Message::new(
+            "tasks.add".to_string(),
+            task_id,
+            serde_json::to_vec(&json!([{}, {}, {}])).expect("encode"),
+        );
+        let err = verify_message_format(&swapped).expect_err("args must be a list");
+        assert!(
+            err.contains("(args) must be a list"),
+            "unexpected error: {}",
+            err
+        );
+
+        // An invalid delivery mode is rejected.
+        let mut bad_mode = Message::new(
+            "tasks.add".to_string(),
+            task_id,
+            serde_json::to_vec(&json!([[], {}, {}])).expect("encode"),
+        );
+        bad_mode.properties.delivery_mode = 7;
+        let err = verify_message_format(&bad_mode).expect_err("delivery_mode 7 must be rejected");
+        assert!(err.contains("delivery_mode"), "unexpected error: {}", err);
+    }
+
+    /// A message built through the crate's own v5 path must also satisfy the
+    /// protocol v2 envelope rules (v5 is the same envelope plus header stamps).
+    #[test]
+    fn test_v5_message_satisfies_v2_envelope_rules() {
+        let msg = crate::v5::V5MessageSpec::new("tasks.add", Uuid::new_v4())
+            .with_args(vec![json!(1), json!(2)])
+            .with_kwarg("debug", json!(true))
+            .build()
+            .expect("v5 build must succeed")
+            .into_message();
+
+        verify_message_format(&msg).expect("a v5 message is a valid v2 envelope");
+    }
+
     #[test]
     fn test_parse_python_celery_message() {
         let task_id = Uuid::new_v4();
@@ -124,6 +329,58 @@ mod tests {
         assert_eq!(msg.headers.id, task_id);
         assert_eq!(msg.headers.lang, "py");
         assert_eq!(msg.content_type, "application/json");
+    }
+
+    /// The fixture must carry the parts a real Celery producer emits and CeleRS
+    /// previously ignored: the null-valued embed keys, `body_encoding`, and the
+    /// full v2 header set. Regression: the fixture claimed to be "the exact
+    /// format Python Celery uses" while emitting an empty embed dict `{}` and
+    /// omitting every one of those keys.
+    #[test]
+    fn test_python_fixture_is_the_canonical_celery_envelope() {
+        let task_id = Uuid::new_v4();
+        let python_msg = create_python_celery_message(
+            "tasks.multiply",
+            task_id,
+            vec![json!(4), json!(5)],
+            json!({}),
+        );
+
+        // Every protocol v2 header key is present (null when unused).
+        for header in CELERY_V2_HEADERS {
+            assert!(
+                python_msg["headers"].get(header).is_some(),
+                "fixture is missing the Celery v2 header '{}'",
+                header
+            );
+        }
+        assert_eq!(python_msg["headers"]["timelimit"], json!([null, null]));
+
+        // kombu's body codec selector.
+        assert_eq!(python_msg["properties"]["body_encoding"], json!("base64"));
+        assert!(python_msg["properties"]["delivery_info"].is_object());
+
+        // The embed dict carries all four workflow keys with explicit nulls,
+        // which is what `as_task_v2` writes.
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(python_msg["body"].as_str().expect("body is a string"))
+            .expect("body is base64");
+        let tuple: serde_json::Value = serde_json::from_slice(&body).expect("body is json");
+        for key in ["callbacks", "errbacks", "chain", "chord"] {
+            assert_eq!(
+                tuple[2][key],
+                json!(null),
+                "embed dict is missing the '{}' key",
+                key
+            );
+        }
+
+        // And the whole thing round-trips into a `Message` whose body decodes.
+        let msg = parse_python_message(python_msg).expect("fixture must parse");
+        let decoded = EmbeddedBody::decode(&msg.body).expect("body must decode");
+        assert_eq!(decoded.args, vec![json!(4), json!(5)]);
+        assert!(!decoded.embed.has_workflow());
+        verify_message_format(&msg).expect("the fixture is a valid v2 envelope");
     }
 
     #[test]

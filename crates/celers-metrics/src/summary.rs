@@ -155,10 +155,17 @@ impl PSquareEstimator {
         }
 
         // Step B.3: adjust interior marker heights/positions if necessary.
+        //
+        // Jain & Chlamtac's condition for a downward move is
+        // `d <= -1 and n[i-1] - n[i] < -1`. `pos_diff_prev` must therefore be
+        // `n[i-1] - n[i]` (which is always <= 0 since positions are
+        // non-decreasing), not `n[i] - n[i-1]` (always >= 0, which would make
+        // the `< -1.0` check unsatisfiable and the marker could never move
+        // down).
         for i in 1..4 {
             let d = self.desired[i] - self.positions[i];
             let pos_diff_next = self.positions[i + 1] - self.positions[i];
-            let pos_diff_prev = self.positions[i] - self.positions[i - 1];
+            let pos_diff_prev = self.positions[i - 1] - self.positions[i];
 
             if (d >= 1.0 && pos_diff_next > 1.0) || (d <= -1.0 && pos_diff_prev < -1.0) {
                 let d_sign = if d >= 0.0 { 1.0 } else { -1.0 };

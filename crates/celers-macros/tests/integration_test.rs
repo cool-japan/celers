@@ -3,18 +3,49 @@
 //! These tests verify that the procedural macros work correctly
 //! in a real-world scenario by actually compiling and executing them.
 
-use celers_macros::task;
+use celers_macros::{task, Task as TaskDerive};
 
-// Mock the celers_core types that the macro expects
+// Mock the celers_core types that the macro expects.
+//
+// `CelersError` mirrors the *real* `celers_core::CelersError` enum shape
+// (see crates/celers-core/src/error.rs) rather than a tuple struct: the
+// macros in this crate generate `celers_core::CelersError::TaskExecution(..)`
+// construction calls, and previously this mock defined `CelersError` as a
+// plain tuple struct `CelersError(pub String)` that happened to *also*
+// compile against the (buggy) old macro output. That meant this whole
+// integration-test suite could not have caught the real crate rejecting the
+// generated code with `error[E0423]: expected function, tuple struct or
+// tuple variant, found enum`. Keeping the mock's shape in lockstep with the
+// real enum (instead of using the real crate directly, which this package's
+// Cargo.toml does not currently pull in as a dev-dependency) at least
+// ensures this suite exercises the exact enum-variant-construction path the
+// real crate requires.
 mod celers_core {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug)]
-    pub struct CelersError(pub String);
+    pub enum CelersError {
+        TaskExecution(String),
+    }
+
+    impl CelersError {
+        /// Test-only accessor for the wrapped message. The real crate
+        /// exposes this via `Display`/`to_string()` (see `thiserror`'s
+        /// `#[error("Task execution failed: {0}")]` on the real variant);
+        /// this mock exposes the raw message directly since a large number
+        /// of assertions below check the message text exactly.
+        pub fn message(&self) -> &str {
+            match self {
+                CelersError::TaskExecution(msg) => msg,
+            }
+        }
+    }
 
     impl std::fmt::Display for CelersError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", self.0)
+            match self {
+                CelersError::TaskExecution(msg) => write!(f, "{}", msg),
+            }
         }
     }
 
@@ -196,7 +227,9 @@ async fn test_mixed_types() {
 #[task]
 async fn failing_task(should_fail: bool) -> celers_core::Result<String> {
     if should_fail {
-        Err(celers_core::CelersError("Task failed".to_string()))
+        Err(celers_core::CelersError::TaskExecution(
+            "Task failed".to_string(),
+        ))
     } else {
         Ok("Success".to_string())
     }
@@ -216,7 +249,7 @@ async fn test_error_handling() {
     let input = FailingTaskTaskInput { should_fail: true };
     let result = task.execute(input).await;
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().0, "Task failed");
+    assert_eq!(result.unwrap_err().message(), "Task failed");
 }
 
 // Test 10: Test serialization of Input structs
@@ -265,19 +298,73 @@ async fn test_complex_return_type() {
     assert_eq!(result.unwrap(), vec![0, 1, 2, 3, 4]);
 }
 
-// Test 13: Task with simple generic (no HRTB for now)
-// Note: Full generic support with HRTB requires more complex implementation
-// This test demonstrates basic generic parameter support
-#[test]
-fn test_generic_task_compiles() {
-    // This test just verifies that generic tasks compile correctly
-    // Actual execution with generics requires the serde bounds which are complex
-    // For now, we verify the macro accepts generic syntax
+// Test 13: Task with a generic type parameter.
+//
+// Regression test: `#[task]` on a generic fn used to expand the task marker
+// struct as a field-less unit struct (`struct GenericCollectTask<T>;`),
+// which is `error[E0392]: type parameter 'T' is never used` for *every*
+// concrete `T` -- generic tasks could not compile at all. The fix gives the
+// marker struct a `PhantomData` field that references every type/lifetime
+// parameter. This test both compiles *and executes* a generic task (with
+// two different concrete `T`s), so it would fail to build if that
+// regression reappeared.
+//
+// Note: the type parameter needs `Serialize + Deserialize` bounds (in
+// addition to `Send + Clone`) because those are required by the generated
+// `<GenericCollectTask<T> as Task>::Input` (`GenericCollectTaskInput<T>`,
+// which derives `Serialize`/`Deserialize` over its `Vec<T>` field).
+// Regression test for a second, related bug the fix also had to address:
+// the generated input struct used to repeat the fn's *entire* where-clause
+// on its own declaration -- redundant with what `#[derive(Serialize,
+// Deserialize)]` already infers per-field, and for any bound that mentions
+// `Serialize`/`Deserialize` (exactly what a task moving real generic data
+// needs), actively conflicting with it as
+// `error[E0283]: type annotations needed ... multiple impls or where
+// clauses satisfying ... found`. The fix stops repeating the where-clause
+// on the input struct specifically (it never needs it: it holds data only,
+// and auto-traits like `Send` are inferred from field types regardless).
+// Without *both* halves of this fix, no generic `#[task]` fn whose data
+// needs to be (de)serialized could compile at all -- this test uses a
+// perfectly ordinary `for<'de> Deserialize<'de>` bound (the fix no longer
+// requires working around the name `'de` specifically) and *executes* the
+// task, so it would fail to build (not just fail an assertion) if either
+// regression reappeared.
+//
+// This test also exercises the *other* half of the `#[task]` generics fix:
+// the output type (`usize`) never mentions `T`, which used to make the
+// generated `type GenericCollectTaskOutput<T> = usize;` alias
+// `error[E0091]: type parameter is never used` -- a hard error, not the
+// `type_alias_bounds` warning the first pass at this fix assumed.
+#[task]
+async fn generic_collect<T>(items: Vec<T>) -> celers_core::Result<usize>
+where
+    T: Send + Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
+{
+    Ok(items.len())
+}
 
-    // The macro should accept this syntax without errors:
-    // #[task]
-    // async fn generic_task<T>(value: T) -> celers_core::Result<T>
-    // where T: Send { Ok(value) }
+#[tokio::test]
+async fn test_generic_task_compiles_and_executes() {
+    let task = GenericCollectTask::<i32>::default();
+    let input = GenericCollectTaskInput {
+        items: vec![1, 2, 3, 4, 5],
+    };
+    let result = task.execute(input).await;
+    assert_eq!(result.unwrap(), 5);
+    assert_eq!(task.name(), "generic_collect");
+}
+
+#[tokio::test]
+async fn test_generic_task_with_different_type_param() {
+    // Same generated struct, instantiated at a different concrete type --
+    // demonstrating the PhantomData marker does not tie the struct to a
+    // single `T`.
+    let task = GenericCollectTask::<String>::default();
+    let input = GenericCollectTaskInput {
+        items: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+    };
+    let result = task.execute(input).await;
+    assert_eq!(result.unwrap(), 3);
 }
 
 // Test 14: Task with empty parameters
@@ -386,7 +473,7 @@ async fn test_validate_min_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("below minimum"));
+    assert!(error.message().contains("below minimum"));
 }
 
 // Test 20: Task with max validation
@@ -411,7 +498,7 @@ async fn test_validate_max_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("exceeds maximum"));
+    assert!(error.message().contains("exceeds maximum"));
 }
 
 // Test 21: Task with range validation (min and max)
@@ -438,7 +525,7 @@ async fn test_validate_range_too_low() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("below minimum"));
+    assert!(error.message().contains("below minimum"));
 }
 
 #[tokio::test]
@@ -448,7 +535,7 @@ async fn test_validate_range_too_high() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("exceeds maximum"));
+    assert!(error.message().contains("exceeds maximum"));
 }
 
 // Test 22: Task with string length validation
@@ -479,7 +566,7 @@ async fn test_validate_length_too_short() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("below minimum"));
+    assert!(error.message().contains("below minimum"));
 }
 
 #[tokio::test]
@@ -491,7 +578,7 @@ async fn test_validate_length_too_long() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("exceeds maximum"));
+    assert!(error.message().contains("exceeds maximum"));
 }
 
 // Test 23: Task with multiple validated parameters
@@ -525,8 +612,8 @@ async fn test_validate_multiple_age_invalid() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("age"));
-    assert!(error.0.contains("below minimum"));
+    assert!(error.message().contains("age"));
+    assert!(error.message().contains("below minimum"));
 }
 
 #[tokio::test]
@@ -539,8 +626,8 @@ async fn test_validate_multiple_name_invalid() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("name"));
-    assert!(error.0.contains("below minimum"));
+    assert!(error.message().contains("name"));
+    assert!(error.message().contains("below minimum"));
 }
 
 // Test 24: Task with pattern validation (email)
@@ -571,7 +658,7 @@ async fn test_validate_pattern_email_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("does not match required pattern"));
+    assert!(error.message().contains("does not match required pattern"));
 }
 
 // Test 25: Task with pattern validation (phone number)
@@ -602,7 +689,7 @@ async fn test_validate_pattern_phone_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("does not match required pattern"));
+    assert!(error.message().contains("does not match required pattern"));
 }
 
 // Test 26: Task with combined validation (length + pattern)
@@ -633,7 +720,7 @@ async fn test_validate_combined_length_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("length"));
+    assert!(error.message().contains("length"));
 }
 
 #[tokio::test]
@@ -645,7 +732,7 @@ async fn test_validate_combined_pattern_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("does not match required pattern"));
+    assert!(error.message().contains("does not match required pattern"));
 }
 
 // Test 27: Custom error message for min validation
@@ -671,7 +758,7 @@ async fn test_custom_message_min_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "You must be at least 18 years old");
+    assert_eq!(error.message(), "You must be at least 18 years old");
 }
 
 // Test 28: Custom error message for max validation
@@ -697,7 +784,7 @@ async fn test_custom_message_max_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Score cannot exceed 100 points");
+    assert_eq!(error.message(), "Score cannot exceed 100 points");
 }
 
 // Test 29: Custom error message for length validation
@@ -732,7 +819,10 @@ async fn test_custom_message_length_too_short() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Username must be between 3 and 20 characters");
+    assert_eq!(
+        error.message(),
+        "Username must be between 3 and 20 characters"
+    );
 }
 
 #[tokio::test]
@@ -744,7 +834,10 @@ async fn test_custom_message_length_too_long() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Username must be between 3 and 20 characters");
+    assert_eq!(
+        error.message(),
+        "Username must be between 3 and 20 characters"
+    );
 }
 
 // Test 30: Custom error message for pattern validation
@@ -778,7 +871,7 @@ async fn test_custom_message_pattern_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Please provide a valid email address");
+    assert_eq!(error.message(), "Please provide a valid email address");
 }
 
 // Test 31: Custom error message with range validation
@@ -809,7 +902,10 @@ async fn test_custom_message_range_too_low() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Age must be a realistic value between 0 and 120");
+    assert_eq!(
+        error.message(),
+        "Age must be a realistic value between 0 and 120"
+    );
 }
 
 #[tokio::test]
@@ -819,7 +915,10 @@ async fn test_custom_message_range_too_high() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Age must be a realistic value between 0 and 120");
+    assert_eq!(
+        error.message(),
+        "Age must be a realistic value between 0 and 120"
+    );
 }
 // Test: Predefined email validator
 #[task]
@@ -846,7 +945,7 @@ async fn test_validate_email_shorthand_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("valid email address"));
+    assert!(error.message().contains("valid email address"));
 }
 
 // Test: Predefined url validator
@@ -874,7 +973,7 @@ async fn test_validate_url_shorthand_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("valid URL"));
+    assert!(error.message().contains("valid URL"));
 }
 
 // Test: Predefined phone validator
@@ -904,7 +1003,7 @@ async fn test_validate_phone_shorthand_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("valid phone number"));
+    assert!(error.message().contains("valid phone number"));
 }
 
 // Test: not_empty validator
@@ -932,7 +1031,7 @@ async fn test_validate_not_empty_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("must not be empty"));
+    assert!(error.message().contains("must not be empty"));
 }
 
 // Test: positive validator
@@ -956,7 +1055,7 @@ async fn test_validate_positive_failure_zero() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("must be positive"));
+    assert!(error.message().contains("must be positive"));
 }
 
 #[tokio::test]
@@ -966,7 +1065,7 @@ async fn test_validate_positive_failure_negative() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("must be positive"));
+    assert!(error.message().contains("must be positive"));
 }
 
 // Test: negative validator
@@ -992,7 +1091,7 @@ async fn test_validate_negative_failure_zero() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("must be negative"));
+    assert!(error.message().contains("must be negative"));
 }
 
 #[tokio::test]
@@ -1002,7 +1101,7 @@ async fn test_validate_negative_failure_positive() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("must be negative"));
+    assert!(error.message().contains("must be negative"));
 }
 
 // Test: alphabetic validator
@@ -1030,7 +1129,7 @@ async fn test_validate_alphabetic_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("only alphabetic characters"));
+    assert!(error.message().contains("only alphabetic characters"));
 }
 
 // Test: alphanumeric validator
@@ -1060,7 +1159,7 @@ async fn test_validate_alphanumeric_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("only alphanumeric characters"));
+    assert!(error.message().contains("only alphanumeric characters"));
 }
 
 // Test: Combined predefined validators with custom message
@@ -1093,7 +1192,7 @@ async fn test_validate_combined_predefined_email_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Please enter a valid email address");
+    assert_eq!(error.message(), "Please enter a valid email address");
 }
 
 #[tokio::test]
@@ -1106,7 +1205,7 @@ async fn test_validate_combined_predefined_quantity_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Quantity must be greater than zero");
+    assert_eq!(error.message(), "Quantity must be greater than zero");
 }
 
 // Test: numeric validator
@@ -1134,7 +1233,7 @@ async fn test_validate_numeric_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("only numeric characters"));
+    assert!(error.message().contains("only numeric characters"));
 }
 
 // Test: uuid validator
@@ -1162,7 +1261,7 @@ async fn test_validate_uuid_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("valid UUID"));
+    assert!(error.message().contains("valid UUID"));
 }
 
 #[tokio::test]
@@ -1217,7 +1316,7 @@ async fn test_validate_ipv4_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("valid IPv4 address"));
+    assert!(error.message().contains("valid IPv4 address"));
 }
 
 #[tokio::test]
@@ -1277,7 +1376,7 @@ async fn test_validate_hexadecimal_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert!(error.0.contains("only hexadecimal characters"));
+    assert!(error.message().contains("only hexadecimal characters"));
 }
 
 // Test: Combined new validators with custom messages
@@ -1316,7 +1415,7 @@ async fn test_validate_new_validators_combined_pin_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "PIN must contain only digits");
+    assert_eq!(error.message(), "PIN must contain only digits");
 }
 
 #[tokio::test]
@@ -1330,7 +1429,7 @@ async fn test_validate_new_validators_combined_uuid_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid transaction ID format");
+    assert_eq!(error.message(), "Invalid transaction ID format");
 }
 
 #[tokio::test]
@@ -1344,7 +1443,7 @@ async fn test_validate_new_validators_combined_ipv4_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid server IP address");
+    assert_eq!(error.message(), "Invalid server IP address");
 }
 
 // Test IPv6 validation
@@ -1382,7 +1481,10 @@ async fn test_validate_ipv6_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Field 'address' must be a valid IPv6 address");
+    assert_eq!(
+        error.message(),
+        "Field 'address' must be a valid IPv6 address"
+    );
 }
 
 // Test slug validation
@@ -1421,7 +1523,7 @@ async fn test_validate_slug_failure_uppercase() {
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
-        error.0,
+        error.message(),
         "Field 'slug' must be a valid URL slug (lowercase letters, numbers, and hyphens only)"
     );
 }
@@ -1471,7 +1573,7 @@ async fn test_validate_mac_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Field 'mac' must be a valid MAC address");
+    assert_eq!(error.message(), "Field 'mac' must be a valid MAC address");
 }
 
 #[tokio::test]
@@ -1520,7 +1622,7 @@ async fn test_validate_network_config_ipv6_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid IPv6 address");
+    assert_eq!(error.message(), "Invalid IPv6 address");
 }
 
 #[tokio::test]
@@ -1534,7 +1636,7 @@ async fn test_validate_network_config_mac_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid MAC address");
+    assert_eq!(error.message(), "Invalid MAC address");
 }
 
 #[tokio::test]
@@ -1548,7 +1650,7 @@ async fn test_validate_network_config_slug_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid hostname slug");
+    assert_eq!(error.message(), "Invalid hostname slug");
 }
 
 // Test JSON validation
@@ -1586,7 +1688,7 @@ async fn test_validate_json_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Field 'data' must be valid JSON");
+    assert_eq!(error.message(), "Field 'data' must be valid JSON");
 }
 
 // Test base64 validation
@@ -1624,7 +1726,7 @@ async fn test_validate_base64_failure_invalid_chars() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Field 'data' must be valid base64");
+    assert_eq!(error.message(), "Field 'data' must be valid base64");
 }
 
 #[tokio::test]
@@ -1673,7 +1775,7 @@ async fn test_validate_color_hex_failure_no_hash() {
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(
-        error.0,
+        error.message(),
         "Field 'color' must be a valid hex color code (#RGB or #RRGGBB)"
     );
 }
@@ -1724,7 +1826,7 @@ async fn test_validate_web_data_json_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid JSON configuration");
+    assert_eq!(error.message(), "Invalid JSON configuration");
 }
 
 #[tokio::test]
@@ -1738,7 +1840,7 @@ async fn test_validate_web_data_base64_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid base64 encoded data");
+    assert_eq!(error.message(), "Invalid base64 encoded data");
 }
 
 #[tokio::test]
@@ -1752,7 +1854,7 @@ async fn test_validate_web_data_color_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid color code");
+    assert_eq!(error.message(), "Invalid color code");
 }
 
 // ============================================================================
@@ -1796,7 +1898,7 @@ async fn test_validate_semver_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid version format");
+    assert_eq!(error.message(), "Invalid version format");
 }
 
 // Domain validator tests
@@ -1836,7 +1938,7 @@ async fn test_validate_domain_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid domain name");
+    assert_eq!(error.message(), "Invalid domain name");
 }
 
 // ASCII validator tests
@@ -1866,7 +1968,7 @@ async fn test_validate_ascii_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Must be ASCII only");
+    assert_eq!(error.message(), "Must be ASCII only");
 }
 
 #[tokio::test]
@@ -1906,7 +2008,7 @@ async fn test_validate_lowercase_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Must be lowercase");
+    assert_eq!(error.message(), "Must be lowercase");
 }
 
 #[tokio::test]
@@ -1946,7 +2048,7 @@ async fn test_validate_uppercase_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Must be uppercase");
+    assert_eq!(error.message(), "Must be uppercase");
 }
 
 #[tokio::test]
@@ -1996,7 +2098,7 @@ async fn test_validate_time_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid time format");
+    assert_eq!(error.message(), "Invalid time format");
 }
 
 // Date ISO 8601 validator tests
@@ -2026,7 +2128,7 @@ async fn test_validate_date_failure_invalid_month() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid date format");
+    assert_eq!(error.message(), "Invalid date format");
 }
 
 #[tokio::test]
@@ -2038,7 +2140,7 @@ async fn test_validate_date_failure_wrong_format() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid date format");
+    assert_eq!(error.message(), "Invalid date format");
 }
 
 // Credit card validator tests
@@ -2080,7 +2182,7 @@ async fn test_validate_credit_card_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid credit card number");
+    assert_eq!(error.message(), "Invalid credit card number");
 }
 
 // Combined test with all new validators
@@ -2131,7 +2233,7 @@ async fn test_validate_all_new_version_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid version");
+    assert_eq!(error.message(), "Invalid version");
 }
 
 #[tokio::test]
@@ -2150,7 +2252,7 @@ async fn test_validate_all_new_card_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid card");
+    assert_eq!(error.message(), "Invalid card");
 }
 
 // ============================================================================
@@ -2497,7 +2599,7 @@ async fn test_validate_location_data_lat_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid latitude");
+    assert_eq!(error.message(), "Invalid latitude");
 }
 
 #[tokio::test]
@@ -2514,7 +2616,7 @@ async fn test_validate_location_data_country_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid country code");
+    assert_eq!(error.message(), "Invalid country code");
 }
 
 // ============================================================================
@@ -2604,7 +2706,7 @@ async fn test_validate_bitcoin_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid Bitcoin address");
+    assert_eq!(error.message(), "Invalid Bitcoin address");
 }
 
 // Ethereum Address Validator Tests
@@ -2644,7 +2746,7 @@ async fn test_validate_ethereum_failure_no_prefix() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid Ethereum address");
+    assert_eq!(error.message(), "Invalid Ethereum address");
 }
 
 #[tokio::test]
@@ -2714,7 +2816,7 @@ async fn test_validate_isbn_failure_invalid_checksum() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid ISBN");
+    assert_eq!(error.message(), "Invalid ISBN");
 }
 
 #[tokio::test]
@@ -2754,7 +2856,7 @@ async fn test_validate_password_failure_too_short() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Weak password");
+    assert_eq!(error.message(), "Weak password");
 }
 
 #[tokio::test]
@@ -2766,7 +2868,7 @@ async fn test_validate_password_failure_no_uppercase() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Weak password");
+    assert_eq!(error.message(), "Weak password");
 }
 
 #[tokio::test]
@@ -2845,7 +2947,7 @@ async fn test_validate_financial_crypto_iban_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Invalid bank account");
+    assert_eq!(error.message(), "Invalid bank account");
 }
 
 #[tokio::test]
@@ -2861,7 +2963,7 @@ async fn test_validate_financial_crypto_password_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Password too weak");
+    assert_eq!(error.message(), "Password too weak");
 }
 
 // Test: Custom validator function support
@@ -2919,7 +3021,7 @@ async fn test_custom_validator_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Value must be an even number");
+    assert_eq!(error.message(), "Value must be an even number");
 }
 
 #[task]
@@ -2949,7 +3051,7 @@ async fn test_custom_validator_username_at_sign() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Username cannot start with @");
+    assert_eq!(error.message(), "Username cannot start with @");
 }
 
 #[tokio::test]
@@ -2961,7 +3063,7 @@ async fn test_custom_validator_username_too_short() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Username must be at least 3 characters");
+    assert_eq!(error.message(), "Username must be at least 3 characters");
 }
 
 #[tokio::test]
@@ -2973,7 +3075,7 @@ async fn test_custom_validator_username_with_space() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Username cannot contain spaces");
+    assert_eq!(error.message(), "Username cannot contain spaces");
 }
 
 #[task]
@@ -3007,7 +3109,10 @@ async fn test_combined_max_validator_failure() {
     assert!(result.is_err());
     let error = result.unwrap_err();
     // The max validator runs before custom validator
-    assert_eq!(error.0, "Field 'completion' value 150 exceeds maximum 100");
+    assert_eq!(
+        error.message(),
+        "Field 'completion' value 150 exceeds maximum 100"
+    );
 }
 
 #[tokio::test]
@@ -3020,7 +3125,7 @@ async fn test_combined_username_validator_failure() {
     let result = task.execute(input).await;
     assert!(result.is_err());
     let error = result.unwrap_err();
-    assert_eq!(error.0, "Username cannot start with @");
+    assert_eq!(error.message(), "Username cannot start with @");
 }
 
 #[tokio::test]
@@ -3034,5 +3139,125 @@ async fn test_combined_min_validator_failure() {
     assert!(result.is_err());
     let error = result.unwrap_err();
     // The min validator runs before custom validator
-    assert!(error.0.contains("below minimum"));
+    assert!(error.message().contains("below minimum"));
+}
+
+// Test: Module-qualified custom validator path (regression test).
+//
+// The custom-validator codegen used to build the call target with
+// `syn::Ident::new(custom_fn, Span::call_site())`, which *panics*
+// ("... is not a valid Ident") for any value containing `::` -- so
+// `#[validate(custom = "some_mod::check")]` could not be used at all; the
+// whole proc-macro invocation aborted with "proc macro panicked" rather
+// than compiling, or even producing an ordinary compile error. The fix
+// parses `custom` as a `syn::Path` while parsing the attribute, which
+// accepts module-qualified paths (and turns a genuinely invalid value into
+// a normal compile error instead of a panic).
+mod validators {
+    pub fn check_even(value: &i32) -> Result<(), String> {
+        if value % 2 == 0 {
+            Ok(())
+        } else {
+            Err("value must be even".to_string())
+        }
+    }
+}
+
+#[task]
+async fn module_qualified_custom_validator(
+    #[validate(custom = "validators::check_even")] value: i32,
+) -> celers_core::Result<String> {
+    Ok(format!("Value: {}", value))
+}
+
+#[tokio::test]
+async fn test_module_qualified_custom_validator_success() {
+    let task = ModuleQualifiedCustomValidatorTask;
+    let input = ModuleQualifiedCustomValidatorTaskInput { value: 4 };
+    let result = task.execute(input).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), "Value: 4");
+}
+
+#[tokio::test]
+async fn test_module_qualified_custom_validator_failure() {
+    let task = ModuleQualifiedCustomValidatorTask;
+    let input = ModuleQualifiedCustomValidatorTaskInput { value: 3 };
+    let result = task.execute(input).await;
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.message(), "value must be even");
+}
+
+// Tests: `#[derive(Task)]` attribute parsing (regression tests for the
+// derive-macro fix). Two of the original bugs -- `parse_nested_meta`
+// errors being discarded via `let _ = ...`, and an unparsable `input`/
+// `output` type string silently becoming `serde_json::Value` -- are
+// compile-time failure modes that would need a `trybuild`-style
+// compile-fail harness to assert on directly (not available to this
+// package's dev-dependencies). What *is* directly testable here is that
+// the valid, documented paths the fix had to keep working still parse
+// correctly and generate a working `Task` impl: explicit `input`/`output`
+// types, and the no-attribute default (`serde_json::Value` for both).
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DeriveMathInput {
+    a: i32,
+    b: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DeriveMathOutput {
+    sum: i32,
+}
+
+#[derive(TaskDerive)]
+#[task(
+    input = "DeriveMathInput",
+    output = "DeriveMathOutput",
+    name = "derive.math.add"
+)]
+struct DeriveMathTask;
+
+impl DeriveMathTask {
+    async fn execute_impl(&self, input: DeriveMathInput) -> celers_core::Result<DeriveMathOutput> {
+        Ok(DeriveMathOutput {
+            sum: input.a + input.b,
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_derive_task_with_explicit_types() {
+    let task = DeriveMathTask;
+    assert_eq!(task.name(), "derive.math.add");
+    let input = DeriveMathInput { a: 3, b: 4 };
+    let result = task.execute(input).await;
+    assert_eq!(result.unwrap().sum, 7);
+}
+
+#[derive(TaskDerive)]
+struct DeriveDefaultTask;
+
+impl DeriveDefaultTask {
+    async fn execute_impl(
+        &self,
+        input: serde_json::Value,
+    ) -> celers_core::Result<serde_json::Value> {
+        Ok(input)
+    }
+}
+
+#[tokio::test]
+async fn test_derive_task_defaults() {
+    let task = DeriveDefaultTask;
+    // No #[task(name = "...")] given -> falls back to the snake_case
+    // conversion of the struct name.
+    assert_eq!(task.name(), "derive_default_task");
+    // No #[task(input = ..., output = ...)] given -> falls back to
+    // `serde_json::Value` for both, per `parse_type_attr`'s documented
+    // default.
+    let input = serde_json::json!({"x": 1});
+    let result = task.execute(input.clone()).await;
+    assert_eq!(result.unwrap(), input);
 }

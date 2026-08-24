@@ -68,10 +68,10 @@
 //! #     .block_on(example());
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -147,6 +147,15 @@ pub struct CircuitBreakerConfig {
     /// Maximum number of trial calls admitted while `HalfOpen`. Additional calls
     /// are rejected until the trials resolve.
     pub half_open_max_calls: u32,
+    /// How long a reserved half-open probe slot may stay unresolved before it is
+    /// reclaimed (seconds). `None` reuses `open_timeout_secs`.
+    ///
+    /// Without this bound a probe whose outcome is never recorded (a dropped
+    /// future, a caller that used [`CircuitBreaker::try_acquire`] and forgot to
+    /// report) would hold its slot forever, wedging the breaker in `HalfOpen`
+    /// and rejecting every subsequent call.
+    #[serde(default)]
+    pub half_open_probe_timeout_secs: Option<u64>,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -157,6 +166,7 @@ impl Default for CircuitBreakerConfig {
             open_timeout_secs: 60,
             failure_window_secs: 60,
             half_open_max_calls: 1,
+            half_open_probe_timeout_secs: None,
         }
     }
 }
@@ -206,6 +216,13 @@ impl CircuitBreakerConfig {
         self
     }
 
+    /// Set how long an unresolved half-open probe may hold its slot (seconds).
+    #[must_use]
+    pub const fn with_half_open_probe_timeout_secs(mut self, secs: u64) -> Self {
+        self.half_open_probe_timeout_secs = Some(secs);
+        self
+    }
+
     /// Returns `true` if the configuration is internally consistent.
     #[must_use]
     pub const fn is_valid(&self) -> bool {
@@ -214,6 +231,10 @@ impl CircuitBreakerConfig {
             && self.open_timeout_secs > 0
             && self.failure_window_secs > 0
             && self.half_open_max_calls > 0
+            && match self.half_open_probe_timeout_secs {
+                Some(secs) => secs > 0,
+                None => true,
+            }
     }
 
     /// The open timeout as a [`Duration`].
@@ -228,6 +249,17 @@ impl CircuitBreakerConfig {
     #[must_use]
     pub const fn failure_window(&self) -> Duration {
         Duration::from_secs(self.failure_window_secs)
+    }
+
+    /// How long an unresolved half-open probe may hold its slot, as a
+    /// [`Duration`] (falls back to [`Self::open_timeout`]).
+    #[inline]
+    #[must_use]
+    pub const fn half_open_probe_timeout(&self) -> Duration {
+        match self.half_open_probe_timeout_secs {
+            Some(secs) => Duration::from_secs(secs),
+            None => self.open_timeout(),
+        }
     }
 }
 
@@ -249,11 +281,22 @@ pub struct CircuitSnapshot {
 struct CircuitInner {
     config: CircuitBreakerConfig,
     state: CircuitState,
-    failure_count: u32,
+    /// Timestamps of the failures currently inside the rolling window.
+    ///
+    /// A true rolling window (rather than a counter reset by a large gap
+    /// between consecutive failures) is what `failure_window_secs` documents:
+    /// failures older than the window are forgotten.
+    failures: VecDeque<Instant>,
     success_count: u32,
-    half_open_in_flight: u32,
+    /// Reservation timestamps of the half-open probes currently in flight. A
+    /// probe whose outcome is never recorded is reclaimed once it is older than
+    /// `half_open_probe_timeout`.
+    half_open_probes: VecDeque<Instant>,
     last_failure_at: Option<Instant>,
     opened_at: Option<Instant>,
+    /// Last time this breaker saw any activity (admission or outcome), used by
+    /// the registry to prune idle breakers.
+    last_activity_at: Instant,
 }
 
 impl CircuitInner {
@@ -261,46 +304,89 @@ impl CircuitInner {
         Self {
             config,
             state: CircuitState::Closed,
-            failure_count: 0,
+            failures: VecDeque::new(),
             success_count: 0,
-            half_open_in_flight: 0,
+            half_open_probes: VecDeque::new(),
             last_failure_at: None,
             opened_at: None,
+            last_activity_at: Instant::now(),
         }
+    }
+
+    /// Number of failures currently counted in the rolling window.
+    fn failure_count(&self) -> u32 {
+        u32::try_from(self.failures.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Number of half-open probes currently holding a slot.
+    fn half_open_in_flight(&self) -> u32 {
+        u32::try_from(self.half_open_probes.len()).unwrap_or(u32::MAX)
     }
 
     fn snapshot(&self) -> CircuitSnapshot {
         CircuitSnapshot {
             state: self.state,
-            failure_count: self.failure_count,
+            failure_count: self.failure_count(),
             success_count: self.success_count,
-            half_open_in_flight: self.half_open_in_flight,
+            half_open_in_flight: self.half_open_in_flight(),
         }
     }
 
-    /// Advance any time-based transition (Open -> HalfOpen) given `now`.
+    /// Drop failures that have fallen out of the rolling window.
+    fn prune_failures(&mut self, now: Instant) {
+        let window = self.config.failure_window();
+        while let Some(&front) = self.failures.front() {
+            if now.duration_since(front) >= window {
+                self.failures.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Reclaim half-open probe slots whose owner never reported an outcome.
+    fn reclaim_stale_probes(&mut self, now: Instant) {
+        let timeout = self.config.half_open_probe_timeout();
+        while let Some(&front) = self.half_open_probes.front() {
+            if now.duration_since(front) >= timeout {
+                self.half_open_probes.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Advance any time-based transition (Open -> `HalfOpen`, expiry of stale
+    /// half-open reservations and of out-of-window failures) given `now`.
     fn refresh(&mut self, now: Instant) {
         if self.state == CircuitState::Open {
             if let Some(opened_at) = self.opened_at {
                 if now.duration_since(opened_at) >= self.config.open_timeout() {
                     self.state = CircuitState::HalfOpen;
-                    self.failure_count = 0;
+                    self.failures.clear();
                     self.success_count = 0;
-                    self.half_open_in_flight = 0;
+                    self.half_open_probes.clear();
                 }
             }
+        }
+        if self.state == CircuitState::HalfOpen {
+            self.reclaim_stale_probes(now);
+        }
+        if self.state == CircuitState::Closed {
+            self.prune_failures(now);
         }
     }
 
     /// Decide whether a call may proceed, reserving a half-open slot if needed.
     fn try_admit(&mut self, now: Instant) -> bool {
         self.refresh(now);
+        self.last_activity_at = now;
         match self.state {
             CircuitState::Closed => true,
             CircuitState::Open => false,
             CircuitState::HalfOpen => {
-                if self.half_open_in_flight < self.config.half_open_max_calls {
-                    self.half_open_in_flight += 1;
+                if self.half_open_in_flight() < self.config.half_open_max_calls {
+                    self.half_open_probes.push_back(now);
                     true
                 } else {
                     false
@@ -309,20 +395,26 @@ impl CircuitInner {
         }
     }
 
-    fn record_success(&mut self) {
+    /// Release one half-open probe slot (the oldest reservation).
+    fn release_probe(&mut self) {
+        self.half_open_probes.pop_front();
+    }
+
+    fn record_success(&mut self, now: Instant) {
+        self.last_activity_at = now;
         match self.state {
             CircuitState::Closed => {
-                self.failure_count = 0;
+                self.failures.clear();
                 self.last_failure_at = None;
             }
             CircuitState::HalfOpen => {
-                self.half_open_in_flight = self.half_open_in_flight.saturating_sub(1);
+                self.release_probe();
                 self.success_count += 1;
                 if self.success_count >= self.config.success_threshold {
                     self.state = CircuitState::Closed;
-                    self.failure_count = 0;
+                    self.failures.clear();
                     self.success_count = 0;
-                    self.half_open_in_flight = 0;
+                    self.half_open_probes.clear();
                     self.opened_at = None;
                     self.last_failure_at = None;
                 }
@@ -334,26 +426,30 @@ impl CircuitInner {
     }
 
     fn record_failure(&mut self, now: Instant) {
+        self.last_activity_at = now;
         match self.state {
             CircuitState::Closed => {
-                if let Some(last) = self.last_failure_at {
-                    if now.duration_since(last) > self.config.failure_window() {
-                        self.failure_count = 0;
-                    }
+                self.prune_failures(now);
+                self.failures.push_back(now);
+                // The deque never needs to hold more than `failure_threshold`
+                // entries: the oldest surplus ones can no longer influence the
+                // decision, so dropping them bounds memory.
+                let cap = self.config.failure_threshold.max(1) as usize;
+                while self.failures.len() > cap {
+                    self.failures.pop_front();
                 }
-                self.failure_count += 1;
                 self.last_failure_at = Some(now);
-                if self.failure_count >= self.config.failure_threshold {
+                if self.failure_count() >= self.config.failure_threshold {
                     self.state = CircuitState::Open;
                     self.opened_at = Some(now);
                 }
             }
             CircuitState::HalfOpen => {
                 // Any failure during probing immediately re-opens the breaker.
-                self.half_open_in_flight = self.half_open_in_flight.saturating_sub(1);
+                self.release_probe();
                 self.state = CircuitState::Open;
                 self.opened_at = Some(now);
-                self.failure_count = 0;
+                self.failures.clear();
                 self.success_count = 0;
                 self.last_failure_at = Some(now);
             }
@@ -365,11 +461,12 @@ impl CircuitInner {
 
     fn reset(&mut self) {
         self.state = CircuitState::Closed;
-        self.failure_count = 0;
+        self.failures.clear();
         self.success_count = 0;
-        self.half_open_in_flight = 0;
+        self.half_open_probes.clear();
         self.last_failure_at = None;
         self.opened_at = None;
+        self.last_activity_at = Instant::now();
     }
 }
 
@@ -379,7 +476,49 @@ impl CircuitInner {
 /// also be used directly. Cloning shares the underlying state (it is `Arc`-backed).
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
-    inner: Arc<RwLock<CircuitInner>>,
+    inner: Arc<Mutex<CircuitInner>>,
+}
+
+/// RAII guard for one admitted call.
+///
+/// If the guarded call's future is dropped before an outcome is recorded
+/// (worker shutdown, a task timeout, a losing `tokio::select!` branch, a panic),
+/// the guard records a *failure* on drop. That both releases any reserved
+/// half-open probe slot — which would otherwise wedge the breaker in `HalfOpen`
+/// forever — and treats an unknown outcome conservatively.
+#[derive(Debug)]
+struct CallGuard {
+    inner: Arc<Mutex<CircuitInner>>,
+    resolved: bool,
+}
+
+impl CallGuard {
+    /// Record the call's outcome and disarm the drop handler.
+    fn resolve(mut self, success: bool) {
+        self.resolved = true;
+        let now = Instant::now();
+        let mut guard = lock_inner(&self.inner);
+        if success {
+            guard.record_success(now);
+        } else {
+            guard.record_failure(now);
+        }
+    }
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        let now = Instant::now();
+        lock_inner(&self.inner).record_failure(now);
+    }
+}
+
+/// Lock the inner state, recovering the value if a previous holder panicked.
+fn lock_inner(inner: &Arc<Mutex<CircuitInner>>) -> MutexGuard<'_, CircuitInner> {
+    inner.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl CircuitBreaker {
@@ -393,16 +532,19 @@ impl CircuitBreaker {
     #[must_use]
     pub fn with_config(config: CircuitBreakerConfig) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(CircuitInner::new(config))),
+            inner: Arc::new(Mutex::new(CircuitInner::new(config))),
         }
     }
 
     /// Returns `true` if a call may proceed right now, reserving a half-open
     /// trial slot when applicable. Prefer [`CircuitBreaker::call`] which pairs
     /// this with automatic success/failure recording.
+    ///
+    /// A caller that acquires a half-open slot and never records an outcome
+    /// holds that slot only until `half_open_probe_timeout` elapses, after which
+    /// it is reclaimed automatically.
     pub async fn try_acquire(&self) -> bool {
-        let mut guard = self.inner.write().await;
-        guard.try_admit(Instant::now())
+        lock_inner(&self.inner).try_admit(Instant::now())
     }
 
     /// Returns `true` if the breaker is currently open (rejecting calls).
@@ -410,41 +552,51 @@ impl CircuitBreaker {
     /// This also performs any pending time-based transition to half-open, so a
     /// breaker whose open timeout has elapsed reports `false` here.
     pub async fn is_open(&self) -> bool {
-        let mut guard = self.inner.write().await;
+        let mut guard = lock_inner(&self.inner);
         guard.refresh(Instant::now());
         guard.state.is_open()
     }
 
     /// Return the current breaker state (after applying time-based transitions).
     pub async fn state(&self) -> CircuitState {
-        let mut guard = self.inner.write().await;
+        let mut guard = lock_inner(&self.inner);
         guard.refresh(Instant::now());
         guard.state
     }
 
     /// Return a serializable snapshot of the breaker's internal counters.
     pub async fn snapshot(&self) -> CircuitSnapshot {
-        let mut guard = self.inner.write().await;
+        let mut guard = lock_inner(&self.inner);
         guard.refresh(Instant::now());
         guard.snapshot()
     }
 
     /// Record a successful call, advancing recovery in the half-open state.
     pub async fn record_success(&self) {
-        let mut guard = self.inner.write().await;
-        guard.record_success();
+        lock_inner(&self.inner).record_success(Instant::now());
     }
 
     /// Record a failed call, possibly tripping or re-opening the breaker.
     pub async fn record_failure(&self) {
-        let mut guard = self.inner.write().await;
-        guard.record_failure(Instant::now());
+        lock_inner(&self.inner).record_failure(Instant::now());
     }
 
     /// Force the breaker back to the closed state, clearing all counters.
     pub async fn reset(&self) {
-        let mut guard = self.inner.write().await;
-        guard.reset();
+        lock_inner(&self.inner).reset();
+    }
+
+    /// The last time this breaker admitted a call or recorded an outcome.
+    pub(crate) fn last_activity_at(&self) -> Instant {
+        lock_inner(&self.inner).last_activity_at
+    }
+
+    /// Returns `true` if the breaker is closed and holds no pending state, i.e.
+    /// it is indistinguishable from a freshly created breaker.
+    pub(crate) fn is_quiescent(&self) -> bool {
+        let mut guard = lock_inner(&self.inner);
+        guard.refresh(Instant::now());
+        guard.state.is_closed() && guard.failures.is_empty() && guard.half_open_probes.is_empty()
     }
 
     /// Run `operation` through the breaker.
@@ -454,21 +606,30 @@ impl CircuitBreaker {
     /// its outcome is recorded (success closes/keeps-closed; failure counts toward
     /// tripping). An `Err` from the operation is surfaced as
     /// [`CircuitBreakerError::Operation`].
+    ///
+    /// This method is cancel-safe with respect to breaker bookkeeping: if the
+    /// returned future is dropped while `operation` is in flight, the call is
+    /// recorded as a failure and any reserved half-open slot is released.
     pub async fn call<F, Fut, T, E>(&self, operation: F) -> Result<T, CircuitBreakerError<E>>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        if !self.try_acquire().await {
+        let admitted = lock_inner(&self.inner).try_admit(Instant::now());
+        if !admitted {
             return Err(CircuitBreakerError::Open);
         }
+        let guard = CallGuard {
+            inner: Arc::clone(&self.inner),
+            resolved: false,
+        };
         match operation().await {
             Ok(value) => {
-                self.record_success().await;
+                guard.resolve(true);
                 Ok(value)
             }
             Err(err) => {
-                self.record_failure().await;
+                guard.resolve(false);
                 Err(CircuitBreakerError::Operation(err))
             }
         }
@@ -533,7 +694,13 @@ pub struct TaskTypeCircuitBreakers {
     default_config: CircuitBreakerConfig,
     overrides: Arc<RwLock<HashMap<String, CircuitBreakerConfig>>>,
     breakers: Arc<RwLock<HashMap<String, CircuitBreaker>>>,
+    max_tracked: usize,
 }
+
+/// Default upper bound on the number of task types that may hold a live
+/// breaker at once. Task names can come from remote messages, so the map must
+/// not be allowed to grow without limit.
+pub const DEFAULT_MAX_TRACKED_TASK_TYPES: usize = 4096;
 
 impl TaskTypeCircuitBreakers {
     /// Create a registry using the default [`CircuitBreakerConfig`].
@@ -550,7 +717,25 @@ impl TaskTypeCircuitBreakers {
             default_config,
             overrides: Arc::new(RwLock::new(HashMap::new())),
             breakers: Arc::new(RwLock::new(HashMap::new())),
+            max_tracked: DEFAULT_MAX_TRACKED_TASK_TYPES,
         }
+    }
+
+    /// Set the maximum number of task types that may hold a live breaker.
+    ///
+    /// When the bound is reached, quiescent (closed, no recorded failures)
+    /// breakers are evicted first, then the least recently active one.
+    #[must_use]
+    pub fn with_max_tracked(mut self, max_tracked: usize) -> Self {
+        self.max_tracked = max_tracked.max(1);
+        self
+    }
+
+    /// The configured maximum number of tracked task types.
+    #[inline]
+    #[must_use]
+    pub const fn max_tracked(&self) -> usize {
+        self.max_tracked
     }
 
     /// The default configuration applied to task types without an override.
@@ -612,16 +797,74 @@ impl TaskTypeCircuitBreakers {
         // Resolve the configuration (override wins) before taking the write lock.
         let config = self.config_for(task_name).await;
         let mut breakers = self.breakers.write().await;
-        // Re-check in case another task created it between the locks.
+        if let Some(breaker) = breakers.get(task_name) {
+            // Another task created it between the locks.
+            return breaker.clone();
+        }
+        Self::make_room(&mut breakers, self.max_tracked);
         breakers
             .entry(task_name.to_string())
             .or_insert_with(|| CircuitBreaker::with_config(config))
             .clone()
     }
 
+    /// Return the breaker for `task_name` **without** creating one.
+    ///
+    /// Read-only queries use this so that merely asking about an unknown (or
+    /// attacker-chosen) task name cannot leak a permanent map entry.
+    pub async fn existing_breaker(&self, task_name: &str) -> Option<CircuitBreaker> {
+        self.breakers.read().await.get(task_name).cloned()
+    }
+
+    /// Evict entries until there is room for one more breaker.
+    ///
+    /// Quiescent breakers go first. That is deliberately aggressive — quiescent
+    /// is also the *healthy* state — but a dropped breaker carries no
+    /// information by definition and is recreated on demand, so churning them is
+    /// strictly preferable to discarding a breaker that is currently counting
+    /// failures or probing.
+    fn make_room(breakers: &mut HashMap<String, CircuitBreaker>, max_tracked: usize) {
+        if breakers.len() < max_tracked {
+            return;
+        }
+        // Prefer dropping breakers that carry no state at all.
+        breakers.retain(|_, breaker| !breaker.is_quiescent());
+        while breakers.len() >= max_tracked {
+            let Some(victim) = breakers
+                .iter()
+                .min_by_key(|(_, breaker)| breaker.last_activity_at())
+                .map(|(name, _)| name.clone())
+            else {
+                return;
+            };
+            breakers.remove(&victim);
+        }
+    }
+
+    /// Drop breakers that are quiescent (closed, nothing recorded) and have seen
+    /// no activity for at least `idle_for`, returning how many were removed.
+    ///
+    /// Intended to be called from a worker's periodic maintenance so a stream of
+    /// unknown task names cannot pin memory for the process lifetime.
+    pub async fn prune_idle(&self, idle_for: Duration) -> usize {
+        let now = Instant::now();
+        let mut breakers = self.breakers.write().await;
+        let before = breakers.len();
+        breakers.retain(|_, breaker| {
+            let idle = now.saturating_duration_since(breaker.last_activity_at());
+            !(idle >= idle_for && breaker.is_quiescent())
+        });
+        before - breakers.len()
+    }
+
     /// Returns `true` if the breaker for `task_name` is currently open.
+    ///
+    /// An unknown task type reports `false` (closed) without creating a breaker.
     pub async fn is_open(&self, task_name: &str) -> bool {
-        self.breaker_for(task_name).await.is_open().await
+        match self.existing_breaker(task_name).await {
+            Some(breaker) => breaker.is_open().await,
+            None => false,
+        }
     }
 
     /// Returns `true` if a call for `task_name` may proceed right now, reserving
@@ -631,13 +874,30 @@ impl TaskTypeCircuitBreakers {
     }
 
     /// Return the current [`CircuitState`] for a task type.
+    ///
+    /// An unknown task type reports [`CircuitState::Closed`] without creating a
+    /// breaker.
     pub async fn state(&self, task_name: &str) -> CircuitState {
-        self.breaker_for(task_name).await.state().await
+        match self.existing_breaker(task_name).await {
+            Some(breaker) => breaker.state().await,
+            None => CircuitState::Closed,
+        }
     }
 
     /// Return a snapshot of a task type's breaker counters.
+    ///
+    /// An unknown task type reports a pristine closed snapshot without creating
+    /// a breaker.
     pub async fn snapshot(&self, task_name: &str) -> CircuitSnapshot {
-        self.breaker_for(task_name).await.snapshot().await
+        match self.existing_breaker(task_name).await {
+            Some(breaker) => breaker.snapshot().await,
+            None => CircuitSnapshot {
+                state: CircuitState::Closed,
+                failure_count: 0,
+                success_count: 0,
+                half_open_in_flight: 0,
+            },
+        }
     }
 
     /// Record a successful execution for a task type.
@@ -963,6 +1223,163 @@ mod tests {
         assert_eq!(snap.state, CircuitState::Closed);
         assert_eq!(snap.failure_count, 2);
         assert_eq!(snap.success_count, 0);
+    }
+
+    #[test]
+    fn rolling_window_forgets_failures_older_than_the_window() {
+        // Regression: the window used to be a *gap* timer, so a slow drip of
+        // failures spaced just under the window apart accumulated forever and
+        // tripped the breaker even though only one failure was ever inside the
+        // window.
+        let config = CircuitBreakerConfig::new(5).with_failure_window_secs(60);
+        let mut inner = CircuitInner::new(config);
+        let t0 = Instant::now();
+
+        for secs in [0u64, 59, 118, 177, 236] {
+            inner.record_failure(t0 + Duration::from_secs(secs));
+            assert_eq!(
+                inner.state,
+                CircuitState::Closed,
+                "breaker tripped at t={secs}s despite only 1-2 failures in the window"
+            );
+        }
+        // Only the failures still inside the 60s window are counted: t=177 and
+        // t=236 (the earlier three have been forgotten), nowhere near the
+        // threshold of 5.
+        assert_eq!(inner.failure_count(), 2);
+
+        // A genuine burst inside one window still trips it.
+        let base = t0 + Duration::from_secs(300);
+        for i in 0..5 {
+            inner.record_failure(base + Duration::from_secs(i));
+        }
+        assert_eq!(inner.state, CircuitState::Open);
+    }
+
+    #[test]
+    fn failure_deque_is_bounded_by_the_threshold() {
+        let config = CircuitBreakerConfig::new(3).with_failure_window_secs(3600);
+        let mut inner = CircuitInner::new(config);
+        let t0 = Instant::now();
+        for i in 0..100 {
+            inner.record_failure(t0 + Duration::from_millis(i));
+        }
+        assert!(inner.failures.len() <= 3);
+    }
+
+    #[test]
+    fn stale_half_open_probe_slot_is_reclaimed() {
+        // Regression: a probe that never recorded an outcome held its slot
+        // forever, so `try_admit` rejected every later call while the breaker
+        // reported HalfOpen (not Open) to monitoring.
+        let config = CircuitBreakerConfig::new(1)
+            .with_open_timeout_secs(10)
+            .with_half_open_probe_timeout_secs(5)
+            .with_half_open_max_calls(1);
+        let mut inner = CircuitInner::new(config);
+        let t0 = Instant::now();
+
+        inner.record_failure(t0);
+        assert_eq!(inner.state, CircuitState::Open);
+
+        // Open timeout elapses: the first probe is admitted...
+        let probe_at = t0 + Duration::from_secs(10);
+        assert!(inner.try_admit(probe_at));
+        assert_eq!(inner.state, CircuitState::HalfOpen);
+        // ...and while it is in flight no other call gets in.
+        assert!(!inner.try_admit(probe_at + Duration::from_secs(1)));
+
+        // The probe never reports an outcome. Once the probe timeout passes the
+        // slot is reclaimed and probing can continue.
+        assert!(inner.try_admit(probe_at + Duration::from_secs(6)));
+        assert_eq!(inner.half_open_in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_call_future_releases_half_open_slot() {
+        use std::pin::Pin;
+        use std::task::{Context, Waker};
+
+        // open_timeout of 0 puts the breaker into HalfOpen as soon as it trips,
+        // which keeps this test free of any sleeping.
+        // A long probe timeout ensures the slot is released by the guard on
+        // drop, not merely reclaimed by the timeout reaper.
+        let config = CircuitBreakerConfig::new(1)
+            .with_open_timeout_secs(0)
+            .with_half_open_probe_timeout_secs(3600)
+            .with_half_open_max_calls(1);
+        let cb = CircuitBreaker::with_config(config);
+        cb.record_failure().await;
+        assert_eq!(cb.state().await, CircuitState::HalfOpen);
+
+        {
+            let mut fut =
+                Box::pin(cb.call(|| async { std::future::pending::<Result<u32, &str>>().await }));
+            let mut cx = Context::from_waker(Waker::noop());
+            // The probe starts (slot reserved) but never completes.
+            assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+            assert_eq!(cb.snapshot().await.half_open_in_flight, 1);
+            // Dropping the future (worker shutdown, task timeout, select!) must
+            // release the slot instead of wedging the breaker.
+        }
+
+        let snapshot = cb.snapshot().await;
+        assert_eq!(snapshot.half_open_in_flight, 0);
+        // The unknown outcome is conservatively recorded as a failure, so the
+        // breaker re-opens (and, with a zero open timeout, immediately re-probes).
+        assert!(cb.try_acquire().await);
+    }
+
+    #[tokio::test]
+    async fn read_only_queries_do_not_create_breakers() {
+        // Regression: `is_open`/`state`/`snapshot` funnelled through
+        // `breaker_for`, so querying an attacker-chosen task name leaked a
+        // permanent map entry.
+        let registry = TaskTypeCircuitBreakers::new();
+        for i in 0..1_000 {
+            let name = format!("unknown.task.{i}");
+            assert!(!registry.is_open(&name).await);
+            assert_eq!(registry.state(&name).await, CircuitState::Closed);
+            assert_eq!(registry.snapshot(&name).await.failure_count, 0);
+        }
+        assert_eq!(registry.tracked_count().await, 0);
+        assert!(registry.existing_breaker("unknown.task.0").await.is_none());
+
+        // Recording an outcome does create one.
+        registry.record_failure("real.task").await;
+        assert_eq!(registry.tracked_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn tracked_breakers_are_bounded_and_prunable() {
+        let registry =
+            TaskTypeCircuitBreakers::with_default(CircuitBreakerConfig::new(1)).with_max_tracked(8);
+        for i in 0..100 {
+            registry.record_failure(&format!("task.{i}")).await;
+        }
+        assert!(registry.tracked_count().await <= 8);
+
+        // Quiescent breakers are pruned by the maintenance hook.
+        let registry = TaskTypeCircuitBreakers::new();
+        for i in 0..10 {
+            // `try_acquire` on a closed breaker leaves it quiescent.
+            assert!(registry.try_acquire(&format!("task.{i}")).await);
+        }
+        assert_eq!(registry.tracked_count().await, 10);
+        assert_eq!(registry.prune_idle(Duration::ZERO).await, 10);
+        assert_eq!(registry.tracked_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_defaults_to_open_timeout() {
+        let config = CircuitBreakerConfig::default();
+        assert_eq!(config.half_open_probe_timeout(), config.open_timeout());
+        let config = config.with_half_open_probe_timeout_secs(5);
+        assert_eq!(config.half_open_probe_timeout(), Duration::from_secs(5));
+        assert!(config.is_valid());
+        assert!(!CircuitBreakerConfig::default()
+            .with_half_open_probe_timeout_secs(0)
+            .is_valid());
     }
 
     #[tokio::test]

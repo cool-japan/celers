@@ -29,10 +29,11 @@
 //! ```
 
 use celers_core::{CelersError, Result};
-use redis::AsyncCommands;
+use redis::{aio::ConnectionManager, AsyncCommands};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
+use tokio::sync::OnceCell;
 
 /// Configuration for queue rate limiting
 #[derive(Debug, Clone)]
@@ -184,6 +185,8 @@ impl TokenBucketLimiter {
 /// rate limiting across multiple workers.
 pub struct DistributedRateLimiter {
     client: redis::Client,
+    /// Long-lived multiplexed connection, shared by every call.
+    conn: OnceCell<ConnectionManager>,
     config: QueueRateLimitConfig,
     queue_name: String,
 }
@@ -193,22 +196,45 @@ impl DistributedRateLimiter {
     pub fn new(client: redis::Client, queue_name: &str, config: QueueRateLimitConfig) -> Self {
         Self {
             client,
+            conn: OnceCell::new(),
             config,
             queue_name: queue_name.to_string(),
         }
+    }
+
+    /// Reuse an existing connection manager instead of opening one lazily.
+    pub fn with_connection_manager(self, manager: ConnectionManager) -> Self {
+        let conn = OnceCell::new();
+        // Only fails if the cell is already initialised, which it is not.
+        let _ = conn.set(manager);
+        Self { conn, ..self }
+    }
+
+    /// Get the shared connection, establishing it on first use.
+    async fn connection(&self) -> Result<ConnectionManager> {
+        self.conn
+            .get_or_try_init(|| async {
+                self.client
+                    .get_connection_manager()
+                    .await
+                    .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))
+            })
+            .await
+            .cloned()
     }
 
     fn rate_limit_key(&self) -> String {
         format!("{}:{}:rate", self.config.key_prefix, self.queue_name)
     }
 
+    /// The counter key backing unique sliding-window members.
+    fn sequence_key(&self) -> String {
+        format!("{}:seq", self.rate_limit_key())
+    }
+
     /// Try to acquire a permit using Redis
     pub async fn try_acquire(&self) -> Result<bool> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
+        let mut conn = self.connection().await?;
 
         let key = self.rate_limit_key();
         let now_ms = std::time::SystemTime::now()
@@ -223,6 +249,7 @@ impl DistributedRateLimiter {
 
         let result: i64 = script
             .key(&key)
+            .key(self.sequence_key())
             .arg(window_start)
             .arg(now_ms)
             .arg(self.config.rate as i64)
@@ -236,11 +263,7 @@ impl DistributedRateLimiter {
 
     /// Get the current request count in the window
     pub async fn current_count(&self) -> Result<u64> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
+        let mut conn = self.connection().await?;
 
         let key = self.rate_limit_key();
         let now_ms = std::time::SystemTime::now()
@@ -269,13 +292,9 @@ impl DistributedRateLimiter {
 
     /// Reset the rate limiter
     pub async fn reset(&self) -> Result<()> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
+        let mut conn = self.connection().await?;
 
-        conn.del::<_, ()>(self.rate_limit_key())
+        conn.del::<_, ()>(&[self.rate_limit_key(), self.sequence_key()])
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to reset: {}", e)))?;
 
@@ -289,8 +308,26 @@ impl DistributedRateLimiter {
 }
 
 /// Lua script for atomic sliding window rate limiting
+///
+/// Each admitted request is recorded as a distinct sorted-set member. The
+/// member must be *provably* unique: `ZADD` treats a repeated member as an
+/// update rather than an insertion, so two admissions that collapse onto one
+/// member make `ZCARD` undercount and the limiter admits more than `limit` for
+/// that window. A millisecond timestamp plus `math.random` is only
+/// probabilistically unique — and Redis's Lua PRNG seeding is a
+/// version-dependent implementation detail — so the discriminator here is an
+/// `INCR` counter, which is exact under any seeding behaviour and across every
+/// client. The counter shares the window's TTL so it is reclaimed with it.
+///
+/// `KEYS[1]`: sliding window sorted set
+/// `KEYS[2]`: sequence counter key
+/// `ARGV[1]`: window start (epoch ms)
+/// `ARGV[2]`: now (epoch ms)
+/// `ARGV[3]`: limit
+/// `ARGV[4]`: TTL in seconds
 const SLIDING_WINDOW_SCRIPT: &str = r#"
 local key = KEYS[1]
+local seq_key = KEYS[2]
 local window_start = tonumber(ARGV[1])
 local now = tonumber(ARGV[2])
 local limit = tonumber(ARGV[3])
@@ -303,10 +340,12 @@ redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
 local count = redis.call('ZCARD', key)
 
 if count < limit then
-    -- Add the new request
-    redis.call('ZADD', key, now, now .. ':' .. math.random(1000000))
+    -- Add the new request under a provably unique member
+    local seq = redis.call('INCR', seq_key)
+    redis.call('ZADD', key, now, now .. ':' .. seq)
     -- Set TTL to auto-cleanup
     redis.call('EXPIRE', key, ttl + 1)
+    redis.call('EXPIRE', seq_key, ttl + 1)
     return 1
 else
     return 0
@@ -422,6 +461,44 @@ impl TrackedRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every admitted request must land on its own sorted-set member. If two
+    /// admissions collapse onto one member (as they can when the member is
+    /// `timestamp:random`), `ZCARD` undercounts and the window admits more
+    /// than `limit` requests.
+    #[tokio::test]
+    async fn test_sliding_window_members_are_unique_within_a_millisecond() {
+        let client = redis::Client::open("redis://127.0.0.1:6379").expect("client");
+        let queue = format!("test-rate-{}", uuid::Uuid::new_v4());
+        let limit = 50u32;
+        let config = QueueRateLimitConfig::new(f64::from(limit))
+            .with_distributed("test-ratelimit")
+            .with_window(Duration::from_secs(30));
+        let limiter = DistributedRateLimiter::new(client, &queue, config);
+
+        // These run back to back, so many share a millisecond timestamp.
+        let mut admitted = 0u32;
+        for _ in 0..limit {
+            if limiter.try_acquire().await.expect("acquire") {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, limit, "the whole budget must be admitted");
+
+        assert_eq!(
+            limiter.current_count().await.expect("count"),
+            u64::from(limit),
+            "each admitted request must occupy its own window entry"
+        );
+
+        assert!(
+            !limiter.try_acquire().await.expect("acquire past limit"),
+            "the window budget is exhausted"
+        );
+
+        limiter.reset().await.expect("reset");
+        assert_eq!(limiter.current_count().await.expect("count"), 0);
+    }
 
     #[test]
     fn test_config_builder() {

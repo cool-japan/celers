@@ -147,6 +147,15 @@ pub enum AnomalyVerdict {
         /// Signed z-score (negative) of the observation.
         z_score: f64,
     },
+    /// The observation was `NaN` or infinite and was discarded without
+    /// affecting the baseline, the variance, or the warm-up count.
+    ///
+    /// This is not a judgement about the underlying metric (unlike
+    /// [`Warmup`](AnomalyVerdict::Warmup), it does not mean "not enough data
+    /// yet") -- it means this particular reading was unusable and the
+    /// detector's state is exactly as it was before `observe`/`score` was
+    /// called. Retry with the next finite sample.
+    Ignored,
 }
 
 impl AnomalyVerdict {
@@ -158,10 +167,11 @@ impl AnomalyVerdict {
         )
     }
 
-    /// The signed z-score, if one was computed (`None` during warm-up).
+    /// The signed z-score, if one was computed (`None` during warm-up, and
+    /// for a discarded non-finite observation).
     pub fn z_score(&self) -> Option<f64> {
         match self {
-            AnomalyVerdict::Warmup => None,
+            AnomalyVerdict::Warmup | AnomalyVerdict::Ignored => None,
             AnomalyVerdict::Normal { z_score }
             | AnomalyVerdict::High { z_score }
             | AnomalyVerdict::Low { z_score } => Some(*z_score),
@@ -266,10 +276,16 @@ impl AnomalyDetector {
 
     /// Score `value` against the current baseline without mutating state.
     ///
-    /// Returns `None` while warming up (the same condition under which
-    /// [`observe`](Self::observe) returns [`AnomalyVerdict::Warmup`]). The
-    /// returned verdict's z-score is computed against the pre-update baseline.
+    /// Returns `Some(`[`AnomalyVerdict::Ignored`]`)` for a non-finite `value`
+    /// regardless of warm-up state (mirroring [`observe`](Self::observe)),
+    /// and `None` while warming up on an otherwise-finite value (the same
+    /// condition under which `observe` returns [`AnomalyVerdict::Warmup`]).
+    /// The returned verdict's z-score is computed against the pre-update
+    /// baseline.
     pub fn score(&self, value: f64) -> Option<AnomalyVerdict> {
+        if !value.is_finite() {
+            return Some(AnomalyVerdict::Ignored);
+        }
         if self.count < self.config.warmup as u64 {
             return None;
         }
@@ -295,7 +311,20 @@ impl AnomalyDetector {
     /// The point is scored against the baseline accumulated from preceding
     /// observations, then folded into the baseline (unless it was flagged as an
     /// anomaly and [`AnomalyDetectorConfig::update_on_anomaly`] is `false`).
+    ///
+    /// A non-finite `value` (`NaN` or infinite) is never folded into the
+    /// baseline and returns [`AnomalyVerdict::Ignored`] without affecting
+    /// `mean`, `variance`, or the warm-up count. Unlike an ordinary
+    /// out-of-range value, `NaN` would otherwise poison `mean`/`variance`
+    /// permanently: every comparison against `NaN` is `false`, so once folded
+    /// in, the baseline stops updating (each new `diff`/`increment` also
+    /// becomes `NaN`) and `classify` would silently return `Normal` for every
+    /// subsequent observation for the life of the detector.
     pub fn observe(&mut self, value: f64) -> AnomalyVerdict {
+        if !value.is_finite() {
+            return AnomalyVerdict::Ignored;
+        }
+
         // Still warming up: just absorb the value, no judgement yet.
         if self.count < self.config.warmup as u64 {
             self.update_baseline(value);
@@ -550,5 +579,87 @@ mod tests {
         let normal = AnomalyVerdict::Normal { z_score: 0.5 };
         assert!(!normal.is_anomaly());
         assert_eq!(AnomalyVerdict::Warmup.z_score(), None);
+        assert_eq!(AnomalyVerdict::Ignored.z_score(), None);
+        assert!(!AnomalyVerdict::Ignored.is_anomaly());
+    }
+
+    #[test]
+    fn nan_observation_is_ignored_and_does_not_poison_baseline() {
+        let mut detector = AnomalyDetector::new(0.1, 3.0, 30);
+        let mut noise = Noise::new(11);
+        for _ in 0..200 {
+            detector.observe(noise.next(100.0, 2.0));
+        }
+        let mean_before = detector.mean();
+        let variance_before = detector.variance();
+        let count_before = detector.count();
+
+        // A NaN reading must be discarded, not folded into the EWMA
+        // baseline: state must be bit-for-bit unchanged.
+        assert_eq!(detector.observe(f64::NAN), AnomalyVerdict::Ignored);
+        assert_eq!(
+            detector.count(),
+            count_before,
+            "NaN changed the observation count"
+        );
+        assert_eq!(detector.mean(), mean_before, "NaN poisoned the mean");
+        assert_eq!(
+            detector.variance(),
+            variance_before,
+            "NaN poisoned the variance"
+        );
+        assert!(!detector.mean().is_nan());
+
+        // Positive and negative infinity must be discarded too.
+        assert_eq!(detector.observe(f64::INFINITY), AnomalyVerdict::Ignored);
+        assert_eq!(detector.observe(f64::NEG_INFINITY), AnomalyVerdict::Ignored);
+        assert_eq!(detector.count(), count_before);
+        assert_eq!(detector.mean(), mean_before);
+
+        // The detector must still be able to flag a real spike afterwards --
+        // before the fix, one NaN permanently disabled detection because
+        // every subsequent z-score comparison against a NaN mean/variance is
+        // `false`, so `classify` always fell through to `Normal`.
+        let verdict = detector.observe(200.0);
+        assert!(
+            matches!(verdict, AnomalyVerdict::High { .. }),
+            "verdict {verdict:?}"
+        );
+        let z = verdict.z_score().expect("z-score present");
+        assert!(z.is_finite() && z > 3.0, "z-score {z}");
+    }
+
+    #[test]
+    fn nan_observation_during_warmup_does_not_count_or_poison() {
+        let mut detector = AnomalyDetector::new(0.2, 3.0, 5);
+
+        assert_eq!(detector.observe(f64::NAN), AnomalyVerdict::Ignored);
+        assert_eq!(detector.count(), 0, "NaN must not count toward warm-up");
+        assert!(!detector.is_warmed_up());
+
+        for _ in 0..5 {
+            assert_eq!(detector.observe(10.0), AnomalyVerdict::Warmup);
+        }
+        assert!(detector.is_warmed_up());
+        assert!(!detector.mean().is_nan());
+        assert!((detector.mean() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_ignores_non_finite_value_regardless_of_warmup() {
+        // Still warming up: an ordinary value scores `None`, but a
+        // non-finite one is reported as `Ignored`, not conflated with
+        // "insufficient data yet".
+        let warming_up = AnomalyDetector::new(0.2, 3.0, 5);
+        assert_eq!(warming_up.score(f64::NAN), Some(AnomalyVerdict::Ignored));
+        assert_eq!(warming_up.score(100.0), None);
+
+        let mut warmed_up = AnomalyDetector::new(0.2, 3.0, 3);
+        warmed_up.observe_all(&[100.0, 100.0, 100.0]);
+        assert_eq!(warmed_up.score(f64::NAN), Some(AnomalyVerdict::Ignored));
+        assert_eq!(
+            warmed_up.score(f64::INFINITY),
+            Some(AnomalyVerdict::Ignored)
+        );
     }
 }

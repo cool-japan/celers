@@ -134,6 +134,23 @@ impl TaskDag {
             )));
         }
 
+        // Reject a self-dependency outright: it is a trivial cycle.
+        if task_id == depends_on {
+            return Err(CelersError::Configuration(format!(
+                "Task {task_id} cannot depend on itself"
+            )));
+        }
+
+        // Check *before* mutating: if `task_id` is already (transitively) a
+        // dependency of `depends_on`, then adding this edge would close a cycle.
+        // Rejecting up front guarantees the DAG is never left in a corrupted
+        // (cyclic) state when this call returns an error.
+        if self.reaches_via_dependencies(depends_on, task_id) {
+            return Err(CelersError::Configuration(
+                "Task DAG contains a cycle".to_string(),
+            ));
+        }
+
         // Add the dependency
         if let Some(node) = self.nodes.get_mut(&task_id) {
             node.dependencies.insert(depends_on);
@@ -144,10 +161,27 @@ impl TaskDag {
             node.dependents.insert(task_id);
         }
 
-        // Validate no cycles were introduced
-        self.validate()?;
-
         Ok(())
+    }
+
+    /// Returns `true` if `target` is reachable from `start` by walking the
+    /// `dependencies` edges (iteratively, so deep chains cannot overflow the
+    /// stack).
+    fn reaches_via_dependencies(&self, start: TaskId, target: TaskId) -> bool {
+        let mut stack = vec![start];
+        let mut seen: HashSet<TaskId> = HashSet::new();
+        while let Some(current) = stack.pop() {
+            if current == target {
+                return true;
+            }
+            if !seen.insert(current) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(&current) {
+                stack.extend(node.dependencies.iter().copied());
+            }
+        }
+        false
     }
 
     /// Remove a dependency relationship
@@ -213,7 +247,7 @@ impl TaskDag {
         let mut rec_stack = HashSet::new();
 
         for node_id in self.nodes.keys() {
-            if self.has_cycle_util(*node_id, &mut visited, &mut rec_stack) {
+            if self.has_cycle_from(*node_id, &mut visited, &mut rec_stack) {
                 return true;
             }
         }
@@ -221,33 +255,49 @@ impl TaskDag {
         false
     }
 
-    /// Helper function for cycle detection using DFS
-    fn has_cycle_util(
+    /// Iterative depth-first cycle detection starting at `start`.
+    ///
+    /// Uses an explicit stack rather than recursion so that arbitrarily deep
+    /// dependency chains cannot overflow the call stack.
+    fn has_cycle_from(
         &self,
-        node_id: TaskId,
+        start: TaskId,
         visited: &mut HashSet<TaskId>,
         rec_stack: &mut HashSet<TaskId>,
     ) -> bool {
-        if rec_stack.contains(&node_id) {
-            return true; // Cycle detected
+        /// One step of the explicit DFS work list.
+        enum Step {
+            /// Descend into this node.
+            Enter(TaskId),
+            /// Pop this node off the recursion stack (post-order).
+            Exit(TaskId),
         }
 
-        if visited.contains(&node_id) {
-            return false; // Already visited this path
-        }
-
-        visited.insert(node_id);
-        rec_stack.insert(node_id);
-
-        if let Some(node) = self.nodes.get(&node_id) {
-            for &dep_id in &node.dependencies {
-                if self.has_cycle_util(dep_id, visited, rec_stack) {
-                    return true;
+        let mut work = vec![Step::Enter(start)];
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Enter(node_id) => {
+                    if rec_stack.contains(&node_id) {
+                        return true; // Cycle detected
+                    }
+                    if visited.contains(&node_id) {
+                        continue; // Already fully explored
+                    }
+                    visited.insert(node_id);
+                    rec_stack.insert(node_id);
+                    work.push(Step::Exit(node_id));
+                    if let Some(node) = self.nodes.get(&node_id) {
+                        for &dep_id in &node.dependencies {
+                            work.push(Step::Enter(dep_id));
+                        }
+                    }
+                }
+                Step::Exit(node_id) => {
+                    rec_stack.remove(&node_id);
                 }
             }
         }
 
-        rec_stack.remove(&node_id);
         false
     }
 
@@ -404,6 +454,58 @@ mod tests {
         // Try to create a cycle
         let result = dag.add_dependency(task1, task3);
         assert!(result.is_err());
+
+        // Regression: the rejected edge must NOT have been applied, so the DAG
+        // is still a valid, sortable DAG afterwards.
+        assert!(dag.validate().is_ok());
+        assert!(dag.topological_sort().is_ok());
+        assert_eq!(dag.get_dependencies(&task1), Some(Vec::new()));
+        assert_eq!(dag.get_dependents(&task3), Some(Vec::new()));
+        assert_eq!(dag.get_roots(), vec![task1]);
+        assert_eq!(dag.get_leaves(), vec![task3]);
+
+        // And the DAG is still usable: further valid edges can be added.
+        let task4 = TaskId::new_v4();
+        dag.add_node(task4, "task4");
+        dag.add_dependency(task4, task3).unwrap();
+        assert_eq!(
+            dag.topological_sort().unwrap(),
+            vec![task1, task2, task3, task4]
+        );
+    }
+
+    #[test]
+    fn test_dag_self_dependency_rejected() {
+        let mut dag = TaskDag::new();
+        let task1 = TaskId::new_v4();
+        dag.add_node(task1, "task1");
+
+        assert!(dag.add_dependency(task1, task1).is_err());
+        assert!(dag.validate().is_ok());
+        assert_eq!(dag.get_dependencies(&task1), Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_dag_deep_chain_does_not_overflow_stack() {
+        // A long linear chain must be validated iteratively (no recursion).
+        let mut dag = TaskDag::new();
+        let ids: Vec<TaskId> = (0..50_000).map(|_| TaskId::new_v4()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            dag.add_node(*id, format!("task{i}"));
+        }
+        // Link the chain from the tail backwards so each insertion's cycle
+        // pre-check is O(1); the resulting graph is the same linear chain.
+        for i in (0..ids.len() - 1).rev() {
+            dag.add_dependency(ids[i + 1], ids[i]).unwrap();
+        }
+        assert!(dag.validate().is_ok());
+        assert_eq!(dag.topological_sort().unwrap().len(), ids.len());
+
+        // Closing the chain into a cycle is still rejected, without mutation.
+        let first = ids[0];
+        let last = ids[ids.len() - 1];
+        assert!(dag.add_dependency(first, last).is_err());
+        assert!(dag.validate().is_ok());
     }
 
     #[test]

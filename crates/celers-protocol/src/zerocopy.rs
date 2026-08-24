@@ -113,6 +113,46 @@ impl Default for MessagePropertiesRef<'_> {
     }
 }
 
+/// Base64 wire encoding for [`MessageRef::body`], matching
+/// [`crate::Message::body`]'s `serde_bytes_opt` module in `types.rs` byte
+/// for byte: a base64 JSON string on the wire, decoded bytes in memory.
+///
+/// The encoded *text* is borrowed from the input when possible (a cheap,
+/// genuinely zero-copy step - no allocation, no decoding), and decoding it
+/// into real bytes happens exactly once, eagerly, right here, rather than
+/// being deferred to every caller of [`MessageRef::body_slice`] /
+/// [`MessageRef::into_owned`]. This keeps those two accessors infallible
+/// and interoperable with the rest of the crate. A malformed body surfaces
+/// as an ordinary deserialization error at the `serde_json::from_...`
+/// call site - exactly where `Message`'s own (non-lazy) body decoding
+/// already surfaces the same failure mode.
+mod base64_body {
+    use base64::Engine;
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+    use std::borrow::Cow;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        serializer.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Cow<'de, [u8]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Borrow the encoded text from the input when possible (zero-copy);
+        // only the final decode step allocates.
+        let encoded = <Cow<'de, str>>::deserialize(deserializer)?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(D::Error::custom)?;
+        Ok(Cow::Owned(decoded))
+    }
+}
+
 /// Zero-copy Celery message
 ///
 /// Uses borrowed data where possible to avoid unnecessary allocations.
@@ -128,8 +168,15 @@ pub struct MessageRef<'a> {
     #[serde(borrow)]
     pub properties: MessagePropertiesRef<'a>,
 
-    /// Message body (zero-copy reference to raw bytes)
-    #[serde(borrow)]
+    /// Message body (decoded bytes).
+    ///
+    /// On the wire this is a base64 JSON string, identical to
+    /// [`crate::Message::body`]'s representation - `"body": "dGVzdA=="`,
+    /// never `"body": [116,101,115,116]` - via the [`base64_body`] serde
+    /// adapter. `MessageRef` and `Message` therefore serialize to, and
+    /// deserialize from, the same wire shape, and `into_owned()` never
+    /// re-encodes or corrupts an already-decoded body.
+    #[serde(borrow, with = "base64_body")]
     pub body: Cow<'a, [u8]>,
 
     /// Content type (zero-copy)
@@ -329,6 +376,20 @@ mod tests {
     }
 
     #[test]
+    fn test_message_ref_deserialize_rejects_malformed_base64() {
+        // Regression guard for the new eager-decode adapter: a malformed
+        // body must surface as an ordinary deserialization error (exactly
+        // like `Message`'s own body decoding already does), not silently
+        // produce garbage bytes.
+        let task_id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"headers":{{"task":"tasks.test","id":"{}","lang":"rust"}},"properties":{{"delivery_mode":2}},"body":"not valid base64!!!","content-type":"application/json","content-encoding":"utf-8"}}"#,
+            task_id
+        );
+        assert!(serde_json::from_str::<MessageRef>(&json).is_err());
+    }
+
+    #[test]
     fn test_task_args_ref() {
         let args = TaskArgsRef::new();
         assert_eq!(args.args.len(), 0);
@@ -353,5 +414,51 @@ mod tests {
         let msg: MessageRef = serde_json::from_str(json).unwrap();
         assert_eq!(msg.task_name(), "tasks.add");
         assert_eq!(msg.content_type, "application/json");
+
+        // Regression: previously the "body" JSON string was treated as raw
+        // bytes (its ASCII text, undecoded) rather than base64-decoded, so
+        // body_slice() returned the literal text "dGVzdA==" instead of the
+        // real, decoded body "test".
+        assert_eq!(msg.body_slice(), b"test");
+    }
+
+    #[test]
+    fn test_message_ref_wire_format_matches_message() {
+        // Regression: `MessageRef` and `Message` must serialize the body
+        // field identically (a base64 JSON string), so a `Message`'s wire
+        // bytes parse cleanly as a `MessageRef` and round-trip back through
+        // `into_owned()` without corrupting or re-encoding the body.
+        let original = crate::builder::MessageBuilder::new("tasks.roundtrip")
+            .args(vec![serde_json::json!(1), serde_json::json!(2)])
+            .build()
+            .unwrap();
+
+        let wire = serde_json::to_vec(&original).unwrap();
+
+        let msg_ref: MessageRef = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(msg_ref.body_slice(), original.body.as_slice());
+
+        let round_tripped = msg_ref.into_owned();
+        assert_eq!(round_tripped.body, original.body);
+        assert_eq!(round_tripped.headers.task, original.headers.task);
+
+        // Re-serializing the round-tripped message must match `Message`'s
+        // own wire format exactly, including the "body" shape (a base64
+        // string, not a JSON byte array, and not double-encoded).
+        let re_serialized = serde_json::to_value(&round_tripped).unwrap();
+        let original_value = serde_json::to_value(&original).unwrap();
+        assert_eq!(re_serialized["body"], original_value["body"]);
+        assert!(original_value["body"].is_string());
+    }
+
+    #[test]
+    fn test_message_ref_serializes_body_as_base64_string_not_byte_array() {
+        // Direct check that MessageRef's own Serialize impl emits the same
+        // shape as Message (a base64 string), not a JSON array of numbers.
+        let task_id = Uuid::new_v4();
+        let msg_ref = MessageRef::new("tasks.test", task_id, b"test");
+
+        let value = serde_json::to_value(&msg_ref).unwrap();
+        assert_eq!(value["body"], serde_json::json!("dGVzdA=="));
     }
 }

@@ -2,7 +2,7 @@
 
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use chrono::{DateTime, Utc};
-use oxisql_core::{Connection, ToSqlValue};
+use oxisql_core::ToSqlValue;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -79,8 +79,11 @@ impl PostgresBroker {
         let chain_id = Uuid::new_v4();
         let chain_total = chain.tasks.len();
         let mut task_ids: Vec<Uuid> = Vec::with_capacity(chain_total);
-        let mut tx = self
-            .conn
+        // Two-step on a pooled broker: check out a connection, then open the
+        // transaction on it (the handle borrows `conn`, so the slot stays
+        // reserved for the transaction's whole lifetime).
+        let conn = self.connection().await?;
+        let mut tx = conn
             .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
@@ -128,8 +131,8 @@ impl PostgresBroker {
             let query_str = format!(
                 r#"
                 INSERT INTO celers_tasks
-                    (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-                VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), {})
+                    (id, task_name, payload, state, priority, max_retries, metadata, queue_name, created_at, scheduled_at)
+                VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), {})
                 "#,
                 scheduled_at
             );
@@ -146,6 +149,7 @@ impl PostgresBroker {
                     &priority,
                     &max_retries,
                     &db_metadata_param,
+                    &self.queue_name,
                 ],
             )
             .await
@@ -269,8 +273,11 @@ impl PostgresBroker {
         workflow: TaskWorkflow,
     ) -> Result<std::collections::HashMap<String, Vec<TaskId>>> {
         let mut result = std::collections::HashMap::new();
-        let mut tx = self
-            .conn
+        // Two-step on a pooled broker: check out a connection, then open the
+        // transaction on it (the handle borrows `conn`, so the slot stays
+        // reserved for the transaction's whole lifetime).
+        let conn = self.connection().await?;
+        let mut tx = conn
             .transaction()
             .await
             .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
@@ -313,8 +320,8 @@ impl PostgresBroker {
                 let query_str = format!(
                     r#"
                     INSERT INTO celers_tasks
-                        (id, task_name, payload, state, priority, max_retries, metadata, created_at, scheduled_at)
-                    VALUES ($1, $2, $3, 'pending', $4, $5, $6, NOW(), {})
+                        (id, task_name, payload, state, priority, max_retries, metadata, queue_name, created_at, scheduled_at)
+                    VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), {})
                     "#,
                     scheduled_at
                 );
@@ -331,6 +338,7 @@ impl PostgresBroker {
                         &priority,
                         &max_retries,
                         &db_metadata_param,
+                        &self.queue_name,
                     ],
                 )
                 .await
@@ -742,11 +750,14 @@ impl PostgresBroker {
                     r#"
                 SELECT
                     metadata->>'stage_id' as stage_id,
+                    MIN(metadata->>'stage_depends_on') as stage_depends_on,
                     COUNT(*) as total_tasks,
                     COUNT(*) FILTER (WHERE state = 'completed') as completed_tasks,
                     COUNT(*) FILTER (WHERE state = 'failed') as failed_tasks,
                     COUNT(*) FILTER (WHERE state = 'pending') as pending_tasks,
-                    COUNT(*) FILTER (WHERE state = 'processing') as processing_tasks
+                    COUNT(*) FILTER (WHERE state = 'processing') as processing_tasks,
+                    COUNT(*) FILTER (WHERE state NOT IN ('completed', 'cancelled'))
+                        as incomplete_tasks
                 FROM celers_tasks
                 WHERE metadata->>'workflow_id' = $1
                 GROUP BY metadata->>'stage_id'
@@ -755,6 +766,40 @@ impl PostgresBroker {
                 )
                 .await
                 .map_err(|e| CelersError::Other(format!("Failed to get stage statuses: {}", e)))?;
+
+            // One pre-pass over the same result set builds `stage_id ->
+            // incomplete task count` and `stage_id -> declared dependencies`,
+            // so `dependencies_met` can be resolved in memory against the
+            // real dependency graph without an N+1 query per stage.
+            let mut incomplete_by_stage: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::with_capacity(stage_rows.len());
+            let mut declared_deps: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::with_capacity(stage_rows.len());
+            for stage_row in &stage_rows {
+                let Ok(stage_id) = stage_row.col::<String>("stage_id") else {
+                    continue;
+                };
+                let incomplete: i64 = stage_row.col("incomplete_tasks").unwrap_or(0);
+                incomplete_by_stage.insert(stage_id.clone(), incomplete);
+
+                // `stage_depends_on` is stored as a JSON array of stage ids in
+                // each task's metadata (written by `enqueue_workflow`).
+                let deps: Vec<String> = stage_row
+                    .col::<Option<String>>("stage_depends_on")
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|value| {
+                        value.as_array().map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_string))
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                declared_deps.insert(stage_id, deps);
+            }
 
             let mut stage_statuses = Vec::new();
             let mut completed_stages = 0;
@@ -788,8 +833,21 @@ impl PostgresBroker {
                     active_stages += 1;
                 }
 
-                // Check if dependencies are met (simplified check)
-                let dependencies_met = stage_pending == 0 || stage_processing > 0 || is_complete;
+                // A dependency is met once the upstream stage has no
+                // incomplete tasks left. A stage that declares none is ready
+                // by definition. This mirrors `check_workflow_stage_
+                // dependencies` (the correct implementation this readout
+                // previously did not consult) without its per-stage queries.
+                let unmet_dependencies: Vec<String> = declared_deps
+                    .get(&stage_id)
+                    .map(|deps| {
+                        deps.iter()
+                            .filter(|dep| incomplete_by_stage.get(*dep).copied().unwrap_or(0) > 0)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let dependencies_met = unmet_dependencies.is_empty();
 
                 stage_statuses.push(StageStatus {
                     stage_id,
@@ -800,6 +858,7 @@ impl PostgresBroker {
                     processing_tasks: stage_processing,
                     is_complete,
                     dependencies_met,
+                    unmet_dependencies,
                 });
             }
 

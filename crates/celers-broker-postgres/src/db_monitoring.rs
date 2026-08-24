@@ -1,7 +1,6 @@
 //! Database monitoring operations (table sizes, index usage, etc.)
 
 use celers_core::{CelersError, Result};
-use oxisql_core::Connection;
 use std::sync::Arc;
 use std::time::Duration;
 

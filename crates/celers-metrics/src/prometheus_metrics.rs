@@ -354,6 +354,15 @@ pub fn gather_metrics() -> String {
 }
 
 /// Reset all metrics (useful for testing)
+///
+/// This resets every `Counter` and `Gauge` declared in this module, including
+/// [`GC_RECOMMENDATIONS_TOTAL`] and [`TOTAL_PAYLOAD_BYTES_PROCESSED`] (the
+/// latter feeds [`crate::history::estimate_costs`] and
+/// [`crate::history::cost_per_task`], so leaving it out let state leak across
+/// resets). `Histogram` metrics (e.g. [`TASK_EXECUTION_TIME`],
+/// [`TASK_AGE_SECONDS`]) are intentionally not touched: the underlying
+/// `prometheus` crate does not expose a `reset()` on `Histogram`, so their
+/// accumulated buckets/count/sum persist for the life of the process.
 #[allow(dead_code)]
 pub fn reset_metrics() {
     TASKS_ENQUEUED_TOTAL.reset();
@@ -383,12 +392,14 @@ pub fn reset_metrics() {
     BATCH_DEQUEUE_TOTAL.reset();
     WORKER_MEMORY_USAGE_BYTES.set(0.0);
     OVERSIZED_RESULTS_TOTAL.reset();
+    GC_RECOMMENDATIONS_TOTAL.reset();
     WORKER_UTILIZATION_PERCENT.set(0.0);
     IDLE_WORKERS.set(0.0);
     BUSY_WORKERS.set(0.0);
     DELAYED_TASKS_SCHEDULED.set(0.0);
     DELAYED_TASKS_ENQUEUED_TOTAL.reset();
     DELAYED_TASKS_EXECUTED_TOTAL.reset();
+    TOTAL_PAYLOAD_BYTES_PROCESSED.reset();
 }
 
 /// Record bytes of payload processed (call when enqueuing tasks or storing results)
@@ -603,6 +614,17 @@ impl MetricsSampler {
     }
 
     /// Check if the current metric should be collected based on sampling rate
+    ///
+    /// Uses fractional-credit accumulation rather than a truncated
+    /// `1.0 / sampling_rate` stride: `sample_every = (1.0 / rate) as u64`
+    /// truncates to `1` for any rate above `0.5` (so a configured `0.9` or
+    /// `0.6` rate previously sampled *everything*) and rounds every other
+    /// rate to the nearest achievable `1/N` fraction (e.g. `0.34` sampled at
+    /// 50%, not 34%). Scoring `floor((count+1) * rate) > floor(count * rate)`
+    /// instead samples call number `count` exactly when the running total of
+    /// "expected samples so far" crosses an integer boundary, which
+    /// telescopes to exactly `floor(N * rate)` samples in any prefix of `N`
+    /// calls -- the exact long-run rate for any value in `(0.0, 1.0)`.
     pub fn should_sample(&self) -> bool {
         if self.sampling_rate >= 1.0 {
             return true;
@@ -612,8 +634,8 @@ impl MetricsSampler {
         }
 
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
-        let sample_every = (1.0 / self.sampling_rate) as u64;
-        count.is_multiple_of(sample_every)
+        let rate = self.sampling_rate;
+        (((count + 1) as f64) * rate).floor() > ((count as f64) * rate).floor()
     }
 }
 
@@ -655,12 +677,134 @@ pub fn calculate_success_rate(completed: f64, failed: f64) -> f64 {
 }
 
 /// Calculate error rate from completed and failed counters
+///
+/// Returns `0.0` when no tasks have been processed yet (`completed + failed
+/// <= 0.0`) rather than the complement of [`calculate_success_rate`]'s `0.0`:
+/// `1.0 - calculate_success_rate(0.0, 0.0)` would otherwise report a 100%
+/// error rate for an idle system (e.g. a freshly started process, or right
+/// after [`reset_metrics`]), which is enough on its own to trip an
+/// `ErrorRateAbove` alert with no failures having occurred.
 pub fn calculate_error_rate(completed: f64, failed: f64) -> f64 {
-    1.0 - calculate_success_rate(completed, failed)
+    let total = completed + failed;
+    if total <= 0.0 {
+        return 0.0;
+    }
+    failed / total
 }
 
 /// Calculate throughput (tasks per second)
 #[must_use]
 pub fn calculate_throughput(task_count: f64, time_seconds: f64) -> f64 {
     calculate_rate(task_count, 0.0, time_seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alerts::{AlertCondition, AlertRule, AlertSeverity};
+    use crate::backends::CurrentMetrics;
+    use serial_test::serial;
+
+    fn zeroed_metrics() -> CurrentMetrics {
+        CurrentMetrics {
+            tasks_enqueued: 0.0,
+            tasks_completed: 0.0,
+            tasks_failed: 0.0,
+            tasks_retried: 0.0,
+            tasks_cancelled: 0.0,
+            queue_size: 0.0,
+            processing_queue_size: 0.0,
+            dlq_size: 0.0,
+            active_workers: 0.0,
+            total_payload_bytes: 0.0,
+        }
+    }
+
+    // ---- calculate_error_rate --------------------------------------------
+
+    #[test]
+    fn error_rate_is_zero_when_no_tasks_processed() {
+        // Regression: previously `1.0 - calculate_success_rate(0.0, 0.0)`
+        // reported a 100% error rate for an idle system.
+        assert_eq!(calculate_error_rate(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn error_rate_and_success_rate_are_complementary_when_data_exists() {
+        assert!((calculate_error_rate(90.0, 10.0) - 0.1).abs() < 1e-12);
+        assert!((calculate_success_rate(90.0, 10.0) - 0.9).abs() < 1e-12);
+        assert!(
+            (calculate_error_rate(90.0, 10.0) + calculate_success_rate(90.0, 10.0) - 1.0).abs()
+                < 1e-12
+        );
+        assert_eq!(calculate_error_rate(100.0, 0.0), 0.0);
+        assert_eq!(calculate_error_rate(0.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn zeroed_metrics_do_not_fire_error_rate_above_alert() {
+        // The exact scenario from the audit: a freshly started process (or
+        // one right after `reset_metrics()`) must not trip an
+        // `ErrorRateAbove` alert just because nothing has happened yet.
+        let rule = AlertRule::new(
+            "high_error_rate",
+            AlertCondition::ErrorRateAbove { threshold: 0.05 },
+            AlertSeverity::Critical,
+            "Error rate exceeded 5%",
+        );
+        assert!(!rule.should_fire(&zeroed_metrics()));
+    }
+
+    // ---- reset_metrics -----------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn reset_metrics_resets_gc_recommendations_and_payload_bytes() {
+        GC_RECOMMENDATIONS_TOTAL.inc_by(3.0);
+        TOTAL_PAYLOAD_BYTES_PROCESSED.inc_by(4096.0);
+        assert!(GC_RECOMMENDATIONS_TOTAL.get() > 0.0);
+        assert!(TOTAL_PAYLOAD_BYTES_PROCESSED.get() > 0.0);
+
+        reset_metrics();
+
+        assert_eq!(GC_RECOMMENDATIONS_TOTAL.get(), 0.0);
+        assert_eq!(TOTAL_PAYLOAD_BYTES_PROCESSED.get(), 0.0);
+    }
+
+    // ---- MetricsSampler::should_sample --------------------------------------
+
+    #[test]
+    fn sampler_high_rate_is_not_truncated_to_full_sampling() {
+        // Regression: `(1.0 / 0.9) as u64 == 1`, which sampled every call.
+        let sampler = MetricsSampler::new(0.9);
+        let sampled = (0..1000).filter(|_| sampler.should_sample()).count();
+        // Exact long-run rate over N calls is floor(N * rate) = 900.
+        assert_eq!(sampled, 900, "sampled {sampled}/1000 at rate 0.9");
+    }
+
+    #[test]
+    fn sampler_awkward_rate_matches_long_run_fraction() {
+        // Regression: `(1.0 / 0.34) as u64 == 2`, which sampled 50% instead
+        // of 34%.
+        let sampler = MetricsSampler::new(0.34);
+        let sampled = (0..100_000).filter(|_| sampler.should_sample()).count();
+        let expected = (100_000.0_f64 * 0.34).floor() as usize;
+        assert_eq!(sampled, expected, "sampled {sampled}/100000 at rate 0.34");
+    }
+
+    #[test]
+    fn sampler_at_scale_matches_configured_rate() {
+        let sampler = MetricsSampler::new(0.9);
+        let sampled = (0..100_000).filter(|_| sampler.should_sample()).count();
+        assert_eq!(sampled, 90_000, "sampled {sampled}/100000 at rate 0.9");
+    }
+
+    #[test]
+    fn sampler_boundary_rates_unchanged() {
+        let always = MetricsSampler::new(1.0);
+        assert!((0..50).all(|_| always.should_sample()));
+
+        let never = MetricsSampler::new(0.0);
+        assert!((0..50).all(|_| !never.should_sample()));
+    }
 }

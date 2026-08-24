@@ -20,6 +20,43 @@ pub(crate) const ENCODING_BINARY: &str = "binary";
 /// Default language
 pub(crate) const DEFAULT_LANG: &str = "rust";
 
+/// Value of the kombu `body_encoding` property emitted by this crate.
+///
+/// [`Message`] always serializes its body as a base64 string (see the
+/// `serde_bytes_opt` module below), which is the kombu virtual-transport
+/// convention. kombu's consumer side only base64-*decodes* when
+/// `properties['body_encoding'] == 'base64'`
+/// (`kombu.transport.virtual.base.Message.__init__` ->
+/// `channel.decode_body(body, properties.get('body_encoding'))`); with the key
+/// absent it passes the base64 *text* through unchanged and the JSON
+/// content-type deserializer then fails on it. Emitting the property is
+/// therefore required for a Python consumer to read a CeleRS message at all.
+pub const BODY_ENCODING_BASE64: &str = "base64";
+
+/// Celery header carrying the task time limits as `[soft, hard]` (seconds).
+///
+/// See [`MessageHeaders::with_timelimit`].
+pub const TIMELIMIT_HEADER: &str = "timelimit";
+
+/// Celery header carrying the `repr()` of the positional arguments.
+///
+/// Purely observational: it is what Flower and `celery events` display, and it
+/// exists so a worker never has to deserialize the body just to log a task.
+pub const ARGSREPR_HEADER: &str = "argsrepr";
+
+/// Celery header carrying the `repr()` of the keyword arguments.
+pub const KWARGSREPR_HEADER: &str = "kwargsrepr";
+
+/// Celery header naming the process that published the task
+/// (`"{pid}@{hostname}"` in Python).
+pub const ORIGIN_HEADER: &str = "origin";
+
+/// Celery header carrying an alternate task name to display in monitoring.
+pub const SHADOW_HEADER: &str = "shadow";
+
+/// Celery header telling the worker not to store a result for this task.
+pub const IGNORE_RESULT_HEADER: &str = "ignore_result";
+
 /// Validation errors for Celery protocol messages
 ///
 /// # Examples
@@ -419,6 +456,163 @@ impl MessageHeaders {
         self
     }
 
+    /// Set the Celery task time limits (builder pattern).
+    ///
+    /// Celery carries time limits as `headers['timelimit'] = [soft, hard]`
+    /// (seconds), where either slot may be `null`. The soft limit raises
+    /// `SoftTimeLimitExceeded` inside the task; the hard limit kills the worker
+    /// child process.
+    ///
+    /// The pair is stored in the flattened [`MessageHeaders::extra`] map, so it
+    /// lands at the top level of the `headers` object on the wire exactly where
+    /// a Python worker looks for it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use celers_protocol::MessageHeaders;
+    /// use uuid::Uuid;
+    ///
+    /// let headers = MessageHeaders::new("tasks.add".to_string(), Uuid::new_v4())
+    ///     .with_timelimit(Some(30), Some(60));
+    ///
+    /// assert_eq!(headers.timelimit(), Some((Some(30), Some(60))));
+    ///
+    /// let value = serde_json::to_value(&headers).expect("serialize");
+    /// assert_eq!(value["timelimit"], serde_json::json!([30, 60]));
+    /// ```
+    #[must_use]
+    pub fn with_timelimit(mut self, soft: Option<u64>, hard: Option<u64>) -> Self {
+        self.set_timelimit(soft, hard);
+        self
+    }
+
+    /// Set the Celery task time limits in place.
+    ///
+    /// See [`MessageHeaders::with_timelimit`].
+    pub fn set_timelimit(&mut self, soft: Option<u64>, hard: Option<u64>) {
+        let encode = |limit: Option<u64>| match limit {
+            Some(seconds) => serde_json::Value::from(seconds),
+            None => serde_json::Value::Null,
+        };
+        self.extra.insert(
+            TIMELIMIT_HEADER.to_string(),
+            serde_json::Value::Array(vec![encode(soft), encode(hard)]),
+        );
+    }
+
+    /// Read the Celery task time limits as `(soft, hard)`.
+    ///
+    /// Returns [`None`] when the header is absent or malformed. Either slot may
+    /// independently be [`None`], matching Celery's `[null, 30]` form.
+    pub fn timelimit(&self) -> Option<(Option<u64>, Option<u64>)> {
+        let entries = self.extra.get(TIMELIMIT_HEADER)?.as_array()?;
+        if entries.len() != 2 {
+            return None;
+        }
+        let parse = |value: &serde_json::Value| -> Option<Option<u64>> {
+            match value {
+                serde_json::Value::Null => Some(None),
+                other => other.as_u64().map(Some),
+            }
+        };
+        Some((parse(&entries[0])?, parse(&entries[1])?))
+    }
+
+    /// Read the soft time limit in seconds, if set.
+    #[inline]
+    pub fn soft_time_limit(&self) -> Option<u64> {
+        self.timelimit().and_then(|(soft, _)| soft)
+    }
+
+    /// Read the hard time limit in seconds, if set.
+    #[inline]
+    pub fn hard_time_limit(&self) -> Option<u64> {
+        self.timelimit().and_then(|(_, hard)| hard)
+    }
+
+    /// Set the `argsrepr` observability header (builder pattern).
+    ///
+    /// See [`ARGSREPR_HEADER`].
+    #[must_use]
+    pub fn with_argsrepr(mut self, argsrepr: impl Into<String>) -> Self {
+        self.set_string_header(ARGSREPR_HEADER, argsrepr);
+        self
+    }
+
+    /// Set the `kwargsrepr` observability header (builder pattern).
+    #[must_use]
+    pub fn with_kwargsrepr(mut self, kwargsrepr: impl Into<String>) -> Self {
+        self.set_string_header(KWARGSREPR_HEADER, kwargsrepr);
+        self
+    }
+
+    /// Set the `origin` header (publisher identity) (builder pattern).
+    #[must_use]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.set_string_header(ORIGIN_HEADER, origin);
+        self
+    }
+
+    /// Set the `shadow` header (display name override) (builder pattern).
+    #[must_use]
+    pub fn with_shadow(mut self, shadow: impl Into<String>) -> Self {
+        self.set_string_header(SHADOW_HEADER, shadow);
+        self
+    }
+
+    /// Set the `ignore_result` header (builder pattern).
+    #[must_use]
+    pub fn with_ignore_result(mut self, ignore_result: bool) -> Self {
+        self.extra.insert(
+            IGNORE_RESULT_HEADER.to_string(),
+            serde_json::Value::Bool(ignore_result),
+        );
+        self
+    }
+
+    /// Read the `argsrepr` header, if set.
+    #[inline]
+    pub fn argsrepr(&self) -> Option<&str> {
+        self.string_header(ARGSREPR_HEADER)
+    }
+
+    /// Read the `kwargsrepr` header, if set.
+    #[inline]
+    pub fn kwargsrepr(&self) -> Option<&str> {
+        self.string_header(KWARGSREPR_HEADER)
+    }
+
+    /// Read the `origin` header, if set.
+    #[inline]
+    pub fn origin(&self) -> Option<&str> {
+        self.string_header(ORIGIN_HEADER)
+    }
+
+    /// Read the `shadow` header, if set.
+    #[inline]
+    pub fn shadow(&self) -> Option<&str> {
+        self.string_header(SHADOW_HEADER)
+    }
+
+    /// Read the `ignore_result` header, if set.
+    #[inline]
+    pub fn ignore_result(&self) -> Option<bool> {
+        self.extra.get(IGNORE_RESULT_HEADER)?.as_bool()
+    }
+
+    /// Read a string-valued custom header.
+    #[inline]
+    fn string_header(&self, key: &str) -> Option<&str> {
+        self.extra.get(key)?.as_str()
+    }
+
+    /// Write a string-valued custom header.
+    fn set_string_header(&mut self, key: &str, value: impl Into<String>) {
+        self.extra
+            .insert(key.to_string(), serde_json::Value::String(value.into()));
+    }
+
     /// Validate message headers
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.task.is_empty() {
@@ -443,27 +637,99 @@ impl MessageHeaders {
 }
 
 /// Message properties (AMQP-like)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Wire format
+///
+/// When these properties are serialized as part of a [`Message`] envelope they
+/// additionally carry kombu's `body_encoding` property, always
+/// [`BODY_ENCODING_BASE64`], because [`Message`] always base64-encodes its body.
+/// Without it a kombu consumer hands the base64 *text* to the JSON
+/// deserializer, which then fails. The property is emitted by the
+/// [`Serialize`] impl below rather than stored as a field, since the encoding
+/// is a property of the envelope and not independently selectable.
+///
+/// Deserialization accepts and ignores `body_encoding` along with the other
+/// virtual-transport keys kombu adds on the consumer side (`delivery_info`,
+/// `delivery_tag`), so a message captured off a Redis/SQS queue round-trips.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageProperties {
     /// Correlation ID for RPC-style calls
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
 
     /// Reply-to queue for results
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
 
     /// Delivery mode (1 = non-persistent, 2 = persistent)
-    #[serde(default = "default_delivery_mode")]
     pub delivery_mode: u8,
 
     /// Priority (0-9, higher = more priority)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
 }
 
 const fn default_delivery_mode() -> u8 {
     2 // Persistent by default
+}
+
+/// Serialization shape of [`MessageProperties`].
+///
+/// Borrows from the live properties so no allocation is needed, and adds the
+/// `body_encoding` property that the envelope always implies.
+#[derive(Serialize)]
+struct MessagePropertiesRepr<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<&'a String>,
+    delivery_mode: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<u8>,
+    /// kombu's body codec selector; see [`BODY_ENCODING_BASE64`].
+    body_encoding: &'static str,
+}
+
+/// Deserialization shape of [`MessageProperties`].
+///
+/// `body_encoding`, `delivery_info` and `delivery_tag` are accepted (and
+/// deliberately discarded) so that a payload produced by this crate, or read
+/// back off a kombu virtual transport, deserializes cleanly.
+#[derive(Deserialize)]
+struct MessagePropertiesDe {
+    #[serde(default)]
+    correlation_id: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
+    #[serde(default = "default_delivery_mode")]
+    delivery_mode: u8,
+    #[serde(default)]
+    priority: Option<u8>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    body_encoding: Option<String>,
+}
+
+impl Serialize for MessageProperties {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        MessagePropertiesRepr {
+            correlation_id: self.correlation_id.as_ref(),
+            reply_to: self.reply_to.as_ref(),
+            delivery_mode: self.delivery_mode,
+            priority: self.priority,
+            body_encoding: BODY_ENCODING_BASE64,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageProperties {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = MessagePropertiesDe::deserialize(deserializer)?;
+        Ok(Self {
+            correlation_id: repr.correlation_id,
+            reply_to: repr.reply_to,
+            delivery_mode: repr.delivery_mode,
+            priority: repr.priority,
+        })
+    }
 }
 
 impl Default for MessageProperties {
@@ -509,6 +775,16 @@ impl MessageProperties {
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = Some(priority);
         self
+    }
+
+    /// The kombu body codec these properties advertise on the wire.
+    ///
+    /// Always [`BODY_ENCODING_BASE64`]: [`Message`] has exactly one body
+    /// encoding. Exposed so callers building a kombu envelope by hand do not
+    /// have to hardcode the string.
+    #[inline]
+    pub const fn body_encoding(&self) -> &'static str {
+        BODY_ENCODING_BASE64
     }
 
     /// Validate message properties
@@ -746,5 +1022,193 @@ impl FromIterator<serde_json::Value> for TaskArgs {
             args: iter.into_iter().collect(),
             kwargs: HashMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Golden fixture: the envelope a kombu virtual transport (Redis/SQS)
+    /// stores for a Celery task.
+    ///
+    /// Field semantics:
+    /// * `body` -- base64 of the `[args, kwargs, embed]` tuple.
+    /// * `properties.body_encoding` -- kombu's codec selector. On the consumer
+    ///   side `virtual.Message.__init__` calls
+    ///   `channel.decode_body(body, properties.get('body_encoding'))`, which
+    ///   base64-decodes **only** for the literal value `"base64"`. Absent, the
+    ///   base64 text is passed straight to the JSON deserializer and the
+    ///   message is unreadable.
+    /// * `properties.delivery_mode` -- 2 = persistent.
+    /// * `content-type` / `content-encoding` -- hyphenated, per kombu.
+    const KOMBU_ENVELOPE: &str = r#"{
+        "body": "W1sxLCAyXSwge30sIHt9XQ==",
+        "content-encoding": "utf-8",
+        "content-type": "application/json",
+        "headers": {
+            "task": "tasks.add",
+            "id": "6d5b1f1e-6a4f-4a3c-9b6c-1f8f5f1a2b3c",
+            "lang": "py",
+            "root_id": null,
+            "parent_id": null,
+            "group": null,
+            "retries": 0,
+            "eta": null,
+            "expires": null,
+            "timelimit": [null, null],
+            "argsrepr": "(1, 2)",
+            "kwargsrepr": "{}",
+            "origin": "1234@worker.local",
+            "shadow": null,
+            "ignore_result": false
+        },
+        "properties": {
+            "correlation_id": "6d5b1f1e-6a4f-4a3c-9b6c-1f8f5f1a2b3c",
+            "reply_to": "b7a1e0d0-5c4e-4a1e-9a2b-3c4d5e6f7a8b",
+            "delivery_mode": 2,
+            "priority": 0,
+            "body_encoding": "base64",
+            "delivery_tag": "9f8e7d6c-5b4a-3928-1706-abcdefabcdef",
+            "delivery_info": {"exchange": "", "routing_key": "celery"}
+        }
+    }"#;
+
+    /// Regression: a real kombu envelope carries `body_encoding`,
+    /// `delivery_tag` and `delivery_info` in `properties`. These must be
+    /// accepted (not rejected as unknown), and the Celery observability
+    /// headers must survive into `extra`.
+    #[test]
+    fn test_parses_real_kombu_envelope() {
+        let msg: Message =
+            serde_json::from_str(KOMBU_ENVELOPE).expect("a real kombu envelope must deserialize");
+
+        assert_eq!(msg.headers.task, "tasks.add");
+        assert_eq!(msg.headers.lang, "py");
+        assert_eq!(msg.body, b"[[1, 2], {}, {}]");
+        assert_eq!(msg.properties.delivery_mode, 2);
+        assert_eq!(msg.properties.priority, Some(0));
+        assert_eq!(
+            msg.properties.reply_to.as_deref(),
+            Some("b7a1e0d0-5c4e-4a1e-9a2b-3c4d5e6f7a8b")
+        );
+
+        // Celery observability headers land in the flattened `extra` map and
+        // are readable through the typed accessors.
+        assert_eq!(msg.headers.timelimit(), Some((None, None)));
+        assert_eq!(msg.headers.argsrepr(), Some("(1, 2)"));
+        assert_eq!(msg.headers.kwargsrepr(), Some("{}"));
+        assert_eq!(msg.headers.origin(), Some("1234@worker.local"));
+        assert_eq!(msg.headers.ignore_result(), Some(false));
+    }
+
+    /// Regression: `body_encoding` used to be absent from the serialized
+    /// properties entirely (the string appeared in zero files), so a kombu
+    /// consumer never base64-decoded a CeleRS-produced body.
+    #[test]
+    fn test_serialized_properties_carry_body_encoding() {
+        let msg = Message::new(
+            "tasks.add".to_string(),
+            uuid::Uuid::new_v4(),
+            b"[[1, 2], {}, {}]".to_vec(),
+        );
+
+        let value = serde_json::to_value(&msg).expect("serialize");
+
+        assert_eq!(value["properties"]["body_encoding"], json!("base64"));
+        assert_eq!(value["properties"]["delivery_mode"], json!(2));
+        // The body really is base64, i.e. the advertised encoding is truthful.
+        assert_eq!(value["body"], json!("W1sxLCAyXSwge30sIHt9XQ=="));
+        assert_eq!(msg.properties.body_encoding(), BODY_ENCODING_BASE64);
+
+        // ... and the envelope still round-trips through our own parser.
+        let restored: Message = serde_json::from_value(value).expect("round-trip");
+        assert_eq!(restored, msg);
+    }
+
+    /// A payload written before `body_encoding` existed must still parse
+    /// (the field is serde-defaulted, not required).
+    #[test]
+    fn test_properties_without_body_encoding_still_parse() {
+        let props: MessageProperties =
+            serde_json::from_str(r#"{"delivery_mode":2}"#).expect("legacy properties must parse");
+        assert_eq!(props, MessageProperties::default());
+    }
+
+    /// Regression: a canvas-configured time limit had nowhere to go on the
+    /// wire -- the Celery header name `timelimit` appeared in zero files.
+    /// Celery carries it as `headers['timelimit'] = [soft, hard]`.
+    #[test]
+    fn test_timelimit_header_round_trips_in_celery_shape() {
+        let headers = MessageHeaders::new("tasks.slow".to_string(), uuid::Uuid::new_v4())
+            .with_timelimit(Some(30), Some(60));
+
+        let value = serde_json::to_value(&headers).expect("serialize headers");
+        // Celery's shape: a two-element [soft, hard] list at the top level of
+        // the headers object.
+        assert_eq!(value["timelimit"], json!([30, 60]));
+
+        let restored: MessageHeaders = serde_json::from_value(value).expect("deserialize headers");
+        assert_eq!(restored.timelimit(), Some((Some(30), Some(60))));
+        assert_eq!(restored.soft_time_limit(), Some(30));
+        assert_eq!(restored.hard_time_limit(), Some(60));
+    }
+
+    /// Either slot of the pair may be null, which is how Celery expresses
+    /// "only a hard limit" / "only a soft limit".
+    #[test]
+    fn test_timelimit_header_allows_null_slots() {
+        let headers = MessageHeaders::new("tasks.slow".to_string(), uuid::Uuid::new_v4())
+            .with_timelimit(None, Some(45));
+
+        let value = serde_json::to_value(&headers).expect("serialize headers");
+        assert_eq!(value["timelimit"], json!([null, 45]));
+
+        let restored: MessageHeaders = serde_json::from_value(value).expect("deserialize headers");
+        assert_eq!(restored.timelimit(), Some((None, Some(45))));
+        assert_eq!(restored.soft_time_limit(), None);
+        assert_eq!(restored.hard_time_limit(), Some(45));
+
+        // Absent header -> no time limits at all.
+        let plain = MessageHeaders::new("tasks.fast".to_string(), uuid::Uuid::new_v4());
+        assert_eq!(plain.timelimit(), None);
+        assert_eq!(plain.soft_time_limit(), None);
+
+        // Malformed values are reported as absent rather than panicking.
+        let mut broken = MessageHeaders::new("tasks.fast".to_string(), uuid::Uuid::new_v4());
+        broken
+            .extra
+            .insert(TIMELIMIT_HEADER.to_string(), json!("30"));
+        assert_eq!(broken.timelimit(), None);
+        broken
+            .extra
+            .insert(TIMELIMIT_HEADER.to_string(), json!([30]));
+        assert_eq!(broken.timelimit(), None);
+    }
+
+    /// The observability headers Flower and `celery events` display.
+    #[test]
+    fn test_observability_headers_round_trip() {
+        let headers = MessageHeaders::new("tasks.add".to_string(), uuid::Uuid::new_v4())
+            .with_argsrepr("(1, 2)")
+            .with_kwargsrepr("{'debug': True}")
+            .with_origin("1234@worker.local")
+            .with_shadow("tasks.add[display]")
+            .with_ignore_result(true);
+
+        let value = serde_json::to_value(&headers).expect("serialize headers");
+        assert_eq!(value["argsrepr"], json!("(1, 2)"));
+        assert_eq!(value["kwargsrepr"], json!("{'debug': True}"));
+        assert_eq!(value["origin"], json!("1234@worker.local"));
+        assert_eq!(value["shadow"], json!("tasks.add[display]"));
+        assert_eq!(value["ignore_result"], json!(true));
+
+        let restored: MessageHeaders = serde_json::from_value(value).expect("deserialize headers");
+        assert_eq!(restored.argsrepr(), Some("(1, 2)"));
+        assert_eq!(restored.kwargsrepr(), Some("{'debug': True}"));
+        assert_eq!(restored.origin(), Some("1234@worker.local"));
+        assert_eq!(restored.shadow(), Some("tasks.add[display]"));
+        assert_eq!(restored.ignore_result(), Some(true));
     }
 }

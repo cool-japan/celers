@@ -1,7 +1,6 @@
 //! Connection health, resilience, and metrics update methods
 
 use celers_core::{CelersError, Result};
-use oxisql_core::Connection;
 use std::time::Duration;
 
 use crate::row_ext::RowExt;

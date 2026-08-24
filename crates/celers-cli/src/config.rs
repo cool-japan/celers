@@ -58,6 +58,8 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::Path;
+use std::sync::{OnceLock, RwLock};
+use tracing::warn;
 
 /// Serialization format used for a configuration file.
 ///
@@ -293,11 +295,52 @@ impl Default for PoolConfig {
     }
 }
 
+/// Process-wide snapshot of the `[pool]`/`[cache]` sections of the most
+/// recently loaded configuration *file* (before any environment-variable
+/// layer is applied to them), populated by [`Config::apply_env_overrides`].
+///
+/// [`PoolConfig::from_env_or_default`]/[`CacheConfig::from_env_or_default`]
+/// are called directly by `commands::queue`/`commands::worker`/
+/// `commands::task`'s read paths, which are reached from CLI dispatch
+/// without a loaded [`Config`] in scope (see their doc comments) -- so
+/// without this, a `celers.toml` `[pool]`/`[cache]` section was silently
+/// never consulted by anything: every one of those call sites only ever saw
+/// environment variables layered on top of this struct's *hardcoded* type
+/// defaults, never the file's values (idx 337).
+///
+/// This stores only the *file* layer (not the fully env-resolved values) so
+/// that `from_env_or_default`'s own env-var checks stay live and
+/// independently authoritative -- it only changes what they fall back to
+/// when no environment variable is set, from a hardcoded default to
+/// whatever the file specified (or the hardcoded default, if no file was
+/// loaded either). A `RwLock` (rather than a write-once `OnceLock<T>`)
+/// because a long-lived process (`celers interactive`, or library use of
+/// this crate) may resolve configuration more than once over its lifetime.
+fn file_pool_cache_floor() -> &'static RwLock<Option<(PoolConfig, CacheConfig)>> {
+    static FLOOR: OnceLock<RwLock<Option<(PoolConfig, CacheConfig)>>> = OnceLock::new();
+    FLOOR.get_or_init(|| RwLock::new(None))
+}
+
+/// Read the current file-provided pool/cache floor, or `PoolConfig`/
+/// `CacheConfig`'s hardcoded type defaults if no configuration has been
+/// resolved yet in this process (e.g. a unit test constructing these types
+/// directly, or a library caller that never called `apply_env_overrides`).
+fn file_pool_cache_floor_or_default() -> (PoolConfig, CacheConfig) {
+    file_pool_cache_floor()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| (PoolConfig::default(), CacheConfig::default()))
+}
+
 impl PoolConfig {
     /// Effective pool configuration, honoring `CELERS_POOL_MAX_SIZE` /
     /// `CELERS_POOL_REUSE_ENABLED` environment overrides (mirroring
     /// [`Config::apply_env_overrides`]'s mechanism for broker/worker
-    /// settings) and falling back to [`PoolConfig::default`] otherwise.
+    /// settings) and otherwise falling back to whichever configuration file
+    /// was most recently resolved in this process (via
+    /// [`Config::apply_env_overrides`]), or [`PoolConfig::default`] if none
+    /// was (idx 337).
     ///
     /// Command read paths in `commands::queue`/`commands::worker`/
     /// `commands::task` are reached directly from CLI dispatch without a
@@ -306,7 +349,7 @@ impl PoolConfig {
     /// through every call site.
     #[must_use]
     pub fn from_env_or_default() -> Self {
-        let defaults = Self::default();
+        let (defaults, _) = file_pool_cache_floor_or_default();
         Self {
             max_size: first_env_parsed(&["CELERS_POOL_MAX_SIZE"]).unwrap_or(defaults.max_size),
             reuse_enabled: first_env_parsed(&["CELERS_POOL_REUSE_ENABLED"])
@@ -344,13 +387,14 @@ impl Default for CacheConfig {
 
 impl CacheConfig {
     /// Effective cache configuration, honoring `CELERS_CACHE_TTL_SECS` /
-    /// `CELERS_CACHE_ENABLED` environment overrides and falling back to
-    /// [`CacheConfig::default`] otherwise. See
+    /// `CELERS_CACHE_ENABLED` environment overrides and otherwise falling
+    /// back to whichever configuration file was most recently resolved in
+    /// this process, or [`CacheConfig::default`] if none was (idx 337). See
     /// [`PoolConfig::from_env_or_default`] for why the read paths use this
     /// instead of a threaded-through [`Config`].
     #[must_use]
     pub fn from_env_or_default() -> Self {
-        let defaults = Self::default();
+        let (_, defaults) = file_pool_cache_floor_or_default();
         Self {
             ttl_secs: first_env_parsed(&["CELERS_CACHE_TTL_SECS"]).unwrap_or(defaults.ttl_secs),
             enabled: first_env_parsed(&["CELERS_CACHE_ENABLED"]).unwrap_or(defaults.enabled),
@@ -364,6 +408,13 @@ impl CacheConfig {
         std::time::Duration::from_secs(self.ttl_secs)
     }
 }
+
+/// The hardcoded fallback broker URL used by [`Config::default_config`] when
+/// no configuration file is found at all. Also consulted by
+/// [`Config::apply_env_overrides`] as the "no file supplied a `broker.url`"
+/// signal for its `REDIS_URL`/`AMQP_URL` fallback precedence (idx 338) -- see
+/// that method's doc comment for the caveat this implies.
+const DEFAULT_BROKER_URL: &str = "redis://localhost:6379";
 
 fn default_pool_max_size() -> usize {
     16
@@ -534,13 +585,54 @@ impl Config {
         Ok(())
     }
 
+    /// Update just the `[aliases]` section of the on-disk configuration file
+    /// at `path`, re-reading and re-writing every other section exactly as
+    /// it already exists on disk.
+    ///
+    /// This exists so a mutating command like `celers alias add`/`remove`
+    /// can persist without going through the fully env/CLI-arg-resolved
+    /// in-memory [`Config`] (as returned by
+    /// [`crate::config_layer::resolve_config`]) and calling
+    /// [`Config::to_file`] on *that* -- doing so bakes every resolved field
+    /// back into the file, including a `broker.url` an environment variable
+    /// (e.g. a PaaS platform's auto-injected `REDIS_URL`) may have supplied
+    /// only for this one process, permanently overwriting whatever the file
+    /// actually said (idx 338). This reads the file fresh (falling back to
+    /// [`Config::default_config`] when `path` does not exist yet, mirroring
+    /// [`crate::config_layer::resolve_config_path`]'s "first default name"
+    /// contract for a mutating command run before `celers init`), mutates
+    /// only `aliases`, and writes that back -- every other section is
+    /// preserved byte-for-byte as it was on disk.
+    ///
+    /// NOTE: as of this fix, nothing calls this yet -- `cli::dispatch`'s
+    /// `Commands::Alias` handler (outside this module) still does
+    /// `load_config(None)?.to_file(...)` on the fully resolved config. See
+    /// the crate-level followups. `#[allow(dead_code)]` (matching this
+    /// file's existing `from_file_with_profile`/`merge_with`) since this is
+    /// public, tested API ready for that handler to adopt, not unreachable
+    /// code left over from a removed feature.
+    #[allow(dead_code)]
+    pub fn write_aliases_only<P: AsRef<Path>>(
+        path: P,
+        aliases: &crate::aliases::AliasConfig,
+    ) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let mut on_disk = if path.exists() {
+            Self::from_file(path)?
+        } else {
+            Self::default_config()
+        };
+        on_disk.aliases = Some(aliases.clone());
+        on_disk.to_file(path)
+    }
+
     /// Create a default configuration file
     pub fn default_config() -> Self {
         Self {
             profile: None,
             broker: BrokerConfig {
                 broker_type: "redis".to_string(),
-                url: "redis://localhost:6379".to_string(),
+                url: DEFAULT_BROKER_URL.to_string(),
                 failover_urls: vec![],
                 failover_retries: default_failover_retries(),
                 failover_timeout_secs: default_failover_timeout(),
@@ -704,22 +796,60 @@ impl Config {
     /// - `CELERY_TASK_TIME_LIMIT` / `CELERS_TIMEOUT_SECS` -> `worker.default_timeout_secs`
     /// - `CELERS_QUEUES` -> `queues` (comma-separated)
     /// - `CELERS_PROFILE` -> `profile`
+    /// - `CELERS_POOL_MAX_SIZE` / `CELERS_POOL_REUSE_ENABLED` -> `pool.*`
+    /// - `CELERS_CACHE_TTL_SECS` / `CELERS_CACHE_ENABLED` -> `cache.*`
     ///
-    /// Variables that are unset or fail to parse are ignored, leaving the
-    /// existing value untouched.
+    /// Variables that are unset are ignored, leaving the existing value
+    /// (typically whatever the config file set, or a hardcoded default if
+    /// no file was loaded) untouched. Variables that are *set* but fail to
+    /// parse are also ignored the same way, but logged via [`tracing::warn`]
+    /// (idx 337) so a typo like `CELERS_CONCURRENCY=abc` or
+    /// `CELERS_MAX_RETRIES=-1` does not silently vanish -- see
+    /// [`first_env_parsed`].
     ///
-    /// When neither `CELERY_BROKER_URL` nor `CELERS_BROKER_URL` is set,
-    /// `broker.url` falls back to [`crate::smart_defaults::detect_broker_from_env`],
-    /// which additionally recognizes the wider `REDIS_URL` / `AMQP_URL`
-    /// hosting-provider conventions. This keeps the overall precedence as
-    /// CLI arg (applied by the caller, not here) > explicit
-    /// `CELERY_BROKER_URL` / `CELERS_BROKER_URL` > `REDIS_URL` / `AMQP_URL`
-    /// fallback > config file value > hardcoded default.
+    /// When neither `CELERY_BROKER_URL` nor `CELERS_BROKER_URL` is set, and
+    /// `broker.url` is still exactly [`DEFAULT_BROKER_URL`] (i.e. no config
+    /// file supplied one -- `BrokerConfig::url` has no `#[serde(default)]`,
+    /// so parsing *any* file that omits it fails outright, meaning this
+    /// field can only still hold the hardcoded default here if
+    /// [`Config::default_config`] was used because no file was found at
+    /// all), `broker.url` falls back to
+    /// [`crate::smart_defaults::detect_broker_from_env`], which additionally
+    /// recognizes the wider `REDIS_URL` / `AMQP_URL` hosting-provider
+    /// conventions. This keeps the overall precedence as CLI arg (applied by
+    /// the caller, not here) > explicit `CELERY_BROKER_URL` /
+    /// `CELERS_BROKER_URL` > an explicit `broker.url` from a config file >
+    /// `REDIS_URL` / `AMQP_URL` fallback > hardcoded default -- previously,
+    /// a generic `REDIS_URL` a PaaS platform injects automatically (Heroku,
+    /// Railway, Render, docker-compose, ...) silently overrode an explicit
+    /// `broker.url = "amqp://..."` from `celers.toml` with no warning (idx
+    /// 338). NOTE: this is a value-based heuristic, not true provenance
+    /// tracking -- a config file that explicitly sets `broker.url` to
+    /// exactly [`DEFAULT_BROKER_URL`] is indistinguishable here from "no
+    /// file was loaded at all", so it would still be overridden by
+    /// `REDIS_URL`/`AMQP_URL`. Precisely tracking "was this explicitly set"
+    /// would need `BrokerConfig::url` to become `Option<String>`, which
+    /// cascades into `config_layer::merge_overlay` and
+    /// `CliConfigArgs::apply_to` (outside this module) -- see the
+    /// crate-level followups.
     pub fn apply_env_overrides(&mut self) {
+        // Snapshot the file/default-provided `[pool]`/`[cache]` sections
+        // *before* the env layer below (if any) mutates them, so
+        // `PoolConfig`/`CacheConfig::from_env_or_default` (called from
+        // read-path command implementations with no `Config` in scope --
+        // see their doc comments) can fall back to the file's values
+        // instead of always falling back to a hardcoded type default (idx
+        // 337).
+        if let Ok(mut floor) = file_pool_cache_floor().write() {
+            *floor = Some((self.pool.clone(), self.cache.clone()));
+        }
+
         if let Some(url) = first_env(&["CELERY_BROKER_URL", "CELERS_BROKER_URL"]) {
             self.broker.url = url;
-        } else if let Some(url) = crate::smart_defaults::detect_broker_from_env() {
-            self.broker.url = url;
+        } else if self.broker.url == DEFAULT_BROKER_URL {
+            if let Some(url) = crate::smart_defaults::detect_broker_from_env() {
+                self.broker.url = url;
+            }
         }
         if let Some(queue) = first_env(&["CELERY_DEFAULT_QUEUE", "CELERS_QUEUE"]) {
             self.broker.queue = queue;
@@ -755,6 +885,18 @@ impl Config {
         }
         if let Some(profile) = first_env(&["CELERS_PROFILE"]) {
             self.profile = Some(profile);
+        }
+        if let Some(max_size) = first_env_parsed(&["CELERS_POOL_MAX_SIZE"]) {
+            self.pool.max_size = max_size;
+        }
+        if let Some(reuse_enabled) = first_env_parsed(&["CELERS_POOL_REUSE_ENABLED"]) {
+            self.pool.reuse_enabled = reuse_enabled;
+        }
+        if let Some(ttl_secs) = first_env_parsed(&["CELERS_CACHE_TTL_SECS"]) {
+            self.cache.ttl_secs = ttl_secs;
+        }
+        if let Some(enabled) = first_env_parsed(&["CELERS_CACHE_ENABLED"]) {
+            self.cache.enabled = enabled;
         }
     }
 
@@ -878,9 +1020,26 @@ fn first_env(keys: &[&str]) -> Option<String> {
 
 /// Return the parsed value of the first set, successfully-parsed environment
 /// variable from `keys`.
+///
+/// A variable that is set but fails to parse (e.g. `CELERS_CONCURRENCY=abc`)
+/// is skipped in favor of the next candidate exactly as an unset variable
+/// would be -- but unlike an unset variable, this logs a warning first (idx
+/// 337), since a malformed override silently reducing to "as if it were
+/// never set" is easy for an operator to miss entirely otherwise.
 fn first_env_parsed<T: std::str::FromStr>(keys: &[&str]) -> Option<T> {
-    keys.iter()
-        .find_map(|key| env::var(key).ok().and_then(|v| v.parse::<T>().ok()))
+    keys.iter().find_map(|key| {
+        let raw = env::var(key).ok()?;
+        match raw.parse::<T>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                warn!(
+                    "Environment variable {key}={raw:?} could not be parsed as the expected \
+                     type; ignoring it (falling back to the next source in the precedence chain)"
+                );
+                None
+            }
+        }
+    })
 }
 
 /// Record a single field change between two displayable values if they differ.
@@ -1126,6 +1285,67 @@ default_timeout_secs = 600
         assert_eq!(config.broker.broker_type, loaded_config.broker.broker_type);
         assert_eq!(config.broker.url, loaded_config.broker.url);
         assert_eq!(config.worker.concurrency, loaded_config.worker.concurrency);
+    }
+
+    /// Regression test for the `write_aliases_only` half of idx 338:
+    /// updating aliases must never overwrite any other on-disk section
+    /// (most importantly `broker.url`) with whatever an in-memory, possibly
+    /// env-resolved `Config` happens to hold.
+    #[test]
+    fn write_aliases_only_preserves_every_other_section_on_disk() {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path();
+
+        let mut on_disk = Config::default_config();
+        on_disk.broker.url = "amqp://explicit-from-file:5672".to_string();
+        on_disk.worker.concurrency = 42;
+        on_disk.to_file(temp_path).unwrap();
+
+        let mut aliases = crate::aliases::AliasConfig::new();
+        aliases
+            .add("w", "worker start", &["worker", "queue", "task"])
+            .expect("valid alias");
+
+        Config::write_aliases_only(temp_path, &aliases).expect("write_aliases_only");
+
+        let reloaded = Config::from_file(temp_path).expect("reload");
+        assert_eq!(
+            reloaded.broker.url, "amqp://explicit-from-file:5672",
+            "write_aliases_only must not clobber broker.url with anything from an in-memory, \
+             possibly env-resolved Config"
+        );
+        assert_eq!(reloaded.worker.concurrency, 42);
+        assert_eq!(reloaded.aliases, Some(aliases));
+    }
+
+    /// `write_aliases_only` against a path that does not exist yet must
+    /// still succeed, producing a sensible file (mirroring
+    /// `config_layer::resolve_config_path`'s "first default name" contract
+    /// for a mutating command run before `celers init`).
+    #[test]
+    fn write_aliases_only_creates_a_sensible_file_when_none_exists_yet() {
+        let path = std::env::temp_dir().join(format!(
+            "celers_cli_alias_only_test_{}_{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut aliases = crate::aliases::AliasConfig::new();
+        aliases
+            .add("w", "worker start", &["worker", "queue", "task"])
+            .expect("valid alias");
+
+        Config::write_aliases_only(&path, &aliases).expect("write_aliases_only on a missing file");
+
+        let reloaded = Config::from_file(&path).expect("reload");
+        assert_eq!(reloaded.aliases, Some(aliases));
+        assert_eq!(
+            reloaded.broker.broker_type, "redis",
+            "falls back to Config::default_config for every other section"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1475,6 +1695,23 @@ max_size = 4
         config.apply_env_overrides();
         assert_eq!(config.broker.url, "redis://from-celery-broker-url:6379");
 
+        // Regression test for idx 338: a `broker.url` that already differs
+        // from the hardcoded default (standing in for "a config file
+        // explicitly set this") must NOT be silently replaced by a generic
+        // REDIS_URL/AMQP_URL -- only CELERY_BROKER_URL/CELERS_BROKER_URL
+        // (an explicit, CeleRS-specific override) may still win.
+        env::remove_var("CELERY_BROKER_URL");
+        env::remove_var("CELERS_BROKER_URL");
+        env::set_var("REDIS_URL", "redis://from-redis-url-again:6379");
+        let mut config = Config::default_config();
+        config.broker.url = "amqp://explicit-from-file:5672".to_string();
+        config.apply_env_overrides();
+        assert_eq!(
+            config.broker.url, "amqp://explicit-from-file:5672",
+            "an explicit (non-default) broker.url must survive apply_env_overrides even when a \
+             generic REDIS_URL is set -- only CELERY_BROKER_URL/CELERS_BROKER_URL may override it"
+        );
+
         env::remove_var("CELERY_BROKER_URL");
         env::remove_var("CELERS_BROKER_URL");
         env::remove_var("REDIS_URL");
@@ -1512,6 +1749,35 @@ max_size = 4
 
         env::remove_var("CELERS_POOL_MAX_SIZE");
         env::remove_var("CELERS_POOL_REUSE_ENABLED");
+
+        // Regression test for idx 337: a `[pool]` section from a resolved
+        // configuration file must be honored by `from_env_or_default` when
+        // no environment variable overrides it -- previously, every
+        // consumer of `from_env_or_default` only ever saw env vars layered
+        // on top of the hardcoded type default, never a file's values.
+        let mut cfg = Config::default_config();
+        cfg.pool.max_size = 77;
+        cfg.pool.reuse_enabled = false;
+        cfg.apply_env_overrides();
+        assert_eq!(
+            PoolConfig::from_env_or_default().max_size,
+            77,
+            "a file-provided [pool] section must be honored, not just env vars / hardcoded defaults"
+        );
+        assert!(!PoolConfig::from_env_or_default().reuse_enabled);
+
+        // An explicit env var still wins over the file-provided floor.
+        env::set_var("CELERS_POOL_MAX_SIZE", "5");
+        assert_eq!(PoolConfig::from_env_or_default().max_size, 5);
+        env::remove_var("CELERS_POOL_MAX_SIZE");
+
+        // Restore the process-wide floor to the type defaults so any later
+        // test in this binary that assumes "no file loaded yet" continues
+        // to see PoolConfig::default() (only observable under the plain
+        // `cargo test` fallback runner's shared process; nextest, this
+        // crate's primary runner, isolates each test in its own process).
+        let mut restore = Config::default_config();
+        restore.apply_env_overrides();
     }
 
     #[test]
@@ -1538,6 +1804,28 @@ max_size = 4
 
         env::remove_var("CELERS_CACHE_TTL_SECS");
         env::remove_var("CELERS_CACHE_ENABLED");
+
+        // Regression test for idx 337: same as PoolConfig above, a `[cache]`
+        // section from a resolved configuration file must be honored.
+        let mut cfg = Config::default_config();
+        cfg.cache.ttl_secs = 111;
+        cfg.cache.enabled = false;
+        cfg.apply_env_overrides();
+        assert_eq!(
+            CacheConfig::from_env_or_default().ttl_secs,
+            111,
+            "a file-provided [cache] section must be honored, not just env vars / hardcoded defaults"
+        );
+        assert!(!CacheConfig::from_env_or_default().enabled);
+
+        env::set_var("CELERS_CACHE_TTL_SECS", "7");
+        assert_eq!(CacheConfig::from_env_or_default().ttl_secs, 7);
+        env::remove_var("CELERS_CACHE_TTL_SECS");
+
+        // Restore the process-wide floor to the type defaults; see the
+        // matching comment in test_pool_config_from_env_or_default.
+        let mut restore = Config::default_config();
+        restore.apply_env_overrides();
     }
 
     #[test]

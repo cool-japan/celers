@@ -110,9 +110,29 @@ impl CancellationToken {
             if self.is_cancelled() {
                 return;
             }
-            // Register interest *before* re-checking the flag to close the race
-            // where `cancel()` fires between the check and the await.
+            // Register interest *before* re-checking the flag to close the
+            // race where `cancel()` fires between the check and the await.
+            //
+            // `Notify::notified()` only *constructs* the `Notified` future;
+            // tokio does not add it to the notify's waiter list until the
+            // future is first polled. A plain `notified.await` here would
+            // therefore leave a real window on a multi-threaded runtime:
+            // another thread could run `cancel()` -- which does
+            // `swap(true)` then `notify_waiters()` -- entirely between the
+            // check below and the first poll of `notified`, and
+            // `notify_waiters()` only wakes *already-registered* waiters,
+            // so that cancellation would be silently lost and this task
+            // would park forever.
+            //
+            // Pinning the future and calling `enable()` forces the waiter
+            // registration to happen synchronously, right now, before the
+            // flag is re-checked -- closing the window: either `cancel()`
+            // already ran (and the check below observes it), or it runs
+            // after this point (and we are already registered to be woken
+            // by it).
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_cancelled() {
                 return;
             }
@@ -432,5 +452,43 @@ mod tests {
         token.cancel();
         token.cancel();
         assert!(token.is_cancelled());
+    }
+
+    /// Regression test for the lost-wakeup race: `Notify::notified()` only
+    /// *constructs* the future -- the waiter is not registered until the
+    /// future is first polled (or explicitly `enable()`d). Without pinning
+    /// and enabling before the flag re-check, a `cancel()` racing in on
+    /// another OS thread between the re-check and the first poll can be
+    /// missed entirely, leaving the waiter parked forever.
+    ///
+    /// This is only reachable under genuine thread-level parallelism (a
+    /// single-threaded/cooperative scheduler can never interleave between
+    /// two back-to-back synchronous statements), so the test runs on a
+    /// multi-thread runtime and races `cancel()` against a freshly spawned
+    /// waiter with no synchronizing delay, many times over, so that
+    /// natural OS scheduling jitter spreads across the tiny window. Each
+    /// iteration is bounded by a timeout used only as a hang detector (not
+    /// as a correctness signal): with the fix, every iteration must
+    /// resolve promptly and deterministically; the pre-fix lost-wakeup bug
+    /// would eventually strand at least one iteration and trip it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_cancelled_no_lost_wakeup_under_tight_race() {
+        for _ in 0..500 {
+            let token = CancellationToken::new(uuid::Uuid::new_v4());
+            let waiter = token.clone();
+            let handle = tokio::spawn(async move {
+                waiter.cancelled().await;
+            });
+
+            // No sleep: race `cancel()` against the freshly spawned waiter
+            // as tightly as possible instead of giving it time to park
+            // first (which is what the other, non-racing test above does).
+            token.cancel();
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .expect("lost wakeup: cancelled() never woke up after cancel()")
+                .expect("waiter task should not panic");
+        }
     }
 }

@@ -32,8 +32,28 @@
 //! ```
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
+
+/// Acquire a read guard, recovering it even if the lock is poisoned.
+///
+/// A poisoned circuit breaker is exactly the failure mode this type exists
+/// to protect callers from: a panic in *unrelated* code that happened to be
+/// holding the lock while, say, another thread was mid-`record_failure()`
+/// must not turn every subsequent `state()`/`record_*()` call into a
+/// cascading panic across every task that touches the breaker. Every write
+/// through this module is a plain, non-partial assignment (`*guard = ...`),
+/// so data recovered from a poisoned lock is always structurally valid —
+/// recovering it instead of panicking again is safe.
+fn read_recover<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Write-lock counterpart of [`read_recover`]; see its documentation.
+fn write_recover<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Circuit breaker state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,14 +202,14 @@ impl CircuitBreaker {
 
     /// Get the current state of the circuit breaker
     pub fn state(&self) -> CircuitState {
-        *self.state.read().expect("lock should not be poisoned")
+        *read_recover(&self.state)
     }
 
     /// Check if recovery timeout has passed (for Open -> HalfOpen transition)
     fn should_transition_to_half_open(&self) -> bool {
-        let state = *self.state.read().expect("lock should not be poisoned");
+        let state = *read_recover(&self.state);
         if state == CircuitState::Open {
-            if let Some(opened_at) = *self.opened_at.read().expect("lock should not be poisoned") {
+            if let Some(opened_at) = *read_recover(&self.opened_at) {
                 return opened_at.elapsed() >= self.config.recovery_timeout;
             }
         }
@@ -208,11 +228,7 @@ impl CircuitBreaker {
         match current_state {
             CircuitState::Closed => {
                 // Check if failure count should be reset
-                if let Some(last_failure) = *self
-                    .last_failure_time
-                    .read()
-                    .expect("lock should not be poisoned")
-                {
+                if let Some(last_failure) = *read_recover(&self.last_failure_time) {
                     if last_failure.elapsed() >= self.config.failure_reset_timeout {
                         self.consecutive_failures.store(0, Ordering::SeqCst);
                     }
@@ -263,10 +279,7 @@ impl CircuitBreaker {
     /// Record a failed operation
     pub fn record_failure(&self) {
         self.total_failures.fetch_add(1, Ordering::SeqCst);
-        *self
-            .last_failure_time
-            .write()
-            .expect("lock should not be poisoned") = Some(Instant::now());
+        *write_recover(&self.last_failure_time) = Some(Instant::now());
 
         let current_state = self.state();
 
@@ -299,15 +312,12 @@ impl CircuitBreaker {
 
     /// Reset the circuit breaker to initial state
     pub fn reset(&self) {
-        *self.state.write().expect("lock should not be poisoned") = CircuitState::Closed;
+        *write_recover(&self.state) = CircuitState::Closed;
         self.consecutive_failures.store(0, Ordering::SeqCst);
         self.consecutive_successes.store(0, Ordering::SeqCst);
         self.half_open_requests.store(0, Ordering::SeqCst);
-        *self
-            .last_failure_time
-            .write()
-            .expect("lock should not be poisoned") = None;
-        *self.opened_at.write().expect("lock should not be poisoned") = None;
+        *write_recover(&self.last_failure_time) = None;
+        *write_recover(&self.opened_at) = None;
     }
 
     /// Get statistics about the circuit breaker
@@ -335,7 +345,7 @@ impl CircuitBreaker {
             return None;
         }
 
-        if let Some(opened_at) = *self.opened_at.read().expect("lock should not be poisoned") {
+        if let Some(opened_at) = *read_recover(&self.opened_at) {
             let elapsed = opened_at.elapsed();
             if elapsed < self.config.recovery_timeout {
                 return Some(self.config.recovery_timeout - elapsed);
@@ -347,10 +357,10 @@ impl CircuitBreaker {
     }
 
     fn transition_to_open(&self) {
-        let mut state = self.state.write().expect("lock should not be poisoned");
+        let mut state = write_recover(&self.state);
 
         // Always update opened_at when transitioning to Open
-        *self.opened_at.write().expect("lock should not be poisoned") = Some(Instant::now());
+        *write_recover(&self.opened_at) = Some(Instant::now());
 
         if *state != CircuitState::Open {
             *state = CircuitState::Open;
@@ -362,7 +372,7 @@ impl CircuitBreaker {
     }
 
     fn transition_to_half_open(&self) {
-        let mut state = self.state.write().expect("lock should not be poisoned");
+        let mut state = write_recover(&self.state);
         if *state == CircuitState::Open {
             *state = CircuitState::HalfOpen;
             self.consecutive_successes.store(0, Ordering::SeqCst);
@@ -371,14 +381,14 @@ impl CircuitBreaker {
     }
 
     fn transition_to_closed(&self) {
-        let mut state = self.state.write().expect("lock should not be poisoned");
+        let mut state = write_recover(&self.state);
         if *state != CircuitState::Closed {
             *state = CircuitState::Closed;
             self.times_closed.fetch_add(1, Ordering::SeqCst);
             self.consecutive_failures.store(0, Ordering::SeqCst);
             self.consecutive_successes.store(0, Ordering::SeqCst);
             self.half_open_requests.store(0, Ordering::SeqCst);
-            *self.opened_at.write().expect("lock should not be poisoned") = None;
+            *write_recover(&self.opened_at) = None;
         }
     }
 }
@@ -426,6 +436,38 @@ mod tests {
     fn test_initial_state_is_closed() {
         let breaker = CircuitBreaker::with_defaults();
         assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_survives_poisoned_state_lock() {
+        // A `RwLock` is poisoned whenever a panic unwinds through code
+        // holding a guard on it -- including within the *same* thread, which
+        // is what `catch_unwind` lets us exercise deterministically here
+        // (no extra thread, no timing sensitivity).
+        let breaker = CircuitBreaker::with_defaults();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = breaker.state.write().unwrap();
+            panic!("simulated panic while holding the circuit breaker's state lock");
+        }));
+        assert!(poisoned.is_err(), "the simulated panic should propagate");
+
+        // Before the fix, `.expect("lock should not be poisoned")` would
+        // turn every one of these calls into a second panic. They must
+        // instead recover the (structurally valid -- writes here are plain
+        // assignments) guard and keep the breaker fully functional.
+        assert_eq!(breaker.state(), CircuitState::Closed);
+
+        breaker.record_failure();
+        assert_eq!(breaker.stats().total_failures, 1);
+
+        breaker.force_open();
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert!(!breaker.allow_request());
+
+        breaker.reset();
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert_eq!(breaker.stats().consecutive_failures, 0);
     }
 
     #[test]

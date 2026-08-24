@@ -63,6 +63,7 @@ mod config;
 mod config_layer;
 mod errors;
 mod interactive;
+mod keys;
 mod logging;
 mod pool;
 mod row_ext;
