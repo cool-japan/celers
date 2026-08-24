@@ -11,7 +11,7 @@
 //!
 //! A client with nothing implementing the service on the other end is not useful on its
 //! own, so [`server::RpcBackendServer`] exists specifically so `GrpcResultBackend::connect(...)`
-//! has something to talk to without every user having to hand-roll the seven RPCs (including
+//! has something to talk to without every user having to hand-roll the eight RPCs (including
 //! the chord-completion counter's atomicity) themselves.
 //!
 //! # Features
@@ -56,6 +56,7 @@ pub mod result_store;
 pub mod server;
 
 mod codec;
+mod task_meta_extra;
 
 pub use config::GrpcConfig;
 pub use metrics::{OperationStats, RpcMetrics, RpcMetricsSnapshot, RpcOperation};
@@ -78,8 +79,8 @@ pub mod proto {
 
 use proto::{
     result_backend_service_client::ResultBackendServiceClient, ChordCompleteTaskRequest,
-    ChordGetStateRequest, ChordInitRequest, DeleteResultRequest, GetResultRequest,
-    SetExpirationRequest, StoreResultRequest,
+    ChordGetStateRequest, ChordInitRequest, ChordUpdateStateRequest, DeleteResultRequest,
+    GetResultRequest, SetExpirationRequest, StoreResultRequest,
 };
 
 /// gRPC result backend client
@@ -168,7 +169,7 @@ impl GrpcResultBackend {
     /// per-call deadline (as a `grpc-timeout` header, so the server can
     /// honor it too) and, if configured, a bearer-token `authorization`
     /// header. Used by every RPC method below so hardening lives in one
-    /// place instead of being copy-pasted seven times.
+    /// place instead of being copy-pasted eight times.
     fn prepare_request<T>(&self, message: T) -> Result<tonic::Request<T>> {
         let mut request = tonic::Request::new(message);
         request.set_timeout(self.config.request_timeout);
@@ -386,6 +387,60 @@ impl ResultBackend for GrpcResultBackend {
         let elapsed = start.elapsed();
         self.metrics
             .record(RpcOperation::ChordInit, elapsed, result.is_err());
+
+        result.map(|_| ())
+    }
+
+    /// Persist a mutated chord state (cancellation, callback change,
+    /// timeout update, ...) **without** resetting the completion counter.
+    ///
+    /// Overriding this is what makes the trait's default
+    /// [`ResultBackend::chord_cancel`] correct over gRPC: without it, that
+    /// default falls through to [`Self::chord_init`] — a create-or-reset
+    /// primitive — and cancelling a chord would silently wipe out every
+    /// task that had already completed.
+    ///
+    /// # Version skew
+    ///
+    /// `ChordUpdateState` is a new RPC: a client built with this method
+    /// against an older [`server::RpcBackendServer`] that predates it gets
+    /// back gRPC `Unimplemented`, which [`is_retryable_code`] correctly
+    /// does not retry, so [`ResultBackend::chord_cancel`] (and any other
+    /// caller of this method) fails outright during a rolling deploy where
+    /// servers lag clients. That is a loud failure, and strictly better
+    /// than the silent completion-counter reset it replaces — but roll out
+    /// servers before clients to avoid hitting it.
+    async fn chord_update_state(&mut self, state: ChordState) -> Result<()> {
+        let message = ChordUpdateStateRequest {
+            state: Some(codec::to_proto_chord(&state)),
+        };
+
+        let start = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let result = loop {
+            let request = self.prepare_request(message.clone())?;
+            match self.client.chord_update_state(request).await {
+                Ok(resp) => break Ok(resp),
+                Err(status) => {
+                    attempt += 1;
+                    match decide_retry(&self.config.retry, attempt, &status) {
+                        RetryDecision::GiveUp(err) => break Err(err),
+                        RetryDecision::Retry(backoff) => {
+                            wait_before_retry(
+                                "chord_update_state",
+                                attempt,
+                                backoff,
+                                status.code(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        };
+        let elapsed = start.elapsed();
+        self.metrics
+            .record(RpcOperation::ChordUpdateState, elapsed, result.is_err());
 
         result.map(|_| ())
     }

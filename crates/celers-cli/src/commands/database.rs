@@ -800,7 +800,9 @@ pub async fn run_dashboard(broker_url: &str, queue: &str, refresh_secs: u64) -> 
     // Hoisted out of the loop: a fresh client/connection every refresh tick
     // churned TCP connections for the lifetime of the dashboard.
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     loop {
         // Clear screen

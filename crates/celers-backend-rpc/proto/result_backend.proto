@@ -19,6 +19,12 @@ service ResultBackendService {
   // Initialize chord state
   rpc ChordInit(ChordInitRequest) returns (ChordInitResponse);
 
+  // Persist a mutated chord state (cancellation, callback change, timeout
+  // update, ...) WITHOUT resetting the completion counter. Unlike
+  // ChordInit, which is a create-or-reset primitive, this must be used for
+  // any update that should preserve tasks that already completed.
+  rpc ChordUpdateState(ChordUpdateStateRequest) returns (ChordUpdateStateResponse);
+
   // Complete chord task (increment counter)
   rpc ChordCompleteTask(ChordCompleteTaskRequest) returns (ChordCompleteTaskResponse);
 
@@ -57,6 +63,14 @@ message TaskMeta {
   uint32 created_at_nanos = 11;
   uint32 started_at_nanos = 12;
   uint32 completed_at_nanos = 13;
+  // JSON-encoded tail carrying the extended TaskMeta fields that have no
+  // dedicated proto field of their own: progress, version, tags, metadata,
+  // worker_hostname, runtime_ms, memory_bytes, retries, queue. Kept as one
+  // opaque blob (mirroring celers-backend-db's `extra` column) so future
+  // extended fields don't each need a new proto field and a version bump
+  // here. Optional so messages from writers that predate this field still
+  // decode to an all-default extended-fields set instead of failing.
+  optional string extra_json = 14;
 }
 
 // Chord state
@@ -72,6 +86,20 @@ message ChordState {
   optional string cancellation_reason = 9;
   // Nanosecond component of `created_at` (see TaskMeta.created_at_nanos).
   uint32 created_at_nanos = 10;
+  // Bare, name-only successor task to enqueue once the chord's callback
+  // task completes. See `ChordState::callback_on_success_link` in
+  // celers-backend-redis for the full semantics. Added after the original
+  // fields so older writers that never set it still decode correctly (as
+  // "no successor").
+  optional string callback_on_success_link = 11;
+  // Number of retry attempts already made. Added after the original
+  // fields; always 0 on messages from writers that predate it.
+  uint32 retry_count = 12;
+  // Maximum retry attempts allowed, if any. Added after the original
+  // fields; absent (rather than defaulting to 0) on messages from writers
+  // that predate it, matching "no retry limit configured" rather than
+  // "zero retries allowed".
+  optional uint32 max_retries = 13;
 }
 
 // Store result request/response
@@ -118,6 +146,15 @@ message ChordInitRequest {
 }
 
 message ChordInitResponse {
+  bool success = 1;
+}
+
+// Chord update state request/response
+message ChordUpdateStateRequest {
+  ChordState state = 1;
+}
+
+message ChordUpdateStateResponse {
   bool success = 1;
 }
 

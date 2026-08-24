@@ -53,6 +53,27 @@ impl Drop for ActiveTaskGuard {
     }
 }
 
+/// Longest task payload preview retained per in-flight task for
+/// `inspect active`.
+///
+/// A payload can be megabytes; the registry exists to answer "what is this
+/// worker doing right now", not to mirror the queue in RAM.
+const ARGS_PREVIEW_LIMIT: usize = 512;
+
+/// What the registry remembers about one dispatched message.
+#[derive(Clone)]
+pub(crate) struct InFlightEntry {
+    /// Broker receipt handle needed to ack/reject the delivery.
+    pub(crate) receipt_handle: Option<String>,
+    /// Task name, for `inspect active`.
+    pub(crate) name: String,
+    /// When the worker dispatched it (Unix timestamp, fractional seconds).
+    pub(crate) started: f64,
+    /// Bounded preview of the serialized payload, captured only when the
+    /// registry was built with [`InFlightRegistry::with_args_capture`].
+    pub(crate) args_preview: Option<String>,
+}
+
 /// The messages a worker has dispatched but not yet disposed of (acked,
 /// rejected or re-enqueued).
 ///
@@ -60,60 +81,123 @@ impl Drop for ActiveTaskGuard {
 /// broker-side disposition of that message. This makes the shutdown-deadline
 /// requeue and a task finishing at the same instant mutually exclusive instead
 /// of racing into a "requeued and acked" double delivery.
+///
+/// It is also the worker's source of truth for `inspect active`: the counters
+/// in [`WorkerStats`] know *how many* tasks are running, only this map knows
+/// *which*.
 #[derive(Clone, Default)]
 pub(crate) struct InFlightRegistry {
-    inner: Arc<Mutex<HashMap<TaskId, Option<String>>>>,
+    inner: Arc<Mutex<HashMap<TaskId, InFlightEntry>>>,
+    /// Whether to retain a payload preview per task. Off unless the remote
+    /// control protocol is wired up, so an ordinary worker pays nothing.
+    capture_args: bool,
 }
 
 impl InFlightRegistry {
-    /// Create an empty registry.
+    /// Create an empty registry that does not retain payload previews.
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Record a dispatched message and its receipt handle.
-    pub(crate) fn register(&self, task_id: TaskId, receipt_handle: Option<String>) {
-        match self.inner.lock() {
-            Ok(mut guard) => {
-                guard.insert(task_id, receipt_handle);
-            }
-            Err(poisoned) => {
-                // A poisoned lock only means some other thread panicked while
-                // holding it; the map itself is still consistent.
-                poisoned.into_inner().insert(task_id, receipt_handle);
-            }
+    /// Create an empty registry that retains a bounded payload preview per
+    /// task, so `inspect active` can report task arguments.
+    pub(crate) fn with_args_capture() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            capture_args: true,
         }
+    }
+
+    /// Lock the map, recovering from a poisoned lock.
+    ///
+    /// A poisoned lock only means some other thread panicked while holding it;
+    /// the map itself is still consistent, and refusing to serve it would
+    /// strand every in-flight message.
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<TaskId, InFlightEntry>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a dispatched message, its receipt handle and its identity.
+    pub(crate) fn register(
+        &self,
+        task_id: TaskId,
+        receipt_handle: Option<String>,
+        task: &celers_core::SerializedTask,
+    ) {
+        let entry = InFlightEntry {
+            receipt_handle,
+            name: task.metadata.name.clone(),
+            started: unix_now(),
+            args_preview: if self.capture_args {
+                Some(args_preview(&task.payload))
+            } else {
+                None
+            },
+        };
+        self.entries().insert(task_id, entry);
     }
 
     /// Claim the right to dispose of `task_id`.
     ///
     /// Returns `true` exactly once per registered message.
     pub(crate) fn claim(&self, task_id: &TaskId) -> bool {
-        match self.inner.lock() {
-            Ok(mut guard) => guard.remove(task_id).is_some(),
-            Err(poisoned) => poisoned.into_inner().remove(task_id).is_some(),
-        }
+        self.entries().remove(task_id).is_some()
     }
 
     /// Take every still-undisposed message, leaving the registry empty.
     pub(crate) fn take_all(&self) -> Vec<(TaskId, Option<String>)> {
-        match self.inner.lock() {
-            Ok(mut guard) => guard.drain().collect(),
-            Err(poisoned) => poisoned.into_inner().drain().collect(),
-        }
+        self.entries()
+            .drain()
+            .map(|(task_id, entry)| (task_id, entry.receipt_handle))
+            .collect()
+    }
+
+    /// Snapshot of every currently dispatched message.
+    pub(crate) fn snapshot(&self) -> Vec<(TaskId, InFlightEntry)> {
+        self.entries()
+            .iter()
+            .map(|(task_id, entry)| (*task_id, entry.clone()))
+            .collect()
     }
 
     /// Number of messages still awaiting disposition.
     pub(crate) fn len(&self) -> usize {
-        match self.inner.lock() {
-            Ok(guard) => guard.len(),
-            Err(poisoned) => poisoned.into_inner().len(),
-        }
+        self.entries().len()
     }
 
     /// Whether every dispatched message has been disposed of.
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Current wall-clock time as fractional seconds since the Unix epoch.
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// A bounded, always-valid-UTF-8 rendering of a task payload.
+///
+/// `CeleRS` payloads are JSON produced by `serde_json`, so the common case
+/// renders verbatim; a binary payload (msgpack, a compressed body) is reported
+/// by size rather than mangled into replacement characters.
+fn args_preview(payload: &[u8]) -> String {
+    match std::str::from_utf8(payload) {
+        Ok(text) if text.len() <= ARGS_PREVIEW_LIMIT => text.to_string(),
+        Ok(text) => {
+            // Truncate on a character boundary, never mid-code-point.
+            let mut end = ARGS_PREVIEW_LIMIT;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}… ({} bytes)", &text[..end], payload.len())
+        }
+        Err(_) => format!("<binary payload, {} bytes>", payload.len()),
     }
 }
 

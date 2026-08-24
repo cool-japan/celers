@@ -1,3 +1,4 @@
+use crate::revocation_channel::RevocationStream;
 use crate::{CelersError, Result, SerializedTask, TaskId};
 
 /// Message envelope for broker operations
@@ -115,6 +116,69 @@ pub trait Broker: Send + Sync {
 
     /// Cancel a pending task
     async fn cancel(&self, task_id: &TaskId) -> Result<bool>;
+
+    // Revocation (optional, with default implementations)
+
+    /// Revoke a task, saying whether a worker already running it should abort.
+    ///
+    /// This is [`cancel`](Self::cancel) plus Celery's `terminate` flag. A
+    /// broker that keeps a durable revoked-id set records the revocation there
+    /// and publishes a
+    /// [`RevocationNotice`](crate::revocation_channel::RevocationNotice)
+    /// carrying `terminate`, so a worker
+    /// subscribed through [`subscribe_revocations`](Self::subscribe_revocations)
+    /// can trip the running task's cancellation token.
+    ///
+    /// The default implementation forwards to [`cancel`](Self::cancel), which
+    /// drops `terminate`: a broker with no revocation channel cannot reach a
+    /// worker that is already executing the task, and pretending otherwise
+    /// would be worse than saying nothing.
+    ///
+    /// Returns whether the broker found a pending copy of the task. `false`
+    /// does **not** mean the revocation was lost — a broker with a persisted
+    /// revoked set still records it, which is what
+    /// [`is_revoked`](Self::is_revoked) reports afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns a broker error if the revocation cannot be recorded.
+    async fn revoke(&self, task_id: &TaskId, terminate: bool) -> Result<bool> {
+        // Deliberately ignored: see the doc comment above.
+        let _ = terminate;
+        self.cancel(task_id).await
+    }
+
+    /// Whether `task_id` is listed in the broker's persisted revoked-id set.
+    ///
+    /// A worker consults this before executing a message it has just dequeued,
+    /// which is what makes revoking a *queued* task work even for a worker that
+    /// was not running when the revocation was published.
+    ///
+    /// The default implementation returns `false` with no I/O: a broker that
+    /// keeps no revoked set has nothing to report, and answering `true`
+    /// speculatively would drop live tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns a broker error if the set cannot be read. Callers should treat
+    /// an error as "not known to be revoked" and log it rather than dropping
+    /// the task.
+    async fn is_revoked(&self, _task_id: &TaskId) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Subscribe to this broker's revocation channel, if it has one.
+    ///
+    /// `Ok(None)` — the default — means the broker publishes no revocations, so
+    /// there is nothing to subscribe to; a worker reports that once rather than
+    /// polling a channel that will never carry anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns a broker error if the subscription cannot be established.
+    async fn subscribe_revocations(&self) -> Result<Option<Box<dyn RevocationStream>>> {
+        Ok(None)
+    }
 
     // Batch Operations (optional, with default implementations)
 

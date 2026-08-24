@@ -786,7 +786,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let dlq_key = crate::keys::dlq(&queue_name);
@@ -847,7 +847,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let to_key = crate::keys::main(&to_queue);

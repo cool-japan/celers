@@ -39,6 +39,7 @@
 //! ```
 
 mod config_cmds;
+pub mod control;
 mod database;
 pub mod depgraph;
 mod dlq;
@@ -60,6 +61,9 @@ pub mod wizard;
 mod worker;
 
 // Re-export all public functions to preserve the flat API
+
+// Remote worker control and inspection (control protocol over Redis Pub/Sub)
+pub use control::{ping_workers, revoke_tasks, run_control, run_inspect, ControlOptions};
 
 // Worker management
 pub use worker::{
@@ -217,17 +221,30 @@ mod tests {
         assert_eq!(pause_key, "celers:worker:worker-123:paused");
     }
 
+    /// Regression test for idx 312: this test used to assert that a queue's
+    /// Redis keys carry a `celers:` prefix (`format!("celers:{queue}")` and
+    /// friends) -- the exact key-namespace bug `crate::keys` exists to
+    /// eliminate, since a real `RedisBroker` queue-family key carries no
+    /// shared prefix at all (see `crate::keys`'s module docs). Left
+    /// unnoticed, this test actively enshrined the wrong scheme as
+    /// "correct" even after every real call site was fixed to use
+    /// `crate::keys`. It must assert against `crate::keys`'s constructors
+    /// (mirroring `crate::keys::tests::queue_family_keys_match_redis_broker_scheme`)
+    /// instead of a hand-rolled, `celers:`-prefixed format string.
     #[test]
     fn test_queue_key_formatting() {
         let queue = "test-queue";
-        let queue_key = format!("celers:{}", queue);
-        assert_eq!(queue_key, "celers:test-queue");
+        let queue_key = crate::keys::main(queue);
+        assert_eq!(queue_key, "test-queue");
 
-        let dlq_key = format!("{}:dlq", queue_key);
-        assert_eq!(dlq_key, "celers:test-queue:dlq");
+        let dlq_key = crate::keys::dlq(queue);
+        assert_eq!(dlq_key, "test-queue:dlq");
 
-        let delayed_key = format!("{}:delayed", queue_key);
-        assert_eq!(delayed_key, "celers:test-queue:delayed");
+        let delayed_key = crate::keys::delayed(queue);
+        assert_eq!(delayed_key, "test-queue:delayed");
+
+        let processing_key = crate::keys::processing(queue);
+        assert_eq!(processing_key, "test-queue:processing");
     }
 
     #[test]

@@ -114,6 +114,7 @@ pub mod caching_backend;
 pub mod circuit_breaker_registry;
 pub mod config;
 pub mod control;
+pub mod control_transport;
 pub mod dag;
 pub mod error;
 pub mod event;
@@ -132,6 +133,7 @@ pub mod result_tombstone;
 pub mod result_ttl;
 pub mod retry;
 pub mod revocation;
+pub mod revocation_channel;
 pub mod router;
 pub mod sanitize;
 pub mod state;
@@ -158,6 +160,11 @@ pub use control::{
     ActiveTaskInfo, BrokerStats, ControlCommand, ControlResponse, DeliveryInfo, InspectCommand,
     InspectResponse, PoolStats, QueueCommand, QueueResponse, QueueStats, RequestInfo,
     ReservedTaskInfo, ScheduledTaskInfo, WorkerConf, WorkerReport, WorkerStats,
+};
+pub use control_transport::{
+    reply_channel, ControlClient, ControlCommandStream, ControlEnvelope, ControlReply,
+    ControlReplyStream, ControlTransport, InMemoryControlTransport, DEFAULT_CONTROL_CHANNEL,
+    DEFAULT_GATHER_TIMEOUT, DEFAULT_REPLY_CHANNEL_PREFIX,
 };
 pub use dag::{DagNode, TaskDag};
 pub use error::{CelersError, Result};
@@ -209,6 +216,7 @@ pub use revocation::{
     PatternRevocation, RevocationManager, RevocationMode, RevocationRequest, RevocationResult,
     RevocationState, WorkerRevocationManager,
 };
+pub use revocation_channel::{RevocationNotice, RevocationStream};
 pub use router::{
     ArgumentCondition, GlobPattern, PatternMatcher, RegexPattern, RouteResult, RouteRule, Router,
     RouterBuilder, RoutingConfig,

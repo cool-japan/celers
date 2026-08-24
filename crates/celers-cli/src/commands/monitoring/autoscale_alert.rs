@@ -253,7 +253,9 @@ pub async fn autoscale_start(
     // additionally replaces a blocking `KEYS celers:worker:*:heartbeat`
     // (O(N) over the whole keyspace) with cursor-based `SCAN`.
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(config.check_interval_secs)).await;
@@ -322,7 +324,9 @@ pub async fn autoscale_status(
         println!();
 
         let client = redis::Client::open(broker_url)?;
-        let mut conn = client.get_multiplexed_async_connection().await?;
+        let mut conn = client
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+            .await?;
         let worker_keys = scan_worker_heartbeat_keys(&mut conn).await?;
 
         println!("Current State:");

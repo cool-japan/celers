@@ -243,6 +243,76 @@ fn is_dead_pooled_connection(e: &redis::RedisError) -> bool {
     e.is_connection_dropped() || e.is_io_error() || e.is_timeout() || e.is_connection_refusal()
 }
 
+/// Default response timeout applied to every async Redis connection this CLI
+/// opens, overridable via `CELERS_REDIS_RESPONSE_TIMEOUT_SECS`.
+const DEFAULT_REDIS_RESPONSE_TIMEOUT_SECS: u64 = 30;
+
+/// Default connection (dial) timeout applied to every async Redis connection
+/// this CLI opens, overridable via `CELERS_REDIS_CONNECTION_TIMEOUT_SECS`.
+const DEFAULT_REDIS_CONNECTION_TIMEOUT_SECS: u64 = 10;
+
+/// The [`redis::AsyncConnectionConfig`] every async Redis connection this CLI
+/// opens (pooled, via [`connect_and_cache`]/[`pooled_redis_connection`], or
+/// direct, via `redis::Client::get_multiplexed_async_connection_with_config`
+/// at the many one-shot call sites throughout `commands::*`) must be built
+/// with.
+///
+/// The `redis` crate's own default (`AsyncConnectionConfig::default()`, used
+/// by the bare, config-less `get_multiplexed_async_connection()`) is a
+/// **500ms response timeout and a 1s connection timeout** -- tuned for a
+/// healthy, idle server, not for an operator CLI that may run alongside
+/// other CPU/IO-heavy work on the same host. Under load elsewhere (e.g. a
+/// concurrent full-workspace test run hammering the same broker), even a
+/// trivial command like `LPUSH` can legitimately take longer than 500ms to
+/// round-trip; the client reports that as a hard connection failure ("timed
+/// out") rather than a slow-but-alive server. This crate issues only plain
+/// request/response commands -- no `BRPOP`/`BLPOP`/`BRPOPLPUSH`/blocking
+/// `XREAD` anywhere in `commands::*` -- so there is no blocking-command
+/// lower bound to respect here; a generous, uniform timeout is strictly an
+/// improvement over the upstream default.
+///
+/// `response_timeout` bounds a single command's round trip, not a
+/// connection's total lifetime, so this same generous value is safe for the
+/// long-lived polling loops in `commands::monitoring::autoscale_alert` too.
+#[must_use]
+pub(crate) fn async_connection_config() -> redis::AsyncConnectionConfig {
+    let response_timeout = first_env_secs(
+        "CELERS_REDIS_RESPONSE_TIMEOUT_SECS",
+        DEFAULT_REDIS_RESPONSE_TIMEOUT_SECS,
+    );
+    let connection_timeout = first_env_secs(
+        "CELERS_REDIS_CONNECTION_TIMEOUT_SECS",
+        DEFAULT_REDIS_CONNECTION_TIMEOUT_SECS,
+    );
+    redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(std::time::Duration::from_secs(response_timeout)))
+        .set_connection_timeout(Some(std::time::Duration::from_secs(connection_timeout)))
+}
+
+/// Read `key` from the environment as a `u64` second count, falling back to
+/// `default` when unset, empty, or unparsable. Mirrors the override pattern
+/// `PoolConfig`/`CacheConfig::from_env_or_default` already use for their own
+/// environment overrides, kept local to this module rather than reusing
+/// `config`'s private `first_env_parsed` (no need to widen that helper's
+/// visibility for a single extra caller).
+///
+/// Floored to `1`: a `0`-second timeout is not "no timeout" (that is
+/// `set_response_timeout(None)`/`set_connection_timeout(None)`, which this
+/// module never uses) but a request that fails *every* command instantly --
+/// the opposite of what someone setting `CELERS_REDIS_RESPONSE_TIMEOUT_SECS=0`
+/// almost certainly intends, and exactly the footgun this whole helper
+/// exists to move this crate away from. Mirrors the same floor
+/// `TtlCache::with_capacity_and_clock`'s `max_entries.max(1)` and
+/// `ClientPool::new`'s `MIN_POOL_SIZE` apply to their own degenerate-zero
+/// case.
+fn first_env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
 /// Connect (or reconnect) `broker_url` and cache the result in `pool`.
 async fn connect_and_cache(
     pool: &ClientPool<redis::aio::MultiplexedConnection>,
@@ -250,7 +320,9 @@ async fn connect_and_cache(
 ) -> anyhow::Result<redis::aio::MultiplexedConnection> {
     pool.get_or_connect(broker_url, || async {
         let client = redis::Client::open(broker_url)?;
-        client.get_multiplexed_async_connection().await
+        client
+            .get_multiplexed_async_connection_with_config(&async_connection_config())
+            .await
     })
     .await
     .map_err(anyhow::Error::from)
@@ -259,13 +331,16 @@ async fn connect_and_cache(
 /// Obtain a pooled multiplexed connection for `broker_url`, connecting (and
 /// caching the result) on a miss.
 ///
-/// This is the pooled replacement for the
-/// `redis::Client::open(url)?.get_multiplexed_async_connection().await?`
-/// pattern used throughout `commands::queue`/`commands::worker`/
-/// `commands::task`. When [`crate::config::PoolConfig::reuse_enabled`] is
-/// `false`, the shared pool's cached entry for `broker_url` (if any) is
-/// dropped first so every call reconnects, matching the "pooling disabled"
-/// contract.
+/// This is the pooled replacement for the direct-connect pattern (open a
+/// `redis::Client`, then `get_multiplexed_async_connection_with_config(&
+/// async_connection_config())`) most one-shot read paths throughout
+/// `commands::*` use instead -- callers that issue many independent lookups
+/// against the same broker within one process (`commands::queue`/
+/// `commands::worker`'s read paths) use this pooled path so they reuse one
+/// connection rather than negotiating a fresh one per lookup. When
+/// [`crate::config::PoolConfig::reuse_enabled`] is `false`, the shared
+/// pool's cached entry for `broker_url` (if any) is dropped first so every
+/// call reconnects, matching the "pooling disabled" contract.
 ///
 /// A *reused* (pool-hit) handle is additionally validated with a cheap
 /// `PING` before being handed back: in a long-lived process (`celers
@@ -570,5 +645,118 @@ mod tests {
         let line = format_cache_entry_line("queue list cache:", 5);
         assert!(line.contains("queue list cache:"));
         assert!(line.contains("5 entries"));
+    }
+
+    /// Serializes tests in this module that mutate the process-wide
+    /// `CELERS_REDIS_*_TIMEOUT_SECS` environment variables, mirroring the
+    /// pattern used by `config_layer::tests::env_guard` (see
+    /// `smart_defaults::tests::env_guard`'s docs for why each module keeps
+    /// its own lock rather than sharing one).
+    fn timeout_env_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn clear_timeout_env() {
+        std::env::remove_var("CELERS_REDIS_RESPONSE_TIMEOUT_SECS");
+        std::env::remove_var("CELERS_REDIS_CONNECTION_TIMEOUT_SECS");
+    }
+
+    /// `redis::AsyncConnectionConfig`'s `response_timeout`/`connection_timeout`
+    /// fields are `pub(crate)` to the `redis` crate (builder-only from the
+    /// outside, see `AsyncConnectionConfig::set_response_timeout`/
+    /// `set_connection_timeout` -- no getters), so this module's own default
+    /// constants are asserted directly against the documented `redis`-crate
+    /// default (500ms/1s) instead of introspecting the built config; the
+    /// live-connection test below then proves `async_connection_config`'s
+    /// output is actually accepted and used by a real connection.
+    #[test]
+    fn timeout_defaults_are_more_generous_than_the_redis_crate_default() {
+        // The `redis` crate's own undocumented default
+        // (`AsyncConnectionConfig::default()`, used by the bare, config-less
+        // `get_multiplexed_async_connection()`) is 500ms response / 1s
+        // connection timeout -- both of this crate's defaults must be
+        // strictly more generous.
+        assert!(
+            std::time::Duration::from_secs(DEFAULT_REDIS_RESPONSE_TIMEOUT_SECS)
+                > std::time::Duration::from_millis(500)
+        );
+        assert!(
+            std::time::Duration::from_secs(DEFAULT_REDIS_CONNECTION_TIMEOUT_SECS)
+                > std::time::Duration::from_secs(1)
+        );
+    }
+
+    /// Regression test for the redis-timeout root cause: a connection opened
+    /// via [`async_connection_config`] must actually work end-to-end against
+    /// a live broker (not just construct without panicking), proving the
+    /// config `async_connection_config` builds -- whether from defaults or
+    /// from an environment override -- is one `redis` itself accepts and
+    /// honors, not just a value this module happens to compute.
+    #[tokio::test]
+    async fn async_connection_config_produces_a_working_connection() {
+        // The env-var mutation + `async_connection_config()` read is the
+        // only part that needs serializing against other tests in this
+        // module; `config` is a concrete, already-resolved value by the
+        // time the guard scope ends, so the connect/PING below (the actual
+        // `await` points) run with no lock held -- avoids
+        // `clippy::await_holding_lock` and, more importantly, avoids
+        // blocking every other test in this file for the duration of a
+        // live network round trip.
+        let config = {
+            let _guard = timeout_env_guard();
+            clear_timeout_env();
+            std::env::set_var("CELERS_REDIS_RESPONSE_TIMEOUT_SECS", "7");
+            std::env::set_var("CELERS_REDIS_CONNECTION_TIMEOUT_SECS", "3");
+            let config = async_connection_config();
+            clear_timeout_env();
+            config
+        };
+
+        let client =
+            redis::Client::open("redis://127.0.0.1:6379").expect("valid broker url literal");
+        let mut conn = client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await
+            .expect("connect with the overridden timeout config");
+        let pong: String = redis::cmd("PING")
+            .query_async(&mut conn)
+            .await
+            .expect("PING over a connection built from async_connection_config");
+        assert_eq!(pong, "PONG");
+    }
+
+    #[test]
+    fn first_env_secs_falls_back_on_unset_or_unparsable() {
+        let _guard = timeout_env_guard();
+        std::env::remove_var("CELERS_TEST_TIMEOUT_PROBE");
+        assert_eq!(first_env_secs("CELERS_TEST_TIMEOUT_PROBE", 42), 42);
+
+        std::env::set_var("CELERS_TEST_TIMEOUT_PROBE", "not-a-number");
+        assert_eq!(first_env_secs("CELERS_TEST_TIMEOUT_PROBE", 42), 42);
+
+        std::env::set_var("CELERS_TEST_TIMEOUT_PROBE", "99");
+        assert_eq!(first_env_secs("CELERS_TEST_TIMEOUT_PROBE", 42), 99);
+
+        std::env::remove_var("CELERS_TEST_TIMEOUT_PROBE");
+    }
+
+    /// A `0`-second timeout is not "no timeout" (that is `None`, which this
+    /// module never passes) -- it fails every command instantly. Both an
+    /// explicit `0` override and a `0` `default` argument must be floored to
+    /// `1`, mirroring the same `.max(1)` floor `TtlCache`/`ClientPool` apply
+    /// to their own degenerate-zero-capacity case.
+    #[test]
+    fn first_env_secs_floors_a_zero_override_or_default_to_one() {
+        let _guard = timeout_env_guard();
+        std::env::set_var("CELERS_TEST_TIMEOUT_PROBE", "0");
+        assert_eq!(first_env_secs("CELERS_TEST_TIMEOUT_PROBE", 42), 1);
+
+        std::env::remove_var("CELERS_TEST_TIMEOUT_PROBE");
+        assert_eq!(first_env_secs("CELERS_TEST_TIMEOUT_PROBE", 0), 1);
+
+        std::env::remove_var("CELERS_TEST_TIMEOUT_PROBE");
     }
 }

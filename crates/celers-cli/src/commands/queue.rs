@@ -427,7 +427,9 @@ async fn read_sized_key(
 /// tasks" while leaving the real queue untouched).
 pub async fn purge_queue(broker_url: &str, queue: &str, confirm: bool) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let queue_key = crate::keys::main(queue);
     let queue_type: String = redis::cmd("TYPE")
@@ -734,7 +736,9 @@ pub async fn move_queue(
     confirm: bool,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     // Construct queue keys (see `crate::keys` -- these must match the bare,
     // unprefixed key scheme `RedisBroker` itself reads/writes).
@@ -1045,7 +1049,9 @@ async fn export_zset_entries(
 /// already-reduced count as if it were the total (idx 332).
 pub async fn export_queue(broker_url: &str, queue: &str, output_file: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let queue_key = crate::keys::main(queue);
 
@@ -1132,7 +1138,9 @@ pub async fn import_queue(
     }
 
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let queue_key = crate::keys::main(queue);
 
@@ -1364,7 +1372,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let _: () = redis::cmd("SET")
@@ -1399,7 +1407,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let bookkeeping_key = format!("celers:worker:{queue_name}:heartbeat");
@@ -1452,7 +1460,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let _: usize = redis::cmd("RPUSH")
@@ -1529,7 +1537,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
 

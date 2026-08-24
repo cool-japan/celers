@@ -656,6 +656,7 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                 }
 
                 if claimed {
+                    stats.task_retried();
                     requeue_for_retry(
                         &broker,
                         &task,
@@ -734,6 +735,7 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                 }
 
                 if claimed {
+                    stats.task_retried();
                     requeue_for_retry(
                         &broker,
                         &task,

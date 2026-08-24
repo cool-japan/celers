@@ -973,8 +973,9 @@
 
 // Re-export core types
 pub use celers_core::{
-    ActiveTaskInfo, AsyncResult, Broker, BrokerStats, CompositeEventEmitter, ControlCommand,
-    ControlResponse, DeliveryInfo, Event, EventEmitter, GlobPattern, InMemoryEventEmitter,
+    ActiveTaskInfo, AsyncResult, Broker, BrokerStats, CompositeEventEmitter, ControlClient,
+    ControlCommand, ControlEnvelope, ControlReply, ControlResponse, ControlTransport, DeliveryInfo,
+    Event, EventEmitter, GlobPattern, InMemoryControlTransport, InMemoryEventEmitter,
     InspectCommand, InspectResponse, LogLevel, LoggingEventEmitter, NoOpEventEmitter,
     PatternMatcher, PoolStats, QueueStats, RateLimitConfig, RateLimiter, RegexPattern, RequestInfo,
     ReservedTaskInfo, ResultStore, RouteResult, RouteRule, Router, RouterBuilder, RoutingConfig,
@@ -995,7 +996,9 @@ pub use celers_kombu::{
 };
 
 // Re-export worker types
-pub use celers_worker::{Worker, WorkerConfig};
+pub use celers_worker::{
+    ControlService, RuntimeRateLimitDecision, RuntimeRateLimits, Worker, WorkerConfig,
+};
 
 // Re-export canvas types
 pub use celers_canvas::{
@@ -1033,7 +1036,7 @@ pub use serde;
 #[cfg(feature = "redis")]
 pub use celers_broker_redis::{
     circuit_breaker, dedup, health, monitoring as redis_monitoring, utilities as redis_utilities,
-    RedisBroker,
+    RedisBroker, RedisControlTransport,
 };
 
 #[cfg(feature = "postgres")]

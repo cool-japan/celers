@@ -232,7 +232,7 @@ pub mod types;
 mod tests;
 
 // Re-exports
-pub use batch_ops::{BatchEntryFailure, BatchOutcome};
+pub use batch_ops::{BatchEntryFailure, BatchOutcome, RETRY_BUDGET_EXHAUSTED_CODE};
 pub use broker_core::SqsBroker;
 pub use delivery::ReceiptMetadata;
 pub use types::*;

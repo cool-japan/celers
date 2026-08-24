@@ -23,7 +23,9 @@ use tabled::{settings::Style, Table, Tabled};
 #[allow(dead_code)]
 pub async fn report_daily(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!("{}", "=== Daily Execution Report ===".bold().cyan());
     println!();
@@ -220,7 +222,9 @@ pub async fn report_daily_formatted(
     template: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let now = Utc::now();
     let today_key = format!("celers:metrics:{}:daily:{}", queue, now.format("%Y-%m-%d"));
@@ -297,7 +301,9 @@ pub async fn report_weekly_formatted(
     template: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let now = Utc::now();
     let week_start = now - chrono::Duration::days(7);
@@ -420,7 +426,9 @@ pub async fn report_history(
     template: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
     let now = Utc::now();
     let days = days.max(1);
 
@@ -534,7 +542,9 @@ pub async fn report_workers(
     template: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let heartbeat_keys = scan_worker_heartbeat_keys(&mut conn).await?;
 
@@ -635,7 +645,9 @@ pub async fn report_queues(
     template: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     // `MATCH *` (not `celers:*`): real `RedisBroker` queue keys carry no
     // shared prefix at all, so a `celers:*`-scoped scan used to match zero

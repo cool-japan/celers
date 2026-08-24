@@ -42,15 +42,35 @@ struct Entry<V> {
     expires_at: Instant,
 }
 
+/// Default cap on the number of distinct entries a [`TtlCache`] retains
+/// before [`TtlCache::insert`] starts making room for a new key, used by
+/// [`TtlCache::new`]/[`TtlCache::with_clock`] (see
+/// [`TtlCache::with_capacity`]/[`TtlCache::with_capacity_and_clock`] for a
+/// configurable cap).
+///
+/// Chosen generously for this crate's own production call sites
+/// (`crate::commands::queue`/`crate::commands::worker` key entries by
+/// broker-url/queue or broker-url/worker identity -- a single process
+/// realistically touches at most a few thousand distinct pairs) while still
+/// giving a long-running process (`celers interactive`, or library-embedded
+/// use of this crate) a hard bound instead of growing the backing `HashMap`
+/// without limit for the lifetime of the process (idx 339 part 2).
+const DEFAULT_MAX_ENTRIES: usize = 10_000;
+
 /// A generic, thread-safe time-to-live cache.
 ///
 /// Entries inserted via [`TtlCache::insert`] expire `ttl` after insertion, as
 /// measured by the cache's clock (see [`TtlCache::with_clock`]). A [`get`]
-/// call on an expired entry evicts it and behaves like a miss.
+/// call on an expired entry evicts it and behaves like a miss; so does
+/// [`insert`] once the cache holds `max_entries` distinct keys (see
+/// [`TtlCache::with_capacity_and_clock`]), which additionally prefers
+/// sweeping already-expired entries over evicting live ones.
 ///
 /// [`get`]: TtlCache::get
+/// [`insert`]: TtlCache::insert
 pub struct TtlCache<K, V> {
     ttl: Duration,
+    max_entries: usize,
     entries: Mutex<HashMap<K, Entry<V>>>,
     now_fn: Box<dyn Fn() -> Instant + Send + Sync>,
     hits: std::sync::atomic::AtomicU64,
@@ -63,13 +83,15 @@ where
     V: Clone,
 {
     /// Create a cache with the given time-to-live, backed by the real
-    /// monotonic clock (`Instant::now`).
+    /// monotonic clock (`Instant::now`) and capped at
+    /// [`DEFAULT_MAX_ENTRIES`] distinct keys.
     #[must_use]
     pub fn new(ttl: Duration) -> Self {
         Self::with_clock(ttl, Instant::now)
     }
 
-    /// Create a cache with the given time-to-live and an injectable clock.
+    /// Create a cache with the given time-to-live and an injectable clock,
+    /// capped at [`DEFAULT_MAX_ENTRIES`] distinct keys.
     ///
     /// Intended for tests that need to simulate TTL expiry deterministically:
     /// pass a closure backed by e.g. an `Arc<Mutex<Instant>>` that the test
@@ -79,8 +101,44 @@ where
     where
         F: Fn() -> Instant + Send + Sync + 'static,
     {
+        Self::with_capacity_and_clock(ttl, DEFAULT_MAX_ENTRIES, now)
+    }
+
+    /// Create a cache with the given time-to-live and entry-count cap,
+    /// backed by the real monotonic clock (`Instant::now`). `max_entries` is
+    /// floored to `1` (a `0`-capacity cache could never hold anything, which
+    /// would silently defeat both caching and the sweep behavior below).
+    ///
+    /// Not reachable from this crate's own `bin` target: this crate's own
+    /// production caches (`crate::commands::queue`/`crate::commands::worker`)
+    /// are all sized off [`DEFAULT_MAX_ENTRIES`] via [`TtlCache::new`], not
+    /// individually tuned. It is still reachable via the public
+    /// `celers_cli::cache` library API, which is the surface this function
+    /// exists for, and is covered by this module's own tests; also kept as
+    /// the conventional companion to the already-used
+    /// [`TtlCache::with_clock`] (a caller needing a non-default clock *and* a
+    /// non-default capacity uses [`TtlCache::with_capacity_and_clock`]
+    /// directly, but one needing only a non-default capacity should not have
+    /// to also supply a clock). Kept, not renamed/removed, per its public API
+    /// contract -- see [`TtlCache::clear`]/[`TtlCache::is_empty`] for the
+    /// same pattern elsewhere in this `impl` block.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn with_capacity(ttl: Duration, max_entries: usize) -> Self {
+        Self::with_capacity_and_clock(ttl, max_entries, Instant::now)
+    }
+
+    /// Create a cache with the given time-to-live, entry-count cap, and
+    /// injectable clock -- the fully general constructor every other
+    /// constructor on this type delegates to.
+    #[must_use]
+    pub fn with_capacity_and_clock<F>(ttl: Duration, max_entries: usize, now: F) -> Self
+    where
+        F: Fn() -> Instant + Send + Sync + 'static,
+    {
         Self {
             ttl,
+            max_entries: max_entries.max(1),
             entries: Mutex::new(HashMap::new()),
             now_fn: Box::new(now),
             hits: std::sync::atomic::AtomicU64::new(0),
@@ -115,9 +173,34 @@ where
 
     /// Insert or overwrite `key` with `value`, resetting its expiry to
     /// `now + ttl`.
+    ///
+    /// When inserting a *new* key would push the cache over its
+    /// `max_entries` cap (see [`TtlCache::with_capacity_and_clock`]), room is
+    /// made first: already-expired entries are swept out preferentially
+    /// (a cache whose readers move on to new keys over time -- e.g.
+    /// `crate::commands::queue`/`crate::commands::worker` caching one
+    /// broker/queue or broker/worker pair after another over a long
+    /// `celers interactive` session -- otherwise never triggers the lazy,
+    /// [`TtlCache::get`]-only eviction path for keys nobody reads again, so
+    /// the backing `HashMap` would grow without limit for the life of the
+    /// process). If every entry is still live after that sweep, one
+    /// arbitrary entry is evicted to make room, mirroring
+    /// [`crate::pool::ClientPool::insert`]'s capacity policy. Overwriting an
+    /// already-present key never evicts anything, regardless of capacity.
     pub fn insert(&self, key: K, value: V) {
-        let expires_at = (self.now_fn)() + self.ttl;
+        let now = (self.now_fn)();
+        let expires_at = now + self.ttl;
         let mut guard = lock(&self.entries);
+
+        if !guard.contains_key(&key) && guard.len() >= self.max_entries {
+            guard.retain(|_, entry| entry.expires_at > now);
+        }
+        if !guard.contains_key(&key) && guard.len() >= self.max_entries {
+            if let Some(evict_key) = guard.keys().next().cloned() {
+                guard.remove(&evict_key);
+            }
+        }
+
         guard.insert(key, Entry { value, expires_at });
     }
 
@@ -148,7 +231,9 @@ where
     }
 
     /// Number of entries currently stored, including any not-yet-evicted
-    /// expired entries (they are only swept lazily, on [`TtlCache::get`]).
+    /// expired entries -- they are swept lazily, on [`TtlCache::get`] (that
+    /// key only) or when [`TtlCache::insert`] needs room for a new key
+    /// (opportunistically, any expired key), never eagerly.
     #[must_use]
     pub fn len(&self) -> usize {
         lock(&self.entries).len()
@@ -315,6 +400,105 @@ mod tests {
             cache.get(&"a".to_string()),
             Some(2),
             "re-inserting must push expiry out another full TTL"
+        );
+    }
+
+    #[test]
+    fn with_capacity_floors_zero_to_one() {
+        let cache: TtlCache<String, i32> = TtlCache::with_capacity(Duration::from_secs(60), 0);
+        cache.insert("a".to_string(), 1);
+        assert_eq!(
+            cache.get(&"a".to_string()),
+            Some(1),
+            "a floored-to-1 capacity must still admit and retain one entry"
+        );
+    }
+
+    /// Regression test for idx 339 part 2: `insert` used to grow the backing
+    /// `HashMap` without any bound at all, so a long-running process (e.g.
+    /// `celers interactive`) whose reads move on to a new key every time
+    /// (never re-`get`ting an old one, so the lazy per-key eviction in
+    /// [`TtlCache::get`] never triggers for it) leaked one entry per distinct
+    /// key for the life of the process. `insert` must now cap the cache at
+    /// `max_entries`, evicting to make room for a genuinely new key.
+    #[test]
+    fn insert_evicts_to_stay_at_or_under_capacity_for_a_new_key() {
+        let cache: TtlCache<String, i32> = TtlCache::with_capacity(Duration::from_secs(60), 2);
+        cache.insert("a".to_string(), 1);
+        cache.insert("b".to_string(), 2);
+        assert_eq!(cache.len(), 2);
+
+        cache.insert("c".to_string(), 3);
+        assert!(
+            cache.len() <= 2,
+            "insert must not let the cache grow past max_entries for a new key"
+        );
+        assert_eq!(
+            cache.get(&"c".to_string()),
+            Some(3),
+            "the new key that triggered eviction must itself be admitted"
+        );
+    }
+
+    #[test]
+    fn insert_overwriting_an_existing_key_never_evicts_even_at_capacity() {
+        let cache: TtlCache<String, i32> = TtlCache::with_capacity(Duration::from_secs(60), 2);
+        cache.insert("a".to_string(), 1);
+        cache.insert("b".to_string(), 2);
+        assert_eq!(cache.len(), 2);
+
+        cache.insert("a".to_string(), 99); // overwrite, not a new key
+        assert_eq!(
+            cache.len(),
+            2,
+            "overwriting a present key must not evict anything"
+        );
+        assert_eq!(cache.get(&"a".to_string()), Some(99));
+        assert_eq!(
+            cache.get(&"b".to_string()),
+            Some(2),
+            "the other live entry must survive an overwrite of a different key"
+        );
+    }
+
+    /// `insert`'s eviction must prefer sweeping an already-expired entry
+    /// over evicting a still-live one, so a cache at capacity keeps serving
+    /// its live entries instead of arbitrarily discarding one of them while
+    /// dead weight (a key whose TTL elapsed but was never `get`-swept
+    /// because nothing looked it up again) lingers.
+    #[test]
+    fn insert_prefers_sweeping_an_expired_entry_over_evicting_a_live_one_when_full() {
+        let clock = FakeClock::new();
+        let cache: TtlCache<String, i32> =
+            TtlCache::with_capacity_and_clock(Duration::from_secs(10), 2, clock.as_fn());
+
+        cache.insert("soon_to_expire".to_string(), 1); // expires at t=10
+        clock.advance(Duration::from_secs(6));
+        cache.insert("still_fresh".to_string(), 2); // expires at t=16
+        clock.advance(Duration::from_secs(5)); // now t=11: expired, fresh is not
+
+        assert_eq!(
+            cache.len(),
+            2,
+            "both entries remain in the map until something triggers a sweep"
+        );
+
+        cache.insert("new".to_string(), 3); // must sweep "soon_to_expire", not evict "still_fresh"
+
+        assert_eq!(
+            cache.len(),
+            2,
+            "cache stays at capacity after the sweep+insert"
+        );
+        assert_eq!(
+            cache.get(&"new".to_string()),
+            Some(3),
+            "the new key must be admitted"
+        );
+        assert_eq!(
+            cache.get(&"still_fresh".to_string()),
+            Some(2),
+            "the still-live entry must survive: the expired one is swept first"
         );
     }
 

@@ -10,6 +10,16 @@
 //! - DLQ message grouping and aggregation
 //! - Automatic remediation suggestions
 //!
+//! [`DlqMessage::failure_count`] should come from the broker's authoritative
+//! `receive_count` (SQS's `ApproximateReceiveCount`) rather than a
+//! caller-tracked counter, the same source
+//! [`crate::replay::replayable_from_envelope`] uses for
+//! `ReplayableMessage::failure_count`.
+//! [`DlqMessage::from_receive_count`] takes it directly, and
+//! [`dlq_message_from_envelope`] reads it (plus the message id and an
+//! enqueue-time lower bound for `first_failure`) straight from the broker
+//! for a received envelope.
+//!
 //! # Examples
 //!
 //! ```
@@ -23,7 +33,12 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+use celers_kombu::Envelope;
+
+use crate::broker_core::SqsBroker;
+use crate::delivery::ReceiptMetadata;
 
 /// Error pattern classification
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -87,6 +102,96 @@ pub struct DlqMessage {
     pub first_failure: SystemTime,
     /// Timestamp of last failure
     pub last_failure: SystemTime,
+}
+
+impl DlqMessage {
+    /// Build a [`DlqMessage`] from an id, task name and error, classifying
+    /// the error and taking the failure count directly from the broker's
+    /// authoritative `receive_count` (SQS's `ApproximateReceiveCount`)
+    /// instead of a caller-tracked counter.
+    ///
+    /// `first_failure` and `last_failure` are both set to `now`: SQS system
+    /// attributes record `SentTimestamp` (when the message was *enqueued*),
+    /// never a failure time, so there is no better default available here.
+    /// [`dlq_message_from_envelope`] uses `SentTimestamp` as a `first_failure`
+    /// lower bound when it is available; set either field explicitly
+    /// afterwards when a more precise time is known.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_broker_sqs::dlq_analytics::{DlqMessage, ErrorPattern};
+    ///
+    /// let message = DlqMessage::from_receive_count(
+    ///     "msg-1",
+    ///     "tasks.process",
+    ///     "Connection timeout",
+    ///     4,
+    /// );
+    /// assert_eq!(message.error_pattern, ErrorPattern::Transient);
+    /// assert_eq!(message.failure_count, 4);
+    /// ```
+    pub fn from_receive_count(
+        message_id: impl Into<String>,
+        task_name: impl Into<String>,
+        error_message: impl Into<String>,
+        receive_count: u32,
+    ) -> Self {
+        let error_message = error_message.into();
+        let error_pattern = DlqAnalyzer::classify_error(&error_message);
+        let severity = DlqAnalyzer::determine_severity(&error_pattern, receive_count);
+        let now = SystemTime::now();
+
+        Self {
+            message_id: message_id.into(),
+            task_name: task_name.into(),
+            error_message,
+            error_pattern,
+            severity,
+            failure_count: receive_count,
+            first_failure: now,
+            last_failure: now,
+        }
+    }
+}
+
+/// Build a [`DlqMessage`] from a DLQ envelope, taking the failure count from
+/// the broker's authoritative [`SqsBroker::receive_count`] for the
+/// envelope's delivery tag rather than a caller-tracked counter -- the same
+/// source [`crate::replay::replayable_from_envelope`] uses for
+/// `ReplayableMessage::failure_count`. Falls back to `1` (first delivery)
+/// when the broker holds no metadata for the tag.
+///
+/// `first_failure` is set from the message's `SentTimestamp` when the broker
+/// recorded one: that is enqueue time, not failure time (SQS records no
+/// failure timestamp), but it is a reasonable lower bound and the closest
+/// proxy available. `last_failure` is `now`, matching
+/// [`DlqMessage::from_receive_count`].
+pub fn dlq_message_from_envelope(
+    broker: &SqsBroker,
+    envelope: &Envelope,
+    error_message: impl Into<String>,
+) -> DlqMessage {
+    let metadata = broker.receipt_metadata(&envelope.delivery_tag);
+    let receive_count = metadata.map(|m| m.receive_count).unwrap_or(1);
+    let message_id = metadata
+        .and_then(|m| m.message_id.clone())
+        .unwrap_or_else(|| envelope.message.headers.id.to_string());
+
+    let mut message = DlqMessage::from_receive_count(
+        message_id,
+        envelope.message.headers.task.clone(),
+        error_message,
+        receive_count,
+    );
+
+    if let Some(sent_secs) = metadata.and_then(ReceiptMetadata::sent_timestamp_secs) {
+        if let Some(sent_at) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(sent_secs)) {
+            message.first_failure = sent_at;
+        }
+    }
+
+    message
 }
 
 /// DLQ analytics statistics
@@ -601,5 +706,91 @@ mod tests {
         assert_eq!(analyzer.message_count(), 1);
         analyzer.clear();
         assert_eq!(analyzer.message_count(), 0);
+    }
+
+    #[test]
+    fn from_receive_count_classifies_and_carries_the_broker_count_through() {
+        let message =
+            DlqMessage::from_receive_count("msg-1", "tasks.process", "Invalid payload", 7);
+
+        assert_eq!(message.message_id, "msg-1");
+        assert_eq!(message.task_name, "tasks.process");
+        assert_eq!(message.error_pattern, ErrorPattern::Permanent);
+        // failure_count comes straight from receive_count, not a
+        // caller-tracked counter.
+        assert_eq!(message.failure_count, 7);
+        assert_eq!(message.first_failure, message.last_failure);
+    }
+
+    #[tokio::test]
+    async fn dlq_message_from_envelope_uses_the_brokers_receive_count() {
+        use crate::delivery::{encode_delivery_tag, ReceiptMetadata};
+        use celers_kombu::Envelope;
+        use celers_protocol::Message;
+        use uuid::Uuid;
+
+        let mut broker = SqsBroker::new("tasks")
+            .await
+            .expect("broker construction does not touch the network");
+
+        let tag = encode_delivery_tag("tasks", "AQEB");
+        // SentTimestamp well in the past: a real DLQ message that has been
+        // failing for a while, distinct from "now".
+        broker.remember_receipt_metadata(
+            &tag,
+            ReceiptMetadata {
+                message_id: Some("sqs-message-id".to_string()),
+                receive_count: 6,
+                sent_timestamp_ms: Some(1_700_000_000_000),
+            },
+        );
+
+        let envelope = Envelope {
+            delivery_tag: tag,
+            message: Message::new("tasks.process".to_string(), Uuid::new_v4(), b"{}".to_vec()),
+            redelivered: true,
+        };
+
+        let message = dlq_message_from_envelope(&broker, &envelope, "Service unavailable");
+
+        assert_eq!(message.message_id, "sqs-message-id");
+        assert_eq!(message.task_name, "tasks.process");
+        assert_eq!(message.failure_count, 6);
+        assert_eq!(message.error_pattern, ErrorPattern::Dependency);
+        // first_failure is derived from SentTimestamp (enqueue time), which
+        // is fixed and in the past -- it must not collapse to `now`, the
+        // way `DlqMessage::from_receive_count` alone would set it.
+        assert_eq!(
+            message.first_failure,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+        assert!(message.first_failure < message.last_failure);
+    }
+
+    #[tokio::test]
+    async fn dlq_message_from_envelope_falls_back_without_broker_metadata() {
+        use celers_kombu::Envelope;
+        use celers_protocol::Message;
+        use uuid::Uuid;
+
+        let broker = SqsBroker::new("tasks")
+            .await
+            .expect("broker construction does not touch the network");
+
+        let message_id = Uuid::new_v4();
+        let envelope = Envelope {
+            // No `remember_receipt_metadata` call for this tag: the broker
+            // has nothing recorded for it.
+            delivery_tag: "AQEB-unknown".to_string(),
+            message: Message::new("tasks.process".to_string(), message_id, b"{}".to_vec()),
+            redelivered: false,
+        };
+
+        let message = dlq_message_from_envelope(&broker, &envelope, "Connection timeout");
+
+        // Falls back to first delivery (1) rather than panicking or
+        // reporting an arbitrary count.
+        assert_eq!(message.failure_count, 1);
+        assert_eq!(message.message_id, message_id.to_string());
     }
 }

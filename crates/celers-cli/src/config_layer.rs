@@ -903,13 +903,22 @@ url = "redis://stable:6379"
             .to_string();
         let overlay = dir.join(format!("{stem}.reset.toml"));
 
+        // `broker.type`/`broker.url` have no serde default (required
+        // fields), so every valid overlay file -- however sparse otherwise
+        // -- must restate them; `max_retries` is left off the base's
+        // non-default value on purpose, to prove an *untouched* field still
+        // survives a reset elsewhere in the same file.
         write_file(
             &base,
-            "[broker]\ntype = \"redis\"\nurl = \"redis://base:6379\"\n[worker]\nconcurrency = 32\n",
+            "[broker]\ntype = \"redis\"\nurl = \"redis://base:6379\"\n\
+             [worker]\nconcurrency = 32\nmax_retries = 10\n",
         );
         // Explicitly sets concurrency back to its type default (4) -- must
         // still win over the base's non-default 32.
-        write_file(&overlay, "[worker]\nconcurrency = 4\n");
+        write_file(
+            &overlay,
+            "[broker]\ntype = \"redis\"\nurl = \"redis://base:6379\"\n[worker]\nconcurrency = 4\n",
+        );
 
         let args = CliConfigArgs {
             config: Some(base.clone()),
@@ -922,9 +931,12 @@ url = "redis://stable:6379"
             "an overlay explicitly setting a field to the type default must still override \
              the base's non-default value"
         );
-        // The overlay never mentioned `broker.url` at all -- must still
-        // come from the base, not get reset to the default broker URL.
-        assert_eq!(config.broker.url, "redis://base:6379");
+        // The overlay never mentioned `worker.max_retries` at all -- must
+        // still come from the base, not get reset to the default (3).
+        assert_eq!(
+            config.worker.max_retries, 10,
+            "a field the overlay never mentions must be preserved from the base, not reset"
+        );
 
         let _ = std::fs::remove_file(&base);
         let _ = std::fs::remove_file(&overlay);
@@ -955,7 +967,8 @@ url = "redis://stable:6379"
         );
         write_file(
             &overlay,
-            "[broker]\nfailover_retries = 7\nfailover_timeout_secs = 42\n\
+            "[broker]\ntype = \"redis\"\nurl = \"redis://base:6379\"\n\
+             failover_retries = 7\nfailover_timeout_secs = 42\n\
              [pool]\nmax_size = 99\nreuse_enabled = false\n\
              [cache]\nttl_secs = 999\nenabled = false\n\
              [aliases]\nw = \"worker start\"\n",

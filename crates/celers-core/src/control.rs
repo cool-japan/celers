@@ -1,8 +1,35 @@
 //! Worker Control Commands
 //!
-//! This module provides the protocol for remote worker control and inspection.
-//! It enables clients to query worker state, inspect running tasks, and send
-//! control commands to workers.
+//! The message types of `CeleRS`'s remote worker control and inspection
+//! protocol: what an operator can ask a worker ([`ControlCommand`]) and what a
+//! worker answers ([`ControlResponse`]).
+//!
+//! This module is *only* the vocabulary. The parts that make it move are:
+//!
+//! - [`crate::control_transport`] — the wire framing ([`ControlEnvelope`], the
+//!   correlation id and reply address a bare command lacks), the
+//!   [`ControlTransport`] trait, an in-process implementation and the
+//!   [`ControlClient`] that broadcasts a command and gathers replies.
+//! - `celers_worker::control` — the worker-side subscriber that dispatches a
+//!   received command to the worker's revocation manager, shutdown/mode
+//!   handle, rate limiter, time limits, circuit breakers, task registry and
+//!   active-task registry, and publishes the answer back.
+//! - `celers_broker_redis::RedisControlTransport` — the Redis Pub/Sub
+//!   transport for a real, multi-process deployment.
+//!
+//! [`ControlEnvelope`]: crate::control_transport::ControlEnvelope
+//! [`ControlTransport`]: crate::control_transport::ControlTransport
+//! [`ControlClient`]: crate::control_transport::ControlClient
+//!
+//! # This is not Celery's control protocol
+//!
+//! Commands here serialise with `#[serde(tag = "type", content = "args")]` and
+//! PascalCase variant names onto a plain Pub/Sub channel. Celery uses a kombu
+//! *pidbox*: a fanout exchange, one auto-delete queue per worker, and a
+//! `{"method": ..., "arguments": {...}, "destination": [...]}` body. The two do
+//! not interoperate — `celery -A app inspect active` cannot read a `CeleRS`
+//! worker and `celers control shutdown` cannot stop a Python Celery worker.
+//! See [`crate::control_transport`] for the full wire description.
 //!
 //! # Example
 //!
@@ -14,6 +41,7 @@
 //!
 //! // Serialize for sending to worker
 //! let json = serde_json::to_string(&cmd).unwrap();
+//! assert!(json.contains("Inspect"));
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +124,16 @@ pub enum ControlCommand {
         pattern: String,
         /// Whether to terminate running tasks
         terminate: bool,
+    },
+
+    /// Reset a task type's circuit breaker (or every breaker).
+    ///
+    /// An open breaker refuses a task type until its recovery timeout elapses;
+    /// this closes it immediately once the operator knows the downstream
+    /// dependency is healthy again.
+    ResetCircuitBreaker {
+        /// Task name whose breaker to reset; `None` resets every breaker.
+        task_name: Option<String>,
     },
 }
 
@@ -188,6 +226,9 @@ pub enum InspectCommand {
 
     /// Get configuration
     Conf,
+
+    /// Get the state of every task-type circuit breaker
+    CircuitBreakers,
 }
 
 /// Response to a control command
@@ -310,6 +351,10 @@ pub enum InspectResponse {
 
     /// Worker configuration
     Conf(WorkerConf),
+
+    /// Circuit-breaker state per task name (`"closed"`, `"open"`,
+    /// `"half-open"`), empty when the worker runs without a breaker.
+    CircuitBreakers(HashMap<String, String>),
 }
 
 /// Information about an actively executing task
@@ -563,6 +608,69 @@ impl ControlCommand {
         Self::Inspect(InspectCommand::QueueInfo)
     }
 
+    /// Create an inspect report command
+    #[inline]
+    #[must_use]
+    pub fn inspect_report() -> Self {
+        Self::Inspect(InspectCommand::Report)
+    }
+
+    /// Create an inspect configuration command
+    #[inline]
+    #[must_use]
+    pub fn inspect_conf() -> Self {
+        Self::Inspect(InspectCommand::Conf)
+    }
+
+    /// Create an inspect circuit-breakers command
+    #[inline]
+    #[must_use]
+    pub fn inspect_circuit_breakers() -> Self {
+        Self::Inspect(InspectCommand::CircuitBreakers)
+    }
+
+    /// Create a rate-limit command (`rate` of `None` removes the limit)
+    #[inline]
+    pub fn rate_limit(task_name: impl Into<String>, rate: Option<f64>) -> Self {
+        Self::RateLimit {
+            task_name: task_name.into(),
+            rate,
+        }
+    }
+
+    /// Create a time-limit command (`None` leaves that half unchanged)
+    #[inline]
+    pub fn time_limit(task_name: impl Into<String>, soft: Option<u64>, hard: Option<u64>) -> Self {
+        Self::TimeLimit {
+            task_name: task_name.into(),
+            soft,
+            hard,
+        }
+    }
+
+    /// Create an add-consumer command
+    #[inline]
+    pub fn add_consumer(queue: impl Into<String>) -> Self {
+        Self::AddConsumer {
+            queue: queue.into(),
+        }
+    }
+
+    /// Create a cancel-consumer command
+    #[inline]
+    pub fn cancel_consumer(queue: impl Into<String>) -> Self {
+        Self::CancelConsumer {
+            queue: queue.into(),
+        }
+    }
+
+    /// Create a circuit-breaker reset command (`None` resets every breaker)
+    #[inline]
+    #[must_use]
+    pub fn reset_circuit_breaker(task_name: Option<String>) -> Self {
+        Self::ResetCircuitBreaker { task_name }
+    }
+
     /// Create a shutdown command
     #[inline]
     #[must_use]
@@ -713,6 +821,20 @@ impl ControlResponse {
         Self::Error {
             error: error.into(),
         }
+    }
+
+    /// Wrap an inspection payload in a response
+    #[inline]
+    #[must_use]
+    pub fn inspect(response: InspectResponse) -> Self {
+        Self::Inspect(Box::new(response))
+    }
+
+    /// Whether this response reports a failure
+    #[inline]
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. } | Self::Ack { ok: false, .. })
     }
 }
 

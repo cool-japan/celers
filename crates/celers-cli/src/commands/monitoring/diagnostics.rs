@@ -88,7 +88,10 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
         }
     };
 
-    let mut conn = match client.get_multiplexed_async_connection().await {
+    let mut conn = match client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await
+    {
         Ok(c) => {
             println!("  {} Successfully connected to broker", "✓".green());
             c
@@ -297,7 +300,9 @@ pub async fn doctor(broker_url: &str, queue: &str, strict: bool) -> anyhow::Resu
     println!();
 
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let mut issues = Vec::new();
     let mut warnings = Vec::new();
@@ -566,7 +571,9 @@ pub async fn show_task_logs(
     println!();
 
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let logs_key = format!("celers:task:{task_id}:logs");
 
@@ -675,7 +682,9 @@ pub async fn debug_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
     println!();
 
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     // Get task logs
     let logs_key = format!("celers:task:{task_id}:logs");
@@ -748,7 +757,9 @@ pub async fn debug_task(broker_url: &str, queue: &str, task_id_str: &str) -> any
 /// Debug worker issues
 pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!(
         "{}",
@@ -845,7 +856,9 @@ pub async fn debug_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
 /// Analyze performance bottlenecks
 pub async fn analyze_bottlenecks(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!(
         "{}",
@@ -1012,7 +1025,9 @@ pub async fn worker_logs(
     initial_lines: usize,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!(
         "{}",

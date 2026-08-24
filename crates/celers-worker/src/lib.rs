@@ -46,6 +46,7 @@ pub mod batching;
 pub mod cancellation;
 pub mod checkpoint;
 pub mod circuit_breaker;
+pub mod control;
 pub mod coordinated_rate_limit;
 pub mod cpu_affinity;
 pub mod crash_dump;
@@ -110,6 +111,12 @@ mod metrics {
 pub mod workflows;
 
 #[cfg(test)]
+mod broker_revocation_tests;
+
+#[cfg(test)]
+mod control_tests;
+
+#[cfg(test)]
 mod tests;
 
 // Re-export types module
@@ -132,6 +139,7 @@ pub use checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointManager, CheckpointStats, CheckpointStrategy,
 };
 pub use circuit_breaker::{CircuitBreaker as WorkerCircuitBreaker, CircuitState};
+pub use control::{ControlService, RuntimeRateLimitDecision, RuntimeRateLimits};
 pub use coordinated_rate_limit::{
     RateLimitDecision, RateLimitKeyStrategy, WorkerRateLimitCoordinator,
 };

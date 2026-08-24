@@ -3,9 +3,220 @@
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
 use crate::config_layer::CliConfigArgs;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
+
+/// Connection and output options shared by every `inspect` / `control`
+/// subcommand.
+#[derive(Args, Clone, Debug)]
+pub(super) struct ControlArgs {
+    /// Broker URL carrying the control channel (e.g. <redis://localhost:6379>)
+    #[arg(short, long)]
+    pub(super) broker: Option<String>,
+    /// Control channel name (defaults to `celers.control`)
+    ///
+    /// Scope a control plane to one deployment when several share a Redis
+    /// instance: a worker only answers commands published to the channel it
+    /// subscribes to.
+    #[arg(long)]
+    pub(super) channel: Option<String>,
+    /// Seconds to gather replies before giving up
+    #[arg(long, default_value_t = crate::commands::control::DEFAULT_CONTROL_TIMEOUT_SECS)]
+    pub(super) timeout: f64,
+    /// Only address the worker with this hostname (repeatable)
+    #[arg(long = "destination", short = 'd')]
+    pub(super) destination: Vec<String>,
+    /// Print the raw replies as JSON
+    #[arg(long)]
+    pub(super) json: bool,
+    /// Configuration file path
+    #[arg(long)]
+    pub(super) config: Option<PathBuf>,
+}
+
+/// Read-only inspection of running workers.
+#[derive(Subcommand)]
+pub(super) enum InspectCommands {
+    /// Check which workers are alive
+    Ping {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// List the tasks each worker is executing right now
+    Active {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// List scheduled (ETA/countdown) tasks held by each worker
+    ///
+    /// Always empty for CeleRS: ETA tasks wait in the broker's delayed queue,
+    /// not in the worker.
+    Scheduled {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// List reserved (prefetched) tasks held by each worker
+    ///
+    /// Always empty for CeleRS: a worker dispatches every message it dequeues
+    /// instead of holding a prefetch reserve.
+    Reserved {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// List the task ids each worker has been told to revoke
+    Revoked {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// List the task types registered in each worker
+    Registered {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Show live counters, pool and broker state for each worker
+    Stats {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Show the depth of the queue each worker consumes
+    Queues {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Show a comprehensive status report for each worker
+    Report {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Show each worker's effective configuration
+    Conf {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Show the circuit-breaker state per task type
+    #[command(name = "circuit-breakers")]
+    CircuitBreakers {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+}
+
+/// Commands that change what a running worker is doing.
+#[derive(Subcommand)]
+pub(super) enum ControlCommands {
+    /// Check which workers are alive
+    Ping {
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Ask workers to stop consuming and drain their in-flight tasks
+    Shutdown {
+        /// Seconds to let in-flight tasks finish before their messages are
+        /// requeued (overrides the worker's configured drain deadline)
+        #[arg(long)]
+        grace: Option<u64>,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Revoke one or more task ids
+    ///
+    /// The revocation is recorded in the queue's durable revoked-id set before
+    /// it is broadcast, so it also applies to tasks still sitting in the queue
+    /// and to workers that start later — unlike every other control command,
+    /// which only reaches workers listening right now.
+    Revoke {
+        /// Task ids (UUIDs) to revoke
+        #[arg(required = true)]
+        task_ids: Vec<String>,
+        /// Also abort the task if a worker is already running it
+        #[arg(long)]
+        terminate: bool,
+        /// Queue holding the task (defaults to the configured queue)
+        ///
+        /// The revoked-id set is per queue, so revoking on the wrong one
+        /// records a revocation nothing will ever consult.
+        #[arg(long)]
+        queue: Option<String>,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Revoke every task whose *name* matches a glob pattern
+    ///
+    /// Worker-local by construction: a broker queue is keyed by task id, so
+    /// nothing broker-side can match a name pattern. Messages already queued
+    /// stay queued until a worker sees and drops them.
+    #[command(name = "revoke-pattern")]
+    RevokePattern {
+        /// Glob pattern matched against task names (e.g. `report.*`)
+        pattern: String,
+        /// Also abort matching tasks that are already running
+        #[arg(long)]
+        terminate: bool,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Set or clear a worker-local rate limit for a task type
+    #[command(name = "rate-limit")]
+    RateLimit {
+        /// Task name to limit
+        task_name: String,
+        /// Maximum tasks per second; omit (or pass --clear) to remove the limit
+        #[arg(long)]
+        rate: Option<f64>,
+        /// Remove the limit instead of setting one
+        #[arg(long, conflicts_with = "rate")]
+        clear: bool,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Set or clear the soft/hard time limits for a task type
+    #[command(name = "time-limit")]
+    TimeLimit {
+        /// Task name to limit
+        task_name: String,
+        /// Soft limit in seconds (a cooperative warning inside the task)
+        #[arg(long)]
+        soft: Option<u64>,
+        /// Hard limit in seconds (the task is killed)
+        #[arg(long)]
+        hard: Option<u64>,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Resume consumption of a queue
+    #[command(name = "add-consumer")]
+    AddConsumer {
+        /// Queue name (must be the queue the worker was started on)
+        queue: String,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Stop consuming a queue without stopping the worker
+    #[command(name = "cancel-consumer")]
+    CancelConsumer {
+        /// Queue name (must be the queue the worker was started on)
+        queue: String,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Ask each worker for the depth of its queue
+    #[command(name = "queue-length")]
+    QueueLength {
+        /// Queue name
+        queue: String,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+    /// Close a tripped circuit breaker
+    #[command(name = "reset-circuit-breaker")]
+    ResetCircuitBreaker {
+        /// Task name whose breaker to close; omit to close every breaker
+        task_name: Option<String>,
+        #[command(flatten)]
+        common: ControlArgs,
+    },
+}
 
 #[derive(Subcommand)]
 pub(super) enum WorkerMgmtCommands {
@@ -866,6 +1077,24 @@ pub(super) enum Commands {
     /// Worker management operations
     #[command(subcommand, visible_alias = "wm")]
     WorkerMgmt(WorkerMgmtCommands),
+    /// Inspect running workers over the remote control channel
+    ///
+    /// Broadcasts an inspection request on the CeleRS control channel and
+    /// prints every reply that arrives before the timeout. Only workers
+    /// started with a control transport answer; "no replies" means nothing was
+    /// listening, not that the command failed.
+    ///
+    /// This is a CeleRS-native protocol: `celery -A app inspect` cannot read a
+    /// CeleRS worker, and these subcommands cannot read a Python Celery worker.
+    #[command(subcommand)]
+    Inspect(InspectCommands),
+    /// Send control commands to running workers
+    ///
+    /// Broadcasts a control request on the CeleRS control channel. See
+    /// `celers inspect` for the read-only half; the same caveats about
+    /// delivery and Celery interoperability apply.
+    #[command(subcommand)]
+    Control(ControlCommands),
     /// Automatic problem detection and diagnostics
     Doctor {
         /// Broker URL

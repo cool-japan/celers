@@ -872,7 +872,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         seed_dlq(&mut conn, &queue_name, total_entries).await;

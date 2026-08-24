@@ -435,14 +435,45 @@ fn test_in_flight_registry_claims_exactly_once() {
     // The registry entry is the disposition token: the shutdown requeue and the
     // task's own ack must not both act on the same message.
     let registry = InFlightRegistry::new();
-    let task_id = TaskId::new_v4();
-    registry.register(task_id, Some("receipt".to_string()));
+    let task = SerializedTask::new("dispose_once".to_string(), vec![1, 2, 3]);
+    let task_id = task.metadata.id;
+    registry.register(task_id, Some("receipt".to_string()), &task);
 
     assert_eq!(registry.len(), 1);
     assert!(registry.claim(&task_id));
     assert!(!registry.claim(&task_id));
     assert!(registry.is_empty());
     assert!(registry.take_all().is_empty());
+}
+
+#[test]
+fn test_in_flight_registry_snapshot_reports_task_identity() {
+    // `inspect active` reads this snapshot: the counters know how many tasks
+    // are running, only the registry knows which.
+    let registry = InFlightRegistry::with_args_capture();
+    let task = SerializedTask::new("send_email".to_string(), br#"{"to":"a@b.c"}"#.to_vec());
+    let task_id = task.metadata.id;
+    registry.register(task_id, None, &task);
+
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    let (seen_id, entry) = &snapshot[0];
+    assert_eq!(*seen_id, task_id);
+    assert_eq!(entry.name, "send_email");
+    assert_eq!(entry.args_preview.as_deref(), Some(r#"{"to":"a@b.c"}"#));
+    assert!(entry.started > 0.0);
+}
+
+#[test]
+fn test_in_flight_registry_skips_args_capture_by_default() {
+    // A worker without remote control must not retain payload copies.
+    let registry = InFlightRegistry::new();
+    let task = SerializedTask::new("bulky".to_string(), vec![7; 4096]);
+    registry.register(task.metadata.id, None, &task);
+
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    assert!(snapshot[0].1.args_preview.is_none());
 }
 
 #[test]

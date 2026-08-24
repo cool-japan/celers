@@ -14,6 +14,7 @@
 //! - Geo-distribution with multi-region replication
 
 use async_trait::async_trait;
+use celers_core::revocation_channel::{RevocationNotice, RevocationStream};
 use celers_core::{Broker, BrokerMessage, CelersError, Result, SerializedTask, TaskId};
 use redis::{
     aio::{ConnectionManager, ConnectionManagerConfig},
@@ -40,6 +41,7 @@ pub mod circuit_breaker;
 pub mod cluster;
 pub mod compression;
 pub mod connection;
+pub mod control;
 pub mod cron_scheduler;
 pub mod dedup;
 pub mod degradation;
@@ -67,6 +69,7 @@ pub mod quota_mgmt;
 pub mod rate_limit;
 pub mod result_backend;
 pub mod retry;
+pub mod revocation;
 pub mod sentinel;
 pub mod streams;
 pub mod structured_logging;
@@ -97,6 +100,7 @@ pub use connection::{
     blocking_response_timeout, ConnectionStats, RedisClientExt, RedisConfig, TlsConfig,
     BLOCKING_RESPONSE_MARGIN, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_RESPONSE_TIMEOUT,
 };
+pub use control::RedisControlTransport;
 pub use cron_scheduler::{CronExpression, CronScheduler, ScheduledTask};
 pub use dedup::{DedupResult, DedupStrategy, Deduplicator};
 pub use degradation::{DegradationManager, DegradationMode, DegradationStats, QueuedOperation};
@@ -170,6 +174,9 @@ pub use rate_limit::{
 };
 pub use result_backend::{ResultBackend, ResultBackendConfig, TaskResult, TaskStatus};
 pub use retry::{BackoffStrategy, RetryConfig, RetryExecutor, RetryResult};
+pub use revocation::RedisRevocationStream;
+
+use revocation::revocation_client;
 pub use sentinel::{
     MasterAddress, SentinelClient, SentinelConfig, SentinelConfigBuilder, SentinelRole,
 };
@@ -1566,6 +1573,17 @@ impl Broker for RedisBroker {
 
     /// Revoke a task.
     ///
+    /// Equivalent to [`revoke`](Self::revoke) with `terminate = false`: Celery's
+    /// plain `revoke(id)` stops a task from starting but never aborts a copy
+    /// that is already running.
+    ///
+    /// Returns `true` once the revocation is recorded.
+    async fn cancel(&self, task_id: &TaskId) -> Result<bool> {
+        self.revoke(task_id, false).await
+    }
+
+    /// Revoke a task, optionally aborting a copy that is already running.
+    ///
     /// The revocation is **durable**: the id is recorded in
     /// `<queue>:revoked` (scored by its expiry, pruned on every call) and
     /// every dequeue path drops messages whose id is listed there, so a task
@@ -1573,23 +1591,26 @@ impl Broker for RedisBroker {
     /// are also removed from the main and delayed queues on a best-effort,
     /// bounded scan.
     ///
-    /// Pub/Sub notification is kept for workers that are already executing
-    /// the task, but it is *not* the mechanism: it is fire-and-forget, so a
-    /// worker that is restarting or momentarily disconnected never sees it —
-    /// which is exactly why the old implementation, which only published,
-    /// cancelled nothing at all.
+    /// A [`RevocationNotice`] is then published on `<queue>:cancel` for workers
+    /// that are already executing the task — the channel
+    /// [`subscribe_revocations`](Self::subscribe_revocations) reads. That
+    /// notification is *not* the mechanism: it is fire-and-forget, so a worker
+    /// that is restarting or momentarily disconnected never sees it — which is
+    /// exactly why an implementation that only published cancelled nothing at
+    /// all. `terminate` travels on the notice, so a worker with no control
+    /// channel of its own still learns whether to abort the running task.
     ///
     /// Returns `true` once the revocation is recorded.
-    async fn cancel(&self, task_id: &TaskId) -> Result<bool> {
+    async fn revoke(&self, task_id: &TaskId, terminate: bool) -> Result<bool> {
         let mut conn = self.get_connection().await?;
-        let cancel_msg = task_id.to_string();
+        let task_key = task_id.to_string();
 
         let removed = self
             .visibility_manager
             .revoke(
                 &mut conn,
                 &self.keys,
-                &cancel_msg,
+                &task_key,
                 self.mode,
                 self.revocation_ttl_secs,
                 REVOKE_SCAN_LIMIT,
@@ -1598,17 +1619,44 @@ impl Broker for RedisBroker {
             .map_err(|e| CelersError::Broker(format!("Failed to record revocation: {}", e)))?;
 
         // Notify workers that may already be executing the task.
+        let body = RevocationNotice::new(*task_id, terminate).to_wire();
         let subscribers: i32 = conn
-            .publish(&self.cancel_channel, &cancel_msg)
+            .publish(&self.cancel_channel, &body)
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to publish cancel message: {}", e)))?;
 
         info!(
-            "Revoked task {} (removed {} pending copies, notified {} subscriber(s))",
-            task_id, removed, subscribers
+            "Revoked task {} (terminate={}, removed {} pending copies, notified {} subscriber(s))",
+            task_id, terminate, removed, subscribers
         );
 
         Ok(true)
+    }
+
+    /// Whether `task_id` is listed in the durable `<queue>:revoked` set.
+    ///
+    /// This is the same set every dequeue path filters against; a worker
+    /// consults it directly so a message that slipped past the bounded purge
+    /// scan — or that was enqueued *after* the revocation was recorded — is
+    /// still refused instead of executed.
+    async fn is_revoked(&self, task_id: &TaskId) -> Result<bool> {
+        let mut conn = self.get_connection().await?;
+        self.visibility_manager
+            .is_revoked(&mut conn, &self.keys, &task_id.to_string())
+            .await
+            .map_err(|e| CelersError::Broker(format!("Failed to read the revoked set: {}", e)))
+    }
+
+    /// Subscribe to `<queue>:cancel`, the channel [`revoke`](Self::revoke)
+    /// publishes on.
+    ///
+    /// The subscription needs RESP3 (Redis 6.0+); the broker's own RESP2 client
+    /// is re-opened with the protocol forced, since a RESP2 subscription
+    /// connects happily and then delivers nothing.
+    async fn subscribe_revocations(&self) -> Result<Option<Box<dyn RevocationStream>>> {
+        let client = revocation_client(&self.client)?;
+        let stream = RedisRevocationStream::connect(&client, &self.cancel_channel).await?;
+        Ok(Some(Box::new(stream)))
     }
 
     // Optimized batch operations using Redis pipelining

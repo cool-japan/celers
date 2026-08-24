@@ -1,7 +1,9 @@
 //! Worker struct and core implementation for task execution.
 
+mod broker_revocation;
+mod control_wiring;
 mod execution;
-mod support;
+pub(crate) mod support;
 
 #[cfg(test)]
 mod tests;
@@ -12,6 +14,7 @@ use crate::batching::{self, CoalesceStrategy};
 use crate::cancellation::CancellationToken;
 use crate::checkpoint::CheckpointManager;
 use crate::circuit_breaker::CircuitBreaker;
+use crate::control::{ControlService, ControlSurface, RuntimeRateLimitDecision, RuntimeRateLimits};
 use crate::coordinated_rate_limit::{RateLimitDecision, WorkerRateLimitCoordinator};
 use crate::dlq::DlqHandler;
 use crate::execution_context::{RevocationWatcher, SoftTimeout, TaskExecutionContext};
@@ -27,13 +30,15 @@ use support::{
     clamp_defer_delay, effective_max_retries, ActiveTaskGuard, EventSink, InFlightRegistry,
 };
 
+use celers_core::control_transport::ControlTransport;
+use celers_core::revocation::WorkerRevocationManager;
 use celers_core::time_limit::{TimeLimitConfig, WorkerTimeLimits};
 use celers_core::{
     Broker, Event, EventEmitter, NoOpEventEmitter, Result, TaskEvent, TaskEventBuilder, TaskId,
     TaskRegistry, WorkerEventBuilder,
 };
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration as StdDuration;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
@@ -49,6 +54,10 @@ const EVENT_FLUSH_BATCH: usize = 64;
 
 /// How long to wait for buffered lifecycle events to flush at shutdown.
 const EVENT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to let an in-flight control command publish its reply before the
+/// control listener is torn down at shutdown.
+const CONTROL_REPLY_GRACE: Duration = Duration::from_secs(2);
 
 /// Why the dequeue loop stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,10 +94,17 @@ pub struct Worker<B: Broker, E: EventEmitter = NoOpEventEmitter> {
     pub(crate) mode: Arc<AtomicU8>, // Stores WorkerMode as u8
     pub(crate) dynamic_config: Arc<RwLock<DynamicConfig>>,
     pub(crate) middleware_stack: Option<Arc<middleware::MiddlewareStack>>,
-    /// Cooperative cancellation: watches the broker's revocation Pub/Sub and
-    /// trips the matching in-flight task's token (enabled via
-    /// [`Worker::with_revocation_watcher`]).
+    /// Cooperative cancellation: trips the matching in-flight task's token when
+    /// a revocation is published into its channel (enabled via
+    /// [`Worker::with_revocation_watcher`]). The channel is fed by the control
+    /// protocol, by the broker bridge below, or by the host application.
     pub(crate) revocation_watcher: Option<RevocationWatcher>,
+    /// Whether the broker feeds revocations to this worker: a subscription to
+    /// [`Broker::subscribe_revocations`] plus a [`Broker::is_revoked`] check
+    /// before every dispatch (enabled via
+    /// [`Worker::with_broker_revocation`]). `false` (the default) leaves
+    /// revocation in-process only.
+    pub(crate) broker_revocation: bool,
     /// Distributed (cluster-wide) rate-limit gate applied before execution
     /// (enabled via [`Worker::with_rate_limit_coordinator`]).
     pub(crate) rate_limit_coordinator: Option<WorkerRateLimitCoordinator>,
@@ -110,6 +126,27 @@ pub struct Worker<B: Broker, E: EventEmitter = NoOpEventEmitter> {
     pub(crate) checkpoints: Option<Arc<CheckpointManager>>,
     /// Liveness/readiness accounting, always on (a handful of atomics).
     pub(crate) health: HealthChecker,
+    /// Revocations recorded by the remote control protocol, checked before
+    /// every dispatch. Empty (and therefore free) until something revokes.
+    pub(crate) revocations: WorkerRevocationManager,
+    /// Worker-local per-task rate limits installed by
+    /// [`ControlCommand::RateLimit`](celers_core::ControlCommand). Empty (and
+    /// therefore a single atomic load) until an operator sets one.
+    pub(crate) rate_limits: RuntimeRateLimits,
+    /// Drain deadline in seconds, seeded from
+    /// [`WorkerConfig::shutdown_timeout_secs`](crate::WorkerConfig) and
+    /// replaceable at runtime by `ControlCommand::Shutdown { timeout }`.
+    pub(crate) shutdown_timeout_secs: Arc<AtomicU64>,
+    /// Remote control channel (enabled via
+    /// [`Worker::with_control_transport`]). `None` (the default) leaves the
+    /// worker unreachable by remote control.
+    pub(crate) control_transport: Option<Arc<dyn ControlTransport>>,
+    /// Broker URL reported by `inspect conf` / `inspect stats`, credentials
+    /// stripped. The broker itself never exposes its URL, so this is supplied
+    /// by whoever built the worker or left unreported.
+    pub(crate) broker_url: Option<String>,
+    /// Result-backend URL reported by `inspect conf`, credentials stripped.
+    pub(crate) result_backend_url: Option<String>,
 }
 
 impl<B: Broker + 'static> Worker<B, NoOpEventEmitter> {
@@ -201,6 +238,8 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             max_retries: config.max_retries,
         };
 
+        let shutdown_timeout_secs = Arc::new(AtomicU64::new(config.shutdown_timeout_secs));
+
         Self {
             broker,
             registry: Arc::new(registry),
@@ -214,12 +253,19 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             dynamic_config: Arc::new(RwLock::new(dynamic_config)),
             middleware_stack: None,
             revocation_watcher: None,
+            broker_revocation: false,
             rate_limit_coordinator: None,
             affinity_registry: None,
             time_limits: None,
             poison_pill: None,
             checkpoints: None,
             health: HealthChecker::new(),
+            revocations: WorkerRevocationManager::new(),
+            rate_limits: RuntimeRateLimits::new(),
+            shutdown_timeout_secs,
+            control_transport: None,
+            broker_url: None,
+            result_backend_url: None,
         }
     }
 
@@ -286,8 +332,12 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
 
     /// Enable cooperative cancellation-during-execution.
     ///
-    /// The supplied [`RevocationWatcher`] subscribes to the broker's revocation
-    /// Pub/Sub. While the worker runs, every in-flight task is registered with the
+    /// The supplied [`RevocationWatcher`] subscribes to the worker's in-process
+    /// revocation channel — use
+    /// [`with_broker_revocation`](Self::with_broker_revocation) to have the
+    /// *broker* feed that channel, which is what lets another process revoke a
+    /// task running here.
+    /// While the worker runs, every in-flight task is registered with the
     /// watcher's registry and executed inside a [`TaskExecutionContext`] carrying
     /// a [`CancellationToken`](crate::cancellation::CancellationToken). When a
     /// revocation signal for an in-flight task arrives, its token is tripped: the
@@ -773,12 +823,16 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             };
 
         // Start the revocation watcher if cooperative cancellation is enabled.
-        // It subscribes to the broker's revocation Pub/Sub and trips the matching
+        // It reads the worker's revocation channel and trips the matching
         // in-flight task's cancellation token.
         let revocation_handle = self.revocation_watcher.as_ref().map(|w| {
             info!("Starting revocation watcher for cooperative cancellation");
             w.spawn()
         });
+
+        // Start the broker → worker revocation bridge, which is what puts
+        // anything on that channel from outside this process.
+        let revocation_bridge_handle = self.spawn_broker_revocation_bridge();
 
         // A DLQ TTL does nothing on its own: something has to run the sweep, or
         // expired entries accumulate forever and `ttl_seconds` is decoration.
@@ -803,9 +857,50 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             .as_ref()
             .and_then(|detector| detector.spawn_pruner());
 
+        // Messages dispatched but not yet disposed of, so a shutdown deadline
+        // can hand them back to the broker instead of stranding them — and the
+        // one place that knows *which* tasks are running, for `inspect active`.
+        //
+        // Created per run, not once per worker: `drain_in_flight` empties it at
+        // shutdown, and a second `run()` inheriting entries from the first would
+        // requeue messages that were already disposed of.
+        let in_flight = if self.control_transport.is_some() {
+            InFlightRegistry::with_args_capture()
+        } else {
+            InFlightRegistry::new()
+        };
+
+        // Start the remote control subscriber if a control channel is wired up.
+        let control = self.control_transport.as_ref().map(|transport| {
+            info!("Starting remote control listener for worker {}", hostname);
+            let service = ControlService::new(Arc::new(self.control_surface(in_flight.clone())));
+            let handle = service.spawn(Arc::clone(transport));
+            (service, handle)
+        });
+
         let result = self
-            .run_loop_inner(&mut shutdown_rx, &hostname, pid, &events)
+            .run_loop_inner(&mut shutdown_rx, &hostname, pid, &events, &in_flight)
             .await;
+
+        // Stop the remote control listener, but let a command that is still
+        // being answered finish first. `ControlCommand::Shutdown` is exactly
+        // this case: it stops the worker from inside the listener, so aborting
+        // the moment the run loop exits would cancel the acknowledgement of the
+        // very command that caused the exit, and the operator would see a
+        // command that appears never to have arrived.
+        if let Some((service, handle)) = control {
+            let deadline = tokio::time::Instant::now() + CONTROL_REPLY_GRACE;
+            while service.pending() > 0 && tokio::time::Instant::now() < deadline {
+                sleep(Duration::from_millis(5)).await;
+            }
+            if service.pending() > 0 {
+                warn!(
+                    "Aborting the control listener with {} command(s) still unanswered",
+                    service.pending()
+                );
+            }
+            handle.abort();
+        }
 
         // Stop heartbeat task
         if let Some(handle) = heartbeat_handle {
@@ -814,6 +909,11 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
 
         // Stop the revocation watcher
         if let Some(handle) = revocation_handle {
+            handle.abort();
+        }
+
+        // Stop the broker revocation bridge
+        if let Some(handle) = revocation_bridge_handle {
             handle.abort();
         }
 
@@ -965,6 +1065,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         hostname: &str,
         pid: u32,
         events: &EventSink,
+        in_flight: &InFlightRegistry,
     ) -> Result<()> {
         // Adaptive poll-interval controller (clock-free decision math). When
         // adaptive polling is disabled the controller is left as `None` and the
@@ -985,10 +1086,6 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             .min(u32::MAX as usize)
             .min(Semaphore::MAX_PERMITS);
         let permits = Arc::new(Semaphore::new(concurrency));
-
-        // Messages dispatched but not yet disposed of, so a shutdown deadline
-        // can hand them back to the broker instead of stranding them.
-        let in_flight = InFlightRegistry::new();
 
         let memory_tracker = if self.config.track_memory_usage {
             Some(Arc::new(MemoryTracker::new()))
@@ -1081,6 +1178,34 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
 
             match messages_result {
                 Ok(messages) if !messages.is_empty() => {
+                    // The worker mode can change while the loop is parked in a
+                    // blocking `dequeue`, and it routinely does: draining,
+                    // maintenance and `ControlCommand::CancelConsumer` all
+                    // arrive from another task. Without this re-check a worker
+                    // that has been told to stop consuming still runs the next
+                    // message to arrive, because the only mode check happens
+                    // *before* the dequeue it is parked in.
+                    let mode_after_dequeue = WorkerMode::from(self.mode.load(Ordering::SeqCst));
+                    if !mode_after_dequeue.should_accept_tasks() {
+                        info!(
+                            "Worker is {} and will not run the {} message(s) just dequeued; \
+                             returning them to the queue",
+                            mode_after_dequeue,
+                            messages.len()
+                        );
+                        for msg in messages {
+                            self.defer_message(
+                                &msg.task.metadata.id,
+                                msg.receipt_handle.as_deref(),
+                                "worker not accepting tasks",
+                            )
+                            .await;
+                        }
+                        // Back to the top: draining breaks the loop, maintenance
+                        // sleeps a poll interval, so this cannot spin.
+                        continue;
+                    }
+
                     if let Some(ref mut ap) = adaptive_poll {
                         ap.record(PollOutcome::found(messages.len()));
                     }
@@ -1108,6 +1233,65 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                 .pid(pid)
                                 .received(),
                         );
+
+                        // Revocation comes first: a task an operator has
+                        // revoked must not run, must not be deferred back into
+                        // the queue, and must not be dead-lettered — it is
+                        // simply dropped. This is what makes
+                        // `ControlCommand::Revoke` / `RevokeByPattern` real for
+                        // a message that was already queued when the revocation
+                        // arrived.
+                        //
+                        // Two sources are consulted. The worker-local record is
+                        // free and covers everything this worker was told about
+                        // (control commands, and the broker bridge while it was
+                        // subscribed). The broker's *persisted* revoked set is
+                        // asked only when broker revocation is enabled, and is
+                        // what catches a revocation published while this worker
+                        // was restarting — Pub/Sub has no redelivery.
+                        let revocation = self.revocations.check_revocation(task_id, &task_name);
+                        let broker_revoked =
+                            !revocation.revoked && self.is_revoked_in_broker(task_id).await;
+                        if revocation.revoked || broker_revoked {
+                            if broker_revoked {
+                                // Remember it, so a redelivery of the same
+                                // message costs no further round trip.
+                                self.revocations
+                                    .revoke(task_id, celers_core::RevocationMode::Ignore);
+                            }
+                            info!(
+                                "Task {} ('{}') is revoked ({}); dropping it",
+                                task_id,
+                                task_name,
+                                if broker_revoked {
+                                    "listed in the broker's revoked set".to_string()
+                                } else {
+                                    format!("recorded by this worker, mode {:?}", revocation.mode)
+                                }
+                            );
+
+                            events.emit(Event::Task(TaskEvent::Revoked {
+                                task_id,
+                                task_name: Some(task_name.clone()),
+                                timestamp: chrono::Utc::now(),
+                                terminated: false,
+                                signum: None,
+                                expired: false,
+                            }));
+
+                            self.stats.task_revoked();
+
+                            // Acknowledge so the broker removes it: a revoked
+                            // task that is requeued would come straight back.
+                            if let Err(e) = self
+                                .broker
+                                .ack(&task_id, msg.receipt_handle.as_deref())
+                                .await
+                            {
+                                error!("Failed to acknowledge revoked task {}: {}", task_id, e);
+                            }
+                            continue;
+                        }
 
                         // Poison-pill quarantine comes before every other
                         // admission check: a quarantined task must not run no
@@ -1317,6 +1501,40 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             }
                         }
 
+                        // Worker-local rate-limit gate, set at runtime by
+                        // `ControlCommand::RateLimit`. Checked before the
+                        // cluster-wide gate because it needs no network round
+                        // trip, and it is a single atomic load until an operator
+                        // installs a limit.
+                        if let RuntimeRateLimitDecision::Denied { retry_after } =
+                            self.rate_limits.check(&task_name)
+                        {
+                            debug!(
+                                "Worker rate limit denied task {} ('{}'); deferring for {:?}",
+                                task_id, task_name, retry_after
+                            );
+                            self.stats.task_rate_limited();
+
+                            // The circuit breaker already admitted this task
+                            // (and, while half-open, handed it a trial slot);
+                            // give the slot back since it is not going to run.
+                            if let Some(ref cb) = self.circuit_breaker {
+                                cb.release_probe(&task_name).await;
+                            }
+
+                            self.defer_message(
+                                &task_id,
+                                msg.receipt_handle.as_deref(),
+                                "worker rate limit",
+                            )
+                            .await;
+                            defer_delay = Some(
+                                self.clamped_defer_delay(retry_after)
+                                    .max(defer_delay.unwrap_or(Duration::ZERO)),
+                            );
+                            continue;
+                        }
+
                         // Distributed rate-limit gate: acquire a permit from the
                         // cluster-wide limiter before executing. If denied, defer
                         // the task by requeueing so another attempt happens later
@@ -1467,7 +1685,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             max_result_size_bytes: self.config.max_result_size_bytes,
                         };
 
-                        in_flight.register(task_id, receipt_handle);
+                        in_flight.register(task_id, receipt_handle, &dispatch.task);
 
                         // Count the task as active *before* spawning: both drain
                         // paths gate on this counter, and a task that is queued
@@ -1521,8 +1739,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             "Worker stopping ({}), draining in-flight tasks",
             stop_reason.as_str()
         );
-        self.drain_in_flight(&permits, &in_flight, concurrency)
-            .await;
+        self.drain_in_flight(&permits, in_flight, concurrency).await;
         info!("Worker stopped ({})", stop_reason.as_str());
 
         Ok(())
@@ -1543,7 +1760,10 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         in_flight: &InFlightRegistry,
         concurrency: usize,
     ) {
-        let deadline = Duration::from_secs(self.config.shutdown_timeout_secs);
+        // Read the runtime value, not the static one: `ControlCommand::Shutdown
+        // { timeout }` replaces the drain deadline, and reading the config here
+        // would make that parameter decorative.
+        let deadline = Duration::from_secs(self.shutdown_timeout_secs.load(Ordering::SeqCst));
         let drain_permits = u32::try_from(concurrency).unwrap_or(u32::MAX);
 
         if self.config.graceful_shutdown && !deadline.is_zero() {

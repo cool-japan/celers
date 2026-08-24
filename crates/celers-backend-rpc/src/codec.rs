@@ -21,8 +21,15 @@
 //!    a present-but-corrupt string propagates
 //!    [`BackendError::Serialization`] so the caller learns the payload was
 //!    lost instead of being told the task "succeeded" with nothing.
+//! 3. **Every `TaskMeta` field round-trips, not just the ones with a
+//!    dedicated proto field.** `progress`, `version`, `tags`, `metadata`,
+//!    `worker_hostname`, `runtime_ms`, `memory_bytes`, `retries`, and
+//!    `queue` are carried through [`proto::TaskMeta::extra_json`] via
+//!    [`crate::task_meta_extra::TaskMetaExtra`] instead of being silently
+//!    dropped to their defaults on every encode.
 
 use crate::proto::{self, TaskResultState};
+use crate::task_meta_extra::TaskMetaExtra;
 use celers_backend_redis::{BackendError, ChordState, Result, TaskMeta, TaskResult};
 use chrono::{TimeZone, Utc};
 use std::time::Duration;
@@ -30,9 +37,10 @@ use uuid::Uuid;
 
 /// Convert a domain [`TaskMeta`] into its protobuf representation.
 ///
-/// Fails only if the `Success` payload cannot be serialized to JSON; on
-/// failure the caller (a `store_result` call) gets a real error instead of
-/// silently storing `None` for the payload.
+/// Fails only if the `Success` payload or the extended-fields tail (see
+/// [`crate::task_meta_extra`]) cannot be serialized to JSON; on failure the
+/// caller (a `store_result` call) gets a real error instead of silently
+/// storing `None`/defaults for the payload.
 pub(crate) fn to_proto_meta(meta: &TaskMeta) -> Result<proto::TaskMeta> {
     let (result_state, result_data, error_message, retry_count) = match &meta.result {
         TaskResult::Pending => (TaskResultState::Pending, None, None, None),
@@ -50,6 +58,15 @@ pub(crate) fn to_proto_meta(meta: &TaskMeta) -> Result<proto::TaskMeta> {
         TaskResult::Revoked => (TaskResultState::Revoked, None, None, None),
         TaskResult::Retry(count) => (TaskResultState::Retry, None, None, Some(*count)),
     };
+
+    let extra_json = TaskMetaExtra::from_meta(meta)
+        .to_json_string()
+        .map_err(|e| {
+            BackendError::Serialization(format!(
+                "failed to encode extended fields for task {}: {e}",
+                meta.task_id
+            ))
+        })?;
 
     Ok(proto::TaskMeta {
         task_id: meta.task_id.to_string(),
@@ -71,16 +88,20 @@ pub(crate) fn to_proto_meta(meta: &TaskMeta) -> Result<proto::TaskMeta> {
             .map(|dt| dt.timestamp_subsec_nanos())
             .unwrap_or(0),
         worker: meta.worker.clone(),
+        extra_json: Some(extra_json),
     })
 }
 
 /// Convert a protobuf `TaskMeta` back into the domain type.
 ///
 /// Fails on an invalid result-state enum value, an invalid UUID, an
-/// out-of-range timestamp, or — critically — a `result_data` string that
-/// is present but fails to parse as JSON. A genuinely absent
-/// `result_data` on a `SUCCESS` state still decodes to `Value::Null`,
-/// which is the only case that should produce it.
+/// out-of-range timestamp, a `result_data` string that is present but
+/// fails to parse as JSON, or — critically — an `extra_json` string that is
+/// present but fails to parse (see [`crate::task_meta_extra`]). A
+/// genuinely absent `result_data` on a `SUCCESS` state still decodes to
+/// `Value::Null`, which is the only case that should produce it; likewise
+/// an absent `extra_json` decodes to all-default extended fields rather
+/// than an error.
 pub(crate) fn from_proto_meta(proto_meta: proto::TaskMeta) -> Result<TaskMeta> {
     let result_state = TaskResultState::try_from(proto_meta.result_state)
         .map_err(|_| BackendError::Serialization("Invalid result state".to_string()))?;
@@ -124,7 +145,14 @@ pub(crate) fn from_proto_meta(proto_meta: proto::TaskMeta) -> Result<TaskMeta> {
             .single()
     });
 
-    Ok(TaskMeta {
+    let extra = TaskMetaExtra::from_field(proto_meta.extra_json.as_deref()).map_err(|e| {
+        BackendError::Serialization(format!(
+            "corrupt extended fields for task {}: {e}",
+            proto_meta.task_id
+        ))
+    })?;
+
+    let mut meta = TaskMeta {
         task_id,
         task_name: proto_meta.task_name,
         result,
@@ -141,7 +169,9 @@ pub(crate) fn from_proto_meta(proto_meta: proto::TaskMeta) -> Result<TaskMeta> {
         memory_bytes: None,
         retries: None,
         queue: None,
-    })
+    };
+    extra.apply_to(&mut meta);
+    Ok(meta)
 }
 
 /// Convert a domain [`ChordState`] into its protobuf representation.
@@ -157,6 +187,9 @@ pub(crate) fn to_proto_chord(state: &ChordState) -> proto::ChordState {
         timeout_seconds: state.timeout.map(|d| d.as_secs()),
         cancelled: state.cancelled,
         cancellation_reason: state.cancellation_reason.clone(),
+        callback_on_success_link: state.callback_on_success_link.clone(),
+        retry_count: state.retry_count,
+        max_retries: state.max_retries,
     }
 }
 
@@ -179,6 +212,7 @@ pub(crate) fn from_proto_chord(proto_state: proto::ChordState) -> Result<ChordSt
         total: proto_state.total as usize,
         completed: proto_state.completed as usize,
         callback: proto_state.callback,
+        callback_on_success_link: proto_state.callback_on_success_link,
         task_ids: task_ids?,
         created_at: Utc
             .timestamp_opt(proto_state.created_at, proto_state.created_at_nanos)
@@ -187,8 +221,8 @@ pub(crate) fn from_proto_chord(proto_state: proto::ChordState) -> Result<ChordSt
         timeout: proto_state.timeout_seconds.map(Duration::from_secs),
         cancelled: proto_state.cancelled,
         cancellation_reason: proto_state.cancellation_reason,
-        retry_count: 0,
-        max_retries: None,
+        retry_count: proto_state.retry_count,
+        max_retries: proto_state.max_retries,
     })
 }
 
@@ -268,6 +302,41 @@ mod tests {
         }
     }
 
+    /// Regression test for the "extended fields are silently dropped"
+    /// class of bug: build a `TaskMeta` with every extended field
+    /// (`progress`, `version`, `tags`, `metadata`, `worker_hostname`,
+    /// `runtime_ms`, `memory_bytes`, `retries`, `queue`) set to a
+    /// non-default value, round-trip it through the codec, and assert
+    /// whole-struct equality (via the `PartialEq` derive on `TaskMeta`)
+    /// rather than checking fields one at a time — a field-by-field
+    /// assertion would keep passing even if `TaskMetaExtra` forgot a
+    /// field, whole-struct equality will not.
+    #[test]
+    fn test_full_task_meta_equality_round_trip() {
+        use celers_backend_redis::ProgressInfo;
+
+        let precise = Utc.timestamp_opt(1_700_000_000, 123_456_789).unwrap();
+        let mut meta = base_meta();
+        meta.result = TaskResult::Success(serde_json::json!({"answer": 42}));
+        meta.started_at = Some(precise);
+        meta.completed_at = Some(precise);
+        meta.worker = Some("worker-7".to_string());
+        meta.progress = Some(ProgressInfo::new(3, 10).with_message("almost there".to_string()));
+        meta.version = 5;
+        meta.tags = vec!["urgent".to_string(), "billing".to_string()];
+        meta.metadata
+            .insert("customer_id".to_string(), serde_json::json!(998));
+        meta.worker_hostname = Some("host-42".to_string());
+        meta.runtime_ms = Some(4321);
+        meta.memory_bytes = Some(1_048_576);
+        meta.retries = Some(1);
+        meta.queue = Some("high_priority".to_string());
+        meta.created_at = precise;
+
+        let decoded = from_proto_meta(to_proto_meta(&meta).unwrap()).unwrap();
+        assert_eq!(decoded, meta);
+    }
+
     #[test]
     fn test_chord_conversion_round_trips_all_fields() {
         let chord_state = ChordState {
@@ -275,13 +344,14 @@ mod tests {
             total: 5,
             completed: 0,
             callback: Some("callback_task".to_string()),
+            callback_on_success_link: Some("successor_task".to_string()),
             task_ids: vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()],
             created_at: Utc::now(),
             timeout: None,
             cancelled: false,
             cancellation_reason: None,
-            retry_count: 0,
-            max_retries: None,
+            retry_count: 1,
+            max_retries: Some(3),
         };
         let chord_id = chord_state.chord_id;
 
@@ -290,14 +360,49 @@ mod tests {
         assert_eq!(proto_chord.total, 5);
         assert_eq!(proto_chord.completed, 0);
         assert_eq!(proto_chord.callback, Some("callback_task".to_string()));
+        assert_eq!(
+            proto_chord.callback_on_success_link,
+            Some("successor_task".to_string())
+        );
         assert_eq!(proto_chord.task_ids.len(), 3);
+        assert_eq!(proto_chord.retry_count, 1);
+        assert_eq!(proto_chord.max_retries, Some(3));
 
         let converted = from_proto_chord(proto_chord).unwrap();
         assert_eq!(converted.chord_id, chord_id);
         assert_eq!(converted.total, 5);
         assert_eq!(converted.completed, 0);
         assert_eq!(converted.callback, Some("callback_task".to_string()));
+        assert_eq!(
+            converted.callback_on_success_link,
+            Some("successor_task".to_string())
+        );
         assert_eq!(converted.task_ids.len(), 3);
+        assert_eq!(converted.retry_count, 1);
+        assert_eq!(converted.max_retries, Some(3));
+    }
+
+    /// Regression test: before `to_proto_chord`/`from_proto_chord` carried
+    /// `retry_count`/`max_retries` across the wire, every `ChordState` that
+    /// passed through this codec lost its retry budget on decode
+    /// (`max_retries` always became `None`), which makes
+    /// `ChordState::can_retry()` — and therefore the `ResultBackend`
+    /// trait's default `chord_retry` — permanently return `false` for any
+    /// chord that had gone through a gRPC round trip, silently disabling
+    /// chord retries entirely.
+    #[test]
+    fn test_chord_retry_budget_survives_round_trip() {
+        let mut state = ChordState::new(Uuid::new_v4(), 2, vec![Uuid::new_v4(), Uuid::new_v4()]);
+        state.max_retries = Some(3);
+        state.retry_count = 1;
+
+        let converted = from_proto_chord(to_proto_chord(&state)).unwrap();
+        assert_eq!(converted.max_retries, Some(3));
+        assert_eq!(converted.retry_count, 1);
+        assert!(
+            converted.can_retry(),
+            "a chord with budget remaining must still be retryable after a round trip"
+        );
     }
 
     #[test]
@@ -384,6 +489,37 @@ mod tests {
         }
     }
 
+    /// Same corruption-must-not-be-swallowed guarantee as
+    /// `test_corrupt_result_data_is_a_decode_error_not_null`, but for the
+    /// `extra_json` tail: a present-but-malformed value must surface as a
+    /// decode error through the full `from_proto_meta` path, not just at
+    /// the lower-level `TaskMetaExtra::from_field` unit.
+    #[test]
+    fn test_corrupt_extra_json_is_a_decode_error() {
+        let meta = base_meta();
+        let mut proto_meta = to_proto_meta(&meta).unwrap();
+        proto_meta.extra_json = Some("{not valid json".to_string());
+
+        let err = from_proto_meta(proto_meta).expect_err("corrupt extra_json must not decode");
+        assert!(err.is_serialization());
+    }
+
+    /// A message from a writer that predates `extra_json` (field absent
+    /// entirely) must decode to all-default extended fields instead of
+    /// failing — this is the backward-compatibility path, distinct from
+    /// the "present but corrupt" path above.
+    #[test]
+    fn test_absent_extra_json_decodes_to_defaults() {
+        let meta = base_meta();
+        let mut proto_meta = to_proto_meta(&meta).unwrap();
+        proto_meta.extra_json = None;
+
+        let decoded = from_proto_meta(proto_meta).unwrap();
+        assert_eq!(decoded.version, 0);
+        assert!(decoded.tags.is_empty());
+        assert!(decoded.progress.is_none());
+    }
+
     #[test]
     fn test_chord_state_nanos_round_trip() {
         let precise = Utc.timestamp_opt(1_700_000_000, 42).unwrap();
@@ -392,6 +528,7 @@ mod tests {
             total: 2,
             completed: 0,
             callback: None,
+            callback_on_success_link: None,
             task_ids: vec![Uuid::new_v4()],
             created_at: precise,
             timeout: None,

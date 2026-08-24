@@ -16,13 +16,30 @@
 //!    function — to observe cancellation and return early.
 //!
 //! 2. **Revocation watching** ([`RevocationWatcher`] + [`RevocationPublisher`]).
-//!    The broker's revocation Pub/Sub is modelled as a
-//!    [`tokio::sync::broadcast`] channel of [`RevocationSignal`]s. The worker runs
-//!    a background watcher that subscribes to this channel and, for every signal,
-//!    trips the matching *in-flight* task's token via a shared
-//!    [`CancellationRegistry`]. A
-//!    real broker (e.g. Redis pub/sub) feeds the same channel; an in-process
-//!    publisher is provided for tests.
+//!    The worker's revocation channel is a [`tokio::sync::broadcast`] channel of
+//!    [`RevocationSignal`]s. The worker runs a background watcher that
+//!    subscribes to it and, for every signal, trips the matching *in-flight*
+//!    task's token via a shared [`CancellationRegistry`].
+//!
+//!    The channel is in-process; three things publish into it, and a worker may
+//!    use any combination:
+//!
+//!    - **A broker**, when the worker is built with
+//!      [`Worker::with_broker_revocation`](crate::Worker::with_broker_revocation):
+//!      a bridge subscribes to
+//!      [`Broker::subscribe_revocations`](celers_core::Broker::subscribe_revocations)
+//!      (Redis: the `<queue>:cancel` Pub/Sub channel) and forwards every notice
+//!      here. This is what makes `celers control revoke --terminate` issued from
+//!      another process abort a task running in this worker.
+//!    - **The remote control protocol**, when the worker is built with
+//!      [`Worker::with_control_transport`](crate::Worker::with_control_transport):
+//!      `ControlCommand::Revoke { terminate: true }` is applied straight through
+//!      [`RevocationWatcher::apply`].
+//!    - **The host application**, by holding a [`RevocationPublisher`] clone —
+//!      which is also how the tests in this module drive it.
+//!
+//!    A worker built with none of those has a watcher nothing can reach, which
+//!    is cooperative cancellation for in-process callers only.
 //!
 //! The worker combines the two by running the task future inside
 //! [`TaskExecutionContext::scope`] *and* racing it against
@@ -498,12 +515,16 @@ pub async fn load_checkpoint() -> Option<Checkpoint> {
         .await
 }
 
-/// A revocation signal published on the broker's cancellation Pub/Sub.
+/// A revocation signal on the worker's revocation channel.
 ///
-/// This is the in-process representation of a message a broker broadcasts when a
-/// task is revoked. A `terminate` signal asks the worker to abort the task if it
-/// is currently running; otherwise it merely records intent (handled elsewhere
-/// for not-yet-started tasks).
+/// This is the in-process representation of a
+/// [`RevocationNotice`](celers_core::RevocationNotice) — the message a broker
+/// broadcasts when a task is revoked. A `terminate` signal asks the worker to
+/// abort the task if it is currently running; a non-terminating one is
+/// deliberately inert here, because refusing a task that has *not* started is
+/// the job of the worker's
+/// [`WorkerRevocationManager`](celers_core::revocation::WorkerRevocationManager),
+/// which the same bridge writes to before publishing here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevocationSignal {
     /// The task to revoke.
@@ -532,10 +553,12 @@ impl RevocationSignal {
     }
 }
 
-/// Publisher side of the revocation Pub/Sub.
+/// Publisher side of the worker's revocation channel.
 ///
-/// A broker (or a control-command handler, or a test) publishes
-/// [`RevocationSignal`]s here; every [`RevocationWatcher`] subscribed to the
+/// The broker bridge installed by
+/// [`Worker::with_broker_revocation`](crate::Worker::with_broker_revocation)
+/// publishes [`RevocationSignal`]s here — as may a control-command handler, a
+/// host application or a test; every [`RevocationWatcher`] subscribed to the
 /// associated channel observes them. Cloning shares the same channel.
 #[derive(Clone)]
 pub struct RevocationPublisher {
@@ -584,15 +607,20 @@ impl Default for RevocationPublisher {
     }
 }
 
-/// Watches the broker's revocation Pub/Sub and trips the matching in-flight
+/// Watches the worker's revocation channel and trips the matching in-flight
 /// task's [`CancellationToken`].
 ///
 /// The watcher holds a shared [`CancellationRegistry`] (the same one the worker
 /// registers in-flight tasks into). For each [`RevocationSignal`] received it
 /// looks up the registry: if the task is currently in flight, its token is
 /// tripped (cooperative cancellation kicks in); if it is not in flight, the
-/// signal is ignored here (not-yet-started revocations are enforced at dequeue
-/// time by other machinery).
+/// signal is ignored *here* — see [`apply`](Self::apply) for what does enforce
+/// it.
+///
+/// Something has to feed the channel for any of this to happen; see the module
+/// documentation for the three publishers, of which
+/// [`Worker::with_broker_revocation`](crate::Worker::with_broker_revocation) is
+/// the one that reaches across processes.
 #[derive(Clone)]
 pub struct RevocationWatcher {
     registry: Arc<CancellationRegistry>,
@@ -650,7 +678,18 @@ impl RevocationWatcher {
     ///
     /// Exposed primarily for deterministic testing and for callers that already
     /// hold the signal; the running [`spawn`](Self::spawn) loop uses this
-    /// internally.
+    /// internally, and so does `ControlService`'s `Revoke` handler.
+    ///
+    /// A signal for a task that is *not* in flight returns `false` and does
+    /// nothing here, which is not the same as being ignored: the worker refuses
+    /// a not-yet-started task at dispatch, from its
+    /// [`WorkerRevocationManager`](celers_core::revocation::WorkerRevocationManager)
+    /// (written by the control handler and by the broker bridge) and, when
+    /// [`Worker::with_broker_revocation`](crate::Worker::with_broker_revocation)
+    /// is on, from the broker's persisted revoked-id set
+    /// ([`Broker::is_revoked`](celers_core::Broker::is_revoked)). A revoked
+    /// message is acknowledged and reported as
+    /// [`TaskEvent::Revoked`](celers_core::TaskEvent) rather than executed.
     pub async fn apply(&self, signal: &RevocationSignal) -> bool {
         if !signal.terminate {
             debug!(

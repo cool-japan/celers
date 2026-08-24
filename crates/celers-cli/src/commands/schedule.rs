@@ -6,7 +6,9 @@ use tabled::{settings::Style, Table, Tabled};
 /// List all scheduled tasks
 pub async fn list_schedules(broker_url: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!("{}", "=== Scheduled Tasks ===".bold().cyan());
     println!();
@@ -132,7 +134,9 @@ pub async fn add_schedule(
     args: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!("{}", "=== Add Scheduled Task ===".bold().cyan());
     println!();
@@ -226,7 +230,9 @@ pub async fn add_schedule(
 /// Remove a scheduled task
 pub async fn remove_schedule(broker_url: &str, name: &str, confirm: bool) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let schedule_key = format!("celers:schedule:{name}");
 
@@ -273,7 +279,9 @@ pub async fn remove_schedule(broker_url: &str, name: &str, confirm: bool) -> any
 /// Pause a schedule
 pub async fn pause_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let schedule_key = format!("celers:schedule:{name}");
 
@@ -316,7 +324,9 @@ pub async fn pause_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> 
 /// Resume a paused schedule
 pub async fn resume_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let schedule_key = format!("celers:schedule:{name}");
 
@@ -368,7 +378,9 @@ pub async fn resume_schedule(broker_url: &str, name: &str) -> anyhow::Result<()>
 /// Manually trigger a scheduled task
 pub async fn trigger_schedule(broker_url: &str, name: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let schedule_key = format!("celers:schedule:{name}");
 
@@ -439,7 +451,9 @@ pub async fn trigger_schedule(broker_url: &str, name: &str) -> anyhow::Result<()
 /// Show execution history for a schedule
 pub async fn schedule_history(broker_url: &str, name: &str, limit: usize) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!(
         "{}",

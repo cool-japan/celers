@@ -1020,6 +1020,8 @@ pub struct WorkerStats {
     processed: AtomicU64,
     /// Total number of tasks revoked (cancelled) since worker start
     revoked: AtomicU64,
+    /// Total number of retry attempts re-enqueued since worker start
+    retried: AtomicU64,
     /// Total number of tasks deferred due to distributed rate limiting
     rate_limited: AtomicU64,
     /// Total number of tasks deferred by admission control (routing, affinity,
@@ -1051,6 +1053,14 @@ impl WorkerStats {
     /// Get the number of tasks revoked (cancelled) during execution
     pub fn revoked(&self) -> u64 {
         self.revoked.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of retry attempts re-enqueued since worker start.
+    ///
+    /// Counts *attempts scheduled*, not distinct tasks: a task retried three
+    /// times contributes three.
+    pub fn retried(&self) -> u64 {
+        self.retried.load(Ordering::Relaxed)
     }
 
     /// Get the number of tasks deferred due to distributed rate limiting
@@ -1106,6 +1116,11 @@ impl WorkerStats {
         self.revoked.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record that a retry attempt was scheduled for a failed task
+    pub fn task_retried(&self) {
+        self.retried.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record that a task was deferred/skipped due to distributed rate limiting
     pub fn task_rate_limited(&self) {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -1133,6 +1148,7 @@ impl Clone for WorkerStats {
             active: AtomicU64::new(self.active.load(Ordering::Relaxed)),
             processed: AtomicU64::new(self.processed.load(Ordering::Relaxed)),
             revoked: AtomicU64::new(self.revoked.load(Ordering::Relaxed)),
+            retried: AtomicU64::new(self.retried.load(Ordering::Relaxed)),
             rate_limited: AtomicU64::new(self.rate_limited.load(Ordering::Relaxed)),
             deferred: AtomicU64::new(self.deferred.load(Ordering::Relaxed)),
             panicked: AtomicU64::new(self.panicked.load(Ordering::Relaxed)),

@@ -92,7 +92,9 @@ pub async fn profile_task(
     output: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
     let now = Utc::now();
     let days = days.max(1);
 
@@ -149,7 +151,9 @@ pub async fn profile_worker(
     output: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let worker_ids: Vec<String> = if let Some(id) = worker_id {
         vec![id.to_string()]
@@ -251,7 +255,9 @@ pub async fn profile_resources(
     output: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
     let now = Utc::now();
     let days = days.max(1);
 

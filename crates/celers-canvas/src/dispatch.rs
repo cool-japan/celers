@@ -584,4 +584,202 @@ mod tests {
             assert_eq!(*schedule, Schedule::Immediate);
         }
     }
+
+    #[test]
+    fn chunk_owned_splits_at_the_boundary_without_reordering() {
+        let items: Vec<u32> = (0..1201).collect();
+        let chunks = chunk_owned(items, 500);
+
+        assert_eq!(
+            chunks.len(),
+            3,
+            "1201 items at 500/chunk must yield 3 chunks"
+        );
+        assert_eq!(chunks[0].len(), 500);
+        assert_eq!(chunks[1].len(), 500);
+        assert_eq!(chunks[2].len(), 201, "the remainder forms its own chunk");
+
+        let flattened: Vec<u32> = chunks.into_iter().flatten().collect();
+        let expected: Vec<u32> = (0..1201).collect();
+        assert_eq!(
+            flattened, expected,
+            "chunking must not reorder, drop, or duplicate items"
+        );
+    }
+
+    #[test]
+    fn chunk_owned_exactly_at_the_boundary_is_a_single_chunk() {
+        let items: Vec<u32> = (0..500).collect();
+        let chunks = chunk_owned(items, 500);
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "exactly `chunk_size` items must not spill into a second chunk"
+        );
+        assert_eq!(chunks[0].len(), 500);
+    }
+
+    #[test]
+    fn chunk_owned_treats_a_zero_chunk_size_as_one() {
+        let chunks = chunk_owned(vec![1, 2, 3], 0);
+        assert_eq!(
+            chunks,
+            vec![vec![1], vec![2], vec![3]],
+            "a zero chunk size must not loop forever or panic"
+        );
+    }
+
+    #[test]
+    fn chunk_owned_empty_input_yields_no_chunks() {
+        let chunks: Vec<Vec<u32>> = chunk_owned(Vec::new(), 500);
+        assert!(chunks.is_empty());
+    }
+
+    /// Broker that only records the size of every `enqueue_batch`/`enqueue`
+    /// call it receives, so `dispatch_all`'s chunking can be verified without
+    /// a real broker.
+    #[derive(Default)]
+    struct BatchSizeRecordingBroker {
+        batch_sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl BatchSizeRecordingBroker {
+        fn batch_sizes(&self) -> Vec<usize> {
+            self.batch_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for BatchSizeRecordingBroker {
+        async fn enqueue(&self, task: SerializedTask) -> celers_core::Result<celers_core::TaskId> {
+            self.batch_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(1);
+            Ok(task.metadata.id)
+        }
+
+        async fn enqueue_batch(
+            &self,
+            tasks: Vec<SerializedTask>,
+        ) -> celers_core::Result<Vec<celers_core::TaskId>> {
+            self.batch_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(tasks.len());
+            Ok(tasks.into_iter().map(|task| task.metadata.id).collect())
+        }
+
+        async fn dequeue(&self) -> celers_core::Result<Option<celers_core::BrokerMessage>> {
+            Ok(None)
+        }
+
+        async fn ack(
+            &self,
+            _task_id: &celers_core::TaskId,
+            _receipt_handle: Option<&str>,
+        ) -> celers_core::Result<()> {
+            Ok(())
+        }
+
+        async fn reject(
+            &self,
+            _task_id: &celers_core::TaskId,
+            _receipt_handle: Option<&str>,
+            _requeue: bool,
+        ) -> celers_core::Result<()> {
+            Ok(())
+        }
+
+        async fn queue_size(&self) -> celers_core::Result<usize> {
+            Ok(0)
+        }
+
+        async fn cancel(&self, _task_id: &celers_core::TaskId) -> celers_core::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// Build `count` immediate tasks, all sharing `chord_id` when given.
+    fn immediate_tasks(count: usize, chord_id: Option<Uuid>) -> Vec<(SerializedTask, Schedule)> {
+        (0..count)
+            .map(|i| {
+                let mut task = SerializedTask::new(format!("t{i}"), Vec::new());
+                task.metadata.chord_id = chord_id;
+                (task, Schedule::Immediate)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dispatch_all_sends_exactly_the_boundary_count_as_one_batch() {
+        let broker = BatchSizeRecordingBroker::default();
+        let tasks = immediate_tasks(MAX_ENQUEUE_BATCH, None);
+
+        let ids = dispatch_all(&broker, tasks).await.expect("dispatch");
+
+        assert_eq!(ids.len(), MAX_ENQUEUE_BATCH);
+        assert_eq!(
+            broker.batch_sizes(),
+            vec![MAX_ENQUEUE_BATCH],
+            "exactly MAX_ENQUEUE_BATCH tasks must fit in a single enqueue_batch call"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_all_chunks_one_task_past_the_boundary() {
+        let broker = BatchSizeRecordingBroker::default();
+        let tasks = immediate_tasks(MAX_ENQUEUE_BATCH + 1, None);
+
+        let ids = dispatch_all(&broker, tasks).await.expect("dispatch");
+
+        assert_eq!(ids.len(), MAX_ENQUEUE_BATCH + 1);
+        assert_eq!(
+            broker.batch_sizes(),
+            vec![MAX_ENQUEUE_BATCH, 1],
+            "one task past the boundary must spill into its own second call"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_all_never_chunks_a_chord_header_even_when_oversized() {
+        let broker = BatchSizeRecordingBroker::default();
+        let chord_id = Uuid::new_v4();
+        let tasks = immediate_tasks(MAX_ENQUEUE_BATCH + 200, Some(chord_id));
+
+        let ids = dispatch_all(&broker, tasks).await.expect("dispatch");
+
+        assert_eq!(ids.len(), MAX_ENQUEUE_BATCH + 200);
+        assert_eq!(
+            broker.batch_sizes(),
+            vec![MAX_ENQUEUE_BATCH + 200],
+            "a chord header must go out in one call so its barrier (registered \
+             for the full count before dispatch) can never be short an entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_all_preserves_order_across_chunk_boundaries() {
+        let broker = BatchSizeRecordingBroker::default();
+        let tasks: Vec<(SerializedTask, Schedule)> = (0..(MAX_ENQUEUE_BATCH + 50))
+            .map(|i| {
+                (
+                    SerializedTask::new(format!("t{i}"), Vec::new()),
+                    Schedule::Immediate,
+                )
+            })
+            .collect();
+        let expected_ids: Vec<Uuid> = tasks.iter().map(|(task, _)| task.metadata.id).collect();
+
+        let ids = dispatch_all(&broker, tasks).await.expect("dispatch");
+
+        assert_eq!(
+            ids, expected_ids,
+            "returned ids must preserve the caller's original order across chunks"
+        );
+    }
 }

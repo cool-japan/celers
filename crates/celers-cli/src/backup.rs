@@ -367,6 +367,13 @@ fn is_totally_empty(backup: &Backup) -> bool {
 /// previous `KEYS celers:queue:*` implementation matched nothing any
 /// producer or worker ever wrote (idx 314), silently producing an
 /// always-empty backup.
+///
+/// A configured queue is included when *any* of its three buckets
+/// (pending/DLQ/delayed) is non-empty -- not only when its main queue key
+/// exists. A queue whose only activity so far is a delayed task (via
+/// `RedisBroker::enqueue_at`, with nothing yet pushed to the main queue or
+/// DLQ) has no main key at all, so gating on the main key alone used to
+/// silently drop that queue -- and its delayed task -- from every backup.
 fn capture_broker_state(broker_url: &str) -> Result<Backup> {
     // Connect to Redis
     let client = redis::Client::open(broker_url).context("Failed to create Redis client")?;
@@ -389,14 +396,6 @@ fn capture_broker_state(broker_url: &str) -> Result<Backup> {
             .arg(&main_key)
             .query(&mut con)
             .unwrap_or_else(|_| "none".to_string());
-
-        // A configured name nothing has ever enqueued to yet -- skip it
-        // rather than recording an empty queue in every backup.
-        if main_type == "none" {
-            continue;
-        }
-
-        println!("  Backing up queue: {}", queue_name.yellow());
 
         let pending_tasks: Vec<String> = match main_type.as_str() {
             "list" => con.lrange(&main_key, 0, -1).unwrap_or_default(),
@@ -422,6 +421,21 @@ fn capture_broker_state(broker_url: &str) -> Result<Backup> {
                 execute_at: score as i64,
             })
             .collect();
+
+        // A configured name nothing has ever enqueued to yet -- skip it
+        // rather than recording an empty queue in every backup. Checked
+        // against all three buckets, not just the main queue's `TYPE`: a
+        // queue whose only activity so far is a delayed task (via
+        // `RedisBroker::enqueue_at`, with nothing ever pushed to the main
+        // queue or DLQ yet) has `main_type == "none"` even though it very
+        // much has real, capture-worthy data in its `:delayed` ZSET -- the
+        // old `main_type == "none"` check alone silently dropped that queue
+        // (and its delayed task) from every backup.
+        if pending_tasks.is_empty() && dlq_tasks.is_empty() && delayed_tasks.is_empty() {
+            continue;
+        }
+
+        println!("  Backing up queue: {}", queue_name.yellow());
 
         let task_count = pending_tasks.len() + dlq_tasks.len() + delayed_tasks.len();
         total_tasks += task_count;
@@ -1150,7 +1164,9 @@ mod tests {
         if let Some(raw) = marker_entry {
             let client = redis::Client::open(broker_url).expect("client");
             let mut conn = client
-                .get_multiplexed_async_connection()
+                .get_multiplexed_async_connection_with_config(
+                    &crate::pool::async_connection_config(),
+                )
                 .await
                 .expect("conn");
             let _: usize = redis::cmd("LREM")
@@ -1164,11 +1180,16 @@ mod tests {
         let _ = std::fs::remove_file(&output_path);
     }
 
-    /// Regression test for the delayed-task score bug found alongside idx 314:
-    /// `capture_broker_state` used to `ZRANGE` delayed tasks without
-    /// `WITHSCORES`, discarding the real `execute_at` entirely. This proves a
-    /// delayed task enqueued via `RedisBroker::enqueue_at` is captured with
-    /// its actual score, not just its payload.
+    /// Regression test for two delayed-task bugs found alongside idx 314:
+    /// (1) `capture_broker_state` used to skip a queue entirely unless its
+    /// *main* key existed, so a queue whose only activity is a delayed task
+    /// (nothing yet pushed to the main queue) was silently dropped from
+    /// every backup regardless of its `:delayed` ZSET; (2) even when
+    /// captured, delayed tasks were `ZRANGE`d without `WITHSCORES`,
+    /// discarding the real `execute_at` entirely. This proves a delayed
+    /// task enqueued via `RedisBroker::enqueue_at` -- with nothing else ever
+    /// pushed to that queue -- is captured at all, and with its actual
+    /// score, not just its payload.
     #[tokio::test]
     async fn backup_captures_delayed_task_execute_at_score() {
         let broker_url = "redis://127.0.0.1:6379";
@@ -1240,7 +1261,9 @@ mod tests {
         if let Some(entry) = marker_entry {
             let client = redis::Client::open(broker_url).expect("client");
             let mut conn = client
-                .get_multiplexed_async_connection()
+                .get_multiplexed_async_connection_with_config(
+                    &crate::pool::async_connection_config(),
+                )
                 .await
                 .expect("conn");
             let _: usize = redis::cmd("ZREM")
@@ -1303,7 +1326,7 @@ mod tests {
 
         let client = redis::Client::open(broker_url).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let score: Option<f64> = redis::cmd("ZSCORE")

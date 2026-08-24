@@ -14,7 +14,7 @@
 //! The [`ResultBackend`] trait requires `&mut self` for every operation,
 //! so a single backend instance cannot be shared across concurrent gRPC
 //! calls without external synchronization. [`RpcBackendServer`] wraps the
-//! backend in a `tokio::sync::Mutex`, serializing all seven RPCs through
+//! backend in a `tokio::sync::Mutex`, serializing all eight RPCs through
 //! one critical section per server instance. This is intentionally
 //! coarse — every request, even on unrelated task/chord ids, waits for
 //! the previous one to finish — but it is also *trivially correct*:
@@ -207,6 +207,23 @@ impl<B: ResultBackend + 'static> ResultBackendService for RpcBackendServer<B> {
         Ok(Response::new(proto::ChordInitResponse { success: true }))
     }
 
+    async fn chord_update_state(
+        &self,
+        request: Request<proto::ChordUpdateStateRequest>,
+    ) -> Result<Response<proto::ChordUpdateStateResponse>, Status> {
+        let req = request.into_inner();
+        let proto_state = req
+            .state
+            .ok_or_else(|| Status::invalid_argument("state is required"))?;
+        let state = codec::from_proto_chord(proto_state).map_err(to_status)?;
+
+        let mut backend = self.backend.lock().await;
+        backend.chord_update_state(state).await.map_err(to_status)?;
+        Ok(Response::new(proto::ChordUpdateStateResponse {
+            success: true,
+        }))
+    }
+
     async fn chord_complete_task(
         &self,
         request: Request<proto::ChordCompleteTaskRequest>,
@@ -296,7 +313,27 @@ mod tests {
             Ok(())
         }
 
-        async fn chord_init(&mut self, state: ChordState) -> celers_backend_redis::Result<()> {
+        async fn chord_init(&mut self, mut state: ChordState) -> celers_backend_redis::Result<()> {
+            // Mirror `RedisResultBackend::chord_init`'s documented
+            // create-or-reset contract (see `ResultBackend::chord_update_state`'s
+            // doc comment): this always zeroes the completion counter,
+            // regardless of what the caller's `state.completed` says. This
+            // is deliberate, not an oversight — it is what makes
+            // `test_chord_cancel_over_rpc_preserves_completed_count` below a
+            // real regression test instead of a vacuous one: without it, a
+            // buggy `chord_update_state` that silently falls back to
+            // `chord_init` would look indistinguishable from a correct one.
+            state.completed = 0;
+            self.chords.insert(state.chord_id, state);
+            Ok(())
+        }
+
+        async fn chord_update_state(
+            &mut self,
+            state: ChordState,
+        ) -> celers_backend_redis::Result<()> {
+            // Persists a state mutation (cancellation, callback change, ...)
+            // WITHOUT resetting the completion counter, unlike `chord_init`.
             self.chords.insert(state.chord_id, state);
             Ok(())
         }
@@ -357,6 +394,24 @@ mod tests {
         meta.result = TaskResult::Success(serde_json::json!({"answer": 42}));
         meta.started_at = Some(utc_now_with_nanos());
         meta.completed_at = Some(utc_now_with_nanos());
+        // Populate every extended field too: `store_result`/`get_result`
+        // here go over a real tonic-encoded wire (unlike the in-process
+        // `codec::to_proto_meta`/`from_proto_meta` unit tests), so this is
+        // what actually proves `extra_json` (proto field 14) round-trips
+        // through prost end to end, not just through the Rust functions
+        // that build and parse it.
+        meta.worker = Some("worker-9".to_string());
+        meta.progress =
+            Some(celers_backend_redis::ProgressInfo::new(1, 2).with_message("halfway".to_string()));
+        meta.version = 3;
+        meta.tags = vec!["wire".to_string(), "test".to_string()];
+        meta.metadata
+            .insert("k".to_string(), serde_json::json!("v"));
+        meta.worker_hostname = Some("host-wire".to_string());
+        meta.runtime_ms = Some(777);
+        meta.memory_bytes = Some(2048);
+        meta.retries = Some(1);
+        meta.queue = Some("default".to_string());
 
         // Nothing stored yet.
         assert!(
@@ -367,7 +422,8 @@ mod tests {
         );
 
         // Store, then read back byte-for-byte (including sub-second
-        // timestamps and the JSON payload).
+        // timestamps, the JSON payload, and every extended field) across
+        // the real gRPC wire.
         <GrpcResultBackend as ResultBackend>::store_result(&mut client, task_id, &meta)
             .await
             .expect("store_result failed");
@@ -376,11 +432,11 @@ mod tests {
             .await
             .expect("get_result failed")
             .expect("expected a stored result");
-        assert_eq!(fetched.task_id, task_id);
-        assert_eq!(fetched.task_name, "round_trip_task");
-        assert_eq!(fetched.started_at, meta.started_at);
-        assert_eq!(fetched.completed_at, meta.completed_at);
-        match fetched.result {
+        assert_eq!(
+            fetched, meta,
+            "TaskMeta must round-trip byte-for-byte over the wire, extended fields included"
+        );
+        match &fetched.result {
             TaskResult::Success(v) => assert_eq!(v["answer"], 42),
             other => panic!("expected Success, got {other:?}"),
         }
@@ -429,6 +485,86 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("server task panicked")
+            .expect("server returned an error");
+    }
+
+    /// Regression test: `ResultBackend::chord_cancel`'s default
+    /// implementation reads the current state, mutates it locally
+    /// (`cancelled = true`), then persists via `chord_update_state` — a
+    /// method that must *not* reset the completion counter. Before
+    /// `GrpcResultBackend` overrode `chord_update_state`, it fell through
+    /// to the trait's own default, which delegates to `chord_init` — a
+    /// create-or-reset primitive. Over the wire that meant cancelling a
+    /// chord silently wiped out every task that had already completed.
+    ///
+    /// This only reproduces the bug because `InMemoryBackend::chord_init`
+    /// (above) faithfully mirrors `RedisResultBackend`'s real "always
+    /// zeroes the counter" behavior instead of a no-op passthrough — see
+    /// its doc comment.
+    #[tokio::test]
+    async fn test_chord_cancel_over_rpc_preserves_completed_count() {
+        let (incoming, addr) = bind_loopback();
+        let server = RpcBackendServer::new(InMemoryBackend::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(server.into_service())
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = GrpcResultBackend::connect(&format!("http://{addr}"))
+            .await
+            .expect("client failed to connect to in-process server");
+
+        let chord_id = Uuid::new_v4();
+        let task_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let state = ChordState::new(chord_id, 3, task_ids);
+        <GrpcResultBackend as ResultBackend>::chord_init(&mut client, state)
+            .await
+            .expect("chord_init failed");
+
+        // Two of the three tasks finish before anyone cancels.
+        <GrpcResultBackend as ResultBackend>::chord_complete_task(&mut client, chord_id)
+            .await
+            .expect("chord_complete_task failed");
+        let completed_before_cancel =
+            <GrpcResultBackend as ResultBackend>::chord_complete_task(&mut client, chord_id)
+                .await
+                .expect("chord_complete_task failed");
+        assert_eq!(completed_before_cancel, 2);
+
+        // Cancelling must preserve the two already-completed tasks, not
+        // reset the counter back to zero.
+        <GrpcResultBackend as ResultBackend>::chord_cancel(
+            &mut client,
+            chord_id,
+            Some("operator requested".to_string()),
+        )
+        .await
+        .expect("chord_cancel failed");
+
+        let fetched = <GrpcResultBackend as ResultBackend>::chord_get_state(&mut client, chord_id)
+            .await
+            .expect("chord_get_state failed")
+            .expect("expected a stored chord state");
+        assert!(fetched.cancelled, "chord must be marked cancelled");
+        assert_eq!(
+            fetched.cancellation_reason.as_deref(),
+            Some("operator requested")
+        );
+        assert_eq!(
+            fetched.completed, 2,
+            "cancelling a chord must not reset already-completed tasks to 0"
         );
 
         let _ = shutdown_tx.send(());

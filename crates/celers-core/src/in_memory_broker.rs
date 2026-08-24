@@ -67,14 +67,28 @@
 //! ```
 
 use crate::result::{ResultStore, TaskResultValue};
+use crate::revocation_channel::{RevocationNotice, RevocationStream};
 use crate::state::TaskState;
 use crate::{BrokerMessage, CelersError, Result, SerializedTask, TaskId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tokio::time::Instant;
 use uuid::Uuid;
+
+/// How long an in-memory revocation is remembered by default.
+///
+/// A revoked-id set has to forget eventually or it grows without bound; an hour
+/// is far longer than the lifetime of a queued message in any test or local
+/// development run, which is what this broker is for.
+pub const DEFAULT_REVOCATION_TTL: Duration = Duration::from_secs(3600);
+
+/// Buffer depth of the in-memory revocation broadcast channel.
+///
+/// A subscriber that falls this far behind skips the overflow and reports it
+/// (`tokio::sync::broadcast`'s contract) rather than blocking the revoker.
+const REVOCATION_CHANNEL_CAPACITY: usize = 256;
 
 /// A single entry in the in-memory ready queue.
 ///
@@ -112,6 +126,15 @@ struct BrokerState {
     /// dropped at dequeue time (for ready tasks) or refused requeue (for
     /// in-flight tasks).
     cancelled: HashMap<TaskId, ()>,
+    /// Persisted revoked-id set: task id to the instant its revocation expires.
+    ///
+    /// This is the in-memory equivalent of `celers_broker_redis`'s
+    /// `<queue>:revoked` sorted set. Unlike `cancelled` it survives the task it
+    /// refers to — a task revoked *before* it is enqueued is still refused when
+    /// it arrives, which is what
+    /// [`Broker::is_revoked`](crate::Broker::is_revoked) reports to a worker at
+    /// dequeue time.
+    revoked: HashMap<TaskId, Instant>,
 }
 
 impl BrokerState {
@@ -165,6 +188,23 @@ impl BrokerState {
     fn next_due(&self) -> Option<Instant> {
         self.scheduled.first().map(|entry| entry.due_at)
     }
+
+    /// Drop revocations whose lifetime has passed.
+    ///
+    /// Pruning on every read keeps the set bounded without a sweeper task, the
+    /// same way the Redis `revoke` script prunes by score on every call.
+    fn prune_revoked(&mut self, now: Instant) {
+        if self.revoked.is_empty() {
+            return;
+        }
+        self.revoked.retain(|_, expires_at| *expires_at > now);
+    }
+
+    /// Whether `task_id` is currently revoked (expired entries pruned first).
+    fn is_revoked(&mut self, task_id: &TaskId, now: Instant) -> bool {
+        self.prune_revoked(now);
+        self.revoked.contains_key(task_id)
+    }
 }
 
 /// A fully in-memory implementation of the [`Broker`](crate::Broker) trait.
@@ -199,6 +239,13 @@ pub struct InMemoryBroker {
     ready_permits: Semaphore,
     /// Monotonic sequence counter for FIFO tie-breaking.
     seq: AtomicU64,
+    /// The revocation channel [`Broker::subscribe_revocations`] hands out.
+    ///
+    /// The broker owns the sender for its whole life, so a subscription only
+    /// ends when the broker is dropped.
+    revocations: broadcast::Sender<RevocationNotice>,
+    /// How long a recorded revocation is remembered.
+    revocation_ttl: Duration,
 }
 
 impl Default for InMemoryBroker {
@@ -211,11 +258,52 @@ impl InMemoryBroker {
     /// Create a new, empty in-memory broker.
     #[must_use]
     pub fn new() -> Self {
+        let (revocations, _rx) = broadcast::channel(REVOCATION_CHANNEL_CAPACITY);
         Self {
             state: Mutex::new(BrokerState::default()),
             ready_permits: Semaphore::new(0),
             seq: AtomicU64::new(0),
+            revocations,
+            revocation_ttl: DEFAULT_REVOCATION_TTL,
         }
+    }
+
+    /// Set how long a revocation recorded by
+    /// [`revoke`](crate::Broker::revoke) / [`cancel`](crate::Broker::cancel) is
+    /// remembered.
+    ///
+    /// The default is [`DEFAULT_REVOCATION_TTL`]. Shorten it to exercise expiry
+    /// in a test; a revocation that has expired stops refusing the task, exactly
+    /// as an expired entry in the Redis broker's `<queue>:revoked` set does.
+    #[must_use]
+    pub fn with_revocation_ttl(mut self, ttl: Duration) -> Self {
+        self.revocation_ttl = ttl;
+        self
+    }
+
+    /// How long a recorded revocation is remembered.
+    #[must_use]
+    pub fn revocation_ttl(&self) -> Duration {
+        self.revocation_ttl
+    }
+
+    /// Number of unexpired entries in the persisted revoked-id set.
+    ///
+    /// Expired entries are pruned by this call, so the count is the number of
+    /// revocations still in force.
+    pub async fn revoked_len(&self) -> usize {
+        let mut guard = self.state.lock().await;
+        guard.prune_revoked(Instant::now());
+        guard.revoked.len()
+    }
+
+    /// Number of live subscriptions to this broker's revocation channel.
+    ///
+    /// Primarily useful for tests: it is how a test can wait until a worker's
+    /// revocation bridge has actually attached before publishing.
+    #[must_use]
+    pub fn revocation_subscriber_count(&self) -> usize {
+        self.revocations.receiver_count()
     }
 
     /// Number of tasks that have been delivered but not yet acknowledged.
@@ -249,14 +337,16 @@ impl InMemoryBroker {
         guard.ready.is_empty() && guard.in_flight.is_empty() && guard.scheduled.is_empty()
     }
 
-    /// Remove every task from the broker (ready, scheduled, in-flight, and
-    /// cancellation markers). Mainly intended for resetting state between tests.
+    /// Remove every task from the broker (ready, scheduled, in-flight,
+    /// cancellation markers and recorded revocations). Mainly intended for
+    /// resetting state between tests.
     pub async fn clear(&self) {
         let mut guard = self.state.lock().await;
         guard.ready.clear();
         guard.scheduled.clear();
         guard.in_flight.clear();
         guard.cancelled.clear();
+        guard.revoked.clear();
     }
 
     /// Release `count` ready permits (one per newly deliverable entry).
@@ -341,6 +431,77 @@ impl InMemoryBroker {
         let receipt = Uuid::new_v4().to_string();
         state.in_flight.insert(receipt.clone(), task.clone());
         Some(BrokerMessage::with_receipt_handle(task, receipt))
+    }
+
+    /// Remove every pending copy of `task_id`, returning whether the broker
+    /// knew about the task at all.
+    ///
+    /// A ready or not-yet-due task is dropped outright; a task that is already
+    /// in flight gets a cancellation marker instead, so a later requeue is
+    /// suppressed rather than putting the task back on the queue.
+    async fn drop_pending(&self, task_id: &TaskId) -> bool {
+        let mut guard = self.state.lock().await;
+
+        // Try to remove the task directly from the ready queue first.
+        if let Some(pos) = guard
+            .ready
+            .iter()
+            .position(|entry| entry.task.metadata.id == *task_id)
+        {
+            guard.ready.remove(pos);
+            // Also drop any stale cancellation marker for this id.
+            guard.cancelled.remove(task_id);
+            drop(guard);
+            self.consume_permit_best_effort();
+            return true;
+        }
+
+        // A task still waiting for its scheduled delivery time can simply be
+        // dropped; it never released a ready permit.
+        if let Some(pos) = guard
+            .scheduled
+            .iter()
+            .position(|scheduled| scheduled.entry.task.metadata.id == *task_id)
+        {
+            guard.scheduled.remove(pos);
+            guard.cancelled.remove(task_id);
+            return true;
+        }
+
+        // If the task is currently in flight, record a cancellation marker so
+        // that a subsequent requeue is suppressed. Report success because the
+        // task is known to the broker.
+        let in_flight = guard
+            .in_flight
+            .values()
+            .any(|task| task.metadata.id == *task_id);
+        if in_flight {
+            guard.cancelled.insert(*task_id, ());
+            return true;
+        }
+
+        false
+    }
+}
+
+/// A subscription to an [`InMemoryBroker`]'s revocation channel.
+struct InMemoryRevocationStream {
+    rx: broadcast::Receiver<RevocationNotice>,
+}
+
+#[async_trait::async_trait]
+impl RevocationStream for InMemoryRevocationStream {
+    async fn recv(&mut self) -> Result<Option<RevocationNotice>> {
+        match self.rx.recv().await {
+            Ok(notice) => Ok(Some(notice)),
+            // Only reachable once the broker itself is dropped.
+            Err(broadcast::error::RecvError::Closed) => Ok(None),
+            // Dropping revocations silently is how a revoked task keeps
+            // running; report it and let the caller keep reading.
+            Err(broadcast::error::RecvError::Lagged(skipped)) => Err(CelersError::Other(format!(
+                "revocation subscriber lagged, {skipped} notice(s) skipped"
+            ))),
+        }
     }
 }
 
@@ -456,46 +617,41 @@ impl crate::Broker for InMemoryBroker {
     }
 
     async fn cancel(&self, task_id: &TaskId) -> Result<bool> {
+        // A plain cancel is a non-terminating revocation: it stops the task
+        // from starting but never aborts a copy that is already running.
+        self.revoke(task_id, false).await
+    }
+
+    async fn revoke(&self, task_id: &TaskId, terminate: bool) -> Result<bool> {
+        // Record first, so a task enqueued between the purge below and the
+        // caller's next action is still refused at dequeue time.
+        {
+            let mut guard = self.state.lock().await;
+            let expires_at = Instant::now() + self.revocation_ttl;
+            guard.revoked.insert(*task_id, expires_at);
+            guard.prune_revoked(Instant::now());
+        }
+
+        let found = self.drop_pending(task_id).await;
+
+        // Fire-and-forget, exactly like a broker's Pub/Sub: an error here means
+        // nobody is subscribed, which is not a failure to revoke.
+        let _ = self
+            .revocations
+            .send(RevocationNotice::new(*task_id, terminate));
+
+        Ok(found)
+    }
+
+    async fn is_revoked(&self, task_id: &TaskId) -> Result<bool> {
         let mut guard = self.state.lock().await;
-        // Try to remove the task directly from the ready queue first.
-        if let Some(pos) = guard
-            .ready
-            .iter()
-            .position(|entry| entry.task.metadata.id == *task_id)
-        {
-            guard.ready.remove(pos);
-            // Also drop any stale cancellation marker for this id.
-            guard.cancelled.remove(task_id);
-            drop(guard);
-            self.consume_permit_best_effort();
-            return Ok(true);
-        }
+        Ok(guard.is_revoked(task_id, Instant::now()))
+    }
 
-        // A task still waiting for its scheduled delivery time can simply be
-        // dropped; it never released a ready permit.
-        if let Some(pos) = guard
-            .scheduled
-            .iter()
-            .position(|scheduled| scheduled.entry.task.metadata.id == *task_id)
-        {
-            guard.scheduled.remove(pos);
-            guard.cancelled.remove(task_id);
-            return Ok(true);
-        }
-
-        // If the task is currently in flight, record a cancellation marker so
-        // that a subsequent requeue is suppressed. Report success because the
-        // task is known to the broker.
-        let in_flight = guard
-            .in_flight
-            .values()
-            .any(|task| task.metadata.id == *task_id);
-        if in_flight {
-            guard.cancelled.insert(*task_id, ());
-            return Ok(true);
-        }
-
-        Ok(false)
+    async fn subscribe_revocations(&self) -> Result<Option<Box<dyn RevocationStream>>> {
+        Ok(Some(Box::new(InMemoryRevocationStream {
+            rx: self.revocations.subscribe(),
+        })))
     }
 
     async fn enqueue_batch(&self, tasks: Vec<SerializedTask>) -> Result<Vec<TaskId>> {
@@ -834,6 +990,91 @@ mod tests {
         assert_eq!(broker.queue_size().await.unwrap(), 0);
         // Cancelling an unknown task returns false.
         assert!(!broker.cancel(&id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancel_records_a_durable_revocation() {
+        // The revoked-id set outlives the message: a task revoked before it is
+        // enqueued must still be refused when it arrives, which is what the
+        // worker's dequeue-time `is_revoked` check reports on.
+        let broker = InMemoryBroker::new();
+        let id = Uuid::new_v4();
+        assert!(!broker.is_revoked(&id).await.unwrap());
+
+        // Nothing queued yet, so no pending copy was found...
+        assert!(!broker.cancel(&id).await.unwrap());
+        // ...but the revocation is recorded all the same.
+        assert!(broker.is_revoked(&id).await.unwrap());
+        assert_eq!(broker.revoked_len().await, 1);
+
+        let mut queued = task("a");
+        queued.metadata.id = id;
+        broker.enqueue(queued).await.unwrap();
+        let msg = broker.dequeue().await.unwrap().unwrap();
+        assert_eq!(msg.task_id(), id);
+        assert!(
+            broker.is_revoked(&msg.task_id()).await.unwrap(),
+            "a message enqueued after the revocation is still revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revocation_expires_with_its_ttl() {
+        let broker = InMemoryBroker::new().with_revocation_ttl(Duration::from_millis(30));
+        assert_eq!(broker.revocation_ttl(), Duration::from_millis(30));
+
+        let id = Uuid::new_v4();
+        broker.cancel(&id).await.unwrap();
+        assert!(broker.is_revoked(&id).await.unwrap());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !broker.is_revoked(&id).await.unwrap(),
+            "an expired revocation must stop refusing the task"
+        );
+        assert_eq!(broker.revoked_len().await, 0, "expired entries are pruned");
+    }
+
+    #[tokio::test]
+    async fn revoke_publishes_a_notice_carrying_the_terminate_flag() {
+        let broker = InMemoryBroker::new();
+        let mut stream = broker
+            .subscribe_revocations()
+            .await
+            .unwrap()
+            .expect("the in-memory broker has a revocation channel");
+        assert_eq!(broker.revocation_subscriber_count(), 1);
+
+        let terminated = Uuid::new_v4();
+        broker.revoke(&terminated, true).await.unwrap();
+        let notice = stream.recv().await.unwrap().expect("a notice arrives");
+        assert_eq!(notice, RevocationNotice::terminate(terminated));
+
+        // A plain `cancel` is the non-terminating form.
+        let ignored = Uuid::new_v4();
+        broker.cancel(&ignored).await.unwrap();
+        let notice = stream.recv().await.unwrap().expect("a notice arrives");
+        assert_eq!(notice, RevocationNotice::ignore(ignored));
+    }
+
+    #[tokio::test]
+    async fn revoking_with_no_subscriber_is_not_an_error() {
+        // Fire-and-forget Pub/Sub semantics: revoking into an empty cluster
+        // still records the revocation.
+        let broker = InMemoryBroker::new();
+        let id = Uuid::new_v4();
+        assert_eq!(broker.revocation_subscriber_count(), 0);
+        broker.revoke(&id, true).await.unwrap();
+        assert!(broker.is_revoked(&id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_forgets_recorded_revocations() {
+        let broker = InMemoryBroker::new();
+        let id = Uuid::new_v4();
+        broker.cancel(&id).await.unwrap();
+        broker.clear().await;
+        assert!(!broker.is_revoked(&id).await.unwrap());
     }
 
     #[tokio::test]

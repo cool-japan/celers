@@ -20,6 +20,7 @@ pub enum RpcOperation {
     DeleteResult,
     SetExpiration,
     ChordInit,
+    ChordUpdateState,
     ChordCompleteTask,
     ChordGetState,
 }
@@ -33,6 +34,7 @@ impl RpcOperation {
             RpcOperation::DeleteResult,
             RpcOperation::SetExpiration,
             RpcOperation::ChordInit,
+            RpcOperation::ChordUpdateState,
             RpcOperation::ChordCompleteTask,
             RpcOperation::ChordGetState,
         ]
@@ -426,7 +428,7 @@ mod tests {
         for op in RpcOperation::all() {
             assert!(snap.operations.contains_key(op), "missing {:?}", op);
         }
-        assert_eq!(snap.operations.len(), 7);
+        assert_eq!(snap.operations.len(), 8);
     }
 
     #[test]

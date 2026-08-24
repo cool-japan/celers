@@ -3,11 +3,13 @@
 use crate::cache::{CacheStats, TtlCache};
 use crate::config::CacheConfig;
 use crate::pool::pooled_redis_connection;
-use celers_broker_redis::{QueueMode, RedisBroker};
-use celers_worker::{wait_for_signal, Worker, WorkerConfig};
+use celers_broker_redis::{QueueMode, RedisBroker, RedisControlTransport};
+use celers_core::time_limit::WorkerTimeLimits;
+use celers_core::ControlTransport;
+use celers_worker::{wait_for_signal, RevocationWatcher, Worker, WorkerConfig};
 use chrono::Utc;
 use colored::Colorize;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tabled::{settings::Style, Table, Tabled};
 
 /// A single row of [`list_workers`]'s output; cached as plain data (as
@@ -175,14 +177,25 @@ pub async fn start_worker(
         poll_interval_ms: 1000,
         max_retries,
         default_timeout_secs: timeout,
+        queue_name: queue.to_string(),
         ..Default::default()
     };
+    let hostname = config.hostname.clone();
+
+    // Join the remote control channel so `celers inspect` / `celers control`
+    // can reach this worker. Without it the worker runs fine but is invisible
+    // to those commands, which is the sort of thing an operator only discovers
+    // during an incident.
+    let control_transport = RedisControlTransport::new(broker_url)?;
+    let control_channel = control_transport.channel().to_string();
 
     println!();
     println!("Worker configuration:");
+    println!("  Hostname: {}", hostname.yellow());
     println!("  Concurrency: {}", concurrency.to_string().yellow());
     println!("  Max retries: {}", max_retries.to_string().yellow());
     println!("  Timeout: {}s", timeout.to_string().yellow());
+    println!("  Control channel: {}", control_channel.yellow());
     println!();
 
     // Create worker and start it with a real shutdown handshake:
@@ -194,9 +207,29 @@ pub async fn start_worker(
     // in-flight task mid-execution with no ack/nack/requeue -- recovery
     // depended entirely on the broker's visibility timeout expiring (idx
     // 336).
-    let worker = Worker::new(broker, registry, config);
+    let worker = Worker::new(broker, registry, config)
+        .with_control_transport(Arc::new(control_transport) as Arc<dyn ControlTransport>)
+        .with_broker_url(broker_url)
+        // Both of these are no-ops until an operator uses them, and both are
+        // what makes `celers control time-limit` / `celers control revoke
+        // --terminate` do something instead of reporting "not configured":
+        // the limits manager starts empty, and the revocation watcher only
+        // trips tasks it is told to.
+        .with_time_limits(WorkerTimeLimits::new())
+        .with_revocation_watcher(RevocationWatcher::new())
+        // And this is what feeds that watcher from outside the process: the
+        // worker subscribes to the queue's revocation channel and checks the
+        // queue's durable revoked set before running anything it dequeues, so
+        // `celers control revoke` works even for a task revoked while this
+        // worker was starting up.
+        .with_broker_revocation();
     let handle = worker.run_with_shutdown().await?;
     println!("{}", "✓ Worker started successfully".green().bold());
+    println!(
+        "  Reachable as {} via `celers inspect ping --broker {}`",
+        hostname.cyan(),
+        broker_url.cyan()
+    );
     println!("{}", "  Press Ctrl+C to stop gracefully".dimmed());
     println!();
 
@@ -544,7 +577,9 @@ fn render_worker_stats(worker_id: &str, snapshot: &WorkerStatsSnapshot) {
 /// Stop a specific worker
 pub async fn stop_worker(broker_url: &str, worker_id: &str, graceful: bool) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!(
         "{}",
@@ -625,7 +660,9 @@ pub async fn stop_worker(broker_url: &str, worker_id: &str, graceful: bool) -> a
 /// this command can report (idx 324).
 pub async fn pause_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let pause_key = format!("celers:worker:{worker_id}:paused");
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -678,7 +715,9 @@ pub async fn pause_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<(
 /// reports the real subscriber count instead of an unconditional "✓".
 pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     let pause_key = format!("celers:worker:{worker_id}:paused");
 
@@ -739,7 +778,9 @@ pub async fn resume_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<
 /// Scale workers to N instances
 pub async fn scale_workers(broker_url: &str, target_count: usize) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!(
         "{}",
@@ -803,7 +844,9 @@ pub async fn scale_workers(broker_url: &str, target_count: usize) -> anyhow::Res
 /// Drain worker (stop accepting new tasks)
 pub async fn drain_worker(broker_url: &str, worker_id: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(broker_url)?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
+        .await?;
 
     println!(
         "{}",
@@ -913,7 +956,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let _: () = redis::cmd("SET")

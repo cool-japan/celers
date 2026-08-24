@@ -11,9 +11,11 @@ use std::path::PathBuf;
 
 use super::types::{
     AlertCommands, AliasCommands, AnalyzeCommands, AutoscaleCommands, Cli, Commands,
-    ConfigCommands, DbCommands, DebugCommands, DlqCommands, ProfileCommands, QueueCommands,
-    ReportCommands, ScheduleCommands, TaskCommands, WorkerMgmtCommands,
+    ConfigCommands, ControlArgs, ControlCommands, DbCommands, DebugCommands, DlqCommands,
+    InspectCommands, ProfileCommands, QueueCommands, ReportCommands, ScheduleCommands,
+    TaskCommands, WorkerMgmtCommands,
 };
+use celers_core::control::{ControlCommand, InspectCommand};
 
 /// Every top-level `celers` subcommand name, in kebab-case (matching clap's
 /// default `Subcommand` rename rule). Passed as the `reserved_names` guard to
@@ -42,6 +44,8 @@ const RESERVED_COMMAND_NAMES: &[&str] = &[
     "manpages",
     "health",
     "worker-mgmt",
+    "inspect",
+    "control",
     "doctor",
     "schedule",
     "debug",
@@ -73,6 +77,32 @@ fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<crate::config::Co
         ..Default::default()
     };
     crate::config_layer::resolve_config(&args)
+}
+
+/// Resolve the shared `inspect`/`control` options through the usual precedence
+/// chain (CLI arg > environment > config file > default).
+fn control_options(args: ControlArgs) -> anyhow::Result<crate::commands::ControlOptions> {
+    let cfg = load_config(args.config)?;
+    let mut options = crate::commands::ControlOptions::new(args.broker.unwrap_or(cfg.broker.url));
+    options.channel = args.channel;
+    options.timeout_secs = args.timeout;
+    options.destination = args.destination;
+    options.json = args.json;
+    Ok(options)
+}
+
+/// Parse task ids for a revoke command, naming the offending value.
+///
+/// Rejecting the whole command on a malformed id is deliberate: revoking a
+/// *subset* of what the operator typed, silently, is how the wrong task ends up
+/// still running.
+fn parse_task_ids(raw: &[String]) -> anyhow::Result<Vec<uuid::Uuid>> {
+    raw.iter()
+        .map(|value| {
+            uuid::Uuid::parse_str(value)
+                .map_err(|e| anyhow::anyhow!("'{value}' is not a valid task id (UUID): {e}"))
+        })
+        .collect()
 }
 
 /// Dispatch a parsed [`Cli`] invocation to its command implementation.
@@ -668,6 +698,104 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .await?;
             }
         },
+
+        Commands::Inspect(inspect_cmd) => {
+            let (common, command) = match inspect_cmd {
+                InspectCommands::Ping { common } => {
+                    let options = control_options(common)?;
+                    return crate::commands::ping_workers(&options).await;
+                }
+                InspectCommands::Active { common } => (common, InspectCommand::Active),
+                InspectCommands::Scheduled { common } => (common, InspectCommand::Scheduled),
+                InspectCommands::Reserved { common } => (common, InspectCommand::Reserved),
+                InspectCommands::Revoked { common } => (common, InspectCommand::Revoked),
+                InspectCommands::Registered { common } => (common, InspectCommand::Registered),
+                InspectCommands::Stats { common } => (common, InspectCommand::Stats),
+                InspectCommands::Queues { common } => (common, InspectCommand::QueueInfo),
+                InspectCommands::Report { common } => (common, InspectCommand::Report),
+                InspectCommands::Conf { common } => (common, InspectCommand::Conf),
+                InspectCommands::CircuitBreakers { common } => {
+                    (common, InspectCommand::CircuitBreakers)
+                }
+            };
+            let options = control_options(common)?;
+            crate::commands::run_inspect(&options, command).await?;
+        }
+
+        Commands::Control(control_cmd) => {
+            let (common, command) = match control_cmd {
+                ControlCommands::Ping { common } => {
+                    let options = control_options(common)?;
+                    return crate::commands::ping_workers(&options).await;
+                }
+                ControlCommands::Shutdown { grace, common } => {
+                    (common, ControlCommand::shutdown(grace))
+                }
+                ControlCommands::Revoke {
+                    task_ids,
+                    terminate,
+                    queue,
+                    common,
+                } => {
+                    let parsed = parse_task_ids(&task_ids)?;
+                    // Revoke is the one control command with a durable half:
+                    // it records the ids in the queue's revoked set before
+                    // broadcasting, so it works with no worker running. That
+                    // needs the queue, which the shared options do not carry.
+                    let cfg = load_config(common.config.clone())?;
+                    let queue_name = queue.unwrap_or(cfg.broker.queue);
+                    let queue_mode = cfg.broker.mode;
+                    let options = control_options(common)?;
+                    return crate::commands::revoke_tasks(
+                        &options,
+                        &queue_name,
+                        &queue_mode,
+                        &parsed,
+                        terminate,
+                    )
+                    .await;
+                }
+                ControlCommands::RevokePattern {
+                    pattern,
+                    terminate,
+                    common,
+                } => (
+                    common,
+                    ControlCommand::revoke_by_pattern(pattern, terminate),
+                ),
+                ControlCommands::RateLimit {
+                    task_name,
+                    rate,
+                    clear,
+                    common,
+                } => {
+                    // `--clear` and a bare `rate-limit <task>` both mean
+                    // "remove the limit"; only an explicit `--rate` sets one.
+                    let rate = if clear { None } else { rate };
+                    (common, ControlCommand::rate_limit(task_name, rate))
+                }
+                ControlCommands::TimeLimit {
+                    task_name,
+                    soft,
+                    hard,
+                    common,
+                } => (common, ControlCommand::time_limit(task_name, soft, hard)),
+                ControlCommands::AddConsumer { queue, common } => {
+                    (common, ControlCommand::add_consumer(queue))
+                }
+                ControlCommands::CancelConsumer { queue, common } => {
+                    (common, ControlCommand::cancel_consumer(queue))
+                }
+                ControlCommands::QueueLength { queue, common } => {
+                    (common, ControlCommand::queue_length(queue))
+                }
+                ControlCommands::ResetCircuitBreaker { task_name, common } => {
+                    (common, ControlCommand::reset_circuit_breaker(task_name))
+                }
+            };
+            let options = control_options(common)?;
+            crate::commands::run_control(&options, command).await?;
+        }
 
         Commands::Doctor {
             broker,

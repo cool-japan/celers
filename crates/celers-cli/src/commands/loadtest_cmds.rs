@@ -1500,7 +1500,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let _: () = redis::cmd("SET")
@@ -1545,7 +1545,7 @@ mod tests {
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&crate::pool::async_connection_config())
             .await
             .expect("conn");
         let _: i64 = redis::cmd("DEL")

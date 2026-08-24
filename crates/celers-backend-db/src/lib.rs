@@ -60,6 +60,13 @@ pub use celers_backend_redis::{
     BackendError, ChordState, ProgressInfo, Result, ResultBackend, TaskMeta, TaskResult,
     TaskTtlConfig,
 };
+// Only reached from `default_ttl_config` (postgres/mysql constructors), not
+// re-exported: `RedisResultBackend::new`'s own default lives behind this
+// same path, so importing it here — rather than repeating the bare
+// `Duration::from_secs(86400)` literal it expands to — keeps both backends'
+// "24 hours" defined in exactly one place.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use celers_backend_redis::ttl;
 // `DateTime` (the bare type name) is only spelled explicitly in MySQL's
 // `get_result` (`row.col::<DateTime<Utc>>(..)`) — Postgres's equivalent read
 // relies on type inference and never names `DateTime` directly, so a
@@ -131,6 +138,28 @@ fn decode_result_state(
     })
 }
 
+/// The TTL configuration every `*ResultBackend::new`/`with_pool_size`
+/// constructor installs: results expire after [`ttl::SUCCESS`] (24 hours),
+/// matching [`RedisResultBackend`](celers_backend_redis::RedisResultBackend)'s
+/// own `new`-time default and Celery's `result_expires`.
+///
+/// Without a default TTL, `store_result`'s `expires_at` column is left NULL
+/// for every task type that has no explicit `set_task_ttl`/`with_ttl_config`
+/// override (see `ttl_expires_at_param`), and `cleanup_expired_results()`
+/// only ever deletes rows `WHERE expires_at IS NOT NULL` — so with no
+/// default, cleanup silently collects nothing and `celers_task_results`
+/// grows without bound. Shared by every constructor (rather than each
+/// repeating `TaskTtlConfig::with_default(ttl::SUCCESS)`) so the "24 hours"
+/// is defined exactly once and is independently unit-testable without a
+/// live database connection.
+///
+/// Callers that genuinely want permanent, never-expiring results can still
+/// opt out with `.with_ttl_config(TaskTtlConfig::new())` after construction.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn default_ttl_config() -> TaskTtlConfig {
+    TaskTtlConfig::with_default(ttl::SUCCESS)
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // PostgreSQL backend
 // ══════════════════════════════════════════════════════════════════════════
@@ -148,6 +177,12 @@ impl PostgresResultBackend {
     /// Create a new PostgreSQL result backend backed by a pool of
     /// [`DEFAULT_POOL_SIZE`] independent connections.
     ///
+    /// Results expire after [`ttl::SUCCESS`] (24 hours) by default, matching
+    /// `RedisResultBackend::new` and Celery's `result_expires` — see
+    /// `default_ttl_config`. Use [`Self::with_ttl_config`]`(TaskTtlConfig::new())`
+    /// for permanent results, or `with_ttl_config` with a populated
+    /// [`TaskTtlConfig`] for per-task-type expiry.
+    ///
     /// # Arguments
     /// * `database_url` - PostgreSQL connection string (e.g., "postgres://user:pass@localhost/db")
     pub async fn new(database_url: &str) -> Result<Self> {
@@ -157,6 +192,9 @@ impl PostgresResultBackend {
     /// Create a new PostgreSQL result backend with an explicit connection
     /// pool size (see [`PgConnPool`] for the pooling/reconnect behavior this
     /// provides over a single shared connection).
+    ///
+    /// Installs the same 24-hour default TTL as [`Self::new`] (which calls
+    /// this with [`DEFAULT_POOL_SIZE`]) — see its doc comment.
     pub async fn with_pool_size(database_url: &str, pool_size: usize) -> Result<Self> {
         let tls = tls_mode::pg_tls_mode_for_url(database_url)
             .map_err(|e| BackendError::Connection(format!("Failed to resolve TLS mode: {e}")))?;
@@ -168,7 +206,7 @@ impl PostgresResultBackend {
 
         Ok(Self {
             conn,
-            ttl_config: TaskTtlConfig::new(),
+            ttl_config: default_ttl_config(),
         })
     }
 
@@ -498,6 +536,24 @@ impl ResultBackend for PostgresResultBackend {
         Ok(())
     }
 
+    // `chord_init` is documented on the trait as a *create-or-reset*
+    // primitive that always zeroes the completion counter — including when
+    // `chord_id` already exists (the `chord_retry` path: same chord id,
+    // freshly re-dispatched header tasks, counter must start back at 0 or
+    // the barrier is already "complete" before any of the retried tasks
+    // report in and the callback fires immediately). The ON CONFLICT branch
+    // below previously omitted `completed` from the SET list entirely,
+    // leaving a pre-existing row's counter untouched on conflict — correct
+    // for a plain no-op re-init, but wrong for a reset, which is exactly
+    // when this branch is taken. `completed = 0` (a literal, not
+    // `EXCLUDED.completed`, since `state.completed` is never part of the
+    // INSERT's own VALUES either — it's hardcoded to 0 there too) makes
+    // this branch match the same reset semantics on both paths.
+    //
+    // Callers that want to persist a mutated state (cancellation, a new
+    // callback, an updated timeout) WITHOUT losing in-flight progress must
+    // use `chord_update_state` instead, which is the same upsert minus the
+    // `completed` column entirely.
     async fn chord_init(&mut self, state: ChordState) -> Result<()> {
         let task_ids = serde_json::to_value(&state.task_ids)
             .map_err(|e| BackendError::Serialization(e.to_string()))?;
@@ -509,6 +565,55 @@ impl ResultBackend for PostgresResultBackend {
                 r#"
                 INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
                 VALUES ($1::text::uuid, $2, 0, $3, $4, $5::text::timestamptz, $6, $7, $8)
+                ON CONFLICT (chord_id) DO UPDATE SET
+                    total = EXCLUDED.total,
+                    completed = 0,
+                    callback = EXCLUDED.callback,
+                    task_ids = EXCLUDED.task_ids,
+                    timeout_seconds = EXCLUDED.timeout_seconds,
+                    cancelled = EXCLUDED.cancelled,
+                    cancellation_reason = EXCLUDED.cancellation_reason
+                "#,
+                &[
+                    &state.chord_id.to_string(),
+                    &(state.total as i64),
+                    &state.callback,
+                    &json_param(&task_ids),
+                    &created_at_param,
+                    &timeout_secs_param,
+                    &state.cancelled,
+                    &state.cancellation_reason,
+                ],
+            )
+            .await
+            .map_err(|e| BackendError::Connection(format!("Failed to init chord: {}", e)))?;
+
+        Ok(())
+    }
+
+    // The `chord_init` upsert minus `completed`, so persisting a state
+    // mutation (cancellation, a new callback/timeout — see `chord_cancel`'s
+    // default implementation, which reads-modify-writes through this
+    // method) never resets tasks that already completed. `completed` is
+    // absent from every clause here: on the INSERT branch (row genuinely
+    // never existed) the column is left out of the column/VALUES lists
+    // entirely so it takes the schema's own `DEFAULT 0` — the honest
+    // starting value for a counter with nothing to preserve — and on the
+    // ON CONFLICT branch it is simply not part of the SET list, so
+    // Postgres leaves the existing value untouched. `created_at` is
+    // likewise only ever written on the INSERT branch, matching
+    // `chord_init`'s own behavior of never rewriting it on conflict.
+    async fn chord_update_state(&mut self, state: ChordState) -> Result<()> {
+        let task_ids = serde_json::to_value(&state.task_ids)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let created_at_param = state.created_at.to_rfc3339();
+        let timeout_secs_param = state.timeout.map(|d| d.as_secs() as i64);
+
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO celers_chord_state (chord_id, total, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
+                VALUES ($1::text::uuid, $2, $3, $4, $5::text::timestamptz, $6, $7, $8)
                 ON CONFLICT (chord_id) DO UPDATE SET
                     total = EXCLUDED.total,
                     callback = EXCLUDED.callback,
@@ -529,7 +634,9 @@ impl ResultBackend for PostgresResultBackend {
                 ],
             )
             .await
-            .map_err(|e| BackendError::Connection(format!("Failed to init chord: {}", e)))?;
+            .map_err(|e| {
+                BackendError::Connection(format!("Failed to update chord state: {}", e))
+            })?;
 
         Ok(())
     }
@@ -596,6 +703,18 @@ impl ResultBackend for PostgresResultBackend {
                     callback: row.col("callback").map_err(|e| {
                         BackendError::Connection(format!("Failed to get chord state: {e}"))
                     })?,
+                    // `celers_chord_state` has no column for this field —
+                    // the same gap `retry_count`/`max_retries` below already
+                    // accept. The Redis backend persists the whole
+                    // `ChordState` as one serialized blob, so a new struct
+                    // field round-trips for free there; this SQL backend
+                    // maps one column per field explicitly and was never
+                    // extended when the field was added. Needs a schema
+                    // migration (a `callback_on_success_link TEXT` column on
+                    // `celers_chord_state`) plus INSERT/SELECT wiring here —
+                    // out of scope for this pass (migrations aren't owned by
+                    // it); tracked as a followup.
+                    callback_on_success_link: None,
                     task_ids,
                     created_at: row.col("created_at").map_err(|e| {
                         BackendError::Connection(format!("Failed to get chord state: {e}"))
@@ -854,6 +973,12 @@ impl MysqlResultBackend {
     /// transparently discards/replaces a broken one on next checkout — no
     /// bespoke pooling wrapper is needed here. See [`Self::with_pool_size`]
     /// to configure the pool's connection limits explicitly.
+    ///
+    /// Results expire after [`ttl::SUCCESS`] (24 hours) by default, matching
+    /// `RedisResultBackend::new` and Celery's `result_expires` — see
+    /// `default_ttl_config`. Use [`Self::with_ttl_config`]`(TaskTtlConfig::new())`
+    /// for permanent results, or `with_ttl_config` with a populated
+    /// [`TaskTtlConfig`] for per-task-type expiry.
     pub async fn new(database_url: &str) -> Result<Self> {
         let tls = tls_mode::mysql_tls_mode_for_url(database_url)
             .map_err(|e| BackendError::Connection(format!("Failed to resolve TLS mode: {e}")))?;
@@ -865,12 +990,15 @@ impl MysqlResultBackend {
 
         Ok(Self {
             conn,
-            ttl_config: TaskTtlConfig::new(),
+            ttl_config: default_ttl_config(),
         })
     }
 
     /// Create a new MySQL result backend with an explicit pool connection
     /// limit (`mysql_async`'s default is 10 when unset).
+    ///
+    /// Installs the same 24-hour default TTL as [`Self::new`] — see its doc
+    /// comment.
     pub async fn with_pool_size(database_url: &str, pool_max: usize) -> Result<Self> {
         let tls = tls_mode::mysql_tls_mode_for_url(database_url)
             .map_err(|e| BackendError::Connection(format!("Failed to resolve TLS mode: {e}")))?;
@@ -890,7 +1018,7 @@ impl MysqlResultBackend {
 
         Ok(Self {
             conn,
-            ttl_config: TaskTtlConfig::new(),
+            ttl_config: default_ttl_config(),
         })
     }
 
@@ -1230,6 +1358,16 @@ impl ResultBackend for MysqlResultBackend {
         Ok(())
     }
 
+    // See the identical comment on
+    // `PostgresResultBackend::chord_init`: this is a *create-or-reset*
+    // primitive that must zero `completed` even on conflict, or a
+    // `chord_retry` of an already-terminal chord leaves the counter at or
+    // above `total` and the callback fires before any retried task reports
+    // in. `completed = 0` (a literal, matching the INSERT branch's own
+    // hardcoded `0`, not `VALUES(completed)`) makes the DUPLICATE KEY branch
+    // agree with the INSERT branch. Callers that want to persist a state
+    // mutation without losing progress must use `chord_update_state`
+    // instead.
     async fn chord_init(&mut self, state: ChordState) -> Result<()> {
         let task_ids = serde_json::to_string(&state.task_ids)
             .map_err(|e| BackendError::Serialization(e.to_string()))?;
@@ -1242,6 +1380,52 @@ impl ResultBackend for MysqlResultBackend {
                 r#"
                 INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
                 VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    total = VALUES(total),
+                    completed = 0,
+                    callback = VALUES(callback),
+                    task_ids = VALUES(task_ids),
+                    timeout_seconds = VALUES(timeout_seconds),
+                    cancelled = VALUES(cancelled),
+                    cancellation_reason = VALUES(cancellation_reason)
+                "#,
+                &[
+                    &state.chord_id.to_string(),
+                    &(state.total as i64),
+                    &state.callback,
+                    &task_ids,
+                    &created_at_param,
+                    &timeout_secs_param,
+                    &state.cancelled,
+                    &state.cancellation_reason,
+                ],
+            )
+            .await
+            .map_err(|e| BackendError::Connection(format!("Failed to init chord: {}", e)))?;
+
+        Ok(())
+    }
+
+    // The `chord_init` upsert minus `completed`: see
+    // `PostgresResultBackend::chord_update_state` for why the column is
+    // absent from every clause rather than pinned to a value — omitted from
+    // the INSERT branch's column/VALUES lists (the fresh-row case takes the
+    // schema's own `DEFAULT 0`) and from the DUPLICATE KEY branch's SET
+    // list (the existing-row case leaves it untouched, preserving in-flight
+    // progress). Used by `chord_cancel`'s default implementation so
+    // cancelling a chord never un-completes tasks that already reported in.
+    async fn chord_update_state(&mut self, state: ChordState) -> Result<()> {
+        let task_ids = serde_json::to_string(&state.task_ids)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+
+        let created_at_param = state.created_at.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let timeout_secs_param = state.timeout.map(|d| d.as_secs() as i64);
+
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO celers_chord_state (chord_id, total, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE
                     total = VALUES(total),
                     callback = VALUES(callback),
@@ -1262,7 +1446,9 @@ impl ResultBackend for MysqlResultBackend {
                 ],
             )
             .await
-            .map_err(|e| BackendError::Connection(format!("Failed to init chord: {}", e)))?;
+            .map_err(|e| {
+                BackendError::Connection(format!("Failed to update chord state: {}", e))
+            })?;
 
         Ok(())
     }
@@ -1376,6 +1562,11 @@ impl ResultBackend for MysqlResultBackend {
                     callback: row.col("callback").map_err(|e| {
                         BackendError::Connection(format!("Failed to get chord state: {e}"))
                     })?,
+                    // See the identical gap called out in
+                    // `PostgresResultBackend::chord_get_state`: no column
+                    // for this field on `celers_chord_state`, same as
+                    // `retry_count`/`max_retries` below.
+                    callback_on_success_link: None,
                     task_ids,
                     created_at: row.col("created_at").map_err(|e| {
                         BackendError::Connection(format!("Failed to get chord state: {e}"))
@@ -1657,6 +1848,139 @@ mod tests {
             .is_none());
     }
 
+    /// Build a fresh, non-cancelled `ChordState` with `TOTAL` header tasks
+    /// and no progress yet, shared by the Postgres/MySQL chord reset and
+    /// update-state tests below.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    fn fresh_chord_state(chord_id: Uuid, total: usize) -> ChordState {
+        ChordState {
+            chord_id,
+            total,
+            completed: 0,
+            callback: Some("noop".to_string()),
+            callback_on_success_link: None,
+            task_ids: (0..total).map(|_| Uuid::new_v4()).collect(),
+            created_at: Utc::now(),
+            timeout: None,
+            cancelled: false,
+            cancellation_reason: None,
+            retry_count: 0,
+            max_retries: None,
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL running
+    async fn test_postgres_chord_init_resets_completed_counter_on_conflict() {
+        // Regression test for the chord *reset* bug: `chord_init`'s
+        // ON CONFLICT branch previously omitted `completed` from its SET
+        // list, so re-running `chord_init` for the same `chord_id` — the
+        // `chord_retry` path — left a terminal counter in place: the
+        // barrier looked already-complete before any of the retried tasks
+        // reported in, and the callback would fire immediately.
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let mut backend = PostgresResultBackend::new(&database_url)
+            .await
+            .expect("connect");
+        backend.migrate().await.expect("migrate");
+
+        const TOTAL: usize = 3;
+        let chord_id = Uuid::new_v4();
+        let state = fresh_chord_state(chord_id, TOTAL);
+        backend.chord_init(state.clone()).await.expect("chord_init");
+
+        for _ in 0..TOTAL {
+            backend
+                .chord_complete_task(chord_id)
+                .await
+                .expect("chord_complete_task");
+        }
+        let terminal = backend
+            .chord_get_state(chord_id)
+            .await
+            .expect("get")
+            .expect("state exists");
+        assert_eq!(
+            terminal.completed, TOTAL,
+            "sanity check: counter must be terminal before the reset"
+        );
+
+        // Re-run chord_init for the SAME chord_id — this is what
+        // `chord_retry` does. The counter must come back to 0, not just on
+        // first insert.
+        backend.chord_init(state).await.expect("chord_init (reset)");
+        let reset = backend
+            .chord_get_state(chord_id)
+            .await
+            .expect("get")
+            .expect("state exists");
+        assert_eq!(
+            reset.completed, 0,
+            "chord_init must reset the completion counter on conflict, matching its \
+             documented create-or-reset contract, not leave a stale terminal count in place"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore] // Requires PostgreSQL running
+    async fn test_postgres_chord_cancel_preserves_completed_counter() {
+        // Regression test for `chord_update_state` (used by `chord_cancel`'s
+        // default trait implementation): persisting a state mutation must
+        // never reset tasks that already completed, unlike `chord_init`'s
+        // create-or-reset semantics. Before `chord_update_state` was
+        // overridden, this fell back to `chord_init`, which (once fixed to
+        // reset `completed` on conflict) would have made cancellation
+        // un-complete a chord's in-flight progress.
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let mut backend = PostgresResultBackend::new(&database_url)
+            .await
+            .expect("connect");
+        backend.migrate().await.expect("migrate");
+
+        const TOTAL: usize = 3;
+        let chord_id = Uuid::new_v4();
+        let state = fresh_chord_state(chord_id, TOTAL);
+        let task_ids = state.task_ids.clone();
+        backend.chord_init(state).await.expect("chord_init");
+        backend
+            .chord_complete_task(chord_id)
+            .await
+            .expect("chord_complete_task");
+
+        backend
+            .chord_cancel(chord_id, Some("test cancel".to_string()))
+            .await
+            .expect("chord_cancel");
+
+        let after = backend
+            .chord_get_state(chord_id)
+            .await
+            .expect("get")
+            .expect("state exists");
+        assert_eq!(
+            after.completed, 1,
+            "chord_update_state must not reset in-flight progress"
+        );
+        assert!(
+            after.cancelled,
+            "chord_cancel must mark the chord cancelled"
+        );
+        assert_eq!(after.cancellation_reason.as_deref(), Some("test cancel"));
+        assert_eq!(
+            after.callback.as_deref(),
+            Some("noop"),
+            "chord_update_state must preserve the callback, not just the counter"
+        );
+        assert_eq!(
+            after.task_ids, task_ids,
+            "chord_update_state must preserve task_ids"
+        );
+    }
+
     #[cfg(feature = "mysql")]
     #[tokio::test]
     #[ignore] // Requires MySQL running
@@ -1693,6 +2017,7 @@ mod tests {
             total: TOTAL,
             completed: 0,
             callback: Some("noop".to_string()),
+            callback_on_success_link: None,
             task_ids: (0..TOTAL).map(|_| Uuid::new_v4()).collect(),
             created_at: Utc::now(),
             timeout: None,
@@ -1727,6 +2052,109 @@ mod tests {
             terminal_observations, 1,
             "exactly one concurrent caller must observe the terminal chord count \
              (Celery chord semantics: the callback fires exactly once)"
+        );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_mysql_chord_init_resets_completed_counter_on_conflict() {
+        // MySQL counterpart of
+        // `test_postgres_chord_init_resets_completed_counter_on_conflict` —
+        // see its comment. The `ON DUPLICATE KEY UPDATE` branch had the same
+        // gap as Postgres's `ON CONFLICT DO UPDATE`.
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let mut backend = MysqlResultBackend::new(&database_url)
+            .await
+            .expect("connect");
+        backend.migrate().await.expect("migrate");
+
+        const TOTAL: usize = 3;
+        let chord_id = Uuid::new_v4();
+        let state = fresh_chord_state(chord_id, TOTAL);
+        backend.chord_init(state.clone()).await.expect("chord_init");
+
+        for _ in 0..TOTAL {
+            backend
+                .chord_complete_task(chord_id)
+                .await
+                .expect("chord_complete_task");
+        }
+        let terminal = backend
+            .chord_get_state(chord_id)
+            .await
+            .expect("get")
+            .expect("state exists");
+        assert_eq!(
+            terminal.completed, TOTAL,
+            "sanity check: counter must be terminal before the reset"
+        );
+
+        backend.chord_init(state).await.expect("chord_init (reset)");
+        let reset = backend
+            .chord_get_state(chord_id)
+            .await
+            .expect("get")
+            .expect("state exists");
+        assert_eq!(
+            reset.completed, 0,
+            "chord_init must reset the completion counter on conflict, matching its \
+             documented create-or-reset contract, not leave a stale terminal count in place"
+        );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore] // Requires MySQL running
+    async fn test_mysql_chord_cancel_preserves_completed_counter() {
+        // MySQL counterpart of
+        // `test_postgres_chord_cancel_preserves_completed_counter` — see its
+        // comment.
+        let database_url = std::env::var("MYSQL_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let mut backend = MysqlResultBackend::new(&database_url)
+            .await
+            .expect("connect");
+        backend.migrate().await.expect("migrate");
+
+        const TOTAL: usize = 3;
+        let chord_id = Uuid::new_v4();
+        let state = fresh_chord_state(chord_id, TOTAL);
+        let task_ids = state.task_ids.clone();
+        backend.chord_init(state).await.expect("chord_init");
+        backend
+            .chord_complete_task(chord_id)
+            .await
+            .expect("chord_complete_task");
+
+        backend
+            .chord_cancel(chord_id, Some("test cancel".to_string()))
+            .await
+            .expect("chord_cancel");
+
+        let after = backend
+            .chord_get_state(chord_id)
+            .await
+            .expect("get")
+            .expect("state exists");
+        assert_eq!(
+            after.completed, 1,
+            "chord_update_state must not reset in-flight progress"
+        );
+        assert!(
+            after.cancelled,
+            "chord_cancel must mark the chord cancelled"
+        );
+        assert_eq!(after.cancellation_reason.as_deref(), Some("test cancel"));
+        assert_eq!(
+            after.callback.as_deref(),
+            Some("noop"),
+            "chord_update_state must preserve the callback, not just the counter"
+        );
+        assert_eq!(
+            after.task_ids, task_ids,
+            "chord_update_state must preserve task_ids"
         );
     }
 
@@ -1879,6 +2307,28 @@ mod tests {
         assert!(
             chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S%.6f").is_ok(),
             "must match MySQL's own DATETIME text grammar: {raw:?}"
+        );
+    }
+
+    // ── default_ttl_config: the constructors' 24h default ───────────────
+    //
+    // Pure, DB-free unit test: every `*ResultBackend::new`/`with_pool_size`
+    // constructor installs this exact config (see their doc comments), but
+    // exercising that live would require a real database connection. This
+    // is what actually gets asserted; the constructors are trusted to call
+    // the same shared function, which every one of them does.
+
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    #[test]
+    fn default_ttl_config_matches_redis_backends_24_hour_default() {
+        let config = default_ttl_config();
+        assert_eq!(
+            config.default_ttl(),
+            Some(Duration::from_secs(86400)),
+            "the DB backends' default TTL must match RedisResultBackend::new's 24-hour \
+             default (ttl::SUCCESS): without it, store_result never populates expires_at, \
+             and cleanup_expired_results() — which only deletes rows WHERE expires_at IS NOT \
+             NULL — silently collects nothing"
         );
     }
 }

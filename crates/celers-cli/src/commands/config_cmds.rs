@@ -214,7 +214,12 @@ pub async fn validate_config(config_path: &str, test_connection: bool) -> anyhow
             "redis" => {
                 match redis::Client::open(config.broker.url.as_str()) {
                     Ok(client) => {
-                        match client.get_multiplexed_async_connection().await {
+                        match client
+                            .get_multiplexed_async_connection_with_config(
+                                &crate::pool::async_connection_config(),
+                            )
+                            .await
+                        {
                             Ok(mut conn) => {
                                 // Test a simple PING command
                                 match redis::cmd("PING").query_async::<String>(&mut conn).await {

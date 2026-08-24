@@ -2,10 +2,15 @@
 pub use crate::AsyncResult;
 pub use crate::Broker;
 pub use crate::CompositeEventEmitter;
+pub use crate::ControlClient;
 pub use crate::ControlCommand;
+pub use crate::ControlEnvelope;
+pub use crate::ControlReply;
 pub use crate::ControlResponse;
+pub use crate::ControlTransport;
 pub use crate::Event;
 pub use crate::EventEmitter;
+pub use crate::InMemoryControlTransport;
 pub use crate::InMemoryEventEmitter;
 pub use crate::InspectCommand;
 pub use crate::InspectResponse;
@@ -41,6 +46,7 @@ pub use crate::RouterBuilder;
 pub use crate::RoutingConfig;
 
 // Worker types
+pub use crate::ControlService;
 pub use crate::Worker;
 pub use crate::WorkerConfig;
 pub use celers_worker::WorkerConfigBuilder;

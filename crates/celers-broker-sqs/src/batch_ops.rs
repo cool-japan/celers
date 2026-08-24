@@ -18,6 +18,35 @@
 //! The operations here chunk internally, account for the aggregate size limit,
 //! retry the per-entry failures whose error code is transient, and surface
 //! everything that remains through [`BatchOutcome`].
+//!
+//! # Shared retry budget
+//!
+//! Each chunk used to retry independently up to `max_retries` times, so a
+//! 100-message call (10 chunks) against a persistently throttled queue could
+//! issue up to `max_retries * 10` requests with no call-wide cap. A
+//! [`RetryBudget`] is now shared across every chunk of one top-level call:
+//! every chunk still gets its unconditional *first* attempt (entries can
+//! never be silently dropped — see above), but attempts beyond the first draw
+//! from a pool sized so that small/medium batches (up to
+//! [`RETRY_BUDGET_CHUNK_CAP`] chunks) are unaffected, while a call with many
+//! chunks can no longer retry every single one of them to the hilt. An entry
+//! that loses a retry to budget exhaustion is reported as
+//! [`RETRY_BUDGET_EXHAUSTED_CODE`], distinguishable from a real AWS error
+//! code, rather than silently continuing to hammer AWS.
+//!
+//! The pool is intentionally a *constant* per call (independent of how many
+//! chunks it has), not a fraction of the chunk count: it is sized for the
+//! motivating scenario -- a queue throttled call-wide, where every chunk is
+//! failing -- rather than a handful of scattered per-chunk blips spread
+//! across a very large call, which will now see some chunks denied a retry
+//! sooner than before. For `ack_batch`/`extend_visibility_batch` specifically,
+//! an entry denied a retry this way is exactly as safe as one AWS itself
+//! rejected: it surfaces through [`BatchOutcome::failed`] /
+//! [`BatchOutcome::into_count`] exactly like any other failure, so a caller
+//! already handling that documented contract sees a real, attributable error
+//! rather than a silent success -- the message simply becomes visible again
+//! and is redelivered, which is the same at-least-once behaviour an
+//! undeleted handle always has.
 
 use std::collections::HashMap;
 
@@ -190,17 +219,91 @@ pub fn entry_wire_size(body: &str, attributes: &HashMap<String, MessageAttribute
     size
 }
 
+/// AWS error code reported for an entry that lost a retry to the shared
+/// [`RetryBudget`] rather than to an AWS-side rejection.
+///
+/// Prefixed so it can never collide with a real AWS batch error code (all of
+/// which are bare PascalCase identifiers such as `InternalError`), letting a
+/// caller inspecting [`BatchOutcome::failed`] tell "AWS rejected this entry"
+/// apart from "we gave up retrying it to protect the queue".
+pub const RETRY_BUDGET_EXHAUSTED_CODE: &str = "CeleRS.RetryBudgetExhausted";
+
+/// Number of chunks' worth of independent retries pooled into one call's
+/// shared [`RetryBudget`].
+///
+/// A call that fits in this many chunks or fewer never notices the budget:
+/// every chunk still gets its full, unshared `max_retries`. Only a call split
+/// into *more* chunks than this starts sharing retries across them, which is
+/// exactly the case (a large batch against a throttled queue) that used to
+/// multiply `max_retries` by the chunk count with no ceiling.
+const RETRY_BUDGET_CHUNK_CAP: usize = 4;
+
+/// Shared retry-attempt budget for one top-level batch call (`publish_batch`,
+/// `ack_batch`, `publish_fifo_batch`, `extend_visibility_batch`), pooled
+/// across every chunk the call is split into.
+///
+/// Each chunk previously retried independently up to `max_retries` times, so
+/// a 100-message `publish_batch` (10 chunks) against a persistently throttled
+/// queue could issue up to `max_retries * 10` requests with nothing capping
+/// the total. A single [`RetryBudget`] is now created once per top-level call
+/// and threaded through every [`run_batch_with_retry`] invocation for that
+/// call (across every chunk, and — for `ack_batch`/`extend_visibility_batch`
+/// — every source queue too).
+///
+/// Every chunk's *first* attempt is never charged against this budget:
+/// [`plan_batch_chunks`] guarantees every entry is covered by exactly one
+/// chunk, and skipping a chunk's first attempt would silently drop its
+/// entries from the returned [`BatchOutcome`] — the exact enqueue-loss bug
+/// this module's chunking exists to prevent (see the module docs). Only
+/// attempts *beyond* the first, on any chunk, draw from this pool.
+#[derive(Debug)]
+struct RetryBudget {
+    remaining: usize,
+}
+
+impl RetryBudget {
+    /// Size the pool so a call that never exceeds [`RETRY_BUDGET_CHUNK_CAP`]
+    /// chunks behaves exactly as before: every chunk gets the full
+    /// `max_retries - 1` retries, unshared.
+    fn new(max_retries: u32) -> Self {
+        let per_chunk_retries =
+            usize::try_from(max_retries.saturating_sub(1)).unwrap_or(usize::MAX);
+        Self {
+            remaining: per_chunk_retries.saturating_mul(RETRY_BUDGET_CHUNK_CAP),
+        }
+    }
+
+    /// Try to spend one retry attempt from the shared pool.
+    ///
+    /// Returns `false` once the pool is exhausted, in which case the caller
+    /// must stop retrying rather than proceed as if the attempt were free.
+    fn try_spend(&mut self) -> bool {
+        match self.remaining.checked_sub(1) {
+            Some(left) => {
+                self.remaining = left;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Run one batch request, retrying the entries whose failure is transient.
 ///
 /// `send` receives the entries still in flight and returns
 /// `(successful_count, failed_entries)`. Entry ids are the *caller's* indices
 /// rendered as decimal strings, which is how a `Failed` entry is mapped back to
 /// the input vector.
+///
+/// `budget` pools retry attempts across every chunk of the enclosing
+/// top-level call (see [`RetryBudget`]); this chunk's first attempt is always
+/// made regardless of the budget's state.
 async fn run_batch_with_retry<E, F, Fut>(
     entries: Vec<(usize, E)>,
     send: F,
     max_retries: u32,
     base_delay_ms: u64,
+    budget: &mut RetryBudget,
 ) -> Result<BatchOutcome>
 where
     E: Clone,
@@ -212,6 +315,31 @@ where
     let mut attempt = 0u32;
 
     while !pending.is_empty() {
+        // The first attempt for this chunk (attempt == 0) is unconditional:
+        // every entry must be tried at least once or it would silently
+        // disappear from `outcome` instead of chunking safely (see the
+        // module docs). Only retries beyond that draw from the shared pool.
+        if attempt > 0 && !budget.try_spend() {
+            warn!(
+                "Shared retry budget exhausted after {} attempt(s); failing {} remaining \
+                 entries instead of retrying further",
+                attempt,
+                pending.len()
+            );
+            for (index, _) in &pending {
+                outcome.failed.push(BatchEntryFailure {
+                    index: *index,
+                    code: RETRY_BUDGET_EXHAUSTED_CODE.to_string(),
+                    message: Some(format!(
+                        "retry budget for this batch call was exhausted after {attempt} \
+                         attempt(s) shared across chunks"
+                    )),
+                    sender_fault: false,
+                });
+            }
+            break;
+        }
+
         let by_id: HashMap<String, (usize, E)> = pending
             .iter()
             .map(|(index, entry)| (index.to_string(), (*index, entry.clone())))
@@ -363,6 +491,7 @@ impl SqsBroker {
         }
 
         let mut outcome = BatchOutcome::default();
+        let mut budget = RetryBudget::new(self.max_retries);
         for chunk in plan_batch_chunks(&sizes, SQS_MAX_BATCH_ENTRIES, SQS_MAX_BATCH_BYTES) {
             let chunk_entries = entries[chunk.clone()].to_vec();
             let client = client.clone();
@@ -391,6 +520,7 @@ impl SqsBroker {
                 },
                 self.max_retries,
                 self.retry_base_delay_ms,
+                &mut budget,
             )
             .await?;
 
@@ -440,6 +570,7 @@ impl SqsBroker {
         let grouped = self.group_handles_by_queue(queue, &receipt_handles);
         let client = self.get_client().await?;
         let mut outcome = BatchOutcome::default();
+        let mut budget = RetryBudget::new(self.max_retries);
 
         for (source_queue, handles) in grouped {
             let queue_url = self.get_queue_url(&source_queue).await?;
@@ -483,6 +614,7 @@ impl SqsBroker {
                     },
                     self.max_retries,
                     self.retry_base_delay_ms,
+                    &mut budget,
                 )
                 .await?;
 
@@ -571,6 +703,7 @@ impl SqsBroker {
         }
 
         let mut outcome = BatchOutcome::default();
+        let mut budget = RetryBudget::new(self.max_retries);
         for chunk in plan_batch_chunks(&sizes, SQS_MAX_BATCH_ENTRIES, SQS_MAX_BATCH_BYTES) {
             let chunk_entries = entries[chunk.clone()].to_vec();
             let client = client.clone();
@@ -599,6 +732,7 @@ impl SqsBroker {
                 },
                 self.max_retries,
                 self.retry_base_delay_ms,
+                &mut budget,
             )
             .await?;
 
@@ -644,6 +778,7 @@ impl SqsBroker {
         let grouped = self.group_handles_by_queue(queue, &tags);
         let client = self.get_client().await?;
         let mut outcome = BatchOutcome::default();
+        let mut budget = RetryBudget::new(self.max_retries);
 
         for (source_queue, handles) in grouped {
             let queue_url = self.get_queue_url(&source_queue).await?;
@@ -689,6 +824,7 @@ impl SqsBroker {
                     },
                     self.max_retries,
                     self.retry_base_delay_ms,
+                    &mut budget,
                 )
                 .await?;
 
@@ -865,5 +1001,158 @@ mod tests {
             failed: Vec::new(),
         };
         assert_eq!(outcome.into_count().expect("complete"), 25);
+    }
+
+    #[test]
+    fn retry_budget_never_exhausts_a_single_chunk() {
+        // A chunk's own loop can retry at most `max_retries - 1` times
+        // (gated by `attempt + 1 < max_retries`) before giving up on its
+        // own; the shared budget must never run out before that point for a
+        // call that is only ever a single chunk, whatever `max_retries` is.
+        for max_retries in [1u32, 2, 3, 5, 20] {
+            let mut budget = RetryBudget::new(max_retries);
+            let chunk_ceiling = max_retries.saturating_sub(1);
+            for spend in 0..chunk_ceiling {
+                assert!(
+                    budget.try_spend(),
+                    "budget exhausted at spend {spend}/{chunk_ceiling} for max_retries={max_retries}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_budget_is_finite() {
+        // per_chunk_retries = 2 - 1 = 1, pooled across RETRY_BUDGET_CHUNK_CAP
+        // chunks' worth = 4 total spends available.
+        let mut budget = RetryBudget::new(2);
+        for _ in 0..RETRY_BUDGET_CHUNK_CAP {
+            assert!(budget.try_spend());
+        }
+        assert!(
+            !budget.try_spend(),
+            "budget must not grant unlimited retries"
+        );
+    }
+
+    #[test]
+    fn retry_budget_grants_no_retries_when_max_retries_is_one() {
+        // max_retries == 1 means "try once, never retry" -- the budget must
+        // reflect that instead of granting spends nobody should use.
+        let mut budget = RetryBudget::new(1);
+        assert!(!budget.try_spend());
+    }
+
+    /// Build a single-entry `Failed` response as if AWS reported the given
+    /// id as throttled -- a transient, retryable failure.
+    fn throttled_failure(id: &str) -> (usize, Vec<BatchResultErrorEntry>) {
+        let failure = BatchResultErrorEntry::builder()
+            .id(id.to_string())
+            .code("ServiceUnavailable")
+            .sender_fault(false)
+            .build()
+            .expect("well-formed error entry");
+        (0usize, vec![failure])
+    }
+
+    #[tokio::test]
+    async fn shared_budget_caps_total_attempts_below_the_old_per_chunk_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Every attempt on every chunk is throttled, so without a shared
+        // budget each of the `chunk_count` chunks would independently retry
+        // up to `max_retries` times: `max_retries * chunk_count` requests.
+        let max_retries = 3u32;
+        let chunk_count = 6usize;
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let mut budget = RetryBudget::new(max_retries);
+        let mut outcome = BatchOutcome::default();
+
+        for chunk_index in 0..chunk_count {
+            let entries = vec![(chunk_index, ())];
+            let id = chunk_index.to_string();
+            let call_count = call_count.clone();
+
+            let chunk_outcome = run_batch_with_retry(
+                entries,
+                move |_batch: Vec<()>| {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    let id = id.clone();
+                    async move { Ok(throttled_failure(&id)) }
+                },
+                max_retries,
+                1, // base_delay_ms: the retry path really sleeps; keep it short
+                &mut budget,
+            )
+            .await
+            .expect("run_batch_with_retry itself never fails in this test");
+
+            outcome.merge(chunk_outcome);
+        }
+
+        let naive_worst_case = max_retries as usize * chunk_count;
+        let observed = call_count.load(Ordering::SeqCst);
+        assert!(
+            observed < naive_worst_case,
+            "shared budget should cap total attempts below the unshared \
+             max_retries * chunk_count bound (observed {observed}, bound {naive_worst_case})"
+        );
+
+        // Every entry is accounted for exactly once -- by AWS or by the
+        // budget -- never silently dropped (see the module docs).
+        assert_eq!(outcome.total(), chunk_count);
+        assert!(!outcome.is_complete());
+        assert!(
+            outcome
+                .failed
+                .iter()
+                .any(|f| f.code == RETRY_BUDGET_EXHAUSTED_CODE),
+            "at least one entry should have been failed by budget exhaustion, not AWS: {:?}",
+            outcome.failed
+        );
+        // Budget-exhausted failures carry the caller's real index, never
+        // `usize::MAX` (that sentinel is reserved for an id AWS itself
+        // failed to echo back).
+        assert!(outcome.failed.iter().all(|f| f.index < chunk_count));
+    }
+
+    #[tokio::test]
+    async fn single_chunk_call_is_unaffected_by_the_shared_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A call that never splits into more than one chunk must retry
+        // exactly as many times as `max_retries` always allowed, matching
+        // pre-budget behaviour.
+        let max_retries = 4u32;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let mut budget = RetryBudget::new(max_retries);
+
+        let entries = vec![(0usize, ())];
+        let outcome = run_batch_with_retry(
+            entries,
+            {
+                let call_count = call_count.clone();
+                move |_batch: Vec<()>| {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    async move { Ok(throttled_failure("0")) }
+                }
+            },
+            max_retries,
+            1,
+            &mut budget,
+        )
+        .await
+        .expect("run_batch_with_retry itself never fails in this test");
+
+        assert_eq!(call_count.load(Ordering::SeqCst), max_retries as usize);
+        assert_eq!(outcome.total(), 1);
+        assert_eq!(
+            outcome.failed[0].code, "ServiceUnavailable",
+            "a single chunk must exhaust its own retry ceiling before ever \
+             touching the shared budget's exhaustion path"
+        );
     }
 }

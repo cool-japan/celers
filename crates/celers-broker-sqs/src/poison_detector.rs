@@ -13,6 +13,19 @@
 //! - Failure pattern analysis
 //! - Integration with DLQ analytics
 //!
+//! # Local tracking vs. the broker's authoritative count
+//!
+//! [`PoisonDetector::track_failure`] only counts failures reported to *this*
+//! detector, so it under-counts across a process restart or a
+//! multi-consumer deployment. [`PoisonDetector::reconcile_receive_count`]
+//! (and its broker-aware wrappers,
+//! [`reconcile_from_broker`](PoisonDetector::reconcile_from_broker) and
+//! [`track_failure_with_broker`](PoisonDetector::track_failure_with_broker))
+//! top the local count up to at least
+//! [`SqsBroker::receive_count`](crate::broker_core::SqsBroker::receive_count)
+//! -- SQS's own `ApproximateReceiveCount` -- so a genuinely poison message
+//! cannot hide behind either.
+//!
 //! # Example
 //!
 //! ```
@@ -47,6 +60,8 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
+
+use crate::broker_core::SqsBroker;
 
 /// Configuration for poison message detection
 #[derive(Debug, Clone)]
@@ -232,6 +247,141 @@ impl PoisonDetector {
         }
 
         is_poison
+    }
+
+    /// Ensure a message's tracked failure count is at least `receive_count`,
+    /// synthesizing timestamps for any gap between what this detector has
+    /// observed locally and the broker's authoritative count. Returns
+    /// whether the message is poison after reconciliation.
+    ///
+    /// [`track_failure`](Self::track_failure) only counts failures *this*
+    /// detector was told about. A process restart, a second consumer
+    /// instance, or a message that fails without ever reaching this detector
+    /// all leave that local count under-reporting how many times SQS has
+    /// actually redelivered the message. `receive_count` -- SQS's
+    /// `ApproximateReceiveCount`, read via
+    /// [`SqsBroker::receive_count`] -- is authoritative and survives all of
+    /// that. Reconciling tops the local record up to at least this count
+    /// before evaluating the poison threshold, so a genuinely poison message
+    /// cannot hide behind a restart or a multi-consumer deployment.
+    ///
+    /// Synthesized timestamps carry no matching error message, so a message
+    /// reconciled this way can show [`FailureInfo::failure_count`] greater
+    /// than `error_messages.len()`, and
+    /// [`analyze_error_patterns`](Self::analyze_error_patterns) -- which only
+    /// looks at recorded error messages -- will undercount it. Call
+    /// [`track_failure`](Self::track_failure) too, with the real error, when
+    /// one is available; this method alone corrects the *count*, not the
+    /// diagnostic detail. [`track_failure_with_broker`](Self::track_failure_with_broker)
+    /// does both in one call.
+    ///
+    /// Synthesized timestamps are also stamped with the current time, not
+    /// the (unknown) time of each real past failure, so a message SQS has
+    /// actually been redelivering for hours is recorded here as if every
+    /// failure just happened. That makes it outlast
+    /// [`PoisonConfig::failure_window`] longer than the true redelivery
+    /// history would justify -- [`cleanup`](Self::cleanup) ages it out from
+    /// *this* reconciliation onward, not from when SQS first saw it fail.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_broker_sqs::poison_detector::{PoisonConfig, PoisonDetector};
+    ///
+    /// let config = PoisonConfig::new().with_max_failures(3).with_auto_isolate(true);
+    /// let mut detector = PoisonDetector::new(config);
+    ///
+    /// // SQS reports 3 receives even though this process never saw a
+    /// // failure for the message before (e.g. it just restarted).
+    /// let is_poison = detector.reconcile_receive_count("msg-1", 3);
+    /// assert!(is_poison);
+    /// assert!(detector.is_isolated("msg-1"));
+    /// assert_eq!(detector.failure_count("msg-1"), 3);
+    ///
+    /// // Reconciling again with a count no higher than what is already
+    /// // tracked does not add more synthetic failures (the message stays
+    /// // poison either way -- crossing the threshold is not reversible).
+    /// detector.reconcile_receive_count("msg-1", 2);
+    /// assert_eq!(detector.failure_count("msg-1"), 3);
+    /// ```
+    pub fn reconcile_receive_count(&mut self, message_id: &str, receive_count: u32) -> bool {
+        let receive_count = receive_count as usize;
+        let now = SystemTime::now();
+
+        let (is_poison, should_add_to_isolated) = {
+            let record = self
+                .failures
+                .entry(message_id.to_string())
+                .or_insert_with(|| FailureRecord {
+                    message_id: message_id.to_string(),
+                    timestamps: Vec::new(),
+                    error_messages: Vec::new(),
+                    is_isolated: false,
+                });
+
+            if record.timestamps.len() < receive_count {
+                let missing = receive_count - record.timestamps.len();
+                record.timestamps.extend(std::iter::repeat_n(now, missing));
+                self.total_failures += missing as u64;
+            }
+
+            let is_poison = record.timestamps.len() >= self.config.max_failures;
+            let should_add = if is_poison && self.config.auto_isolate && !record.is_isolated {
+                record.is_isolated = true;
+                true
+            } else {
+                false
+            };
+
+            (is_poison, should_add)
+        }; // record borrow ends here
+
+        if should_add_to_isolated && !self.isolated_messages.contains(&message_id.to_string()) {
+            self.isolated_messages.push(message_id.to_string());
+        }
+
+        is_poison
+    }
+
+    /// Reconcile using the broker's authoritative [`SqsBroker::receive_count`]
+    /// for `delivery_tag`, when the broker has it. A thin wrapper around
+    /// [`reconcile_receive_count`](Self::reconcile_receive_count); see its
+    /// docs for what reconciliation means.
+    ///
+    /// Returns `None` when the broker holds no metadata for `delivery_tag`
+    /// (for example because the message was already acknowledged), in which
+    /// case nothing was tracked. Otherwise returns the same poison verdict
+    /// `reconcile_receive_count` would.
+    pub fn reconcile_from_broker(
+        &mut self,
+        broker: &SqsBroker,
+        delivery_tag: &str,
+        message_id: &str,
+    ) -> Option<bool> {
+        let receive_count = broker.receive_count(delivery_tag)?;
+        Some(self.reconcile_receive_count(message_id, receive_count))
+    }
+
+    /// Track an observed failure and, when the broker has it, reconcile the
+    /// local count up to its authoritative [`SqsBroker::receive_count`].
+    ///
+    /// This is the combination most callers actually want: record *what*
+    /// went wrong (feeds [`analyze_error_patterns`](Self::analyze_error_patterns))
+    /// while trusting SQS, not this process alone, for *how many times*. See
+    /// [`reconcile_receive_count`](Self::reconcile_receive_count) for why the
+    /// two counts can otherwise disagree.
+    pub fn track_failure_with_broker(
+        &mut self,
+        broker: &SqsBroker,
+        delivery_tag: &str,
+        message_id: &str,
+        error_message: &str,
+    ) -> bool {
+        let tracked = self.track_failure(message_id, error_message);
+        match broker.receive_count(delivery_tag) {
+            Some(receive_count) => self.reconcile_receive_count(message_id, receive_count),
+            None => tracked,
+        }
     }
 
     /// Cleanup failures outside the time window
@@ -656,5 +806,149 @@ mod tests {
 
         assert!(!is_poison);
         assert_eq!(detector.failure_count("msg-1"), 1);
+    }
+
+    #[test]
+    fn reconcile_receive_count_flags_a_never_locally_seen_message() {
+        // Simulates a process restart: this detector has never seen the
+        // message fail, but SQS says it has already been redelivered past
+        // the threshold.
+        let config = PoisonConfig::new()
+            .with_max_failures(3)
+            .with_auto_isolate(true);
+        let mut detector = PoisonDetector::new(config);
+
+        let is_poison = detector.reconcile_receive_count("msg-1", 5);
+
+        assert!(is_poison);
+        assert!(detector.is_isolated("msg-1"));
+        assert_eq!(detector.failure_count("msg-1"), 5);
+    }
+
+    #[test]
+    fn reconcile_receive_count_never_decreases_the_tracked_count() {
+        let config = PoisonConfig::new().with_max_failures(10);
+        let mut detector = PoisonDetector::new(config);
+
+        detector.reconcile_receive_count("msg-1", 5);
+        assert_eq!(detector.failure_count("msg-1"), 5);
+
+        // A smaller count than what is already tracked must not roll the
+        // record backwards.
+        detector.reconcile_receive_count("msg-1", 2);
+        assert_eq!(detector.failure_count("msg-1"), 5);
+
+        // A larger count still tops it up.
+        detector.reconcile_receive_count("msg-1", 8);
+        assert_eq!(detector.failure_count("msg-1"), 8);
+    }
+
+    #[test]
+    fn reconcile_receive_count_tops_up_the_count_without_inventing_error_detail() {
+        let config = PoisonConfig::new().with_max_failures(10);
+        let mut detector = PoisonDetector::new(config);
+
+        // One real, locally observed failure with its error message ...
+        detector.track_failure("msg-1", "Connection timeout");
+        // ... but SQS says the true count is much higher (e.g. a second
+        // consumer instance also failed it, or this process just restarted).
+        detector.reconcile_receive_count("msg-1", 5);
+
+        let info = detector
+            .get_failure_info("msg-1")
+            .expect("message is tracked");
+        assert_eq!(info.failure_count, 5);
+        // The synthetic timestamps carry no matching error text: only the
+        // one real failure has a recorded message (the documented
+        // failure_count / error_messages.len() divergence).
+        assert_eq!(info.error_messages.len(), 1);
+        assert_eq!(info.error_messages[0], "Connection timeout");
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_broker_returns_none_without_metadata() {
+        let config = PoisonConfig::new();
+        let mut detector = PoisonDetector::new(config);
+        let broker = SqsBroker::new("tasks")
+            .await
+            .expect("broker construction does not touch the network");
+
+        let result = detector.reconcile_from_broker(&broker, "AQEB-unknown", "msg-1");
+
+        assert_eq!(result, None);
+        assert_eq!(detector.failure_count("msg-1"), 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_broker_uses_the_brokers_authoritative_count() {
+        use crate::delivery::{encode_delivery_tag, ReceiptMetadata};
+
+        let config = PoisonConfig::new().with_max_failures(4);
+        let mut detector = PoisonDetector::new(config);
+        let mut broker = SqsBroker::new("tasks")
+            .await
+            .expect("broker construction does not touch the network");
+
+        let tag = encode_delivery_tag("tasks", "AQEB");
+        broker.remember_receipt_metadata(
+            &tag,
+            ReceiptMetadata {
+                message_id: Some("m-1".to_string()),
+                receive_count: 4,
+                sent_timestamp_ms: None,
+            },
+        );
+
+        let result = detector.reconcile_from_broker(&broker, &tag, "msg-1");
+
+        assert_eq!(result, Some(true));
+        assert_eq!(detector.failure_count("msg-1"), 4);
+        assert!(detector.is_poison("msg-1"));
+    }
+
+    #[tokio::test]
+    async fn track_failure_with_broker_records_error_and_reconciles_count() {
+        use crate::delivery::{encode_delivery_tag, ReceiptMetadata};
+
+        let config = PoisonConfig::new().with_max_failures(3);
+        let mut detector = PoisonDetector::new(config);
+        let mut broker = SqsBroker::new("tasks")
+            .await
+            .expect("broker construction does not touch the network");
+
+        let tag = encode_delivery_tag("tasks", "AQEB");
+        broker.remember_receipt_metadata(
+            &tag,
+            ReceiptMetadata {
+                message_id: Some("m-1".to_string()),
+                receive_count: 3,
+                sent_timestamp_ms: None,
+            },
+        );
+
+        let is_poison =
+            detector.track_failure_with_broker(&broker, &tag, "msg-1", "Database timeout");
+
+        assert!(is_poison);
+        assert_eq!(detector.failure_count("msg-1"), 3);
+        let info = detector.get_failure_info("msg-1").expect("tracked");
+        assert_eq!(info.error_messages, vec!["Database timeout".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn track_failure_with_broker_falls_back_without_metadata() {
+        let config = PoisonConfig::new().with_max_failures(2);
+        let mut detector = PoisonDetector::new(config);
+        let broker = SqsBroker::new("tasks")
+            .await
+            .expect("broker construction does not touch the network");
+
+        // No `remember_receipt_metadata` call: the broker has nothing for
+        // this tag, so behaviour must fall back to the plain local count.
+        let first = detector.track_failure_with_broker(&broker, "AQEB-unknown", "msg-1", "e1");
+        assert!(!first);
+        let second = detector.track_failure_with_broker(&broker, "AQEB-unknown", "msg-1", "e2");
+        assert!(second);
+        assert_eq!(detector.failure_count("msg-1"), 2);
     }
 }
