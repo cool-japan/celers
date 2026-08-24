@@ -173,12 +173,21 @@ pub fn verify_message_format(msg: &Message) -> Result<(), String> {
 /// * the embed dict with all four workflow keys present
 ///   (`{'callbacks': None, 'errbacks': None, 'chain': None, 'chord': None}`),
 ///   which is what Python emits even when no workflow is attached.
+///
+/// # Errors
+///
+/// Returns [`serde_json::Error`] if the `[args, kwargs, embed]` body tuple
+/// cannot be serialized to JSON. In practice this cannot happen for a body
+/// built from already-valid [`serde_json::Value`]s (a `Value` can never
+/// hold a non-finite float or a non-string map key -- the only two things
+/// that make `serde_json` serialization fail), but the possibility is
+/// surfaced through the return type rather than papered over with a panic.
 pub fn create_python_celery_message(
     task_name: &str,
     task_id: Uuid,
     args: Vec<serde_json::Value>,
     kwargs: serde_json::Value,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, serde_json::Error> {
     let embed = json!({
         "callbacks": null,
         "errbacks": null,
@@ -186,7 +195,9 @@ pub fn create_python_celery_message(
         "chord": null
     });
 
-    json!({
+    let body = serde_json::to_vec(&json!([args, kwargs, embed]))?;
+
+    Ok(json!({
         "headers": {
             "task": task_name,
             "id": task_id.to_string(),
@@ -215,10 +226,8 @@ pub fn create_python_celery_message(
         },
         "content-type": "application/json",
         "content-encoding": "utf-8",
-        "body": base64::engine::general_purpose::STANDARD.encode(
-            serde_json::to_vec(&json!([args, kwargs, embed])).expect("serialization should not fail")
-        )
-    })
+        "body": base64::engine::general_purpose::STANDARD.encode(body)
+    }))
 }
 
 /// Parse a Python Celery message into CeleRS Message
@@ -320,7 +329,8 @@ mod tests {
             task_id,
             vec![json!(4), json!(5)],
             json!({}),
-        );
+        )
+        .expect("fixture serialization should not fail");
 
         // Should parse without errors
         let msg = parse_python_message(python_msg).expect("Should parse Python message");
@@ -344,7 +354,8 @@ mod tests {
             task_id,
             vec![json!(4), json!(5)],
             json!({}),
-        );
+        )
+        .expect("fixture serialization should not fail");
 
         // Every protocol v2 header key is present (null when unused).
         for header in CELERY_V2_HEADERS {

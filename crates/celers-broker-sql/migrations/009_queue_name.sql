@@ -20,6 +20,10 @@ ALTER TABLE celers_tasks
 -- Backfill from the JSON label written by every pre-migration enqueue path.
 -- `JSON_EXTRACT` returns SQL NULL when the path is absent, so rows written by
 -- paths that never stored a queue label fall back to 'default'.
+--
+-- Operational note: this is an unbounded UPDATE. On a large existing
+-- `celers_tasks` it will hold row locks for its duration, so apply it during
+-- a maintenance window on a busy deployment.
 UPDATE celers_tasks
 SET queue_name = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.queue')), 'default');
 

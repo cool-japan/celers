@@ -472,13 +472,26 @@ pub fn render_dot_with_limits(dag: &TaskDag, max_depth: usize, max_nodes: usize)
 /// - A dependency id not present in `tasks` (e.g. a queue export only
 ///   captures a subset of the full workload) is skipped, as is a
 ///   self-referential dependency.
-/// - A dependency that would introduce a cycle is rejected. Note that
-///   [`TaskDag::add_dependency`] mutates its internal adjacency *before*
-///   running its own cycle check, so a rejected edge is left partially
-///   applied by that call; this function immediately reverses that partial
-///   mutation via [`TaskDag::remove_dependency`] so the graph returned here
-///   is always genuinely acyclic (and therefore always fully reachable from
-///   [`TaskDag::get_roots`] by [`render_ascii`]/[`render_dot`]).
+/// - A dependency that would introduce a cycle is rejected.
+///   [`TaskDag::add_dependency`] validates *before* mutating its internal
+///   adjacency, so a rejected (cycle-closing) call is guaranteed to leave the
+///   graph exactly as it was -- this function's own [`TaskDag::remove_dependency`]
+///   call after a rejection is therefore a no-op on every currently
+///   supported `celers-core` version, kept only as cheap defense-in-depth
+///   against a future regression of that guarantee, not because it currently
+///   undoes anything. Either way, the graph returned here is always
+///   genuinely acyclic (and therefore always fully reachable from
+///   [`TaskDag::get_roots`] by [`render_ascii`]/[`render_dot`]) *when built
+///   through this function*.
+///
+///   A `TaskDag` handed to [`render_ascii`]/[`render_dot`] from elsewhere is
+///   not bound by that guarantee, though: `TaskDag`/`DagNode` both derive
+///   `serde::Deserialize` with every `DagNode` field `pub`, so a cyclic graph
+///   can still be constructed directly from hand-crafted or adversarial JSON
+///   via `serde_json::from_str::<TaskDag>`, bypassing `add_dependency`
+///   entirely -- which is exactly why those renderers carry their own
+///   independent cycle guards rather than relying solely on this function's
+///   acyclic-by-construction contract.
 #[must_use]
 pub fn dag_from_tasks(tasks: &[SerializedTask]) -> TaskDag {
     let mut dag = TaskDag::new();
@@ -497,8 +510,9 @@ pub fn dag_from_tasks(tasks: &[SerializedTask]) -> TaskDag {
                 .add_dependency(task.metadata.id, *dependency_id)
                 .is_err()
             {
-                // Would have closed a cycle; undo the partial mutation left
-                // behind by the rejected call (see doc comment above).
+                // No-op on a `TaskDag::add_dependency` that validates before
+                // mutating (see doc comment above); retained in case that
+                // guarantee ever regresses.
                 dag.remove_dependency(task.metadata.id, *dependency_id);
             }
         }
@@ -953,27 +967,49 @@ mod tests {
         assert!(rendered.lines().count() <= DEFAULT_MAX_RENDERED_NODES + 5);
     }
 
+    /// Build the JSON representation of one [`celers_core::dag::DagNode`]
+    /// (all fields `pub`, matching its `Serialize`/`Deserialize` derive) for
+    /// hand-crafting a `TaskDag` that bypasses `add_dependency` entirely --
+    /// see `dag_from_tasks`'s doc comment for why that is the one remaining
+    /// way to reach a genuinely cyclic `TaskDag`.
+    fn dag_node_json(
+        id: TaskId,
+        name: &str,
+        dependencies: &[TaskId],
+        dependents: &[TaskId],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "task_id": id,
+            "task_name": name,
+            "dependencies": dependencies,
+            "dependents": dependents,
+        })
+    }
+
     #[test]
     fn render_ascii_and_dot_terminate_on_corrupted_cyclic_dag_without_hanging() {
-        // `TaskDag::add_dependency` mutates its adjacency before validating,
-        // so a rejected (cycle-closing) edge is left partially applied --
-        // a documented quirk of the read-only celers-core dag module,
-        // worked around in `dag_from_tasks` via an add+rollback pair. This
-        // test proves the renderers are *also* safe against that residual
-        // possibility for any `TaskDag` not built via `dag_from_tasks`.
-        let mut dag = TaskDag::new();
+        // `TaskDag::add_dependency` now validates *before* mutating (see
+        // `dag_from_tasks`'s doc comment), so a genuinely cyclic `TaskDag`
+        // can no longer be built through that API -- every rejected,
+        // cycle-closing call leaves the graph exactly as it was. This test's
+        // premise still holds via the *other* documented avenue: `TaskDag`
+        // derives `Deserialize` with every `DagNode` field `pub`, so a
+        // cyclic graph can be built directly from hand-crafted JSON,
+        // bypassing `add_dependency` entirely. R -> X -> Y -> X (X and Y
+        // cyclically depend on each other, fed by root R).
         let r = TaskId::from_u128(1);
         let x = TaskId::from_u128(2);
         let y = TaskId::from_u128(3);
-        dag.add_node(r, "R");
-        dag.add_node(x, "X");
-        dag.add_node(y, "Y");
-        assert!(dag.add_dependency(x, r).is_ok());
-        assert!(dag.add_dependency(y, x).is_ok());
 
-        // Expected to fail (closes cycle X -> Y -> X); per the quirk above,
-        // it still leaves Y.dependents containing X.
-        assert!(dag.add_dependency(x, y).is_err());
+        let mut nodes = serde_json::Map::new();
+        nodes.insert(r.to_string(), dag_node_json(r, "R", &[], &[x]));
+        nodes.insert(x.to_string(), dag_node_json(x, "X", &[r, y], &[y]));
+        nodes.insert(y.to_string(), dag_node_json(y, "Y", &[x], &[x]));
+        let mut top = serde_json::Map::new();
+        top.insert("nodes".to_string(), serde_json::Value::Object(nodes));
+
+        let dag: TaskDag = serde_json::from_value(serde_json::Value::Object(top))
+            .expect("hand-crafted cyclic TaskDag JSON must deserialize");
 
         let rendered = render_ascii(&dag);
         assert!(rendered.contains("cycle detected"));

@@ -100,9 +100,11 @@ impl BeatScheduler {
     ///
     /// 1. Tick the heartbeat (leader election / lease renewal). Standby
     ///    instances return immediately with an empty list.
-    /// 2. Collect the entries that are due, each paired with its precise
-    ///    scheduled fire instant (jitter included, matching
-    ///    [`crate::task::ScheduledTask::next_run_time`]).
+    /// 2. Collect the entries that are due, each paired with the
+    ///    schedule-grid occurrence being fired (jitter and calendars decide
+    ///    *when* an occurrence becomes eligible, but the occurrence itself is
+    ///    the fire's identity — see
+    ///    [`crate::scheduler::BeatScheduler::planned_fires`]).
     /// 3. For every due entry, attempt to acquire the
     ///    [`dispatch_lock_key`]-scoped lock. If acquisition succeeds the entry
     ///    is marked as run and added to the returned list. If another instance
@@ -148,21 +150,16 @@ impl BeatScheduler {
             return Ok(Vec::new());
         }
 
-        // Step 2: Snapshot due entries with their scheduled fire instants.
-        // We resolve the instant up front (immutable borrow) so the subsequent
-        // mutable lock/mark operations don't fight the borrow checker.
-        let due_fires: Vec<(String, DateTime<Utc>)> = self
-            .get_due_tasks_by_priority()
-            .iter()
-            .filter_map(|task| {
-                // The fire instant is the (jitter-aware) next run time. If it
-                // cannot be computed the entry is skipped rather than dispatched
-                // blindly.
-                task.next_run_time()
-                    .ok()
-                    .map(|instant| (task.name.clone(), instant))
-            })
-            .collect();
+        // Step 2: Snapshot the due fires with their scheduled instants. We
+        // resolve them up front (immutable borrow) so the subsequent mutable
+        // lock/mark operations don't fight the borrow checker.
+        //
+        // Every instant here is derived from the schedule grid — from
+        // `last_run_at` when the entry has run and from `created_at` when it has
+        // not — never from the wall clock at evaluation time. That is what makes
+        // two instances compute the *same* key for the same fire, including an
+        // entry's very first fire.
+        let due_fires = self.collect_due_fires(Utc::now());
 
         // Step 3: Lock-guarded dispatch.
         let mut dispatched = Vec::new();
@@ -173,25 +170,37 @@ impl BeatScheduler {
 
             if !acquired {
                 // Another instance owns this exact fire; skip to avoid a
-                // duplicate dispatch.
+                // duplicate dispatch. Logged so the skip is observable rather
+                // than silent.
+                tracing::debug!(
+                    entry = %name,
+                    instant = %instant,
+                    "dispatch lock already held; skipping this fire"
+                );
                 continue;
             }
 
-            // We own the fire: mark it as run and record it as dispatched.
-            // `mark_task_run` advances `last_run_at`, so the entry's *next*
-            // fire is a fresh instant (and thus a fresh lock key).
+            // We own the fire: record it against the *occurrence* instant (not
+            // the wall clock) so the entry's next evaluation continues along
+            // the schedule grid, and record it as dispatched.
             //
             // The per-fire lock is deliberately NOT released here; it is the
             // durable claim on this instant and is allowed to lapse by its TTL
             // (see the method docs). Early release would permit a sibling
             // instance ticking slightly later to re-dispatch the same fire.
-            let _ = self.mark_task_run(&name);
-            dispatched.push(name.clone());
+            // State is persisted once at the end of the tick rather than once
+            // per dispatched fire.
+            if self.record_run(&name, instant) {
+                dispatched.push(name);
+            }
         }
 
-        // Step 4: Refresh heartbeat metadata and persist.
+        // Step 4: Refresh heartbeat metadata and persist. An idle tick changed
+        // nothing, so it must not rewrite the whole state file.
         self.update_heartbeat_info().await;
-        let _ = self.save_state();
+        if !dispatched.is_empty() {
+            self.persist_after_tick().await;
+        }
 
         Ok(dispatched)
     }

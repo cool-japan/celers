@@ -753,7 +753,15 @@ fn test_scheduler_task_prioritization() {
     // Verify all tasks were added
     assert_eq!(scheduler.tasks.len(), 3);
 
-    // All tasks should initially be due (never run)
+    // A never-run task waits for its first schedule-derived occurrence, so
+    // backdate registration past the longest interval to make them all due.
+    for name in ["task_60", "task_120", "task_30"] {
+        if let Some(task) = scheduler.tasks.get_mut(name) {
+            task.created_at = Utc::now() - Duration::seconds(200);
+            task.invalidate_next_run_cache();
+        }
+    }
+
     let due_tasks = scheduler.get_due_tasks();
     assert_eq!(due_tasks.len(), 3);
 }
@@ -767,7 +775,11 @@ fn test_scheduler_task_lifecycle() {
     scheduler.add_task(task).unwrap();
     assert_eq!(scheduler.tasks.len(), 1);
 
-    // 2. Task is due (short interval, never run)
+    // 2. Task is due once its first schedule-derived occurrence has elapsed
+    if let Some(task) = scheduler.tasks.get_mut("lifecycle_task") {
+        task.created_at = Utc::now() - Duration::seconds(5);
+        task.invalidate_next_run_cache();
+    }
     let due_tasks = scheduler.get_due_tasks();
     assert_eq!(due_tasks.len(), 1);
 
@@ -828,6 +840,14 @@ fn test_scheduler_loop_simulation() {
     // Add task with 1 second interval
     let task = ScheduledTask::new("loop_task".to_string(), Schedule::interval(1));
     scheduler.add_task(task).unwrap();
+
+    // Backdate registration so the first occurrence has already elapsed (a
+    // never-run task is due at its first schedule-derived occurrence, not on
+    // registration).
+    if let Some(task) = scheduler.tasks.get_mut("loop_task") {
+        task.created_at = Utc::now() - Duration::seconds(5);
+        task.invalidate_next_run_cache();
+    }
 
     // Simulate 5 iterations of scheduler loop
     let mut executions = 0;

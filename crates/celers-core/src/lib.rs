@@ -169,8 +169,9 @@ pub use event::{
     TaskEvent, TaskEventBuilder, WorkerEvent, WorkerEventBuilder,
 };
 pub use event_filter::{
-    CollectingEventHandler, CompositeEventFilter, EventFilterTrait, EventHandlerTrait, EventRouter,
-    ExactEventFilter, FilterMode, GlobEventFilter, LoggingEventHandler, PrefixEventFilter,
+    CollectingEventHandler, CompositeEventFilter, DispatchReport, EventFilterTrait,
+    EventHandlerTrait, EventRouter, ExactEventFilter, FilterMode, GlobEventFilter,
+    LoggingEventHandler, PrefixEventFilter,
 };
 pub use event_persistence::{
     EventPersister, FileEventPersister, FileEventPersisterConfig, RotationPolicy,
@@ -197,8 +198,8 @@ pub use rate_limit_distributed::{
     RateLimitParams,
 };
 pub use result::{
-    AsyncResult, ExtendedResultStore, ResultChunk, ResultChunker, ResultCompressor, ResultMetadata,
-    ResultStore, ResultTombstone, TaskResultValue,
+    AsyncResult, AsyncResultConfig, ExtendedResultStore, ResultChunk, ResultChunker,
+    ResultCompressor, ResultMetadata, ResultStore, ResultTombstone, TaskResultValue,
 };
 pub use result_groups::{GroupChild, GroupStatus, ResultGroup};
 pub use result_tombstone::{ResultExistence, TombstoneExt, TombstoneRegistry};
@@ -218,7 +219,8 @@ pub use sanitize::{
 pub use state::{StateHistory, StateTransition, TaskState};
 pub use task::{SerializedTask, Task, TaskId, TaskMetadata};
 pub use task_signature::{
-    HmacSha256, Sha256, SignatureAlgorithm, SignatureError, SignedFields, TaskSignature, TaskSigner,
+    FreshnessWindow, HmacSha256, ReplayGuard, Sha256, SignatureAlgorithm, SignatureError,
+    SignedCallback, SignedFields, TaskSignature, TaskSigner,
 };
 pub use tenant_rate_limit::{TenantRateLimit, TenantRateLimiter, TenantUsage};
 pub use time_limit::{

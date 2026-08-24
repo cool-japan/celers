@@ -38,6 +38,7 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, TaskId};
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
@@ -250,7 +251,7 @@ impl ResultBackend {
     pub async fn store_task_result(&self, task_result: &TaskResult) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -295,7 +296,7 @@ impl ResultBackend {
     pub async fn get_result(&self, task_id: &TaskId) -> Result<Option<TaskResult>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -326,7 +327,7 @@ impl ResultBackend {
     pub async fn delete_result(&self, task_id: &TaskId) -> Result<bool> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -399,7 +400,7 @@ impl ResultBackend {
     pub async fn count_results(&self) -> Result<usize> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -417,7 +418,7 @@ impl ResultBackend {
     pub async fn clear_all(&self) -> Result<usize> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 

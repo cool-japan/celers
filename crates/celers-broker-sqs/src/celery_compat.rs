@@ -370,6 +370,99 @@ impl CeleryAttributeMapper {
         Ok(headers)
     }
 
+    /// Merge recovered [`CeleryHeaders`] into a deserialized message.
+    ///
+    /// Only *gaps* are filled: the JSON body is authoritative for everything
+    /// CeleRS itself published, so overwriting from the SQS attributes would
+    /// corrupt its own round trip. This is what makes the attribute mapping
+    /// bidirectional — a Python Celery producer that carries a header only as a
+    /// MessageAttribute is now understood on the consume path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use celers_broker_sqs::celery_compat::{CeleryAttributeMapper, CeleryHeaders};
+    /// use celers_protocol::Message;
+    /// use uuid::Uuid;
+    ///
+    /// let mapper = CeleryAttributeMapper::new();
+    /// let mut message = Message::new("tasks.add".to_string(), Uuid::new_v4(), Vec::new());
+    ///
+    /// let mut headers = CeleryHeaders::new();
+    /// headers.task = Some("tasks.other".to_string());
+    /// headers.retries = Some(3);
+    ///
+    /// mapper.apply_headers(&headers, &mut message);
+    ///
+    /// // The body wins for the task name ...
+    /// assert_eq!(message.headers.task, "tasks.add");
+    /// // ... but the gap is filled from the attributes.
+    /// assert_eq!(message.headers.retries, Some(3));
+    /// ```
+    pub fn apply_headers(&self, headers: &CeleryHeaders, message: &mut celers_protocol::Message) {
+        if message.headers.task.is_empty() {
+            if let Some(ref task) = headers.task {
+                message.headers.task = task.clone();
+            }
+        }
+
+        if message.headers.id.is_nil() {
+            if let Some(id) = headers.id {
+                message.headers.id = id;
+            }
+        }
+
+        if message.headers.lang.is_empty() {
+            if let Some(ref lang) = headers.lang {
+                message.headers.lang = lang.clone();
+            }
+        }
+
+        if message.headers.root_id.is_none() {
+            message.headers.root_id = headers.root_id;
+        }
+
+        if message.headers.parent_id.is_none() {
+            message.headers.parent_id = headers.parent_id;
+        }
+
+        if message.headers.group.is_none() {
+            message.headers.group = headers.group;
+        }
+
+        if message.headers.retries.is_none() {
+            message.headers.retries = headers.retries;
+        }
+
+        if message.headers.eta.is_none() {
+            message.headers.eta = headers.eta;
+        }
+
+        if message.headers.expires.is_none() {
+            message.headers.expires = headers.expires;
+        }
+
+        if message.properties.priority.is_none() {
+            message.properties.priority = headers.priority;
+        }
+
+        if message.properties.correlation_id.is_none() {
+            message.properties.correlation_id = headers.correlation_id.clone();
+        }
+
+        if message.content_type.is_empty() {
+            if let Some(ref content_type) = headers.content_type {
+                message.content_type = content_type.clone();
+            }
+        }
+
+        if message.content_encoding.is_empty() {
+            if let Some(ref content_encoding) = headers.content_encoding {
+                message.content_encoding = content_encoding.clone();
+            }
+        }
+    }
+
     /// Build a String type MessageAttributeValue
     fn build_string_attribute(&self, value: &str) -> Result<MessageAttributeValue> {
         MessageAttributeValue::builder()

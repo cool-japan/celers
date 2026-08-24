@@ -384,10 +384,77 @@ struct EventRoute {
     priority: i32,
 }
 
+/// Outcome of a best-effort fan-out to the matching handlers.
+///
+/// Unlike a bare `Result<usize>`, this keeps the delivery count *and* the
+/// failures: a caller can see that 3 of 5 handlers took the event even when one
+/// of them returned an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchReport {
+    /// Number of routes whose filter matched the event.
+    pub matched: usize,
+    /// Number of handlers that accepted the event without error.
+    pub dispatched: usize,
+    /// One formatted message per failing handler, in dispatch order.
+    pub failures: Vec<String>,
+}
+
+impl DispatchReport {
+    /// `true` when every matching handler accepted the event.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// Number of handlers that returned an error.
+    #[must_use]
+    pub fn failure_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    /// Merge another report into this one (used when batching).
+    fn absorb(&mut self, other: Self) {
+        self.matched += other.matched;
+        self.dispatched += other.dispatched;
+        self.failures.extend(other.failures);
+    }
+
+    /// Collapse into the `Result<usize>` shape returned by
+    /// [`EventRouter::dispatch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an aggregated error naming every failing handler when at least
+    /// one handler failed. The successful-delivery count is preserved in the
+    /// message so it is not lost on the error path; callers that need it
+    /// programmatically should use [`EventRouter::dispatch_report`] instead.
+    pub fn into_result(self) -> crate::Result<usize> {
+        if self.failures.is_empty() {
+            return Ok(self.dispatched);
+        }
+        Err(crate::CelersError::Other(format!(
+            "{} of {} matching event handlers failed ({} delivered): {}",
+            self.failures.len(),
+            self.matched,
+            self.dispatched,
+            self.failures.join("; ")
+        )))
+    }
+}
+
 /// Routes events to appropriate handlers based on filters
 ///
 /// Events are dispatched to all handlers whose filter matches.
 /// Routes are processed in priority order (higher priority first).
+///
+/// # Failure semantics
+///
+/// Fan-out is **best-effort**: a handler that returns an error must never
+/// starve the remaining handlers of the event, so every matching handler is
+/// attempted and the failures are aggregated afterwards. This matches
+/// [`crate::event::CompositeEventEmitter`], the other fan-out site in this
+/// crate. Use [`EventRouter::dispatch_report`] when the delivery count matters
+/// even in the presence of failures.
 pub struct EventRouter {
     routes: Vec<EventRoute>,
 }
@@ -433,41 +500,78 @@ impl EventRouter {
         self.routes.len()
     }
 
-    /// Dispatch an event to all matching handlers (in priority order)
+    /// Dispatch an event to all matching handlers (in priority order),
+    /// returning the full [`DispatchReport`].
     ///
-    /// Returns the number of handlers that processed the event.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any handler fails to process the event.
-    pub async fn dispatch(&self, event: Event) -> crate::Result<usize> {
-        let mut count = 0usize;
+    /// This never short-circuits: every matching handler is attempted even if
+    /// an earlier one failed, and the count of successful deliveries survives
+    /// alongside the failures.
+    pub async fn dispatch_report(&self, event: Event) -> DispatchReport {
+        let mut report = DispatchReport::default();
 
         for route in &self.routes {
-            if route.filter.matches(&event) {
-                route.handler.handle(event.clone()).await?;
-                count += 1;
+            if !route.filter.matches(&event) {
+                continue;
+            }
+            report.matched += 1;
+            match route.handler.handle(event.clone()).await {
+                Ok(()) => report.dispatched += 1,
+                Err(e) => {
+                    let handler = route.handler.name();
+                    tracing::warn!(
+                        handler = handler,
+                        event_type = event.event_type(),
+                        error = %e,
+                        "Event handler failed; continuing with the remaining handlers"
+                    );
+                    report.failures.push(format!("handler[{handler}]: {e}"));
+                }
             }
         }
 
-        Ok(count)
+        report
+    }
+
+    /// Dispatch an event to all matching handlers (in priority order)
+    ///
+    /// Returns the number of handlers that processed the event successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns a single aggregated error if any handler failed. The remaining
+    /// handlers are still invoked first — see [`EventRouter::dispatch_report`]
+    /// if the delivery count is needed on the failure path.
+    pub async fn dispatch(&self, event: Event) -> crate::Result<usize> {
+        self.dispatch_report(event).await.into_result()
+    }
+
+    /// Dispatch a batch of events, returning the aggregated
+    /// [`DispatchReport`].
+    ///
+    /// Best-effort across both dimensions: a failing handler does not stop the
+    /// remaining handlers for that event, and a failing event does not stop the
+    /// remaining events.
+    pub async fn dispatch_batch_report(&self, events: Vec<Event>) -> DispatchReport {
+        let mut total = DispatchReport::default();
+
+        for event in events {
+            total.absorb(self.dispatch_report(event).await);
+        }
+
+        total
     }
 
     /// Dispatch a batch of events
     ///
-    /// Returns the total number of handler invocations across all events.
+    /// Returns the total number of successful handler invocations across all
+    /// events.
     ///
     /// # Errors
     ///
-    /// Returns an error if any handler fails to process any event.
+    /// Returns a single aggregated error if any handler failed for any event,
+    /// after every event has been offered to every matching handler.
     pub async fn dispatch_batch(&self, events: Vec<Event>) -> crate::Result<usize> {
-        let mut total = 0usize;
-
-        for event in events {
-            total += self.dispatch(event).await?;
-        }
-
-        Ok(total)
+        self.dispatch_batch_report(events).await.into_result()
     }
 }
 
@@ -1050,5 +1154,115 @@ mod tests {
         assert_eq!(count.ok(), Some(2));
         assert_eq!(a_clone.len().await, 1);
         assert_eq!(b_clone.len().await, 1);
+    }
+
+    // ---- Best-effort fan-out regression tests ----
+
+    /// A handler that always fails, used to prove the fan-out does not
+    /// short-circuit.
+    #[derive(Debug)]
+    struct FailingEventHandler {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl EventHandlerTrait for FailingEventHandler {
+        async fn handle(&self, _event: Event) -> crate::Result<()> {
+            Err(crate::CelersError::Other(format!("{} is down", self.name)))
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+    }
+
+    /// Regression: `dispatch` used `?` on the first failing handler, so a single
+    /// broken sink starved every lower-priority handler of the event and the
+    /// delivery count was discarded. Fan-out is now best-effort, as it already
+    /// was in `event::CompositeEventEmitter`.
+    #[tokio::test]
+    async fn dispatch_is_best_effort_and_reaches_handlers_after_a_failure() {
+        let survivor = CollectingEventHandler::new("survivor", 100);
+        let survivor_clone = survivor.clone();
+
+        // The failing handler has the higher priority, so it runs first.
+        let router = EventRouter::new()
+            .route_with_priority(
+                GlobEventFilter::new("**"),
+                FailingEventHandler { name: "broken" },
+                100,
+            )
+            .route_with_priority(GlobEventFilter::new("**"), survivor, 1);
+
+        let report = router.dispatch_report(make_task_sent()).await;
+        assert_eq!(report.matched, 2);
+        assert_eq!(report.dispatched, 1, "the healthy handler still got it");
+        assert_eq!(report.failure_count(), 1);
+        assert!(!report.is_ok());
+        assert!(report.failures[0].contains("broken"));
+
+        // The event genuinely reached the second handler.
+        assert_eq!(survivor_clone.len().await, 1);
+    }
+
+    /// The `Result` shape keeps the delivery count visible in the error message
+    /// instead of silently dropping it.
+    #[tokio::test]
+    async fn dispatch_error_reports_delivered_count() {
+        let router = EventRouter::new()
+            .route(
+                GlobEventFilter::new("**"),
+                CollectingEventHandler::new("ok", 4),
+            )
+            .route(
+                GlobEventFilter::new("**"),
+                FailingEventHandler { name: "broken" },
+            );
+
+        let err = router
+            .dispatch(make_task_sent())
+            .await
+            .expect_err("a failing handler must surface an error");
+        let message = err.to_string();
+        assert!(message.contains("1 delivered"), "unexpected: {message}");
+        assert!(message.contains("broken"), "unexpected: {message}");
+    }
+
+    /// Regression: `dispatch_batch` kept its own `?`, so it still fail-fast on
+    /// the first bad event even after `dispatch` became best-effort.
+    #[tokio::test]
+    async fn dispatch_batch_is_best_effort_across_events() {
+        let collector = CollectingEventHandler::new("all", 100);
+        let collector_clone = collector.clone();
+
+        let router = EventRouter::new()
+            .route_with_priority(
+                GlobEventFilter::new("**"),
+                FailingEventHandler { name: "broken" },
+                100,
+            )
+            .route_with_priority(GlobEventFilter::new("**"), collector, 1);
+
+        let events = vec![make_task_sent(), make_task_failed(), make_worker_online()];
+        let report = router.dispatch_batch_report(events).await;
+
+        assert_eq!(report.matched, 6);
+        assert_eq!(report.dispatched, 3);
+        assert_eq!(report.failure_count(), 3);
+
+        // Every event was still offered to the healthy handler.
+        assert_eq!(collector_clone.len().await, 3);
+    }
+
+    #[tokio::test]
+    async fn successful_dispatch_report_collapses_to_ok() {
+        let router = EventRouter::new().route(
+            GlobEventFilter::new("**"),
+            CollectingEventHandler::new("a", 4),
+        );
+
+        let report = router.dispatch_report(make_task_sent()).await;
+        assert!(report.is_ok());
+        assert_eq!(report.into_result().ok(), Some(1));
     }
 }

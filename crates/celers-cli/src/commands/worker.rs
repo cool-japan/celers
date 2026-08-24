@@ -81,17 +81,22 @@ fn invalidate_worker_caches(broker_url: &str, worker_id: &str) {
 /// Grace period [`start_worker`] waits for in-flight tasks to finish during
 /// shutdown before giving up and exiting anyway.
 ///
-/// Configurable via `CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS` (falls back to 30
-/// seconds). There is intentionally no `--shutdown-timeout` CLI flag wired
-/// to this yet -- adding one requires a change to the `Commands::Worker`
-/// struct and its `cli::dispatch` handler, both outside this module (see
-/// the crate-level followups) -- but every caller of [`start_worker`] still
-/// benefits from bounded, honest shutdown behavior via this default.
-fn worker_shutdown_timeout() -> std::time::Duration {
-    let secs = std::env::var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+/// Precedence: `override_secs` (threaded from `Commands::Worker`'s
+/// `--shutdown-timeout` flag via `cli::dispatch`) wins when set to a
+/// positive value; otherwise the `CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS`
+/// environment variable is consulted; otherwise this falls back to 30
+/// seconds. A `0` from either source is treated as "not set" -- a
+/// zero-length timeout would make shutdown behave exactly like the old
+/// unconditional `abort()` again.
+fn worker_shutdown_timeout(override_secs: Option<u64>) -> std::time::Duration {
+    let secs = override_secs
         .filter(|&secs| secs > 0)
+        .or_else(|| {
+            std::env::var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&secs| secs > 0)
+        })
         .unwrap_or(30);
     std::time::Duration::from_secs(secs)
 }
@@ -109,6 +114,9 @@ fn worker_shutdown_timeout() -> std::time::Duration {
 /// * `concurrency` - Maximum number of concurrent tasks to process
 /// * `max_retries` - Maximum retry attempts for failed tasks
 /// * `timeout` - Task execution timeout in seconds
+/// * `shutdown_timeout_secs` - Optional override for the graceful-shutdown
+///   grace period (see [`worker_shutdown_timeout`]); `None` falls back to
+///   `CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS`, then a 30s default.
 ///
 /// # Returns
 ///
@@ -127,7 +135,8 @@ fn worker_shutdown_timeout() -> std::time::Duration {
 ///     "fifo",
 ///     4,
 ///     3,
-///     300
+///     300,
+///     None,
 /// ).await?;
 /// # Ok(())
 /// # }
@@ -139,6 +148,7 @@ pub async fn start_worker(
     concurrency: usize,
     max_retries: u32,
     timeout: u64,
+    shutdown_timeout_secs: Option<u64>,
 ) -> anyhow::Result<()> {
     println!("{}", "=== CeleRS Worker ===".bold().green());
     println!();
@@ -193,7 +203,7 @@ pub async fn start_worker(
     // Wait for shutdown signal
     wait_for_signal().await;
 
-    let shutdown_timeout = worker_shutdown_timeout();
+    let shutdown_timeout = worker_shutdown_timeout(shutdown_timeout_secs);
     println!();
     println!(
         "{}",
@@ -739,14 +749,14 @@ pub async fn scale_workers(broker_url: &str, target_count: usize) -> anyhow::Res
     );
     println!();
 
-    // Get current worker count
-    let pattern = "celers:worker:*:heartbeat";
-    let keys: Vec<String> = redis::cmd("KEYS")
-        .arg(pattern)
-        .query_async(&mut conn)
-        .await?;
-
-    let current_count = keys.len();
+    // Get current worker count. `SCAN` (cursor-based, bounded per call cost)
+    // rather than a blocking `KEYS celers:worker:*:heartbeat`, which locks
+    // up the entire single-threaded Redis server for the duration of the
+    // call on a large keyspace -- the same fix already applied to the other
+    // 5 sites that used to duplicate this exact pattern (idx 331).
+    let current_count = crate::commands::monitoring::report::scan_worker_heartbeat_keys(&mut conn)
+        .await?
+        .len();
 
     println!("Current workers: {}", current_count.to_string().yellow());
     println!("Target workers: {}", target_count.to_string().green());
@@ -889,39 +899,130 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Regression test for the 6th (and last) idx-331 site: `scale_workers`
+    /// used to count workers via a blocking `KEYS celers:worker:*:heartbeat`
+    /// (locks up the single-threaded Redis server for the call's duration on
+    /// a large keyspace), unlike the other 5 sites already swapped to the
+    /// cursor-based `scan_worker_heartbeat_keys`. This proves the swapped
+    /// call still completes cleanly end-to-end against live Redis with a
+    /// real heartbeat key present.
+    #[tokio::test]
+    async fn scale_workers_counts_via_scan_not_blocking_keys() {
+        let worker_id = format!("test-scale-{}", uuid::Uuid::new_v4());
+        let heartbeat_key = format!("celers:worker:{worker_id}:heartbeat");
+
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("conn");
+        let _: () = redis::cmd("SET")
+            .arg(&heartbeat_key)
+            .arg("alive")
+            .query_async(&mut conn)
+            .await
+            .expect("seed heartbeat key");
+
+        let current_count =
+            crate::commands::monitoring::report::scan_worker_heartbeat_keys(&mut conn)
+                .await
+                .expect("scan_worker_heartbeat_keys")
+                .len();
+        assert!(
+            current_count >= 1,
+            "the just-seeded heartbeat key must be counted"
+        );
+
+        scale_workers(TEST_BROKER_URL, current_count + 1)
+            .await
+            .expect("scale_workers must complete without error against live Redis");
+
+        let _: () = redis::cmd("DEL")
+            .arg(&heartbeat_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(());
+    }
+
     /// Regression test for the `--shutdown-timeout` half of idx 336:
-    /// `worker_shutdown_timeout` must honor a valid override, fall back to
-    /// a sane default (30s) when unset, and never panic or silently produce
-    /// a zero-length timeout (which would make shutdown behave exactly like
-    /// the old unconditional `abort()` again) on a malformed value.
+    /// `worker_shutdown_timeout` must honor a valid env-var override, fall
+    /// back to a sane default (30s) when unset, and never panic or silently
+    /// produce a zero-length timeout (which would make shutdown behave
+    /// exactly like the old unconditional `abort()` again) on a malformed
+    /// value.
     #[test]
     fn worker_shutdown_timeout_reads_env_with_sane_fallback() {
         let _guard = shutdown_timeout_env_guard();
 
         std::env::remove_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS");
         assert_eq!(
-            worker_shutdown_timeout(),
+            worker_shutdown_timeout(None),
             std::time::Duration::from_secs(30)
         );
 
         std::env::set_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS", "5");
-        assert_eq!(worker_shutdown_timeout(), std::time::Duration::from_secs(5));
+        assert_eq!(
+            worker_shutdown_timeout(None),
+            std::time::Duration::from_secs(5)
+        );
 
         std::env::set_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS", "not-a-number");
         assert_eq!(
-            worker_shutdown_timeout(),
+            worker_shutdown_timeout(None),
             std::time::Duration::from_secs(30),
             "an unparseable override must fall back to the default"
         );
 
         std::env::set_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS", "0");
         assert_eq!(
-            worker_shutdown_timeout(),
+            worker_shutdown_timeout(None),
             std::time::Duration::from_secs(30),
             "a zero timeout would make every shutdown behave like an immediate hard-abort again"
         );
 
         std::env::remove_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS");
+    }
+
+    /// Regression test for the `--shutdown-timeout` CLI flag itself (the
+    /// second half of idx 336, wired up once `Commands::Worker`/
+    /// `cli::dispatch` were in scope): an explicit `override_secs` must win
+    /// over the environment variable, and a `0` override must fall through
+    /// to the env var (or default) exactly like an unset env var does,
+    /// never producing a zero-length timeout.
+    #[test]
+    fn worker_shutdown_timeout_explicit_override_wins_over_env_var() {
+        let _guard = shutdown_timeout_env_guard();
+
+        std::env::remove_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS");
+        assert_eq!(
+            worker_shutdown_timeout(Some(15)),
+            std::time::Duration::from_secs(15),
+            "an explicit override must be honored with no env var set"
+        );
+
+        std::env::set_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS", "5");
+        assert_eq!(
+            worker_shutdown_timeout(Some(15)),
+            std::time::Duration::from_secs(15),
+            "an explicit CLI-flag override must win over the environment variable"
+        );
+        assert_eq!(
+            worker_shutdown_timeout(Some(0)),
+            std::time::Duration::from_secs(5),
+            "a zero override must fall through to the env var, not zero out the timeout"
+        );
+        assert_eq!(
+            worker_shutdown_timeout(None),
+            std::time::Duration::from_secs(5),
+            "no override at all must still fall through to the env var"
+        );
+
+        std::env::remove_var("CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS");
+        assert_eq!(
+            worker_shutdown_timeout(Some(0)),
+            std::time::Duration::from_secs(30),
+            "a zero override with no env var must fall through to the default"
+        );
     }
 
     /// Regression test for idx 336's core mechanism: `start_worker` now

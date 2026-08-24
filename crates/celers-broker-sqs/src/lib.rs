@@ -5,12 +5,14 @@
 //! # Features
 //!
 //! - Long polling for efficiency (up to 20 seconds)
-//! - Visibility timeout handling
+//! - Visibility timeout handling, with an optional background heartbeat that
+//!   keeps a message invisible for as long as its handler runs
 //! - Dead Letter Queue (DLQ) integration
 //! - FIFO queue support with message deduplication
 //! - Server-side encryption (SSE) with optional KMS
 //! - IAM role authentication
-//! - Batch operations for throughput (publish_batch, consume_batch, ack_batch)
+//! - Batch operations for throughput (publish_batch, consume_batch, ack_batch),
+//!   chunked automatically and reporting per-entry failures
 //! - Priority queue support (via message attributes)
 //! - Cost optimization through batch API calls (10x reduction)
 //! - Queue monitoring and statistics
@@ -24,7 +26,7 @@
 //! - **Quota/budget management** for cost control ✨ NEW
 //! - **Multi-queue routing** for message distribution ✨ NEW
 //! - **Performance profiling** with latency tracking ✨ NEW
-//! - **Message deduplication** utilities for preventing duplicate processing ✨ NEW
+//! - **Message deduplication** utilities (per-process, stable SHA-256 keys) ✨ NEW
 //! - **Advanced DLQ analytics** with error pattern detection and retry recommendations ✨ NEW
 //! - **Observability hooks** for custom metrics and logging integration ✨ NEW
 //! - **Backpressure management** for preventing system overload ✨ NEW
@@ -43,7 +45,7 @@
 //! broker.connect().await?;
 //!
 //! // Publish a message
-//! let message = Message::new("tasks.add");
+//! let message = Message::new("tasks.add".to_string(), uuid::Uuid::new_v4(), Vec::new());
 //! broker.publish("my-queue", message).await?;
 //!
 //! // Consume messages
@@ -95,7 +97,7 @@
 //!
 //! // Batch acknowledge
 //! let tags: Vec<String> = envelopes.iter().map(|e| e.delivery_tag.clone()).collect();
-//! broker.ack_batch(&tags).await?;
+//! broker.ack_batch("my-queue", tags).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -199,7 +201,9 @@ pub mod circuit_breaker;
 pub mod cost_alerts;
 pub mod cost_tracker;
 pub mod dedup;
+pub mod delivery;
 pub mod dlq_analytics;
+pub mod fifo;
 pub mod hooks;
 pub mod lambda_helpers;
 pub mod metrics_aggregator;
@@ -209,13 +213,16 @@ pub mod poison_detector;
 pub mod profiler;
 pub mod quota_manager;
 pub mod replay;
+pub mod retry_policy;
 pub mod router;
 pub mod sla_monitor;
 pub mod tracing_util;
 pub mod utilities;
+pub mod visibility;
 pub mod workload_presets;
 
 // Core modules
+pub mod batch_ops;
 pub mod broker_core;
 pub mod broker_ops;
 pub mod types;
@@ -225,5 +232,8 @@ pub mod types;
 mod tests;
 
 // Re-exports
+pub use batch_ops::{BatchEntryFailure, BatchOutcome};
 pub use broker_core::SqsBroker;
+pub use delivery::ReceiptMetadata;
 pub use types::*;
+pub use visibility::VisibilityHeartbeat;

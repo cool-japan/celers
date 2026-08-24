@@ -443,7 +443,9 @@ impl BeatScheduler {
 
         // Save state if we made changes
         if !resolutions.is_empty() {
-            let _ = self.save_state();
+            if let Err(e) = self.save_state() {
+                tracing::error!(error = %e, "failed to persist auto-resolved conflicts");
+            }
         }
 
         resolutions
@@ -533,8 +535,11 @@ impl BeatScheduler {
             // Only clear jitter if it was likely added by auto-resolution
             // (we can't be 100% certain, but we clear it anyway)
             task.jitter = None;
+            task.invalidate_next_run_cache();
         }
-        let _ = self.save_state();
+        if let Err(e) = self.save_state() {
+            tracing::error!(error = %e, "failed to persist cleared conflict jitter");
+        }
     }
 }
 
@@ -823,7 +828,7 @@ impl BeatScheduler {
         let mut due_tasks: Vec<&ScheduledTask> = self
             .tasks
             .values()
-            .filter(|task| task.enabled && task.is_due().unwrap_or(false))
+            .filter(|task| task.enabled && self.task_is_due(task))
             .collect();
 
         // Sort by effective priority (descending), then by next run time (ascending)

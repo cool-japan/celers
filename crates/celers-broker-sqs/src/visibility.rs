@@ -203,21 +203,49 @@ mod tests {
         assert!(within_extension_budget(i64::MAX, 30, i64::MAX));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn heartbeat_stops_when_cancelled() {
-        // No SDK call is exercised here: the task sleeps first, so cancelling
-        // before the first tick must leave it inert and finish immediately.
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&cancelled);
+    #[tokio::test]
+    async fn heartbeat_can_be_stopped_before_its_first_tick() {
+        // The task sleeps for a full interval before touching AWS, so
+        // cancelling immediately guarantees no request is ever made and the
+        // test stays deterministic (no sleeps, no network).
+        let config = aws_sdk_sqs::Config::builder()
+            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
+            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
+            .build();
+        let client = Client::from_conf(config);
 
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            flag.load(Ordering::Acquire)
-        });
+        let heartbeat = VisibilityHeartbeat::spawn(
+            client,
+            "http://localhost/queue".to_string(),
+            "AQEB-handle".to_string(),
+            30,
+            300,
+        );
 
-        cancelled.store(true, Ordering::Release);
-        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(!heartbeat.is_cancelled());
+        heartbeat.stop();
+        assert!(heartbeat.is_cancelled());
+    }
 
-        assert!(handle.await.expect("task completes"));
+    #[tokio::test]
+    async fn dropping_a_heartbeat_cancels_it() {
+        let config = aws_sdk_sqs::Config::builder()
+            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
+            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
+            .build();
+        let client = Client::from_conf(config);
+
+        let cancelled = {
+            let heartbeat = VisibilityHeartbeat::spawn(
+                client,
+                "http://localhost/queue".to_string(),
+                "AQEB-handle".to_string(),
+                30,
+                300,
+            );
+            Arc::clone(&heartbeat.cancelled)
+        };
+
+        assert!(cancelled.load(Ordering::Acquire));
     }
 }

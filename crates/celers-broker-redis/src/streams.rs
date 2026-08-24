@@ -2,6 +2,7 @@
 //!
 //! Provides stream-based task queues with consumer groups for distributed processing.
 
+use crate::connection::RedisClientExt;
 use crate::{CelersError, Result, SerializedTask};
 use redis::{AsyncCommands, Client, Value};
 use serde::{Deserialize, Serialize};
@@ -205,7 +206,7 @@ impl StreamsClient {
     pub async fn init(&self) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -246,7 +247,7 @@ impl StreamsClient {
     pub async fn add_task(&self, task: &SerializedTask) -> Result<StreamMessageId> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -281,12 +282,24 @@ impl StreamsClient {
     }
 
     /// Read tasks from the stream as a consumer group member
+    ///
+    /// When [`StreamConfig::block_ms`] is set this issues a *blocking*
+    /// `XREADGROUP`, so the connection is opened with a response deadline
+    /// derived from that block rather than the shared default: a client that
+    /// gives up before the server's own `BLOCK` expires turns "no new
+    /// entries" into an I/O error.
     pub async fn read_tasks(&self) -> Result<Vec<StreamEntry>> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
+        let mut conn = match self.config.block_ms {
+            // `BLOCK 0` means "wait forever", which `celers_blocking_connection`
+            // maps to "no response deadline at all".
+            Some(block_ms) => {
+                self.client
+                    .celers_blocking_connection(std::time::Duration::from_millis(block_ms as u64))
+                    .await
+            }
+            None => self.client.celers_multiplexed_connection().await,
+        }
+        .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
         let mut cmd = redis::cmd("XREADGROUP");
         cmd.arg("GROUP")
@@ -315,7 +328,7 @@ impl StreamsClient {
     pub async fn ack(&self, message_id: &StreamMessageId) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -336,7 +349,7 @@ impl StreamsClient {
     pub async fn get_pending(&self) -> Result<Vec<StreamMessageId>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -373,7 +386,7 @@ impl StreamsClient {
 
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -408,7 +421,7 @@ impl StreamsClient {
     pub async fn get_stats(&self) -> Result<StreamStats> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -470,7 +483,7 @@ impl StreamsClient {
     pub async fn delete_stream(&self) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 

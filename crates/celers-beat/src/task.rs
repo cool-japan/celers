@@ -36,6 +36,24 @@ pub struct ScheduledTask {
     #[serde(default)]
     pub options: TaskOptions,
 
+    /// Registration timestamp.
+    ///
+    /// Used as the schedule evaluation base for a task that has never run, so
+    /// the first fire is derived from the schedule itself rather than from the
+    /// wall clock at evaluation time. This makes the first fire instant
+    /// deterministic (and therefore usable as a distributed dispatch-lock key).
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+
+    /// Fire once immediately on registration, before the first scheduled
+    /// occurrence.
+    ///
+    /// Defaults to `false`: a freshly registered task fires at its first
+    /// schedule-derived occurrence (Celery beat semantics). Set to `true` for
+    /// the explicit "run once at startup" behaviour.
+    #[serde(default)]
+    pub run_on_startup: bool,
+
     /// Last run timestamp
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_at: Option<DateTime<Utc>>,
@@ -84,8 +102,13 @@ pub struct ScheduledTask {
     #[serde(default)]
     pub execution_history: Vec<ExecutionRecord>,
 
-    /// Maximum number of history records to keep (0 = unlimited)
-    #[serde(default)]
+    /// Maximum number of history records to keep (0 = unlimited).
+    ///
+    /// Defaults to [`DEFAULT_MAX_HISTORY_SIZE`]; the history is part of the
+    /// persisted scheduler state, so an unbounded default would grow the state
+    /// file without limit. Set explicitly to `0` to opt into unlimited
+    /// retention.
+    #[serde(default = "default_max_history_size")]
     pub max_history_size: usize,
 
     /// Version history (tracks schedule modifications)
@@ -108,6 +131,14 @@ pub struct ScheduledTask {
     #[serde(skip)]
     pub(crate) cached_next_run: Option<DateTime<Utc>>,
 
+    /// The `last_run_at` value the cached next run was derived from.
+    ///
+    /// The cache is only reused while this matches the current `last_run_at`,
+    /// so a fire that advances `last_run_at` can never serve a stale instant
+    /// (which would otherwise reuse an already-claimed dispatch-lock key).
+    #[serde(skip)]
+    pub(crate) cached_next_run_basis: Option<DateTime<Utc>>,
+
     /// Alert configuration for this task
     #[serde(default)]
     pub alert_config: AlertConfig,
@@ -119,11 +150,39 @@ pub struct ScheduledTask {
     /// Weighted Fair Queuing state
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wfq_state: Option<WFQState>,
+
+    /// Optional business calendar; fire instants are advanced to the next
+    /// business time when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_calendar: Option<BusinessCalendar>,
+
+    /// Optional holiday calendar; fire instants landing on a holiday are
+    /// advanced to the next non-holiday day when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holiday_calendar: Option<HolidayCalendar>,
 }
+
+/// Default cap on retained execution-history records per task.
+///
+/// History is serialized into the scheduler state file on every save, so an
+/// unbounded default would grow that file (and the per-save serialization cost)
+/// without limit.
+pub const DEFAULT_MAX_HISTORY_SIZE: usize = 100;
+
+/// Cap on retained schedule versions per task.
+///
+/// Each version snapshots the whole `Schedule`, `Jitter` and `CatchupPolicy`,
+/// so an unbounded version list has the same state-file growth problem as the
+/// execution history.
+pub const MAX_VERSION_HISTORY: usize = 100;
 
 #[allow(dead_code)]
 fn default_true() -> bool {
     true
+}
+
+fn default_max_history_size() -> usize {
+    DEFAULT_MAX_HISTORY_SIZE
 }
 
 fn default_version() -> u32 {
@@ -138,6 +197,8 @@ impl ScheduledTask {
             args: Vec::new(),
             kwargs: HashMap::new(),
             options: TaskOptions::default(),
+            created_at: Utc::now(),
+            run_on_startup: false,
             last_run_at: None,
             total_run_count: 0,
             enabled: true,
@@ -150,21 +211,24 @@ impl ScheduledTask {
             last_failure_at: None,
             total_failure_count: 0,
             execution_history: Vec::new(),
-            max_history_size: 0, // 0 = unlimited
+            max_history_size: DEFAULT_MAX_HISTORY_SIZE,
             version_history: Vec::new(),
             current_version: 1,
             dependencies: HashSet::new(),
             wait_for_dependencies: true,
             cached_next_run: None,
+            cached_next_run_basis: None,
             alert_config: AlertConfig::default(),
             execution_state: ExecutionState::default(),
             wfq_state: None,
+            business_calendar: None,
+            holiday_calendar: None,
         };
 
         // Create initial version
         let initial_version =
             ScheduleVersion::from_task(&task, 1, Some("Initial creation".to_string()));
-        task.version_history.push(initial_version);
+        task.push_version(initial_version);
 
         task
     }
@@ -208,6 +272,28 @@ impl ScheduledTask {
     /// Set catch-up policy for missed schedules
     pub fn with_catchup_policy(mut self, policy: CatchupPolicy) -> Self {
         self.catchup_policy = policy;
+        self
+    }
+
+    /// Fire this task once immediately on registration, ahead of its first
+    /// schedule-derived occurrence.
+    ///
+    /// Off by default: without it a freshly registered task first fires at the
+    /// instant its schedule says, which is what a `OneTime` schedule and a
+    /// nightly crontab both require.
+    pub fn with_run_on_startup(mut self, run_on_startup: bool) -> Self {
+        self.run_on_startup = run_on_startup;
+        self
+    }
+
+    /// Override the registration timestamp used as the schedule evaluation
+    /// base for a task that has never run.
+    ///
+    /// Mostly useful when re-hydrating a task from an external store so that
+    /// every instance derives the same first-fire instant.
+    pub fn with_created_at(mut self, created_at: DateTime<Utc>) -> Self {
+        self.created_at = created_at;
+        self.invalidate_next_run_cache();
         self
     }
 
@@ -261,38 +347,62 @@ impl ScheduledTask {
         self.group.as_deref() == Some(group)
     }
 
-    /// Check if task is due to run
-    pub fn is_due(&self) -> Result<bool, ScheduleError> {
-        // Tasks that have never run are due immediately
-        if self.last_run_at.is_none() {
-            return Ok(true);
+    /// The instant the schedule is evaluated from.
+    ///
+    /// For a task that has already run this is `last_run_at`. For a task that
+    /// has never run it is `created_at`, so the first occurrence is derived
+    /// from the schedule instead of from the wall clock at evaluation time —
+    /// this is what makes `next_run_time` (and therefore the per-fire dispatch
+    /// lock key) deterministic and identical across cooperating instances.
+    ///
+    /// One-time schedules are the exception: `Schedule::OneTime::next_run`
+    /// returns `run_at` for a `None` base and errors once the task has run, so
+    /// the base stays `last_run_at` verbatim.
+    pub fn schedule_base(&self) -> Option<DateTime<Utc>> {
+        if self.schedule.is_onetime() {
+            self.last_run_at
+        } else {
+            self.last_run_at.or(Some(self.created_at))
         }
-        let mut next_run = self.schedule.next_run(self.last_run_at)?;
-
-        // Apply jitter if configured
-        if let Some(ref jitter) = self.jitter {
-            next_run = jitter.apply(next_run, &self.name);
-        }
-
-        Ok(Utc::now() >= next_run)
     }
 
-    /// Get the next scheduled run time (with jitter if configured)
+    /// Check if task is due to run
+    ///
+    /// A task that has never run is due at its first schedule-derived
+    /// occurrence, *not* immediately — a `OneTime` schedule set for next month
+    /// stays pending until then, and a nightly crontab registered at midday
+    /// does not fire on registration. Opt into the old "fire on registration"
+    /// behaviour explicitly with [`ScheduledTask::with_run_on_startup`].
+    pub fn is_due(&self) -> Result<bool, ScheduleError> {
+        if self.run_on_startup && self.last_run_at.is_none() {
+            return Ok(true);
+        }
+        if self.is_spent_onetime() {
+            // A one-time schedule that has already fired is simply never due
+            // again; that is not a schedule evaluation failure.
+            return Ok(false);
+        }
+        Ok(Utc::now() >= self.compute_next_run()?)
+    }
+
+    /// Whether this is a one-time schedule that has already executed.
+    pub fn is_spent_onetime(&self) -> bool {
+        self.schedule.is_onetime() && self.last_run_at.is_some()
+    }
+
+    /// Get the next scheduled run time (with jitter and calendars applied).
+    ///
+    /// Uses the memoised value when it is still valid for the current
+    /// `last_run_at`; a fire that advances `last_run_at` invalidates it
+    /// implicitly, so a stale instant can never be returned.
     pub fn next_run_time(&self) -> Result<DateTime<Utc>, ScheduleError> {
-        // Return cached value if available
         if let Some(cached) = self.cached_next_run {
-            return Ok(cached);
+            if self.cached_next_run_basis == self.last_run_at {
+                return Ok(cached);
+            }
         }
 
-        // Calculate and return (but don't cache in immutable self)
-        let mut next_run = self.schedule.next_run(self.last_run_at)?;
-
-        // Apply jitter if configured
-        if let Some(ref jitter) = self.jitter {
-            next_run = jitter.apply(next_run, &self.name);
-        }
-
-        Ok(next_run)
+        self.compute_next_run()
     }
 
     /// Calculate and cache the next run time
@@ -300,23 +410,70 @@ impl ScheduledTask {
     /// This method calculates the next run time and caches it for future calls.
     /// The cache is invalidated when the schedule changes or the task is executed.
     pub fn update_next_run_cache(&mut self) {
-        if let Ok(next_run) = self.next_run_time_uncached() {
-            self.cached_next_run = Some(next_run);
-        } else {
-            self.cached_next_run = None;
+        match self.compute_next_run() {
+            Ok(next_run) => {
+                self.cached_next_run = Some(next_run);
+                self.cached_next_run_basis = self.last_run_at;
+            }
+            Err(_) => {
+                self.cached_next_run = None;
+                self.cached_next_run_basis = None;
+            }
         }
     }
 
-    /// Calculate next run time without using cache
-    fn next_run_time_uncached(&self) -> Result<DateTime<Utc>, ScheduleError> {
-        let mut next_run = self.schedule.next_run(self.last_run_at)?;
+    /// Calculate the next run time from scratch, bypassing the cache.
+    ///
+    /// Applies, in order: the schedule itself (evaluated from
+    /// [`ScheduledTask::schedule_base`]), the configured jitter, and any
+    /// configured holiday / business calendar.
+    pub fn compute_next_run(&self) -> Result<DateTime<Utc>, ScheduleError> {
+        let occurrence = self.schedule.next_run(self.schedule_base())?;
+        Ok(self.dispatch_time_for(occurrence))
+    }
 
-        // Apply jitter if configured
+    /// The moment a given schedule-grid `occurrence` becomes eligible to
+    /// dispatch: the occurrence smeared by the configured jitter and then
+    /// advanced past any calendar restriction.
+    ///
+    /// The occurrence itself is the fire's *identity* (what gets recorded as
+    /// `last_run_at` and what the dispatch-lock key is derived from); this is
+    /// only the *timing*. Keeping the two apart is what stops jitter from
+    /// re-anchoring the schedule grid on every fire.
+    pub fn dispatch_time_for(&self, occurrence: DateTime<Utc>) -> DateTime<Utc> {
+        let mut fire = occurrence;
+
         if let Some(ref jitter) = self.jitter {
-            next_run = jitter.apply(next_run, &self.name);
+            fire = jitter.apply(fire, &self.name);
         }
 
-        Ok(next_run)
+        self.apply_calendars(fire)
+    }
+
+    /// Advance `instant` past any configured holiday / business-calendar
+    /// restriction. Returns `instant` unchanged when no calendar is configured.
+    pub(crate) fn apply_calendars(&self, instant: DateTime<Utc>) -> DateTime<Utc> {
+        let mut adjusted = instant;
+
+        if let Some(ref holidays) = self.holiday_calendar {
+            adjusted = holidays.next_non_holiday(adjusted);
+        }
+
+        if let Some(ref business) = self.business_calendar {
+            if !business.is_business_time(&adjusted) {
+                adjusted = business.next_business_time(adjusted);
+                // Advancing into business hours may land on a holiday again;
+                // re-check once so the two calendars compose.
+                if let Some(ref holidays) = self.holiday_calendar {
+                    let after_holiday = holidays.next_non_holiday(adjusted);
+                    if after_holiday != adjusted {
+                        adjusted = business.next_business_time(after_holiday);
+                    }
+                }
+            }
+        }
+
+        adjusted
     }
 
     /// Invalidate the next run time cache
@@ -324,6 +481,19 @@ impl ScheduledTask {
     /// This should be called whenever the schedule changes or the task is executed.
     pub fn invalidate_next_run_cache(&mut self) {
         self.cached_next_run = None;
+        self.cached_next_run_basis = None;
+    }
+
+    /// Record a fire at `fired_at`, advancing the run counters and dropping the
+    /// memoised next-run instant.
+    ///
+    /// Callers dispatching a catch-up occurrence should pass that occurrence's
+    /// instant (not the wall clock) so the next evaluation continues from the
+    /// schedule grid rather than from an arbitrary dispatch time.
+    pub fn mark_run_at(&mut self, fired_at: DateTime<Utc>) {
+        self.last_run_at = Some(fired_at);
+        self.total_run_count += 1;
+        self.invalidate_next_run_cache();
     }
 
     /// Check if task is enabled
@@ -698,6 +868,9 @@ impl ScheduledTask {
                 Schedule::Crontab { .. } => Duration::hours(24), // Assume daily as threshold
                 #[cfg(feature = "solar")]
                 Schedule::Solar { .. } => Duration::hours(24), // Solar events are daily
+                // Month-end fires once per month; use the longest month as the
+                // conservative threshold so a normal gap is never "stuck".
+                Schedule::MonthlyLastDay { .. } => Duration::days(31),
                 Schedule::OneTime { .. } => return None, // One-time schedules can't be stuck
             };
 
@@ -718,6 +891,16 @@ impl ScheduledTask {
         Ok(())
     }
 
+    /// Append a version record, trimming the oldest entries beyond
+    /// [`MAX_VERSION_HISTORY`] so the persisted state file stays bounded.
+    pub(crate) fn push_version(&mut self, version: ScheduleVersion) {
+        self.version_history.push(version);
+        if self.version_history.len() > MAX_VERSION_HISTORY {
+            let remove_count = self.version_history.len() - MAX_VERSION_HISTORY;
+            self.version_history.drain(0..remove_count);
+        }
+    }
+
     /// Update schedule and create a new version
     pub fn update_schedule(&mut self, new_schedule: Schedule, change_reason: Option<String>) {
         self.current_version += 1;
@@ -727,7 +910,7 @@ impl ScheduledTask {
         self.update_next_run_cache();
 
         let version = ScheduleVersion::from_task(self, self.current_version, change_reason);
-        self.version_history.push(version);
+        self.push_version(version);
     }
 
     /// Update schedule configuration (enabled, jitter, catchup) and create a new version
@@ -757,7 +940,7 @@ impl ScheduledTask {
 
         self.current_version += 1;
         let version = ScheduleVersion::from_task(self, self.current_version, change_reason);
-        self.version_history.push(version);
+        self.push_version(version);
     }
 
     /// Rollback to a previous version
@@ -776,6 +959,9 @@ impl ScheduledTask {
         self.jitter = version.jitter.clone();
         self.catchup_policy = version.catchup_policy.clone();
 
+        // The restored schedule/jitter changes the next fire instant.
+        self.invalidate_next_run_cache();
+
         // Create a new version record for the rollback
         self.current_version += 1;
         let rollback_version = ScheduleVersion::from_task(
@@ -783,7 +969,7 @@ impl ScheduledTask {
             self.current_version,
             Some(format!("Rolled back to version {}", version_number)),
         );
-        self.version_history.push(rollback_version);
+        self.push_version(rollback_version);
 
         Ok(())
     }
@@ -983,22 +1169,37 @@ impl ScheduleVersion {
 }
 
 impl ScheduledTask {
-    /// Set business calendar for this task
+    /// Set the business calendar for this task.
     ///
-    /// This doesn't currently enforce business hours (requires more extensive changes),
-    /// but provides the configuration for future use.
-    pub fn with_business_calendar(self, _calendar: BusinessCalendar) -> Self {
-        // Store for future use - currently just validation
+    /// Fire instants that fall outside the calendar's working days/hours are
+    /// advanced to the next business time by
+    /// [`ScheduledTask::compute_next_run`], so `is_due` and `next_run_time`
+    /// both honour it.
+    pub fn with_business_calendar(mut self, calendar: BusinessCalendar) -> Self {
+        self.business_calendar = Some(calendar);
+        self.invalidate_next_run_cache();
         self
     }
 
-    /// Set holiday calendar for this task
+    /// Set the holiday calendar for this task.
     ///
-    /// This doesn't currently enforce holidays (requires more extensive changes),
-    /// but provides the configuration for future use.
-    pub fn with_holiday_calendar(self, _calendar: HolidayCalendar) -> Self {
-        // Store for future use - currently just validation
+    /// A fire instant landing on a holiday is advanced to the next non-holiday
+    /// day (preserving the time of day) by
+    /// [`ScheduledTask::compute_next_run`].
+    pub fn with_holiday_calendar(mut self, calendar: HolidayCalendar) -> Self {
+        self.holiday_calendar = Some(calendar);
+        self.invalidate_next_run_cache();
         self
+    }
+
+    /// Get the configured business calendar, if any.
+    pub fn business_calendar(&self) -> Option<&BusinessCalendar> {
+        self.business_calendar.as_ref()
+    }
+
+    /// Get the configured holiday calendar, if any.
+    pub fn holiday_calendar(&self) -> Option<&HolidayCalendar> {
+        self.holiday_calendar.as_ref()
     }
 }
 
@@ -1013,13 +1214,9 @@ impl ScheduledTask {
     ///     .with_wfq_weight(5.0).unwrap();
     /// ```
     pub fn with_wfq_weight(mut self, weight: f64) -> Result<Self, String> {
-        if self.wfq_state.is_none() {
-            self.wfq_state = Some(WFQState::default());
-        }
-        self.wfq_state
-            .as_mut()
-            .expect("wfq_state initialized just above if None")
-            .weight = TaskWeight::new(weight)?;
+        let task_weight = TaskWeight::new(weight)?;
+        let state = self.wfq_state.get_or_insert_with(WFQState::default);
+        state.weight = task_weight;
         Ok(self)
     }
 

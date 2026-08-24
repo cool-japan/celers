@@ -6,6 +6,7 @@
 //! - Batch priority adjustments
 //! - Priority histogram analysis
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, SerializedTask};
 use redis::{AsyncCommands, Client};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,7 +82,7 @@ impl PriorityManager {
 
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -97,7 +98,12 @@ impl PriorityManager {
             .as_secs();
 
         let mut boosted_count = 0;
+        // MULTI/EXEC: each boost is a `ZREM` of the old payload followed by
+        // a `ZADD` of the rewritten one. Applied piecemeal, a failure
+        // between the two deletes the task outright — it is gone from the
+        // sorted set and was never re-added anywhere.
         let mut pipe = redis::pipe();
+        pipe.atomic();
 
         for (data, _) in items {
             let task: SerializedTask = serde_json::from_str(&data)
@@ -162,7 +168,7 @@ impl PriorityManager {
 
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -172,7 +178,9 @@ impl PriorityManager {
             .map_err(|e| CelersError::Broker(format!("Failed to get tasks: {}", e)))?;
 
         let mut adjusted_count = 0;
+        // MULTI/EXEC: `ZREM` + `ZADD` per task — see `boost_aged_tasks`.
         let mut pipe = redis::pipe();
+        pipe.atomic();
 
         for (data, _) in items {
             let task: SerializedTask = serde_json::from_str(&data)
@@ -221,7 +229,7 @@ impl PriorityManager {
 
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -258,7 +266,7 @@ impl PriorityManager {
 
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -291,7 +299,9 @@ impl PriorityManager {
         }
 
         let range = max_priority - min_priority;
+        // MULTI/EXEC: `ZREM` + `ZADD` per task — see `boost_aged_tasks`.
         let mut pipe = redis::pipe();
+        pipe.atomic();
         let mut normalized_count = 0;
 
         for (task, old_data) in tasks.iter().zip(items.iter()) {

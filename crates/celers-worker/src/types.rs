@@ -196,11 +196,13 @@ pub struct WorkerConfig {
 
     /// Restrict coalescing to true redelivery duplicates (same task id).
     ///
-    /// The default coalescing key is `(task name, payload hash)`, so two
+    /// **Defaults to `true`**, which is the only lossless setting. Disabling it
+    /// widens the coalescing key to `(task name, payload hash)`, so two
     /// *independent* submissions with identical arguments — different task ids
-    /// — collapse into one and the dropped one never runs and never produces a
-    /// result. Enable this to coalesce only repeated deliveries of the *same*
-    /// task id, which is lossless.
+    /// — collapse into one: the dropped one never runs, never produces a result
+    /// and leaves its caller waiting forever on an `AsyncResult` that can never
+    /// resolve. Only turn it off for genuinely idempotent, fire-and-forget work
+    /// where nobody is waiting on the second submission's result.
     pub coalesce_require_same_task_id: bool,
 
     /// Maximum task result size in bytes (0 = unlimited)
@@ -298,7 +300,7 @@ impl Default for WorkerConfig {
             adaptive_poll_config: AdaptivePollConfig::default(),
             enable_coalescing: false,
             coalescing_config: BatchConfig::default(),
-            coalesce_require_same_task_id: false,
+            coalesce_require_same_task_id: true,
             max_result_size_bytes: 0, // unlimited
             track_memory_usage: false,
             enable_circuit_breaker: false,
@@ -770,11 +772,11 @@ impl WorkerConfigBuilder {
 
     /// Coalesce only repeated deliveries of the *same* task id (lossless).
     ///
-    /// With the default (`false`) key — `(task name, payload hash)` —
+    /// Turning this **off** widens the key to `(task name, payload hash)`, so
     /// independent submissions with identical arguments coalesce into one and
     /// the dropped submissions never produce a result.
     ///
-    /// Default: false
+    /// Default: true
     pub fn coalesce_require_same_task_id(mut self, enabled: bool) -> Self {
         self.config.coalesce_require_same_task_id = enabled;
         self
@@ -1025,6 +1027,9 @@ pub struct WorkerStats {
     deferred: AtomicU64,
     /// Total number of task handlers that panicked
     panicked: AtomicU64,
+    /// Total number of tasks whose **soft** time limit expired while they were
+    /// still running (Celery's `SoftTimeLimitExceeded`)
+    soft_timeouts: AtomicU64,
 }
 
 impl WorkerStats {
@@ -1062,6 +1067,15 @@ impl WorkerStats {
     /// Get the number of task handlers that panicked
     pub fn panicked(&self) -> u64 {
         self.panicked.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of tasks whose soft time limit expired while running.
+    ///
+    /// A soft-limit expiry is a *warning*, not a disposition: the task keeps
+    /// running (and may still succeed) until its hard limit, so this counter is
+    /// independent of `processed` / `revoked`.
+    pub fn soft_timeouts(&self) -> u64 {
+        self.soft_timeouts.load(Ordering::Relaxed)
     }
 
     /// Increment the active task count (called when a task starts)
@@ -1106,6 +1120,11 @@ impl WorkerStats {
     pub fn task_panicked(&self) {
         self.panicked.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Record that a task's soft time limit expired while it was still running
+    pub fn task_soft_timeout(&self) {
+        self.soft_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl Clone for WorkerStats {
@@ -1117,6 +1136,7 @@ impl Clone for WorkerStats {
             rate_limited: AtomicU64::new(self.rate_limited.load(Ordering::Relaxed)),
             deferred: AtomicU64::new(self.deferred.load(Ordering::Relaxed)),
             panicked: AtomicU64::new(self.panicked.load(Ordering::Relaxed)),
+            soft_timeouts: AtomicU64::new(self.soft_timeouts.load(Ordering::Relaxed)),
         }
     }
 }
@@ -1127,9 +1147,20 @@ pub struct WorkerHandle {
     pub(crate) mode: Arc<AtomicU8>,
     pub(crate) stats: Arc<WorkerStats>,
     pub(crate) dynamic_config: Arc<RwLock<DynamicConfig>>,
+    pub(crate) health: crate::health::HealthChecker,
 }
 
 impl WorkerHandle {
+    /// Liveness/readiness accounting for the running worker.
+    ///
+    /// The worker itself is moved into its run loop by
+    /// [`Worker::run_with_shutdown`](crate::Worker::run_with_shutdown), so this
+    /// is how an embedder reaches the health state afterwards — to serve a
+    /// Kubernetes `livenessProbe` / `readinessProbe`, for example.
+    pub fn health(&self) -> crate::health::HealthChecker {
+        self.health.clone()
+    }
+
     /// Request graceful shutdown of the worker
     pub async fn shutdown(&self) -> Result<()> {
         self.shutdown_tx.send(()).await.map_err(|_| {

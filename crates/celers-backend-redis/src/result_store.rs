@@ -61,19 +61,55 @@ fn task_result_to_state(result: &TaskResult) -> TaskState {
 
 #[async_trait]
 impl ResultStore for RedisResultBackend {
+    /// Record a task outcome.
+    ///
+    /// This is a read-modify-write: the existing record is loaded first and
+    /// only `result` (plus `completed_at` for terminal states) is changed, so
+    /// `task_name`, `worker`, `started_at`, `created_at`, `tags`, `metadata`
+    /// and friends survive. Writing a freshly constructed `TaskMeta` here used
+    /// to wipe every one of those fields — and, with an empty `task_name`, it
+    /// also made per-task-type TTL configuration unreachable.
+    ///
+    /// The clones below are shallow: connection, cache, metrics and compression
+    /// statistics all live behind `Arc`, so statistics recorded through this
+    /// adapter land on the shared counters.
     async fn store_result(
         &self,
         task_id: TaskId,
         result: TaskResultValue,
     ) -> celers_core::Result<()> {
         let task_result = to_task_result(&result);
-
-        // Create TaskMeta
-        let mut meta = TaskMeta::new(task_id, String::new()); // Task name unknown at this level
-        meta.result = task_result;
-
-        // Store using existing backend - need mut self
         let mut backend = self.clone();
+
+        // Read through Redis rather than the cache: a task that is still
+        // running is deliberately not cached.
+        let existing = backend
+            .get_result_uncached(task_id)
+            .await
+            .map_err(|e| celers_core::CelersError::Other(format!("Redis error: {}", e)))?;
+
+        let meta = match existing {
+            Some(mut meta) => {
+                let is_terminal = task_result.is_terminal();
+                meta.result = task_result;
+                if is_terminal && meta.completed_at.is_none() {
+                    meta.completed_at = Some(chrono::Utc::now());
+                }
+                meta
+            }
+            None => {
+                // Nothing recorded yet: the task name is genuinely unknown at
+                // this layer, so the default TTL applies.
+                let mut meta = TaskMeta::new(task_id, String::new());
+                let is_terminal = task_result.is_terminal();
+                meta.result = task_result;
+                if is_terminal {
+                    meta.completed_at = Some(chrono::Utc::now());
+                }
+                meta
+            }
+        };
+
         <RedisResultBackend as LocalResultBackend>::store_result(&mut backend, task_id, &meta)
             .await
             .map_err(|e| celers_core::CelersError::Other(format!("Redis error: {}", e)))
@@ -111,16 +147,13 @@ impl ResultStore for RedisResultBackend {
     }
 
     async fn has_result(&self, task_id: TaskId) -> celers_core::Result<bool> {
-        // Note: The local ResultBackend trait doesn't have has_result, so we check get_result
+        // `EXISTS` avoids fetching (and decrypting, decompressing, reassembling)
+        // a payload we are going to throw away.
         let mut backend = self.clone();
-        match <RedisResultBackend as LocalResultBackend>::get_result(&mut backend, task_id).await {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
-            Err(e) => Err(celers_core::CelersError::Other(format!(
-                "Redis error: {}",
-                e
-            ))),
-        }
+        backend
+            .task_exists(task_id)
+            .await
+            .map_err(|e| celers_core::CelersError::Other(format!("Redis error: {}", e)))
     }
 }
 

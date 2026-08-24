@@ -250,6 +250,40 @@ impl ResultCache {
         before_count - entries.len()
     }
 
+    /// Spawn a background task that calls [`ResultCache::cleanup_expired`] on
+    /// `interval` forever, logging (rather than propagating) the outcome of
+    /// each pass — this cache never returns an error from cleanup, so there
+    /// is nothing to fail loudly about, only debug-log-worthy counts.
+    ///
+    /// Purely opt-in: nothing calls this automatically. Wire it in from
+    /// application start-up if periodic expiry cleanup is desired — this
+    /// cache is a library type and must not spawn background work the caller
+    /// didn't ask for. Follows the same opt-in tick-skip-then-loop shape as
+    /// `celers_backend_db::PostgresResultBackend::spawn_periodic_cleanup`,
+    /// `DbLockBackend::spawn_periodic_cleanup` and
+    /// `DbEventPersister::spawn_periodic_cleanup` (the last of which also
+    /// takes a `retention` argument that this cache, with a single
+    /// already-configured TTL, does not need).
+    ///
+    /// The returned handle can be `.abort()`-ed to stop the loop; dropping it
+    /// leaves the task running (Tokio detaches spawned tasks by default).
+    pub fn spawn_periodic_cleanup(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // The first tick fires immediately; skip it so the first real
+            // cleanup happens after one full `interval`, not at t=0.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let removed = cache.cleanup_expired();
+                if removed > 0 {
+                    tracing::debug!(removed, "cleaned up expired cache entries");
+                }
+            }
+        })
+    }
+
     /// Evict the oldest entry based on cached_at timestamp
     fn evict_oldest(&self, entries: &mut HashMap<Uuid, CacheEntry>) {
         if let Some((&oldest_key, _)) = entries.iter().min_by_key(|(_, entry)| entry.cached_at) {
@@ -451,6 +485,37 @@ mod tests {
         let removed = cache.cleanup_expired();
         assert_eq!(removed, 5);
         assert_eq!(cache.len(), 0);
+    }
+
+    /// `spawn_periodic_cleanup` must actually remove expired entries on its
+    /// own, on a timer, with no caller-driven `cleanup_expired()` call.
+    #[tokio::test]
+    async fn test_cache_spawn_periodic_cleanup_removes_expired_entries() {
+        let config = CacheConfig::new().with_ttl(Duration::from_millis(30));
+        let cache = ResultCache::new(config);
+
+        for i in 0..5 {
+            let task_id = Uuid::new_v4();
+            let meta = TaskMeta::new(task_id, format!("test-{}", i));
+            cache.put(task_id, meta);
+        }
+        assert_eq!(cache.len(), 5);
+
+        let handle = cache.spawn_periodic_cleanup(Duration::from_millis(20));
+
+        // Wait past both the TTL and at least one cleanup tick (the first
+        // tick is skipped, then TTL + interval must elapse), with a little
+        // slack for scheduler jitter.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            cache.len(),
+            0,
+            "periodic cleanup should have removed every expired entry"
+        );
+
+        // Stop the background loop so the test doesn't leak a task.
+        handle.abort();
     }
 
     #[test]

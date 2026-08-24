@@ -31,9 +31,27 @@
 use celers_core::{CelersError, Result};
 use redis::{aio::ConnectionManager, AsyncCommands};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
+
+/// Acquire a read guard, recovering it even if the lock is poisoned.
+///
+/// A rate limiter exists to keep a system from falling over; turning it into
+/// a landmine that panics every caller because some *unrelated* thread
+/// panicked while holding this lock defeats the point. Every write through
+/// this module is a plain assignment of a fully-formed value (`*guard =
+/// ...`), never a multi-step mutation that could be observed half-applied,
+/// so a value recovered from a poisoned lock is always structurally valid.
+fn read_recover<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Write-lock counterpart of [`read_recover`]; see its documentation.
+fn write_recover<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Configuration for queue rate limiting
 #[derive(Debug, Clone)]
@@ -107,15 +125,12 @@ impl TokenBucketLimiter {
 
     fn refill(&self) {
         let now = Instant::now();
-        let mut last_refill = self
-            .last_refill
-            .write()
-            .expect("lock should not be poisoned");
+        let mut last_refill = write_recover(&self.last_refill);
         let elapsed = now.duration_since(*last_refill);
         *last_refill = now;
 
         let tokens_to_add = elapsed.as_secs_f64() * self.config.rate;
-        let mut tokens = self.tokens.write().expect("lock should not be poisoned");
+        let mut tokens = write_recover(&self.tokens);
         *tokens = (*tokens + tokens_to_add).min(self.config.burst as f64);
     }
 
@@ -123,7 +138,7 @@ impl TokenBucketLimiter {
     pub fn try_acquire(&self) -> bool {
         self.refill();
 
-        let mut tokens = self.tokens.write().expect("lock should not be poisoned");
+        let mut tokens = write_recover(&self.tokens);
         if *tokens >= 1.0 {
             *tokens -= 1.0;
             true
@@ -136,7 +151,7 @@ impl TokenBucketLimiter {
     pub fn try_acquire_n(&self, n: u32) -> bool {
         self.refill();
 
-        let mut tokens = self.tokens.write().expect("lock should not be poisoned");
+        let mut tokens = write_recover(&self.tokens);
         if *tokens >= n as f64 {
             *tokens -= n as f64;
             true
@@ -149,7 +164,7 @@ impl TokenBucketLimiter {
     pub fn time_until_available(&self) -> Duration {
         self.refill();
 
-        let tokens = self.tokens.read().expect("lock should not be poisoned");
+        let tokens = read_recover(&self.tokens);
         if *tokens >= 1.0 {
             Duration::ZERO
         } else {
@@ -161,16 +176,13 @@ impl TokenBucketLimiter {
     /// Get the current number of available permits
     pub fn available_permits(&self) -> u32 {
         self.refill();
-        *self.tokens.read().expect("lock should not be poisoned") as u32
+        *read_recover(&self.tokens) as u32
     }
 
     /// Reset the limiter to full capacity
     pub fn reset(&self) {
-        *self.tokens.write().expect("lock should not be poisoned") = self.config.burst as f64;
-        *self
-            .last_refill
-            .write()
-            .expect("lock should not be poisoned") = Instant::now();
+        *write_recover(&self.tokens) = self.config.burst as f64;
+        *write_recover(&self.last_refill) = Instant::now();
     }
 
     /// Get the configuration

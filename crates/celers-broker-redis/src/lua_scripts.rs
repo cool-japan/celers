@@ -6,6 +6,7 @@
 //! The ScriptManager handles script loading and caching using SCRIPT LOAD
 //! for optimal performance.
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result};
 use redis::{Client, Script};
 use std::collections::HashMap;
@@ -844,7 +845,7 @@ impl ScriptManager {
     pub async fn load_all(&self) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -894,7 +895,7 @@ impl ScriptManager {
     pub async fn load_script(&self, script_id: ScriptId) -> Result<String> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -932,7 +933,7 @@ impl ScriptManager {
 
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 

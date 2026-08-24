@@ -71,6 +71,64 @@ pub(crate) const RECURRING_CLAIM_SQL: &str = "UPDATE celers_task_results \
      WHERE task_id = ? \
      AND result = ?";
 
+/// Build the chunked `DELETE` used to prune terminal
+/// (`completed`/`cancelled`/`failed`) tasks in one logical queue, older than
+/// a caller-supplied cutoff.
+///
+/// # Two separate MySQL restrictions, one shape
+///
+/// A naive `DELETE FROM celers_tasks WHERE id IN (SELECT id FROM
+/// celers_tasks WHERE ... LIMIT n)` fails on MySQL for two independent
+/// reasons, and the nesting below fixes both at once:
+///
+/// 1. **`ERROR 1093`** (`You can't specify target table 'celers_tasks' for
+///    update in FROM clause`) — the inner `SELECT` reads the very table the
+///    outer `DELETE` targets.
+/// 2. **`ERROR 1235`** (`This version of MySQL doesn't yet support 'LIMIT &
+///    IN/ALL/ANY/SOME subquery'`) — a `LIMIT` is not allowed directly inside
+///    the subquery operand of an `IN (...)` predicate.
+///
+/// Wrapping the `LIMIT`-bearing `SELECT` in a second, nested derived table
+/// (`... AS terminal_batch`) sidesteps both: MySQL materializes a derived
+/// table before the enclosing statement starts its own scan, so the outer
+/// `IN` subquery no longer reads `celers_tasks` directly (fixing #1), and
+/// that outer subquery itself carries no `LIMIT` — only the innermost
+/// `SELECT` does (fixing #2). This is the standard, documented MySQL
+/// workaround for both errors, and mirrors the row-count cap
+/// `celers-broker-postgres`'s `sql::purge_terminal_sql` uses for the
+/// identical purpose (Postgres needs neither restriction worked around, so
+/// its version is a single-level subquery).
+///
+/// `batch_size` is embedded as a literal rather than bound: the caller
+/// (`MysqlBroker::purge_terminal_tasks` / `MysqlBroker::spawn_retention_task`)
+/// always clamps it to `1..=100_000` before formatting, so this is never
+/// attacker-controlled text, and embedding it keeps this builder's shape
+/// identical to the already-proven Postgres builder rather than depending on
+/// whether a bound `LIMIT` placeholder is honoured inside a doubly-nested
+/// derived table on every MySQL/MariaDB version this crate supports.
+///
+/// Bind order: `queue_name`, then the cutoff timestamp text — MySQL
+/// `DATETIME` convention (see `row_ext.rs`'s "DateTime<Utc> parameter
+/// convention (MySQL)" section); bind
+/// `cutoff.format("%Y-%m-%d %H:%M:%S%.6f")`, never `.to_rfc3339()`.
+pub(crate) fn purge_terminal_tasks_sql(batch_size: i64) -> String {
+    format!(
+        "DELETE FROM celers_tasks \
+         WHERE id IN ( \
+         SELECT id FROM ( \
+         SELECT id \
+         FROM celers_tasks \
+         WHERE queue_name = ? \
+         AND state IN ('completed', 'cancelled', 'failed') \
+         AND completed_at IS NOT NULL \
+         AND completed_at < ? \
+         ORDER BY completed_at ASC, id ASC \
+         LIMIT {batch_size} \
+         ) AS terminal_batch \
+         )"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +208,88 @@ mod tests {
         // Without the trailing `AND result = ?` the claim is not atomic and
         // every scheduler instance would enqueue the same due task.
         assert!(RECURRING_CLAIM_SQL.ends_with("AND result = ?"));
+    }
+
+    #[test]
+    fn purge_terminal_sql_is_exact() {
+        assert_eq!(
+            purge_terminal_tasks_sql(500),
+            "DELETE FROM celers_tasks \
+             WHERE id IN ( \
+             SELECT id FROM ( \
+             SELECT id FROM celers_tasks \
+             WHERE queue_name = ? \
+             AND state IN ('completed', 'cancelled', 'failed') \
+             AND completed_at IS NOT NULL \
+             AND completed_at < ? \
+             ORDER BY completed_at ASC, id ASC \
+             LIMIT 500 \
+             ) AS terminal_batch \
+             )"
+        );
+    }
+
+    /// Regression guard for `ERROR 1093` (`You can't specify target table
+    /// ... for update in FROM clause`): the `SELECT` feeding the outer `IN`
+    /// must be wrapped in a derived table, not a bare correlated subquery on
+    /// `celers_tasks`.
+    #[test]
+    fn purge_terminal_sql_wraps_the_select_in_a_derived_table() {
+        let sql = purge_terminal_tasks_sql(100);
+        assert!(
+            sql.contains(") AS terminal_batch"),
+            "the inner SELECT must be aliased as a derived table, got: {sql}"
+        );
+        // Two nested `SELECT id` levels: the derived table and the outer
+        // `SELECT id FROM (...)` that feeds `IN`.
+        assert_eq!(
+            sql.matches("SELECT id").count(),
+            2,
+            "expected exactly two nested SELECT id levels, got: {sql}"
+        );
+    }
+
+    /// Regression guard for `ERROR 1235` (`This version of MySQL doesn't yet
+    /// support 'LIMIT & IN/ALL/ANY/SOME subquery'`): `LIMIT` may only appear
+    /// on the innermost `SELECT`, never on the subquery operand of `IN`
+    /// directly.
+    #[test]
+    fn purge_terminal_sql_limit_is_only_on_the_innermost_select() {
+        let sql = purge_terminal_tasks_sql(100);
+        assert_eq!(
+            sql.matches("LIMIT").count(),
+            1,
+            "LIMIT must appear exactly once, on the innermost SELECT, got: {sql}"
+        );
+        let limit_pos = sql.find("LIMIT").expect("a LIMIT clause");
+        let derived_alias_pos = sql
+            .find(") AS terminal_batch")
+            .expect("the derived table alias");
+        assert!(
+            limit_pos < derived_alias_pos,
+            "LIMIT must be inside the derived table, not on the outer IN subquery, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn purge_terminal_sql_filters_by_queue_name_and_terminal_states() {
+        let sql = purge_terminal_tasks_sql(100);
+        assert!(sql.contains("WHERE queue_name = ?"), "got: {sql}");
+        assert!(
+            sql.contains("state IN ('completed', 'cancelled', 'failed')"),
+            "must never delete a pending or processing task, got: {sql}"
+        );
+        assert!(
+            sql.contains("completed_at < ?"),
+            "must be bounded by the caller's cutoff, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn purge_terminal_sql_clamps_batch_size_into_the_text() {
+        // The function itself does not clamp — callers do — but confirms the
+        // literal really is substituted, not left as a stray placeholder.
+        assert!(purge_terminal_tasks_sql(1).contains("LIMIT 1 "));
+        assert!(purge_terminal_tasks_sql(100_000).contains("LIMIT 100000 "));
     }
 }

@@ -16,6 +16,7 @@
 //!   verified across process boundaries — a separate producer process and
 //!   consumer process share the same watermark.
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, SerializedTask};
 use redis::{AsyncCommands, Client, Script};
 use serde::{Deserialize, Serialize};
@@ -262,7 +263,7 @@ impl IntegrityValidator {
     ) -> Result<u64> {
         let mut conn = backend
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -339,7 +340,7 @@ impl IntegrityValidator {
     ) -> Result<SequenceCheck> {
         let mut conn = backend
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 

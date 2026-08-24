@@ -1007,26 +1007,19 @@ fn test_notification_channel_naming() {
     assert_eq!(expected_channel, "celers_tasks_high_priority");
 }
 
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_notification_listener_creation() {
-    // This test requires a live PostgreSQL database
-    // Run with: cargo test test_notification_listener_creation -- --ignored
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_enable_disable_notifications() {
-    // This test requires a live PostgreSQL database
-    // Run with: cargo test test_enable_disable_notifications -- --ignored
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_notification_end_to_end() {
-    // This test requires a live PostgreSQL database
-    // Run with: cargo test test_notification_end_to_end -- --ignored
-}
+// Notification tests against a real database live in `tests_pg.rs`
+// (`create_notification_listener_subscribes_to_the_queues_channel`), which
+// is gated on `CELERS_TEST_POSTGRES_URL` and actually runs instead of being
+// permanently `#[ignore]`d.
+//
+// `test_enable_disable_notifications` and `test_notification_end_to_end`
+// were dropped rather than filled in: `enable_notifications` installs one
+// `AFTER INSERT` trigger on `celers_tasks` with a database-wide function
+// name (see `notifications.rs`), so any other test or process enabling
+// notifications for a different queue concurrently repoints the trigger at
+// its own channel mid-test. A NOTIFY-driven test against that design is
+// racy by construction, not merely flaky; the fix is per-queue trigger
+// naming, tracked as a followup alongside the same finding.
 
 // ========== Task Deduplication Tests ==========
 
@@ -1125,203 +1118,41 @@ fn test_deduplication_window_expiry() {
     assert!(duration.num_seconds() >= config.window_secs - 1);
 }
 
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_enqueue_idempotent() {
-    // This test requires a live PostgreSQL database
-    // Run with: cargo test test_enqueue_idempotent -- --ignored
-}
+// Deduplication tests against a real database (enqueue_idempotent,
+// check_deduplication, cleanup_deduplication, get_deduplication_stats) live
+// in `tests_pg.rs`, gated on `CELERS_TEST_POSTGRES_URL`.
 
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_check_deduplication() {
-    // This test requires a live PostgreSQL database
-    // Run with: cargo test test_check_deduplication -- --ignored
-}
+// ========== Tests for TTL and Performance Analytics (real DB) ==========
+//
+// `expire_tasks_by_ttl`, `expire_all_tasks_by_ttl`, `get_task_percentiles`
+// and `get_slowest_tasks` are exercised against a real database in
+// `tests_pg.rs`, gated on `CELERS_TEST_POSTGRES_URL`.
+//
+// `test_advisory_lock_acquire_release` and `test_advisory_lock_blocking`
+// were dropped rather than filled in: `try_advisory_lock` / `advisory_lock`
+// / `release_advisory_lock` (`convenience.rs`) are session-scoped Postgres
+// advisory locks issued through `PgPool::{query,execute}` (`pool.rs`), which
+// checks out a connection per call and returns it to the pool immediately
+// after. An acquire and its matching release therefore usually land on
+// different backend sessions: `pg_advisory_unlock` returns `false` without
+// releasing anything, and the lock stays held on whichever pooled
+// connection happens to have acquired it until that connection is closed.
+// `is_advisory_lock_held` is unaffected (it reads the system-wide
+// `pg_locks` view rather than a session-local check), but "release, then
+// verify the lock can be acquired again" — the stub's own step 3-5 — is not
+// reachable through the current API against a pooled broker. Tracked as a
+// followup: the fix needs the `TaskNotificationListener` pattern
+// (`notifications.rs`) — a guard type owning a dedicated `PgConnection`,
+// returned from acquire and released on `Drop` — which changes three public
+// signatures. No caller in this workspace uses these methods today.
 
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_cleanup_deduplication() {
-    // This test requires a live PostgreSQL database
-    // Run with: cargo test test_cleanup_deduplication -- --ignored
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_get_deduplication_stats() {
-    // This test requires a live PostgreSQL database
-    // Run with: cargo test test_get_deduplication_stats -- --ignored
-}
-
-// ========== Tests for new features (TTL, Advisory Locks, Performance Analytics) ==========
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_expire_tasks_by_ttl() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Enqueue tasks of a specific type
-    // 2. Manually update their created_at to be old
-    // 3. Call expire_tasks_by_ttl
-    // 4. Verify tasks are in cancelled state
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_expire_all_tasks_by_ttl() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Enqueue multiple task types
-    // 2. Manually update their created_at to be old
-    // 3. Call expire_all_tasks_by_ttl
-    // 4. Verify all old tasks are cancelled
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_advisory_lock_acquire_release() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Acquire lock with try_advisory_lock
-    // 2. Verify it returns true
-    // 3. Try to acquire same lock again, verify returns false
-    // 4. Release lock
-    // 5. Verify lock can be acquired again
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_advisory_lock_blocking() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Acquire lock with advisory_lock
-    // 2. Verify is_advisory_lock_held returns true
-    // 3. Release lock
-    // 4. Verify is_advisory_lock_held returns false
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_get_task_percentiles() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Create and complete multiple tasks with varying durations
-    // 2. Call get_task_percentiles
-    // 3. Verify p50, p95, p99 are calculated correctly
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_get_slowest_tasks() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Create and complete multiple tasks with varying durations
-    // 2. Call get_slowest_tasks
-    // 3. Verify results are ordered by duration (slowest first)
-    // 4. Verify limit is respected
-}
-
-// ========== Tests for Rate Limiting, Priority, DLQ Analytics, Cancellation ==========
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_get_task_rate() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Complete multiple tasks of same type
-    // 2. Call get_task_rate
-    // 3. Verify count matches expected rate
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_is_rate_limited() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Complete tasks to reach rate limit
-    // 2. Call is_rate_limited
-    // 3. Verify it returns true when limit exceeded
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_boost_task_priority() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Enqueue tasks with normal priority
-    // 2. Boost priority
-    // 3. Verify tasks have increased priority
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_set_task_priority() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Enqueue tasks
-    // 2. Set absolute priority for specific tasks
-    // 3. Verify priority was set correctly
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_get_dlq_stats_by_task() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Create failed tasks in DLQ
-    // 2. Call get_dlq_stats_by_task
-    // 3. Verify task counts grouped by name
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_get_dlq_error_patterns() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Create DLQ tasks with various errors
-    // 2. Call get_dlq_error_patterns
-    // 3. Verify most common errors are returned
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_get_recent_dlq_tasks() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Create DLQ tasks at different times
-    // 2. Call get_recent_dlq_tasks
-    // 3. Verify only recent tasks are returned
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_cancel_with_reason() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Enqueue task
-    // 2. Cancel with reason
-    // 3. Verify task is cancelled with reason recorded
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_cancel_batch_with_reason() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Enqueue multiple tasks
-    // 2. Batch cancel with reason
-    // 3. Verify all tasks cancelled with reason
-}
-
-#[tokio::test]
-#[ignore] // Requires PostgreSQL connection
-async fn test_get_cancellation_reasons() {
-    // This test requires a live PostgreSQL database
-    // It would test:
-    // 1. Cancel tasks with various reasons
-    // 2. Call get_cancellation_reasons
-    // 3. Verify reasons are grouped and counted correctly
-}
+// ========== Tests for Rate Limiting, Priority, DLQ Analytics, Cancellation (real DB) ==========
+//
+// `get_task_rate`, `is_rate_limited`, `boost_task_priority`,
+// `set_task_priority`, `get_dlq_stats_by_task`, `get_dlq_error_patterns`,
+// `get_recent_dlq_tasks`, `cancel_with_reason`, `cancel_batch_with_reason`
+// and `get_cancellation_reasons` are all exercised against a real database
+// in `tests_pg.rs`, gated on `CELERS_TEST_POSTGRES_URL`.
 
 // ========== Queue-label validation (no database required) ==========
 
@@ -1381,4 +1212,32 @@ fn test_retry_strategy_backoff_sql_shapes() {
     }
     .backoff_sql()
     .contains("random()"));
+}
+
+#[test]
+fn test_retry_strategy_backoff_does_not_overflow_on_extreme_retry_counts() {
+    // `2_i64.pow(n)` panics for n >= 63; the exponential strategies clamp the
+    // exponent instead, matching the server-side expression's own clamp.
+    for strategy in [
+        RetryStrategy::Exponential {
+            max_delay_secs: 3600,
+        },
+        RetryStrategy::ExponentialWithJitter {
+            max_delay_secs: 3600,
+        },
+        RetryStrategy::Linear {
+            base_delay_secs: 10,
+            max_delay_secs: 100,
+        },
+    ] {
+        for retry_count in [-5, 0, 62, 63, 1_000, i32::MAX] {
+            let backoff = strategy.calculate_backoff(retry_count);
+            // Upper bound is 1.5x the cap: `ExponentialWithJitter` applies its
+            // 0.5..1.5 jitter factor *after* clamping, by design.
+            assert!(
+                (0..=5400).contains(&backoff),
+                "{strategy:?} at {retry_count} produced {backoff}"
+            );
+        }
+    }
 }

@@ -22,6 +22,15 @@ use crate::pool::{configure_channel, ChannelPool, ConnectionPool, DeduplicationC
 use crate::topic_routing;
 use crate::types::*;
 
+/// A channel handed out for publishing, plus what the caller needs to know
+/// about it: whether it came from the channel pool (and must be returned to
+/// it) and whether it actually has publisher confirms enabled.
+pub(crate) struct PublishChannel {
+    pub(crate) channel: Channel,
+    pub(crate) pooled: bool,
+    pub(crate) confirms: bool,
+}
+
 /// AMQP broker implementation using RabbitMQ
 pub struct AmqpBroker {
     pub(crate) url: String,
@@ -62,6 +71,22 @@ pub struct AmqpBroker {
     pub(crate) consumers: HashMap<String, lapin::Consumer>,
 }
 
+/// Append a virtual host segment to a broker URL, matching RabbitMQ's URI
+/// vhost convention.
+///
+/// Returns `url` unchanged when `vhost` is `None`; otherwise appends the
+/// vhost directly when `url` already ends in `/`, or via a `/` separator
+/// otherwise. Shared by [`AmqpBroker::effective_url`] and
+/// [`AmqpBroker::with_config`] (which needs the same URI, built before `Self`
+/// exists, for the connection pool) so the two paths cannot drift apart.
+fn append_vhost(url: &str, vhost: Option<&str>) -> String {
+    match vhost {
+        Some(vhost) if url.ends_with('/') => format!("{}{}", url, vhost),
+        Some(vhost) => format!("{}/{}", url, vhost),
+        None => url.to_string(),
+    }
+}
+
 impl AmqpBroker {
     /// Create a new AMQP broker with default configuration
     pub async fn new(url: &str, queue_name: &str) -> Result<Self> {
@@ -70,14 +95,15 @@ impl AmqpBroker {
 
     /// Create a new AMQP broker with custom configuration
     pub async fn with_config(url: &str, queue_name: &str, config: AmqpConfig) -> Result<Self> {
+        // Install the Pure-Rust TLS provider as early as possible: the first
+        // component in the process to build a `rustls::ClientConfig` decides
+        // which provider is used process-wide.
+        connect::install_pure_tls_provider();
+
         let connection_pool = if config.connection_pool_size > 0 {
             // Pooled connections must use exactly the same URI (vhost,
             // heartbeat, connection timeout) as the primary connection.
-            let pool_url = match config.vhost {
-                Some(ref vhost) if url.ends_with('/') => format!("{}{}", url, vhost),
-                Some(ref vhost) => format!("{}/{}", url, vhost),
-                None => url.to_string(),
-            };
+            let pool_url = append_vhost(url, config.vhost.as_deref());
             let uri = connect::build_uri(&pool_url, config.heartbeat, config.connection_timeout)?;
             Some(ConnectionPool::new(
                 uri,
@@ -228,16 +254,7 @@ impl AmqpBroker {
 
     /// Get the effective URL including virtual host if configured
     pub(crate) fn effective_url(&self) -> String {
-        if let Some(ref vhost) = self.config.vhost {
-            // Parse and append vhost to URL
-            if self.url.ends_with('/') {
-                format!("{}{}", self.url, vhost)
-            } else {
-                format!("{}/{}", self.url, vhost)
-            }
-        } else {
-            self.url.clone()
-        }
+        append_vhost(&self.url, self.config.vhost.as_deref())
     }
 
     /// Open a connection using the configured heartbeat, vhost and timeout.
@@ -305,7 +322,14 @@ impl AmqpBroker {
         self.channel_confirm_mode = false;
         // Consumers are channel-scoped: a consumer from a dead channel never
         // yields another delivery, so they must not survive the channel.
-        self.consumers.clear();
+        if !self.consumers.is_empty() {
+            warn!(
+                "Dropping {} AMQP subscription(s) with the channel; any delivery tag \
+                 handed out before this point is no longer valid",
+                self.consumers.len()
+            );
+            self.consumers.clear();
+        }
     }
 
     /// Check connection and channel health, attempting auto-reconnection if needed
@@ -398,6 +422,7 @@ impl AmqpBroker {
 
         let channel = self.create_configured_channel(connection).await?;
 
+        self.channel_confirm_mode = self.confirms_enabled();
         self.channel = Some(channel);
 
         // Setup topology using the channel we just created
@@ -514,12 +539,16 @@ impl AmqpBroker {
     /// Pooled channels are only ever used for publishing: delivery tags are
     /// channel-scoped, so consuming/acking always stays on the primary
     /// channel.
-    pub(crate) async fn acquire_publish_channel(&mut self) -> Result<(Channel, bool)> {
+    pub(crate) async fn acquire_publish_channel(&mut self) -> Result<PublishChannel> {
         let pooling_usable =
             self.channel_pool.is_some() && self.transaction_state != TransactionState::Started;
 
         if !pooling_usable {
-            return Ok((self.get_channel().await?.clone(), false));
+            return Ok(PublishChannel {
+                channel: self.get_channel().await?.clone(),
+                pooled: false,
+                confirms: self.channel_confirm_mode,
+            });
         }
 
         // Make sure we have a live connection to create pooled channels from.
@@ -559,21 +588,29 @@ impl AmqpBroker {
         }
 
         match result {
-            Ok(channel) => Ok((channel, true)),
+            Ok(channel) => Ok(PublishChannel {
+                channel,
+                pooled: true,
+                confirms,
+            }),
             Err(e) => {
                 warn!("Falling back to the primary channel: {}", e);
-                Ok((self.get_channel().await?.clone(), false))
+                Ok(PublishChannel {
+                    channel: self.get_channel().await?.clone(),
+                    pooled: false,
+                    confirms: self.channel_confirm_mode,
+                })
             }
         }
     }
 
     /// Return a channel obtained from [`Self::acquire_publish_channel`].
-    pub(crate) async fn release_publish_channel(&self, channel: Channel, pooled: bool) {
-        if !pooled {
+    pub(crate) async fn release_publish_channel(&self, publish_channel: PublishChannel) {
+        if !publish_channel.pooled {
             return;
         }
         if let Some(ref pool) = self.channel_pool {
-            pool.release(channel).await;
+            pool.release(publish_channel.channel).await;
         }
     }
 
@@ -886,11 +923,13 @@ impl Producer for AmqpBroker {
         if let Some(ref dedup_cache) = self.deduplication_cache {
             let message_id = message.headers.id.to_string();
             if dedup_cache.is_duplicate(&message_id).await {
-                debug!(
-                    "Skipping duplicate message: {} to {}/{}",
+                // Logged at info level, with the message id, so a false
+                // positive (a dropped publish) is diagnosable in production.
+                info!(
+                    "Deduplication: skipping publish of message {} to {}/{}",
                     message_id, exchange, routing_key
                 );
-                return Ok(()); // Silently skip duplicate
+                return Ok(()); // Duplicate: already published
             }
         }
 
@@ -932,8 +971,10 @@ impl Producer for AmqpBroker {
         }
 
         // Publish and get confirmation future in a scoped block to drop channel reference
-        let (channel, pooled) = self.acquire_publish_channel().await?;
-        let publish_result = channel
+        let publish_channel = self.acquire_publish_channel().await?;
+        let confirms_enabled = publish_channel.confirms;
+        let publish_result = publish_channel
+            .channel
             .basic_publish(
                 effective_exchange.as_str().into(),
                 effective_routing_key.as_str().into(),
@@ -949,7 +990,7 @@ impl Producer for AmqpBroker {
         let confirm_future = match publish_result {
             Ok(confirm_future) => confirm_future,
             Err(e) => {
-                self.release_publish_channel(channel, pooled).await;
+                self.release_publish_channel(publish_channel).await;
                 self.channel_metrics.publish_errors += 1;
                 return Err(BrokerError::OperationFailed(format!(
                     "Failed to publish: {}",
@@ -967,9 +1008,8 @@ impl Producer for AmqpBroker {
         let confirmation = confirm_future
             .await
             .map_err(|e| BrokerError::OperationFailed(format!("Failed to confirm publish: {}", e)));
-        self.release_publish_channel(channel, pooled).await;
+        self.release_publish_channel(publish_channel).await;
 
-        let confirms_enabled = self.confirms_enabled();
         match confirmation.and_then(|c| classify_confirmation(c, confirms_enabled)) {
             Ok(()) => {
                 // Update metrics
@@ -1116,5 +1156,40 @@ impl Broker for AmqpBroker {
         Err(BrokerError::OperationFailed(
             "list_queues requires RabbitMQ Management API".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `append_vhost` backs both `AmqpBroker::effective_url` (covered end to
+    // end via the broker in `tests.rs`) and the connection-pool URI built in
+    // `with_config` before `Self` exists, which has no accessor to assert
+    // against directly. Pinning the shared helper here covers both callers
+    // at once and keeps them from silently drifting apart again.
+
+    #[test]
+    fn no_vhost_leaves_the_url_untouched() {
+        assert_eq!(
+            append_vhost("amqp://localhost:5672", None),
+            "amqp://localhost:5672"
+        );
+    }
+
+    #[test]
+    fn vhost_is_appended_with_a_separator() {
+        assert_eq!(
+            append_vhost("amqp://localhost:5672", Some("production")),
+            "amqp://localhost:5672/production"
+        );
+    }
+
+    #[test]
+    fn vhost_is_appended_directly_when_the_url_already_ends_in_a_slash() {
+        assert_eq!(
+            append_vhost("amqp://localhost:5672/", Some("staging")),
+            "amqp://localhost:5672/staging"
+        );
     }
 }

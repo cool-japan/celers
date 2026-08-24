@@ -498,7 +498,13 @@ fn default_alert_check_interval() -> u64 {
 
 /// Expand environment variables in a string
 /// Supports ${VAR} and ${`VAR:default_value`} syntax
-fn expand_env_vars(s: &str) -> String {
+///
+/// `pub(crate)` so `config_layer`'s raw-overlay-value parsing (see
+/// `parse_raw_overlay_value`) can apply the exact same preprocessing
+/// [`Config::from_file`] does before parsing, keeping the two views of a
+/// profile overlay file (typed `Config`, raw presence-checking value)
+/// consistent.
+pub(crate) fn expand_env_vars(s: &str) -> String {
     let mut result = s.to_string();
     let mut start_idx = 0;
 
@@ -604,14 +610,8 @@ impl Config {
     /// only `aliases`, and writes that back -- every other section is
     /// preserved byte-for-byte as it was on disk.
     ///
-    /// NOTE: as of this fix, nothing calls this yet -- `cli::dispatch`'s
-    /// `Commands::Alias` handler (outside this module) still does
-    /// `load_config(None)?.to_file(...)` on the fully resolved config. See
-    /// the crate-level followups. `#[allow(dead_code)]` (matching this
-    /// file's existing `from_file_with_profile`/`merge_with`) since this is
-    /// public, tested API ready for that handler to adopt, not unreachable
-    /// code left over from a removed feature.
-    #[allow(dead_code)]
+    /// `cli::dispatch`'s `Commands::Alias` handler calls this instead of
+    /// re-serializing the fully env/CLI-resolved `Config` back to disk.
     pub fn write_aliases_only<P: AsRef<Path>>(
         path: P,
         aliases: &crate::aliases::AliasConfig,

@@ -38,6 +38,7 @@
 //! }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, SerializedTask, TaskState};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -395,7 +396,7 @@ impl CronScheduler {
     async fn claim_occurrence(&self, job_id: &str, fire_instant: i64) -> Result<bool> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 

@@ -880,17 +880,26 @@ impl MysqlBroker {
         task: SerializedTask,
         dedup_key: &str,
     ) -> Result<TaskId> {
-        // First check if a task with this dedup key already exists
+        // First check if a task with this dedup key already exists.
+        //
+        // Scoped to `queue_name` (leading predicate, matching the
+        // `sql_text::dequeue_select_sql` convention): without it, two
+        // brokers on different logical queues but the same database would
+        // collide on an identical `dedup_key`, and the *second* broker's
+        // `enqueue_deduplicated` would silently return the *first* broker's
+        // task id without inserting anything — a task lost for the caller's
+        // own queue, which its own `dequeue` (queue-scoped) would never see.
         let existing_rows = self
             .connection()
             .query(
                 r#"
                 SELECT id FROM celers_tasks
-                WHERE JSON_EXTRACT(metadata, '$.dedup_key') = ?
+                WHERE queue_name = ?
+                  AND JSON_EXTRACT(metadata, '$.dedup_key') = ?
                   AND state IN ('pending', 'processing')
                 LIMIT 1
                 "#,
-                &[&dedup_key],
+                &[&self.queue_name, &dedup_key],
             )
             .await
             .map_err(|e| {

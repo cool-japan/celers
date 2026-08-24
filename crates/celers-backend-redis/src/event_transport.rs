@@ -30,9 +30,10 @@
 use async_trait::async_trait;
 use celers_core::event::{Event, EventEmitter};
 use celers_core::{CelersError, Result};
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::OnceCell;
 
 /// Default channel name for all events
 const DEFAULT_CHANNEL: &str = "celeryev";
@@ -118,8 +119,13 @@ impl RedisEventConfig {
 pub struct RedisEventEmitter {
     client: Client,
     config: RedisEventConfig,
-    /// Connection for publishing (kept open for efficiency)
-    conn: Arc<RwLock<Option<redis::aio::MultiplexedConnection>>>,
+    /// Reconnecting connection for publishing.
+    ///
+    /// A [`ConnectionManager`] re-dials with backoff on its own. The previous
+    /// implementation cached a `MultiplexedConnection` that nothing ever
+    /// replaced, so after a Redis restart, failover or idle disconnect every
+    /// subsequent `emit` failed permanently for the lifetime of the process.
+    conn: Arc<OnceCell<ConnectionManager>>,
 }
 
 impl RedisEventEmitter {
@@ -142,7 +148,7 @@ impl RedisEventEmitter {
         Ok(Self {
             client,
             config: RedisEventConfig::default(),
-            conn: Arc::new(RwLock::new(None)),
+            conn: Arc::new(OnceCell::new()),
         })
     }
 
@@ -162,32 +168,23 @@ impl RedisEventEmitter {
         Ok(Self {
             client,
             config,
-            conn: Arc::new(RwLock::new(None)),
+            conn: Arc::new(OnceCell::new()),
         })
     }
 
-    /// Get or create a connection
-    async fn get_connection(
-        &self,
-    ) -> std::result::Result<redis::aio::MultiplexedConnection, crate::BackendError> {
-        // Check if we have a cached connection
-        {
-            let conn_guard = self.conn.read().await;
-            if let Some(ref conn) = *conn_guard {
-                return Ok(conn.clone());
-            }
-        }
-
-        // Create a new connection
-        let conn = self.client.get_multiplexed_async_connection().await?;
-
-        // Cache it
-        {
-            let mut conn_guard = self.conn.write().await;
-            *conn_guard = Some(conn.clone());
-        }
-
-        Ok(conn)
+    /// Get the shared reconnecting connection, establishing it on first use.
+    ///
+    /// If the initial connect fails the cell stays empty, so the next call
+    /// re-dials rather than caching a permanent failure.
+    async fn get_connection(&self) -> std::result::Result<ConnectionManager, crate::BackendError> {
+        self.conn
+            .get_or_try_init(|| async {
+                ConnectionManager::new(self.client.clone())
+                    .await
+                    .map_err(crate::BackendError::from)
+            })
+            .await
+            .cloned()
     }
 
     /// Publish an event to a channel
@@ -371,6 +368,14 @@ impl RedisEventReceiver {
     /// This is a convenience method that subscribes to configured channels
     /// and processes incoming messages.
     ///
+    /// # Errors
+    /// Returns [`BackendError::Connection`](crate::BackendError::Connection)
+    /// when the pub/sub stream terminates. Redis pub/sub has no orderly
+    /// end-of-stream, so a stream that ends means the connection dropped —
+    /// reporting `Ok(())` there made a permanently dead subscription look like
+    /// a clean shutdown. Use [`Self::receive_with_reconnect`] to resubscribe
+    /// automatically.
+    ///
     /// # Arguments
     /// * `handler` - Async function to call for each received event
     ///
@@ -423,7 +428,68 @@ impl RedisEventReceiver {
             }
         }
 
-        Ok(())
+        Err(crate::BackendError::Connection(
+            "Redis pub/sub stream ended unexpectedly".to_string(),
+        ))
+    }
+
+    /// Receive events forever, resubscribing with backoff after a drop
+    ///
+    /// Redis pub/sub is fire-and-forget: events published while the connection
+    /// is down are lost. This loop keeps the subscription alive so the outage
+    /// is bounded by the reconnect delay instead of lasting for the rest of the
+    /// process's life.
+    ///
+    /// Runs until `handler` returns an error, which is propagated to the
+    /// caller. Connection failures are retried indefinitely using `strategy`'s
+    /// backoff curve (its `max_attempts` bounds the *consecutive* failures
+    /// tolerated before giving up).
+    pub async fn receive_with_reconnect<F, Fut>(
+        &self,
+        strategy: crate::retry::RetryStrategy,
+        mut handler: F,
+    ) -> std::result::Result<(), crate::BackendError>
+    where
+        F: FnMut(Event) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<(), crate::BackendError>>,
+    {
+        let max_attempts = strategy.max_attempts.max(1);
+        let mut consecutive_failures: u32 = 0;
+
+        loop {
+            let started = std::time::Instant::now();
+            let outcome = self.receive(&mut handler).await;
+
+            match outcome {
+                // `receive` only ever returns on failure.
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if !strategy.is_retryable(&error) {
+                        return Err(error);
+                    }
+
+                    // A subscription that survived longer than the backoff
+                    // ceiling was healthy: do not count it against the budget.
+                    if started.elapsed() > strategy.max_backoff {
+                        consecutive_failures = 0;
+                    }
+
+                    consecutive_failures += 1;
+                    if consecutive_failures >= max_attempts {
+                        return Err(error);
+                    }
+
+                    let backoff = strategy.backoff_duration(consecutive_failures - 1);
+                    tracing::warn!(
+                        attempt = consecutive_failures,
+                        backoff_ms = backoff.as_millis(),
+                        error = %error,
+                        "Redis event subscription dropped; resubscribing"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
     }
 }
 

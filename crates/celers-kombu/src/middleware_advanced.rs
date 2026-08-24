@@ -1397,19 +1397,29 @@ mod hardening_tests {
         assert_eq!(boosted, Priority::Normal);
     }
 
-    #[tokio::test]
-    async fn priority_boost_age_boost_fires_once_message_actually_ages() {
-        // Real-clock based (no `headers.extra["timestamp"]` override, and
-        // `get_age_seconds` is backed by `chrono::Utc::now()`, which no
-        // mock clock in this dependency graph can fast-forward), so this
-        // waits for a real, short elapsed time rather than faking one.
-        // `get_age_seconds` truncates to whole seconds, hence the >1s wait
-        // against a threshold just below it.
+    #[test]
+    fn priority_boost_age_boost_fires_once_message_actually_ages() {
+        // Backdate via the `headers.extra["timestamp"]` override that
+        // `calculate_priority` prefers over the real `created_at`-based
+        // fallback (see the doc comment on `calculate_priority` above),
+        // instead of sleeping in real time: no mock clock in this
+        // dependency graph can fast-forward `get_age_seconds` (backed by
+        // `chrono::Utc::now()`), and `chrono` itself is a dependency of
+        // `celers-protocol`, not of `celers-kombu`. This mirrors the same
+        // override already used by `test_priority_boost_middleware_age_boost`
+        // in tests_middleware.rs.
         let middleware = PriorityBoostMiddleware::new()
             .with_age_boost(Duration::from_millis(500), Priority::Highest);
-        let msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        let mut msg = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let old_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_secs_f64()
+            - 5.0;
+        msg.headers
+            .extra
+            .insert("timestamp".to_string(), serde_json::json!(old_timestamp));
 
         let boosted = middleware.calculate_priority(&msg, Priority::Normal);
         assert_eq!(boosted, Priority::Highest);

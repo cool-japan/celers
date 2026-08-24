@@ -236,20 +236,32 @@ pub async fn list_queues(broker_url: &str) -> anyhow::Result<()> {
 async fn fetch_queue_list(broker_url: &str) -> anyhow::Result<Vec<QueueListEntry>> {
     let mut conn = pooled_redis_connection(broker_url).await?;
 
+    // `MATCH *` (not `celers:*`): real `RedisBroker` queue-family keys carry
+    // no shared prefix at all -- see `crate::keys`'s module docs and
+    // `commands::monitoring::report::base_queue_name`'s docs for the full
+    // rationale (idx 331/337). Every namespace this CLI itself owns in
+    // Redis (worker/task/metrics/schedule/alias) *is* `celers:`-prefixed, so
+    // those are filtered back out below via
+    // `crate::keys::is_reserved_namespace_key` -- the pause/drain control
+    // flags are not filtered by name here (unlike that namespace check,
+    // they are not distinguishable by name alone from the default queue
+    // literally named "celers", see that function's docs) and are instead
+    // dropped by [`fetch_queue_list_entry`]'s Redis `TYPE` check below,
+    // since a control flag is always a Redis STRING, never a LIST/ZSET.
     let mut cursor = 0;
-    let mut queue_keys: Vec<String> = Vec::new();
+    let mut candidate_keys: Vec<String> = Vec::new();
 
     loop {
         let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
-            .arg("celers:*")
+            .arg("*")
             .arg("COUNT")
             .arg(100)
             .query_async(&mut conn)
             .await?;
 
-        queue_keys.extend(keys);
+        candidate_keys.extend(keys);
         cursor = new_cursor;
 
         if cursor == 0 {
@@ -257,23 +269,39 @@ async fn fetch_queue_list(broker_url: &str) -> anyhow::Result<Vec<QueueListEntry
         }
     }
 
+    let queue_keys: Vec<String> = candidate_keys
+        .into_iter()
+        .filter(|k| !crate::keys::is_reserved_namespace_key(k))
+        .collect();
+
     let fetches = queue_keys.into_iter().map(|key| {
         let mut task_conn = conn.clone();
         async move { fetch_queue_list_entry(&mut task_conn, key).await }
     });
 
-    futures::future::join_all(fetches)
+    let entries: Vec<Option<QueueListEntry>> = futures::future::join_all(fetches)
         .await
         .into_iter()
-        .collect()
+        .collect::<anyhow::Result<Vec<Option<QueueListEntry>>>>()?;
+
+    Ok(entries.into_iter().flatten().collect())
 }
 
 /// Fetch the `TYPE` and size of a single queue-like key.
+///
+/// Returns `Ok(None)` when `key`'s Redis type is neither `list` nor `zset`
+/// -- the only two types `RedisBroker` ever creates a queue-family key as
+/// -- rather than reporting a stray non-queue key elsewhere in the keyspace
+/// as a bogus zero-size "queue".
 async fn fetch_queue_list_entry(
     conn: &mut redis::aio::MultiplexedConnection,
     key: String,
-) -> anyhow::Result<QueueListEntry> {
+) -> anyhow::Result<Option<QueueListEntry>> {
     let key_type: String = redis::cmd("TYPE").arg(&key).query_async(conn).await?;
+
+    if key_type != "list" && key_type != "zset" {
+        return Ok(None);
+    }
 
     let size: isize = match key_type.as_str() {
         "list" => redis::cmd("LLEN").arg(&key).query_async(conn).await?,
@@ -281,37 +309,42 @@ async fn fetch_queue_list_entry(
         _ => 0,
     };
 
-    let queue_type = if key.contains(":dlq") {
+    let queue_type = if key.ends_with(":dlq") {
         "DLQ".to_string()
-    } else if key.contains(":delayed") {
+    } else if key.ends_with(":delayed") {
         "Delayed".to_string()
+    } else if key.ends_with(":processing") {
+        "Processing".to_string()
     } else if key_type == "zset" {
         "Priority".to_string()
     } else {
         "FIFO".to_string()
     };
 
-    Ok(QueueListEntry {
+    Ok(Some(QueueListEntry {
         name: key,
         queue_type,
         size: size.to_string(),
-    })
+    }))
 }
 
 /// Discover the primary queue names currently known to the broker.
 ///
-/// Scans `celers:*` keys the same way [`fetch_queue_list`] does, then
-/// filters them down to primary queue keys via
-/// [`crate::commands::monitoring::report::base_queue_name`] — the exact
-/// same filter [`crate::commands::monitoring::report::report_queues`] uses
-/// to enumerate queues for its metrics report — so this reuses that single
-/// source of truth for "what counts as a queue" rather than duplicating the
-/// key-scan/filter logic a third time.
+/// Scans the full keyspace the same way [`fetch_queue_list`] does, then
+/// filters them down to name candidates via
+/// [`crate::commands::monitoring::report::base_queue_name`] -- the same
+/// prefix/suffix filter [`crate::commands::monitoring::report::report_queues`]
+/// uses -- and finally narrows those candidates to the two Redis types
+/// `RedisBroker` ever creates a primary queue key as (`LIST`/`ZSET`, one
+/// concurrent `TYPE` lookup per candidate, mirroring
+/// [`fetch_queue_list_entry`]'s own check), so a stray non-queue key
+/// elsewhere in the keyspace that happens to survive the name filter is
+/// never suggested as a "did you mean" queue.
 ///
-/// Returns a sorted, deduplicated list of queue names (no type/size
-/// information, unlike [`list_queues`]/[`fetch_queue_list`]). Used by the
-/// interactive REPL's `use <queue>` command to offer a "did you mean"
-/// suggestion when the requested queue doesn't already exist.
+/// Returns a sorted, deduplicated list of queue names (no size information,
+/// unlike [`list_queues`]/[`fetch_queue_list`]). Used by the interactive
+/// REPL's `use <queue>` command to offer a "did you mean" suggestion when
+/// the requested queue doesn't already exist.
 pub async fn queue_names(broker_url: &str) -> anyhow::Result<Vec<String>> {
     let mut conn = pooled_redis_connection(broker_url).await?;
 
@@ -322,7 +355,7 @@ pub async fn queue_names(broker_url: &str) -> anyhow::Result<Vec<String>> {
         let (new_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
-            .arg("celers:*")
+            .arg("*")
             .arg("COUNT")
             .arg(100)
             .query_async(&mut conn)
@@ -336,12 +369,34 @@ pub async fn queue_names(broker_url: &str) -> anyhow::Result<Vec<String>> {
         }
     }
 
-    let mut names: Vec<String> = keys
+    let mut candidates: Vec<String> = keys
         .iter()
         .filter_map(|key| crate::commands::monitoring::report::base_queue_name(key))
         .collect();
-    names.sort();
-    names.dedup();
+    candidates.sort();
+    candidates.dedup();
+
+    // Each candidate's `TYPE` lookup is independent, so these run
+    // concurrently via cloned handles from the shared connection pool
+    // rather than one round trip at a time (matching `fetch_queue_list`'s
+    // own concurrency pattern above).
+    let checks = candidates.into_iter().map(|name| {
+        let mut task_conn = conn.clone();
+        async move {
+            let key_type: String = redis::cmd("TYPE")
+                .arg(crate::keys::main(&name))
+                .query_async(&mut task_conn)
+                .await
+                .unwrap_or_else(|_| "none".to_string());
+            (key_type == "list" || key_type == "zset").then_some(name)
+        }
+    });
+
+    let names: Vec<String> = futures::future::join_all(checks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
 
     Ok(names)
 }
@@ -1254,6 +1309,182 @@ mod tests {
             0,
             "purge_queue must empty the exact key RedisBroker reads from/writes to"
         );
+    }
+
+    /// Regression test for idx 331/337: `fetch_queue_list`/`queue_names`
+    /// used to `SCAN celers:*`, a namespace `RedisBroker` never writes a
+    /// queue-family key into (see `crate::keys`'s module docs) -- so a
+    /// queue populated the same way a real producer would (via
+    /// `RedisBroker::enqueue`) was invisible to both, matching nothing.
+    /// Asserts only that this specific, UUID-scoped queue is discovered
+    /// (not an exact total count) since this suite runs against a shared,
+    /// possibly concurrently-used Redis instance.
+    #[tokio::test]
+    async fn queue_names_and_fetch_queue_list_discover_a_real_broker_queue() {
+        let queue_name = format!("test-discover-{}", uuid::Uuid::new_v4());
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+        broker
+            .enqueue(celers_core::SerializedTask::new(
+                "solo".to_string(),
+                Vec::new(),
+            ))
+            .await
+            .expect("enqueue");
+
+        let names = queue_names(TEST_BROKER_URL).await.expect("queue_names");
+        assert!(
+            names.contains(&queue_name),
+            "queue_names must discover a queue populated through the real RedisBroker key scheme"
+        );
+
+        let entries = fetch_queue_list(TEST_BROKER_URL)
+            .await
+            .expect("fetch_queue_list");
+        let discovered = entries.iter().find(|e| e.name == queue_name);
+        assert_eq!(
+            discovered.map(|e| (e.queue_type.as_str(), e.size.as_str())),
+            Some(("FIFO", "1")),
+            "fetch_queue_list must list the real broker queue with its actual type/size, \
+             not omit it"
+        );
+
+        purge_queue(TEST_BROKER_URL, &queue_name, true)
+            .await
+            .expect("cleanup purge");
+    }
+
+    /// Regression test found during review of idx 331/337's fix: without a
+    /// Redis `TYPE` check, any non-`celers:`-namespaced key in the
+    /// keyspace -- including one totally unrelated to any queue -- would be
+    /// suggested by [`queue_names`] as a "did you mean" queue name. This
+    /// proves a bare STRING key is excluded.
+    #[tokio::test]
+    async fn queue_names_excludes_non_list_zset_keys() {
+        let stray_key = format!("test-stray-string-{}", uuid::Uuid::new_v4());
+
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("conn");
+        let _: () = redis::cmd("SET")
+            .arg(&stray_key)
+            .arg("not a queue")
+            .query_async(&mut conn)
+            .await
+            .expect("seed stray string key");
+
+        let names = queue_names(TEST_BROKER_URL).await.expect("queue_names");
+        assert!(
+            !names.contains(&stray_key),
+            "queue_names must not suggest a bare STRING key as a queue name"
+        );
+
+        let _: () = redis::cmd("DEL")
+            .arg(&stray_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(());
+    }
+
+    /// `fetch_queue_list` must not surface this CLI's own `celers:`-
+    /// namespaced bookkeeping keys (worker heartbeats, schedules, etc.) or
+    /// a queue's pause/drain control flags as if they were queue rows --
+    /// only real, addressable queue-family keys.
+    #[tokio::test]
+    async fn fetch_queue_list_excludes_non_queue_namespaces_and_control_flags() {
+        let queue_name = format!("test-exclude-{}", uuid::Uuid::new_v4());
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+        broker.queue_controller().pause().await.expect("pause");
+
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("conn");
+        let bookkeeping_key = format!("celers:worker:{queue_name}:heartbeat");
+        let _: () = redis::cmd("SET")
+            .arg(&bookkeeping_key)
+            .arg("alive")
+            .query_async(&mut conn)
+            .await
+            .expect("seed bookkeeping key");
+
+        let entries = fetch_queue_list(TEST_BROKER_URL)
+            .await
+            .expect("fetch_queue_list");
+        assert!(
+            entries.iter().all(|e| e.name != bookkeeping_key),
+            "a celers:-namespaced bookkeeping key must never be listed as a queue"
+        );
+        assert!(
+            entries.iter().all(|e| !e.name.ends_with(":paused")),
+            "a queue's pause control flag must never be listed as a queue"
+        );
+
+        broker.queue_controller().resume().await.expect("resume");
+        let _: () = redis::cmd("DEL")
+            .arg(&bookkeeping_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(());
+    }
+
+    /// Regression test found during review of idx 331/337's fix:
+    /// `Config::default_config` names the default queue literally
+    /// `"celers"`, so this queue's own sibling keys (`celers:dlq`,
+    /// `celers:processing`, `celers:delayed`) collide syntactically with the
+    /// `celers:`-prefixed bookkeeping namespaces `fetch_queue_list` also
+    /// filters out. Checking the bookkeeping-namespace exclusion before the
+    /// queue-family-suffix check would silently hide this queue's DLQ row
+    /// (and every other sibling) from `celers queue list` forever. This
+    /// proves a DLQ entry on a queue literally named "celers" is still
+    /// discovered.
+    ///
+    /// Uses `RPUSH`/`LREM` (additive, targeted removal) rather than `DEL`,
+    /// since the literal name "celers" is also this suite's config-driven
+    /// default queue name and may be touched by other concurrently-running
+    /// tests against the same shared Redis instance.
+    #[tokio::test]
+    async fn fetch_queue_list_finds_dlq_row_for_the_default_queue_named_celers() {
+        let marker = format!("dlq-marker-{}", uuid::Uuid::new_v4());
+        let dlq_key = crate::keys::dlq("celers");
+
+        let client = redis::Client::open(TEST_BROKER_URL).expect("client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("conn");
+        let _: usize = redis::cmd("RPUSH")
+            .arg(&dlq_key)
+            .arg(&marker)
+            .query_async(&mut conn)
+            .await
+            .expect("seed dlq marker");
+
+        let entries = fetch_queue_list(TEST_BROKER_URL)
+            .await
+            .expect("fetch_queue_list");
+        let dlq_row = entries.iter().find(|e| e.name == dlq_key);
+        match dlq_row {
+            Some(row) => assert_eq!(
+                row.queue_type, "DLQ",
+                "the default queue's DLQ sibling key must be labeled DLQ, not hidden or \
+                 mislabeled"
+            ),
+            None => panic!(
+                "fetch_queue_list must not hide the default queue's own DLQ sibling key \
+                 ({dlq_key}) just because it starts with \"celers:\""
+            ),
+        }
+
+        let _: usize = redis::cmd("LREM")
+            .arg(&dlq_key)
+            .arg(1)
+            .arg(&marker)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(0);
     }
 
     /// `purge_queue` against a queue key that was never created must be a

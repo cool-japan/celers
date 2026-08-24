@@ -31,6 +31,14 @@
 //! - Task status inspection
 //! - Database health checks
 //! - Automatic task archiving
+//!
+//! # Retention
+//!
+//! `ack` keeps terminal (`completed`/`cancelled`/`failed`) rows in
+//! `celers_tasks` for auditing. Since `celers_tasks` is also the table every
+//! `dequeue` scans, prune it with [`MysqlBroker::purge_terminal_tasks`] for a
+//! one-shot chunked sweep, or start a background sweeper with
+//! [`MysqlBroker::spawn_retention_task`].
 
 // Core type definitions
 pub mod types;

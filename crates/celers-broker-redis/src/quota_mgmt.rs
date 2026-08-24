@@ -33,6 +33,7 @@
 //! }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result};
 use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
@@ -186,7 +187,7 @@ impl QuotaManager {
     /// Get a Redis connection
     async fn get_connection(&self) -> Result<MultiplexedConnection> {
         self.client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))
     }

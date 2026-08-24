@@ -23,6 +23,29 @@ impl DlqConfig {
     }
 }
 
+/// Where the `MessageGroupId` of a FIFO publish comes from.
+///
+/// SQS rejects any `SendMessage` to a FIFO queue that lacks a
+/// `MessageGroupId`, but the generic [`Producer`](celers_kombu::Producer)
+/// interface has no parameter for one. This selects how the broker derives it.
+/// Messages sharing a group id are delivered in strict order; different groups
+/// are processed in parallel, so the choice is a throughput/ordering trade-off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FifoGroupIdSource {
+    /// Use `headers.group` when the message belongs to a group, otherwise the
+    /// task name. This is the default: it preserves ordering inside a Celery
+    /// group while letting unrelated tasks proceed in parallel.
+    #[default]
+    MessageGroup,
+    /// Always use the same, fixed group id — strict global ordering, lowest
+    /// throughput (one message in flight per queue at a time).
+    Fixed(String),
+    /// Use the queue name, i.e. strict ordering per queue.
+    PerQueue,
+    /// Use the task name, i.e. strict ordering per task type.
+    PerTaskName,
+}
+
 /// FIFO queue configuration
 #[derive(Debug, Clone, Default)]
 pub struct FifoConfig {
@@ -32,6 +55,9 @@ pub struct FifoConfig {
     pub high_throughput: bool,
     /// Default message group ID for messages without explicit group
     pub default_message_group_id: Option<String>,
+    /// How `MessageGroupId` is derived when publishing through the generic
+    /// [`Producer`](celers_kombu::Producer) interface
+    pub group_id_source: FifoGroupIdSource,
 }
 
 impl FifoConfig {
@@ -55,6 +81,20 @@ impl FifoConfig {
     /// Set default message group ID
     pub fn with_default_message_group_id(mut self, group_id: impl Into<String>) -> Self {
         self.default_message_group_id = Some(group_id.into());
+        self
+    }
+
+    /// Choose how `MessageGroupId` is derived for generic publishes
+    ///
+    /// # Example
+    /// ```
+    /// use celers_broker_sqs::types::{FifoConfig, FifoGroupIdSource};
+    ///
+    /// let config = FifoConfig::new().with_group_id_source(FifoGroupIdSource::PerTaskName);
+    /// assert_eq!(config.group_id_source, FifoGroupIdSource::PerTaskName);
+    /// ```
+    pub fn with_group_id_source(mut self, source: FifoGroupIdSource) -> Self {
+        self.group_id_source = source;
         self
     }
 }

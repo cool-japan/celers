@@ -69,12 +69,13 @@ impl AmqpBroker {
             })
             .collect();
 
-        let confirms_enabled = self.confirms_enabled();
         let publish_options = BasicPublishOptions {
             mandatory: self.config.mandatory_publish,
             ..Default::default()
         };
-        let (channel, pooled) = self.acquire_publish_channel().await?;
+        let publish_channel = self.acquire_publish_channel().await?;
+        let confirms_enabled = publish_channel.confirms;
+        let channel = publish_channel.channel.clone();
 
         let effective_depth = if pipeline_depth == 0 {
             messages.len() // Unlimited - send all before waiting
@@ -183,7 +184,8 @@ impl AmqpBroker {
             }
         }
 
-        self.release_publish_channel(channel, pooled).await;
+        drop(channel);
+        self.release_publish_channel(publish_channel).await;
 
         if let Some(e) = fatal_error {
             self.channel_metrics.publish_errors += (messages.len() - success_count) as u64;
@@ -255,12 +257,13 @@ impl AmqpBroker {
             })
             .collect();
 
-        let confirms_enabled = self.confirms_enabled();
         let publish_options = BasicPublishOptions {
             mandatory: self.config.mandatory_publish,
             ..Default::default()
         };
-        let (channel, pooled) = self.acquire_publish_channel().await?;
+        let publish_channel = self.acquire_publish_channel().await?;
+        let confirms_enabled = publish_channel.confirms;
+        let channel = publish_channel.channel.clone();
 
         // Publish all messages and collect confirm futures
         let mut confirms = Vec::with_capacity(messages.len());
@@ -341,7 +344,8 @@ impl AmqpBroker {
             }
         }
 
-        self.release_publish_channel(channel, pooled).await;
+        drop(channel);
+        self.release_publish_channel(publish_channel).await;
 
         self.channel_metrics.messages_published += success_count as u64;
         self.publisher_confirm_stats.total_confirms += messages.len() as u64;
@@ -704,8 +708,9 @@ impl AmqpBroker {
 
         let exchange = self.config.default_exchange.clone();
         {
-            let channel = self.get_channel().await?;
-            channel
+            let channel = self.get_channel().await?.clone();
+            let confirms_enabled = self.channel_confirm_mode;
+            let confirmation = channel
                 .basic_publish(
                     exchange.as_str().into(),
                     rpc_queue.into(),
@@ -721,6 +726,7 @@ impl AmqpBroker {
                 .map_err(|e| {
                     BrokerError::OperationFailed(format!("Failed to confirm RPC request: {}", e))
                 })?;
+            classify_confirmation(confirmation, confirms_enabled)?;
         }
 
         debug!(
@@ -869,8 +875,8 @@ impl AmqpBroker {
             .with_content_encoding(ShortString::from("utf-8"))
             .with_correlation_id(ShortString::from(correlation_id.as_str()));
 
-        let confirms_enabled = self.confirms_enabled();
-        let channel = self.get_channel().await?;
+        let channel = self.get_channel().await?.clone();
+        let confirms_enabled = self.channel_confirm_mode;
 
         // The reply queue is a temporary queue with no binding, so the reply
         // goes to the default exchange with the queue name as routing key.

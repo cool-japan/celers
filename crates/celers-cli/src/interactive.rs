@@ -286,7 +286,10 @@ impl InteractiveSession {
                 crate::commands::health_check(&self.broker_url, &self.queue_name).await?;
             }
             "doctor" | "d" => {
-                crate::commands::doctor(&self.broker_url, &self.queue_name).await?;
+                // The REPL has no `--strict` flag of its own; warnings never
+                // fail an interactive session, matching this command's
+                // pre-`--strict` behavior.
+                crate::commands::doctor(&self.broker_url, &self.queue_name, false).await?;
             }
             "metrics" | "m" => {
                 crate::commands::show_metrics("text", None, None, None).await?;

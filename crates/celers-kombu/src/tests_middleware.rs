@@ -1368,16 +1368,19 @@ async fn test_compression_middleware_round_trip_restores_body() {
     middleware.before_publish(&mut msg).await.unwrap();
 
     // Body must have been compressed (smaller) and the encoding header set.
+    // Namespaced under "x-" (not the bare "content-encoding") so this
+    // internal marker can't collide with a producer-set header of the
+    // same name; see `CompressionMiddleware::COMPRESSION_HEADER`.
     assert!(msg.body.len() < original.len());
     assert_eq!(
-        msg.headers.extra.get("content-encoding"),
+        msg.headers.extra.get("x-compression-encoding"),
         Some(&serde_json::Value::String("gzip".to_string()))
     );
 
     // Consuming must restore the exact original body and clean up the header.
     middleware.after_consume(&mut msg).await.unwrap();
     assert_eq!(msg.body, original);
-    assert!(!msg.headers.extra.contains_key("content-encoding"));
+    assert!(!msg.headers.extra.contains_key("x-compression-encoding"));
 }
 
 #[cfg(feature = "compression")]
@@ -1393,7 +1396,7 @@ async fn test_compression_middleware_skips_small_body() {
     middleware.before_publish(&mut msg).await.unwrap();
     // Below threshold: no compression, no header.
     assert_eq!(msg.body, original);
-    assert!(!msg.headers.extra.contains_key("content-encoding"));
+    assert!(!msg.headers.extra.contains_key("x-compression-encoding"));
 
     // after_consume leaves an uncompressed body untouched.
     middleware.after_consume(&mut msg).await.unwrap();

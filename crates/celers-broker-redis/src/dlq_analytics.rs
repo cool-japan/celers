@@ -35,6 +35,7 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, SerializedTask, TaskState};
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
@@ -258,7 +259,7 @@ impl DLQAnalyzer {
     pub async fn detect_failure_patterns(&self, limit: usize) -> Result<Vec<FailurePattern>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -317,7 +318,7 @@ impl DLQAnalyzer {
     pub async fn cluster_errors(&self, limit: usize) -> Result<Vec<ErrorCluster>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -416,7 +417,7 @@ impl DLQAnalyzer {
     pub async fn analyze_temporal_patterns(&self, limit: usize) -> Result<TemporalAnalysis> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 

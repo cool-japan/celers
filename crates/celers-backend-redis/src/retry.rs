@@ -111,6 +111,13 @@ impl RetryStrategy {
 }
 
 /// Retry executor for async operations
+///
+/// `RedisResultBackend` already retries its own operations using the
+/// [`RetryStrategy`] configured via
+/// [`with_retry_strategy`](crate::RedisResultBackend::with_retry_strategy) —
+/// it cannot go through this executor because its methods take `&mut self`,
+/// which a re-entrant `FnMut` closure cannot borrow. This type is for wrapping
+/// *your own* fallible Redis-adjacent work with the same backoff behaviour.
 pub struct RetryExecutor {
     strategy: RetryStrategy,
 }

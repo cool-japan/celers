@@ -397,6 +397,7 @@ impl Default for HeartbeatStats {
 /// Standby instances periodically call [`check_leader_health`](BeatHeartbeat::check_leader_health).
 /// If the leader's lock has expired, a standby calls `try_become_leader`
 /// to promote itself.
+#[derive(Clone)]
 pub struct BeatHeartbeat {
     /// Configuration for heartbeat timing and keys
     config: HeartbeatConfig,
@@ -412,6 +413,23 @@ pub struct BeatHeartbeat {
     stats: Arc<HeartbeatStats>,
     /// Whether the heartbeat loop is running
     running: Arc<AtomicBool>,
+    /// Absolute expiry of the leader lease currently held by this instance.
+    ///
+    /// Leadership is a TTL lease, so a stalled process must be able to work out
+    /// that it is no longer the leader *without* waiting for its next tick.
+    /// [`BeatHeartbeat::is_leader`] consults this before answering.
+    lease_expires_at: Arc<RwLock<Option<DateTime<Utc>>>>,
+    /// Monotonically increasing fencing token, bumped on every fresh
+    /// acquisition of the leader lease (not on renewals).
+    ///
+    /// A deposed leader that later resumes carries a stale epoch, which lets a
+    /// downstream store reject its writes.
+    lease_epoch: Arc<AtomicU64>,
+    /// When this instance first observed the leader key to be absent.
+    ///
+    /// Used to hold promotion back until `failover_timeout` has elapsed, so a
+    /// momentarily unreachable backend does not immediately trigger a takeover.
+    leader_missing_since: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
 
 impl BeatHeartbeat {
@@ -438,6 +456,9 @@ impl BeatHeartbeat {
             heartbeat_info: Arc::new(RwLock::new(info)),
             stats: Arc::new(HeartbeatStats::new()),
             running: Arc::new(AtomicBool::new(true)),
+            lease_expires_at: Arc::new(RwLock::new(None)),
+            lease_epoch: Arc::new(AtomicU64::new(0)),
+            leader_missing_since: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -461,6 +482,11 @@ impl BeatHeartbeat {
             .await?;
 
         if acquired {
+            // Fresh acquisition: start a new lease and bump the fencing token.
+            self.lease_epoch.fetch_add(1, Ordering::SeqCst);
+            *self.lease_expires_at.write().await = Some(self.new_lease_deadline());
+            *self.leader_missing_since.write().await = None;
+
             let mut role = self.role.write().await;
             *role = BeatRole::Leader;
             let mut info = self.heartbeat_info.write().await;
@@ -471,12 +497,144 @@ impl BeatHeartbeat {
             let mut role = self.role.write().await;
             if *role != BeatRole::Leader {
                 *role = BeatRole::Standby;
+                *self.lease_expires_at.write().await = None;
             }
             let mut info = self.heartbeat_info.write().await;
             info.role = *role;
             self.stats.record_election_lost();
             Ok(false)
         }
+    }
+
+    /// Absolute deadline for a lease acquired or renewed right now.
+    fn new_lease_deadline(&self) -> DateTime<Utc> {
+        let ttl = chrono::Duration::from_std(self.config.leader_lease_ttl)
+            .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX / 1000));
+        Utc::now() + ttl
+    }
+
+    /// Safety margin subtracted from the lease deadline before this instance
+    /// still considers itself the leader.
+    ///
+    /// Covers clock skew and the time between the check and the actual
+    /// dispatch, so a lease that is about to expire is treated as already gone.
+    fn lease_safety_margin(&self) -> chrono::Duration {
+        let ttl_secs = self.config.leader_lease_ttl.as_secs();
+        chrono::Duration::seconds((ttl_secs / 10) as i64)
+    }
+
+    /// The current fencing token for this instance's leadership.
+    ///
+    /// Incremented on every fresh acquisition of the leader lease. A holder
+    /// that was deposed and re-elected has a strictly greater epoch than it did
+    /// before, so late writes from the deposed incarnation are identifiable.
+    pub fn lease_epoch(&self) -> u64 {
+        self.lease_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Absolute expiry of the leader lease this instance holds, if any.
+    pub async fn lease_expires_at(&self) -> Option<DateTime<Utc>> {
+        *self.lease_expires_at.read().await
+    }
+
+    /// Force the recorded lease deadline.
+    ///
+    /// Exposed alongside [`BeatHeartbeat::set_leader_missing_since`] so a
+    /// supervising process (or a deterministic test) can simulate a lease that
+    /// lapsed while the process was stalled, without waiting out
+    /// `leader_lease_ttl` in real time. Normal operation sets this implicitly
+    /// on every acquisition and renewal.
+    pub async fn set_lease_expires_at(&self, at: Option<DateTime<Utc>>) {
+        *self.lease_expires_at.write().await = at;
+    }
+
+    /// Whether the held leader lease is still valid (with safety margin).
+    pub async fn lease_is_valid(&self) -> bool {
+        match *self.lease_expires_at.read().await {
+            Some(expiry) => Utc::now() < expiry - self.lease_safety_margin(),
+            None => false,
+        }
+    }
+
+    /// Resolve the effective role, self-demoting a leader whose lease lapsed.
+    ///
+    /// The cached role is only refreshed by `tick`, which is caller-driven — a
+    /// stalled process could otherwise keep reporting `Leader` (and keep
+    /// dispatching) long after a standby took over. Checking the lease here
+    /// makes the demotion happen without needing a tick.
+    async fn effective_role(&self) -> BeatRole {
+        let cached = *self.role.read().await;
+        if cached != BeatRole::Leader {
+            return cached;
+        }
+
+        if self.lease_is_valid().await {
+            return BeatRole::Leader;
+        }
+
+        // Lease lapsed while we were not looking: demote locally so no dispatch
+        // decision is made on a lease we no longer hold.
+        let mut role = self.role.write().await;
+        if *role == BeatRole::Leader {
+            *role = BeatRole::Standby;
+            let mut info = self.heartbeat_info.write().await;
+            info.role = BeatRole::Standby;
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                "leader lease expired without renewal; self-demoting to standby"
+            );
+        }
+        *role
+    }
+
+    /// The key this instance publishes its heartbeat under.
+    ///
+    /// Formed from [`HeartbeatConfig::heartbeat_key_prefix`] and the instance
+    /// id, so any peer that knows an instance id can check its liveness.
+    pub fn heartbeat_key(&self) -> String {
+        format!("{}{}", self.config.heartbeat_key_prefix, self.instance_id)
+    }
+
+    /// Publish this instance's liveness beacon to the shared lock backend.
+    ///
+    /// The beacon is a `heartbeat_ttl`-scoped entry at
+    /// `{heartbeat_key_prefix}{instance_id}` owned by this instance. Renewal is
+    /// attempted first so the entry never blinks out (which a peer would read
+    /// as a dead instance); a fresh acquire covers the first publish and
+    /// recovery after an expiry.
+    ///
+    /// The beacon expires on its own if the process dies, which is exactly the
+    /// failure detection [`HeartbeatConfig::failover_timeout`] is built on.
+    pub async fn publish_heartbeat(&self) -> celers_core::error::Result<()> {
+        let key = self.heartbeat_key();
+        let ttl = self.config.heartbeat_ttl.as_secs().max(1);
+
+        if self
+            .lock_backend
+            .renew(&key, &self.instance_id, ttl)
+            .await?
+        {
+            return Ok(());
+        }
+
+        self.lock_backend
+            .try_acquire(&key, &self.instance_id, ttl)
+            .await?;
+        Ok(())
+    }
+
+    /// Check whether another instance's heartbeat beacon is still live.
+    ///
+    /// Returns `Ok(false)` once that instance's beacon has expired — i.e. it
+    /// stopped publishing for longer than `heartbeat_ttl`.
+    pub async fn is_instance_alive(&self, instance_id: &str) -> celers_core::error::Result<bool> {
+        let key = format!("{}{}", self.config.heartbeat_key_prefix, instance_id);
+        self.lock_backend.is_locked(&key).await
+    }
+
+    /// The instance id currently holding the leader lock, if any.
+    pub async fn current_leader(&self) -> celers_core::error::Result<Option<String>> {
+        self.lock_backend.owner(&self.config.leader_lock_key).await
     }
 
     /// Renew the leader lease by extending the distributed lock TTL.
@@ -499,9 +657,11 @@ impl BeatHeartbeat {
 
         if renewed {
             self.stats.record_lease_renewal();
+            *self.lease_expires_at.write().await = Some(self.new_lease_deadline());
         } else {
             self.stats.record_lease_renewal_failure();
             // Lost leadership
+            *self.lease_expires_at.write().await = None;
             let mut role = self.role.write().await;
             *role = BeatRole::Standby;
             let mut info = self.heartbeat_info.write().await;
@@ -532,13 +692,24 @@ impl BeatHeartbeat {
     /// * `schedule_count` - Number of tasks currently registered
     /// * `next_due_task` - Name of the next task due for execution
     pub async fn update_info(&self, schedule_count: usize, next_due_task: Option<String>) {
-        let current_role = *self.role.read().await;
-        let mut info = self.heartbeat_info.write().await;
-        info.last_heartbeat_at = Utc::now();
-        info.schedule_count = schedule_count;
-        info.next_due_task = next_due_task;
-        info.role = current_role;
+        let current_role = self.effective_role().await;
+        {
+            let mut info = self.heartbeat_info.write().await;
+            info.last_heartbeat_at = Utc::now();
+            info.schedule_count = schedule_count;
+            info.next_due_task = next_due_task;
+            info.role = current_role;
+        }
         self.stats.record_heartbeat();
+
+        // Publish the liveness beacon so peers can observe this instance.
+        if let Err(e) = self.publish_heartbeat().await {
+            tracing::warn!(
+                instance_id = %self.instance_id,
+                error = %e,
+                "failed to publish heartbeat beacon"
+            );
+        }
     }
 
     /// Gracefully shut down the heartbeat manager.
@@ -546,6 +717,13 @@ impl BeatHeartbeat {
     /// If this instance is the leader, the leader lock is released so
     /// that another instance can take over immediately instead of
     /// waiting for the lease to expire.
+    /// Gracefully shut down the heartbeat manager.
+    ///
+    /// Releases the leader lock (only when this instance still holds a valid
+    /// lease) and its heartbeat beacon so another instance can take over
+    /// immediately instead of waiting for the TTLs to lapse. The backends only
+    /// honour a release from the recorded owner, so a deposed instance cannot
+    /// release the new leader's lock.
     pub async fn shutdown(&self) -> celers_core::error::Result<()> {
         self.running.store(false, Ordering::SeqCst);
         let role = *self.role.read().await;
@@ -554,6 +732,14 @@ impl BeatHeartbeat {
                 .release(&self.config.leader_lock_key, &self.instance_id)
                 .await?;
         }
+        // Drop the liveness beacon too; a graceful exit should be observable
+        // immediately rather than after `heartbeat_ttl`.
+        self.lock_backend
+            .release(&self.heartbeat_key(), &self.instance_id)
+            .await?;
+
+        *self.lease_expires_at.write().await = None;
+        *self.leader_missing_since.write().await = None;
         let mut r = self.role.write().await;
         *r = BeatRole::Unknown;
         let mut info = self.heartbeat_info.write().await;
@@ -562,18 +748,34 @@ impl BeatHeartbeat {
     }
 
     /// Get the current role of this instance.
+    ///
+    /// A leader whose lease has lapsed reports `Standby`: the role is a lease,
+    /// not a latch.
     pub async fn role(&self) -> BeatRole {
+        self.effective_role().await
+    }
+
+    /// Get the cached role without consulting the lease deadline.
+    ///
+    /// Mainly useful for diagnostics; scheduling decisions should use
+    /// [`BeatHeartbeat::role`] / [`BeatHeartbeat::is_leader`].
+    pub async fn cached_role(&self) -> BeatRole {
         *self.role.read().await
     }
 
     /// Check if this instance is currently the leader.
+    ///
+    /// Returns `false` once the leader lease has expired (minus a safety
+    /// margin), even if no tick has run since — a stalled process therefore
+    /// stops dispatching on its own rather than racing the standby that
+    /// replaced it.
     pub async fn is_leader(&self) -> bool {
-        *self.role.read().await == BeatRole::Leader
+        self.effective_role().await == BeatRole::Leader
     }
 
     /// Check if this instance is currently in standby mode.
     pub async fn is_standby(&self) -> bool {
-        *self.role.read().await == BeatRole::Standby
+        self.effective_role().await == BeatRole::Standby
     }
 
     /// Get a snapshot of the current heartbeat info.
@@ -622,13 +824,95 @@ impl BeatHeartbeat {
             BeatRole::Standby | BeatRole::Unknown => {
                 // Check if leader is still alive
                 let leader_alive = self.check_leader_health().await?;
-                if !leader_alive {
+                if leader_alive {
+                    // The lock may still be *ours*: a stalled tick lets the
+                    // lease slip inside the safety margin and self-demotes us
+                    // even though nobody else took over. Renew and re-promote
+                    // instead of idling until the lock expires and then waiting
+                    // out `failover_timeout` — that would turn a brief stall
+                    // into a much longer dispatch outage.
+                    if self.current_leader().await?.as_deref() == Some(self.instance_id.as_str()) {
+                        if !self.renew_lease().await? {
+                            self.try_become_leader().await?;
+                        } else {
+                            let mut role = self.role.write().await;
+                            *role = BeatRole::Leader;
+                            let mut info = self.heartbeat_info.write().await;
+                            info.role = BeatRole::Leader;
+                        }
+                    }
+                    // Leader observed: reset the failover countdown.
+                    *self.leader_missing_since.write().await = None;
+                } else if self.failover_deadline_reached(role).await {
                     self.stats.record_failover();
                     self.try_become_leader().await?;
                 }
             }
         }
+
+        // Every tick refreshes this instance's liveness beacon, leader or not.
+        self.publish_heartbeat().await?;
         Ok(())
+    }
+
+    /// Whether a standby may promote itself now that the leader key is absent.
+    ///
+    /// From `Unknown` (startup, or right after a shutdown) promotion is
+    /// immediate: there is no incumbent to protect. From `Standby` the absence
+    /// must persist for [`HeartbeatConfig::failover_timeout`], so a single
+    /// missed read against a flaky backend cannot trigger a takeover.
+    async fn failover_deadline_reached(&self, role: BeatRole) -> bool {
+        if role == BeatRole::Unknown {
+            return true;
+        }
+
+        let now = Utc::now();
+        let mut missing_since = self.leader_missing_since.write().await;
+        let first_missed = *missing_since.get_or_insert(now);
+
+        let timeout = chrono::Duration::from_std(self.config.failover_timeout)
+            .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX / 1000));
+
+        now - first_missed >= timeout
+    }
+
+    /// When this instance first observed the leader key missing, if it
+    /// currently considers the leader absent.
+    pub async fn leader_missing_since(&self) -> Option<DateTime<Utc>> {
+        *self.leader_missing_since.read().await
+    }
+
+    /// Force the failover countdown to a specific start instant.
+    ///
+    /// Exposed so a supervising process (or a deterministic test) can control
+    /// the moment the leader was first seen to be gone without waiting out
+    /// `failover_timeout` in real time.
+    pub async fn set_leader_missing_since(&self, at: Option<DateTime<Utc>>) {
+        *self.leader_missing_since.write().await = at;
+    }
+
+    /// Spawn a background task that ticks the heartbeat at
+    /// [`HeartbeatConfig::leader_renewal_interval`].
+    ///
+    /// Without this the lease is only renewed when the embedder happens to call
+    /// [`BeatHeartbeat::tick`], so the renewal cadence is not actually tied to
+    /// the configured interval. The loop stops after
+    /// [`BeatHeartbeat::shutdown`]; aborting the returned handle also stops it.
+    pub fn spawn_renewal_loop(&self) -> tokio::task::JoinHandle<()> {
+        let heartbeat = self.clone();
+        tokio::spawn(async move {
+            let interval = heartbeat.config.leader_renewal_interval;
+            while heartbeat.is_running() {
+                if let Err(e) = heartbeat.tick().await {
+                    tracing::warn!(
+                        instance_id = %heartbeat.instance_id,
+                        error = %e,
+                        "heartbeat renewal tick failed"
+                    );
+                }
+                tokio::time::sleep(interval).await;
+            }
+        })
     }
 }
 
@@ -941,5 +1225,195 @@ mod tests {
         let renewed = hb.renew_lease().await;
         assert!(renewed.is_ok_and(|v| !v));
         assert_eq!(hb.stats().lease_renewal_failures(), 1);
+    }
+
+    // -- Lease validity / fencing tests --
+
+    /// Regression: `is_leader()` returned a cached role, so a process stalled
+    /// past `leader_lease_ttl` kept reporting `Leader` (and kept dispatching)
+    /// until its next tick, racing the standby that had taken over.
+    #[tokio::test]
+    async fn test_is_leader_false_once_lease_expired() {
+        let backend = make_backend();
+        // A zero TTL makes the lease expire the instant it is taken, which
+        // exercises the deadline check without sleeping.
+        let hb = BeatHeartbeat::new(
+            "instance-1".to_string(),
+            backend,
+            HeartbeatConfig::new().with_leader_lease_ttl(Duration::from_secs(0)),
+        );
+
+        assert!(hb.try_become_leader().await.is_ok_and(|v| v));
+        // The cached role still says Leader ...
+        assert_eq!(hb.cached_role().await, BeatRole::Leader);
+        // ... but the lease-aware view must not.
+        assert!(!hb.lease_is_valid().await);
+        assert!(!hb.is_leader().await);
+        assert_eq!(hb.role().await, BeatRole::Standby);
+    }
+
+    #[tokio::test]
+    async fn test_valid_lease_keeps_leadership() {
+        let backend = make_backend();
+        let hb = make_heartbeat("instance-1", backend);
+
+        assert!(hb.try_become_leader().await.is_ok_and(|v| v));
+        assert!(hb.lease_is_valid().await);
+        assert!(hb.is_leader().await);
+        assert!(hb.lease_expires_at().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_lease_epoch_advances_on_reacquisition() {
+        let backend = make_backend();
+        let hb = make_heartbeat("instance-1", backend);
+
+        assert_eq!(hb.lease_epoch(), 0);
+        let _ = hb.try_become_leader().await;
+        let first = hb.lease_epoch();
+        assert_eq!(first, 1);
+
+        // A renewal must not bump the fencing token.
+        let _ = hb.renew_lease().await;
+        assert_eq!(hb.lease_epoch(), first);
+
+        // A fresh acquisition after losing leadership must.
+        let _ = hb.shutdown().await;
+        let _ = hb.try_become_leader().await;
+        assert!(hb.lease_epoch() > first);
+    }
+
+    // -- Distributed heartbeat beacon tests --
+
+    /// Regression: `heartbeat_key_prefix` and `heartbeat_ttl` were configured
+    /// but never used, so an instance's heartbeat was invisible to its peers.
+    #[tokio::test]
+    async fn test_heartbeat_is_published_and_observable_by_peers() {
+        let backend = make_backend();
+        let hb1 = make_heartbeat("instance-1", backend.clone());
+        let hb2 = make_heartbeat("instance-2", backend.clone());
+
+        // Nothing published yet.
+        assert!(hb2.is_instance_alive("instance-1").await.is_ok_and(|v| !v));
+
+        hb1.publish_heartbeat().await.expect("publish heartbeat");
+
+        // The beacon lands under the configured prefix and is visible to a peer.
+        assert_eq!(hb1.heartbeat_key(), "beat_heartbeat:instance-1");
+        assert!(backend
+            .is_locked("beat_heartbeat:instance-1")
+            .await
+            .is_ok_and(|v| v));
+        assert!(hb2.is_instance_alive("instance-1").await.is_ok_and(|v| v));
+    }
+
+    #[tokio::test]
+    async fn test_repeated_publish_keeps_beacon_continuously_live() {
+        let backend = make_backend();
+        let hb = make_heartbeat("instance-1", backend.clone());
+
+        for _ in 0..5 {
+            hb.publish_heartbeat().await.expect("publish heartbeat");
+            // The beacon must never blink out between publishes: a peer reading
+            // in the gap would otherwise see the instance as dead.
+            assert!(hb.is_instance_alive("instance-1").await.is_ok_and(|v| v));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drops_the_beacon() {
+        let backend = make_backend();
+        let hb = make_heartbeat("instance-1", backend.clone());
+
+        hb.publish_heartbeat().await.expect("publish heartbeat");
+        assert!(hb.is_instance_alive("instance-1").await.is_ok_and(|v| v));
+
+        hb.shutdown().await.expect("shutdown");
+        assert!(hb.is_instance_alive("instance-1").await.is_ok_and(|v| !v));
+    }
+
+    #[tokio::test]
+    async fn test_update_info_publishes_the_beacon() {
+        let backend = make_backend();
+        let hb = make_heartbeat("instance-1", backend.clone());
+
+        hb.update_info(3, Some("task_a".to_string())).await;
+        assert!(hb.is_instance_alive("instance-1").await.is_ok_and(|v| v));
+    }
+
+    // -- Failover timeout tests --
+
+    /// Regression: `failover_timeout` had no consumer; a standby promoted on
+    /// the very first observed miss of the leader key.
+    #[tokio::test]
+    async fn test_standby_waits_for_failover_timeout_before_promoting() {
+        let backend = make_backend();
+        let hb1 = make_heartbeat("instance-1", backend.clone());
+        let hb2 = make_heartbeat("instance-2", backend.clone());
+
+        assert!(hb1.try_become_leader().await.is_ok_and(|v| v));
+        assert!(hb2.try_become_leader().await.is_ok_and(|v| !v));
+        assert!(hb2.is_standby().await);
+
+        // Leader disappears.
+        hb1.shutdown().await.expect("shutdown");
+
+        // First observed miss: the countdown starts, no promotion yet.
+        hb2.tick().await.expect("tick");
+        assert!(
+            !hb2.is_leader().await,
+            "promoted on the first observed miss"
+        );
+        assert!(hb2.leader_missing_since().await.is_some());
+        assert_eq!(hb2.stats().failovers_detected(), 0);
+
+        // Backdate the first miss past `failover_timeout` (45 s by default).
+        let long_ago = Utc::now() - chrono::Duration::seconds(120);
+        hb2.set_leader_missing_since(Some(long_ago)).await;
+
+        hb2.tick().await.expect("tick");
+        assert!(
+            hb2.is_leader().await,
+            "should promote after failover_timeout"
+        );
+        assert_eq!(hb2.stats().failovers_detected(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failover_countdown_resets_when_leader_returns() {
+        let backend = make_backend();
+        let hb1 = make_heartbeat("instance-1", backend.clone());
+        let hb2 = make_heartbeat("instance-2", backend.clone());
+
+        let _ = hb1.try_become_leader().await;
+        let _ = hb2.try_become_leader().await;
+        hb1.shutdown().await.expect("shutdown");
+
+        hb2.tick().await.expect("tick");
+        assert!(hb2.leader_missing_since().await.is_some());
+
+        // Leader comes back before the timeout elapses.
+        let hb3 = make_heartbeat("instance-3", backend.clone());
+        assert!(hb3.try_become_leader().await.is_ok_and(|v| v));
+
+        hb2.tick().await.expect("tick");
+        assert!(
+            hb2.leader_missing_since().await.is_none(),
+            "countdown should reset once a leader is observed again"
+        );
+        assert!(!hb2.is_leader().await);
+    }
+
+    /// An instance that has never seen a leader (role `Unknown`, i.e. startup)
+    /// must still bootstrap immediately rather than idling for
+    /// `failover_timeout`.
+    #[tokio::test]
+    async fn test_unknown_role_promotes_immediately() {
+        let backend = make_backend();
+        let hb = make_heartbeat("instance-1", backend);
+
+        assert_eq!(hb.cached_role().await, BeatRole::Unknown);
+        hb.tick().await.expect("tick");
+        assert!(hb.is_leader().await);
     }
 }

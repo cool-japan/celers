@@ -256,7 +256,7 @@ pub async fn profile_resources(
     let days = days.max(1);
 
     // Current snapshot (same reads as `analyze_bottlenecks`).
-    let queue_key = format!("celers:{queue}");
+    let queue_key = crate::keys::main(queue);
     let queue_type: String = redis::cmd("TYPE")
         .arg(&queue_key)
         .query_async(&mut conn)
@@ -278,7 +278,7 @@ pub async fn profile_resources(
     };
     let worker_keys = scan_worker_heartbeat_keys(&mut conn).await?;
     let dlq_size: u64 = redis::cmd("LLEN")
-        .arg(format!("{queue_key}:dlq"))
+        .arg(crate::keys::dlq(queue))
         .query_async(&mut conn)
         .await
         .unwrap_or(0);

@@ -304,6 +304,32 @@ pub enum CatchupPolicy {
 }
 
 impl CatchupPolicy {
+    /// Project this policy onto the occurrence-list model in
+    /// [`crate::catchup::CatchupPolicy`].
+    ///
+    /// The scheduler enumerates the concrete occurrences a task missed and then
+    /// asks this policy which of them to replay, so both catch-up models share
+    /// one implementation of "which of these instants do we fire":
+    ///
+    /// | This policy            | Occurrence policy | Replayed misses          |
+    /// |------------------------|-------------------|--------------------------|
+    /// | `Skip`                 | `Skip`            | none                     |
+    /// | `RunOnce`              | `FireLatestOnly`  | the most recent miss     |
+    /// | `RunMultiple`          | `FireAll`         | capped at `max_catchup`  |
+    /// | `TimeWindow`           | `FireAll`         | filtered by the window   |
+    ///
+    /// The count/window narrowing for the last two rows is applied by the
+    /// caller; this method only picks the coarse shape.
+    pub fn occurrence_policy(&self) -> crate::catchup::CatchupPolicy {
+        match self {
+            CatchupPolicy::Skip => crate::catchup::CatchupPolicy::Skip,
+            CatchupPolicy::RunOnce => crate::catchup::CatchupPolicy::FireLatestOnly,
+            CatchupPolicy::RunMultiple { .. } | CatchupPolicy::TimeWindow { .. } => {
+                crate::catchup::CatchupPolicy::FireAll
+            }
+        }
+    }
+
     /// Check if we should execute a catch-up run
     pub fn should_catchup(
         &self,
@@ -378,8 +404,17 @@ pub struct Jitter {
 }
 
 impl Jitter {
-    /// Create a new jitter configuration
+    /// Create a new jitter configuration.
+    ///
+    /// An inverted range (`min_seconds > max_seconds`) is normalised by
+    /// swapping the bounds, so a transposed argument pair can never produce a
+    /// wrapped, enormous offset.
     pub fn new(min_seconds: i64, max_seconds: i64) -> Self {
+        let (min_seconds, max_seconds) = if min_seconds <= max_seconds {
+            (min_seconds, max_seconds)
+        } else {
+            (max_seconds, min_seconds)
+        };
         Self {
             min_seconds,
             max_seconds,
@@ -388,40 +423,44 @@ impl Jitter {
 
     /// Create jitter with only positive offset (0 to max_seconds)
     pub fn positive(max_seconds: i64) -> Self {
-        Self {
-            min_seconds: 0,
-            max_seconds,
-        }
+        Self::new(0, max_seconds)
     }
 
     /// Create symmetric jitter (-seconds to +seconds)
     pub fn symmetric(seconds: i64) -> Self {
-        Self {
-            min_seconds: -seconds,
-            max_seconds: seconds,
-        }
+        Self::new(-seconds, seconds)
     }
 
-    /// Apply jitter to a datetime using hash-based deterministic randomization
+    /// Check whether the configured range is well-formed (`min <= max`).
+    ///
+    /// Always true for values built through the constructors; a deserialized
+    /// configuration can still be inverted, which [`Jitter::apply`] normalises.
+    pub fn is_valid(&self) -> bool {
+        self.min_seconds <= self.max_seconds
+    }
+
+    /// Apply jitter to a datetime using a stable, hash-based deterministic
+    /// offset.
+    ///
+    /// The offset lies in the **inclusive** range `[min_seconds, max_seconds]`
+    /// and is derived from the FNV-1a construction in [`crate::jitter`], whose
+    /// output is specified and stable across Rust releases and platforms. That
+    /// stability is what lets two beat instances agree on the jittered fire
+    /// instant for the same entry — and therefore contend for the same
+    /// per-fire dispatch lock instead of both dispatching.
+    ///
+    /// An out-of-range or overflowing result degrades to the un-jittered
+    /// instant rather than panicking.
     pub fn apply(&self, dt: DateTime<Utc>, task_name: &str) -> DateTime<Utc> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        let offset =
+            crate::jitter::stable_bounded_offset(task_name, dt, self.min_seconds, self.max_seconds);
 
-        // Use task name and datetime to generate deterministic random offset
-        let mut hasher = DefaultHasher::new();
-        task_name.hash(&mut hasher);
-        dt.timestamp().hash(&mut hasher);
-        let hash = hasher.finish();
-
-        // Map hash to jitter range
-        let range = (self.max_seconds - self.min_seconds) as u64;
-        let offset = if range > 0 {
-            (hash % range) as i64 + self.min_seconds
-        } else {
-            self.min_seconds
-        };
-
-        dt + Duration::seconds(offset)
+        // `Duration::seconds` panics for out-of-range values, and the add can
+        // overflow the representable datetime range; both degrade to the
+        // un-jittered instant.
+        Duration::try_seconds(offset)
+            .and_then(|delta| dt.checked_add_signed(delta))
+            .unwrap_or(dt)
     }
 }
 

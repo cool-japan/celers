@@ -27,7 +27,13 @@ static TLS_PROVIDER_INIT: Once = Once::new();
 /// Installing a default can only ever succeed once; a second attempt (or an
 /// attempt after another component installed its own) is not an error here,
 /// it simply means somebody else already made the choice.
-pub(crate) fn install_pure_tls_provider() {
+///
+/// **Ordering matters**: whoever builds a `rustls::ClientConfig` first wins.
+/// This crate installs the provider when a broker is constructed and again
+/// before every connect, but an application that creates TLS clients through
+/// other libraries earlier in startup should call this itself, first thing in
+/// `main`.
+pub fn install_pure_tls_provider() {
     TLS_PROVIDER_INIT.call_once(|| {
         // `CryptoProvider::install_default` consumes the provider by value.
         if oxitls::pure_provider()
@@ -82,7 +88,10 @@ pub(crate) fn build_uri(
 ///
 /// Returns [`BrokerError::Connection`] if the connection could not be
 /// established within the timeout.
-pub(crate) async fn open_connection(uri: &AMQPUri, connection_timeout: Duration) -> Result<Connection> {
+pub(crate) async fn open_connection(
+    uri: &AMQPUri,
+    connection_timeout: Duration,
+) -> Result<Connection> {
     install_pure_tls_provider();
 
     let connect = Connection::connect_uri(uri.clone(), ConnectionProperties::default());
@@ -95,10 +104,7 @@ pub(crate) async fn open_connection(uri: &AMQPUri, connection_timeout: Duration)
 
     match tokio::time::timeout(connection_timeout, connect).await {
         Ok(Ok(connection)) => Ok(connection),
-        Ok(Err(e)) => Err(BrokerError::Connection(format!(
-            "Failed to connect: {}",
-            e
-        ))),
+        Ok(Err(e)) => Err(BrokerError::Connection(format!("Failed to connect: {}", e))),
         Err(_) => Err(BrokerError::Connection(format!(
             "Timed out after {:?} while connecting to the AMQP broker",
             connection_timeout
@@ -112,8 +118,8 @@ mod tests {
 
     #[test]
     fn build_uri_applies_configured_heartbeat_and_timeout() {
-        let uri = build_uri("amqp://localhost:5672/%2f", 17, Duration::from_secs(3))
-            .expect("valid uri");
+        let uri =
+            build_uri("amqp://localhost:5672/%2f", 17, Duration::from_secs(3)).expect("valid uri");
         assert_eq!(uri.query.heartbeat, Some(17));
         assert_eq!(uri.query.connection_timeout, Some(3_000));
     }

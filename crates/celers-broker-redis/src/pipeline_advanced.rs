@@ -41,6 +41,7 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result};
 use redis::{aio::MultiplexedConnection, Client, Pipeline, RedisError};
 use serde::{Deserialize, Serialize};
@@ -400,7 +401,7 @@ impl AdvancedPipeline {
     ) -> Result<PipelineExecutionResult> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 

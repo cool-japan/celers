@@ -4,7 +4,7 @@
 //! Redis-based task result storage, including builder methods, convenience
 //! methods, query operations, transaction support, and archival.
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::stream::StreamExt;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
@@ -14,7 +14,6 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::codec;
-use crate::query::TaskQuery;
 use crate::result_backend_trait::{ResultBackend, ResultStream};
 use crate::stats::{ttl, BackendStats, BatchOperationResult, PoolStats, StateCount, TaskSummary};
 use crate::types::{BackendError, ProgressInfo, Result, TaskMeta, TaskResult, TaskTtlConfig};
@@ -525,10 +524,18 @@ impl RedisResultBackend {
     pub async fn get_stats(&mut self) -> Result<BackendStats> {
         let mut conn = self.connection().await?;
 
-        // Count task result keys using SCAN (production-safe)
-        let task_pattern = format!("{}*", self.key_prefix);
+        // Count task result keys using SCAN (production-safe).
+        // Only keys whose suffix is a task UUID are real results — chunk,
+        // version, archive and dependency keys share the prefix.
+        let task_pattern = self.scan_pattern("*");
         let task_keys = self.scan_keys(&task_pattern).await?;
-        let task_key_count = task_keys.len();
+        let task_key_count = task_keys
+            .iter()
+            .filter(|key| {
+                key.strip_prefix(&self.key_prefix)
+                    .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
+            })
+            .count();
 
         // Count chord state keys using SCAN (production-safe)
         let chord_keys = self.scan_keys("celery-chord-*").await?;
@@ -583,7 +590,7 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn cleanup_old_results(&mut self, older_than: Duration) -> Result<usize> {
-        let pattern = format!("{}*", self.key_prefix);
+        let pattern = self.scan_pattern("*");
         let keys = self.scan_keys(&pattern).await?;
 
         let cutoff = Utc::now() - chrono::Duration::from_std(older_than).unwrap_or_default();
@@ -687,8 +694,12 @@ impl RedisResultBackend {
         meta: &TaskMeta,
         ttl: Duration,
     ) -> Result<()> {
-        self.store_result(task_id, meta).await?;
-        self.set_expiration(task_id, ttl).await?;
+        // One atomic write with `SET ... EX`: a crash can never leave the
+        // result stored without its expiry.
+        let key = self.task_key(task_id);
+        self.write_meta_to_key(&key, meta, Some(ttl), None).await?;
+        self.cache_terminal(task_id, meta);
+        self.publish_notification(task_id, meta).await;
         Ok(())
     }
 
@@ -718,10 +729,9 @@ impl RedisResultBackend {
         results: &[(Uuid, TaskMeta)],
         ttl: Duration,
     ) -> Result<()> {
-        self.store_results_batch(results).await?;
-        self.set_multiple_expirations(&results.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ttl)
-            .await?;
-        Ok(())
+        // `atomic_store_multiple` already applies the TTL inside the same
+        // write, covering chunk keys as well.
+        self.atomic_store_multiple(results, Some(ttl)).await
     }
 
     /// Set expiration for multiple tasks at once
@@ -751,76 +761,25 @@ impl RedisResultBackend {
             return Ok(());
         }
 
-        let mut conn = self.connection().await?;
-        let mut pipe = redis::pipe();
+        // The expire command covers the chunk and chunk-metadata keys too, so a
+        // chunked result cannot end up with a bare, never-expiring body.
+        let commands: Vec<redis::Cmd> = task_ids
+            .iter()
+            .map(|id| codec::expire_command(&self.task_key(*id), ttl))
+            .collect();
 
-        let ttl_secs = ttl.as_secs() as i64;
-        for task_id in task_ids {
-            let key = self.task_key(*task_id);
-            pipe.expire(&key, ttl_secs);
-        }
-
-        pipe.query_async::<()>(&mut conn).await?;
-        Ok(())
-    }
-
-    /// Wait for a task result with timeout and polling
-    ///
-    /// Polls the backend until the task reaches a terminal state or timeout is reached.
-    ///
-    /// # Arguments
-    /// * `task_id` - Task to wait for
-    /// * `timeout` - Maximum time to wait
-    /// * `poll_interval` - Time between polls (default: 500ms)
-    ///
-    /// # Returns
-    /// * `Ok(Some(meta))` - Task completed (terminal state)
-    /// * `Ok(None)` - Timeout reached before completion
-    /// * `Err(...)` - Backend error
-    ///
-    /// # Example
-    /// ```no_run
-    /// use celers_backend_redis::RedisResultBackend;
-    /// use uuid::Uuid;
-    /// use std::time::Duration;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
-    /// let task_id = Uuid::new_v4();
-    ///
-    /// // Wait up to 30 seconds for result
-    /// match backend.wait_for_result(
-    ///     task_id,
-    ///     Duration::from_secs(30),
-    ///     Duration::from_millis(500)
-    /// ).await? {
-    ///     Some(meta) => println!("Task completed: {:?}", meta.result),
-    ///     None => println!("Task timed out"),
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn wait_for_result(
-        &mut self,
-        task_id: Uuid,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<Option<TaskMeta>> {
-        let start = std::time::Instant::now();
-
-        loop {
-            if let Some(meta) = self.get_result(task_id).await? {
-                if meta.is_terminal() {
-                    return Ok(Some(meta));
+        self.run_with_retry("set_multiple_expirations", |mut conn| {
+            let commands = commands.clone();
+            async move {
+                let mut pipe = redis::pipe();
+                for command in commands {
+                    pipe.add_command(command);
                 }
+                pipe.query_async::<Vec<i64>>(&mut conn).await?;
+                Ok(())
             }
-
-            if start.elapsed() >= timeout {
-                return Ok(None);
-            }
-
-            tokio::time::sleep(poll_interval).await;
-        }
+        })
+        .await
     }
 
     /// Check if a task is in a terminal state without fetching full metadata
@@ -1143,10 +1102,7 @@ impl RedisResultBackend {
     ///
     /// Extends the TTL of a task by the specified duration from now.
     pub async fn refresh_ttl(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
-        let mut conn = self.connection().await?;
-        let key = self.task_key(task_id);
-        let _: bool = conn.expire(&key, ttl.as_secs() as i64).await?;
-        Ok(())
+        self.set_expiration(task_id, ttl).await
     }
 
     /// Refresh TTL for multiple tasks at once
@@ -1154,16 +1110,29 @@ impl RedisResultBackend {
     /// Efficiently updates TTL for multiple tasks using pipelining.
     /// Returns the number of tasks that had their TTL updated.
     pub async fn refresh_ttl_batch(&mut self, task_ids: &[Uuid], ttl: Duration) -> Result<usize> {
-        let mut conn = self.connection().await?;
-        let mut pipe = redis::pipe();
-
-        for task_id in task_ids {
-            let key = self.task_key(*task_id);
-            pipe.expire(&key, ttl.as_secs() as i64);
+        if task_ids.is_empty() {
+            return Ok(0);
         }
 
-        let results: Vec<bool> = pipe.query_async(&mut conn).await?;
-        Ok(results.iter().filter(|&&r| r).count())
+        let commands: Vec<redis::Cmd> = task_ids
+            .iter()
+            .map(|id| codec::expire_command(&self.task_key(*id), ttl))
+            .collect();
+
+        let results: Vec<i64> = self
+            .run_with_retry("refresh_ttl_batch", |mut conn| {
+                let commands = commands.clone();
+                async move {
+                    let mut pipe = redis::pipe();
+                    for command in commands {
+                        pipe.add_command(command);
+                    }
+                    Ok(pipe.query_async(&mut conn).await?)
+                }
+            })
+            .await?;
+
+        Ok(results.iter().filter(|&&applied| applied == 1).count())
     }
 
     /// Remove TTL from a task (make it persistent)
@@ -1238,22 +1207,52 @@ impl RedisResultBackend {
         results: &[(Uuid, TaskMeta)],
         ttl: Option<Duration>,
     ) -> Result<()> {
-        let mut conn = self.connection().await?;
-        let mut pipe = redis::pipe();
-        pipe.atomic();
+        if results.is_empty() {
+            return Ok(());
+        }
+
+        let mut commands = Vec::with_capacity(results.len());
 
         for (task_id, meta) in results {
             let key = self.task_key(*task_id);
-            let json = serde_json::to_string(meta)
-                .map_err(|e| BackendError::Serialization(e.to_string()))?;
-            pipe.set(&key, json);
+            // Same encode pipeline as every other write path: compression and
+            // encryption are never bypassed, and oversized payloads chunk.
+            let encoded = codec::encode_meta(
+                meta,
+                &self.compression_config,
+                &self.encryption_config,
+                &self.chunker,
+            )
+            .inspect_err(|e| self.record_failure(e))?;
+            self.metrics
+                .record_data_size(encoded.original_size, encoded.stored_size);
+            self.compression_stats
+                .record(encoded.original_size, encoded.stored_size);
 
-            if let Some(ttl_duration) = ttl {
-                pipe.expire(&key, ttl_duration.as_secs() as i64);
-            }
+            // An explicit `ttl` wins; otherwise fall back to the configured
+            // per-task-type policy so atomic writes expire like normal ones.
+            let effective_ttl = ttl.or_else(|| self.ttl_config.get_ttl(&meta.task_name));
+            commands.push(codec::write_command(&key, &encoded, effective_ttl, None));
         }
 
-        let _: () = pipe.query_async(&mut conn).await?;
+        self.run_with_retry("atomic_store_multiple", |mut conn| {
+            let commands = commands.clone();
+            async move {
+                let mut pipe = redis::pipe();
+                pipe.atomic();
+                for command in commands {
+                    pipe.add_command(command);
+                }
+                pipe.query_async::<Vec<i64>>(&mut conn).await?;
+                Ok(())
+            }
+        })
+        .await?;
+
+        for (task_id, meta) in results {
+            self.cache_terminal(*task_id, meta);
+        }
+
         Ok(())
     }
 
@@ -1276,17 +1275,35 @@ impl RedisResultBackend {
     /// # }
     /// ```
     pub async fn atomic_delete_multiple(&mut self, task_ids: &[Uuid]) -> Result<usize> {
-        let mut conn = self.connection().await?;
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-
-        for task_id in task_ids {
-            let key = self.task_key(*task_id);
-            pipe.del(&key);
+        if task_ids.is_empty() {
+            return Ok(0);
         }
 
-        let results: Vec<i32> = pipe.query_async(&mut conn).await?;
-        Ok(results.iter().sum::<i32>() as usize)
+        let commands: Vec<redis::Cmd> = task_ids
+            .iter()
+            .map(|id| codec::delete_command(&self.task_key(*id)))
+            .collect();
+
+        let deleted: Vec<i64> = self
+            .run_with_retry("atomic_delete_multiple", |mut conn| {
+                let commands = commands.clone();
+                async move {
+                    let mut pipe = redis::pipe();
+                    pipe.atomic();
+                    for command in commands {
+                        pipe.add_command(command);
+                    }
+                    Ok(pipe.query_async(&mut conn).await?)
+                }
+            })
+            .await?;
+
+        // Deleted results must stop being served from the cache.
+        for task_id in task_ids {
+            self.cache.invalidate(*task_id);
+        }
+
+        Ok(deleted.iter().sum::<i64>().max(0) as usize)
     }
 
     // === Lua Script Support ===
@@ -1340,13 +1357,28 @@ impl RedisResultBackend {
         Ok(result)
     }
 
-    /// Compare-and-swap operation using Lua script
+    /// Compare-and-swap operation
     ///
-    /// Atomically updates a task result only if the current state matches the expected state.
+    /// Atomically updates a task result only if the currently stored result
+    /// equals `expected`.
+    ///
+    /// The comparison is done in two steps so it stays correct with compression,
+    /// encryption and chunking enabled: the stored bytes are read and decoded,
+    /// the decoded value is compared with `expected`, and the write is then
+    /// guarded server-side on those exact bytes still being present. A
+    /// concurrent writer therefore always loses the race instead of being
+    /// silently overwritten.
     ///
     /// # Returns
-    /// - `Ok(true)` if the swap was successful
-    /// - `Ok(false)` if the current state didn't match
+    /// - `Ok(true)` if the swap was performed
+    /// - `Ok(false)` if the stored result did not match `expected`, or another
+    ///   writer modified the key in between (retry in that case)
+    ///
+    /// # Note
+    /// With encryption enabled the guard is stricter than semantic equality:
+    /// AES-GCM uses a fresh nonce per write, so a concurrent rewrite of the
+    /// *same* logical value still invalidates the guard. That yields a spurious
+    /// `false` (safe), never a spurious `true`.
     ///
     /// # Example
     /// ```no_run
@@ -1375,27 +1407,36 @@ impl RedisResultBackend {
         new_value: &TaskMeta,
     ) -> Result<bool> {
         let key = self.task_key(task_id);
-        let expected_json = serde_json::to_string(expected)
-            .map_err(|e| BackendError::Serialization(e.to_string()))?;
-        let new_json = serde_json::to_string(new_value)
-            .map_err(|e| BackendError::Serialization(e.to_string()))?;
 
-        // Lua script for atomic compare-and-swap
-        let script = r#"
-            local current = redis.call('GET', KEYS[1])
-            if current == ARGV[1] then
-                redis.call('SET', KEYS[1], ARGV[2])
-                return 1
-            else
-                return 0
-            end
-        "#;
+        // Read the raw bytes currently stored; they double as the optimistic
+        // concurrency token handed to the guarded write.
+        let Some(raw) = self.read_raw(&key).await? else {
+            return Ok(false);
+        };
 
-        let result: i32 = self
-            .eval_script(script, &[&key], &[&expected_json, &new_json])
+        // The stored representation may be a chunk sentinel, so decode through
+        // the normal read path before comparing.
+        let mut current = self
+            .read_metas_from_keys(std::slice::from_ref(&key))
+            .await?;
+        let Some(current) = current.pop().flatten() else {
+            return Ok(false);
+        };
+
+        if &current != expected {
+            return Ok(false);
+        }
+
+        let ttl = self.ttl_config.get_ttl(&new_value.task_name);
+        let swapped = self
+            .write_meta_to_key(&key, new_value, ttl, Some(&raw))
             .await?;
 
-        Ok(result == 1)
+        if swapped {
+            self.cache_terminal(task_id, new_value);
+        }
+
+        Ok(swapped)
     }
 
     // === Pattern-Based Operations ===
@@ -1419,7 +1460,9 @@ impl RedisResultBackend {
     /// ```
     pub async fn find_tasks_by_pattern(&mut self, pattern: &str) -> Result<Vec<Uuid>> {
         let mut conn = self.connection().await?;
-        let full_pattern = format!("{}{}", self.key_prefix, pattern);
+        // `pattern` is a *suffix*: the key prefix is supplied here. Callers
+        // must not repeat it, or the composed pattern matches nothing.
+        let full_pattern = self.scan_pattern(pattern);
 
         let mut task_ids = Vec::new();
         let mut cursor = 0u64;
@@ -1623,176 +1666,7 @@ impl RedisResultBackend {
         Ok(start.elapsed())
     }
 
-    // === Task Querying ===
-
-    /// Query tasks by state
-    ///
-    /// Returns task IDs that match the specified state.
-    ///
-    /// # Example
-    /// ```no_run
-    /// use celers_backend_redis::{RedisResultBackend, TaskResult};
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
-    ///
-    /// // Find all failed tasks
-    /// let failed_ids = backend.query_tasks_by_state(TaskResult::Failure("".to_string())).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn query_tasks_by_state(&mut self, target_state: TaskResult) -> Result<Vec<Uuid>> {
-        // Get all task keys
-        let pattern = format!("{}task-meta-*", self.key_prefix);
-        let task_ids = self.find_tasks_by_pattern(&pattern).await?;
-
-        let mut matching_ids = Vec::new();
-
-        // Filter by state
-        for task_id in task_ids {
-            if let Some(meta) = self.get_result(task_id).await? {
-                if meta.result.same_variant(&target_state) {
-                    matching_ids.push(task_id);
-                }
-            }
-        }
-
-        Ok(matching_ids)
-    }
-
-    /// Query tasks by worker name
-    ///
-    /// Returns task IDs that were executed by the specified worker.
-    pub async fn query_tasks_by_worker(&mut self, worker_name: &str) -> Result<Vec<Uuid>> {
-        let pattern = format!("{}task-meta-*", self.key_prefix);
-        let task_ids = self.find_tasks_by_pattern(&pattern).await?;
-
-        let mut matching_ids = Vec::new();
-
-        for task_id in task_ids {
-            if let Some(meta) = self.get_result(task_id).await? {
-                if let Some(ref worker) = meta.worker {
-                    if worker == worker_name {
-                        matching_ids.push(task_id);
-                    }
-                }
-            }
-        }
-
-        Ok(matching_ids)
-    }
-
-    /// Query tasks created within a time range
-    ///
-    /// # Arguments
-    /// * `start` - Start time (inclusive)
-    /// * `end` - End time (inclusive)
-    ///
-    /// # Returns
-    /// Vector of task IDs created within the specified time range
-    pub async fn query_tasks_by_time_range(
-        &mut self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Vec<Uuid>> {
-        let pattern = format!("{}task-meta-*", self.key_prefix);
-        let task_ids = self.find_tasks_by_pattern(&pattern).await?;
-
-        let mut matching_ids = Vec::new();
-
-        for task_id in task_ids {
-            if let Some(meta) = self.get_result(task_id).await? {
-                if meta.created_at >= start && meta.created_at <= end {
-                    matching_ids.push(task_id);
-                }
-            }
-        }
-
-        Ok(matching_ids)
-    }
-
-    /// Query tasks by multiple criteria
-    ///
-    /// # Arguments
-    /// * `criteria` - Query criteria to filter tasks
-    ///
-    /// # Returns
-    /// Vector of task IDs that match all specified criteria
-    pub async fn query_tasks(&mut self, criteria: TaskQuery) -> Result<Vec<Uuid>> {
-        let pattern = format!("{}task-meta-*", self.key_prefix);
-        let task_ids = self.find_tasks_by_pattern(&pattern).await?;
-
-        let mut matching_ids = Vec::new();
-
-        for task_id in task_ids {
-            if let Some(meta) = self.get_result(task_id).await? {
-                if criteria.matches(&meta) {
-                    matching_ids.push(task_id);
-                }
-            }
-        }
-
-        Ok(matching_ids)
-    }
-
-    /// Query tasks by tags (task must have all specified tags)
-    ///
-    /// This is a convenience method that wraps `query_tasks` with a tag filter.
-    pub async fn query_tasks_by_tags(&mut self, tags: Vec<String>) -> Result<Vec<Uuid>> {
-        let criteria = TaskQuery::new().with_tags(tags);
-        self.query_tasks(criteria).await
-    }
-
-    /// Count tasks with specific tags
-    ///
-    /// Returns the number of tasks that have all specified tags.
-    pub async fn count_tasks_by_tags(&mut self, tags: Vec<String>) -> Result<usize> {
-        let task_ids = self.query_tasks_by_tags(tags).await?;
-        Ok(task_ids.len())
-    }
-
-    /// Bulk delete tasks with specific tags
-    ///
-    /// Deletes all tasks that have all specified tags.
-    /// Returns the number of tasks deleted.
-    pub async fn bulk_delete_by_tags(&mut self, tags: Vec<String>) -> Result<usize> {
-        let task_ids = self.query_tasks_by_tags(tags).await?;
-        if task_ids.is_empty() {
-            return Ok(0);
-        }
-        self.delete_results_batch(&task_ids).await?;
-        Ok(task_ids.len())
-    }
-
-    /// Bulk revoke tasks with specific tags
-    ///
-    /// Revokes all tasks that have all specified tags.
-    /// Returns the number of tasks revoked.
-    pub async fn bulk_revoke_by_tags(&mut self, tags: Vec<String>) -> Result<usize> {
-        let task_ids = self.query_tasks_by_tags(tags).await?;
-        if task_ids.is_empty() {
-            return Ok(0);
-        }
-        self.bulk_transition_state(&task_ids, TaskResult::Revoked)
-            .await
-    }
-
-    /// Bulk set TTL for tasks with specific tags
-    ///
-    /// Sets expiration time for all tasks that have all specified tags.
-    /// Returns the number of tasks updated.
-    pub async fn bulk_set_ttl_by_tags(
-        &mut self,
-        tags: Vec<String>,
-        ttl: Duration,
-    ) -> Result<usize> {
-        let task_ids = self.query_tasks_by_tags(tags).await?;
-        if task_ids.is_empty() {
-            return Ok(0);
-        }
-        self.set_multiple_expirations(&task_ids, ttl).await?;
-        Ok(task_ids.len())
-    }
+    // === Batch Operations With Error Detail ===
 
     /// Store multiple results with detailed error tracking
     ///
@@ -1928,82 +1802,6 @@ impl RedisResultBackend {
         } else {
             Err(BackendError::NotFound(task_id))
         }
-    }
-
-    // === Result Archival ===
-
-    /// Copy task results to an archive key with a longer TTL
-    ///
-    /// This is useful for preserving important results before they expire.
-    ///
-    /// # Example
-    /// ```no_run
-    /// use celers_backend_redis::RedisResultBackend;
-    /// use uuid::Uuid;
-    /// use std::time::Duration;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut backend = RedisResultBackend::new("redis://localhost")?;
-    /// let task_id = Uuid::new_v4();
-    ///
-    /// // Archive with 90-day retention
-    /// backend.archive_result(task_id, Duration::from_secs(90 * 86400)).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn archive_result(&mut self, task_id: Uuid, archive_ttl: Duration) -> Result<()> {
-        let mut conn = self.connection().await?;
-
-        let source_key = format!("{}task-meta-{}", self.key_prefix, task_id);
-        let archive_key = format!("{}archive:task-meta-{}", self.key_prefix, task_id);
-
-        // Copy to archive key
-        let _: () = redis::cmd("COPY")
-            .arg(&source_key)
-            .arg(&archive_key)
-            .arg("REPLACE")
-            .query_async(&mut conn)
-            .await?;
-
-        // Set TTL on archive
-        let ttl_secs = archive_ttl.as_secs() as i64;
-        let _: () = conn.expire(&archive_key, ttl_secs).await?;
-
-        Ok(())
-    }
-
-    /// Retrieve an archived task result
-    pub async fn get_archived_result(&mut self, task_id: Uuid) -> Result<Option<TaskMeta>> {
-        let mut conn = self.connection().await?;
-        let archive_key = format!("{}archive:task-meta-{}", self.key_prefix, task_id);
-
-        let data: Option<String> = conn.get(&archive_key).await?;
-
-        match data {
-            Some(json_str) => {
-                let meta: TaskMeta = serde_json::from_str(&json_str)
-                    .map_err(|e| BackendError::Serialization(e.to_string()))?;
-                Ok(Some(meta))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Bulk archive multiple task results
-    pub async fn archive_results_batch(
-        &mut self,
-        task_ids: &[Uuid],
-        archive_ttl: Duration,
-    ) -> Result<usize> {
-        let mut count = 0;
-
-        for &task_id in task_ids {
-            if self.archive_result(task_id, archive_ttl).await.is_ok() {
-                count += 1;
-            }
-        }
-
-        Ok(count)
     }
 
     // === Connection Pool Statistics ===

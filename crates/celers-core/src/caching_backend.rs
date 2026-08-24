@@ -575,6 +575,32 @@ impl<B: ResultStore> ResultStore for CachingResultBackend<B> {
             .apply_result_ttl(task_id, config, task_name)
             .await
     }
+
+    async fn store_result_named(
+        &self,
+        task_id: TaskId,
+        task_name: Option<&str>,
+        result: TaskResultValue,
+    ) -> Result<()> {
+        // Write through with the name intact so an inner backend that honours
+        // per-task-type TTLs still sees it, then refresh the caches exactly as
+        // `store_result` does.
+        self.inner
+            .store_result_named(task_id, task_name, result.clone())
+            .await?;
+        self.populate(task_id, Some(&result)).await;
+        Ok(())
+    }
+
+    async fn await_result_change(
+        &self,
+        task_id: TaskId,
+        max_wait: std::time::Duration,
+    ) -> Result<bool> {
+        // Delegate so wrapping a push-capable backend in the cache does not
+        // silently downgrade waiters back to polling.
+        self.inner.await_result_change(task_id, max_wait).await
+    }
 }
 
 /// Map an optional cached result value to the conventional [`TaskState`].

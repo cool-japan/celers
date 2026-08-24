@@ -264,17 +264,25 @@ impl Extension for RoutingExtension {
 }
 
 /// Create a registry with built-in extensions
+///
+/// The three built-in extensions have fixed, distinct names, so registering
+/// them into a freshly created (and therefore empty) registry can never hit
+/// [`ExtensionRegistry::register`]'s "already registered" error branch.
+/// Inserting directly into the registry's map here (rather than going
+/// through the fallible `register` and unwrapping the result) keeps that
+/// structurally unreachable error out of this function entirely instead of
+/// papering over it with a panic.
 pub fn create_default_registry() -> ExtensionRegistry {
     let mut registry = ExtensionRegistry::new();
-    registry
-        .register(Box::new(TelemetryExtension))
-        .expect("Failed to register TelemetryExtension");
-    registry
-        .register(Box::new(MetricsExtension))
-        .expect("Failed to register MetricsExtension");
-    registry
-        .register(Box::new(RoutingExtension))
-        .expect("Failed to register RoutingExtension");
+    for extension in [
+        Box::new(TelemetryExtension) as Box<dyn Extension>,
+        Box::new(MetricsExtension) as Box<dyn Extension>,
+        Box::new(RoutingExtension) as Box<dyn Extension>,
+    ] {
+        registry
+            .extensions
+            .insert(extension.name().to_string(), extension);
+    }
     registry
 }
 
@@ -319,6 +327,22 @@ mod tests {
 
         assert!(registry.register(Box::new(TestExt)).is_ok());
         assert!(registry.register(Box::new(TestExt)).is_err());
+    }
+
+    #[test]
+    fn test_create_default_registry_contains_all_builtins() {
+        // Regression: `create_default_registry` used to build the registry
+        // through the fallible `register` + `.expect(...)`, which panics in
+        // non-test code if any two built-ins ever end up sharing a name.
+        // Assert the observable contract directly (rather than only relying
+        // on incidental coverage from tests that happen to call this
+        // function) so a future name collision surfaces as a normal
+        // assertion failure here.
+        let registry = create_default_registry();
+
+        let mut names = registry.list();
+        names.sort_unstable();
+        assert_eq!(names, vec!["metrics", "routing", "telemetry"]);
     }
 
     #[test]

@@ -150,18 +150,80 @@ impl OperationResult {
 }
 
 /// Telemetry hook trait for custom observability integration
+///
+/// # Callback order
+///
+/// `RedisResultBackend` fires exactly one lifecycle sequence per operation:
+///
+/// * success: `before_operation` → `after_operation` (with `success == true`);
+/// * failure: `before_operation` → `on_error` → `after_operation` (with
+///   `success == false`).
+///
+/// Implementations should therefore count failures in **one** of `on_error` and
+/// `after_operation`, not both. Prefer `after_operation`: it carries the
+/// authoritative `success` flag and is the callback every caller fires, so the
+/// count stays correct even for code paths that never call `on_error`.
 pub trait TelemetryHook: Send + Sync {
     /// Called before an operation starts
     fn before_operation(&self, _context: &OperationContext) {}
 
-    /// Called after an operation completes
+    /// Called after an operation completes, successfully or not
     fn after_operation(&self, _result: &OperationResult) {}
 
-    /// Called when an error occurs
+    /// Called when an error occurs, just before `after_operation`
     fn on_error(&self, _operation: OperationType, _error: &BackendError) {}
 
     /// Called for custom events
     fn on_event(&self, _event_name: &str, _data: &[(String, String)]) {}
+}
+
+/// Span helper that fires the registered [`TelemetryHook`] around one backend
+/// operation.
+///
+/// Constructed by every `ResultBackend` method on `RedisResultBackend`; when no
+/// hook is registered it degrades to a couple of moves and does no work.
+pub(crate) struct OperationSpan {
+    hook: Option<Arc<dyn TelemetryHook>>,
+    context: Option<OperationContext>,
+}
+
+impl OperationSpan {
+    /// Start a span, firing `before_operation` when a hook is registered.
+    pub(crate) fn start(hook: Option<&Arc<dyn TelemetryHook>>, context: OperationContext) -> Self {
+        match hook {
+            Some(hook) => {
+                hook.before_operation(&context);
+                Self {
+                    hook: Some(Arc::clone(hook)),
+                    context: Some(context),
+                }
+            }
+            None => Self {
+                hook: None,
+                context: None,
+            },
+        }
+    }
+
+    /// Complete the span successfully.
+    pub(crate) fn ok(self, data_size: Option<usize>) {
+        if let (Some(hook), Some(context)) = (self.hook, self.context) {
+            let mut result = OperationResult::success(context);
+            result.data_size = data_size;
+            hook.after_operation(&result);
+        }
+    }
+
+    /// Complete the span with a failure, firing both `on_error` and
+    /// `after_operation`.
+    pub(crate) fn err(self, error: &BackendError) {
+        if let (Some(hook), Some(context)) = (self.hook, self.context) {
+            let operation = context.operation;
+            hook.on_error(operation, error);
+            let result = OperationResult::failure(context, error);
+            hook.after_operation(&result);
+        }
+    }
 }
 
 /// No-op telemetry hook (default)
@@ -359,7 +421,9 @@ impl TelemetryHook for MetricsHook {
         *entry += result.duration;
         drop(durations);
 
-        // Update error count if failed
+        // Failures are counted here rather than in `on_error`: `after_operation`
+        // carries the authoritative `success` flag and is the one callback every
+        // caller fires, so the count is right whether or not `on_error` ran.
         if !result.success {
             let mut errors = self
                 .error_counts
@@ -369,12 +433,9 @@ impl TelemetryHook for MetricsHook {
         }
     }
 
-    fn on_error(&self, operation: OperationType, _error: &BackendError) {
-        let mut errors = self
-            .error_counts
-            .lock()
-            .expect("lock should not be poisoned");
-        *errors.entry(operation.as_str()).or_insert(0) += 1;
+    fn on_error(&self, _operation: OperationType, _error: &BackendError) {
+        // Intentionally does not count: `after_operation` follows and records
+        // the failure. Counting in both places double-counted every error.
     }
 }
 

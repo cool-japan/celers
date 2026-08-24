@@ -401,8 +401,56 @@ fn test_scheduled_task_is_due_never_run() {
     let schedule = Schedule::interval(60);
     let task = ScheduledTask::new("test_task".to_string(), schedule);
 
-    // Should be due immediately if never run
-    assert!(task.is_due().unwrap());
+    // A never-run task is due at its first *schedule-derived* occurrence
+    // (created_at + 60s), not on registration.
+    assert!(!task.is_due().unwrap());
+
+    // Once that first occurrence has elapsed it becomes due.
+    let mut elapsed = task.clone();
+    elapsed.created_at = Utc::now() - Duration::seconds(61);
+    elapsed.invalidate_next_run_cache();
+    assert!(elapsed.is_due().unwrap());
+
+    // "Fire on registration" is available as an explicit opt-in.
+    let startup = ScheduledTask::new("startup_task".to_string(), Schedule::interval(60))
+        .with_run_on_startup(true);
+    assert!(startup.is_due().unwrap());
+}
+
+/// Regression: `is_due` short-circuited to `true` whenever `last_run_at` was
+/// `None`, so a one-time schedule set for the future fired on the very next
+/// tick instead of at `run_at`.
+#[test]
+fn test_future_onetime_task_is_not_due_on_registration() {
+    let run_at = Utc::now() + Duration::days(30);
+    let task = ScheduledTask::new("invoice".to_string(), Schedule::onetime(run_at));
+
+    assert!(!task.is_due().unwrap(), "future one-time task fired early");
+    assert_eq!(task.next_run_time().unwrap(), run_at);
+
+    // A one-time schedule whose instant has already passed is due.
+    let past = ScheduledTask::new(
+        "backfill".to_string(),
+        Schedule::onetime(Utc::now() - Duration::minutes(5)),
+    );
+    assert!(past.is_due().unwrap());
+}
+
+/// Regression: a nightly crontab registered at midday fired immediately and
+/// then again at its real time.
+#[cfg(feature = "cron")]
+#[test]
+fn test_nightly_crontab_does_not_fire_on_registration() {
+    // 03:00 every day.
+    let task = ScheduledTask::new(
+        "nightly".to_string(),
+        Schedule::crontab("0", "3", "*", "*", "*"),
+    );
+    assert!(!task.is_due().unwrap());
+
+    let next = task.next_run_time().unwrap();
+    assert_eq!(next.hour(), 3);
+    assert!(next > Utc::now());
 }
 
 #[test]
@@ -567,7 +615,16 @@ fn test_beat_scheduler_get_due_tasks() {
 
     scheduler.add_task(task).unwrap();
 
-    // Should be due immediately (never run before)
+    // A freshly registered task waits for its first schedule-derived
+    // occurrence rather than firing on registration.
+    assert_eq!(scheduler.get_due_tasks().len(), 0);
+
+    // Backdate registration past one interval: now it is due.
+    if let Some(task) = scheduler.tasks.get_mut("test_task") {
+        task.created_at = Utc::now() - Duration::seconds(61);
+        task.invalidate_next_run_cache();
+    }
+
     let due_tasks = scheduler.get_due_tasks();
     assert_eq!(due_tasks.len(), 1);
     assert_eq!(due_tasks[0].name, "test_task");

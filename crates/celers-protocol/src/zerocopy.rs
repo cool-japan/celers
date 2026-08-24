@@ -79,6 +79,14 @@ fn default_lang_cow() -> Cow<'static, str> {
 }
 
 /// Zero-copy message properties
+///
+/// # Wire format
+///
+/// Like [`crate::MessageProperties`], this always carries kombu's
+/// `body_encoding` property (see [`crate::BODY_ENCODING_BASE64`]), because
+/// [`MessageRef::body`] -- like [`crate::Message::body`] -- always
+/// base64-encodes its body. Without it, a kombu consumer hands the base64
+/// *text* to the content-type deserializer instead of decoding it first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagePropertiesRef<'a> {
     /// Correlation ID
@@ -96,10 +104,24 @@ pub struct MessagePropertiesRef<'a> {
     /// Priority (0-9)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
+
+    /// kombu's body codec selector; see [`crate::BODY_ENCODING_BASE64`].
+    ///
+    /// Regression guard: this field used to be entirely absent from
+    /// [`MessagePropertiesRef`], so a message published through
+    /// [`MessageRef`] serialized a `properties` object with no
+    /// `body_encoding` at all -- exactly the payload shape a kombu
+    /// consumer never base64-decodes.
+    #[serde(borrow, default = "default_body_encoding")]
+    pub body_encoding: Cow<'a, str>,
 }
 
 fn default_delivery_mode() -> u8 {
     2
+}
+
+fn default_body_encoding() -> Cow<'static, str> {
+    Cow::Borrowed(crate::BODY_ENCODING_BASE64)
 }
 
 impl Default for MessagePropertiesRef<'_> {
@@ -109,6 +131,7 @@ impl Default for MessagePropertiesRef<'_> {
             reply_to: None,
             delivery_mode: default_delivery_mode(),
             priority: None,
+            body_encoding: default_body_encoding(),
         }
     }
 }
@@ -460,5 +483,42 @@ mod tests {
 
         let value = serde_json::to_value(&msg_ref).unwrap();
         assert_eq!(value["body"], serde_json::json!("dGVzdA=="));
+    }
+
+    /// Regression: `MessagePropertiesRef` used to have no `body_encoding`
+    /// field at all, so a message published through `MessageRef` serialized
+    /// a `properties` object missing kombu's body codec selector -- a
+    /// payload a kombu consumer never base64-decodes, even though the body
+    /// really is base64 (see `base64_body`). This is the zero-copy-path
+    /// counterpart of the same bug already fixed for `Message` /
+    /// `MessageProperties` in `types.rs`.
+    #[test]
+    fn test_message_ref_serializes_body_encoding() {
+        let task_id = Uuid::new_v4();
+        let msg_ref = MessageRef::new("tasks.test", task_id, b"test");
+
+        let value = serde_json::to_value(&msg_ref).unwrap();
+        assert_eq!(
+            value["properties"]["body_encoding"],
+            serde_json::json!(crate::BODY_ENCODING_BASE64)
+        );
+
+        // And a message serialized through the zero-copy path still
+        // round-trips through `MessageRef` itself, keeping the property.
+        let wire = serde_json::to_vec(&msg_ref).unwrap();
+        let round_tripped: MessageRef = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(
+            round_tripped.properties.body_encoding,
+            crate::BODY_ENCODING_BASE64
+        );
+
+        // ... and survives the owned round-trip, where `Message`'s own
+        // `Serialize` impl independently re-emits the property.
+        let owned = round_tripped.into_owned();
+        let owned_value = serde_json::to_value(&owned).unwrap();
+        assert_eq!(
+            owned_value["properties"]["body_encoding"],
+            serde_json::json!(crate::BODY_ENCODING_BASE64)
+        );
     }
 }

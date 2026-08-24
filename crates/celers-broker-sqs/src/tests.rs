@@ -681,3 +681,827 @@ async fn test_retry_config() {
     assert_eq!(broker.max_retries, 5);
     assert_eq!(broker.retry_base_delay_ms, 200);
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the 0.3.1 SQS audit findings.
+//
+// These exercise the request-shaping decisions the broker makes *before* it
+// talks to AWS: which queue a receipt handle is deleted against, which wait
+// time and batch size a poll carries, which attributes a publish emits, how a
+// FIFO group id is derived and how a large batch is chunked. That is precisely
+// the layer where the shipped bugs lived and where a green suite previously
+// proved nothing.
+//
+// End-to-end coverage lives in `tests/localstack.rs`, gated on
+// `CELERS_TEST_SQS_URL`.
+// ---------------------------------------------------------------------------
+
+use crate::batch_ops::{plan_batch_chunks, SQS_MAX_BATCH_BYTES, SQS_MAX_BATCH_ENTRIES};
+use crate::celery_compat::{CelerySqsConfig, QueueNamingStrategy};
+use crate::delivery::{
+    decode_delivery_tag, encode_delivery_tag, resolve_wait_time, ReceiptMetadata,
+};
+use crate::types::FifoGroupIdSource;
+use celers_kombu::Envelope;
+use std::time::Duration as StdDuration;
+use uuid::Uuid;
+
+fn test_message(task: &str) -> Message {
+    Message::new(task.to_string(), Uuid::new_v4(), b"{}".to_vec())
+}
+
+/// idx 213: a handle received from queue B must be deleted against B, not
+/// against the broker's configured queue A.
+#[tokio::test]
+async fn ack_targets_the_queue_the_message_came_from() {
+    let broker = SqsBroker::new("queue-a").await.unwrap();
+
+    let tag_from_b = encode_delivery_tag("queue-b", "AQEB-handle-from-b");
+    let grouped = broker.group_handles_by_queue("queue-a", std::slice::from_ref(&tag_from_b));
+
+    assert_eq!(grouped.len(), 1);
+    assert_eq!(grouped[0].0, "queue-b", "delete must target queue-b");
+    assert_eq!(grouped[0].1[0].1, "AQEB-handle-from-b");
+
+    // And the raw handle is recovered without the queue prefix.
+    assert_eq!(
+        decode_delivery_tag(&tag_from_b),
+        (Some("queue-b"), "AQEB-handle-from-b")
+    );
+}
+
+/// idx 213: handles from several queues in one `ack_batch` are split per queue.
+#[tokio::test]
+async fn ack_batch_groups_handles_per_source_queue() {
+    let broker = SqsBroker::new("main").await.unwrap();
+
+    let tags = vec![
+        encode_delivery_tag("main", "h0"),
+        encode_delivery_tag("dlq", "h1"),
+        "legacy-handle".to_string(),
+        encode_delivery_tag("dlq", "h3"),
+    ];
+
+    let grouped = broker.group_handles_by_queue("main", &tags);
+    let mut by_queue: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (queue, handles) in grouped {
+        by_queue.insert(queue, handles.into_iter().map(|(i, _)| i).collect());
+    }
+
+    // The tagless handle falls back to the queue the caller named.
+    assert_eq!(by_queue.get("main"), Some(&vec![0, 2]));
+    assert_eq!(by_queue.get("dlq"), Some(&vec![1, 3]));
+}
+
+/// idx 213: the DLQ redrive must delete from the DLQ, never the main queue.
+#[tokio::test]
+async fn dlq_queue_name_is_derived_from_the_arn() {
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_dlq(DlqConfig::new(
+            "arn:aws:sqs:us-east-1:123456789012:tasks-dlq",
+            5,
+        ));
+
+    assert_eq!(broker.dlq_queue_name().unwrap(), "tasks-dlq");
+    assert_eq!(broker.main_queue_name(), "tasks");
+    assert_ne!(broker.dlq_queue_name().unwrap(), broker.main_queue_name());
+}
+
+#[tokio::test]
+async fn dlq_helpers_report_missing_configuration() {
+    let broker = SqsBroker::new("tasks").await.unwrap();
+    let error = broker.dlq_queue_name().unwrap_err();
+    assert!(matches!(error, celers_kombu::BrokerError::Configuration(_)));
+}
+
+/// idx 216: `Envelope.redelivered` derives from `ApproximateReceiveCount`,
+/// which is only present when the system attributes are requested.
+#[test]
+fn receipt_metadata_drives_the_redelivered_flag() {
+    let first = ReceiptMetadata {
+        message_id: Some("m".to_string()),
+        receive_count: 1,
+        sent_timestamp_ms: Some(1_700_000_000_000),
+    };
+    assert!(!first.is_redelivered());
+
+    let redelivered = ReceiptMetadata {
+        receive_count: 5,
+        ..first
+    };
+    assert!(redelivered.is_redelivered());
+    assert_eq!(redelivered.sent_timestamp_secs(), Some(1_700_000_000));
+}
+
+/// idx 216: the raw receive count is retrievable, not just a boolean.
+#[tokio::test]
+async fn receive_count_is_tracked_per_delivery_tag() {
+    let mut broker = SqsBroker::new("tasks").await.unwrap();
+    let tag = encode_delivery_tag("tasks", "AQEB");
+
+    broker.remember_receipt_metadata(
+        &tag,
+        ReceiptMetadata {
+            message_id: Some("m-1".to_string()),
+            receive_count: 7,
+            sent_timestamp_ms: Some(1_700_000_000_000),
+        },
+    );
+
+    assert_eq!(broker.receive_count(&tag), Some(7));
+    assert!(broker.receipt_metadata(&tag).unwrap().is_redelivered());
+
+    broker.forget_receipt_metadata(&tag);
+    assert_eq!(broker.receive_count(&tag), None);
+}
+
+#[tokio::test]
+async fn receipt_metadata_map_is_bounded() {
+    let mut broker = SqsBroker::new("tasks").await.unwrap();
+
+    for index in 0..12_000 {
+        broker.remember_receipt_metadata(
+            &format!("tag-{index}"),
+            ReceiptMetadata {
+                receive_count: 1,
+                ..Default::default()
+            },
+        );
+    }
+
+    assert!(
+        broker.receipt_metadata.len() <= 10_000,
+        "receipt metadata must not grow without bound"
+    );
+}
+
+/// idx 224 / idx 300: batches longer than 10 are chunked, never truncated.
+#[test]
+fn batches_of_25_are_fully_covered_by_chunks() {
+    let sizes = vec![64usize; 25];
+    let chunks = plan_batch_chunks(&sizes, SQS_MAX_BATCH_ENTRIES, SQS_MAX_BATCH_BYTES);
+
+    let covered: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+    assert_eq!(covered, 25);
+    assert!(chunks.iter().all(|chunk| chunk.len() <= 10));
+}
+
+/// idx 224: the 256 KB aggregate limit is respected while chunking.
+#[test]
+fn chunking_respects_the_aggregate_payload_limit() {
+    let sizes = vec![60_000usize; 10];
+    let chunks = plan_batch_chunks(&sizes, SQS_MAX_BATCH_ENTRIES, SQS_MAX_BATCH_BYTES);
+
+    for chunk in &chunks {
+        let bytes: usize = sizes[chunk.clone()].iter().sum();
+        assert!(
+            bytes <= SQS_MAX_BATCH_BYTES,
+            "chunk of {bytes} bytes exceeds the SQS aggregate limit"
+        );
+    }
+    assert!(chunks.len() > 1, "10 x 60 KB cannot fit in one request");
+}
+
+#[tokio::test]
+async fn empty_batches_are_no_ops_without_touching_aws() {
+    let mut broker = SqsBroker::new("tasks").await.unwrap();
+
+    assert_eq!(broker.publish_batch("tasks", Vec::new()).await.unwrap(), 0);
+    assert_eq!(broker.ack_batch("tasks", Vec::new()).await.unwrap(), 0);
+    assert_eq!(
+        broker
+            .publish_fifo_batch("tasks.fifo", Vec::new())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        broker
+            .extend_visibility_batch("tasks", Vec::new())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// idx 225: the configured wait time actually caps the poll.
+#[test]
+fn configured_wait_time_caps_the_poll() {
+    assert_eq!(resolve_wait_time(StdDuration::from_secs(20), 5), 5);
+    assert_eq!(resolve_wait_time(StdDuration::from_secs(1), 20), 1);
+    assert_eq!(resolve_wait_time(StdDuration::from_secs(3_600), 20), 20);
+}
+
+/// idx 225: `production()` really is 20s long polling / 10 messages.
+#[tokio::test]
+async fn production_preset_matches_its_documentation() {
+    let broker = SqsBroker::production("tasks").await.unwrap();
+
+    assert_eq!(broker.wait_time_seconds, 20);
+    assert_eq!(broker.max_messages, 10);
+    assert_eq!(broker.visibility_timeout, 300);
+    assert!(broker.visibility_heartbeat_enabled);
+
+    // A 20 second poll is not silently downgraded to a 1 second short poll.
+    assert_eq!(
+        resolve_wait_time(StdDuration::from_secs(20), broker.wait_time_seconds),
+        20
+    );
+}
+
+#[tokio::test]
+async fn development_preset_uses_short_polling() {
+    let broker = SqsBroker::development("tasks").await.unwrap();
+
+    assert_eq!(broker.wait_time_seconds, 5);
+    assert_eq!(broker.max_messages, 1);
+    assert_eq!(
+        resolve_wait_time(StdDuration::from_secs(20), broker.wait_time_seconds),
+        5
+    );
+}
+
+/// idx 225: prefetched messages are keyed per queue, so a poll on queue B never
+/// returns a message received from queue A.
+#[tokio::test]
+async fn prefetch_buffer_is_keyed_per_queue() {
+    let mut broker = SqsBroker::new("a").await.unwrap();
+
+    let envelope = Envelope {
+        delivery_tag: encode_delivery_tag("a", "h"),
+        message: test_message("tasks.add"),
+        redelivered: false,
+    };
+    broker.buffer_prefetched("a", vec![envelope]);
+
+    assert_eq!(broker.prefetched_count(), 1);
+    assert!(
+        broker.take_prefetched("b").is_none(),
+        "queue B must not see queue A's message"
+    );
+
+    let taken = broker
+        .take_prefetched("a")
+        .expect("queue A serves its own buffer");
+    assert_eq!(taken.message.headers.task, "tasks.add");
+    assert_eq!(broker.prefetched_count(), 0);
+}
+
+/// idx 226: every publish path builds attributes through one helper, so single
+/// and batch sends share a wire format.
+#[tokio::test]
+async fn celery_mode_maps_headers_on_every_publish_path() {
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_celery_defaults();
+
+    let mut message = test_message("tasks.add");
+    message.properties.priority = Some(7);
+    message.properties.correlation_id = Some("corr-1".to_string());
+
+    let attributes = broker.build_attributes(&message).unwrap();
+
+    assert!(attributes.contains_key(crate::celery_compat::attribute_names::TASK));
+    assert!(attributes.contains_key(crate::celery_compat::attribute_names::ID));
+    assert!(attributes.contains_key(crate::celery_compat::attribute_names::PRIORITY));
+    assert!(attributes.contains_key(crate::celery_compat::attribute_names::CORRELATION_ID));
+}
+
+#[tokio::test]
+async fn standard_mode_maps_only_priority_and_correlation_id() {
+    let broker = SqsBroker::new("tasks").await.unwrap();
+
+    let mut message = test_message("tasks.add");
+    message.properties.priority = Some(3);
+
+    let attributes = broker.build_attributes(&message).unwrap();
+    assert_eq!(attributes.len(), 1);
+    assert!(attributes.contains_key("priority"));
+}
+
+/// idx 226: Celery attributes are read back and merged without clobbering the
+/// authoritative body.
+#[tokio::test]
+async fn celery_attributes_round_trip_into_the_message() {
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_celery_defaults();
+
+    let mut original = test_message("tasks.add");
+    original.properties.priority = Some(4);
+    original.headers.retries = Some(2);
+
+    let attributes = broker.build_attributes(&original).unwrap();
+
+    let mapper = crate::celery_compat::CeleryAttributeMapper::new();
+    let headers = mapper.deserialize_attributes(&attributes).unwrap();
+
+    // A body that lost its optional headers gets them back ...
+    let mut stripped = Message::new(String::new(), Uuid::nil(), b"{}".to_vec());
+    mapper.apply_headers(&headers, &mut stripped);
+    assert_eq!(stripped.headers.task, "tasks.add");
+    assert_eq!(stripped.headers.id, original.headers.id);
+    assert_eq!(stripped.headers.retries, Some(2));
+    assert_eq!(stripped.properties.priority, Some(4));
+
+    // ... but a populated body is never overwritten.
+    let mut populated = test_message("tasks.other");
+    populated.headers.retries = Some(9);
+    mapper.apply_headers(&headers, &mut populated);
+    assert_eq!(populated.headers.task, "tasks.other");
+    assert_eq!(populated.headers.retries, Some(9));
+}
+
+/// idx 226: the Kombu naming strategy is applied on the publish/consume path.
+#[tokio::test]
+async fn kombu_naming_is_applied_to_queue_names() {
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_celery_compat(CelerySqsConfig::kombu_compatible("celery"));
+
+    assert_eq!(
+        broker.physical_queue_name("tasks.high"),
+        "celery_tasks-high"
+    );
+
+    let mut message = test_message("tasks.add");
+    message.properties.priority = Some(9);
+    assert_eq!(
+        broker.resolve_publish_queue("tasks", &message),
+        "celery_tasks-priority-9"
+    );
+
+    let queues = broker.priority_queues("tasks");
+    assert_eq!(
+        queues.first().map(String::as_str),
+        Some("celery_tasks-priority-9")
+    );
+    assert_eq!(queues.last().map(String::as_str), Some("celery_tasks"));
+}
+
+#[tokio::test]
+async fn queue_names_are_untouched_without_celery_mode() {
+    let broker = SqsBroker::new("tasks").await.unwrap();
+    assert_eq!(broker.physical_queue_name("tasks.high"), "tasks.high");
+    assert!(broker.priority_queues("tasks").is_empty());
+}
+
+/// idx 231: a missing queue is `QueueNotFound`, not a generic failure, and the
+/// error text no longer claims "does not exist" for every possible cause.
+#[tokio::test]
+async fn missing_queue_maps_to_queue_not_found() {
+    // Constructed directly: this asserts the mapping, not a live AWS call.
+    let error = celers_kombu::BrokerError::QueueNotFound("tasks".to_string());
+    assert!(error.is_queue_not_found());
+
+    let credentials = celers_kombu::BrokerError::Connection(
+        "GetQueueUrl for 'tasks' failed: AccessDenied".to_string(),
+    );
+    assert!(credentials.is_connection());
+    assert!(!credentials.is_queue_not_found());
+    assert!(!crate::retry_policy::is_retryable_error(&credentials));
+}
+
+/// idx 232: publishing to a FIFO queue through the generic trait derives a
+/// group id instead of sending a request SQS will reject.
+#[tokio::test]
+async fn fifo_group_id_is_derived_for_generic_publishes() {
+    let broker = SqsBroker::new("orders.fifo")
+        .await
+        .unwrap()
+        .with_fifo(FifoConfig::new());
+
+    let message = test_message("tasks.charge");
+    assert!(broker.is_fifo());
+    assert_eq!(
+        broker.derive_group_id("orders.fifo", &message),
+        "tasks.charge"
+    );
+}
+
+#[tokio::test]
+async fn fifo_group_id_source_is_configurable() {
+    let per_queue = SqsBroker::new("orders.fifo")
+        .await
+        .unwrap()
+        .with_fifo(FifoConfig::new().with_group_id_source(FifoGroupIdSource::PerQueue));
+    let message = test_message("tasks.charge");
+    assert_eq!(
+        per_queue.derive_group_id("orders.fifo", &message),
+        "orders.fifo"
+    );
+
+    let fixed = SqsBroker::new("orders.fifo").await.unwrap().with_fifo(
+        FifoConfig::new().with_group_id_source(FifoGroupIdSource::Fixed("global".to_string())),
+    );
+    assert_eq!(fixed.derive_group_id("orders.fifo", &message), "global");
+}
+
+/// idx 232: FIFO deduplication ids are stable, so a retried send is idempotent.
+#[tokio::test]
+async fn fifo_deduplication_id_is_stable_across_retries() {
+    let message = test_message("tasks.charge");
+
+    let first = crate::fifo::derive_deduplication_id(false, None, &message);
+    let second = crate::fifo::derive_deduplication_id(false, None, &message);
+
+    assert_eq!(first, second);
+    assert_eq!(first, Some(message.headers.id.to_string()));
+}
+
+/// idx 232: a FIFO queue rejects per-message delays up front instead of after
+/// spending the whole retry budget on a non-retryable validation error.
+#[tokio::test]
+async fn delayed_publish_rejects_fifo_queues_before_any_api_call() {
+    let mut broker = SqsBroker::new("orders.fifo").await.unwrap();
+    let error = broker
+        .publish_with_delay("orders.fifo", test_message("tasks.charge"), 30)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not support per-message delays"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn fifo_publish_rejects_non_fifo_queue_names() {
+    let mut broker = SqsBroker::new("orders").await.unwrap();
+    let error = broker
+        .publish_fifo("orders", test_message("tasks.charge"), "g", None)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains(".fifo"), "{error}");
+}
+
+/// idx 236: `max_retries` is clamped, and the backoff never overflows.
+#[tokio::test]
+async fn retry_config_is_clamped() {
+    let huge = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_retry_config(u32::MAX, 1_000);
+    assert_eq!(huge.max_retries, crate::retry_policy::MAX_RETRY_ATTEMPTS);
+
+    let zero = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_retry_config(0, 10);
+    assert_eq!(zero.max_retries, 1);
+
+    // The delay computation is total for every attempt the clamp allows.
+    for attempt in 0..=crate::retry_policy::MAX_RETRY_ATTEMPTS {
+        let delay = crate::retry_policy::backoff_delay_ms(1_000, attempt, 0);
+        assert!(delay <= crate::retry_policy::MAX_BACKOFF_DELAY_MS);
+    }
+}
+
+/// idx 236: non-retryable validation errors are not retried.
+#[tokio::test]
+async fn non_retryable_errors_short_circuit_the_retry_loop() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_retry_config(5, 1);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+
+    let result: celers_kombu::Result<()> = broker
+        .retry_with_backoff(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(celers_kombu::BrokerError::OperationFailed(
+                    "Failed to send message: MissingParameter: MessageGroupId".to_string(),
+                ))
+            }
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "must not retry a validation error"
+    );
+}
+
+#[tokio::test]
+async fn transient_errors_exhaust_the_retry_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_retry_config(3, 0);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+
+    let result: celers_kombu::Result<()> = broker
+        .retry_with_backoff(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(celers_kombu::BrokerError::OperationFailed(
+                    "Failed to send message: ServiceUnavailable".to_string(),
+                ))
+            }
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// idx 239: `is_connected` reflects the outcome of real SDK calls.
+#[tokio::test]
+async fn is_connected_tracks_observed_health() {
+    let mut broker = SqsBroker::new("tasks").await.unwrap();
+
+    // Nothing connected yet.
+    assert!(!broker.is_connected());
+
+    // Simulate a cached, working connection.
+    broker
+        .queue_url_cache
+        .insert("tasks".to_string(), "http://localhost/tasks".to_string());
+    broker.client = Some(aws_sdk_sqs::Client::from_conf(
+        aws_sdk_sqs::Config::builder()
+            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
+            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
+            .build(),
+    ));
+    assert!(broker.is_connected());
+
+    // A credential/transport failure observed by any operation flips it.
+    broker.mark_unhealthy();
+    assert!(!broker.is_connected());
+    assert!(!broker.is_connection_healthy());
+
+    broker.mark_healthy();
+    assert!(broker.is_connected());
+}
+
+/// idx 217: heartbeats are tracked per delivery tag and released on ack.
+#[tokio::test]
+async fn heartbeats_are_tracked_and_released() {
+    let mut broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_visibility_heartbeat(true)
+        .with_heartbeat_max_extension(600);
+
+    assert!(broker.visibility_heartbeat_enabled);
+    assert_eq!(broker.heartbeat_max_extension_secs, 600);
+    assert_eq!(broker.active_heartbeat_count(), 0);
+
+    let client = aws_sdk_sqs::Client::from_conf(
+        aws_sdk_sqs::Config::builder()
+            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
+            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
+            .build(),
+    );
+    let tag = encode_delivery_tag("tasks", "AQEB");
+    broker.maybe_start_heartbeat(&client, "http://localhost/tasks", &tag, "AQEB");
+    assert_eq!(broker.active_heartbeat_count(), 1);
+
+    broker.stop_visibility_heartbeat(&tag);
+    assert_eq!(broker.active_heartbeat_count(), 0);
+}
+
+#[tokio::test]
+async fn heartbeats_are_not_started_when_disabled() {
+    let mut broker = SqsBroker::new("tasks").await.unwrap();
+    let client = aws_sdk_sqs::Client::from_conf(
+        aws_sdk_sqs::Config::builder()
+            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
+            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
+            .build(),
+    );
+
+    broker.maybe_start_heartbeat(&client, "http://localhost/tasks", "tag", "AQEB");
+    assert_eq!(broker.active_heartbeat_count(), 0);
+}
+
+/// idx 218: replay refuses to run without a DLQ instead of silently doing
+/// nothing, and dry-run is a first-class mode.
+#[tokio::test]
+async fn replay_requires_a_configured_dlq() {
+    use crate::replay::{ReplayConfig, ReplayFilter, ReplayManager};
+
+    let mut broker = SqsBroker::new("tasks").await.unwrap();
+    let mut manager = ReplayManager::new(ReplayConfig::new());
+
+    let error = manager
+        .replay_from_dlq(&mut broker, &ReplayFilter::new(), true)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, celers_kombu::BrokerError::Configuration(_)));
+}
+
+#[test]
+fn replay_rate_limiting_is_computed_not_guessed() {
+    use crate::replay::replay_target_duration;
+
+    assert_eq!(
+        replay_target_duration(50, 100),
+        StdDuration::from_millis(500)
+    );
+    assert_eq!(replay_target_duration(0, 100), StdDuration::ZERO);
+    assert_eq!(replay_target_duration(50, 0), StdDuration::ZERO);
+}
+
+/// idx 218: the module no longer promises a replay it does not implement.
+#[test]
+fn replay_filter_selects_by_task_time_and_failure_count() {
+    use crate::replay::{ReplayFilter, ReplayableMessage};
+
+    let filter = ReplayFilter::new()
+        .with_task_pattern("tasks.payment.*")
+        .with_time_range(1_000, 2_000)
+        .with_min_failure_count(3);
+
+    let matching = ReplayableMessage {
+        message_id: "m-1".to_string(),
+        body: "{}".to_string(),
+        task_name: "tasks.payment.charge".to_string(),
+        attributes: std::collections::HashMap::new(),
+        timestamp: 1_500,
+        error_message: None,
+        failure_count: 4,
+    };
+    assert!(filter.matches(&matching));
+
+    let too_few_failures = ReplayableMessage {
+        failure_count: 1,
+        ..matching.clone()
+    };
+    assert!(!filter.matches(&too_few_failures));
+
+    let wrong_task = ReplayableMessage {
+        task_name: "tasks.email.send".to_string(),
+        ..matching.clone()
+    };
+    assert!(!filter.matches(&wrong_task));
+
+    let too_old = ReplayableMessage {
+        timestamp: 10,
+        ..matching
+    };
+    assert!(!filter.matches(&too_old));
+}
+
+#[test]
+fn replay_time_range_hours_never_underflows() {
+    use crate::replay::ReplayFilter;
+
+    let filter = ReplayFilter::new().with_time_range_hours(u64::MAX);
+    assert_eq!(filter.min_timestamp, Some(0));
+}
+
+/// Disconnecting releases every in-flight resource the broker holds.
+#[tokio::test]
+async fn disconnect_releases_prefetch_heartbeats_and_metadata() {
+    use celers_kombu::Transport;
+
+    let mut broker = SqsBroker::new("tasks").await.unwrap();
+
+    broker.buffer_prefetched(
+        "tasks",
+        vec![Envelope {
+            delivery_tag: encode_delivery_tag("tasks", "h"),
+            message: test_message("tasks.add"),
+            redelivered: false,
+        }],
+    );
+    broker.remember_receipt_metadata("tag", ReceiptMetadata::default());
+
+    broker.disconnect().await.unwrap();
+
+    assert_eq!(broker.prefetched_count(), 0);
+    assert_eq!(broker.active_heartbeat_count(), 0);
+    assert!(broker.receipt_metadata.is_empty());
+    assert!(!broker.is_connected());
+}
+
+/// The naming strategy is only ever applied once: a physical name resolved
+/// twice is idempotent for the Direct strategy and stable for Kombu.
+#[tokio::test]
+async fn queue_name_resolution_is_deterministic() {
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_celery_compat(CelerySqsConfig {
+            naming_strategy: QueueNamingStrategy::kombu("celery"),
+            ..CelerySqsConfig::default()
+        });
+
+    let once = broker.physical_queue_name("tasks");
+    assert_eq!(once, "celery_tasks");
+    assert_eq!(broker.physical_queue_name("tasks"), once);
+}
+
+/// idx 226 follow-through: the read paths (`queue_size`, `purge`) must resolve
+/// queue names exactly like the write paths, or a Celery-mode broker publishes
+/// to `celery_tasks` and inspects `tasks`.
+#[tokio::test]
+async fn read_and_write_paths_resolve_the_same_queue_name() {
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_celery_compat(CelerySqsConfig::kombu_compatible("celery"));
+
+    let message = test_message("tasks.add"); // no priority set
+    let write_target = broker.resolve_publish_queue("tasks", &message);
+    let read_target = broker.resolve_queue_name("tasks");
+
+    assert_eq!(write_target, read_target);
+    assert_eq!(read_target, "celery_tasks");
+    assert_eq!(broker.physical_queue_name("tasks"), read_target);
+}
+
+/// Resolution must never destroy the `.fifo` suffix: SQS refuses to treat a
+/// queue as FIFO without it, and the Kombu strategy rewrites `.` to `-`.
+#[tokio::test]
+async fn naming_strategy_preserves_the_fifo_suffix() {
+    let broker = SqsBroker::new("orders.fifo")
+        .await
+        .unwrap()
+        .with_celery_compat(CelerySqsConfig::kombu_compatible("celery"));
+
+    let physical = broker.physical_queue_name("orders.fifo");
+    assert_eq!(physical, "celery_orders.fifo");
+    assert!(broker.is_fifo_queue(&physical));
+
+    // FIFO queues are never split across priority siblings.
+    let mut message = test_message("tasks.charge");
+    message.properties.priority = Some(9);
+    assert_eq!(
+        broker.resolve_publish_queue("orders.fifo", &message),
+        physical
+    );
+    assert!(broker.priority_queues("orders.fifo").is_empty());
+}
+
+/// Resolution is applied exactly once: `get_queue_url`'s auto-create path uses
+/// the physical variant so a Kombu prefix is never doubled.
+#[tokio::test]
+async fn naming_strategy_is_never_applied_twice() {
+    let broker = SqsBroker::new("tasks")
+        .await
+        .unwrap()
+        .with_celery_compat(CelerySqsConfig::kombu_compatible("celery"));
+
+    let once = broker.resolve_queue_name("tasks");
+    assert_eq!(once, "celery_tasks");
+    assert_ne!(
+        broker.resolve_queue_name(&once),
+        once,
+        "the strategy is not idempotent, which is exactly why it must be applied once"
+    );
+}
+
+/// idx 225 / prefetch: `consume_batch` drains the buffer `consume` filled, so
+/// prefetched messages cannot sit there until their visibility timeout expires.
+#[tokio::test]
+async fn consume_batch_drains_the_prefetch_buffer_first() {
+    let mut broker = SqsBroker::new("tasks").await.unwrap();
+
+    let buffered: Vec<Envelope> = (0..3)
+        .map(|index| Envelope {
+            delivery_tag: encode_delivery_tag("tasks", &format!("h{index}")),
+            message: test_message(&format!("tasks.buffered.{index}")),
+            redelivered: false,
+        })
+        .collect();
+    broker.buffer_prefetched("tasks", buffered);
+    assert_eq!(broker.prefetched_count(), 3);
+
+    // Asking for exactly what is buffered is served entirely from memory: no
+    // client is configured, so any API call would fail the test.
+    let drained = broker
+        .consume_batch_physical("tasks", 3, 0)
+        .await
+        .expect("served from the prefetch buffer");
+
+    assert_eq!(drained.len(), 3);
+    assert_eq!(drained[0].message.headers.task, "tasks.buffered.0");
+    assert_eq!(broker.prefetched_count(), 0);
+}

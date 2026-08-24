@@ -8,8 +8,131 @@
 //! - Authentication options
 
 use celers_core::{CelersError, Result};
-use redis::{Client, ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
+use redis::{
+    aio::MultiplexedConnection, Client, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
+};
+use std::future::Future;
 use std::time::Duration;
+
+/// How long a normal (non-blocking) command may take before the *client*
+/// gives up on it.
+///
+/// The `redis` crate defaults this to **500 ms** — for every connection built
+/// with `Client::get_multiplexed_async_connection` or a bare
+/// `ConnectionManagerConfig::new()`. Half a second is a plausible budget for
+/// an idle laptop and a hopeless one for a loaded machine: under CPU
+/// saturation even an `LPUSH` round trip can miss it, and the failure
+/// surfaces as a bare `"timed out"` I/O error that looks like a broken Redis
+/// rather than an impatient client. Thirty seconds is long enough that
+/// hitting it means something is genuinely wrong, and still short enough to
+/// stop a caller waiting forever on a wedged server.
+pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long establishing a connection (TCP connect, TLS handshake, `AUTH`,
+/// `SELECT`) may take. The `redis` crate default is 1 second, which the same
+/// saturated machine misses on the handshake alone.
+pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Headroom added to a blocking command's own timeout when deriving the
+/// response timeout of the connection that carries it.
+///
+/// A blocking command (`BRPOPLPUSH`, `BLPOP`, `XREAD BLOCK`) legitimately
+/// sends no reply until either a message arrives or its server-side timeout
+/// expires. A response timeout shorter than that server-side wait makes the
+/// client kill its own request before the server ever answers — an empty
+/// queue then reports `Err("timed out")` instead of "nothing there". The
+/// response timeout of such a connection must therefore always be strictly
+/// greater than the longest block it will carry.
+pub const BLOCKING_RESPONSE_MARGIN: Duration = Duration::from_secs(10);
+
+/// The response timeout a connection carrying blocking commands must use.
+///
+/// Returns `None` — meaning "never time out the response" — when the
+/// requested block is unbounded (`0`, which Redis reads as "wait forever") or
+/// so long that adding the margin would overflow.
+pub fn blocking_response_timeout(max_block: Duration) -> Option<Duration> {
+    if max_block.is_zero() {
+        // Redis treats a zero timeout as "block indefinitely", so no
+        // client-side deadline can be correct.
+        return None;
+    }
+    max_block.checked_add(BLOCKING_RESPONSE_MARGIN)
+}
+
+/// Connection settings for ordinary request/response traffic.
+pub fn default_async_config() -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(DEFAULT_RESPONSE_TIMEOUT))
+        .set_connection_timeout(Some(DEFAULT_CONNECTION_TIMEOUT))
+}
+
+/// Connection settings for a connection that will carry blocking commands
+/// blocking for at most `max_block`.
+pub fn blocking_async_config(max_block: Duration) -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_response_timeout(blocking_response_timeout(max_block))
+        .set_connection_timeout(Some(DEFAULT_CONNECTION_TIMEOUT))
+}
+
+/// Connection-manager settings for ordinary request/response traffic.
+///
+/// [`redis::aio::ConnectionManagerConfig::new`] carries the same 500 ms
+/// response timeout as [`DEFAULT_RESPONSE_TIMEOUT`] documents, so every
+/// manager this crate builds goes through here.
+pub fn default_manager_config() -> redis::aio::ConnectionManagerConfig {
+    redis::aio::ConnectionManagerConfig::new()
+        .set_response_timeout(Some(DEFAULT_RESPONSE_TIMEOUT))
+        .set_connection_timeout(Some(DEFAULT_CONNECTION_TIMEOUT))
+}
+
+/// Connection constructors carrying this crate's timeouts.
+///
+/// Every connection in this crate is opened through one of these instead of
+/// [`redis::Client::get_multiplexed_async_connection`], whose defaults
+/// (500 ms response, 1 s connect) are documented on
+/// [`DEFAULT_RESPONSE_TIMEOUT`].
+pub trait RedisClientExt {
+    /// Open a multiplexed connection for ordinary request/response traffic.
+    fn celers_multiplexed_connection(
+        &self,
+    ) -> impl Future<Output = redis::RedisResult<MultiplexedConnection>> + Send;
+
+    /// Open a connection that will carry blocking commands waiting at most
+    /// `max_block` — a `Duration::ZERO` meaning "block indefinitely".
+    ///
+    /// Such a connection must not be multiplexed with ordinary traffic: a
+    /// blocking command parks every command queued behind it on the same
+    /// socket.
+    fn celers_blocking_connection(
+        &self,
+        max_block: Duration,
+    ) -> impl Future<Output = redis::RedisResult<MultiplexedConnection>> + Send;
+}
+
+// `async fn` in a trait would return a future with no `Send` bound, which
+// every `tokio::spawn`ed and `#[async_trait]` caller in this crate needs; the
+// explicit `impl Future + Send` is the point, not an oversight.
+#[allow(clippy::manual_async_fn)]
+impl RedisClientExt for Client {
+    fn celers_multiplexed_connection(
+        &self,
+    ) -> impl Future<Output = redis::RedisResult<MultiplexedConnection>> + Send {
+        async move {
+            self.get_multiplexed_async_connection_with_config(&default_async_config())
+                .await
+        }
+    }
+
+    fn celers_blocking_connection(
+        &self,
+        max_block: Duration,
+    ) -> impl Future<Output = redis::RedisResult<MultiplexedConnection>> + Send {
+        async move {
+            self.get_multiplexed_async_connection_with_config(&blocking_async_config(max_block))
+                .await
+        }
+    }
+}
 
 /// TLS/SSL configuration for Redis connections
 #[derive(Debug, Clone, Default)]
@@ -121,8 +244,10 @@ impl Default for RedisConfig {
         Self {
             url: "redis://localhost:6379".to_string(),
             tls: TlsConfig::default(),
-            connection_timeout: Some(Duration::from_secs(5)),
-            response_timeout: Some(Duration::from_secs(3)),
+            // See `DEFAULT_RESPONSE_TIMEOUT`: a few seconds is not a safety
+            // margin, it is a tripwire that fires on a busy machine.
+            connection_timeout: Some(DEFAULT_CONNECTION_TIMEOUT),
+            response_timeout: Some(DEFAULT_RESPONSE_TIMEOUT),
             // Defaulting to `Some(0)` would silently override a database
             // selected in the URL (`redis://host/3`), because the URL parser
             // cannot distinguish "unset" from "explicitly 0".
@@ -339,8 +464,19 @@ impl RedisConfig {
     ///
     /// The timeouts belong to the connection rather than the client, so they
     /// are applied where the connection is actually established.
+    ///
+    /// Both timeouts are always set explicitly, never left at the `redis`
+    /// crate's defaults — see [`DEFAULT_RESPONSE_TIMEOUT`].
     pub fn manager_config(&self) -> redis::aio::ConnectionManagerConfig {
         redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(self.connection_timeout)
+            .set_response_timeout(self.response_timeout)
+    }
+
+    /// Connection settings for one-off multiplexed connections built from
+    /// this configuration.
+    pub fn async_config(&self) -> redis::AsyncConnectionConfig {
+        redis::AsyncConnectionConfig::new()
             .set_connection_timeout(self.connection_timeout)
             .set_response_timeout(self.response_timeout)
     }
@@ -451,7 +587,55 @@ mod tests {
         // `None` means "inherit from the URL"; a default of `Some(0)` would
         // silently override a database selected in the URL.
         assert_eq!(config.database, None);
-        assert!(config.connection_timeout.is_some());
+        // Never the `redis` crate's 500 ms / 1 s defaults, and never the
+        // 3 s / 5 s this used to carry: both are short enough that a busy
+        // machine trips them on healthy traffic.
+        assert_eq!(config.connection_timeout, Some(DEFAULT_CONNECTION_TIMEOUT));
+        assert_eq!(config.response_timeout, Some(DEFAULT_RESPONSE_TIMEOUT));
+    }
+
+    /// A connection carrying a blocking command must outlive the block
+    /// itself, or the client kills its own request before the server
+    /// answers.
+    #[test]
+    fn test_blocking_response_timeout_exceeds_the_block() {
+        let block = Duration::from_secs(5);
+        let timeout = blocking_response_timeout(block).expect("a bounded block has a deadline");
+        assert!(
+            timeout > block,
+            "{:?} must leave room beyond the {:?} block",
+            timeout,
+            block
+        );
+        assert_eq!(timeout, block + BLOCKING_RESPONSE_MARGIN);
+
+        // A long block scales the deadline instead of capping it.
+        let long = Duration::from_secs(600);
+        assert_eq!(
+            blocking_response_timeout(long),
+            Some(long + BLOCKING_RESPONSE_MARGIN)
+        );
+
+        // Redis reads a zero timeout as "block forever", so no client-side
+        // deadline can be right.
+        assert_eq!(blocking_response_timeout(Duration::ZERO), None);
+    }
+
+    /// `AsyncConnectionConfig` exposes no getters, so the manager config —
+    /// which does — stands in for "the shared defaults are not the `redis`
+    /// crate's".
+    #[test]
+    fn test_default_manager_config_overrides_crate_defaults() {
+        let manager = default_manager_config();
+        assert_eq!(manager.response_timeout(), Some(DEFAULT_RESPONSE_TIMEOUT));
+        assert_eq!(
+            manager.connection_timeout(),
+            Some(DEFAULT_CONNECTION_TIMEOUT)
+        );
+
+        // The values the `redis` crate would have used unasked.
+        assert_ne!(manager.response_timeout(), Some(Duration::from_millis(500)));
+        assert_ne!(manager.connection_timeout(), Some(Duration::from_secs(1)));
     }
 
     #[test]

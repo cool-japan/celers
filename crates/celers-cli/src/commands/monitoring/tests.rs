@@ -131,18 +131,27 @@ mod tests_report {
 
     #[test]
     fn test_base_queue_name_filters_non_queue_keys() {
+        // Regression test for idx 331/337: a real `RedisBroker` queue-family
+        // key carries no shared prefix at all (see `crate::keys`'s module
+        // docs) -- a bare key is the primary queue, unlike every other
+        // namespace this CLI writes into Redis, which *is* `celers:`-
+        // prefixed. The old version of this function (and this test)
+        // encoded the opposite, incorrect assumption.
+        assert_eq!(base_queue_name("default"), Some("default".to_string()));
         assert_eq!(
-            base_queue_name("celers:default"),
-            Some("default".to_string())
-        );
-        assert_eq!(
-            base_queue_name("celers:high-priority"),
+            base_queue_name("high-priority"),
             Some("high-priority".to_string())
         );
-        assert_eq!(base_queue_name("celers:default:dlq"), None);
-        assert_eq!(base_queue_name("celers:default:processing"), None);
-        assert_eq!(base_queue_name("celers:default:delayed"), None);
-        assert_eq!(base_queue_name("celers:default:paused"), None);
+        // Suffixed sibling keys of the same queue family are not
+        // themselves primary queues.
+        assert_eq!(base_queue_name("default:dlq"), None);
+        assert_eq!(base_queue_name("default:processing"), None);
+        assert_eq!(base_queue_name("default:delayed"), None);
+        assert_eq!(base_queue_name("default:paused"), None);
+        assert_eq!(base_queue_name("default:drain"), None);
+        // Every other namespace this crate owns in Redis is `celers:`-
+        // prefixed, however deeply nested, so it is excluded regardless of
+        // whether this function knows that exact sub-namespace by name.
         assert_eq!(base_queue_name("celers:worker:w1:heartbeat"), None);
         assert_eq!(base_queue_name("celers:task:abc:logs"), None);
         assert_eq!(
@@ -151,7 +160,40 @@ mod tests_report {
         );
         assert_eq!(base_queue_name("celers:schedule:job1"), None);
         assert_eq!(base_queue_name("celers:"), None);
-        assert_eq!(base_queue_name("other:default"), None);
+        assert_eq!(base_queue_name(""), None);
+        // A name that merely *contains* a colon without a reserved
+        // sub-namespace prefix or a recognized queue-family suffix is
+        // indistinguishable from a real queue name by this heuristic -- a
+        // documented, inherent limitation (see this function's docs) rather
+        // than an oversight.
+        assert_eq!(
+            base_queue_name("other:default"),
+            Some("other:default".to_string())
+        );
+    }
+
+    /// Regression test: `Config::default_config` names the default queue
+    /// literally `"celers"`, so its own sibling keys (`celers:dlq`,
+    /// `celers:processing`, `celers:delayed`) collide syntactically with the
+    /// `celers:`-prefixed bookkeeping namespaces this function also filters
+    /// out. `base_queue_name` must recognize the *default queue itself* and
+    /// still fold its siblings into it rather than misclassifying either as
+    /// bookkeeping -- and must not swallow a differently-named queue that
+    /// merely starts with "celers:" either.
+    #[test]
+    fn test_base_queue_name_handles_the_default_queue_named_celers() {
+        assert_eq!(base_queue_name("celers"), Some("celers".to_string()));
+        assert_eq!(base_queue_name("celers:dlq"), None);
+        assert_eq!(base_queue_name("celers:processing"), None);
+        assert_eq!(base_queue_name("celers:delayed"), None);
+        assert_eq!(base_queue_name("celers:paused"), None);
+        assert_eq!(base_queue_name("celers:drain"), None);
+        // A queue literally named "celers:staging" is not one of the five
+        // reserved sub-namespaces and must still be recognized.
+        assert_eq!(
+            base_queue_name("celers:staging"),
+            Some("celers:staging".to_string())
+        );
     }
 
     #[test]

@@ -27,7 +27,8 @@ Cloud-native message broker using AWS SQS with:
 - ✅ **Poison Message Detection**: Isolate repeatedly failing messages ✨ NEW
 - ✅ **Cost Alert System**: Real-time budget monitoring with alerts ✨ NEW
 - ✅ **Lambda Integration**: Helpers for AWS Lambda SQS event processing ✨ NEW
-- ✅ **Message Replay**: DLQ replay with selective filtering and rate limiting ✨ NEW
+- ✅ **Message Replay**: DLQ-to-main redrive with filtering, rate limiting, retries and dry-run ✨ NEW
+- ✅ **Visibility Heartbeat**: keeps long-running handlers' messages invisible ✨ NEW
 - ✅ **SLA Monitoring**: Real-time SLA compliance tracking and reporting ✨ NEW
 
 ## Features
@@ -845,21 +846,95 @@ Benchmarks include:
 - Polling strategies
 - Parallel vs sequential processing
 
+## Delivery semantics
+
+CeleRS on SQS is **at-least-once**, and this crate is explicit about where the
+remaining duplication comes from:
+
+- A `SendMessage` that times out after AWS accepted it is retried and can
+  duplicate on a **standard** queue — SQS offers no deduplication id there.
+  FIFO publishes carry a `MessageDeduplicationId` derived from the task id, so
+  a retry is deduplicated inside SQS's 5-minute interval.
+- A handler that outlives its visibility timeout has its message redelivered.
+  Enable `with_visibility_heartbeat(true)` (on by default in
+  `SqsBroker::production`) to keep the message invisible for as long as the
+  handler runs; a worker that *dies* mid-task still releases it, which is the
+  irreducible at-least-once case.
+- `with_max_messages(n > 1)` prefetches: the surplus messages are already in
+  flight while they sit in the in-process buffer. Size the visibility timeout
+  (or the heartbeat) for `n x handler duration`.
+
+Delivery tags returned by `consume`/`consume_batch` encode the queue the
+message came from, so `ack`/`reject` always delete against the right queue —
+including messages taken from a DLQ.
+
+## Celery compatibility scope
+
+`with_celery_compat` / `with_celery_defaults` cover:
+
+- **Attributes** — Celery headers are mapped to SQS MessageAttributes on every
+  publish path (single, batch, FIFO, FIFO batch, delayed) and read back on the
+  consume paths, filling gaps in the deserialized message without overwriting
+  it.
+- **Naming** — the configured `QueueNamingStrategy` translates logical queue
+  names, exactly once, on **every** path: publish, consume, `queue_size`,
+  `purge`, `create_queue`, `delete_queue`, tagging, redrive policies and stats.
+  A `.fifo` suffix survives the translation (`orders.fifo` ->
+  `celery_orders.fifo`) because SQS refuses to treat a queue as FIFO without
+  it. The one exception is `list_queues`, which reports the names AWS holds;
+  use `broker.physical_queue_name("tasks")` to compare against them. The
+  translation is not idempotent, so never feed a physical name back into
+  another broker method.
+- **Priority** — with `enable_priority_queues`, publishes are routed to a
+  per-priority sibling queue and `consume` polls those queues highest-priority
+  first (`broker.priority_queues("tasks")` lists them, highest first). Only the
+  lowest-priority queue uses the full long poll, so a priority scan costs one
+  long poll rather than one per level.
+
+## Pure Rust policy exception
+
+⚠️ **This crate is not Pure Rust.** `aws-smithy-runtime`'s
+`default-https-client` feature unconditionally selects
+`aws-smithy-http-client/rustls-aws-lc`, which pulls in `aws-lc-rs` ->
+`aws-lc-sys` (vendored C/C++/assembly, built with `cmake` + `cc`).
+`aws-smithy-http-client` offers no pure-Rust TLS provider: every option it has
+(`rustls-aws-lc`, `rustls-aws-lc-fips`, `rustls-ring`, `legacy-rustls-ring`,
+`s2n-tls`) is C or assembly.
+
+Blast radius is contained to this crate and `celers-broker-amqp`: no other
+workspace member pulls `aws-lc-sys`, and the `celers` facade only becomes
+impure through its `sqs` / `amqp` / `full` features (or `--all-features`).
+
+Removing the exception requires implementing an
+`aws_smithy_runtime_api::client::http::HttpClient` backed by `oxihttp-client`
+and installing it with `aws_config::defaults(..).http_client(..)` while building
+the SDK with `default-features = false`. That needs `aws-smithy-runtime-api` and
+`aws-smithy-types` as workspace dependencies; see the workspace TODO.
+
 ## Testing
 
 ```bash
-# Run unit tests
-cargo test
+# Unit tests (hermetic: no AWS calls, no network)
+cargo nextest run -p celers-broker-sqs --all-features
+cargo test --doc -p celers-broker-sqs --all-features
 
-# Run with AWS credentials for integration tests
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
+# End-to-end tests against LocalStack
+docker run --rm -p 4566:4566 localstack/localstack
+
+export CELERS_TEST_SQS_URL=http://localhost:4566
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
 export AWS_REGION=us-east-1
-cargo test --features integration
+cargo test -p celers-broker-sqs --test localstack -- --ignored --test-threads=1
 
 # Check for warnings
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+The LocalStack suite (`tests/localstack.rs`) covers enqueue -> consume -> ack,
+redelivery counting from `ApproximateReceiveCount`, acknowledging a message
+consumed from a *different* queue, 25-entry batch publish/ack, FIFO publish
+through the generic `Producer`, and DLQ redrive (dry run and real).
 
 ## Comparison with Other Brokers
 

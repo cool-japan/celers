@@ -575,3 +575,37 @@ impl Default for RetryPolicy {
         }
     }
 }
+
+/// Retention policy for terminal tasks left in the dispatch table.
+///
+/// `celers_tasks` is the table every `dequeue` scans, and `ack` leaves
+/// completed rows in it for auditing (see `broker_trait.rs`'s `ack`).
+/// Without a sweeper the table (and its indexes) grows monotonically with
+/// lifetime throughput. Configure this and call
+/// [`crate::MysqlBroker::spawn_retention_task`] to have terminal rows pruned
+/// in bounded chunks, or call
+/// [`crate::MysqlBroker::purge_terminal_tasks`] directly for a one-shot
+/// sweep. Mirrors `celers-broker-postgres::RetentionConfig` field-for-field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// How long a terminal (`completed`/`cancelled`/`failed`) task is kept.
+    pub retain_for: std::time::Duration,
+    /// Interval between sweeps.
+    pub sweep_interval: std::time::Duration,
+    /// Maximum rows deleted per statement, so no sweep holds long row locks.
+    pub batch_size: i64,
+    /// Maximum statements per sweep, bounding one sweep's total work.
+    pub max_batches_per_sweep: u32,
+}
+
+impl Default for RetentionConfig {
+    /// Seven days of history, swept hourly in 10 000-row chunks.
+    fn default() -> Self {
+        Self {
+            retain_for: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            sweep_interval: std::time::Duration::from_secs(60 * 60),
+            batch_size: 10_000,
+            max_batches_per_sweep: 100,
+        }
+    }
+}

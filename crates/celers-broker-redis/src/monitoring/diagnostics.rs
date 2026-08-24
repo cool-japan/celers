@@ -84,18 +84,12 @@ pub fn analyze_redis_slowlog(
 
     // Time span analysis
     let timestamps: Vec<i64> = slowlog_entries.iter().map(|(_, _, t)| *t).collect();
-    let time_span_seconds = if timestamps.len() > 1 {
-        (timestamps
-            .iter()
-            .max()
-            .expect("timestamps validated to be non-empty")
-            - timestamps
-                .iter()
-                .min()
-                .expect("timestamps validated to be non-empty"))
-        .max(1)
-    } else {
-        1
+    // `max`/`min` are `Some` whenever there is more than one entry, but
+    // taking that from the values instead of asserting it keeps the
+    // invariant and its use in the same expression.
+    let time_span_seconds = match (timestamps.iter().max(), timestamps.iter().min()) {
+        (Some(newest), Some(oldest)) if timestamps.len() > 1 => (newest - oldest).max(1),
+        _ => 1,
     };
 
     // Generate recommendations
@@ -656,9 +650,10 @@ pub fn detect_queue_burst(recent_queue_sizes: &[usize], window_size: usize) -> B
         };
     }
 
-    let current_size = *recent_queue_sizes
-        .last()
-        .expect("recent_queue_sizes validated to be non-empty");
+    // The length check above guarantees a last element; reading it as an
+    // `Option` keeps that guarantee local instead of trusting a guard the
+    // next edit may move.
+    let current_size = recent_queue_sizes.last().copied().unwrap_or(0);
     let baseline_window = window_size.min(recent_queue_sizes.len() - 1);
 
     // Calculate baseline from recent history (excluding current)

@@ -207,16 +207,28 @@ impl Default for RetryStrategy {
     }
 }
 
+/// `2^retry_count` as an `i64`, clamped instead of overflowing.
+///
+/// `2_i64.pow(n)` panics for `n >= 63` (and on a negative cast), which a
+/// pathological `retry_count` could reach. The exponential strategies always
+/// clamp the result to `max_delay_secs` anyway, so saturating here changes no
+/// reachable answer — it only removes the panic. Mirrors the `LEAST(GREATEST(
+/// retry_count, 0), 62)` clamp in [`RetryStrategy::backoff_sql`].
+fn two_pow_saturating(retry_count: i32) -> i64 {
+    let exponent = retry_count.clamp(0, 62) as u32;
+    1_i64 << exponent
+}
+
 impl RetryStrategy {
     /// Calculate backoff delay in seconds based on retry count
     pub fn calculate_backoff(&self, retry_count: i32) -> i64 {
         match self {
             RetryStrategy::Exponential { max_delay_secs } => {
-                let backoff = 2_i64.pow(retry_count as u32);
+                let backoff = two_pow_saturating(retry_count);
                 backoff.min(*max_delay_secs)
             }
             RetryStrategy::ExponentialWithJitter { max_delay_secs } => {
-                let base_backoff = 2_i64.pow(retry_count as u32).min(*max_delay_secs);
+                let base_backoff = two_pow_saturating(retry_count).min(*max_delay_secs);
                 let jitter_factor = 0.5 + ((retry_count % 10) as f64 / 10.0);
                 ((base_backoff as f64) * jitter_factor).round() as i64
             }
@@ -224,7 +236,10 @@ impl RetryStrategy {
                 base_delay_secs,
                 max_delay_secs,
             } => {
-                let backoff = base_delay_secs * (retry_count as i64);
+                // `retry_count.max(0)` mirrors the `GREATEST(retry_count, 0)`
+                // in [`RetryStrategy::backoff_sql`]: a negative backoff would
+                // schedule the retry in the past, i.e. no backoff at all.
+                let backoff = base_delay_secs.saturating_mul(i64::from(retry_count.max(0)));
                 backoff.min(*max_delay_secs)
             }
             RetryStrategy::Fixed { delay_secs } => *delay_secs,
@@ -430,7 +445,14 @@ pub struct WorkflowStatus {
 }
 
 /// Status information for a workflow stage
+///
+/// `#[non_exhaustive]`: fields have grown before (`unmet_dependencies` was
+/// added alongside `dependencies_met`'s bug fix) without a major version
+/// bump, since only this crate ever constructs one. Marking it
+/// non-exhaustive stops that from being a breaking change for downstream
+/// struct-literal construction in the future.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StageStatus {
     pub stage_id: String,
     pub total_tasks: i64,
@@ -932,7 +954,13 @@ pub struct QueueHealthCheck {
 }
 
 /// Task group status
+///
+/// `#[non_exhaustive]`: `description` was added after this type first
+/// shipped without a major version bump, since only this crate ever
+/// constructs one. Marking it non-exhaustive stops a future field addition
+/// from being a breaking change for downstream struct-literal construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TaskGroupStatus {
     pub group_id: String,
     /// The name the group was created with.

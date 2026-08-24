@@ -1926,11 +1926,19 @@ as the accurate statement of what `008_production_features.sql` actually contain
 
 ## broker_core.rs size (2026-07)
 
-`src/broker_core.rs` is currently 2051 lines, over this project's 2000-line
-refactor-policy threshold. This was found during release-check for 0.3.0. Splitting it
-is deferred to a dedicated follow-up session — no split is attempted in this pass.
-`splitrs` (the project's SMT-solver-backed Rust refactoring tool, already installed) is
-the recommended tool for the eventual split.
+`src/broker_core.rs` was 2051 lines, over this project's 2000-line
+refactor-policy threshold.
 
-**Status: DEFERRED / OPEN** — nothing to act on now.
+**Status: RESOLVED (0.3.1).** Split along the file's own section markers:
+
+- `src/broker_dequeue.rs` — `dequeue_with_worker_id`, `enqueue_batch_impl`,
+  `dequeue_batch_impl`, plus the shared `claim_pending_rows` /
+  `mark_rows_processing` helpers the single-task path also uses.
+- `src/broker_results.rs` — the `// ========== Task Result Storage ==========`
+  section (`store_result`, `get_result`, `delete_result`, `archive_results`).
+
+Splitting along that seam also collapsed the three duplicated dequeue bodies
+into one shared claim helper and one shared row mapper
+(`src/sql_text.rs`, `src/task_row.rs`), which is what stopped the same bug
+from living in three places at once.
 

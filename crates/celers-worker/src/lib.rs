@@ -142,18 +142,22 @@ pub use dead_worker_detection::{
 };
 pub use degradation::{DegradationLevel, DegradationPolicy, DegradationThresholds};
 pub use dependencies::{DependencyGraph, DependencyStats, DependencyStatus, TaskDependency};
+pub use distributed_rate_limit::AcquireOutcome;
 pub use dlq::{
     DlqConfig, DlqEntry, DlqHandler, DlqReprocessConfig, DlqReprocessor, DlqStats,
-    TaskStats as DlqTaskStats,
+    DlqStorageBackend, TaskStats as DlqTaskStats,
 };
 pub use error_aggregation::{
     ErrorAggregator, ErrorAggregatorConfig, ErrorEntry, ErrorPattern, ErrorStats,
 };
 pub use execution_context::{
-    check_cancelled, current_context, current_token, is_cancelled, RevocationPublisher,
-    RevocationSignal, RevocationWatcher, TaskExecutionContext,
+    check_cancelled, check_soft_time_limit, current_checkpoints, current_context,
+    current_soft_timeout, current_token, is_cancelled, load_checkpoint, save_checkpoint,
+    soft_time_limit_exceeded, RevocationPublisher, RevocationSignal, RevocationWatcher,
+    SoftTimeout, TaskExecutionContext,
 };
 pub use feature_flags::{FeatureFlags, TaskFeatureRequirements};
+pub use health::{HealthChecker, HealthInfo, HealthStatus};
 pub use incremental_deser::{DeserConfig, DeserState, DeserStats, IncrementalDeserializer};
 pub use leak_detection::{LeakDetector, LeakDetectorConfig, LeakInfo, MemorySample};
 pub use lockfree_queue::LockFreeQueue;
@@ -178,7 +182,10 @@ pub use restart_manager::{
 };
 pub use retry::{RetryConfig, RetryStrategy};
 pub use routing::{RoutingStrategy, TaskRoutingRequirements, WorkerTags};
-pub use sandbox::{IsolationLevel, Sandbox, SandboxConfig, SandboxStats, SandboxViolation};
+pub use sandbox::{
+    EnforcementReport, IsolationLevel, Sandbox, SandboxConfig, SandboxError, SandboxStats,
+    SandboxViolation,
+};
 pub use scheduler::{
     AvailableResources, ScheduledTask, SchedulerConfig, TaskPriority, TaskRequirements,
     TaskScheduler,
@@ -193,6 +200,7 @@ pub use task_timeout::{
 };
 pub use worker_pool::{
     ScalingDecision, ScalingPolicy, WorkerInfo, WorkerPool, WorkerPoolConfig, WorkerPoolStats,
+    WorkerTaskFn,
 };
 pub use zero_copy::{BufferMetadata, SharedBuffer, ZeroCopyBuffer, ZeroCopyPool};
 

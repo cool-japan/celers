@@ -6,9 +6,11 @@
 //! - Health monitoring
 //! - Automatic cleanup
 
+use crate::connection::{blocking_async_config, DEFAULT_RESPONSE_TIMEOUT};
 use celers_core::{CelersError, Result};
 use redis::{aio::MultiplexedConnection, Client};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, warn};
 
@@ -21,6 +23,16 @@ pub struct PoolConfig {
     pub max_size: usize,
     /// Connection timeout in seconds
     pub connection_timeout_secs: u64,
+    /// Longest blocking command this pool's connections will carry.
+    ///
+    /// Connections from this pool exist precisely to serve blocking commands
+    /// (`BRPOPLPUSH` and friends), which send no reply until a message
+    /// arrives or the server-side timeout expires. Their client-side response
+    /// timeout is derived from this value — see
+    /// [`crate::connection::blocking_response_timeout`] — so that the client
+    /// never gives up before the server answers. `Duration::ZERO` means
+    /// "blocks indefinitely", which disables the response timeout entirely.
+    pub max_block: Duration,
 }
 
 impl Default for PoolConfig {
@@ -29,6 +41,9 @@ impl Default for PoolConfig {
             min_idle: 2,
             max_size: 10,
             connection_timeout_secs: 5,
+            // A pool used for ordinary traffic gets the ordinary deadline;
+            // callers serving blocking commands must say how long they block.
+            max_block: DEFAULT_RESPONSE_TIMEOUT,
         }
     }
 }
@@ -54,6 +69,16 @@ impl PoolConfig {
     /// Set connection timeout
     pub fn with_connection_timeout(mut self, timeout_secs: u64) -> Self {
         self.connection_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Declare the longest blocking command this pool's connections will
+    /// carry, so their response timeout can be sized to outlast it.
+    ///
+    /// Pass `Duration::ZERO` for commands that block indefinitely; that
+    /// removes the client-side response deadline altogether.
+    pub fn with_max_block(mut self, max_block: Duration) -> Self {
+        self.max_block = max_block;
         self
     }
 }
@@ -209,14 +234,25 @@ impl ConnectionPool {
         })
     }
 
-    /// Create a new Redis connection
+    /// Create a new Redis connection sized for this pool's blocking work.
+    ///
+    /// The connection's response timeout is derived from
+    /// [`PoolConfig::max_block`] rather than left at the `redis` crate's
+    /// 500 ms default: these connections carry blocking commands, and a
+    /// response deadline shorter than the block turns "queue is empty" into
+    /// `Err("timed out")`.
     async fn create_connection(&self) -> Result<MultiplexedConnection> {
         let timeout = tokio::time::Duration::from_secs(self.config.connection_timeout_secs);
+        let config = blocking_async_config(self.config.max_block);
 
-        tokio::time::timeout(timeout, self.client.get_multiplexed_async_connection())
-            .await
-            .map_err(|_| CelersError::Broker("Connection timeout".to_string()))?
-            .map_err(|e| CelersError::Broker(format!("Failed to create connection: {}", e)))
+        tokio::time::timeout(
+            timeout,
+            self.client
+                .get_multiplexed_async_connection_with_config(&config),
+        )
+        .await
+        .map_err(|_| CelersError::Broker("Connection timeout".to_string()))?
+        .map_err(|e| CelersError::Broker(format!("Failed to create connection: {}", e)))
     }
 
     /// Ensure minimum idle connections are maintained
@@ -309,6 +345,7 @@ mod tests {
         assert_eq!(config.min_idle, 2);
         assert_eq!(config.max_size, 10);
         assert_eq!(config.connection_timeout_secs, 5);
+        assert_eq!(config.max_block, DEFAULT_RESPONSE_TIMEOUT);
     }
 
     #[test]
@@ -316,11 +353,33 @@ mod tests {
         let config = PoolConfig::new()
             .with_min_idle(5)
             .with_max_size(20)
-            .with_connection_timeout(10);
+            .with_connection_timeout(10)
+            .with_max_block(Duration::from_secs(45));
 
         assert_eq!(config.min_idle, 5);
         assert_eq!(config.max_size, 20);
         assert_eq!(config.connection_timeout_secs, 10);
+        assert_eq!(config.max_block, Duration::from_secs(45));
+    }
+
+    /// The pool's connections must always outlast the block they carry,
+    /// however long the caller configures it.
+    #[test]
+    fn test_pool_response_deadline_outlasts_configured_block() {
+        use crate::connection::blocking_response_timeout;
+
+        for secs in [1u64, 5, 60, 3600] {
+            let block = Duration::from_secs(secs);
+            let config = PoolConfig::new().with_max_block(block);
+            let deadline = blocking_response_timeout(config.max_block)
+                .expect("a bounded block has a deadline");
+            assert!(
+                deadline > block,
+                "a {:?} block needs more than {:?} of patience",
+                block,
+                deadline
+            );
+        }
     }
 
     #[test]

@@ -503,6 +503,71 @@ fn test_chord_state_version_field() {
     assert!(!state.is_retry());
 }
 
+/// A chord's callback must be able to carry a bare, name-only successor of
+/// its own, so a chord can be a non-terminal step of a chain: the barrier
+/// enqueues the callback, and once *that* task completes it enqueues
+/// `callback_on_success_link` in turn (mirroring the existing
+/// `on_success_link` "no chain tail" continuation path).
+#[test]
+fn test_chord_state_callback_on_success_link() {
+    let chord_id = Uuid::new_v4();
+
+    // Absent by default.
+    let state = ChordState::new(chord_id, 5, vec![]).with_callback("aggregate".to_string());
+    assert!(!state.has_callback_on_success_link());
+    assert_eq!(state.callback_on_success_link, None);
+
+    // Builder sets it.
+    let state = state.with_callback_on_success_link("notify_done".to_string());
+    assert!(state.has_callback_on_success_link());
+    assert_eq!(
+        state.callback_on_success_link,
+        Some("notify_done".to_string())
+    );
+
+    // Round-trips through JSON, and is present in the serialized form.
+    let json = serde_json::to_string(&state).unwrap();
+    assert!(
+        json.contains("callback_on_success_link"),
+        "field must appear in JSON when set: {json}"
+    );
+    let deserialized: ChordState = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        deserialized.callback_on_success_link,
+        Some("notify_done".to_string())
+    );
+}
+
+/// When unset, the field must be omitted from the serialized JSON entirely
+/// (not written as `null`), and — critically — a `ChordState` blob written by
+/// a previous version of this crate (which never had this field at all)
+/// must still deserialize cleanly, so upgrading never breaks reads of
+/// already-stored chord state.
+#[test]
+fn test_chord_state_callback_on_success_link_absent_is_backward_compatible() {
+    let chord_id = Uuid::new_v4();
+    let state = ChordState::new(chord_id, 5, vec![]).with_callback("aggregate".to_string());
+    assert!(state.callback_on_success_link.is_none());
+
+    let json = serde_json::to_string(&state).unwrap();
+    assert!(
+        !json.contains("callback_on_success_link"),
+        "field must be omitted from JSON when None: {json}"
+    );
+
+    // Simulate a pre-upgrade stored value: the same JSON but with the field
+    // never having existed in the schema at all.
+    let old_json = format!(
+        r#"{{"chord_id":"{}","total":5,"completed":0,"callback":"aggregate","task_ids":[],"created_at":"{}","cancelled":false,"retry_count":0}}"#,
+        chord_id,
+        state.created_at.to_rfc3339(),
+    );
+    let deserialized: ChordState =
+        serde_json::from_str(&old_json).expect("pre-upgrade ChordState JSON must still parse");
+    assert_eq!(deserialized.callback_on_success_link, None);
+    assert_eq!(deserialized.callback, Some("aggregate".to_string()));
+}
+
 #[test]
 fn test_task_meta_version_field() {
     let task_id = Uuid::new_v4();
@@ -931,14 +996,23 @@ async fn test_integration_cache_performance() {
 #[tokio::test]
 #[ignore]
 async fn test_integration_connection_failure() {
-    // Try to connect to non-existent Redis instance
-    let result = RedisResultBackend::new("redis://localhost:9999");
+    use std::time::Duration as StdDuration;
 
-    // Should fail to connect
-    assert!(result.is_err());
-    if let Err(e) = result {
-        assert!(e.is_connection() || e.is_redis());
-    }
+    // Construction is lazy: `Client::open` only parses the URL, so pointing at
+    // a port nothing listens on must still yield a usable backend value.
+    let mut backend = RedisResultBackend::new("redis://127.0.0.1:9999")
+        .expect("client construction must not connect")
+        .without_retries()
+        .with_pipeline_config(
+            crate::pipeline::PipelineConfig::new().with_timeout(StdDuration::from_millis(300)),
+        );
+
+    // The failure surfaces on the first operation instead.
+    let err = backend
+        .get_result(Uuid::new_v4())
+        .await
+        .expect_err("an unreachable Redis must produce an error");
+    assert!(err.is_connection() || err.is_redis());
 }
 
 #[tokio::test]

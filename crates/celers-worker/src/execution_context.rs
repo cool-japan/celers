@@ -58,10 +58,14 @@
 //! ```
 
 use crate::cancellation::{CancellationError, CancellationRegistry, CancellationToken};
+use crate::checkpoint::{Checkpoint, CheckpointManager, CheckpointStoreError};
+use celers_core::time_limit::TimeLimitExceeded;
 use celers_core::TaskId;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::time::Duration;
+use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -71,27 +75,262 @@ tokio::task_local! {
     static CURRENT_CONTEXT: TaskExecutionContext;
 }
 
+/// Cooperative **soft time limit** signal for a running task.
+///
+/// Celery's soft time limit is deliberately *not* terminal: when it expires the
+/// task is told to wrap up (Celery raises `SoftTimeLimitExceeded` inside the
+/// task body) while the worker keeps the task running until the *hard* limit
+/// kills it. This type is the Rust equivalent of that signal — the worker arms
+/// a timer, the timer trips this flag, and cooperative task code observes it
+/// through [`soft_time_limit_exceeded`] / [`check_soft_time_limit`] (or by
+/// awaiting [`SoftTimeout::expired`]) and returns early with whatever partial
+/// work it has.
+///
+/// Crucially it is a *separate* channel from the [`CancellationToken`]: tripping
+/// the token makes the worker treat the task as **revoked** (acked, never
+/// retried), which is the wrong disposition for a soft-limit expiry.
+///
+/// Cloning is cheap and shares the same underlying flag.
+///
+/// # Example
+///
+/// ```rust
+/// use celers_worker::execution_context::{check_soft_time_limit, TaskExecutionContext, SoftTimeout};
+/// use celers_worker::cancellation::CancellationToken;
+/// use std::time::Duration;
+///
+/// # async fn example() {
+/// let task_id = uuid::Uuid::new_v4();
+/// let soft = SoftTimeout::new(task_id, Some(Duration::from_millis(50)));
+/// let ctx = TaskExecutionContext::with_soft_timeout(CancellationToken::new(task_id), soft);
+///
+/// let outcome = ctx
+///     .scope(async {
+///         loop {
+///             // Cooperative task body: bail out once the soft limit fires.
+///             if check_soft_time_limit().is_err() {
+///                 return "wrapped up early";
+///             }
+///             tokio::task::yield_now().await;
+///         }
+///     })
+///     .await;
+/// # let _ = outcome;
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct SoftTimeout {
+    inner: Arc<SoftTimeoutInner>,
+}
+
+/// Shared state behind a [`SoftTimeout`].
+struct SoftTimeoutInner {
+    /// The task the limit belongs to.
+    task_id: TaskId,
+    /// Configured soft limit in milliseconds; `0` means "no soft limit".
+    limit_millis: u64,
+    /// Whether the limit has fired.
+    expired: AtomicBool,
+    /// How long the task had been running when the limit fired.
+    elapsed_millis: AtomicU64,
+    /// Wakes anything awaiting [`SoftTimeout::expired`].
+    notify: Notify,
+}
+
+impl SoftTimeout {
+    /// Create a soft-timeout signal for `task_id`.
+    ///
+    /// `limit` of `None` (or `Duration::ZERO`) means no soft limit is
+    /// configured: the signal exists but can never fire, so task code observing
+    /// it always sees "within limits".
+    #[must_use]
+    pub fn new(task_id: TaskId, limit: Option<Duration>) -> Self {
+        let limit_millis = limit
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        Self {
+            inner: Arc::new(SoftTimeoutInner {
+                task_id,
+                limit_millis,
+                expired: AtomicBool::new(false),
+                elapsed_millis: AtomicU64::new(0),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    /// Create a signal for a task with no soft limit configured.
+    #[must_use]
+    pub fn unlimited(task_id: TaskId) -> Self {
+        Self::new(task_id, None)
+    }
+
+    /// The task this signal belongs to.
+    #[must_use]
+    pub fn task_id(&self) -> TaskId {
+        self.inner.task_id
+    }
+
+    /// The configured soft limit, if any.
+    #[must_use]
+    pub fn limit(&self) -> Option<Duration> {
+        if self.inner.limit_millis == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.inner.limit_millis))
+        }
+    }
+
+    /// Whether a soft limit is configured at all.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.inner.limit_millis > 0
+    }
+
+    /// Whether the soft limit has already fired.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.inner.expired.load(Ordering::Acquire)
+    }
+
+    /// Trip the signal, recording how long the task had been running.
+    ///
+    /// Idempotent: returns `true` only for the first call, so the worker emits
+    /// exactly one warning per task.
+    pub fn expire(&self, elapsed: Duration) -> bool {
+        // `notify_waiters` only wakes *currently registered* waiters, so it is
+        // paired with the flag check inside `expired()` to avoid lost wakeups.
+        if self.is_expired() {
+            // Already fired. The reported elapsed time belongs to the moment the
+            // limit was *crossed*, so a later redundant call must not overwrite
+            // it with a larger, meaningless number.
+            self.inner.notify.notify_waiters();
+            return false;
+        }
+
+        let elapsed_millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        // Publish the elapsed time *before* the flag that makes it readable, so
+        // a reader that observes the expiry never sees a zero elapsed.
+        self.inner
+            .elapsed_millis
+            .store(elapsed_millis, Ordering::Release);
+        let was_expired = self.inner.expired.swap(true, Ordering::Release);
+        self.inner.notify.notify_waiters();
+        !was_expired
+    }
+
+    /// Wait until the soft limit fires.
+    ///
+    /// Notification-based (no polling) and safe against lost wakeups: the waiter
+    /// is registered before the flag is re-checked, exactly as
+    /// [`CancellationToken::cancelled`](crate::cancellation::CancellationToken::cancelled)
+    /// does.
+    pub async fn expired(&self) {
+        loop {
+            if self.is_expired() {
+                return;
+            }
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_expired() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// The violation, once the soft limit has fired.
+    #[must_use]
+    pub fn exceeded(&self) -> Option<TimeLimitExceeded> {
+        if !self.is_expired() {
+            return None;
+        }
+        Some(TimeLimitExceeded::SoftLimitExceeded {
+            task_id: self.inner.task_id.to_string(),
+            elapsed_millis: self.inner.elapsed_millis.load(Ordering::Acquire),
+            limit_millis: self.inner.limit_millis,
+        })
+    }
+
+    /// `Err` once the soft limit has fired, so cooperative task code can `?`
+    /// this at natural checkpoints.
+    pub fn check(&self) -> Result<(), TimeLimitExceeded> {
+        match self.exceeded() {
+            Some(exceeded) => Err(exceeded),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Ambient context describing the task currently being executed.
 ///
 /// Cheaply cloneable. Installed into a task-local for the lifetime of a task
-/// future so cooperative task code can reach its [`CancellationToken`] without
-/// having it threaded explicitly through every call.
+/// future so cooperative task code can reach its [`CancellationToken`] and its
+/// [`SoftTimeout`] without having them threaded explicitly through every call.
 #[derive(Clone)]
 pub struct TaskExecutionContext {
     token: CancellationToken,
+    soft_timeout: SoftTimeout,
+    checkpoints: Option<Arc<CheckpointManager>>,
 }
 
 impl TaskExecutionContext {
     /// Create a new execution context wrapping a cancellation token.
+    ///
+    /// The context carries an unconfigured [`SoftTimeout`] (no soft time limit);
+    /// use [`with_soft_timeout`](Self::with_soft_timeout) to attach one.
     #[must_use]
     pub fn new(token: CancellationToken) -> Self {
-        Self { token }
+        let soft_timeout = SoftTimeout::unlimited(token.task_id());
+        Self {
+            token,
+            soft_timeout,
+            checkpoints: None,
+        }
+    }
+
+    /// Create a context carrying both a cancellation token and a soft
+    /// time-limit signal.
+    #[must_use]
+    pub fn with_soft_timeout(token: CancellationToken, soft_timeout: SoftTimeout) -> Self {
+        Self {
+            token,
+            soft_timeout,
+            checkpoints: None,
+        }
+    }
+
+    /// Attach a checkpoint manager, making it reachable from inside the task
+    /// through [`save_checkpoint`] / [`load_checkpoint`].
+    #[must_use]
+    pub fn with_checkpoints(mut self, checkpoints: Arc<CheckpointManager>) -> Self {
+        self.checkpoints = Some(checkpoints);
+        self
+    }
+
+    /// The checkpoint manager available to this task, if any.
+    #[must_use]
+    pub fn checkpoints(&self) -> Option<&Arc<CheckpointManager>> {
+        self.checkpoints.as_ref()
     }
 
     /// The cancellation token for this task.
     #[must_use]
     pub fn token(&self) -> &CancellationToken {
         &self.token
+    }
+
+    /// The soft time-limit signal for this task.
+    #[must_use]
+    pub fn soft_timeout(&self) -> &SoftTimeout {
+        &self.soft_timeout
+    }
+
+    /// Whether this task's soft time limit has fired.
+    #[must_use]
+    pub fn is_soft_time_limit_exceeded(&self) -> bool {
+        self.soft_timeout.is_expired()
     }
 
     /// The id of the task this context belongs to.
@@ -154,6 +393,109 @@ pub fn check_cancelled() -> Result<(), CancellationError> {
         Ok(token) => token.check_cancelled(),
         Err(_) => Ok(()),
     }
+}
+
+/// Get the ambient [`SoftTimeout`] for the currently executing task, if any.
+#[must_use]
+pub fn current_soft_timeout() -> Option<SoftTimeout> {
+    CURRENT_CONTEXT
+        .try_with(|ctx| ctx.soft_timeout.clone())
+        .ok()
+}
+
+/// Convenience: whether the currently executing task has passed its **soft**
+/// time limit.
+///
+/// Returns `false` outside a task scope, and for tasks with no soft limit
+/// configured.
+#[must_use]
+pub fn soft_time_limit_exceeded() -> bool {
+    CURRENT_CONTEXT
+        .try_with(|ctx| ctx.soft_timeout.is_expired())
+        .unwrap_or(false)
+}
+
+/// Convenience: return the [`TimeLimitExceeded`] violation if the currently
+/// executing task has passed its soft time limit, otherwise `Ok(())`.
+///
+/// This is the Rust equivalent of Celery raising `SoftTimeLimitExceeded` inside
+/// the task body: a cooperative task `?`s this at natural checkpoints and gets
+/// the chance to clean up before the hard limit kills it. Outside of a task
+/// scope this is always `Ok(())`.
+pub fn check_soft_time_limit() -> Result<(), TimeLimitExceeded> {
+    match CURRENT_CONTEXT.try_with(|ctx| ctx.soft_timeout.clone()) {
+        Ok(soft_timeout) => soft_timeout.check(),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Get the ambient [`CheckpointManager`] for the currently executing task, if
+/// the worker was built with one.
+#[must_use]
+pub fn current_checkpoints() -> Option<Arc<CheckpointManager>> {
+    CURRENT_CONTEXT
+        .try_with(|ctx| ctx.checkpoints.clone())
+        .ok()
+        .flatten()
+}
+
+/// Save a checkpoint for the currently executing task.
+///
+/// A long-running task calls this at its own natural progress boundaries; the
+/// worker deletes the task's checkpoints once it completes successfully, and
+/// [`load_checkpoint`] hands them back when a retry (or a restart) picks the
+/// task up again — so work already done is not repeated.
+///
+/// Returns `Ok(false)` when no checkpoint manager is installed or there is no
+/// ambient task context, so task code can call it unconditionally.
+///
+/// # Errors
+///
+/// Returns the storage backend's error when the checkpoint cannot be written.
+///
+/// # Example
+///
+/// ```no_run
+/// # use celers_worker::execution_context::{load_checkpoint, save_checkpoint};
+/// # async fn process(from: usize) -> Vec<u8> { Vec::new() }
+/// # async fn task_body() {
+/// // Resume where the previous attempt stopped.
+/// let resume_from = load_checkpoint()
+///     .await
+///     .and_then(|cp| String::from_utf8(cp.data).ok())
+///     .and_then(|s| s.parse::<usize>().ok())
+///     .unwrap_or(0);
+///
+/// for step in resume_from..1_000 {
+///     let _ = process(step).await;
+///     let _ = save_checkpoint(step.to_string().into_bytes()).await;
+/// }
+/// # }
+/// ```
+pub async fn save_checkpoint(data: Vec<u8>) -> Result<bool, CheckpointStoreError> {
+    let Some(ctx) = current_context() else {
+        return Ok(false);
+    };
+    let Some(manager) = ctx.checkpoints else {
+        return Ok(false);
+    };
+    manager
+        .save_checkpoint(Checkpoint::new(ctx.token.task_id().to_string(), data))
+        .await?;
+    Ok(true)
+}
+
+/// Load the most recent checkpoint saved for the currently executing task.
+///
+/// Returns `None` when no checkpoint manager is installed, when there is no
+/// ambient task context, or when the task has never checkpointed.
+#[must_use]
+pub async fn load_checkpoint() -> Option<Checkpoint> {
+    let ctx = current_context()?;
+    let manager = ctx.checkpoints?;
+    manager
+        .load_checkpoint(&ctx.token.task_id().to_string())
+        .await
 }
 
 /// A revocation signal published on the broker's cancellation Pub/Sub.
@@ -535,5 +877,119 @@ mod tests {
         assert!(watcher.registry().has_token(&task_id).await);
         watcher.unregister(&task_id).await;
         assert!(!watcher.registry().has_token(&task_id).await);
+    }
+
+    // ----------------------------------------------------------------------
+    // Soft time limit (idx 42)
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_soft_timeout_without_a_limit_never_fires() {
+        let signal = SoftTimeout::unlimited(uuid::Uuid::new_v4());
+        assert!(!signal.is_configured());
+        assert_eq!(signal.limit(), None);
+        assert!(!signal.is_expired());
+        assert!(signal.exceeded().is_none());
+        assert!(signal.check().is_ok());
+    }
+
+    #[test]
+    fn test_soft_timeout_expiry_is_idempotent_and_reports_the_violation() {
+        let task_id = uuid::Uuid::new_v4();
+        let signal = SoftTimeout::new(task_id, Some(Duration::from_millis(250)));
+        assert!(signal.is_configured());
+        assert_eq!(signal.limit(), Some(Duration::from_millis(250)));
+
+        assert!(
+            signal.expire(Duration::from_millis(300)),
+            "the first expiry is the one that warns"
+        );
+        assert!(
+            !signal.expire(Duration::from_millis(400)),
+            "a second expiry must not warn again"
+        );
+
+        let exceeded = signal.check().expect_err("the limit has fired");
+        assert!(matches!(
+            exceeded,
+            celers_core::time_limit::TimeLimitExceeded::SoftLimitExceeded { .. }
+        ));
+        assert!(!exceeded.is_hard(), "a soft limit is never the hard one");
+        assert_eq!(exceeded.task_id(), task_id.to_string());
+        assert_eq!(exceeded.limit(), Duration::from_millis(250));
+        assert_eq!(exceeded.elapsed(), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn test_soft_timeout_clones_share_one_flag() {
+        let signal = SoftTimeout::new(uuid::Uuid::new_v4(), Some(Duration::from_secs(1)));
+        let observer = signal.clone();
+        assert!(!observer.is_expired());
+        signal.expire(Duration::from_secs(2));
+        assert!(observer.is_expired());
+    }
+
+    #[tokio::test]
+    async fn test_awaiting_expiry_wakes_and_never_misses_an_early_fire() {
+        let signal = SoftTimeout::new(uuid::Uuid::new_v4(), Some(Duration::from_millis(10)));
+
+        // Already expired before the await: returns immediately.
+        signal.expire(Duration::from_millis(11));
+        tokio::time::timeout(Duration::from_secs(1), signal.expired())
+            .await
+            .expect("an already-expired signal must not park");
+
+        // And a waiter registered first is woken by a later expiry.
+        let signal = SoftTimeout::new(uuid::Uuid::new_v4(), Some(Duration::from_millis(10)));
+        let waiter = signal.clone();
+        let firing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            signal.expire(Duration::from_millis(20));
+        });
+        tokio::time::timeout(Duration::from_secs(2), waiter.expired())
+            .await
+            .expect("the waiter must be woken");
+        firing.await.expect("firing task");
+    }
+
+    #[tokio::test]
+    async fn test_soft_limit_is_visible_inside_the_task_scope_only() {
+        let task_id = uuid::Uuid::new_v4();
+        let signal = SoftTimeout::new(task_id, Some(Duration::from_millis(5)));
+        let ctx = TaskExecutionContext::with_soft_timeout(
+            CancellationToken::new(task_id),
+            signal.clone(),
+        );
+
+        // Outside a scope the helpers are inert.
+        assert!(current_soft_timeout().is_none());
+        assert!(!soft_time_limit_exceeded());
+        assert!(check_soft_time_limit().is_ok());
+
+        let seen = ctx
+            .scope(async {
+                let before = (soft_time_limit_exceeded(), check_soft_time_limit().is_ok());
+                signal.expire(Duration::from_millis(6));
+                let after = (soft_time_limit_exceeded(), check_soft_time_limit().is_err());
+                assert!(current_soft_timeout().is_some());
+                (before, after)
+            })
+            .await;
+
+        assert_eq!(seen, ((false, true), (true, true)));
+        assert!(ctx.is_soft_time_limit_exceeded());
+        // The cancellation token is a *separate* channel: a soft limit must
+        // never make the worker treat the task as revoked.
+        assert!(!ctx.token().is_cancelled());
+    }
+
+    #[test]
+    fn test_plain_context_carries_an_unconfigured_soft_timeout() {
+        let task_id = uuid::Uuid::new_v4();
+        let ctx = TaskExecutionContext::new(CancellationToken::new(task_id));
+        assert!(!ctx.soft_timeout().is_configured());
+        assert_eq!(ctx.soft_timeout().task_id(), task_id);
+        assert!(!ctx.is_soft_time_limit_exceeded());
+        assert!(ctx.checkpoints().is_none());
     }
 }

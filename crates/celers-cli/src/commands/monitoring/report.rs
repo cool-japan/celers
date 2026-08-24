@@ -637,13 +637,17 @@ pub async fn report_queues(
     let client = redis::Client::open(broker_url)?;
     let mut conn = client.get_multiplexed_async_connection().await?;
 
+    // `MATCH *` (not `celers:*`): real `RedisBroker` queue keys carry no
+    // shared prefix at all, so a `celers:*`-scoped scan used to match zero
+    // of them against a live, non-empty broker (idx 331/337; see
+    // `base_queue_name`'s docs for the full rationale).
     let mut cursor = 0u64;
     let mut keys = Vec::new();
     loop {
         let (new_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
-            .arg("celers:*")
+            .arg("*")
             .arg("COUNT")
             .arg(100)
             .query_async(&mut conn)
@@ -661,11 +665,20 @@ pub async fn report_queues(
 
     let mut records = Vec::new();
     for queue in &queue_names {
-        let queue_key = format!("celers:{queue}");
+        let queue_key = crate::keys::main(queue);
         let queue_type: String = redis::cmd("TYPE")
             .arg(&queue_key)
             .query_async(&mut conn)
             .await?;
+
+        // `base_queue_name` filters by prefix/suffix, not by type -- narrow
+        // further to the only two Redis types `RedisBroker` ever creates a
+        // primary queue key as, so a stray non-queue key elsewhere in the
+        // keyspace that happened to survive the name filter is dropped here
+        // rather than reported as an empty "Unknown" queue.
+        if queue_type != "list" && queue_type != "zset" {
+            continue;
+        }
 
         let pending: u64 = match queue_type.as_str() {
             "list" => {
@@ -683,17 +696,17 @@ pub async fn report_queues(
             _ => 0,
         };
         let processing: u64 = redis::cmd("LLEN")
-            .arg(format!("{queue_key}:processing"))
+            .arg(crate::keys::processing(queue))
             .query_async(&mut conn)
             .await
             .unwrap_or(0);
         let dlq: u64 = redis::cmd("LLEN")
-            .arg(format!("{queue_key}:dlq"))
+            .arg(crate::keys::dlq(queue))
             .query_async(&mut conn)
             .await
             .unwrap_or(0);
         let delayed: u64 = redis::cmd("ZCARD")
-            .arg(format!("{queue_key}:delayed"))
+            .arg(crate::keys::delayed(queue))
             .query_async(&mut conn)
             .await
             .unwrap_or(0);
@@ -740,27 +753,49 @@ pub(crate) fn queue_type_label(redis_type: &str) -> String {
     }
 }
 
-/// Pure helper: extract the base queue name from a scanned `celers:*` key,
-/// filtering out worker/task/metrics/schedule namespaces and queue-derived
-/// suffix keys (`:dlq`, `:processing`, `:delayed`, `:paused`), leaving only
-/// primary queue keys of the form `celers:<name>`.
+/// Pure helper: extract the base queue name from a scanned Redis key,
+/// filtering out this CLI's own `celers:`-namespaced non-queue keys
+/// (worker/task/metrics/schedule/alias, see
+/// [`crate::keys::is_reserved_namespace_key`]) and queue-derived suffix keys
+/// (`:dlq`, `:processing`, `:delayed`, `:paused`, `:drain`, see
+/// [`crate::keys::has_queue_family_suffix`]), leaving only primary queue
+/// keys.
+///
+/// Unlike every other namespace this CLI writes into Redis -- all of which
+/// are deliberately `celers:`-prefixed -- a real `RedisBroker` queue-family
+/// key carries no shared prefix at all (see [`crate::keys`]'s module docs):
+/// the bare queue name *is* the key. So this used to (incorrectly) require
+/// a `celers:` prefix and strip it off before treating the rest as a queue
+/// name (idx 331/337); scanning `celers:*` for that scheme matched nothing
+/// for a real, non-prefixed queue, silently making every caller of this
+/// function see zero queues against a live, non-empty broker. The fix is to
+/// treat the *absence* of a `celers:` prefix (and of a recognized
+/// queue-family suffix) as the positive signal for "this is a queue key",
+/// since that is the one property real queue keys and every other namespace
+/// this CLI owns can always be told apart by.
+///
+/// The suffix check runs *before* the namespace check, not after: the
+/// configured *default* queue name is literally `"celers"` (see
+/// `Config::default_config`), so that queue's own sibling keys
+/// (`celers:dlq`, `celers:processing`, `celers:delayed`) would otherwise be
+/// misclassified as `celers:`-namespaced bookkeeping instead of as this
+/// queue's own buckets -- silently hiding the default queue's DLQ/delayed
+/// rows from every caller.
+///
+/// This is necessarily a heuristic rather than a guarantee: `RedisBroker`
+/// reserves no namespace of its own, so a key written by something entirely
+/// unrelated to `celers` (sharing the same Redis logical DB) that happens to
+/// avoid both the reserved namespaces and every queue-family suffix cannot
+/// be distinguished from a real queue by name alone. Callers that scan the
+/// keyspace additionally filter by Redis `TYPE` (`list`/`zset`, the only
+/// types `RedisBroker` ever creates a queue-family key as) to narrow this
+/// further.
 pub(crate) fn base_queue_name(key: &str) -> Option<String> {
-    let rest = key.strip_prefix("celers:")?;
-    if rest.is_empty() {
+    if key.is_empty() || crate::keys::has_queue_family_suffix(key) {
         return None;
     }
-    const NON_QUEUE_PREFIXES: &[&str] = &["worker:", "task:", "metrics:", "schedule:", "alias:"];
-    if NON_QUEUE_PREFIXES.iter().any(|p| rest.starts_with(p)) {
+    if crate::keys::is_reserved_namespace_key(key) {
         return None;
     }
-    const QUEUE_SUFFIXES: &[&str] = &[":dlq", ":processing", ":delayed", ":paused"];
-    if QUEUE_SUFFIXES.iter().any(|s| rest.ends_with(s)) {
-        return None;
-    }
-    if rest.contains(':') {
-        // Anything else with a colon is an unrecognized nested namespace, not
-        // a primary queue key.
-        return None;
-    }
-    Some(rest.to_string())
+    Some(key.to_string())
 }

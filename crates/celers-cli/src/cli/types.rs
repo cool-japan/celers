@@ -650,6 +650,12 @@ pub(super) enum Commands {
         /// Task timeout in seconds
         #[arg(short, long, default_value_t = 300)]
         timeout: u64,
+        /// Graceful-shutdown grace period in seconds: how long to wait for
+        /// in-flight tasks to finish after Ctrl+C before giving up and
+        /// exiting anyway. Overrides `CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS`;
+        /// falls back to a 30s default when neither is set.
+        #[arg(long)]
+        shutdown_timeout: Option<u64>,
         /// Configuration file path
         #[arg(long)]
         config: Option<PathBuf>,
@@ -868,6 +874,11 @@ pub(super) enum Commands {
         /// Queue name
         #[arg(short, long)]
         queue: Option<String>,
+        /// Treat warnings as failures too (exit non-zero on any detected
+        /// issue, not just critical ones). Useful for gating CI/monitoring
+        /// on a fully clean result.
+        #[arg(long)]
+        strict: bool,
         /// Configuration file path
         #[arg(long)]
         config: Option<PathBuf>,
@@ -936,6 +947,12 @@ pub(super) enum Commands {
         /// RFC 3339 timestamp; only entries changed since this time are included (ignored if --previous is set).
         #[arg(long)]
         since: Option<String>,
+        /// Confirm that a backup capturing zero queues and zero schedules is
+        /// expected, and write the (empty) archive anyway. Without this,
+        /// such a capture fails loudly instead of silently producing a
+        /// useless archive (almost always a misconfigured `queues` list).
+        #[arg(long)]
+        allow_empty: bool,
         /// Configuration file path
         #[arg(long)]
         config: Option<PathBuf>,

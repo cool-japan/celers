@@ -73,18 +73,7 @@ pub(crate) fn build_serialized_task(row: &DequeuedRow) -> SerializedTask {
     let mut metadata = row
         .metadata_json
         .as_deref()
-        .and_then(|raw| match serde_json::from_str::<TaskMetadata>(raw) {
-            Ok(meta) => Some(meta),
-            Err(e) => {
-                tracing::warn!(
-                    task_id = %row.id,
-                    error = %e,
-                    "Task metadata document could not be decoded; \
-                     falling back to column values"
-                );
-                None
-            }
-        })
+        .and_then(decode_task_metadata)
         .unwrap_or_else(|| TaskMetadata::new(row.task_name.clone()));
 
     metadata.id = row.id;
@@ -95,6 +84,41 @@ pub(crate) fn build_serialized_task(row: &DequeuedRow) -> SerializedTask {
     SerializedTask {
         metadata,
         payload: row.payload.clone(),
+    }
+}
+
+/// Decode a stored metadata document into a [`TaskMetadata`].
+///
+/// Distinguishes the two failure shapes so the logs stay useful:
+///
+/// * A document with no `id` key is simply not a task-metadata document —
+///   older rows and a few auxiliary insert paths store only labels. Expected,
+///   logged at debug.
+/// * A document that *has* an `id` but still fails to decode is real
+///   corruption or a schema/serde mismatch, and is logged at warn.
+fn decode_task_metadata(raw: &str) -> Option<TaskMetadata> {
+    match serde_json::from_str::<TaskMetadata>(raw) {
+        Ok(metadata) => Some(metadata),
+        Err(error) => {
+            let looks_like_metadata = serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|value| value.get("id").cloned())
+                .is_some();
+            if looks_like_metadata {
+                tracing::warn!(
+                    %error,
+                    "Task metadata document has an id but could not be decoded; \
+                     falling back to column values"
+                );
+            } else {
+                tracing::debug!(
+                    %error,
+                    "Task row carries a label-only metadata document; \
+                     rebuilding task metadata from column values"
+                );
+            }
+            None
+        }
     }
 }
 
@@ -217,6 +241,24 @@ mod tests {
         assert_eq!(task.metadata.id, row.id);
         assert_eq!(task.metadata.priority, 42);
         assert_eq!(task.metadata.timeout_secs, None);
+    }
+
+    /// Some auxiliary insert paths store only labels, not a full metadata
+    /// document. That must degrade cleanly, not lose the row id.
+    #[test]
+    fn label_only_metadata_document_degrades_without_losing_the_id() {
+        let row = sample_row(Some(r#"{"queue":"payments","group_id":"g1"}"#.to_string()));
+        let task = build_serialized_task(&row);
+        assert_eq!(task.metadata.id, row.id);
+        assert_eq!(task.metadata.name, "send_email");
+        assert_eq!(task.metadata.max_retries, 7);
+    }
+
+    #[test]
+    fn null_metadata_column_degrades_without_losing_the_id() {
+        let row = sample_row(None);
+        let task = build_serialized_task(&row);
+        assert_eq!(task.metadata.id, row.id);
     }
 
     #[test]

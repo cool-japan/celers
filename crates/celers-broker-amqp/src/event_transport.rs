@@ -239,6 +239,8 @@ impl AmqpEventEmitter {
             .await
             .map_err(|e| CelersError::Other(format!("AMQP channel creation error: {}", e)))?;
 
+        enable_publisher_confirms(&channel).await?;
+
         Ok(Self {
             channel: Arc::new(RwLock::new(Some(channel))),
             uri: uri.to_string(),
@@ -355,6 +357,8 @@ impl AmqpEventEmitter {
             .await
             .map_err(|e| CelersError::Other(format!("AMQP channel recreation error: {}", e)))?;
 
+        enable_publisher_confirms(&new_channel).await?;
+
         // Reset exchange declared flag since we have a new channel
         {
             let mut declared = self.exchange_declared.write().await;
@@ -377,7 +381,7 @@ impl AmqpEventEmitter {
             .with_content_type("application/json".into())
             .with_delivery_mode(if self.config.durable { 2 } else { 1 });
 
-        channel
+        let confirmation = channel
             .basic_publish(
                 self.config.exchange.as_str().into(),
                 self.config.routing_key.as_str().into(),
@@ -390,8 +394,25 @@ impl AmqpEventEmitter {
             .await
             .map_err(|e| CelersError::Other(format!("AMQP publish confirm error: {}", e)))?;
 
+        // A `Nack` or an unroutable return means the broker did not take the
+        // event: it must not be reported as a successful publish.
+        crate::confirm::classify_confirmation(confirmation, true)
+            .map_err(|e| CelersError::Other(format!("AMQP publish not confirmed: {}", e)))?;
+
         Ok(())
     }
+}
+
+/// Enable publisher confirms on an event-publishing channel.
+///
+/// Without `confirm.select` every `PublisherConfirm` resolves immediately
+/// with `Confirmation::NotRequested`, so "confirmed" statistics would be
+/// fabricated.
+async fn enable_publisher_confirms(channel: &Channel) -> std::result::Result<(), CelersError> {
+    channel
+        .confirm_select(ConfirmSelectOptions::default())
+        .await
+        .map_err(|e| CelersError::Other(format!("AMQP confirm.select error: {}", e)))
 }
 
 #[async_trait]
@@ -469,8 +490,16 @@ impl EventEmitter for AmqpEventEmitter {
 
             // Wait for all confirms in this chunk
             for (bytes, event_type, confirm) in confirms {
-                match confirm.await {
-                    Ok(_) => {
+                let outcome = match confirm.await {
+                    Ok(confirmation) => crate::confirm::classify_confirmation(confirmation, true)
+                        .map_err(|e| CelersError::Other(e.to_string())),
+                    Err(e) => Err(CelersError::Other(format!(
+                        "AMQP publish confirm error: {}",
+                        e
+                    ))),
+                };
+                match outcome {
+                    Ok(()) => {
                         let mut stats = self.stats.write().await;
                         stats.record_success(bytes);
                         debug!(

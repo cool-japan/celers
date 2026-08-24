@@ -465,7 +465,8 @@ ScheduleTemplates::weekend_mornings(); // Sat/Sun at 8 AM
 
 // Monthly schedules
 ScheduleTemplates::monthly_first_day(); // 1st of month
-ScheduleTemplates::monthly_last_day(); // 28-31st of month
+ScheduleTemplates::monthly_last_day(); // real last day of month (28/29/30/31), once
+ScheduleTemplates::monthly_last_day_at(23, 30); // ...at a specific time
 
 // Business hours
 ScheduleTemplates::business_hours_hourly();

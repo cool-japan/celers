@@ -41,6 +41,7 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result};
 use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
@@ -439,7 +440,7 @@ impl AdaptiveConnectionPool {
     async fn create_connection(&self) -> Result<(MultiplexedConnection, String)> {
         let conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to create connection: {}", e)))?;
 
@@ -471,7 +472,7 @@ impl AdaptiveConnectionPool {
         if current_stats.utilization > config.scale_up_threshold
             && current_stats.current_size < config.max_size
         {
-            if let Ok(conn) = client.get_multiplexed_async_connection().await {
+            if let Ok(conn) = client.celers_multiplexed_connection().await {
                 let id = format!("conn_{}", uuid::Uuid::new_v4());
 
                 let meta = ConnectionMetadata {

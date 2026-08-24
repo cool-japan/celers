@@ -414,7 +414,9 @@ impl AmqpBroker {
                 (exchange.to_string(), routing_key.to_string())
             };
 
-        let channel = self.get_channel().await?;
+        let channel = self.get_channel().await?.clone();
+        let confirms_enabled = self.channel_confirm_mode;
+        let mandatory = self.config.mandatory_publish;
 
         // Serialize message to JSON
         let payload =
@@ -442,11 +444,14 @@ impl AmqpBroker {
         }
 
         // Publish message
-        channel
+        let confirmation = channel
             .basic_publish(
                 effective_exchange.as_str().into(),
                 effective_routing_key.as_str().into(),
-                BasicPublishOptions::default(),
+                BasicPublishOptions {
+                    mandatory,
+                    ..Default::default()
+                },
                 &payload,
                 properties,
             )
@@ -456,6 +461,8 @@ impl AmqpBroker {
             .map_err(|e| {
                 BrokerError::OperationFailed(format!("Failed to confirm publish: {}", e))
             })?;
+
+        crate::confirm::classify_confirmation(confirmation, confirms_enabled)?;
 
         debug!(
             "Published message to {}/{}",
@@ -667,6 +674,18 @@ impl AmqpBroker {
     ///
     /// After calling this, all publish and ack operations will be part of the transaction
     /// until `commit_transaction()` or `rollback_transaction()` is called.
+    ///
+    /// `tx.select` and `confirm.select` are mutually exclusive on an AMQP
+    /// channel, so when publisher confirms are enabled the current channel is
+    /// replaced by a fresh, non-confirming one for the duration of the
+    /// transaction (and replaced again once the transaction ends).
+    ///
+    /// Replacing the channel invalidates every delivery tag handed out so far
+    /// and cancels live subscriptions, so a *transactional ack* workflow
+    /// (consume, then ack inside the transaction) requires the channel to stay
+    /// put: build the broker with
+    /// [`AmqpConfig::with_publisher_confirms(false)`](crate::AmqpConfig::with_publisher_confirms).
+    /// Publishing inside a transaction is unaffected.
     pub async fn start_transaction(&mut self) -> Result<()> {
         if self.transaction_state == TransactionState::Started {
             return Err(BrokerError::OperationFailed(
@@ -674,15 +693,46 @@ impl AmqpBroker {
             ));
         }
 
-        let channel = self.get_channel().await?;
+        let previous_state = self.transaction_state;
 
-        channel.tx_select().await.map_err(|e| {
-            BrokerError::OperationFailed(format!("Failed to start transaction: {}", e))
-        })?;
+        if self.channel_confirm_mode {
+            // The cached channel is in confirm mode and cannot be switched to
+            // transactional mode; drop it so a plain one is created.
+            self.discard_channel();
+        }
 
+        // Set the state first so the replacement channel is created without
+        // `confirm.select`.
         self.transaction_state = TransactionState::Started;
+
+        let result = async {
+            let channel = self.get_channel().await?;
+            channel.tx_select().await.map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to start transaction: {}", e))
+            })
+        }
+        .await;
+
+        if let Err(e) = result {
+            self.transaction_state = previous_state;
+            // The channel that failed `tx.select` is not in confirm mode
+            // either; drop it so the next operation gets a channel that
+            // matches the configuration again.
+            self.discard_channel();
+            return Err(e);
+        }
+
         debug!("Started transaction");
         Ok(())
+    }
+
+    /// Leave transactional mode: the channel used for the transaction can
+    /// never go back to confirm mode, so drop it when confirms are wanted.
+    fn end_transaction(&mut self, state: TransactionState) {
+        self.transaction_state = state;
+        if self.config.publisher_confirms {
+            self.discard_channel();
+        }
     }
 
     /// Commit the current transaction
@@ -701,7 +751,7 @@ impl AmqpBroker {
             BrokerError::OperationFailed(format!("Failed to commit transaction: {}", e))
         })?;
 
-        self.transaction_state = TransactionState::Committed;
+        self.end_transaction(TransactionState::Committed);
         debug!("Committed transaction");
         Ok(())
     }
@@ -722,7 +772,7 @@ impl AmqpBroker {
             BrokerError::OperationFailed(format!("Failed to rollback transaction: {}", e))
         })?;
 
-        self.transaction_state = TransactionState::RolledBack;
+        self.end_transaction(TransactionState::RolledBack);
         debug!("Rolled back transaction");
         Ok(())
     }

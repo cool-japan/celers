@@ -715,7 +715,7 @@ impl PostgresBroker {
         if let Some(created_after_secs) = filter.created_after_secs {
             param_count += 1;
             conditions.push(format!(
-                "created_at >= NOW() - INTERVAL '1 second' * ${}",
+                "created_at >= NOW() - INTERVAL '1 second' * ${}::bigint",
                 param_count
             ));
             owned_params.push(Box::new(created_after_secs));
@@ -996,7 +996,7 @@ impl PostgresBroker {
         if let Some(created_after_secs) = filter.created_after_secs {
             param_count += 1;
             conditions.push(format!(
-                "created_at >= NOW() - INTERVAL '1 second' * ${}",
+                "created_at >= NOW() - INTERVAL '1 second' * ${}::bigint",
                 param_count
             ));
             owned_params.push(Box::new(created_after_secs));

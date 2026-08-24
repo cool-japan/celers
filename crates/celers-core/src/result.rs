@@ -179,6 +179,80 @@ pub trait ResultStore: Send + Sync {
     ) -> crate::Result<bool> {
         Ok(false)
     }
+
+    /// Store a task result, carrying the task's *name* alongside it.
+    ///
+    /// [`Self::store_result`] takes only the task id, so a backend that wants
+    /// to honour a per-task-type TTL ([`crate::result_ttl::ResultTtlConfig`])
+    /// has to recover the name by reading the record it is about to write —
+    /// which is impossible for a result whose record does not exist yet, i.e.
+    /// exactly the first write. This method closes that gap without breaking
+    /// existing implementors.
+    ///
+    /// # Contract
+    ///
+    /// * The default implementation ignores `task_name` and delegates to
+    ///   [`Self::store_result`], so behaviour is unchanged for every backend
+    ///   that does not override it.
+    /// * `task_name` is `None` when the caller genuinely does not know it;
+    ///   an overriding backend must then fall back to the default TTL.
+    /// * Overriding backends must remain consistent with `store_result`: the
+    ///   stored value must be identical, only the retention policy may differ.
+    ///
+    /// # Status
+    ///
+    /// No in-repo backend overrides this yet, so today it is a pure pass-through
+    /// everywhere; it exists so a name-aware backend can be written without a
+    /// breaking trait change. See the crate follow-up notes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever the underlying store returns.
+    async fn store_result_named(
+        &self,
+        task_id: TaskId,
+        task_name: Option<&str>,
+        result: TaskResultValue,
+    ) -> crate::Result<()> {
+        let _ = task_name;
+        self.store_result(task_id, result).await
+    }
+
+    // ------------------------------------------------------------------
+    // Completion notifications (default "unsupported" hook)
+    // ------------------------------------------------------------------
+
+    /// Block until the backend has news about `task_id`, or `max_wait` elapses.
+    ///
+    /// This is the push half of [`AsyncResult::get`]: a backend with a
+    /// completion signal (Redis keyspace notifications, PostgreSQL
+    /// `LISTEN`/`NOTIFY`, a gRPC server stream) can override this so waiters
+    /// are woken by the write instead of re-reading on a timer.
+    ///
+    /// # Contract
+    ///
+    /// * `Ok(true)` — "I waited": either a signal arrived or `max_wait`
+    ///   elapsed. The caller re-reads the result immediately and does **not**
+    ///   sleep. An implementation that returns `Ok(true)` without having
+    ///   actually waited turns the caller's poll loop into a busy loop.
+    /// * `Ok(false)` — "unsupported": the caller falls back to its own backoff
+    ///   sleep. This is the default, so every existing backend keeps polling
+    ///   exactly as before.
+    /// * A spurious wake-up is always safe: the caller re-checks the stored
+    ///   result and loops if the task is still pending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport errors from the subscription. A backend that loses
+    /// its subscription should prefer returning `Ok(false)` (degrade to
+    /// polling) over failing the caller's wait.
+    async fn await_result_change(
+        &self,
+        _task_id: TaskId,
+        _max_wait: Duration,
+    ) -> crate::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Task result value stored in backend
@@ -304,6 +378,14 @@ pub struct AsyncResultConfig {
     /// Whether a tombstoned (explicitly forgotten) result ends the wait with an
     /// error instead of polling forever.
     pub fail_on_tombstone: bool,
+    /// Longest single block on [`ResultStore::await_result_change`] when the
+    /// backend supports completion notifications.
+    ///
+    /// Only a safety re-check interval: a push-capable backend returns as soon
+    /// as the result lands, so this bounds how long a *missed* notification can
+    /// delay a waiter. Ignored entirely by backends that do not override
+    /// `await_result_change`.
+    pub max_notification_wait: Duration,
 }
 
 impl Default for AsyncResultConfig {
@@ -312,6 +394,7 @@ impl Default for AsyncResultConfig {
             initial_poll_interval: Duration::from_millis(100),
             max_poll_interval: Duration::from_secs(2),
             fail_on_tombstone: true,
+            max_notification_wait: Duration::from_secs(30),
         }
     }
 }
@@ -324,6 +407,7 @@ impl AsyncResultConfig {
             initial_poll_interval: interval,
             max_poll_interval: interval,
             fail_on_tombstone: true,
+            max_notification_wait: Duration::from_secs(30),
         }
     }
 
@@ -345,6 +429,13 @@ impl AsyncResultConfig {
     #[must_use]
     pub const fn with_fail_on_tombstone(mut self, fail: bool) -> Self {
         self.fail_on_tombstone = fail;
+        self
+    }
+
+    /// Set the longest single block on a backend completion notification.
+    #[must_use]
+    pub const fn with_max_notification_wait(mut self, wait: Duration) -> Self {
+        self.max_notification_wait = wait;
         self
     }
 
@@ -586,6 +677,29 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
                         self.task_id
                     )));
                 }
+            }
+
+            // Prefer the backend's completion signal over a timer. A backend
+            // that does not support one returns `Ok(false)` (the trait default)
+            // and we fall back to the exponential backoff below.
+            let mut notification_wait = self.config.max_notification_wait;
+            if let Some(timeout_duration) = timeout {
+                // Never block past the caller's deadline.
+                notification_wait =
+                    notification_wait.min(timeout_duration.saturating_sub(start.elapsed()));
+            }
+            // A zero wait would make a contract-abiding backend return
+            // `Ok(true)` immediately ("max_wait elapsed"), turning the loop into
+            // a hot spin over the last microseconds before the deadline.
+            if !notification_wait.is_zero()
+                && self
+                    .store
+                    .await_result_change(self.task_id, notification_wait)
+                    .await?
+            {
+                // The backend waited for us: re-read at once, and do not grow
+                // the backoff, since we were not polling.
+                continue;
             }
 
             // Wait before next poll, backing off up to the configured ceiling.

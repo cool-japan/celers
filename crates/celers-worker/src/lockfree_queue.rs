@@ -126,13 +126,37 @@ impl<T> Default for LockFreeQueue<T> {
     }
 }
 
-// Implement Send and Sync explicitly to ensure thread-safety
-unsafe impl<T: Send> Send for LockFreeQueue<T> {}
-unsafe impl<T: Send> Sync for LockFreeQueue<T> {}
+// `Send`/`Sync` are deliberately *not* implemented by hand here. Every field is
+// an `Arc` over a type crossbeam already declares thread-safe
+// (`Injector<T>: Send + Sync where T: Send`), so the compiler derives both auto
+// traits with exactly the same bounds. The hand-written `unsafe impl`s that used
+// to live here bought nothing and disabled the compiler's future checking: any
+// later field that is genuinely not thread-safe would have been silently
+// blessed instead of rejected. The static assertion below pins the property.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The auto-derived `Send`/`Sync` really do hold, so removing the manual
+    /// `unsafe impl`s did not narrow the queue's usable surface.
+    #[test]
+    fn test_lockfree_queue_is_send_and_sync_without_manual_impls() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<LockFreeQueue<String>>();
+        assert_send_sync::<LockFreeQueue<Vec<u8>>>();
+        // Shared across threads, which is the property the manual impls existed
+        // to advertise.
+        let queue = Arc::new(LockFreeQueue::new());
+        let writer = Arc::clone(&queue);
+        let handle = std::thread::spawn(move || {
+            for i in 0..100u32 {
+                writer.push(i);
+            }
+        });
+        handle.join().expect("writer thread");
+        assert_eq!(queue.len(), 100);
+    }
 
     #[test]
     fn test_lockfree_queue_basic() {

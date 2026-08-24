@@ -132,15 +132,21 @@ pub mod batch {
         counts
     }
 
-    /// Check if any tasks have expired
+    /// Check if any *messages* have passed their `expires_at` deadline
+    ///
+    /// This reads message expiry only — a long-queued task whose *execution*
+    /// time limit (`timeout_secs`) has elapsed is not expired, because it has
+    /// not started running yet.
     ///
     /// # Example
     /// ```
     /// use celers_core::{SerializedTask, task::batch};
     ///
     /// let tasks = vec![
+    ///     // An execution time limit is NOT a message expiry.
     ///     SerializedTask::new("task1".to_string(), vec![1]).with_timeout(60),
-    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    ///     SerializedTask::new("task2".to_string(), vec![2])
+    ///         .with_expires_in(chrono::Duration::seconds(60)),
     /// ];
     ///
     /// // Fresh tasks shouldn't be expired
@@ -152,20 +158,21 @@ pub mod batch {
         tasks.iter().any(super::SerializedTask::is_expired)
     }
 
-    /// Get tasks that have expired
+    /// Get the tasks whose message has passed its `expires_at` deadline
     ///
     /// # Example
     /// ```
     /// use celers_core::{SerializedTask, task::batch};
     ///
     /// let tasks = vec![
-    ///     SerializedTask::new("task1".to_string(), vec![1]).with_timeout(60),
-    ///     SerializedTask::new("task2".to_string(), vec![2]),
+    ///     SerializedTask::new("task1".to_string(), vec![1])
+    ///         .with_expires_in(chrono::Duration::seconds(-1)),
+    ///     SerializedTask::new("task2".to_string(), vec![2])
+    ///         .with_expires_in(chrono::Duration::seconds(60)),
     /// ];
     ///
     /// let expired = batch::get_expired_tasks(&tasks);
-    /// // Fresh tasks shouldn't be expired
-    /// assert_eq!(expired.len(), 0);
+    /// assert_eq!(expired.len(), 1);
     /// ```
     #[inline]
     #[must_use]
@@ -423,13 +430,25 @@ pub struct TaskMetadata {
     ///
     /// This bounds how long the task may run once a worker starts it
     /// (`celers-worker` wraps execution in a `tokio::time::timeout` of this
-    /// length, measured from when the task starts).
+    /// length, measured from when the task starts). It is Celery's
+    /// `time_limit`, **not** its `expires`.
     ///
-    /// Celery keeps message expiry (`expires`) and the execution limit
-    /// (`time_limit`) separate; this type does not yet have a distinct
-    /// `expires_at`, so [`TaskMetadata::is_expired`] currently reads this field
-    /// as a creation-relative message expiry. See that method's documentation.
+    /// Message expiry lives in the separate [`Self::expires_at`] field, which is
+    /// what [`TaskMetadata::is_expired`] reads.
     pub timeout_secs: Option<u64>,
+
+    /// Absolute deadline after which the *message* is stale and must not be
+    /// executed at all.
+    ///
+    /// This is Celery's `expires` (see `celers-protocol`'s task message), kept
+    /// deliberately distinct from [`Self::timeout_secs`]: a task that sits in a
+    /// queue for longer than its execution time limit is **not** expired, it
+    /// simply has not started yet. `None` means the message never expires.
+    ///
+    /// Optional and defaulted on the wire, so messages produced before this
+    /// field existed still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 
     /// Task priority (higher = more important)
     pub priority: i32,
@@ -505,6 +524,7 @@ impl TaskMetadata {
             updated_at: now,
             max_retries: 3,
             timeout_secs: None,
+            expires_at: None,
             priority: 0,
             group_id: None,
             chord_id: None,
@@ -524,6 +544,32 @@ impl TaskMetadata {
     #[must_use]
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    /// Set the absolute message-expiry deadline (Celery's `expires`).
+    ///
+    /// Distinct from [`Self::with_timeout`], which sets the *execution* time
+    /// limit.
+    #[inline]
+    #[must_use]
+    pub fn with_expires_at(mut self, expires_at: DateTime<Utc>) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Set the message-expiry deadline relative to `created_at`.
+    ///
+    /// A `ttl` beyond the representable range saturates instead of wrapping, so
+    /// an absurdly large TTL means "effectively never" rather than "already
+    /// expired".
+    #[inline]
+    #[must_use]
+    pub fn with_expires_in(mut self, ttl: chrono::Duration) -> Self {
+        self.expires_at = self.created_at.checked_add_signed(ttl);
+        if self.expires_at.is_none() {
+            self.expires_at = Some(DateTime::<Utc>::MAX_UTC);
+        }
         self
     }
 
@@ -581,24 +627,35 @@ impl TaskMetadata {
         })
     }
 
-    /// Check if the task has expired based on its timeout.
+    /// Whether the *message* has expired and must not be executed.
     ///
     /// # Semantics
     ///
-    /// This measures `timeout_secs` from `created_at`, i.e. it treats the
-    /// *execution* time limit as a *message* expiry. Celery keeps the two
-    /// separate (`expires` vs `time_limit`), and so should this type: a task
-    /// that waits in a queue longer than its execution timeout is reported
-    /// expired here even though it has not started running. Separating them
-    /// requires a distinct `expires_at` field on this struct, which is a
-    /// source-breaking addition for exhaustive struct literals and is tracked as
-    /// follow-up work; until then this is an alias of
-    /// [`Self::execution_time_elapsed`], and callers that want the execution
-    /// limit should measure it from the start of execution as the worker does.
+    /// This reads [`Self::expires_at`] only — the absolute deadline that
+    /// corresponds to Celery's `expires`. A task with no `expires_at` never
+    /// expires, however long it waits in a queue and whatever
+    /// [`Self::timeout_secs`] says: `timeout_secs` is the *execution* time
+    /// limit, which the worker measures from the moment the task starts
+    /// running, and conflating the two used to mark a merely-queued task as
+    /// expired.
+    ///
+    /// Use [`Self::execution_time_elapsed`] for the (different, and rarely what
+    /// you want) creation-relative reading of `timeout_secs`.
     #[inline]
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.execution_time_elapsed()
+        self.expires_at
+            .is_some_and(|deadline| Utc::now() > deadline)
+    }
+
+    /// Time remaining before the message expires.
+    ///
+    /// Returns `None` when no [`Self::expires_at`] is set ("never expires").
+    /// A task already past its deadline yields a negative duration.
+    #[inline]
+    #[must_use]
+    pub fn time_until_expiry(&self) -> Option<chrono::Duration> {
+        self.expires_at.map(|deadline| deadline - Utc::now())
     }
 
     /// Check if the task is in a terminal state (Succeeded or Failed)
@@ -983,6 +1040,12 @@ impl TaskMetadata {
 
     /// Clone task with a new ID (useful for task retry/duplication)
     ///
+    /// `created_at`/`updated_at` are reset to now, but [`Self::expires_at`] is
+    /// carried over **unshifted**: it is an absolute deadline for the unit of
+    /// work, so a retry must not be able to outlive the deadline the producer
+    /// set. Call [`Self::with_expires_in`] on the clone to grant a fresh window
+    /// deliberately.
+    ///
     /// # Example
     /// ```
     /// use celers_core::TaskMetadata;
@@ -992,6 +1055,7 @@ impl TaskMetadata {
     /// assert_ne!(task.id, cloned.id);
     /// assert_eq!(task.name, cloned.name);
     /// assert_eq!(task.priority, cloned.priority);
+    /// assert_eq!(task.expires_at, cloned.expires_at);
     /// ```
     #[inline]
     #[must_use]
@@ -1005,6 +1069,7 @@ impl TaskMetadata {
             updated_at: now,
             max_retries: self.max_retries,
             timeout_secs: self.timeout_secs,
+            expires_at: self.expires_at,
             priority: self.priority,
             group_id: self.group_id,
             chord_id: self.chord_id,
@@ -1029,6 +1094,10 @@ impl fmt::Display for TaskMetadata {
 
         if let Some(timeout) = self.timeout_secs {
             write!(f, " timeout={timeout}s")?;
+        }
+
+        if let Some(expires_at) = self.expires_at {
+            write!(f, " expires={}", expires_at.to_rfc3339())?;
         }
 
         if let Some(chord_id) = self.chord_id {
@@ -1133,6 +1202,25 @@ impl SerializedTask {
         self
     }
 
+    /// Set the absolute message-expiry deadline (Celery's `expires`).
+    ///
+    /// Distinct from [`Self::with_timeout`], which sets the *execution* time
+    /// limit; only this one affects [`Self::is_expired`].
+    #[inline]
+    #[must_use]
+    pub fn with_expires_at(mut self, expires_at: DateTime<Utc>) -> Self {
+        self.metadata = self.metadata.with_expires_at(expires_at);
+        self
+    }
+
+    /// Set the message-expiry deadline relative to the task's creation time.
+    #[inline]
+    #[must_use]
+    pub fn with_expires_in(mut self, ttl: chrono::Duration) -> Self {
+        self.metadata = self.metadata.with_expires_in(ttl);
+        self
+    }
+
     /// Set the group ID for workflow grouping
     #[inline]
     #[must_use]
@@ -1164,9 +1252,10 @@ impl SerializedTask {
         self.metadata.age()
     }
 
-    /// Check if the task has expired based on its timeout.
+    /// Whether the *message* has passed its `expires_at` deadline.
     ///
-    /// See [`TaskMetadata::is_expired`] for the (currently conflated) semantics.
+    /// See [`TaskMetadata::is_expired`]: this reads the message-expiry deadline
+    /// only, never the execution time limit.
     #[inline]
     #[must_use]
     pub fn is_expired(&self) -> bool {
@@ -1794,24 +1883,11 @@ mod tests {
             assert!(invalid_metadata.validate().is_err());
         }
 
-        #[test]
-        fn test_task_expiration_lifecycle() {
-            // Fresh task with a 1s timeout is not yet expired.
-            let mut task =
-                SerializedTask::new("expiring_task".to_string(), vec![1, 2, 3]).with_timeout(1);
-            assert!(!task.is_expired());
-            assert!(!task.execution_time_elapsed());
-
-            // Back-date creation instead of sleeping: deterministic and instant.
-            task.metadata.created_at = Utc::now() - chrono::Duration::seconds(5);
-            assert!(task.is_expired());
-            assert!(task.execution_time_elapsed());
-
-            // A task with no timeout never expires.
-            let mut forever = SerializedTask::new("forever".to_string(), vec![1]);
-            forever.metadata.created_at = Utc::now() - chrono::Duration::days(365);
-            assert!(!forever.is_expired());
-        }
+        // The task-expiry lifecycle tests live in
+        // `tests/task_metadata_regression.rs` — see
+        // `expiration_lifecycle_reads_only_the_message_deadline` and
+        // `message_expiry_and_execution_limit_are_separate` — so this file stays
+        // comfortably under the 2000-line cap.
 
         #[test]
         fn test_workflow_with_multiple_dependencies() {

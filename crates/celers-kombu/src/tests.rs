@@ -191,10 +191,18 @@ fn test_retry_policy_infinite() {
 
 #[test]
 fn test_retry_policy_delay_for_attempt() {
+    // `.with_jitter(false)` is required here: `RetryPolicy` defaults to
+    // `jitter: true`, under which `delay_for_attempt` returns a uniformly
+    // random value in `[0, capped_delay]` (see retry.rs), which is
+    // incompatible with the exact-value assertions below. Disabling jitter
+    // isolates the exponential-backoff base-delay math this test actually
+    // targets, matching `test_retry_policy_builders` above and
+    // `retry::tests::delay_for_attempt_without_jitter_is_deterministic`.
     let policy = RetryPolicy::new()
         .with_initial_delay(Duration::from_millis(100))
         .with_backoff_multiplier(2.0)
-        .with_max_delay(Duration::from_secs(10));
+        .with_max_delay(Duration::from_secs(10))
+        .with_jitter(false);
 
     assert_eq!(policy.delay_for_attempt(0), Duration::from_millis(100));
     assert_eq!(policy.delay_for_attempt(1), Duration::from_millis(200));

@@ -9,20 +9,25 @@ mod tests;
 use crate::adaptive_poll::{AdaptivePoll, PollOutcome};
 use crate::affinity::{AffinityDecision, AffinityRegistry};
 use crate::batching::{self, CoalesceStrategy};
+use crate::cancellation::CancellationToken;
+use crate::checkpoint::CheckpointManager;
 use crate::circuit_breaker::CircuitBreaker;
 use crate::coordinated_rate_limit::{RateLimitDecision, WorkerRateLimitCoordinator};
 use crate::dlq::DlqHandler;
-use crate::execution_context::{RevocationWatcher, TaskExecutionContext};
+use crate::execution_context::{RevocationWatcher, SoftTimeout, TaskExecutionContext};
+use crate::health::HealthChecker;
 use crate::memory::MemoryTracker;
 use crate::middleware;
+use crate::poison_pill::PoisonPillDetector;
 use crate::routing::RoutingStrategy;
 use crate::types::{DynamicConfig, WorkerConfig, WorkerHandle, WorkerMode, WorkerStats};
 
-use execution::{DeadLetterRequest, TaskDispatch};
+use execution::{DeadLetterRequest, ExecutionLimits, TaskDispatch};
 use support::{
     clamp_defer_delay, effective_max_retries, ActiveTaskGuard, EventSink, InFlightRegistry,
 };
 
+use celers_core::time_limit::{TimeLimitConfig, WorkerTimeLimits};
 use celers_core::{
     Broker, Event, EventEmitter, NoOpEventEmitter, Result, TaskEvent, TaskEventBuilder, TaskId,
     TaskRegistry, WorkerEventBuilder,
@@ -92,6 +97,19 @@ pub struct Worker<B: Broker, E: EventEmitter = NoOpEventEmitter> {
     /// is matched against the worker's labels before execution and deferred if
     /// the worker cannot serve it. `None` (the default) is a no-op.
     pub(crate) affinity_registry: Option<Arc<AffinityRegistry>>,
+    /// Celery-style soft/hard time limits, resolved per task name (enabled via
+    /// [`Worker::with_time_limits`]). `None` (the default) leaves the plain
+    /// execution timeout as the only bound on a running task.
+    pub(crate) time_limits: Option<WorkerTimeLimits>,
+    /// Poison-pill quarantine (enabled via [`Worker::with_poison_pill`]).
+    /// `None` (the default) is a no-op.
+    pub(crate) poison_pill: Option<Arc<PoisonPillDetector>>,
+    /// Task-checkpoint store made available to running tasks (enabled via
+    /// [`Worker::with_checkpoints`]). `None` (the default) makes
+    /// [`save_checkpoint`](crate::execution_context::save_checkpoint) a no-op.
+    pub(crate) checkpoints: Option<Arc<CheckpointManager>>,
+    /// Liveness/readiness accounting, always on (a handful of atomics).
+    pub(crate) health: HealthChecker,
 }
 
 impl<B: Broker + 'static> Worker<B, NoOpEventEmitter> {
@@ -107,6 +125,23 @@ impl<B: Broker + 'static> Worker<B, NoOpEventEmitter> {
     /// run loop).
     pub fn new_from_arc(broker: Arc<B>, registry: TaskRegistry, config: WorkerConfig) -> Self {
         Worker::with_event_emitter_from_arc(broker, registry, config, NoOpEventEmitter::new())
+    }
+
+    /// Create a new worker, opening the configured DLQ storage backend.
+    ///
+    /// [`Worker::new`] cannot honour a Redis/PostgreSQL
+    /// [`DlqConfig::storage`](crate::DlqConfig::storage) because opening one is
+    /// async: it falls back to in-process memory (with a warning), so a
+    /// deployment that configured a *persistent* dead-letter queue silently got
+    /// a volatile one that empties on every restart. Use this constructor
+    /// whenever `dlq_config.storage` names a persistent backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DLQ backend cannot be reached, or if the
+    /// configuration names a backend whose cargo feature is not compiled in.
+    pub async fn connect(broker: B, registry: TaskRegistry, config: WorkerConfig) -> Result<Self> {
+        Worker::connect_with_event_emitter(broker, registry, config, NoOpEventEmitter::new()).await
     }
 }
 
@@ -128,23 +163,33 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         config: WorkerConfig,
         event_emitter: E,
     ) -> Self {
+        // `enable_dlq` is authoritative: `DlqConfig::enabled` defaults to false,
+        // so building the handler straight from the default config produced a
+        // handler that silently discarded every entry.
+        let dlq_handler = Self::effective_dlq_config(&config)
+            .map(|dlq_config| Arc::new(DlqHandler::new(dlq_config)));
+
+        Self::assemble(broker, registry, config, event_emitter, dlq_handler)
+    }
+
+    /// Build the worker around an already-decided DLQ handler.
+    ///
+    /// Split out so [`Worker::connect`] does not have to build a throwaway
+    /// in-memory handler first: `DlqHandler::new` warns that a configured
+    /// persistent backend is being downgraded, and emitting that warning on the
+    /// path that *does* honour the backend told operators the exact opposite of
+    /// the truth.
+    fn assemble(
+        broker: Arc<B>,
+        registry: TaskRegistry,
+        config: WorkerConfig,
+        event_emitter: E,
+        dlq_handler: Option<Arc<DlqHandler>>,
+    ) -> Self {
         let circuit_breaker = if config.enable_circuit_breaker {
             Some(Arc::new(CircuitBreaker::with_config(
                 config.circuit_breaker_config.clone(),
             )))
-        } else {
-            None
-        };
-
-        // `enable_dlq` is authoritative: `DlqConfig::enabled` defaults to false,
-        // so building the handler straight from the default config produced a
-        // handler that silently discarded every entry.
-        let dlq_handler = if config.enable_dlq {
-            let dlq_config = crate::dlq::DlqConfig {
-                enabled: true,
-                ..config.dlq_config.clone()
-            };
-            Some(Arc::new(DlqHandler::new(dlq_config)))
         } else {
             None
         };
@@ -171,7 +216,72 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             revocation_watcher: None,
             rate_limit_coordinator: None,
             affinity_registry: None,
+            time_limits: None,
+            poison_pill: None,
+            checkpoints: None,
+            health: HealthChecker::new(),
         }
+    }
+
+    /// The DLQ configuration this worker should actually run with, or `None`
+    /// when the dead-letter queue is disabled.
+    ///
+    /// `enable_dlq` is authoritative over `DlqConfig::enabled`, whose `false`
+    /// default otherwise produced a handler that silently discarded every entry.
+    fn effective_dlq_config(config: &WorkerConfig) -> Option<crate::dlq::DlqConfig> {
+        if !config.enable_dlq {
+            return None;
+        }
+        Some(crate::dlq::DlqConfig {
+            enabled: true,
+            ..config.dlq_config.clone()
+        })
+    }
+
+    /// Create a new worker with a custom event emitter, opening the configured
+    /// DLQ storage backend.
+    ///
+    /// See [`Worker::connect`] for why this exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DLQ backend cannot be reached, or if the
+    /// configuration names a backend whose cargo feature is not compiled in.
+    pub async fn connect_with_event_emitter(
+        broker: B,
+        registry: TaskRegistry,
+        config: WorkerConfig,
+        event_emitter: E,
+    ) -> Result<Self> {
+        Self::connect_with_event_emitter_from_arc(Arc::new(broker), registry, config, event_emitter)
+            .await
+    }
+
+    /// Create a new worker from a shared broker handle with a custom event
+    /// emitter, opening the configured DLQ storage backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DLQ backend cannot be reached, or if the
+    /// configuration names a backend whose cargo feature is not compiled in.
+    pub async fn connect_with_event_emitter_from_arc(
+        broker: Arc<B>,
+        registry: TaskRegistry,
+        config: WorkerConfig,
+        event_emitter: E,
+    ) -> Result<Self> {
+        let dlq_handler = match Self::effective_dlq_config(&config) {
+            Some(dlq_config) => Some(Arc::new(DlqHandler::connect(dlq_config).await?)),
+            None => None,
+        };
+
+        Ok(Self::assemble(
+            broker,
+            registry,
+            config,
+            event_emitter,
+            dlq_handler,
+        ))
     }
 
     /// Enable cooperative cancellation-during-execution.
@@ -272,6 +382,198 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     pub fn with_affinity(mut self, registry: AffinityRegistry) -> Self {
         self.affinity_registry = Some(Arc::new(registry));
         self
+    }
+
+    /// Enable Celery-style soft/hard time limits.
+    ///
+    /// For every task the worker resolves the effective
+    /// [`TimeLimitConfig`] for that task *name* (the per-task override merged
+    /// onto the manager's default) and applies it to the execution:
+    ///
+    /// * The **hard** limit becomes part of the execution deadline — the task
+    ///   future is raced against the earlier of the hard limit and the task's
+    ///   own `timeout_secs` — and expiry aborts the task with a timeout
+    ///   failure (retried while the retry budget allows, dead-lettered after,
+    ///   with `failure_type = "hard_time_limit"`).
+    /// * The **soft** limit is *not* terminal. When it expires the worker trips
+    ///   the task's [`SoftTimeout`] signal, counts it in
+    ///   [`WorkerStats::soft_timeouts`](crate::WorkerStats::soft_timeouts) and
+    ///   logs a warning; the task keeps running and can observe the signal via
+    ///   [`check_soft_time_limit`](crate::execution_context::check_soft_time_limit)
+    ///   to clean up and return partial work before the hard limit lands.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_worker::{Worker, WorkerConfig};
+    /// use celers_core::TaskRegistry;
+    /// use celers_core::time_limit::{TimeLimitConfig, WorkerTimeLimits};
+    /// use std::time::Duration;
+    /// # use celers_core::Broker;
+    /// # async fn example<B: Broker + 'static>(broker: B) {
+    /// let limits = WorkerTimeLimits::with_default(
+    ///     TimeLimitConfig::new()
+    ///         .with_soft_limit(Duration::from_secs(30))
+    ///         .with_hard_limit(Duration::from_secs(60)),
+    /// );
+    /// // A single task may run longer; the 30s soft warning still applies.
+    /// limits.set_task_limit(
+    ///     "generate_report",
+    ///     TimeLimitConfig::new().with_hard_limit(Duration::from_secs(600)),
+    /// );
+    ///
+    /// let worker = Worker::new(broker, TaskRegistry::new(), WorkerConfig::default())
+    ///     .with_time_limits(limits);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_time_limits(mut self, limits: WorkerTimeLimits) -> Self {
+        self.time_limits = Some(limits);
+        self
+    }
+
+    /// Get the configured time limits (if soft/hard time limits are enabled).
+    pub fn time_limits(&self) -> Option<&WorkerTimeLimits> {
+        self.time_limits.as_ref()
+    }
+
+    /// Enable poison-pill detection and quarantine.
+    ///
+    /// A *poison pill* is a task that keeps failing (or keeps coming back
+    /// undelivered) and would otherwise be redelivered forever, burning CPU and
+    /// wedging the queue behind it. With a detector installed the worker:
+    ///
+    /// * records a strike for every failed execution,
+    /// * records a *redelivery* strike when a re-attempt arrives whose previous
+    ///   failure this worker never saw (another worker's, or one that died
+    ///   mid-task — the classic poison-pill signature),
+    /// * clears a task's strikes when it eventually succeeds, and
+    /// * refuses to execute a quarantined task at all, dead-lettering it
+    ///   instead so it stops cycling.
+    ///
+    /// When [`PoisonPillConfig::decay_window`](crate::PoisonPillConfig::decay_window)
+    /// is set, the worker also runs the detector's background pruner for the
+    /// duration of its run loop.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_worker::{PoisonPillConfig, PoisonPillDetector, Worker, WorkerConfig};
+    /// use celers_core::TaskRegistry;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// # use celers_core::Broker;
+    /// # async fn example<B: Broker + 'static>(broker: B) {
+    /// let detector = Arc::new(PoisonPillDetector::new(
+    ///     PoisonPillConfig::new()
+    ///         .with_threshold(3)
+    ///         .with_decay_window(Duration::from_secs(600)),
+    /// ));
+    /// let worker = Worker::new(broker, TaskRegistry::new(), WorkerConfig::default())
+    ///     .with_poison_pill(Arc::clone(&detector));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_poison_pill(mut self, detector: Arc<PoisonPillDetector>) -> Self {
+        self.poison_pill = Some(detector);
+        self
+    }
+
+    /// Get the poison-pill detector (if quarantine is enabled).
+    pub fn poison_pill(&self) -> Option<&Arc<PoisonPillDetector>> {
+        self.poison_pill.as_ref()
+    }
+
+    /// Make a [`CheckpointManager`] available to running tasks.
+    ///
+    /// The manager is installed into every task's ambient
+    /// [`TaskExecutionContext`], so a long-running task body can call
+    /// [`save_checkpoint`](crate::execution_context::save_checkpoint) at its own
+    /// progress boundaries and
+    /// [`load_checkpoint`](crate::execution_context::load_checkpoint) on a later
+    /// attempt to resume instead of restarting from scratch — no argument has to
+    /// be threaded through the task's call stack. The worker deletes a task's
+    /// checkpoints once it completes successfully.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_worker::{CheckpointConfig, CheckpointManager, Worker, WorkerConfig};
+    /// use celers_core::TaskRegistry;
+    /// use std::sync::Arc;
+    /// # use celers_core::Broker;
+    /// # async fn example<B: Broker + 'static>(broker: B) {
+    /// let checkpoints = Arc::new(CheckpointManager::new(CheckpointConfig::new()));
+    /// let worker = Worker::new(broker, TaskRegistry::new(), WorkerConfig::default())
+    ///     .with_checkpoints(checkpoints);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_checkpoints(mut self, checkpoints: Arc<CheckpointManager>) -> Self {
+        self.checkpoints = Some(checkpoints);
+        self
+    }
+
+    /// Get the checkpoint manager (if task checkpointing is enabled).
+    pub fn checkpoints(&self) -> Option<&Arc<CheckpointManager>> {
+        self.checkpoints.as_ref()
+    }
+
+    /// A shared handle to this worker's liveness/readiness accounting.
+    ///
+    /// Cloning is cheap and the clone keeps reporting after the worker has been
+    /// moved into its run loop, so an embedder can serve `/healthz` and
+    /// `/readyz` from it:
+    ///
+    /// ```no_run
+    /// # use celers_worker::{Worker, WorkerConfig};
+    /// # use celers_core::{Broker, TaskRegistry};
+    /// # async fn example<B: Broker + 'static>(broker: B) {
+    /// let worker = Worker::new(broker, TaskRegistry::new(), WorkerConfig::default());
+    /// let health = worker.health();
+    /// let _handle = worker.run_with_shutdown().await;
+    /// // ... elsewhere, in an HTTP handler:
+    /// let live = health.is_healthy();
+    /// let ready = health.is_ready();
+    /// # let _ = (live, ready);
+    /// # }
+    /// ```
+    pub fn health(&self) -> HealthChecker {
+        self.health.clone()
+    }
+
+    /// Whether `task_id` is quarantined, recording a redelivery strike first
+    /// when this delivery is a re-attempt whose failure this worker never saw.
+    ///
+    /// Striking only in that case is what keeps the two signals from
+    /// double-counting: an attempt this worker failed itself already produced a
+    /// failure strike, and its redelivery must not produce a second one.
+    async fn is_quarantined(&self, task_id: TaskId, spent_retries: u32) -> bool {
+        let Some(ref detector) = self.poison_pill else {
+            return false;
+        };
+        if detector.is_poison(&task_id).await {
+            return true;
+        }
+        if spent_retries > 0 && detector.strike_count(&task_id).await == 0 {
+            return detector.record_redelivery(task_id).await.is_quarantined();
+        }
+        false
+    }
+
+    /// The effective (merged) time-limit configuration for `task_name`.
+    ///
+    /// Returns `None` when time limits are disabled, when the task name has no
+    /// applicable configuration, or when the resolved configuration is empty.
+    /// The merge (per-task override *onto* the manager default) is
+    /// [`TaskTimeLimits::get_limit`](celers_core::TaskTimeLimits::get_limit)'s
+    /// job; it is reached here through
+    /// [`WorkerTimeLimits::create_tracker`], the manager's only public
+    /// resolution entry point.
+    fn resolve_time_limits(&self, task_id: TaskId, task_name: &str) -> Option<TimeLimitConfig> {
+        let limits = self.time_limits.as_ref()?;
+        let tracker = limits.create_tracker(&task_id.to_string(), task_name)?;
+        Some(tracker.config().clone())
     }
 
     /// Get the task-affinity registry (if affinity admission is enabled).
@@ -396,6 +698,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             mode: Arc::clone(&self.mode),
             stats: Arc::clone(&self.stats),
             dynamic_config: Arc::clone(&self.dynamic_config),
+            health: self.health.clone(),
         };
 
         self.shutdown_tx = Some(shutdown_tx);
@@ -477,6 +780,29 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             w.spawn()
         });
 
+        // A DLQ TTL does nothing on its own: something has to run the sweep, or
+        // expired entries accumulate forever and `ttl_seconds` is decoration.
+        let dlq_cleanup_handle = self
+            .dlq_handler
+            .as_ref()
+            .zip(self.config.dlq_config.ttl_seconds)
+            .map(|(handler, ttl_seconds)| {
+                let interval = support::dlq_cleanup_interval(ttl_seconds);
+                info!(
+                    "Starting DLQ TTL sweep every {:?} (entry TTL {}s)",
+                    interval, ttl_seconds
+                );
+                Arc::clone(handler).spawn_cleanup_task(interval)
+            });
+
+        // Poison-pill tracking records for task ids that are simply never seen
+        // again only expire if something prunes them. `spawn_pruner` is a no-op
+        // (returns `None`) unless a decay window is configured.
+        let poison_pruner_handle = self
+            .poison_pill
+            .as_ref()
+            .and_then(|detector| detector.spawn_pruner());
+
         let result = self
             .run_loop_inner(&mut shutdown_rx, &hostname, pid, &events)
             .await;
@@ -488,6 +814,16 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
 
         // Stop the revocation watcher
         if let Some(handle) = revocation_handle {
+            handle.abort();
+        }
+
+        // Stop the DLQ TTL sweep
+        if let Some(handle) = dlq_cleanup_handle {
+            handle.abort();
+        }
+
+        // Stop the poison-pill pruner
+        if let Some(handle) = poison_pruner_handle {
             handle.abort();
         }
 
@@ -773,6 +1109,50 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                 .received(),
                         );
 
+                        // Poison-pill quarantine comes before every other
+                        // admission check: a quarantined task must not run no
+                        // matter which worker or queue it lands on, and letting
+                        // it be deferred instead would put it straight back in
+                        // the queue it is wedging.
+                        if self
+                            .is_quarantined(task_id, execution::spent_retries(&msg.task))
+                            .await
+                        {
+                            warn!(
+                                "Task {} ('{}') is quarantined as a poison pill; dead-lettering \
+                                 instead of executing it",
+                                task_id, task_name
+                            );
+
+                            events.emit(Event::Task(TaskEvent::Rejected {
+                                task_id,
+                                task_name: Some(task_name.clone()),
+                                hostname: hostname.to_string(),
+                                timestamp: chrono::Utc::now(),
+                                reason: "Quarantined as a poison pill".to_string(),
+                            }));
+
+                            execution::dead_letter(
+                                &self.broker,
+                                self.dlq_handler.as_ref(),
+                                events,
+                                hostname,
+                                pid,
+                                DeadLetterRequest {
+                                    task: &msg.task,
+                                    task_id,
+                                    receipt_handle: msg.receipt_handle.as_deref(),
+                                    retry_count: execution::spent_retries(&msg.task),
+                                    error_msg: "Task quarantined as a poison pill",
+                                    failure_type: "poison_pill",
+                                    extra_metadata: vec![("task_name", task_name.clone())],
+                                    dispose: true,
+                                },
+                            )
+                            .await;
+                            continue;
+                        }
+
                         // Check routing - can this worker handle this task type?
                         if !self.can_handle_task(&task_name) {
                             warn!(
@@ -862,6 +1242,42 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                         // Check circuit breaker
                         if let Some(ref cb) = self.circuit_breaker {
                             if !cb.should_allow(&task_name).await {
+                                // Two very different rejections share this
+                                // branch. A *half-open* circuit rejects because
+                                // its trial-probe budget is already spoken for:
+                                // nothing is known to be wrong with this task,
+                                // so it is deferred (requeued) like any other
+                                // admission miss. Only a genuinely *open*
+                                // circuit is terminal.
+                                if cb.get_state(&task_name).await.is_half_open() {
+                                    debug!(
+                                        "Circuit breaker HALF-OPEN for task type '{}' with its \
+                                         probe budget in use, deferring task {}",
+                                        task_name, task_id
+                                    );
+
+                                    events.emit(Event::Task(TaskEvent::Rejected {
+                                        task_id,
+                                        task_name: Some(task_name.clone()),
+                                        hostname: hostname.to_string(),
+                                        timestamp: chrono::Utc::now(),
+                                        reason: "Circuit breaker HALF-OPEN (probe budget in use)"
+                                            .to_string(),
+                                    }));
+
+                                    self.defer_message(
+                                        &task_id,
+                                        msg.receipt_handle.as_deref(),
+                                        "circuit breaker half-open",
+                                    )
+                                    .await;
+                                    defer_delay = Some(
+                                        self.admission_defer_delay()
+                                            .max(defer_delay.unwrap_or(Duration::ZERO)),
+                                    );
+                                    continue;
+                                }
+
                                 warn!(
                                     "Circuit breaker OPEN for task type '{}', failing task {}",
                                     task_name, task_id
@@ -925,6 +1341,14 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                     );
                                     self.stats.task_rate_limited();
 
+                                    // The circuit breaker already admitted this
+                                    // task (and, while half-open, handed it a
+                                    // trial slot); give the slot back since the
+                                    // task is not going to run.
+                                    if let Some(ref cb) = self.circuit_breaker {
+                                        cb.release_probe(&task_name).await;
+                                    }
+
                                     // Defer (requeue) so the task is retried later.
                                     self.defer_message(
                                         &task_id,
@@ -963,16 +1387,50 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                         let timeout_secs =
                             msg.task.metadata.timeout_secs.unwrap_or(default_timeout);
 
+                        // Celery-style time limits for this task name: the hard
+                        // limit joins the execution deadline, the soft one is
+                        // armed as a cooperative warning.
+                        let limits = match self.resolve_time_limits(task_id, &task_name) {
+                            Some(ref config) => {
+                                ExecutionLimits::from_timeout(timeout_secs).with_time_limits(config)
+                            }
+                            None => ExecutionLimits::from_timeout(timeout_secs),
+                        };
+
                         // Cooperative cancellation: register this task as in-flight
                         // and obtain its cancellation token + execution context. The
                         // token is tripped by the revocation watcher if a matching
                         // revocation signal arrives while the task runs.
+                        //
+                        // A soft time limit needs the same ambient context (that is
+                        // where the task reads its `SoftTimeout` from), so the
+                        // context is also installed when revocation is disabled but
+                        // a soft limit applies. The token is then a private one that
+                        // nothing can trip.
                         let exec_context = match self.revocation_watcher {
                             Some(ref watcher) => {
                                 let token = watcher.register(task_id).await;
-                                Some(TaskExecutionContext::new(token))
+                                Some(TaskExecutionContext::with_soft_timeout(
+                                    token,
+                                    SoftTimeout::new(task_id, limits.soft_limit),
+                                ))
+                            }
+                            // A soft limit or a checkpoint store also has to be
+                            // reachable from inside the task, so the context is
+                            // installed for those too.
+                            None if limits.soft_limit.is_some() || self.checkpoints.is_some() => {
+                                Some(TaskExecutionContext::with_soft_timeout(
+                                    CancellationToken::new(task_id),
+                                    SoftTimeout::new(task_id, limits.soft_limit),
+                                ))
                             }
                             None => None,
+                        };
+                        let exec_context = match self.checkpoints {
+                            Some(ref manager) => {
+                                exec_context.map(|ctx| ctx.with_checkpoints(Arc::clone(manager)))
+                            }
+                            None => exec_context,
                         };
 
                         // The task's own retry request, capped by the worker's
@@ -997,7 +1455,10 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             exec_context,
                             in_flight: in_flight.clone(),
                             memory_tracker: memory_tracker.clone(),
-                            timeout_secs,
+                            poison_pill: self.poison_pill.clone(),
+                            checkpoints: self.checkpoints.clone(),
+                            health: self.health.clone(),
+                            limits,
                             max_retries: effective_max_retries(
                                 task_max_retries,
                                 dynamic_max_retries,

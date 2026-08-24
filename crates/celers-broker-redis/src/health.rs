@@ -7,6 +7,8 @@
 //! - Keyspace statistics
 //! - Replication lag monitoring
 
+use crate::connection::RedisClientExt;
+use crate::visibility::QueueKeys;
 use celers_core::{CelersError, Result};
 use redis::AsyncCommands;
 use std::collections::HashMap;
@@ -72,10 +74,29 @@ pub struct QueueStats {
     pub dlq: usize,
     /// Number of tasks in the delayed queue
     pub delayed: usize,
+    /// Number of in-flight messages carrying a visibility deadline.
+    ///
+    /// These are the *same* messages counted by [`Self::processing`], seen
+    /// through the other in-flight structure (the `<queue>:unacked` sorted
+    /// set, which scores each one by the moment it becomes redeliverable).
+    /// A persistent gap between the two means bookkeeping has drifted —
+    /// typically a worker that died between staging a message and recording
+    /// its deadline.
+    pub in_flight: usize,
+    /// How many of [`Self::in_flight`] are already past their deadline, and
+    /// so are waiting for the reaper to redeliver them.
+    ///
+    /// A number that stays above zero is the signal that workers are dying
+    /// mid-task, or that the visibility timeout is shorter than the work.
+    pub overdue: usize,
 }
 
 impl QueueStats {
     /// Total number of tasks across all queues
+    ///
+    /// [`Self::in_flight`] and [`Self::overdue`] are deliberately excluded:
+    /// they count the same messages as [`Self::processing`] from a different
+    /// angle, and adding them would double- or triple-count in-flight work.
     pub fn total(&self) -> usize {
         self.pending + self.processing + self.dlq + self.delayed
     }
@@ -149,7 +170,7 @@ impl HealthChecker {
 
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
@@ -165,7 +186,7 @@ impl HealthChecker {
     pub async fn check_health(&self) -> RedisHealthStatus {
         let start = std::time::Instant::now();
 
-        let conn_result = self.client.get_multiplexed_async_connection().await;
+        let conn_result = self.client.celers_multiplexed_connection().await;
         let mut conn = match conn_result {
             Ok(c) => c,
             Err(e) => return RedisHealthStatus::unhealthy(format!("Connection failed: {}", e)),
@@ -218,13 +239,11 @@ impl HealthChecker {
     ) -> Result<QueueStats> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
-        let processing_queue = format!("{}:processing", queue_name);
-        let dlq_name = format!("{}:dlq", queue_name);
-        let delayed_queue = format!("{}:delayed", queue_name);
+        let keys = QueueKeys::new(queue_name);
 
         let pending: usize = if is_priority_mode {
             conn.zcard(queue_name).await.unwrap_or(0)
@@ -232,15 +251,29 @@ impl HealthChecker {
             conn.llen(queue_name).await.unwrap_or(0)
         };
 
-        let processing: usize = conn.llen(&processing_queue).await.unwrap_or(0);
-        let dlq: usize = conn.llen(&dlq_name).await.unwrap_or(0);
-        let delayed: usize = conn.zcard(&delayed_queue).await.unwrap_or(0);
+        let processing: usize = conn.llen(&keys.processing).await.unwrap_or(0);
+        let dlq: usize = conn.llen(&keys.dlq).await.unwrap_or(0);
+        let delayed: usize = conn.zcard(&keys.delayed).await.unwrap_or(0);
+        let in_flight: usize = conn.zcard(&keys.unacked).await.unwrap_or(0);
+
+        // Deadlines are Unix seconds, so everything scored at or below "now"
+        // is already redeliverable.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as f64)
+            .unwrap_or(0.0);
+        let overdue: usize = conn
+            .zcount(&keys.unacked, f64::NEG_INFINITY, now)
+            .await
+            .unwrap_or(0);
 
         Ok(QueueStats {
             pending,
             processing,
             dlq,
             delayed,
+            in_flight,
+            overdue,
         })
     }
 
@@ -248,7 +281,7 @@ impl HealthChecker {
     pub async fn get_memory_info(&self) -> Result<HashMap<String, String>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
@@ -265,7 +298,7 @@ impl HealthChecker {
     pub async fn get_keyspace_stats(&self) -> Result<Vec<KeyspaceStats>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
@@ -315,7 +348,7 @@ impl HealthChecker {
     pub async fn get_replication_info(&self) -> Result<ReplicationInfo> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
@@ -427,8 +460,64 @@ mod tests {
             processing: 5,
             dlq: 2,
             delayed: 3,
+            // The same five messages `processing` counts, seen through the
+            // unacked set: counting them again would inflate the total.
+            in_flight: 5,
+            overdue: 2,
         };
         assert_eq!(stats.total(), 20);
+    }
+
+    /// The in-flight counters must reflect the unacked set, including how
+    /// much of it the reaper is already entitled to take back.
+    #[tokio::test]
+    async fn test_queue_stats_report_in_flight_and_overdue() {
+        let queue = format!("test-health-inflight-{}", uuid::Uuid::new_v4());
+        let keys = QueueKeys::new(&queue);
+        let client = redis::Client::open("redis://127.0.0.1:6379").expect("client");
+        let checker = HealthChecker::new(client.clone());
+        let mut conn = client
+            .celers_multiplexed_connection()
+            .await
+            .expect("connection");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as f64;
+
+        // Two in flight: one whose deadline has passed, one still running.
+        let _: () = conn
+            .zadd(&keys.unacked, "expired-message", now - 60.0)
+            .await
+            .expect("zadd");
+        let _: () = conn
+            .zadd(&keys.unacked, "live-message", now + 600.0)
+            .await
+            .expect("zadd");
+        let _: () = conn
+            .lpush(&keys.processing, "expired-message")
+            .await
+            .expect("lpush");
+        let _: () = conn
+            .lpush(&keys.processing, "live-message")
+            .await
+            .expect("lpush");
+
+        let stats = checker.get_queue_stats(&queue, false).await.expect("stats");
+        assert_eq!(stats.in_flight, 2, "both messages carry a deadline");
+        assert_eq!(stats.overdue, 1, "only one deadline has passed");
+        assert_eq!(stats.processing, 2);
+        assert_eq!(
+            stats.total(),
+            2,
+            "in-flight counters must not be added on top of `processing`"
+        );
+
+        let _: i64 = conn
+            .del(&[keys.unacked.clone(), keys.processing.clone()])
+            .await
+            .unwrap_or(0);
     }
 
     #[test]

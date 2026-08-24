@@ -414,13 +414,15 @@ pub fn build_v5_message(spec: &V5MessageSpec) -> Result<V5Message, V5BuildError>
         properties,
         body,
         content_type: spec.content_type.as_str().to_string(),
-        content_encoding: if matches!(spec.content_type, ContentType::Json) {
-            ENCODING_UTF8.to_string()
-        } else {
-            // Non-JSON serializations (msgpack/binary/custom) are binary on the
-            // wire; default to binary encoding for those.
-            crate::ContentEncoding::Binary.as_str().to_string()
-        },
+        // Shared with `MessageBuilder::build` (see `builder.rs`) via
+        // `ContentType::default_content_encoding` so the two
+        // message-construction paths cannot independently drift on this
+        // mapping.
+        content_encoding: spec
+            .content_type
+            .default_content_encoding()
+            .as_str()
+            .to_string(),
     })
 }
 

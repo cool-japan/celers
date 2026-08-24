@@ -5,13 +5,28 @@
 //!
 //! # Features
 //!
-//! - Task result storage
+//! - Task result storage with transparent compression, encryption and chunking
 //! - **Task progress tracking** for long-running tasks
 //! - Chord state management (barrier synchronization)
 //! - Result expiration (TTL)
+//! - Versioned result history
 //! - Atomic operations for counter-based workflows
 //! - Batch operations for high throughput
 //! - **Real-time event transport** via Redis pub/sub
+//!
+//! # Result expiration
+//!
+//! Results stored through [`RedisResultBackend`] expire after 24 hours by
+//! default, matching Celery's `result_expires`. Configure a different policy
+//! with [`RedisResultBackend::with_ttl_config`], or opt out entirely with
+//! [`RedisResultBackend::without_ttl`] — note that without a TTL, Redis
+//! accumulates one permanent key per task the deployment ever runs.
+//!
+//! # Result caching
+//!
+//! The in-memory result cache holds **terminal** results only. A pending or
+//! running task is always read straight from Redis, so a waiter can never be
+//! pinned to a stale non-terminal state.
 //!
 //! # Progress Tracking Example
 //!
@@ -63,6 +78,13 @@ pub mod stats;
 pub mod trait_impl;
 pub mod types;
 
+// ── Storage pipeline ─────────────────────────────────────────────────
+pub mod archive;
+pub(crate) mod codec;
+pub mod querying;
+pub mod versioning;
+pub mod waiting;
+
 // ── Feature modules ──────────────────────────────────────────────────
 pub mod batch_stream;
 pub mod cache;
@@ -86,6 +108,10 @@ pub mod utilities;
 #[path = "tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "tests_ops.rs"]
+mod tests_ops;
+
 // ── Re-exports: preserve public API ──────────────────────────────────
 
 // types
@@ -97,7 +123,7 @@ pub use types::{
 pub use result_backend_trait::{LazyTaskResult, ResultBackend, ResultStream};
 
 // backend struct
-pub use backend::RedisResultBackend;
+pub use backend::{RedisResultBackend, VersioningConfig};
 
 // query
 pub use query::TaskQuery;

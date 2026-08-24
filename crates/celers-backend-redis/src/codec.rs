@@ -103,6 +103,28 @@ end
 return redis.call('DEL', k)
 "#;
 
+/// Lua script applying a TTL to a result *and* every key that belongs to it.
+///
+/// `KEYS[1]` primary key, `KEYS[2]` chunk-metadata key, `ARGV[1]` TTL seconds.
+/// Returns 1 when the primary key existed.
+pub(crate) const EXPIRE_RESULT_SCRIPT: &str = r#"
+local k = KEYS[1]
+local m = KEYS[2]
+local t = ARGV[1]
+local applied = redis.call('EXPIRE', k, t)
+local old = redis.call('GET', m)
+if old then
+  local ok, decoded = pcall(cjson.decode, old)
+  if ok and type(decoded) == 'table' and tonumber(decoded.total_chunks) then
+    for i = 0, tonumber(decoded.total_chunks) - 1 do
+      redis.call('EXPIRE', k .. ':chunk:' .. i, t)
+    end
+  end
+  redis.call('EXPIRE', m, t)
+end
+return applied
+"#;
+
 /// A fully encoded `TaskMeta`, ready to be handed to [`write_command`].
 #[derive(Debug, Clone)]
 pub(crate) struct EncodedResult {
@@ -211,6 +233,17 @@ pub(crate) fn delete_command(key: &str) -> redis::Cmd {
     cmd
 }
 
+/// Build the `EVAL` command that applies `ttl` to `key` and all of its chunks.
+pub(crate) fn expire_command(key: &str, ttl: Duration) -> redis::Cmd {
+    let mut cmd = redis::cmd("EVAL");
+    cmd.arg(EXPIRE_RESULT_SCRIPT)
+        .arg(2)
+        .arg(key)
+        .arg(ResultChunker::metadata_key(key))
+        .arg(ttl.as_secs().max(1));
+    cmd
+}
+
 /// Decrypt → decompress → deserialize a fully assembled stored payload.
 pub(crate) fn decode_payload(
     data: &[u8],
@@ -289,7 +322,7 @@ pub(crate) async fn decode_many(
 
     // Pass 3: reassemble and decode.
     let mut results = Vec::with_capacity(raws.len());
-    for (raw, plan) in raws.into_iter().zip(plans.into_iter()) {
+    for (raw, plan) in raws.into_iter().zip(plans) {
         let Some(bytes) = raw else {
             results.push(None);
             continue;
@@ -311,11 +344,9 @@ pub(crate) async fn decode_many(
                         }
                     }
                 }
-                chunker
-                    .reassemble_chunks(&metadata, &chunks)
-                    .map_err(|e| {
-                        BackendError::Serialization(format!("Chunk reassembly error: {}", e))
-                    })?
+                chunker.reassemble_chunks(&metadata, &chunks).map_err(|e| {
+                    BackendError::Serialization(format!("Chunk reassembly error: {}", e))
+                })?
             }
             None => bytes,
         };
@@ -355,10 +386,7 @@ mod tests {
                 compression::CompressionConfig::default(),
                 EncryptionConfig::disabled(),
             ),
-            (
-                compression::CompressionConfig::disabled(),
-                keyed.clone(),
-            ),
+            (compression::CompressionConfig::disabled(), keyed.clone()),
             (compression::CompressionConfig::default(), keyed),
         ];
 
@@ -373,17 +401,15 @@ mod tests {
             assert_eq!(decoded.result, meta.result);
 
             // Chunking enabled with a tiny threshold -> sentinel + chunks.
-            let chunker = ResultChunker::new(
-                ChunkingConfig::new().with_threshold(64).with_chunk_size(32),
-            );
+            let chunker =
+                ResultChunker::new(ChunkingConfig::new().with_threshold(64).with_chunk_size(32));
             let encoded = encode_meta(&meta, &comp, &enc, &chunker).expect("encode chunked");
             assert!(encoded.is_chunked(), "payload should have been chunked");
             assert!(ResultChunker::is_chunked(&encoded.main));
 
-            let (metadata, chunk_keys) =
-                chunk_plan("celery-task-meta-x", &encoded.main)
-                    .expect("chunk plan")
-                    .expect("sentinel detected");
+            let (metadata, chunk_keys) = chunk_plan("celery-task-meta-x", &encoded.main)
+                .expect("chunk plan")
+                .expect("sentinel detected");
             assert_eq!(chunk_keys.len(), encoded.chunks.len());
             let reassembled = chunker
                 .reassemble_chunks(&metadata, &encoded.chunks)
@@ -412,18 +438,19 @@ mod tests {
         )
         .expect("encode");
 
-        // The plain write carries: script, numkeys, 2 keys, guard, ttl, main, chunk-meta.
+        // EVAL, script, numkeys, 2 keys, guard, ttl, main value, chunk-meta.
+        const FIXED_ARGS: usize = 9;
+
         let plain = write_command("k", &encoded, None, None);
-        assert_eq!(plain.args_iter().count(), 8);
+        assert_eq!(plain.args_iter().count(), FIXED_ARGS);
 
         // A CAS write has the same arity but a non-empty guard argument.
         let guarded = write_command("k", &encoded, Some(Duration::from_secs(60)), Some(b"prev"));
-        assert_eq!(guarded.args_iter().count(), 8);
+        assert_eq!(guarded.args_iter().count(), FIXED_ARGS);
 
         // Chunked writes append one argument per chunk.
-        let chunker = ResultChunker::new(
-            ChunkingConfig::new().with_threshold(8).with_chunk_size(8),
-        );
+        let chunker =
+            ResultChunker::new(ChunkingConfig::new().with_threshold(8).with_chunk_size(8));
         let chunked = encode_meta(
             &meta,
             &compression::CompressionConfig::disabled(),
@@ -431,7 +458,8 @@ mod tests {
             &chunker,
         )
         .expect("encode chunked");
+        assert!(chunked.is_chunked());
         let cmd = write_command("k", &chunked, None, None);
-        assert_eq!(cmd.args_iter().count(), 8 + chunked.chunks.len());
+        assert_eq!(cmd.args_iter().count(), FIXED_ARGS + chunked.chunks.len());
     }
 }

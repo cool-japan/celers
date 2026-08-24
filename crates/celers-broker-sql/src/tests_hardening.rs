@@ -175,6 +175,50 @@ fn queue_name_migration_adds_an_indexed_backfilled_column() {
     );
 }
 
+/// Index names must be unique across the whole migration chain.
+///
+/// MySQL has no `CREATE INDEX IF NOT EXISTS`, so a name reused by a later
+/// migration fails with "Duplicate key name" and aborts `migrate()` partway
+/// through, on a fresh database, with some tables already created.
+#[test]
+fn migrations_do_not_reuse_index_names() {
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    for (file, sql) in APPLIED_MIGRATIONS {
+        for statement in strip_sql_line_comments(sql).split(';') {
+            let statement = statement.trim();
+            let Some(rest) = statement.strip_prefix("CREATE INDEX ") else {
+                continue;
+            };
+            let name = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if let Some((_, first_file)) = seen.iter().find(|(known, _)| known == &name) {
+                panic!("index `{name}` is created in both {first_file} and {file}");
+            }
+            seen.push((name, file));
+        }
+    }
+    assert!(
+        seen.len() >= 15,
+        "expected the migration chain to create many indexes, found {}",
+        seen.len()
+    );
+}
+
+/// The claim path's covering index must exist somewhere in the chain.
+#[test]
+fn the_dequeue_covering_index_is_created() {
+    let created = APPLIED_MIGRATIONS
+        .iter()
+        .any(|(_, sql)| sql.contains("idx_tasks_queue_dequeue"));
+    assert!(
+        created,
+        "no migration creates the queue-scoped dequeue index"
+    );
+}
+
 // ========== Source-level guards ==========
 
 /// Every `INSERT INTO celers_tasks` must bind the `queue_name` column.
@@ -613,6 +657,188 @@ mod integration {
             1,
             "a due recurring task must be claimed by exactly one scheduler, \
              got {first} + {second}"
+        );
+    }
+
+    /// `purge_terminal_tasks` must delete only terminal (acked) rows, never a
+    /// still-pending one — and the nested-derived-table `DELETE` built by
+    /// `sql_text::purge_terminal_tasks_sql` must actually parse and execute
+    /// on a live server (its two MySQL-specific workarounds, for `ERROR
+    /// 1093` and `ERROR 1235`, are untestable without one).
+    #[tokio::test]
+    async fn retention_purges_only_terminal_tasks() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        let completed_id = broker
+            .enqueue(SerializedTask::new("done".to_string(), b"x".to_vec()))
+            .await
+            .expect("enqueue should succeed");
+        let msg = broker
+            .dequeue()
+            .await
+            .expect("dequeue should succeed")
+            .expect("the enqueued task must be claimable");
+        broker
+            .ack(&msg.task.metadata.id, msg.receipt_handle.as_deref())
+            .await
+            .expect("ack should succeed");
+
+        let pending_id = broker
+            .enqueue(SerializedTask::new(
+                "still_waiting".to_string(),
+                b"x".to_vec(),
+            ))
+            .await
+            .expect("enqueue should succeed");
+
+        // Zero retention: everything terminal is eligible immediately, so
+        // the assertion needs no sleeping.
+        let deleted = broker
+            .purge_terminal_tasks(std::time::Duration::from_secs(0), 100, 5)
+            .await
+            .expect("purge_terminal_tasks should succeed");
+        assert_eq!(deleted, 1, "exactly the one acked task must be purged");
+
+        assert!(
+            broker
+                .get_task(&completed_id)
+                .await
+                .expect("get_task should succeed")
+                .is_none(),
+            "the completed task must be gone"
+        );
+        assert!(
+            broker
+                .get_task(&pending_id)
+                .await
+                .expect("get_task should succeed")
+                .is_some(),
+            "the still-pending task must survive"
+        );
+    }
+
+    /// A broker's purge must never delete another logical queue's terminal
+    /// tasks, matching every other claim/read path's queue isolation.
+    #[tokio::test]
+    async fn retention_purge_is_scoped_to_the_owning_queue() {
+        let Some((alpha, _alpha_queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+        let Some((beta, _beta_queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        let task = SerializedTask::new("alpha_done".to_string(), b"x".to_vec());
+        alpha.enqueue(task).await.expect("enqueue should succeed");
+        let msg = alpha
+            .dequeue()
+            .await
+            .expect("dequeue should succeed")
+            .expect("alpha's task must be claimable");
+        alpha
+            .ack(&msg.task.metadata.id, msg.receipt_handle.as_deref())
+            .await
+            .expect("ack should succeed");
+
+        let deleted = beta
+            .purge_terminal_tasks(std::time::Duration::from_secs(0), 100, 5)
+            .await
+            .expect("purge_terminal_tasks should succeed");
+        assert_eq!(
+            deleted, 0,
+            "beta must not purge alpha's terminal tasks from a different queue"
+        );
+
+        assert_eq!(
+            alpha
+                .get_task(&msg.task.metadata.id)
+                .await
+                .expect("get_task should succeed")
+                .expect("alpha's completed task must be untouched")
+                .state
+                .to_string(),
+            "completed"
+        );
+    }
+
+    /// Two brokers on different logical queues must not dedupe against each
+    /// other: an identical `dedup_key` must not make the second broker's
+    /// `enqueue_deduplicated` hand back the first broker's task id — that id
+    /// is invisible to the second broker's queue-scoped `dequeue`, so doing
+    /// so would silently lose the second task.
+    #[tokio::test]
+    async fn dedup_does_not_cross_queue_boundaries() {
+        let Some((alpha, _alpha_queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+        let Some((beta, _beta_queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        let dedup_key = format!("shared_key_{}", Uuid::new_v4().simple());
+        let alpha_task = SerializedTask::new("alpha_job".to_string(), b"a".to_vec());
+        let beta_task = SerializedTask::new("beta_job".to_string(), b"b".to_vec());
+
+        let alpha_id = alpha
+            .enqueue_deduplicated(alpha_task, &dedup_key)
+            .await
+            .expect("alpha's enqueue_deduplicated should succeed");
+        let beta_id = beta
+            .enqueue_deduplicated(beta_task, &dedup_key)
+            .await
+            .expect("beta's enqueue_deduplicated should succeed");
+
+        assert_ne!(
+            alpha_id, beta_id,
+            "the same dedup_key on two different queues must not collide"
+        );
+        assert_eq!(
+            alpha.queue_size().await.expect("queue_size"),
+            1,
+            "alpha's own task must have been inserted, not skipped"
+        );
+        assert_eq!(
+            beta.queue_size().await.expect("queue_size"),
+            1,
+            "beta's own task must have been inserted, not skipped"
+        );
+    }
+
+    /// The same `dedup_key` submitted twice on the *same* queue must still
+    /// dedupe — the queue predicate narrows the match, it must not disable
+    /// deduplication altogether.
+    #[tokio::test]
+    async fn dedup_still_applies_within_the_same_queue() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        let dedup_key = format!("same_queue_key_{}", Uuid::new_v4().simple());
+        let first_id = broker
+            .enqueue_deduplicated(
+                SerializedTask::new("first".to_string(), b"x".to_vec()),
+                &dedup_key,
+            )
+            .await
+            .expect("first enqueue_deduplicated should succeed");
+        let second_id = broker
+            .enqueue_deduplicated(
+                SerializedTask::new("second".to_string(), b"y".to_vec()),
+                &dedup_key,
+            )
+            .await
+            .expect("second enqueue_deduplicated should succeed");
+
+        assert_eq!(
+            first_id, second_id,
+            "a repeated dedup_key on the same queue must return the existing task id"
+        );
+        assert_eq!(
+            broker.queue_size().await.expect("queue_size"),
+            1,
+            "the second call must not have inserted a duplicate row"
         );
     }
 }

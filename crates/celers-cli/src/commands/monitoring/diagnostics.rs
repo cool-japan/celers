@@ -4,7 +4,7 @@
 
 use super::super::task::inspect_task;
 use super::report::scan_worker_heartbeat_keys;
-use celers_broker_redis::RedisBroker;
+use celers_broker_redis::{QueueState, RedisBroker};
 use celers_core::Broker;
 use colored::Colorize;
 use tabled::{settings::Style, Table, Tabled};
@@ -152,7 +152,7 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
 
     // Test 3: Queue Accessibility
     println!("{}", "3. Queue Accessibility".bold());
-    let queue_key = format!("celers:{queue}");
+    let queue_key = crate::keys::main(queue);
     let _queue_type: String = match redis::cmd("TYPE")
         .arg(&queue_key)
         .query_async(&mut conn)
@@ -182,18 +182,21 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
         }
     };
 
-    // Check if queue is paused
-    let pause_key = format!("celers:{queue}:paused");
-    match redis::cmd("GET")
-        .arg(&pause_key)
-        .query_async::<Option<String>>(&mut conn)
-        .await
-    {
-        Ok(Some(paused_at)) => {
-            println!("  {} Queue is PAUSED (since: {})", "⚠".yellow(), paused_at);
-            health_warnings.push(format!("Queue is paused since {paused_at}"));
+    // Check if queue is paused. Goes through `QueueController` (the single
+    // source of truth for pause/drain state, see `commands::queue::pause_queue`)
+    // rather than a raw `GET` of a hand-rolled `celers:{queue}:paused` key --
+    // a key `RedisBroker`/`QueueController` never write to at all (idx 312's
+    // key-namespace bug, same class as Test 3 above).
+    match broker.queue_controller().get_state().await {
+        Ok(QueueState::Paused) => {
+            println!("  {} Queue is PAUSED", "⚠".yellow());
+            health_warnings.push("Queue is paused".to_string());
         }
-        Ok(None) => {
+        Ok(QueueState::Draining) => {
+            println!("  {} Queue is DRAINING", "⚠".yellow());
+            health_warnings.push("Queue is draining".to_string());
+        }
+        Ok(QueueState::Active) => {
             println!("  {} Queue is not paused", "✓".green());
         }
         Err(e) => {
@@ -281,8 +284,14 @@ pub async fn health_check(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Automatic problem detection and diagnostics
-pub async fn doctor(broker_url: &str, queue: &str) -> anyhow::Result<()> {
+/// Automatic problem detection and diagnostics.
+///
+/// Exits with an error whenever `issues` (critical) is non-empty. When
+/// `strict` is `true`, a `warnings`-only result (no critical issues) also
+/// exits with an error instead of the default `Ok(())` -- for a CI/monitoring
+/// invocation that wants to gate on *any* detected problem, not just
+/// critical ones.
+pub async fn doctor(broker_url: &str, queue: &str, strict: bool) -> anyhow::Result<()> {
     println!("{}", "=== CeleRS Doctor ===".bold().cyan());
     println!("{}", "Running automatic diagnostics...".dimmed());
     println!();
@@ -363,20 +372,31 @@ pub async fn doctor(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     }
     println!();
 
-    // Test 4: Queue pause status
+    // Test 4: Queue pause status. Goes through `QueueController`, the real
+    // owner of pause/drain state, rather than a raw `GET` of a hand-rolled
+    // `celers:{queue}:paused` key that nothing ever writes to (idx 312).
     println!("{}", "4. Checking queue status...".bold());
-    let pause_key = format!("celers:{queue}:paused");
-    let paused: Option<String> = redis::cmd("GET")
-        .arg(&pause_key)
-        .query_async(&mut conn)
-        .await?;
-
-    if let Some(paused_at) = paused {
-        warnings.push(format!("Queue '{queue}' is paused since {paused_at}"));
-        recommendations.push("Resume queue with: celers queue resume".to_string());
-        println!("  {} Queue is PAUSED", "⚠".yellow());
-    } else {
-        println!("  {} Queue is active", "✓".green());
+    match broker.queue_controller().get_state().await {
+        Ok(QueueState::Paused) => {
+            warnings.push(format!("Queue '{queue}' is paused"));
+            recommendations.push("Resume queue with: celers queue resume".to_string());
+            println!("  {} Queue is PAUSED", "⚠".yellow());
+        }
+        Ok(QueueState::Draining) => {
+            warnings.push(format!("Queue '{queue}' is draining"));
+            println!("  {} Queue is DRAINING", "⚠".yellow());
+        }
+        Ok(QueueState::Active) => {
+            println!("  {} Queue is active", "✓".green());
+        }
+        Err(e) => {
+            warnings.push(format!("Could not check queue pause status: {e}"));
+            println!(
+                "  {} Could not check queue pause status: {}",
+                "⚠".yellow(),
+                e
+            );
+        }
     }
     println!();
 
@@ -509,12 +529,22 @@ pub async fn doctor(broker_url: &str, queue: &str) -> anyhow::Result<()> {
     // `doctor` must agree with its sibling `health_check` (which already
     // returns `Err` on critical issues, see above): a command meant to gate
     // CI/monitoring is useless if it always exits 0 regardless of what it
-    // found. Warnings alone still exit 0 (matching `health_check`).
+    // found. Warnings alone still exit 0 by default (matching
+    // `health_check`) -- unless `--strict` asked for warnings to fail the
+    // run too.
     if !issues.is_empty() {
         anyhow::bail!(
             "doctor detected {} critical issue(s): {}",
             issues.len(),
             issues.join("; ")
+        );
+    }
+
+    if strict && !warnings.is_empty() {
+        anyhow::bail!(
+            "doctor detected {} warning(s) (--strict treats warnings as failures): {}",
+            warnings.len(),
+            warnings.join("; ")
         );
     }
 
@@ -823,7 +853,7 @@ pub async fn analyze_bottlenecks(broker_url: &str, queue: &str) -> anyhow::Resul
     );
     println!();
 
-    let queue_key = format!("celers:{queue}");
+    let queue_key = crate::keys::main(queue);
     let queue_type: String = redis::cmd("TYPE")
         .arg(&queue_key)
         .query_async(&mut conn)
@@ -848,7 +878,7 @@ pub async fn analyze_bottlenecks(broker_url: &str, queue: &str) -> anyhow::Resul
     let worker_keys = scan_worker_heartbeat_keys(&mut conn).await?;
     let worker_count = worker_keys.len();
 
-    let dlq_key = format!("celers:{queue}:dlq");
+    let dlq_key = crate::keys::dlq(queue);
     let dlq_size: isize = redis::cmd("LLEN")
         .arg(&dlq_key)
         .query_async(&mut conn)
@@ -1339,5 +1369,34 @@ maxmemory_human:10.00M
         let _ = state.advance(window.clone());
 
         assert!(state.advance(window).is_empty());
+    }
+
+    // ---- doctor --strict ------------------------------------------------
+
+    /// Local Redis used by this module's live-broker regression tests.
+    const TEST_BROKER_URL: &str = "redis://127.0.0.1:6379";
+
+    /// Regression test for the `--strict` half of idx 340: a paused (but
+    /// otherwise empty, healthy) queue produces exactly one *warning*
+    /// ("Queue is paused") and no critical issue, so `doctor` without
+    /// `--strict` must still exit `Ok(())` -- and with `--strict`, that same
+    /// warning must now fail the run.
+    #[tokio::test]
+    async fn doctor_strict_fails_on_warnings_only_result() {
+        let queue_name = format!("test-doctor-strict-{}", uuid::Uuid::new_v4());
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+        broker.queue_controller().pause().await.expect("pause");
+
+        doctor(TEST_BROKER_URL, &queue_name, false)
+            .await
+            .expect("non-strict doctor must still exit Ok(()) on warnings alone");
+
+        let strict_result = doctor(TEST_BROKER_URL, &queue_name, true).await;
+        assert!(
+            strict_result.is_err(),
+            "--strict doctor must fail when any warning (here: a paused queue) is detected"
+        );
+
+        broker.queue_controller().resume().await.expect("resume");
     }
 }

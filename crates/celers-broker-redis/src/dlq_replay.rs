@@ -38,6 +38,7 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use crate::QueueMode;
 use celers_core::{CelersError, Result, SerializedTask, TaskState};
 use redis::{AsyncCommands, Client, Script};
@@ -159,7 +160,7 @@ pub struct ReplayScheduler {
     dlq_key: String,
     /// Must match the mode of the queue being replayed into: a `Priority`
     /// queue is a Redis sorted set, so replay must `ZADD` rather than
-    /// `RPUSH` (which fails with `WRONGTYPE` against a sorted set).
+    /// `LPUSH` (which fails with `WRONGTYPE` against a sorted set).
     mode: QueueMode,
     policies: HashMap<String, ReplayPolicy>,
     /// Registry backing [`ReplayCondition::Custom`] — see
@@ -434,14 +435,18 @@ enum ReplayOutcome {
 /// `KEYS[1]` = DLQ key, `KEYS[2]` = destination queue key, `KEYS[3]` =
 /// per-policy replay-attempts hash key. `ARGV[1]` = the exact DLQ entry
 /// payload, `ARGV[2]` = `"1"` for priority mode (`ZADD`) or `"0"` for FIFO
-/// (`RPUSH`), `ARGV[3]` = the ZADD score (ignored in FIFO mode), `ARGV[4]` =
+/// (`LPUSH`), `ARGV[3]` = the ZADD score (ignored in FIFO mode), `ARGV[4]` =
 /// the task id (attempts-hash field), `ARGV[5]` = max retries.
+///
+/// FIFO replay pushes to the **head**, matching `RedisBroker::enqueue`:
+/// consumers pop the tail, so a tail push would put a task that has already
+/// failed once ahead of every task currently waiting.
 ///
 /// Returns `1` (replayed), `0` (entry not found in the DLQ — a concurrent
 /// replay already claimed it), or `-1` (retry budget exhausted). Doing the
 /// budget check, the `LREM`, the attempt-count increment, and the
 /// destination push in one `EVAL` is what makes this atomic: unlike a
-/// separate `RPUSH` followed by a separate `LREM`, there is no window in
+/// separate push followed by a separate `LREM`, there is no window in
 /// which a task could be duplicated (present in both the DLQ and the live
 /// queue) or double-counted against its retry budget.
 const REPLAY_MOVE_SCRIPT: &str = r#"
@@ -457,7 +462,7 @@ redis.call('HINCRBY', KEYS[3], ARGV[4], 1)
 if ARGV[2] == '1' then
     redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
 else
-    redis.call('RPUSH', KEYS[2], ARGV[1])
+    redis.call('LPUSH', KEYS[2], ARGV[1])
 end
 return 1
 "#;
@@ -467,7 +472,7 @@ impl ReplayScheduler {
     ///
     /// Use [`Self::with_mode`] for a queue running in
     /// [`QueueMode::Priority`] — replaying into a priority queue with FIFO
-    /// semantics issues `RPUSH` against what is actually a Redis sorted set,
+    /// semantics issues `LPUSH` against what is actually a Redis sorted set,
     /// which fails with `WRONGTYPE`.
     pub async fn new(redis_url: &str, queue_name: &str) -> Result<Self> {
         Self::with_mode(redis_url, queue_name, QueueMode::Fifo).await
@@ -478,7 +483,7 @@ impl ReplayScheduler {
     /// `mode` must match the mode the target queue actually uses (the same
     /// value passed to `RedisBroker::with_mode`), since a `Priority` queue
     /// is a Redis sorted set and replay must `ZADD` into it rather than
-    /// `RPUSH`.
+    /// `LPUSH`.
     pub async fn with_mode(redis_url: &str, queue_name: &str, mode: QueueMode) -> Result<Self> {
         let client = Client::open(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
@@ -649,7 +654,7 @@ impl ReplayScheduler {
         let start = std::time::Instant::now();
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -1247,7 +1252,7 @@ mod tests {
     async fn test_conn() -> redis::aio::MultiplexedConnection {
         Client::open(TEST_REDIS_URL)
             .unwrap()
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .unwrap()
     }
@@ -1314,6 +1319,68 @@ mod tests {
         // cleanup
         let _: () = conn.del(&dlq_key).await.unwrap();
         let _: () = conn.del(&queue_name).await.unwrap();
+    }
+
+    /// A replayed task must land at the *back* of the delivery order, not
+    /// the front.
+    ///
+    /// The broker enqueues with `LPUSH` and consumes from the tail, so a
+    /// replay that pushed with `RPUSH` would hand a task that has already
+    /// failed at least once straight to the next worker, ahead of every task
+    /// that was waiting first — a silent fairness inversion no type check
+    /// catches.
+    #[tokio::test]
+    async fn test_fifo_replay_lands_behind_waiting_tasks() {
+        let queue_name = format!("test-replay-order-{}", uuid::Uuid::new_v4());
+        let mut scheduler = ReplayScheduler::new(TEST_REDIS_URL, &queue_name)
+            .await
+            .unwrap();
+        scheduler
+            .add_policy("immediate", ReplayPolicy::time_based(Duration::ZERO))
+            .await
+            .unwrap();
+
+        let mut conn = test_conn().await;
+        let dlq_key = format!("{}:dlq", queue_name);
+
+        // Already waiting, enqueued the way the broker does it (head push).
+        let waiting = SerializedTask::new("waiting".to_string(), vec![]);
+        let waiting_data = serde_json::to_string(&waiting).unwrap();
+        let _: () = conn.lpush(&queue_name, &waiting_data).await.unwrap();
+
+        let failed = SerializedTask::new("failed".to_string(), vec![]);
+        let failed_data = serde_json::to_string(&failed).unwrap();
+        let _: () = conn.rpush(&dlq_key, &failed_data).await.unwrap();
+
+        let results = scheduler.execute_once().await.unwrap();
+        assert_eq!(results[0].replayed_count, 1);
+
+        // Consumers pop the tail, so the tail is what gets served next.
+        let next: Option<String> = conn.rpop(&queue_name, None).await.unwrap();
+        assert_eq!(
+            next.as_deref(),
+            Some(waiting_data.as_str()),
+            "the task that was already waiting must be served before the replayed one"
+        );
+        let then: Option<String> = conn.rpop(&queue_name, None).await.unwrap();
+        assert_eq!(then.as_deref(), Some(failed_data.as_str()));
+
+        let _: () = conn.del(&dlq_key).await.unwrap();
+        let _: () = conn.del(&queue_name).await.unwrap();
+    }
+
+    /// The replay script must agree with the broker on which end of the list
+    /// is the back of the queue.
+    #[test]
+    fn test_replay_script_pushes_to_the_head() {
+        assert!(
+            REPLAY_MOVE_SCRIPT.contains("'LPUSH'"),
+            "replay must push to the head, as `RedisBroker::enqueue` does"
+        );
+        assert!(
+            !REPLAY_MOVE_SCRIPT.contains("'RPUSH'"),
+            "a tail push puts the replayed task at the front of the delivery order"
+        );
     }
 
     #[tokio::test]

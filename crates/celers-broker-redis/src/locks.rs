@@ -39,9 +39,10 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result};
 use redis::{AsyncCommands, Client, Script};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -152,7 +153,11 @@ impl DistributedLock {
         &self,
         timeout: Option<Duration>,
     ) -> Result<Option<LockToken>> {
-        let start = SystemTime::now();
+        // Monotonic, not `SystemTime`: an NTP correction or a manual clock
+        // change during the retry loop would make a wall-clock `elapsed()`
+        // fail outright (it returns `Err` when the clock steps backwards),
+        // and the timeout would then be measured against a moving ruler.
+        let start = tokio::time::Instant::now();
         let mut attempts = 0;
 
         loop {
@@ -172,11 +177,7 @@ impl DistributedLock {
 
             // Check timeout
             if let Some(timeout) = timeout {
-                if start
-                    .elapsed()
-                    .expect("system time should not go backwards")
-                    >= timeout
-                {
+                if start.elapsed() >= timeout {
                     warn!(
                         "Failed to acquire lock '{}' within timeout ({} attempts)",
                         self.resource_name, attempts
@@ -200,7 +201,7 @@ impl DistributedLock {
     pub async fn try_acquire(&self, token: &LockToken) -> Result<bool> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -224,7 +225,7 @@ impl DistributedLock {
     pub async fn release(&self, token: &LockToken) -> Result<bool> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -267,7 +268,7 @@ impl DistributedLock {
     pub async fn extend(&self, token: &LockToken, additional_secs: u64) -> Result<bool> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -311,7 +312,7 @@ impl DistributedLock {
     pub async fn is_locked(&self) -> Result<bool> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -329,7 +330,7 @@ impl DistributedLock {
     pub async fn ttl(&self) -> Result<Option<i64>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -351,7 +352,7 @@ impl DistributedLock {
     pub async fn force_release(&self) -> Result<bool> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 

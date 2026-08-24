@@ -421,13 +421,55 @@ impl TaskException {
         serde_json::from_str(json)
     }
 
-    /// Convert to Celery-compatible format
+    /// The Python module this exception's class belongs to, if known.
+    ///
+    /// Read from the `"module"` metadata entry (set with
+    /// [`TaskException::with_metadata`] or [`TaskException::with_module`]).
+    /// Returns [`None`] when the entry is absent or is not a JSON string, so a
+    /// caller that stuffed a non-string under `"module"` does not silently
+    /// produce a bogus `exc_module`.
+    #[must_use]
+    pub fn module(&self) -> Option<&str> {
+        self.metadata.get("module").and_then(|v| v.as_str())
+    }
+
+    /// Record the Python module the exception class lives in.
+    ///
+    /// Use `"builtins"` for the standard Python exceptions (`ValueError`,
+    /// `RuntimeError`, …) so a Python consumer re-raises the real type instead
+    /// of a synthesized stand-in.
+    #[must_use]
+    pub fn with_module(self, module: impl Into<String>) -> Self {
+        self.with_metadata("module", serde_json::Value::String(module.into()))
+    }
+
+    /// Convert to Celery's exception dict.
+    ///
+    /// The shape matches `celery.backends.base.Backend.prepare_exception`, which
+    /// is what `exception_to_python` reads back:
+    ///
+    /// ```text
+    /// {"exc_type": "ValueError", "exc_message": ["bad input"], "exc_module": "builtins"}
+    /// ```
+    ///
+    /// Two details are load-bearing for cross-language compatibility and match
+    /// `celers_protocol::result::ExceptionInfo`:
+    ///
+    /// * `exc_message` is a **list**, not a bare string: Python splats it into
+    ///   the exception constructor as `*args` (it is `exc.args`). A bare string
+    ///   would be splatted character by character.
+    /// * `exc_module` is **always emitted**, `null` when unknown, because
+    ///   `celery.utils.serialization.create_exception_cls` uses it (together
+    ///   with `exc_type`) to import the real exception class; a missing key
+    ///   forces a synthesized stand-in class.
     #[must_use]
     pub fn to_celery_format(&self) -> serde_json::Value {
         serde_json::json!({
             "exc_type": self.exc_type,
-            "exc_message": self.exc_message,
-            "exc_module": self.metadata.get("module").cloned().unwrap_or(serde_json::Value::Null),
+            "exc_message": [self.exc_message],
+            "exc_module": self.module().map_or(serde_json::Value::Null, |module| {
+                serde_json::Value::String(module.to_string())
+            }),
             "traceback": self.traceback_str.clone().unwrap_or_else(|| self.format_traceback()),
         })
     }
@@ -1087,11 +1129,50 @@ mod tests {
     #[test]
     fn test_task_exception_celery_format() {
         let exc = TaskException::new("ValueError", "Invalid value")
+            .with_module("builtins")
             .with_traceback_str("Traceback (most recent call last):\n  File \"test.py\"");
 
         let celery = exc.to_celery_format();
         assert_eq!(celery["exc_type"], "ValueError");
-        assert_eq!(celery["exc_message"], "Invalid value");
+        // `exc_message` is Python's `exc.args`: a list, not a bare string.
+        assert_eq!(celery["exc_message"], serde_json::json!(["Invalid value"]));
+        assert_eq!(celery["exc_module"], "builtins");
+        assert!(celery["traceback"]
+            .as_str()
+            .is_some_and(|tb| tb.contains("test.py")));
+    }
+
+    /// Regression: `to_celery_format` emitted `exc_message` as a bare string and
+    /// dropped `exc_module` unless it happened to be present, which made the
+    /// dict inconsistent with `celers_protocol::result::ExceptionInfo` and
+    /// unreadable by `celery.backends.base.Backend.exception_to_python`.
+    #[test]
+    fn test_celery_format_always_emits_exc_module_key() {
+        let exc = TaskException::new("CustomError", "boom");
+        let celery = exc.to_celery_format();
+
+        let object = celery
+            .as_object()
+            .expect("celery exception dict must be a JSON object");
+        assert!(
+            object.contains_key("exc_module"),
+            "exc_module key must always be present, null when unknown"
+        );
+        assert_eq!(celery["exc_module"], serde_json::Value::Null);
+        assert_eq!(celery["exc_message"], serde_json::json!(["boom"]));
+    }
+
+    /// A non-string `"module"` metadata entry must not leak into `exc_module`.
+    #[test]
+    fn test_celery_format_ignores_non_string_module_metadata() {
+        let exc = TaskException::new("CustomError", "boom")
+            .with_metadata("module", serde_json::json!(42));
+
+        assert_eq!(exc.module(), None);
+        assert_eq!(
+            exc.to_celery_format()["exc_module"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

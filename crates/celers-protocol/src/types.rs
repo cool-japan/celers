@@ -229,6 +229,24 @@ impl ContentType {
             ContentType::Custom(s) => s,
         }
     }
+
+    /// The [`ContentEncoding`] a message with this content type carries
+    /// when no encoding is explicitly chosen.
+    ///
+    /// JSON is text (`utf-8`); every other format (msgpack, binary, custom)
+    /// is treated as opaque binary. Declaring `content-encoding: utf-8` on
+    /// a non-JSON body would be a lie the receiving end could act on.
+    ///
+    /// Shared by [`crate::builder::MessageBuilder::build`] and
+    /// [`crate::v5::build_v5_message`] so the two message-construction
+    /// paths cannot independently drift on this mapping.
+    #[inline]
+    pub fn default_content_encoding(&self) -> ContentEncoding {
+        match self {
+            ContentType::Json => ContentEncoding::Utf8,
+            _ => ContentEncoding::Binary,
+        }
+    }
 }
 
 impl std::fmt::Display for ContentType {
@@ -1210,5 +1228,25 @@ mod wire_format_tests {
         assert_eq!(restored.origin(), Some("1234@worker.local"));
         assert_eq!(restored.shadow(), Some("tasks.add[display]"));
         assert_eq!(restored.ignore_result(), Some(true));
+    }
+
+    /// `default_content_encoding` is the single source of truth for the
+    /// content-type -> content-encoding mapping shared by
+    /// `MessageBuilder::build` and `build_v5_message`.
+    #[test]
+    fn test_content_type_default_content_encoding() {
+        assert_eq!(
+            ContentType::Json.default_content_encoding(),
+            ContentEncoding::Utf8
+        );
+        #[cfg(feature = "msgpack")]
+        assert_eq!(
+            ContentType::MessagePack.default_content_encoding(),
+            ContentEncoding::Binary
+        );
+        assert_eq!(
+            ContentType::Custom("application/x-custom".to_string()).default_content_encoding(),
+            ContentEncoding::Binary
+        );
     }
 }

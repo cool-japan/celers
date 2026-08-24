@@ -3,11 +3,14 @@
 //! Split out of [`worker_core`](crate::worker_core) so the dequeue loop stays
 //! readable. Everything here runs inside the task's own spawned future.
 
+use crate::checkpoint::CheckpointManager;
 use crate::circuit_breaker::CircuitBreaker;
 use crate::dlq::{self, DlqHandler};
 use crate::execution_context::{RevocationWatcher, TaskExecutionContext};
+use crate::health::HealthChecker;
 use crate::memory::{self, MemoryTracker};
 use crate::middleware;
+use crate::poison_pill::PoisonPillDetector;
 use crate::retry::RetryConfig;
 use crate::types::WorkerStats;
 
@@ -16,6 +19,7 @@ use super::support::{
     InFlightRegistry,
 };
 
+use celers_core::time_limit::{TimeLimitConfig, TimeLimitExceeded};
 use celers_core::{
     Broker, CelersError, Event, Result, SerializedTask, TaskEvent, TaskEventBuilder, TaskId,
     TaskRegistry, TaskState,
@@ -30,6 +34,107 @@ use celers_metrics::{
     TASKS_COMPLETED_BY_TYPE, TASKS_COMPLETED_TOTAL, TASKS_FAILED_BY_TYPE, TASKS_FAILED_TOTAL,
     TASKS_RETRIED_BY_TYPE, TASKS_RETRIED_TOTAL, TASK_EXECUTION_TIME, TASK_EXECUTION_TIME_BY_TYPE,
 };
+
+/// The time bounds applied to one task's execution.
+///
+/// CeleRS (like Celery) has two independent notions of "running too long":
+///
+/// * the task's own **execution timeout**
+///   ([`TaskMetadata::timeout_secs`](celers_core::TaskMetadata::timeout_secs),
+///   falling back to the worker's `default_timeout_secs`), and
+/// * the configured **time limits**
+///   ([`WorkerTimeLimits`](celers_core::WorkerTimeLimits)): a *soft* limit that
+///   only warns the running task, and a *hard* limit that kills it.
+///
+/// The task future is raced against whichever of the execution timeout and the
+/// hard limit comes first. The soft limit is armed separately and never ends the
+/// task: it trips the [`SoftTimeout`](crate::execution_context::SoftTimeout)
+/// signal so cooperative task code can wrap up before the hard limit lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutionLimits {
+    /// The configured execution timeout, in seconds.
+    pub(crate) timeout_secs: u64,
+    /// Soft time limit, when configured.
+    pub(crate) soft_limit: Option<Duration>,
+    /// Hard time limit, when configured.
+    pub(crate) hard_limit: Option<Duration>,
+}
+
+/// The terminal failure produced by an expired execution deadline.
+///
+/// Both the plain execution timeout and the hard time limit funnel through the
+/// worker's single timeout path (retry while budget remains, dead-letter after);
+/// only the wording, failure class and DLQ metadata differ, so callers can tell
+/// a Celery `TimeLimitExceeded` apart from an ordinary timeout.
+pub(crate) struct TimeoutFailure {
+    /// Human-readable reason (the `task-failed` event's exception text).
+    pub(crate) message: String,
+    /// Machine-readable failure class recorded in the DLQ.
+    pub(crate) failure_type: &'static str,
+    /// Extra DLQ metadata describing the limit that fired.
+    pub(crate) metadata: Vec<(&'static str, String)>,
+}
+
+impl ExecutionLimits {
+    /// Limits consisting of just the execution timeout (no time limits).
+    pub(crate) fn from_timeout(timeout_secs: u64) -> Self {
+        Self {
+            timeout_secs,
+            soft_limit: None,
+            hard_limit: None,
+        }
+    }
+
+    /// Overlay a resolved [`TimeLimitConfig`] onto these limits.
+    pub(crate) fn with_time_limits(mut self, config: &TimeLimitConfig) -> Self {
+        self.soft_limit = config.soft_limit();
+        self.hard_limit = config.hard_limit();
+        self
+    }
+
+    /// The deadline the task future is actually raced against: the earlier of
+    /// the execution timeout and the hard time limit.
+    pub(crate) fn deadline(&self) -> Duration {
+        let timeout = Duration::from_secs(self.timeout_secs);
+        match self.hard_limit {
+            Some(hard) => hard.min(timeout),
+            None => timeout,
+        }
+    }
+
+    /// Whether the hard time limit — rather than the plain execution timeout —
+    /// is the binding deadline.
+    ///
+    /// Ties go to the hard limit: it is the more specific configuration, and its
+    /// failure carries the limit that operators actually set.
+    pub(crate) fn hard_limit_is_binding(&self) -> bool {
+        self.hard_limit
+            .is_some_and(|hard| hard <= Duration::from_secs(self.timeout_secs))
+    }
+
+    /// Describe the failure for a task that hit its deadline after `elapsed`.
+    pub(crate) fn timeout_failure(&self, task_id: TaskId, elapsed: Duration) -> TimeoutFailure {
+        match self.hard_limit.filter(|_| self.hard_limit_is_binding()) {
+            Some(hard) => {
+                let exceeded = TimeLimitExceeded::HardLimitExceeded {
+                    task_id: task_id.to_string(),
+                    elapsed_millis: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    limit_millis: u64::try_from(hard.as_millis()).unwrap_or(u64::MAX),
+                };
+                TimeoutFailure {
+                    message: exceeded.to_string(),
+                    failure_type: "hard_time_limit",
+                    metadata: vec![("hard_limit_millis", hard.as_millis().to_string())],
+                }
+            }
+            None => TimeoutFailure {
+                message: format!("Task timed out after {}s", self.timeout_secs),
+                failure_type: "timeout",
+                metadata: vec![("timeout_secs", self.timeout_secs.to_string())],
+            },
+        }
+    }
+}
 
 /// Everything one dispatched message needs to run to a terminal disposition.
 pub(crate) struct TaskDispatch<B: Broker> {
@@ -65,8 +170,14 @@ pub(crate) struct TaskDispatch<B: Broker> {
     pub(crate) in_flight: InFlightRegistry,
     /// Optional result-memory tracker.
     pub(crate) memory_tracker: Option<Arc<MemoryTracker>>,
-    /// Execution timeout for this task.
-    pub(crate) timeout_secs: u64,
+    /// Optional poison-pill detector (strike accounting).
+    pub(crate) poison_pill: Option<Arc<PoisonPillDetector>>,
+    /// Optional task-checkpoint store (cleared on successful completion).
+    pub(crate) checkpoints: Option<Arc<CheckpointManager>>,
+    /// Liveness/readiness accounting.
+    pub(crate) health: HealthChecker,
+    /// Execution timeout and (optional) soft/hard time limits for this task.
+    pub(crate) limits: ExecutionLimits,
     /// Effective retry budget (task request capped by the worker's setting).
     pub(crate) max_retries: u32,
     /// Effective retry strategy (delays, jitter).
@@ -261,7 +372,10 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
         exec_context,
         in_flight,
         memory_tracker,
-        timeout_secs,
+        poison_pill,
+        checkpoints,
+        health,
+        limits,
         max_retries,
         retry_config,
         max_result_size_bytes,
@@ -270,6 +384,10 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
     let start_time = Instant::now();
     let task_name = task.metadata.name.clone();
     let current_retry = spent_retries(&task);
+
+    // Liveness: a worker with a task in hand is processing, whatever the
+    // outcome. Cleared on every exit path below.
+    health.set_processing(true);
 
     let mut ctx = middleware::TaskContext {
         task_id: task_id.to_string(),
@@ -292,15 +410,34 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
         }
     }
 
+    // Arm the soft time limit, if one is configured. It only *warns* the running
+    // task (Celery semantics): the timer trips the cooperative signal the task
+    // observes through `check_soft_time_limit()`, and the task keeps running
+    // until it finishes or the hard limit ends it.
+    let soft_timer = arm_soft_time_limit(
+        exec_context.as_ref(),
+        &limits,
+        task_id,
+        &task_name,
+        &stats,
+        start_time,
+    );
+
     let exec_outcome = drive_task(
         Arc::clone(&registry),
         Arc::clone(&task),
         task_id,
         exec_context,
-        timeout_secs,
+        limits.deadline(),
         &stats,
     )
     .await;
+
+    // The task is done one way or another: stop the soft-limit timer so it can
+    // never fire for a task that already finished.
+    if let Some(timer) = soft_timer {
+        timer.abort();
+    }
 
     // Claim the right to dispose of this delivery. A graceful-shutdown deadline
     // may already have requeued it, in which case the broker owns the message
@@ -332,6 +469,10 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                 }
                 if let Some(ref cb) = circuit_breaker {
                     cb.record_failure(&task_name).await;
+                }
+                health.record_failure();
+                if let Some(ref detector) = poison_pill {
+                    detector.record_failure(task_id, size_error.clone()).await;
                 }
 
                 // Retrying cannot shrink a deterministic result, so this is
@@ -392,6 +533,24 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                 if let Some(ref cb) = circuit_breaker {
                     cb.record_success(&task_name).await;
                 }
+                health.record_success();
+                // A task that eventually succeeds is forgiven: its accumulated
+                // poison-pill strikes are cleared.
+                if let Some(ref detector) = poison_pill {
+                    detector.record_success(&task_id).await;
+                }
+                // Its resume points are dead weight now: a completed task will
+                // never restart from them, and leaving them behind is how a
+                // checkpoint store grows without bound.
+                if let Some(ref manager) = checkpoints {
+                    let removed = manager.delete_checkpoints(&task_id.to_string()).await;
+                    if removed > 0 {
+                        debug!(
+                            "Discarded {} checkpoint(s) for completed task {}",
+                            removed, task_id
+                        );
+                    }
+                }
 
                 #[cfg(feature = "metrics")]
                 {
@@ -405,7 +564,40 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                         .observe(duration.as_secs_f64());
                 }
 
+                // Workflow continuation and the ack are both owned by whoever
+                // holds the disposition token. `claimed == false` means the
+                // shutdown drain already requeued this delivery: the task will
+                // run again on redelivery and advance the workflow then, so
+                // advancing it here too would enqueue every chain successor
+                // twice.
                 if claimed {
+                    // Chain tails, branch/switch steps and chord barriers all
+                    // live in the finished task's payload and metadata;
+                    // advancing them is what makes an N-step chain run all N
+                    // steps instead of stopping after the first. Done *before*
+                    // the ack so a crash in between redelivers the task rather
+                    // than silently ending the workflow.
+                    #[cfg(feature = "canvas")]
+                    {
+                        let continued = crate::workflows::handle_workflow_completion(
+                            &task,
+                            &result,
+                            broker.as_ref(),
+                            // The worker holds no result-backend handle yet, so
+                            // chord barrier counting is skipped (chain
+                            // continuation and branch/switch evaluation are not).
+                            #[cfg(feature = "workflows")]
+                            None,
+                        )
+                        .await;
+                        if let Err(e) = continued {
+                            error!(
+                                "Failed to continue the workflow after task {} succeeded: {}",
+                                task_id, e
+                            );
+                        }
+                    }
+
                     if let Err(e) = broker.ack(&task_id, receipt_handle.as_deref()).await {
                         error!("Failed to acknowledge task {}: {}", task_id, e);
                     }
@@ -427,6 +619,13 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
             // times slower than the configured threshold.
             if let Some(ref cb) = circuit_breaker {
                 cb.record_failure(&task_name).await;
+            }
+            health.record_failure();
+            // Every failed *execution* is a poison-pill strike, whether or not
+            // the retry budget will send it round again: "this task id keeps
+            // failing" is exactly the signal quarantine exists for.
+            if let Some(ref detector) = poison_pill {
+                detector.record_failure(task_id, error_msg.clone()).await;
             }
 
             if current_retry < max_retries {
@@ -500,11 +699,18 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
             }
         }
         ExecOutcome::TimedOut => {
-            let error_msg = format!("Task timed out after {}s", timeout_secs);
-            error!("Task {} timed out after {}s", task_id, timeout_secs);
+            // A hard time limit and a plain execution timeout share this path;
+            // only the wording and the recorded failure class differ.
+            let failure = limits.timeout_failure(task_id, start_time.elapsed());
+            let error_msg = failure.message;
+            error!("Task {} exceeded its deadline: {}", task_id, error_msg);
 
             if let Some(ref cb) = circuit_breaker {
                 cb.record_failure(&task_name).await;
+            }
+            health.record_failure();
+            if let Some(ref detector) = poison_pill {
+                detector.record_failure(task_id, error_msg.clone()).await;
             }
 
             if current_retry < max_retries {
@@ -557,8 +763,8 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                         receipt_handle: receipt_handle.as_deref(),
                         retry_count: current_retry,
                         error_msg: &error_msg,
-                        failure_type: "timeout",
-                        extra_metadata: vec![("timeout_secs", timeout_secs.to_string())],
+                        failure_type: failure.failure_type,
+                        extra_metadata: failure.metadata,
                         dispose: claimed,
                     },
                 )
@@ -579,6 +785,13 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                 if let Err(e) = mw.on_error(&ctx, "Task revoked during execution").await {
                     warn!("Middleware on_error error: {}", e);
                 }
+            }
+
+            // A revoked task produced neither a success nor a failure, so the
+            // breaker learns nothing from it — but it may have been admitted on
+            // a half-open trial slot, which has to go back.
+            if let Some(ref cb) = circuit_breaker {
+                cb.release_probe(&task_name).await;
             }
 
             events.emit(Event::Task(TaskEvent::Revoked {
@@ -608,8 +821,54 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
         watcher.unregister(&task_id).await;
     }
 
+    // `stats.active()` still counts *this* task (its guard drops below), so
+    // "someone else is still working" is `> 1`. Without the comparison, one
+    // task finishing would report a busy worker as idle.
+    health.set_processing(stats.active() > 1);
+
     // `_guard` drops here: active-count decremented, concurrency permit
     // released — including on an unwind past this point.
+}
+
+/// Arm the task's **soft** time limit, if one is configured.
+///
+/// Returns the timer's [`JoinHandle`](tokio::task::JoinHandle) so the caller can
+/// abort it the moment the task finishes. When it fires it trips the task's
+/// [`SoftTimeout`](crate::execution_context::SoftTimeout) — which a cooperative
+/// handler observes through
+/// [`check_soft_time_limit`](crate::execution_context::check_soft_time_limit) —
+/// counts the expiry in [`WorkerStats`] and logs a warning. It deliberately does
+/// **not** touch the cancellation token: tripping that would make the worker
+/// treat the task as revoked (acked, never retried), whereas a soft-limit expiry
+/// leaves the task running until it finishes or hits its hard limit.
+fn arm_soft_time_limit(
+    exec_context: Option<&TaskExecutionContext>,
+    limits: &ExecutionLimits,
+    task_id: TaskId,
+    task_name: &str,
+    stats: &Arc<WorkerStats>,
+    start_time: Instant,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let soft_limit = limits.soft_limit?;
+    let signal = exec_context?.soft_timeout().clone();
+    if !signal.is_configured() {
+        // The context was built without the soft limit (nothing to trip).
+        return None;
+    }
+
+    let stats = Arc::clone(stats);
+    let task_name = task_name.to_string();
+    Some(tokio::spawn(async move {
+        sleep(soft_limit).await;
+        if signal.expire(start_time.elapsed()) {
+            stats.task_soft_timeout();
+            warn!(
+                "Soft time limit of {:?} exceeded for task {} ('{}'); the task may wrap up \
+                 cooperatively until its hard limit",
+                soft_limit, task_id, task_name
+            );
+        }
+    }))
 }
 
 /// Drive the handler future, bounded by the timeout and racing the task's
@@ -626,7 +885,7 @@ async fn drive_task(
     task: Arc<SerializedTask>,
     task_id: TaskId,
     exec_context: Option<TaskExecutionContext>,
-    timeout_secs: u64,
+    deadline: Duration,
     stats: &Arc<WorkerStats>,
 ) -> ExecOutcome {
     let scoped_context = exec_context.clone();
@@ -643,7 +902,6 @@ async fn drive_task(
         }
     });
 
-    let deadline = Duration::from_secs(timeout_secs);
     let joined = match exec_context.as_ref().map(|c| c.token().clone()) {
         Some(token) => {
             timeout(deadline, async {

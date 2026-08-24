@@ -32,6 +32,7 @@ pub struct BackendBuilder {
     compression_level: Option<u32>,
     key_prefix: Option<String>,
     encryption_key: Option<crate::encryption::EncryptionKey>,
+    result_ttl: Option<Option<Duration>>,
 }
 
 impl BackendBuilder {
@@ -45,7 +46,26 @@ impl BackendBuilder {
             compression_level: None,
             key_prefix: None,
             encryption_key: None,
+            result_ttl: None,
         }
+    }
+
+    /// Override how long stored results live
+    ///
+    /// Defaults to [`ttl::SUCCESS`](crate::ttl::SUCCESS) (24 hours) when left
+    /// unset, matching Celery's `result_expires`.
+    pub fn with_result_ttl(mut self, ttl: Duration) -> Self {
+        self.result_ttl = Some(Some(ttl));
+        self
+    }
+
+    /// Store results permanently (no expiry)
+    ///
+    /// Redis memory then grows with every task the deployment runs, so results
+    /// must be removed by some other means.
+    pub fn without_result_ttl(mut self) -> Self {
+        self.result_ttl = Some(None);
+        self
     }
 
     /// Enable caching with specified capacity and TTL
@@ -115,6 +135,12 @@ impl BackendBuilder {
             let config = crate::encryption::EncryptionConfig::new(key);
             backend = backend.with_encryption(config);
         }
+
+        backend = match self.result_ttl {
+            Some(Some(ttl)) => backend.with_ttl_config(crate::TaskTtlConfig::with_default(ttl)),
+            Some(None) => backend.without_ttl(),
+            None => backend,
+        };
 
         Ok(backend)
     }
@@ -215,6 +241,7 @@ impl ChordBuilder {
                 total,
                 completed: 0,
                 callback: None,
+                callback_on_success_link: None,
                 task_ids: Vec::new(),
                 created_at: Utc::now(),
                 timeout: None,
@@ -229,6 +256,14 @@ impl ChordBuilder {
     /// Set the callback task name
     pub fn with_callback(mut self, callback: impl Into<String>) -> Self {
         self.state.callback = Some(callback.into());
+        self
+    }
+
+    /// Set the bare, name-only successor to enqueue once the callback task
+    /// completes. See [`ChordState::callback_on_success_link`] for what this
+    /// can and cannot carry.
+    pub fn with_callback_on_success_link(mut self, task_name: impl Into<String>) -> Self {
+        self.state.callback_on_success_link = Some(task_name.into());
         self
     }
 
@@ -529,6 +564,7 @@ mod tests {
 
         let chord = ChordBuilder::new(chord_id, 10)
             .with_callback("aggregate")
+            .with_callback_on_success_link("notify_done")
             .with_timeout(Duration::from_secs(300))
             .with_max_retries(3)
             .add_task_id(task_id1)
@@ -538,6 +574,10 @@ mod tests {
         assert_eq!(chord.chord_id, chord_id);
         assert_eq!(chord.total, 10);
         assert_eq!(chord.callback, Some("aggregate".to_string()));
+        assert_eq!(
+            chord.callback_on_success_link,
+            Some("notify_done".to_string())
+        );
         assert_eq!(chord.timeout, Some(Duration::from_secs(300)));
         assert_eq!(chord.max_retries, Some(3));
         assert_eq!(chord.task_ids.len(), 2);

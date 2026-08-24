@@ -37,13 +37,28 @@ pub trait ResultBackend: Send + Sync {
     /// Chord: Get chord state
     async fn chord_get_state(&mut self, chord_id: Uuid) -> Result<Option<ChordState>>;
 
+    /// Chord: Persist a mutated chord state **without** resetting progress
+    ///
+    /// [`chord_init`](Self::chord_init) is a *create-or-reset* primitive: it
+    /// zeroes the completion counter. Callers that merely want to record a
+    /// state change (cancellation, a new callback, an updated timeout) must use
+    /// this method instead, otherwise the tasks that already completed are
+    /// forgotten and the callback fires late or never.
+    ///
+    /// The default implementation falls back to `chord_init` so existing
+    /// backends keep compiling; backends that can update in place should
+    /// override it.
+    async fn chord_update_state(&mut self, state: ChordState) -> Result<()> {
+        self.chord_init(state).await
+    }
+
     /// Chord: Cancel a chord
     async fn chord_cancel(&mut self, chord_id: Uuid, reason: Option<String>) -> Result<()> {
         if let Some(mut state) = self.chord_get_state(chord_id).await? {
             state.cancel(reason);
-            // Re-store the updated state (requires ChordState to be serializable)
-            // This is a default implementation that should be overridden for efficiency
-            self.chord_init(state).await?;
+            // Persist the cancellation *without* resetting the completion
+            // counter — cancelling must not un-complete finished tasks.
+            self.chord_update_state(state).await?;
         }
         Ok(())
     }
@@ -112,8 +127,17 @@ pub trait ResultBackend: Send + Sync {
 
     /// Store a versioned result
     ///
-    /// Stores the result with an incremented version number and keeps a history
-    /// of previous versions using a versioned key pattern.
+    /// Stores the result with an incremented version number and returns the new
+    /// version.
+    ///
+    /// Whether previous versions are *retained* depends on the backend:
+    /// `RedisResultBackend` overrides this to keep a bounded history under
+    /// `{task_key}:v{n}` (see
+    /// [`VersioningConfig`](crate::backend::VersioningConfig)). The default
+    /// implementation below only advances the version counter on the current
+    /// record — it keeps no history, so
+    /// [`get_result_version`](Self::get_result_version) can answer for the
+    /// latest version only.
     async fn store_versioned_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<u32> {
         // Get current version
         let current_version = if let Some(existing) = self.get_result(task_id).await? {
@@ -135,15 +159,25 @@ pub trait ResultBackend: Send + Sync {
 
     /// Get a specific version of a result
     ///
-    /// Returns None if the version doesn't exist. Version 0 or omitted means latest.
+    /// `version == 0` means "latest". Returns `Ok(None)` when the requested
+    /// version is not available, rather than silently substituting a different
+    /// one.
+    ///
+    /// The default implementation keeps no history, so it can only answer for
+    /// the version the current record carries; `RedisResultBackend` overrides
+    /// it with real versioned-key lookups.
     async fn get_result_version(
         &mut self,
         task_id: Uuid,
-        _version: u32,
+        version: u32,
     ) -> Result<Option<TaskMeta>> {
-        // Default implementation only returns the latest version
-        // Override in specific backends to support versioned storage
-        self.get_result(task_id).await
+        let latest = self.get_result(task_id).await?;
+        match latest {
+            Some(meta) if version == 0 || meta.version == version => Ok(Some(meta)),
+            // Historical versions are not retained by this backend: report the
+            // miss instead of returning the wrong version.
+            _ => Ok(None),
+        }
     }
 
     // Progress tracking (with default implementations)

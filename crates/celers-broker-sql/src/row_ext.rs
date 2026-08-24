@@ -330,6 +330,33 @@ mod tests {
         assert!(matches!(result, Err(OxiSqlError::TypeMismatch { .. })));
     }
 
+    /// The invariant `broker_diagnostics.rs`'s `get_task_execution_stats`
+    /// (and its siblings) depend on: `row.col::<Option<T>>(name)` must decode
+    /// a genuine SQL NULL (e.g. `MIN(...)`/`AVG(...)` over zero matching
+    /// rows) as `Ok(None)`, never an `Err` — a NULL aggregate is expected,
+    /// routine output, not a decode failure to swallow with `.ok()`.
+    #[test]
+    fn col_option_wraps_null_as_ok_none_not_an_error() {
+        let row = row_with("n", Value::Null);
+        let result: Result<Option<i64>, _> = row.col("n");
+        assert_eq!(
+            result.expect("a NULL column must decode cleanly through Option<T>"),
+            None
+        );
+    }
+
+    /// The other half of the same invariant: a value that is present but the
+    /// *wrong* type must still surface as `Err` through `Option<T>` — this is
+    /// exactly the genuine-bug case `.col::<T>(name).ok()` used to collapse
+    /// into the same `None` as a routine NULL, hiding a real defect behind a
+    /// fabricated statistic.
+    #[test]
+    fn col_option_still_errors_on_genuine_type_mismatch() {
+        let row = row_with("n", Value::Text("not a number".to_string()));
+        let result: Result<Option<i64>, _> = row.col("n");
+        assert!(matches!(result, Err(OxiSqlError::TypeMismatch { .. })));
+    }
+
     #[test]
     fn col_idx_extracts_by_position_for_unaliased_expressions() {
         // Mirrors `SELECT 1` / `SELECT now() - x`, where the driver-assigned

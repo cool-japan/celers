@@ -111,6 +111,36 @@ else
 end
 "#;
 
+/// Lua script for atomic acquire-or-refresh.
+///
+/// Takes the lock when it is free, refreshes it when this owner already holds
+/// it, and refuses when somebody else does — all in one round trip.
+///
+/// A non-atomic `GET` + `PEXPIRE` fast path is not equivalent: if the lock
+/// expires between the two commands and another instance acquires it, the
+/// `PEXPIRE` extends *that* instance's lock while this one reports success, so
+/// both believe they hold it. For a beat scheduler lock that means the same
+/// periodic task is dispatched twice.
+///
+/// ```lua
+/// local current = redis.call('get', KEYS[1])
+/// if not current or current == ARGV[1] then
+///     redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2])
+///     return 1
+/// else
+///     return 0
+/// end
+/// ```
+const ACQUIRE_SCRIPT: &str = r#"
+local current = redis.call('get', KEYS[1])
+if not current or current == ARGV[1] then
+    redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    return 1
+else
+    return 0
+end
+"#;
+
 #[async_trait]
 impl DistributedLockBackend for RedisLockBackend {
     async fn try_acquire(
@@ -122,36 +152,18 @@ impl DistributedLockBackend for RedisLockBackend {
         let mut conn = self.get_conn().await?;
         let lock_key = self.lock_key(key);
 
-        // First check if we already own the lock
-        let current: Option<String> = conn
-            .get(&lock_key)
-            .await
-            .map_err(|e| CelersError::Broker(format!("Redis GET failed: {}", e)))?;
-
-        if let Some(ref current_owner) = current {
-            if current_owner == owner {
-                // We already own it, just refresh TTL
-                let _: () = conn
-                    .pexpire(&lock_key, (ttl_secs * 1000) as i64)
-                    .await
-                    .map_err(|e| CelersError::Broker(format!("Redis PEXPIRE failed: {}", e)))?;
-                return Ok(true);
-            }
-        }
-
-        // Try atomic SET NX EX
-        let result: Option<String> = redis::cmd("SET")
-            .arg(&lock_key)
+        // Single atomic step: acquire if free, refresh if already ours, refuse
+        // otherwise. There is no window in which another owner's lock could be
+        // extended by us.
+        let acquired: i64 = redis::Script::new(ACQUIRE_SCRIPT)
+            .key(&lock_key)
             .arg(owner)
-            .arg("NX")
-            .arg("EX")
             .arg(ttl_secs)
-            .query_async(&mut conn)
+            .invoke_async(&mut conn)
             .await
-            .map_err(|e| CelersError::Broker(format!("Redis SET NX EX failed: {}", e)))?;
+            .map_err(|e| CelersError::Broker(format!("Redis acquire script failed: {}", e)))?;
 
-        // Redis returns "OK" on success, nil on failure
-        Ok(result.is_some())
+        Ok(acquired == 1)
     }
 
     async fn release(&self, key: &str, owner: &str) -> celers_core::error::Result<bool> {
@@ -231,24 +243,18 @@ impl DistributedLockBackend for RedisLockBackend {
                 .map_err(|e| CelersError::Broker(format!("Redis SCAN failed: {}", e)))?;
 
             for key in &keys {
-                let current_owner: Option<String> = conn
-                    .get(key)
+                // The release script re-checks ownership itself, so the extra
+                // GET that used to precede it was pure round-trip overhead.
+                let result: i64 = redis::Script::new(RELEASE_SCRIPT)
+                    .key(key)
+                    .arg(owner)
+                    .invoke_async(&mut conn)
                     .await
-                    .map_err(|e| CelersError::Broker(format!("Redis GET failed: {}", e)))?;
-
-                if current_owner.as_deref() == Some(owner) {
-                    // Use the release script to ensure atomicity
-                    let result: i64 = redis::Script::new(RELEASE_SCRIPT)
-                        .key(key)
-                        .arg(owner)
-                        .invoke_async(&mut conn)
-                        .await
-                        .map_err(|e| {
-                            CelersError::Broker(format!("Redis release script failed: {}", e))
-                        })?;
-                    if result == 1 {
-                        released += 1;
-                    }
+                    .map_err(|e| {
+                        CelersError::Broker(format!("Redis release script failed: {}", e))
+                    })?;
+                if result == 1 {
+                    released += 1;
                 }
             }
 

@@ -6,6 +6,7 @@
 //! - Count tasks matching conditions
 //! - Task metadata extraction
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, SerializedTask, TaskId, TaskState};
 use redis::{AsyncCommands, Client};
 use tracing::debug;
@@ -180,7 +181,7 @@ impl TaskQuery {
     ) -> Result<Vec<SerializedTask>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -224,7 +225,7 @@ impl TaskQuery {
     pub async fn peek(&self, count: usize) -> Result<Vec<SerializedTask>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -293,7 +294,7 @@ impl TaskQuery {
     pub async fn get_task_stats(&self) -> Result<TaskStats> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 

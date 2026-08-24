@@ -6,7 +6,8 @@
 //! # Features
 //!
 //! - Exchange/Queue/Binding topology management
-//! - Publisher Confirm for reliability
+//! - Publisher Confirm for reliability (`confirm.select` on every channel; a
+//!   broker `nack` or an unroutable return is reported as a publish failure)
 //! - **Batch Publishing** for improved throughput (publish multiple messages before waiting for confirms)
 //! - Consumer QoS (Prefetch) control
 //! - **Consumer Streaming** via `start_consumer()` for high-throughput message processing
@@ -119,6 +120,8 @@
 // --- Internal modules (split from original lib.rs) ---
 mod batch_ops;
 mod broker_core;
+mod confirm;
+mod connect;
 mod management;
 mod pool;
 mod queue_ops;
@@ -167,7 +170,14 @@ pub use management::{
 // --- Re-exports: core broker ---
 pub use broker_core::AmqpBroker;
 
+// --- Re-exports: Pure-Rust TLS provider installation ---
+pub use connect::install_pure_tls_provider;
+
 // --- Tests ---
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests_hardening.rs"]
+mod tests_hardening;

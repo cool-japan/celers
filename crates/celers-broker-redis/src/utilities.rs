@@ -295,11 +295,17 @@ pub fn analyze_redis_command_performance(
         return analysis;
     }
 
-    // Find slowest command
-    let (slowest_cmd, max_latency) = command_latencies
+    // Find slowest command. The emptiness guard above makes `max_by` a
+    // `Some`, but an invariant enforced ten lines away is exactly the kind
+    // that a later edit quietly breaks — so this reads the emptiness out of
+    // the value itself rather than asserting it.
+    let Some((slowest_cmd, max_latency)) = command_latencies
         .iter()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .expect("collection validated to be non-empty");
+    else {
+        analysis.insert("status".to_string(), "no_data".to_string());
+        return analysis;
+    };
 
     analysis.insert("slowest_command".to_string(), slowest_cmd.clone());
     analysis.insert("max_latency_ms".to_string(), format!("{:.2}", max_latency));

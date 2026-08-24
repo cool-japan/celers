@@ -31,11 +31,14 @@ fn task_with_priority(name: &str, priority: i32) -> SerializedTask {
 }
 
 async fn raw_connection() -> redis::aio::MultiplexedConnection {
-    redis::Client::open(TEST_REDIS_URL)
-        .expect("client")
-        .get_multiplexed_async_connection()
-        .await
-        .expect("connection")
+    // Not `celers_multiplexed_connection()`: its 500ms response timeout
+    // makes even `DEL` flaky on a loaded machine, which would show up as
+    // failures in these tests rather than in the code under test.
+    crate::connection::RedisClientExt::celers_multiplexed_connection(
+        &redis::Client::open(TEST_REDIS_URL).expect("client"),
+    )
+    .await
+    .expect("connection")
 }
 
 async fn cleanup(broker: &RedisBroker) {
@@ -536,6 +539,148 @@ async fn test_broker_reuses_a_single_connection() {
         client_id(&broker).await,
         "helpers must inherit the broker's connection"
     );
+
+    cleanup(&broker).await;
+}
+
+/// A dequeue against an empty queue must wait out the block timeout and then
+/// report "nothing here" — it must not fail.
+///
+/// The `redis` crate gives every connection built with
+/// `celers_multiplexed_connection()` a **500ms** response timeout, which
+/// is shorter than the broker's default one-second block. The client then
+/// kills its own `BRPOPLPUSH` before the server has had a chance to answer,
+/// and an empty queue surfaces as `Err("timed out")`. The rest of this file
+/// zeroes the block timeout, which short-circuits the blocking path entirely
+/// and hides this; here it is deliberately left at the default.
+#[tokio::test]
+async fn test_blocking_dequeue_on_empty_queue_reports_empty() {
+    let broker = test_broker(QueueMode::Fifo);
+    assert!(
+        broker.block_timeout_secs() > 0.0,
+        "this test is only meaningful when the blocking path is live"
+    );
+
+    let outcome = broker
+        .dequeue()
+        .await
+        .expect("an empty queue is not an error");
+    assert!(outcome.is_none(), "an empty queue yields no message");
+
+    cleanup(&broker).await;
+}
+
+/// The same guarantee must hold for a block *longer* than the client's
+/// ordinary response deadline: the connection carrying a blocking command is
+/// sized from the block, not from a fixed constant.
+#[tokio::test]
+async fn test_blocking_dequeue_honours_a_longer_block_timeout() {
+    let broker = test_broker(QueueMode::Fifo).with_block_timeout(2.0);
+
+    let started = std::time::Instant::now();
+    let outcome = broker
+        .dequeue()
+        .await
+        .expect("an empty queue is not an error");
+    let waited = started.elapsed();
+
+    assert!(outcome.is_none());
+    assert!(
+        waited >= std::time::Duration::from_millis(1_800),
+        "the dequeue must actually wait out its block, not bail early (waited {:?})",
+        waited
+    );
+
+    cleanup(&broker).await;
+}
+
+/// A paused queue must refuse new work rather than silently swallow it.
+///
+/// Dropping the task would be data loss the caller never learns about, so
+/// `enqueue` reports the refusal; `dequeue` stays quiet (`Ok(None)`) because
+/// a polling worker would otherwise log an error on every poll.
+#[tokio::test]
+async fn test_paused_queue_rejects_enqueue_and_yields_no_work() {
+    let broker = test_broker(QueueMode::Fifo).with_block_timeout(0.0);
+    let controller = broker.queue_controller();
+
+    broker
+        .enqueue(task_named("before-pause"))
+        .await
+        .expect("enqueue");
+    controller.pause().await.expect("pause");
+
+    let refused = broker.enqueue(task_named("during-pause")).await;
+    assert!(
+        refused.is_err(),
+        "a paused queue must not silently accept work"
+    );
+    let refused_batch = broker.enqueue_batch(vec![task_named("during-pause")]).await;
+    assert!(refused_batch.is_err(), "nor accept it in a batch");
+
+    // The task that was already queued is not delivered while paused.
+    assert_eq!(dequeued_name(&broker).await, None);
+    assert!(broker.dequeue_batch(5).await.expect("batch").is_empty());
+
+    controller.resume().await.expect("resume");
+    assert_eq!(
+        dequeued_name(&broker).await.as_deref(),
+        Some("before-pause")
+    );
+
+    cleanup(&broker).await;
+}
+
+/// Draining stops new work but keeps delivering what is already queued —
+/// that is the whole point of a drain.
+#[tokio::test]
+async fn test_draining_queue_rejects_enqueue_but_keeps_delivering() {
+    let broker = test_broker(QueueMode::Fifo).with_block_timeout(0.0);
+    let controller = broker.queue_controller();
+
+    broker
+        .enqueue(task_named("already-queued"))
+        .await
+        .expect("enqueue");
+    controller.drain().await.expect("drain");
+
+    assert!(
+        broker.enqueue(task_named("too-late")).await.is_err(),
+        "a draining queue must not accept new work"
+    );
+    assert_eq!(
+        dequeued_name(&broker).await.as_deref(),
+        Some("already-queued"),
+        "but work already queued must still drain out"
+    );
+
+    controller.resume().await.expect("stop drain");
+    broker.enqueue(task_named("after")).await.expect("enqueue");
+
+    cleanup(&broker).await;
+}
+
+/// One `QueueController` is shared by the broker, so an emergency stop
+/// triggered through one handle is visible through every other.
+///
+/// Building a fresh controller per call gave each caller its own, immediately
+/// orphaned, process-local flag.
+#[tokio::test]
+async fn test_queue_controller_handles_share_emergency_stop() {
+    let broker = test_broker(QueueMode::Fifo).with_block_timeout(0.0);
+
+    let first = broker.queue_controller();
+    let second = broker.queue_controller();
+
+    assert!(!second.is_emergency_stopped());
+    first.emergency_stop();
+    assert!(
+        second.is_emergency_stopped(),
+        "controllers handed out by one broker must observe the same flag"
+    );
+
+    first.clear_emergency_stop();
+    assert!(!second.is_emergency_stopped());
 
     cleanup(&broker).await;
 }

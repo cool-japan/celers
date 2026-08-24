@@ -21,8 +21,9 @@
 //! callers, rather than constructing a fresh one (and therefore a fresh,
 //! immediately-orphaned emergency-stop flag) on every call.
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result};
-use redis::AsyncCommands;
+use redis::{aio::ConnectionLike, AsyncCommands};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -51,8 +52,12 @@ pub fn drain_key_for(queue_name: &str) -> String {
 /// it is neither paused nor draining), using a connection the caller already
 /// holds. Issues a single `MGET` (one round trip) rather than two sequential
 /// `GET`s.
-pub async fn is_enqueue_allowed(
-    conn: &mut redis::aio::MultiplexedConnection,
+///
+/// Generic over the connection type so a caller holding a
+/// [`redis::aio::ConnectionManager`] (as `RedisBroker` does) can pass it
+/// straight through; a `MultiplexedConnection` still works unchanged.
+pub async fn is_enqueue_allowed<C: ConnectionLike + Send + Sync>(
+    conn: &mut C,
     queue_name: &str,
 ) -> Result<bool> {
     let keys = [pause_key_for(queue_name), drain_key_for(queue_name)];
@@ -66,8 +71,14 @@ pub async fn is_enqueue_allowed(
 /// Cheaply check whether `queue_name` currently allows dequeues (draining
 /// still allows dequeue — only a full pause blocks it), using a connection
 /// the caller already holds.
-pub async fn is_dequeue_allowed(
-    conn: &mut redis::aio::MultiplexedConnection,
+///
+/// `RedisBroker` does not call this on its hot path: its dequeue is one
+/// `EVAL` that already checks the pause key server-side (see
+/// [`crate::lua_scripts::POP_TO_UNACKED`]), so asking here would add a round
+/// trip for an answer the script has already given. It exists for callers
+/// that pop with something other than that script.
+pub async fn is_dequeue_allowed<C: ConnectionLike + Send + Sync>(
+    conn: &mut C,
     queue_name: &str,
 ) -> Result<bool> {
     let paused: Option<String> = conn
@@ -147,12 +158,16 @@ impl QueueController {
     pub async fn pause(&self) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
-        // Set pause flag and remove drain flag
+        // MULTI/EXEC: pausing is "paused, not draining" as one state
+        // change. Applied piecemeal, a failure between the two commands
+        // leaves the queue both paused *and* draining, which no reader
+        // expects.
         let mut pipe = redis::pipe();
+        pipe.atomic();
         pipe.set(self.pause_key(), "1");
         pipe.del(self.drain_key());
 
@@ -167,12 +182,15 @@ impl QueueController {
     pub async fn resume(&self) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
-        // Remove both pause and drain flags
+        // MULTI/EXEC: resuming clears both flags or neither, so a partial
+        // failure cannot leave the queue draining when the operator asked
+        // for a full resume.
         let mut pipe = redis::pipe();
+        pipe.atomic();
         pipe.del(self.pause_key());
         pipe.del(self.drain_key());
 
@@ -190,12 +208,13 @@ impl QueueController {
     pub async fn drain(&self) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
-        // Set drain flag and remove pause flag
+        // MULTI/EXEC: see `pause` — draining is one state change, not two.
         let mut pipe = redis::pipe();
+        pipe.atomic();
         pipe.set(self.drain_key(), "1");
         pipe.del(self.pause_key());
 
@@ -216,6 +235,15 @@ impl QueueController {
         self.emergency_stop.load(Ordering::SeqCst)
     }
 
+    /// Lift an emergency stop without touching Redis.
+    ///
+    /// [`Self::resume`] also clears the flag, but it additionally deletes the
+    /// pause and drain keys — so it cannot be used to undo an emergency stop
+    /// on a queue that is *meant* to stay paused.
+    pub fn clear_emergency_stop(&self) {
+        self.emergency_stop.store(false, Ordering::SeqCst);
+    }
+
     /// Get current queue state
     pub async fn get_state(&self) -> Result<QueueState> {
         if self.is_emergency_stopped() {
@@ -224,7 +252,7 @@ impl QueueController {
 
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect: {}", e)))?;
 
@@ -316,7 +344,7 @@ mod tests {
         let queue_name = format!("test-qc-{}", uuid::Uuid::new_v4());
         let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
         let controller = QueueController::new(client.clone(), &queue_name);
-        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let mut conn = client.celers_multiplexed_connection().await.unwrap();
 
         // Active: both enqueue and dequeue allowed.
         assert!(is_enqueue_allowed(&mut conn, &queue_name).await.unwrap());

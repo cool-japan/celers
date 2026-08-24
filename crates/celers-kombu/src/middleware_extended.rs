@@ -1150,9 +1150,6 @@ impl PartitioningMiddleware {
     }
 
     fn calculate_partition(&self, message: &Message) -> usize {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         // Try to extract partition key from specified field or use task ID
         let task_id_str = message.headers.id.to_string();
         let key = if let Some(field) = &self.partition_key_fn {
@@ -1167,10 +1164,15 @@ impl PartitioningMiddleware {
             &task_id_str
         };
 
-        // Hash the key to determine partition
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
+        // Hash the key to determine partition. `std::collections::hash_map::
+        // DefaultHasher` is explicitly documented as unstable across Rust
+        // releases, so hashing the same key could silently route it to a
+        // different partition/worker after a toolchain upgrade -- breaking
+        // the "related messages go to the same partition" guarantee this
+        // middleware exists to provide. `fnv1a_hash` has a fixed, versioned
+        // definition that never changes, so the mapping from key to
+        // partition is stable forever.
+        let hash = crate::utils::fnv1a_hash(key.as_bytes());
 
         (hash % self.partition_count as u64) as usize
     }
@@ -1480,5 +1482,74 @@ mod hardening_tests {
         middleware.reset();
         let mut msg2 = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
         assert!(middleware.before_publish(&mut msg2).await.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // idx151: PartitioningMiddleware must hash the partition key with a
+    // toolchain-stable algorithm, not `DefaultHasher` (explicitly
+    // documented as unstable across Rust releases - the same class of bug
+    // already fixed for `generate_deduplication_id` in utils/mod.rs). A
+    // pinned, independently-computed expected partition is the only way a
+    // test can actually catch a regression back to an unstable hasher: an
+    // assertion derived by calling this crate's own hashing code again
+    // would keep passing even if the algorithm silently changed
+    // underneath both call sites.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn partitioning_maps_a_known_key_to_a_pinned_partition() {
+        // Independently computed from the standard FNV-1a algorithm (not
+        // by calling this crate's own `fnv1a_hash`):
+        // `fnv1a_hash(b"customer-42") == 0x1e1b8c70eb18f59e`, and
+        // `0x1e1b8c70eb18f59e % 8 == 6`. If this ever changes, either the
+        // hashing algorithm changed underneath `calculate_partition` (a
+        // real regression) or the partition math changed (needs a
+        // matching update here).
+        let middleware = PartitioningMiddleware::new(8).with_partition_key_field("route");
+        let mut message = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+        message
+            .headers
+            .extra
+            .insert("route".to_string(), serde_json::json!("customer-42"));
+
+        middleware.before_publish(&mut message).await.unwrap();
+
+        assert_eq!(
+            message.headers.extra.get("x-partition-id"),
+            Some(&serde_json::json!(6))
+        );
+    }
+
+    #[tokio::test]
+    async fn partitioning_same_key_maps_to_same_partition_across_instances() {
+        // The property that actually matters in production: two
+        // independently constructed middleware instances (standing in for
+        // two different processes - e.g. a producer and a consumer, or
+        // the same fleet before and after a rolling deploy) must agree on
+        // the partition for the same key. A hasher whose output depends on
+        // anything instance- or process-specific (unlike a fixed-
+        // algorithm hash) would break this.
+        let key = "order-service-shard-key";
+        let mk_message = || {
+            let mut message = Message::new("t".to_string(), Uuid::new_v4(), vec![]);
+            message
+                .headers
+                .extra
+                .insert("route".to_string(), serde_json::json!(key));
+            message
+        };
+
+        let middleware_a = PartitioningMiddleware::new(16).with_partition_key_field("route");
+        let mut message_a = mk_message();
+        middleware_a.before_publish(&mut message_a).await.unwrap();
+
+        let middleware_b = PartitioningMiddleware::new(16).with_partition_key_field("route");
+        let mut message_b = mk_message();
+        middleware_b.before_publish(&mut message_b).await.unwrap();
+
+        assert_eq!(
+            message_a.headers.extra.get("x-partition-id"),
+            message_b.headers.extra.get("x-partition-id")
+        );
     }
 }

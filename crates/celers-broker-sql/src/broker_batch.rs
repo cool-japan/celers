@@ -144,11 +144,18 @@ impl MysqlBroker {
 
         let mut stored = 0u64;
         for result in results {
-            let result_json = result
-                .result
-                .as_ref()
-                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
-                .unwrap_or_else(|| "null".to_string());
+            // A *missing* result legitimately stores JSON `null`; a result
+            // that fails to serialize must not, or a lost value would look
+            // like a task that successfully returned null.
+            let result_json = match result.result.as_ref() {
+                Some(value) => serde_json::to_string(value).map_err(|e| {
+                    CelersError::Serialization(format!(
+                        "Failed to serialize result for task {}: {e}",
+                        result.task_id
+                    ))
+                })?,
+                None => "null".to_string(),
+            };
             let status_str = result.status.to_string();
 
             let rows_affected = tx
@@ -400,10 +407,17 @@ impl MysqlBroker {
         status: WorkerStatus,
         capabilities: Option<serde_json::Value>,
     ) -> Result<()> {
-        let capabilities_json = capabilities
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
-            .unwrap_or_else(|| "null".to_string());
+        // Absent capabilities legitimately store JSON `null`; capabilities
+        // that fail to serialize must surface the error instead of being
+        // silently recorded as "this worker declared nothing".
+        let capabilities_json = match capabilities.as_ref() {
+            Some(value) => serde_json::to_string(value).map_err(|e| {
+                CelersError::Serialization(format!(
+                    "Failed to serialize capabilities for worker {worker_id}: {e}"
+                ))
+            })?,
+            None => "null".to_string(),
+        };
         let status_str = status.to_string();
 
         self.connection()
@@ -595,14 +609,16 @@ impl MysqlBroker {
         let mut task_ids = Vec::new();
 
         for task in tasks {
+            // This path mints its own row id, so the stored metadata document
+            // must record that id — not `task.metadata.id`. Otherwise the
+            // dequeue side would rebuild the task around an id that belongs
+            // to no row, which is the same defect that made every ack a
+            // silent no-op.
             let task_id = Uuid::new_v4();
-            let group_metadata_str = serde_json::to_string(&json!({
-                "queue": self.queue_name(),
-                "group_id": group_id,
-            }))
-            .map_err(|e| {
-                CelersError::Serialization(format!("Failed to serialize group metadata: {e}"))
-            })?;
+            let mut stored_task = task.clone();
+            stored_task.metadata.id = task_id;
+            let group_metadata_str =
+                self.build_task_metadata_document(&stored_task, json!({ "group_id": group_id }))?;
 
             tx.execute(
                 r#"
@@ -627,10 +643,14 @@ impl MysqlBroker {
         }
 
         // Store group metadata
-        let metadata_json = metadata
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
-            .unwrap_or_else(|| "null".to_string());
+        let metadata_json = match metadata.as_ref() {
+            Some(value) => serde_json::to_string(value).map_err(|e| {
+                CelersError::Serialization(format!(
+                    "Failed to serialize metadata for task group {group_id}: {e}"
+                ))
+            })?,
+            None => "null".to_string(),
+        };
         let task_count = task_ids.len() as i64;
 
         tx.execute(

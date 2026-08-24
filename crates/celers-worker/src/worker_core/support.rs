@@ -273,6 +273,20 @@ pub(crate) fn backoff_delay(config: &RetryConfig, retry_count: u32) -> Duration 
     config.calculate_delay(retry_count.min(MAX_EXPONENT))
 }
 
+/// How often the worker sweeps expired dead-letter entries, given their TTL.
+///
+/// A TTL only describes *when* an entry becomes stale; something has to run the
+/// sweep or the queue grows without bound. Sweeping once per TTL keeps a short
+/// TTL honest without burning a round trip per second, and the hour cap keeps a
+/// multi-day TTL from meaning "never actually reclaimed within one worker's
+/// lifetime". A zero TTL is clamped to one second: `interval` panics on a zero
+/// period.
+pub(crate) fn dlq_cleanup_interval(ttl_seconds: u64) -> Duration {
+    /// Never sweep less often than hourly, whatever the TTL.
+    const MAX_INTERVAL_SECS: u64 = 3_600;
+    Duration::from_secs(ttl_seconds.clamp(1, MAX_INTERVAL_SECS))
+}
+
 /// The retry budget actually applied to a task.
 ///
 /// The task's own `max_retries` is the request; the worker's (runtime

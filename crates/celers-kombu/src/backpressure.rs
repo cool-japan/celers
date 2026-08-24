@@ -137,6 +137,19 @@ impl PoisonMessageDetector {
 
         let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Opportunistically prune entries that have been idle for more
+        // than one full failure window (a 2x margin so an entry mid-reset
+        // on another thread is never evicted out from under it). Without
+        // this, `failures` grows by one permanent entry per distinct
+        // task_id ever seen for the lifetime of the process: a task that
+        // fails once and is never retried (or succeeds and is never
+        // explicitly cleared via `clear_failures`) would otherwise never
+        // leave the map.
+        let window_secs = self.failure_window.as_secs();
+        failures.retain(|_, (_, last_failure)| {
+            now.saturating_sub(*last_failure) < window_secs.saturating_mul(2)
+        });
+
         let entry = failures.entry(task_id).or_insert((0, now));
 
         // Reset if outside window
@@ -200,5 +213,65 @@ impl PoisonMessageDetector {
 impl Default for PoisonMessageDetector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // idx126: PoisonMessageDetector must not accumulate a permanent entry
+    // per distinct task_id, matching the ResourceQuotaMiddleware /
+    // SLAMonitoringMiddleware fix in middleware_monitoring.rs.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn poison_detector_prunes_long_idle_task_entries() {
+        let detector = PoisonMessageDetector::new().with_failure_window(Duration::from_secs(1));
+        let stale_task = uuid::Uuid::new_v4();
+
+        // Simulate a task whose last failure is long past 2x the failure
+        // window, by writing directly into the (module-private) failures
+        // map rather than waiting in real time.
+        {
+            let mut failures = detector.failures.lock().unwrap_or_else(|e| e.into_inner());
+            failures.insert(stale_task, (1, 0));
+        }
+        assert_eq!(detector.failure_count(stale_task), 0); // outside window already
+
+        {
+            let failures = detector.failures.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                failures.contains_key(&stale_task),
+                "entry must still be present before any pruning sweep runs"
+            );
+        }
+
+        // Recording a failure for a *different* task_id must sweep the
+        // stale entry out of the map, not just leave it there forever.
+        let active_task = uuid::Uuid::new_v4();
+        detector.record_failure(active_task);
+
+        let failures = detector.failures.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !failures.contains_key(&stale_task),
+            "long-idle task entry must be pruned, not retained indefinitely"
+        );
+        assert!(failures.contains_key(&active_task));
+    }
+
+    #[test]
+    fn poison_detector_does_not_prune_entries_still_within_the_grace_margin() {
+        let detector = PoisonMessageDetector::new().with_failure_window(Duration::from_secs(3600));
+        let task_id = uuid::Uuid::new_v4();
+
+        detector.record_failure(task_id);
+        assert_eq!(detector.failure_count(task_id), 1);
+
+        // A second failure for the same (freshly active) task must never
+        // be pruned out from under itself.
+        detector.record_failure(task_id);
+        assert_eq!(detector.failure_count(task_id), 2);
     }
 }

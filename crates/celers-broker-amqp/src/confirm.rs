@@ -26,7 +26,10 @@ use lapin::Confirmation;
 ///
 /// Returns [`BrokerError::OperationFailed`] for every outcome that is not a
 /// genuine broker acknowledgement.
-pub(crate) fn classify_confirmation(confirmation: Confirmation, confirms_enabled: bool) -> Result<()> {
+pub(crate) fn classify_confirmation(
+    confirmation: Confirmation,
+    confirms_enabled: bool,
+) -> Result<()> {
     match confirmation {
         Confirmation::Ack(None) => Ok(()),
         Confirmation::Ack(Some(returned)) => Err(BrokerError::OperationFailed(format!(

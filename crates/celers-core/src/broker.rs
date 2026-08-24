@@ -57,7 +57,11 @@ impl BrokerMessage {
         self.task.metadata.priority
     }
 
-    /// Check if task is expired
+    /// Whether the message has passed its `expires_at` deadline.
+    ///
+    /// See [`crate::TaskMetadata::is_expired`]: this is Celery's `expires`, not
+    /// the execution time limit, so a message that has merely been queued for a
+    /// long time is **not** expired.
     #[inline]
     #[must_use]
     pub fn is_expired(&self) -> bool {
@@ -422,6 +426,17 @@ mod tests {
 
         // Newly created task should not be expired
         assert!(!msg.is_expired());
+
+        // A message-expiry deadline in the past does expire it.
+        let mut stale = create_test_task();
+        stale.metadata.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        assert!(BrokerMessage::new(stale).is_expired());
+
+        // An elapsed *execution* time limit does not: the task never started.
+        let mut queued = create_test_task();
+        queued.metadata.timeout_secs = Some(1);
+        queued.metadata.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert!(!BrokerMessage::new(queued).is_expired());
     }
 
     #[test]

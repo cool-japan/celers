@@ -285,6 +285,7 @@ mod tests {
                 chord_id: None,
                 on_success_link: None,
                 dependencies: HashSet::new(),
+                expires_at: None,
             },
             payload: b"test payload".to_vec(),
         }

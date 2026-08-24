@@ -79,7 +79,7 @@ VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), $8::text::tim
 pub(crate) const INSERT_TASK_AFTER: &str = r#"
 INSERT INTO celers_tasks
     (id, task_name, payload, state, priority, max_retries, metadata, queue_name, created_at, scheduled_at)
-VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), NOW() + ($8 || ' seconds')::INTERVAL)
+VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), NOW() + ($8::bigint || ' seconds')::INTERVAL)
 "#;
 
 // ── Dequeue ────────────────────────────────────────────────────────────────
@@ -298,12 +298,22 @@ DELETE FROM celers_tasks
 /// an `id IN (SELECT ... LIMIT n)` sub-select that is valid in both the
 /// archive INSERT and the DELETE. Both parameters are Rust integers formatted
 /// by `format!`, so no caller-controlled text reaches the statement.
+///
+/// The ordering carries `id` as a tiebreaker, and that is load-bearing rather
+/// than cosmetic: this fragment is evaluated **twice** (once by
+/// [`archive_insert_sql`], once by [`archive_delete_sql`]), `created_at` is
+/// not unique — `enqueue_batch` writes one identical `NOW()` for every task in
+/// a batch — and with ties straddling the `LIMIT` boundary the two statements
+/// could otherwise select different row sets, deleting a row that was never
+/// archived and archiving a row that stays live (and gets archived again next
+/// sweep). A total order makes both sub-selects pick the same rows.
 pub(crate) fn completed_batch_predicate(older_than_days: i32, batch_size: i64) -> String {
     format!(
         "id IN (SELECT id FROM celers_tasks \
          WHERE queue_name = $1 AND state = 'completed' \
+         AND task_name <> '__baseline__' \
          AND created_at < NOW() - INTERVAL '{older_than_days} days' \
-         ORDER BY created_at ASC LIMIT {batch_size})"
+         ORDER BY created_at ASC, id ASC LIMIT {batch_size})"
     )
 }
 
@@ -311,6 +321,14 @@ pub(crate) fn completed_batch_predicate(older_than_days: i32, batch_size: i64) -
 ///
 /// Deleting through a bounded sub-select keeps each statement short-lived, so
 /// a large backlog never turns into one long row-lock sweep.
+///
+/// Excludes `task_name = '__baseline__'` rows: those are the marker rows
+/// [`crate::PostgresBroker::store_performance_baseline`] writes into
+/// `celers_tasks` (see `analytics.rs`), and without this exclusion a
+/// baseline silently vanished — and `compare_to_baseline` started reporting
+/// "not found" — the moment it aged past `retain_for`. This is a stopgap:
+/// baselines belong in their own table rather than as `celers_tasks` rows
+/// impersonating completed work, but that needs a migration.
 pub(crate) fn purge_terminal_sql(batch_size: i64) -> String {
     format!(
         r#"
@@ -320,9 +338,10 @@ DELETE FROM celers_tasks
            FROM celers_tasks
           WHERE queue_name = $1
             AND state IN ('completed', 'cancelled', 'failed')
+            AND task_name <> '__baseline__'
             AND completed_at IS NOT NULL
-            AND completed_at < NOW() - ($2 || ' seconds')::INTERVAL
-          ORDER BY completed_at ASC
+            AND completed_at < NOW() - ($2::bigint || ' seconds')::INTERVAL
+          ORDER BY completed_at ASC, id ASC
           LIMIT {batch_size}
        )
 "#
@@ -398,7 +417,7 @@ mod tests {
             );
         }
         assert!(INSERT_TASK_AT.contains("$8::text::timestamptz"));
-        assert!(INSERT_TASK_AFTER.contains("($8 || ' seconds')::INTERVAL"));
+        assert!(INSERT_TASK_AFTER.contains("($8::bigint || ' seconds')::INTERVAL"));
     }
 
     #[test]
@@ -463,6 +482,16 @@ mod tests {
         );
         assert!(insert.contains("queue_name = $1"));
         assert!(delete.contains("queue_name = $1"));
+        // The fragment is evaluated twice; a total order is what keeps the
+        // INSERT and the DELETE selecting the same rows when `created_at`
+        // ties at the LIMIT boundary.
+        assert!(predicate.contains("ORDER BY created_at ASC, id ASC"));
+        // `store_performance_baseline` marker rows must survive archiving,
+        // or `compare_to_baseline` starts reporting "not found" once the
+        // baseline ages past the archive window.
+        assert!(predicate.contains("task_name <> '__baseline__'"));
+        assert!(insert.contains("task_name <> '__baseline__'"));
+        assert!(delete.contains("task_name <> '__baseline__'"));
     }
 
     #[test]
@@ -472,6 +501,9 @@ mod tests {
         assert!(sql.contains("queue_name = $1"));
         assert!(sql.contains("state IN ('completed', 'cancelled', 'failed')"));
         assert!(sql.trim_start().starts_with("DELETE FROM celers_tasks"));
+        // Performance-baseline marker rows are terminal-looking
+        // (`state = 'completed'`) but must not be swept by retention.
+        assert!(sql.contains("task_name <> '__baseline__'"));
     }
 
     #[test]

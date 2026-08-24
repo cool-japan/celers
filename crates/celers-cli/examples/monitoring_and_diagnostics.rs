@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "   This will identify configuration issues, connectivity problems, and bottlenecks.\n"
     );
-    if let Err(e) = commands::doctor(&broker_url, &queue_name).await {
+    if let Err(e) = commands::doctor(&broker_url, &queue_name, false).await {
         eprintln!("Doctor check failed: {e}");
     }
 

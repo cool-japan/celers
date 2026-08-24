@@ -397,11 +397,15 @@ impl MysqlBroker {
 
         // Store all results
         for (_, _, result) in tasks_with_results {
-            let result_json = result
-                .result
-                .as_ref()
-                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()))
-                .unwrap_or_else(|| "null".to_string());
+            let result_json = match result.result.as_ref() {
+                Some(value) => serde_json::to_string(value).map_err(|e| {
+                    CelersError::Serialization(format!(
+                        "Failed to serialize result for task {}: {e}",
+                        result.task_id
+                    ))
+                })?,
+                None => "null".to_string(),
+            };
             let status_str = result.status.to_string();
 
             tx.execute(
@@ -661,11 +665,35 @@ impl MysqlBroker {
             CelersError::Other("get_task_execution_stats: query returned no rows".into())
         })?;
 
+        // `row.col::<Option<T>>(name)` (not `row.col::<T>(name).ok()`) is
+        // deliberate: `Option<T>: FromValue` already maps a genuine SQL NULL
+        // (MIN/MAX/AVG/STDDEV over zero matching rows, when `task_count` is
+        // 0) to `Ok(None)` on its own — see `oxisql_core::Row::try_get`'s
+        // blanket `Option<T>` impl. The previous `row.col::<T>(name).ok()`
+        // form inferred the bare, non-`Option` `T` from the `let` binding,
+        // so `T::from_value` had no NULL case of its own and *every* `Err`
+        // (a real NULL *or* a genuine type mismatch — e.g. this driver ever
+        // changing how it represents a `TIMESTAMPDIFF`/`STDDEV` result) was
+        // collapsed by `.ok()` into the same `None`, which every call below
+        // then turned into a fabricated `0`/`0.0` in reported statistics
+        // with no error and no log. Unlike `rows_to_query_plans`'s EXPLAIN
+        // column decoding (whose column *set* legitimately varies across
+        // MySQL versions and so keeps `.ok()`), this query's column list is
+        // fixed by its own `AS` aliases, so a decode error here is always a
+        // real bug worth surfacing via `?`.
         let task_count: i64 = row.col("task_count").unwrap_or(0);
-        let min_execution: Option<i64> = row.col("min_execution").ok();
-        let max_execution: Option<i64> = row.col("max_execution").ok();
-        let avg_execution: Option<String> = row.col("avg_execution").ok();
-        let stddev_execution: Option<String> = row.col("stddev_execution").ok();
+        let min_execution: Option<i64> = row.col("min_execution").map_err(|e| {
+            CelersError::Other(format!("Failed to get task execution stats: {}", e))
+        })?;
+        let max_execution: Option<i64> = row.col("max_execution").map_err(|e| {
+            CelersError::Other(format!("Failed to get task execution stats: {}", e))
+        })?;
+        let avg_execution: Option<String> = row.col("avg_execution").map_err(|e| {
+            CelersError::Other(format!("Failed to get task execution stats: {}", e))
+        })?;
+        let stddev_execution: Option<String> = row.col("stddev_execution").map_err(|e| {
+            CelersError::Other(format!("Failed to get task execution stats: {}", e))
+        })?;
 
         // Calculate approximate P95 using ORDER BY LIMIT approach
         let p95_offset = (task_count as f64 * 0.05).ceil() as i64;

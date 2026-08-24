@@ -214,8 +214,8 @@ fn load_base_config(path: Option<&Path>, profile: Option<&str>) -> anyhow::Resul
         .map(str::to_string)
         .or_else(|| config.profile.clone());
     if let Some(profile) = effective_profile {
-        if let Some(overlay) = load_profile_overlay(&path, &profile)? {
-            config = merge_overlay(config, overlay);
+        if let Some((overlay, overlay_raw)) = load_profile_overlay(&path, &profile)? {
+            config = merge_overlay(config, overlay, &overlay_raw);
         }
     }
 
@@ -255,7 +255,17 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
 /// Given a base path of `dir/celers.toml` and profile `prod`, this looks for
 /// `dir/celers.prod.toml` (matching the base file's extension), then for the
 /// other supported extensions. Returns `Ok(None)` when no overlay exists.
-fn load_profile_overlay(base: &Path, profile: &str) -> anyhow::Result<Option<Config>> {
+///
+/// Returns both the typed [`Config`] (used for its actual values) and the
+/// same file's raw, format-agnostic [`serde_json::Value`] (used by
+/// [`merge_overlay`] to tell "this field was genuinely absent from the
+/// overlay file" apart from "this field was present and happened to equal
+/// the type default" -- a distinction the typed `Config` alone cannot make,
+/// since both parse to the exact same default value).
+fn load_profile_overlay(
+    base: &Path,
+    profile: &str,
+) -> anyhow::Result<Option<(Config, serde_json::Value)>> {
     let parent = base.parent().filter(|p| !p.as_os_str().is_empty());
     let stem = base
         .file_stem()
@@ -276,51 +286,121 @@ fn load_profile_overlay(base: &Path, profile: &str) -> anyhow::Result<Option<Con
             None => PathBuf::from(&file_name),
         };
         if candidate.exists() {
-            return Ok(Some(Config::from_file(candidate)?));
+            let config = Config::from_file(&candidate)?;
+            let raw = parse_raw_overlay_value(&candidate)?;
+            return Ok(Some((config, raw)));
         }
     }
 
     Ok(None)
 }
 
-/// Merge an overlay configuration onto a base, with overlay values winning
-/// when they differ from the type defaults.
-fn merge_overlay(mut base: Config, overlay: Config) -> Config {
-    let defaults = Config::default_config();
+/// Parse `path`'s raw content into a format-agnostic [`serde_json::Value`]
+/// tree, applying the exact same environment-variable expansion
+/// [`Config::from_file`] does first (so the two views of the file stay
+/// consistent, even though expansion only ever changes string *values*, not
+/// which keys are present).
+///
+/// TOML and YAML are each parsed with their own `Deserialize` impl
+/// (`toml::Value` / `serde_yaml::Value`) and then re-serialized through
+/// `serde_json::to_value`, giving [`merge_overlay`] one uniform
+/// presence-checking representation regardless of the overlay file's
+/// on-disk format.
+fn parse_raw_overlay_value(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let content = std::fs::read_to_string(path)?;
+    let expanded = crate::config::expand_env_vars(&content);
+    let value = match ConfigFormat::from_path(path) {
+        ConfigFormat::Toml => {
+            let v: toml::Value = toml::from_str(&expanded)?;
+            serde_json::to_value(v)?
+        }
+        ConfigFormat::Yaml => {
+            let v: serde_yaml::Value = serde_yaml::from_str(&expanded)?;
+            serde_json::to_value(v)?
+        }
+    };
+    Ok(value)
+}
 
-    if overlay.profile.is_some() {
+/// `true` when `raw[section][field]` is present and non-null -- i.e. the
+/// overlay file actually set this field, regardless of what value it was
+/// set to (including a value that happens to equal the type default). See
+/// [`parse_raw_overlay_value`] and [`merge_overlay`].
+#[must_use]
+fn overlay_sets(raw: &serde_json::Value, section: &str, field: &str) -> bool {
+    raw.get(section)
+        .and_then(|s| s.get(field))
+        .is_some_and(|v| !v.is_null())
+}
+
+/// Top-level counterpart of [`overlay_sets`] for a field with no section
+/// nesting (`queues`, `profile`).
+#[must_use]
+fn overlay_sets_top(raw: &serde_json::Value, field: &str) -> bool {
+    raw.get(field).is_some_and(|v| !v.is_null())
+}
+
+/// Merge an overlay configuration onto a base, with an overlay field winning
+/// whenever it was actually *present* in the overlay file -- checked against
+/// `overlay_raw` (see [`overlay_sets`]/[`overlay_sets_top`]), not against
+/// whether the overlay's typed value differs from the type default.
+///
+/// This used to compare `overlay`'s typed value to [`Config::default_config`]
+/// instead of consulting the raw file (idx 337 part 2): since a field
+/// deserializes to the exact same default value whether it was explicitly
+/// set to that value or simply absent from the file, that comparison could
+/// never let an overlay *reset* a base value back down to the default --
+/// the overlay's field wins the comparison against the default (a no-op)
+/// while the base's genuinely non-default value silently survives. It also
+/// merged only a subset of [`Config`]'s fields, leaving
+/// `broker.failover_retries`/`failover_timeout_secs`, `pool`, `cache`, and
+/// `aliases` un-overridable by any profile overlay no matter what the
+/// overlay file said.
+///
+/// `Option<T>` fields (`autoscale`, `alerts`, `aliases`) are the one
+/// exception that never needed the raw-value treatment: serde already
+/// represents "absent" as `None` for those, so `Option::is_some()` was (and
+/// remains) a correct presence check on the typed value alone.
+fn merge_overlay(mut base: Config, overlay: Config, overlay_raw: &serde_json::Value) -> Config {
+    if overlay_sets_top(overlay_raw, "profile") {
         base.profile = overlay.profile;
     }
-    if !overlay.broker.url.is_empty() && overlay.broker.url != defaults.broker.url {
+    if overlay_sets(overlay_raw, "broker", "url") {
         base.broker.url = overlay.broker.url;
     }
-    if !overlay.broker.broker_type.is_empty()
-        && overlay.broker.broker_type != defaults.broker.broker_type
-    {
+    // `BrokerConfig::broker_type` is `#[serde(rename = "type")]`, so the raw
+    // on-disk key is "type", not "broker_type".
+    if overlay_sets(overlay_raw, "broker", "type") {
         base.broker.broker_type = overlay.broker.broker_type;
     }
-    if overlay.broker.queue != defaults.broker.queue {
+    if overlay_sets(overlay_raw, "broker", "queue") {
         base.broker.queue = overlay.broker.queue;
     }
-    if overlay.broker.mode != defaults.broker.mode {
+    if overlay_sets(overlay_raw, "broker", "mode") {
         base.broker.mode = overlay.broker.mode;
     }
-    if !overlay.broker.failover_urls.is_empty() {
+    if overlay_sets(overlay_raw, "broker", "failover_urls") {
         base.broker.failover_urls = overlay.broker.failover_urls;
     }
-    if overlay.worker.concurrency != defaults.worker.concurrency {
+    if overlay_sets(overlay_raw, "broker", "failover_retries") {
+        base.broker.failover_retries = overlay.broker.failover_retries;
+    }
+    if overlay_sets(overlay_raw, "broker", "failover_timeout_secs") {
+        base.broker.failover_timeout_secs = overlay.broker.failover_timeout_secs;
+    }
+    if overlay_sets(overlay_raw, "worker", "concurrency") {
         base.worker.concurrency = overlay.worker.concurrency;
     }
-    if overlay.worker.poll_interval_ms != defaults.worker.poll_interval_ms {
+    if overlay_sets(overlay_raw, "worker", "poll_interval_ms") {
         base.worker.poll_interval_ms = overlay.worker.poll_interval_ms;
     }
-    if overlay.worker.max_retries != defaults.worker.max_retries {
+    if overlay_sets(overlay_raw, "worker", "max_retries") {
         base.worker.max_retries = overlay.worker.max_retries;
     }
-    if overlay.worker.default_timeout_secs != defaults.worker.default_timeout_secs {
+    if overlay_sets(overlay_raw, "worker", "default_timeout_secs") {
         base.worker.default_timeout_secs = overlay.worker.default_timeout_secs;
     }
-    if !overlay.queues.is_empty() {
+    if overlay_sets_top(overlay_raw, "queues") {
         base.queues = overlay.queues;
     }
     if overlay.autoscale.is_some() {
@@ -328,6 +408,21 @@ fn merge_overlay(mut base: Config, overlay: Config) -> Config {
     }
     if overlay.alerts.is_some() {
         base.alerts = overlay.alerts;
+    }
+    if overlay_sets(overlay_raw, "pool", "max_size") {
+        base.pool.max_size = overlay.pool.max_size;
+    }
+    if overlay_sets(overlay_raw, "pool", "reuse_enabled") {
+        base.pool.reuse_enabled = overlay.pool.reuse_enabled;
+    }
+    if overlay_sets(overlay_raw, "cache", "ttl_secs") {
+        base.cache.ttl_secs = overlay.cache.ttl_secs;
+    }
+    if overlay_sets(overlay_raw, "cache", "enabled") {
+        base.cache.enabled = overlay.cache.enabled;
+    }
+    if overlay.aliases.is_some() {
+        base.aliases = overlay.aliases;
     }
 
     base
@@ -783,6 +878,108 @@ url = "redis://stable:6379"
         let config = resolve_config(&args).expect("profile overlay");
         assert_eq!(config.broker.url, "redis://prod:6379");
         assert_eq!(config.worker.concurrency, 32);
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&overlay);
+    }
+
+    /// Regression test for idx 337 part 2: `merge_overlay` used to apply an
+    /// overlay field only when its typed value differed from the *type
+    /// default*, not the base -- so an overlay explicitly resetting a field
+    /// back down to the default (here, `worker.concurrency = 4`, the real
+    /// default) was silently ignored, leaving the base's non-default value
+    /// (32) in place instead.
+    #[test]
+    fn test_profile_overlay_can_reset_a_field_to_the_type_default() {
+        let _guard = env_guard();
+        clear_env();
+
+        let base = temp_path("celers.toml");
+        let dir = base.parent().expect("temp dir").to_path_buf();
+        let stem = base
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("stem")
+            .to_string();
+        let overlay = dir.join(format!("{stem}.reset.toml"));
+
+        write_file(
+            &base,
+            "[broker]\ntype = \"redis\"\nurl = \"redis://base:6379\"\n[worker]\nconcurrency = 32\n",
+        );
+        // Explicitly sets concurrency back to its type default (4) -- must
+        // still win over the base's non-default 32.
+        write_file(&overlay, "[worker]\nconcurrency = 4\n");
+
+        let args = CliConfigArgs {
+            config: Some(base.clone()),
+            profile: Some("reset".to_string()),
+            ..Default::default()
+        };
+        let config = resolve_config(&args).expect("profile overlay");
+        assert_eq!(
+            config.worker.concurrency, 4,
+            "an overlay explicitly setting a field to the type default must still override \
+             the base's non-default value"
+        );
+        // The overlay never mentioned `broker.url` at all -- must still
+        // come from the base, not get reset to the default broker URL.
+        assert_eq!(config.broker.url, "redis://base:6379");
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&overlay);
+    }
+
+    /// Regression test for idx 337 part 2: `merge_overlay` used to never
+    /// merge `broker.failover_retries`/`failover_timeout_secs`, `pool`,
+    /// `cache`, or `aliases` at all -- no matter what a profile overlay file
+    /// said, those sections always came from the base (or the built-in
+    /// default if the base didn't set them either).
+    #[test]
+    fn test_profile_overlay_merges_previously_unmerged_sections() {
+        let _guard = env_guard();
+        clear_env();
+
+        let base = temp_path("celers.toml");
+        let dir = base.parent().expect("temp dir").to_path_buf();
+        let stem = base
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("stem")
+            .to_string();
+        let overlay = dir.join(format!("{stem}.full.toml"));
+
+        write_file(
+            &base,
+            "[broker]\ntype = \"redis\"\nurl = \"redis://base:6379\"\n",
+        );
+        write_file(
+            &overlay,
+            "[broker]\nfailover_retries = 7\nfailover_timeout_secs = 42\n\
+             [pool]\nmax_size = 99\nreuse_enabled = false\n\
+             [cache]\nttl_secs = 999\nenabled = false\n\
+             [aliases]\nw = \"worker start\"\n",
+        );
+
+        let args = CliConfigArgs {
+            config: Some(base.clone()),
+            profile: Some("full".to_string()),
+            ..Default::default()
+        };
+        let config = resolve_config(&args).expect("profile overlay");
+
+        assert_eq!(config.broker.failover_retries, 7);
+        assert_eq!(config.broker.failover_timeout_secs, 42);
+        assert_eq!(config.pool.max_size, 99);
+        assert!(!config.pool.reuse_enabled);
+        assert_eq!(config.cache.ttl_secs, 999);
+        assert!(!config.cache.enabled);
+        assert!(
+            config
+                .aliases
+                .is_some_and(|a| a.list().iter().any(|(name, _)| *name == "w")),
+            "the overlay's [aliases] section must be merged in, not silently dropped"
+        );
 
         let _ = std::fs::remove_file(&base);
         let _ = std::fs::remove_file(&overlay);

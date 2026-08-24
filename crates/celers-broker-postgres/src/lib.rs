@@ -19,6 +19,30 @@
 //! - Database health checks
 //! - Automatic task archiving
 //!
+//! # Queue scoping
+//!
+//! `queue_name` is a real column on `celers_tasks` and
+//! `celers_dead_letter_queue` (migration `007_queue_identity.sql`), and every
+//! query this crate runs is scoped to the broker's queue by binding it as a
+//! parameter. Two brokers with different queue names therefore never serve
+//! each other's tasks. The label is validated at construction against
+//! `[A-Za-z0-9_-]{1,64}`.
+//!
+//! # Connection pool
+//!
+//! A [`PostgresBroker`] owns a fixed-size pool of independent connections (see
+//! [`pool`]); `with_pool_config`'s `max_connections` sizes it. Concurrent
+//! `dequeue`s run on different connections, so `FOR UPDATE SKIP LOCKED` gives
+//! real in-process parallelism, and a dropped connection is detected and
+//! reconnected (with backoff) instead of wedging the broker.
+//!
+//! # Retention
+//!
+//! `ack` keeps terminal rows for auditing. Since `celers_tasks` is also the
+//! table every `dequeue` scans, prune it with
+//! [`PostgresBroker::purge_terminal_tasks`] or start a background sweeper with
+//! [`PostgresBroker::spawn_retention_task`].
+//!
 //! # Quick Start
 //!
 //! ```no_run

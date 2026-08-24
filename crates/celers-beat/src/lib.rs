@@ -53,7 +53,9 @@ pub mod registry;
 pub mod schedule;
 pub mod schedule_ext;
 pub mod scheduler;
+pub mod scheduler_catchup;
 pub mod scheduler_ext;
+pub mod scheduler_persistence;
 pub mod task;
 #[cfg(feature = "cron")]
 pub mod timezone_schedule;

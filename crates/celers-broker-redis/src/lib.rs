@@ -20,6 +20,7 @@ use redis::{
     AsyncCommands, Client,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
@@ -92,7 +93,10 @@ pub use cluster::{
 };
 #[allow(deprecated)]
 pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionStats, Compressor};
-pub use connection::{ConnectionStats, RedisConfig, TlsConfig};
+pub use connection::{
+    blocking_response_timeout, ConnectionStats, RedisClientExt, RedisConfig, TlsConfig,
+    BLOCKING_RESPONSE_MARGIN, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_RESPONSE_TIMEOUT,
+};
 pub use cron_scheduler::{CronExpression, CronScheduler, ScheduledTask};
 pub use dedup::{DedupResult, DedupStrategy, Deduplicator};
 pub use degradation::{DegradationManager, DegradationMode, DegradationStats, QueuedOperation};
@@ -302,6 +306,13 @@ pub struct RedisBroker {
     last_sweep: AtomicU64,
     /// How long a revocation is remembered
     revocation_ttl_secs: u64,
+    /// The one controller this broker hands out clones of.
+    ///
+    /// Built once rather than per call: `QueueController` carries a
+    /// process-local emergency-stop flag, so constructing a fresh one per
+    /// call would give every caller its own immediately-orphaned flag and
+    /// `emergency_stop()` would never be observed anywhere.
+    queue_controller: QueueController,
 }
 
 impl RedisBroker {
@@ -312,6 +323,7 @@ impl RedisBroker {
         mode: QueueMode,
         manager_config: ConnectionManagerConfig,
     ) -> Self {
+        let queue_controller = QueueController::new(client.clone(), queue_name);
         Self {
             client,
             conn: OnceCell::new(),
@@ -331,6 +343,7 @@ impl RedisBroker {
             sweep_interval_secs: DEFAULT_SWEEP_INTERVAL_SECS,
             last_sweep: AtomicU64::new(0),
             revocation_ttl_secs: DEFAULT_REVOCATION_TTL_SECS,
+            queue_controller,
         }
     }
 
@@ -348,7 +361,7 @@ impl RedisBroker {
             client,
             queue_name,
             mode,
-            ConnectionManagerConfig::new(),
+            connection::default_manager_config(),
         ))
     }
 
@@ -380,7 +393,7 @@ impl RedisBroker {
             client,
             queue_name,
             mode,
-            ConnectionManagerConfig::new(),
+            connection::default_manager_config(),
         ))
     }
 
@@ -435,6 +448,42 @@ impl RedisBroker {
         self.mode
     }
 
+    /// How long [`Broker::dequeue`] waits for a message before reporting an
+    /// empty queue. Zero disables the blocking wait entirely.
+    pub fn block_timeout_secs(&self) -> f64 {
+        self.block_timeout_secs
+    }
+
+    /// Refuse the enqueue if the queue is paused, draining, or emergency
+    /// stopped.
+    ///
+    /// Refusing loudly rather than dropping the task: a silently discarded
+    /// enqueue is data loss the caller never learns about, and "the queue is
+    /// closed" is exactly the kind of thing a producer needs to retry or
+    /// escalate. (The dequeue side stays quiet — `Ok(None)` — because a
+    /// polling worker would otherwise log an error on every poll; its check
+    /// lives inside the dequeue script, which already reads the pause key
+    /// server-side.)
+    ///
+    /// Costs one `MGET` on the connection the caller already holds.
+    async fn ensure_accepting_work(&self, conn: &mut ConnectionManager) -> Result<()> {
+        if self.queue_controller.is_emergency_stopped() {
+            return Err(CelersError::Broker(format!(
+                "Queue {} is emergency stopped, refusing to enqueue",
+                self.queue_name
+            )));
+        }
+
+        if !queue_control::is_enqueue_allowed(conn, &self.queue_name).await? {
+            return Err(CelersError::Broker(format!(
+                "Queue {} is paused or draining, refusing to enqueue",
+                self.queue_name
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Get the shared multiplexed connection, establishing it on first use.
     ///
     /// [`ConnectionManager`] is cheap to clone, multiplexes concurrent
@@ -452,10 +501,19 @@ impl RedisBroker {
     }
 
     /// Get the pool backing blocking pops, creating it on first use.
+    ///
+    /// The pool is told how long its connections will block so it can size
+    /// their response timeout accordingly: the `redis` crate's 500 ms default
+    /// is shorter than even the default one-second block, which turns an
+    /// empty queue into `Err("timed out")` instead of `Ok(None)`.
     async fn blocking_connections(&self) -> Result<&ConnectionPool> {
         self.blocking_pool
             .get_or_try_init(|| async {
-                ConnectionPool::new(self.client.clone(), self.blocking_pool_config.clone()).await
+                let config = self
+                    .blocking_pool_config
+                    .clone()
+                    .with_max_block(Duration::from_secs_f64(self.block_timeout_secs.max(0.0)));
+                ConnectionPool::new(self.client.clone(), config).await
             })
             .await
     }
@@ -590,9 +648,14 @@ impl RedisBroker {
         HealthChecker::new(self.client.clone())
     }
 
-    /// Create a queue controller for pause/resume operations
+    /// A handle on this broker's queue controller, for pause/resume/drain.
+    ///
+    /// Every call returns a clone of the *same* controller, so an emergency
+    /// stop triggered through one handle is seen by every other handle and by
+    /// the broker itself. (Constructing a controller per call, as this used
+    /// to, gave each caller a private flag that nothing else could observe.)
     pub fn queue_controller(&self) -> QueueController {
-        QueueController::new(self.client.clone(), &self.queue_name)
+        self.queue_controller.clone()
     }
 
     /// Create a task deduplicator
@@ -1279,6 +1342,7 @@ fn message_task_id(message: &str) -> Result<Option<String>> {
 impl Broker for RedisBroker {
     async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
         let mut conn = self.get_connection().await?;
+        self.ensure_accepting_work(&mut conn).await?;
 
         let task_id = task.metadata.id;
         let priority = task.metadata.priority;
@@ -1555,6 +1619,7 @@ impl Broker for RedisBroker {
         }
 
         let mut conn = self.get_connection().await?;
+        self.ensure_accepting_work(&mut conn).await?;
 
         let mut task_ids = Vec::with_capacity(tasks.len());
         let mut pipe = redis::pipe();

@@ -22,8 +22,8 @@
 use std::collections::HashMap;
 
 use aws_sdk_sqs::types::{
-    BatchResultErrorEntry, ChangeMessageVisibilityBatchRequestEntry, DeleteMessageBatchRequestEntry,
-    MessageAttributeValue, SendMessageBatchRequestEntry,
+    BatchResultErrorEntry, ChangeMessageVisibilityBatchRequestEntry,
+    DeleteMessageBatchRequestEntry, MessageAttributeValue, SendMessageBatchRequestEntry,
 };
 use celers_kombu::{BrokerError, Result};
 use celers_protocol::Message;
@@ -714,7 +714,9 @@ impl SqsBroker {
 
         for (index, tag) in tags.iter().enumerate() {
             let (source, handle) = decode_delivery_tag(tag);
-            let source_queue = source.map(str::to_string).unwrap_or_else(|| fallback.clone());
+            let source_queue = source
+                .map(str::to_string)
+                .unwrap_or_else(|| fallback.clone());
 
             grouped
                 .entry(source_queue.clone())
@@ -776,7 +778,10 @@ mod tests {
 
         assert_eq!(chunks, vec![0..10, 10..20, 20..25]);
         let total: usize = chunks.iter().map(|c| c.len()).sum();
-        assert_eq!(total, 25, "every entry must be covered by exactly one chunk");
+        assert_eq!(
+            total, 25,
+            "every entry must be covered by exactly one chunk"
+        );
     }
 
     #[test]
@@ -845,7 +850,9 @@ mod tests {
         assert_eq!(outcome.total(), 9);
         assert!(!outcome.is_complete());
 
-        let error = outcome.into_count().expect_err("partial failure is an error");
+        let error = outcome
+            .into_count()
+            .expect_err("partial failure is an error");
         let rendered = error.to_string();
         assert!(rendered.contains("entry 9"), "{rendered}");
         assert!(rendered.contains("InvalidParameterValue"), "{rendered}");

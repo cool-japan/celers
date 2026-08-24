@@ -31,6 +31,7 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, TaskId};
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
@@ -211,7 +212,7 @@ impl TaskGroup {
     pub async fn add_task(&self, task_id: &TaskId) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -238,7 +239,7 @@ impl TaskGroup {
     pub async fn remove_task(&self, task_id: &TaskId) -> Result<bool> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -303,7 +304,7 @@ impl TaskGroup {
     pub async fn get_tasks(&self) -> Result<Vec<TaskId>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -329,7 +330,7 @@ impl TaskGroup {
     pub async fn size(&self) -> Result<usize> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -399,7 +400,7 @@ impl TaskGroup {
     pub async fn get_metadata(&self) -> Result<Option<GroupMetadata>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -423,7 +424,7 @@ impl TaskGroup {
     async fn store_metadata(&self, metadata: &GroupMetadata) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -448,7 +449,7 @@ impl TaskGroup {
     pub async fn delete(&self) -> Result<()> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 

@@ -319,12 +319,16 @@ impl SqsBroker {
     /// - Every Celery header is mapped to an SQS MessageAttribute on *all*
     ///   publish paths (single, batch, FIFO, delayed), and read back on both
     ///   consume paths — the round trip is symmetric.
-    /// - Logical queue names are translated with the configured
-    ///   [`QueueNamingStrategy`](crate::celery_compat::QueueNamingStrategy) on
-    ///   the publish and consume paths. Administrative calls
-    ///   (`create_queue`, `delete_queue`, `purge`, `queue_size`) take the
-    ///   *physical* name; use [`physical_queue_name`](Self::physical_queue_name)
-    ///   to obtain it.
+    /// - Every public queue-name argument is a *logical* name, translated with
+    ///   the configured
+    ///   [`QueueNamingStrategy`](crate::celery_compat::QueueNamingStrategy)
+    ///   exactly once, on every path — publish, consume, `queue_size`, `purge`,
+    ///   `create_queue`, `delete_queue`, tagging, redrive policies and stats.
+    ///   A `.fifo` suffix is preserved across the translation. The only
+    ///   exception is [`list_queues`](celers_kombu::Broker::list_queues), which
+    ///   reports the names AWS itself holds; use
+    ///   [`physical_queue_name`](Self::physical_queue_name) to compare against
+    ///   it.
     /// - When `enable_priority_queues` is set, publishes are routed to a
     ///   per-priority queue and `consume` polls those queues highest-priority
     ///   first. [`priority_queues`](Self::priority_queues) lists them.
@@ -589,15 +593,17 @@ impl SqsBroker {
         }
     }
 
-    /// Internal create_queue used by get_queue_url for auto-creation
-    /// This delegates to the Broker trait implementation via broker_ops
+    /// Internal create_queue used by `get_queue_url` for auto-creation.
+    ///
+    /// Takes a *physical* queue name: `get_queue_url` has already applied the
+    /// naming strategy, and applying it twice would produce
+    /// `celery_celery_tasks`.
     pub(crate) async fn create_queue_internal(
         &mut self,
-        queue: &str,
+        physical_queue: &str,
         mode: QueueMode,
     ) -> Result<()> {
-        use celers_kombu::Broker;
-        self.create_queue(queue, mode).await
+        self.create_queue_physical(physical_queue, mode).await
     }
 
     /// Get or create CloudWatch client
@@ -855,27 +861,60 @@ impl SqsBroker {
         Ok(decompressed)
     }
 
-    /// Retry an async operation with exponential backoff
+    /// Retry an async operation with exponential backoff.
     ///
-    /// Uses the configured max_retries and retry_base_delay_ms settings.
-    pub(crate) async fn retry_with_backoff<F, Fut, T>(&self, mut operation: F) -> Result<T>
+    /// Only *transient* failures are retried (see
+    /// [`is_retryable_error`]); a client-side validation error such as the FIFO
+    /// `MissingParameter` returns immediately instead of sleeping through the
+    /// whole retry budget.
+    ///
+    /// Note that `SendMessage` is not idempotent on a standard queue: a request
+    /// that times out after AWS accepted it produces a duplicate when retried.
+    /// CeleRS therefore documents at-least-once delivery. FIFO publishes carry
+    /// a stable `MessageDeduplicationId` derived from the task id, which makes
+    /// them idempotent within SQS's 5-minute deduplication interval.
+    pub(crate) async fn retry_with_backoff<F, Fut, T>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let mut attempt = 0;
+        self.retry_with_backoff_if(operation, is_retryable_error)
+            .await
+    }
+
+    /// Retry an async operation, deciding retryability with `should_retry`.
+    pub(crate) async fn retry_with_backoff_if<F, Fut, T, P>(
+        &self,
+        mut operation: F,
+        should_retry: P,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+        P: Fn(&BrokerError) -> bool,
+    {
+        let mut attempt = 0u32;
 
         loop {
             match operation().await {
                 Ok(result) => return Ok(result),
-                Err(e) => {
+                Err(error) => {
                     attempt += 1;
+
                     if attempt >= self.max_retries {
-                        return Err(e);
+                        return Err(error);
                     }
 
-                    // Exponential backoff: base_delay * 2^attempt
-                    let delay_ms = self.retry_base_delay_ms * (1 << attempt);
+                    if !should_retry(&error) {
+                        debug!("Not retrying non-transient failure: {}", error);
+                        return Err(error);
+                    }
+
+                    let delay_ms = backoff_delay_ms(
+                        self.retry_base_delay_ms,
+                        attempt,
+                        wall_clock_jitter_permille(),
+                    );
                     debug!(
                         "Retry attempt {}/{}, waiting {}ms before retry",
                         attempt, self.max_retries, delay_ms
@@ -894,5 +933,381 @@ impl SqsBroker {
     pub fn clear_queue_url_cache(&mut self) {
         self.queue_url_cache.clear();
         debug!("Cleared queue URL cache");
+    }
+
+    // --- Queue name resolution -------------------------------------------
+
+    /// Translate a logical queue name into the physical SQS queue name.
+    ///
+    /// With Celery compatibility enabled this applies the configured
+    /// [`QueueNamingStrategy`](crate::celery_compat::QueueNamingStrategy)
+    /// (Kombu prefixes, `.` -> `-`), preserving any `.fifo` suffix; otherwise
+    /// the name is returned unchanged.
+    ///
+    /// Every broker operation takes the *logical* name and performs this
+    /// translation itself, so you rarely need this. It is useful for matching
+    /// against [`list_queues`](celers_kombu::Broker::list_queues), which
+    /// reports the names AWS holds, and for building CloudWatch dimensions.
+    ///
+    /// The translation is deliberately **not** idempotent (`celery_tasks`
+    /// resolves to `celery_celery_tasks`), which is why it is applied at
+    /// exactly one boundary per operation — never pass a value returned here
+    /// back into another broker method in Celery mode.
+    pub fn physical_queue_name(&self, queue: &str) -> String {
+        self.resolve_queue_name(queue)
+    }
+
+    pub(crate) fn resolve_queue_name(&self, queue: &str) -> String {
+        let Some(ref config) = self.celery_config else {
+            return queue.to_string();
+        };
+
+        // A `.fifo` suffix is load bearing: SQS refuses to treat a queue as
+        // FIFO without it, and the Kombu strategy rewrites `.` to `-`. Strip
+        // the suffix before applying the strategy and put it back afterwards.
+        match queue.strip_suffix(".fifo") {
+            Some(stem) => format!("{}.fifo", config.naming_strategy.apply(stem)),
+            None => config.naming_strategy.apply(queue),
+        }
+    }
+
+    /// Physical queue names for a logical queue, highest priority first.
+    ///
+    /// Empty unless Celery compatibility is enabled with
+    /// `enable_priority_queues`. SQS has no message-level priority, so CeleRS
+    /// follows Kombu and spreads priorities across sibling queues; `consume`
+    /// polls them in the order returned here.
+    pub fn priority_queues(&self, queue: &str) -> Vec<String> {
+        let Some(ref config) = self.celery_config else {
+            return Vec::new();
+        };
+        if !config.enable_priority_queues {
+            return Vec::new();
+        }
+
+        if queue.ends_with(".fifo") {
+            return Vec::new();
+        }
+
+        celery_compat::PriorityQueueManager::new(queue)
+            .with_naming_strategy(config.naming_strategy.clone())
+            .get_queues_by_priority()
+    }
+
+    /// Physical queue a message should be published to.
+    pub(crate) fn resolve_publish_queue(
+        &self,
+        queue: &str,
+        message: &celers_protocol::Message,
+    ) -> String {
+        let Some(ref config) = self.celery_config else {
+            return queue.to_string();
+        };
+
+        match (config.enable_priority_queues, message.properties.priority) {
+            // FIFO queues are never split across priority siblings: the `.fifo`
+            // suffix has to stay last and ordering is the point of the queue.
+            (true, Some(priority)) if !queue.ends_with(".fifo") => {
+                celery_compat::PriorityQueueManager::new(queue)
+                    .with_naming_strategy(config.naming_strategy.clone())
+                    .get_queue_for_priority(priority)
+            }
+            _ => self.resolve_queue_name(queue),
+        }
+    }
+
+    /// Whether a *physical* queue name addresses a FIFO queue.
+    ///
+    /// SQS requires FIFO queue names to end with `.fifo`, so the suffix is the
+    /// authoritative test — a `FifoConfig` on the broker must not turn an
+    /// unrelated standard queue into a FIFO publish.
+    pub(crate) fn is_fifo_queue(&self, queue: &str) -> bool {
+        queue.ends_with(".fifo")
+    }
+
+    /// Derive the `MessageGroupId` for a message published to `queue`.
+    pub(crate) fn derive_group_id(
+        &self,
+        queue: &str,
+        message: &celers_protocol::Message,
+    ) -> String {
+        let (source, default) = match self.fifo_config {
+            Some(ref config) => (
+                config.group_id_source.clone(),
+                config.default_message_group_id.clone(),
+            ),
+            None => (crate::types::FifoGroupIdSource::default(), None),
+        };
+
+        crate::fifo::derive_message_group_id(&source, queue, message, default.as_deref())
+    }
+
+    // --- Message encoding -------------------------------------------------
+
+    /// Serialize (and optionally compress) a message body.
+    pub(crate) fn encode_body(&self, message: &celers_protocol::Message) -> Result<String> {
+        let body = serde_json::to_string(message)
+            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+
+        if let Some(threshold) = self.compression_threshold {
+            if body.len() > threshold {
+                let original_size = body.len();
+                let compressed = self.compress_message(&body)?;
+                debug!(
+                    "Compressed message from {} to {} bytes",
+                    original_size,
+                    compressed.len()
+                );
+                return Ok(compressed);
+            }
+        }
+
+        Ok(body)
+    }
+
+    /// Build the SQS MessageAttributes for a message.
+    ///
+    /// This is the single source of truth for every publish path (single,
+    /// batch, FIFO, FIFO batch, delayed). Previously only `Producer::publish`
+    /// consulted the Celery mapper, so batch and FIFO sends emitted a different
+    /// wire format than single sends.
+    pub(crate) fn build_attributes(
+        &self,
+        message: &celers_protocol::Message,
+    ) -> Result<HashMap<String, MessageAttributeValue>> {
+        if let Some(ref mapper) = self.celery_mapper {
+            return mapper
+                .serialize_message(message)
+                .map_err(|e| BrokerError::OperationFailed(e.to_string()));
+        }
+
+        let mut attributes = HashMap::new();
+
+        if let Some(priority) = message.properties.priority {
+            attributes.insert(
+                "priority".to_string(),
+                MessageAttributeValue::builder()
+                    .data_type("Number")
+                    .string_value(priority.to_string())
+                    .build()
+                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+            );
+        }
+
+        if let Some(ref correlation_id) = message.properties.correlation_id {
+            attributes.insert(
+                "correlation_id".to_string(),
+                MessageAttributeValue::builder()
+                    .data_type("String")
+                    .string_value(correlation_id)
+                    .build()
+                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
+            );
+        }
+
+        Ok(attributes)
+    }
+
+    // --- Connection health ------------------------------------------------
+
+    pub(crate) fn mark_healthy(&self) {
+        self.connection_healthy.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mark_unhealthy(&self) {
+        self.connection_healthy.store(false, Ordering::Release);
+    }
+
+    /// Record the outcome of an SDK call for [`Transport::is_connected`](celers_kombu::Transport::is_connected).
+    pub(crate) fn record_call_result<T>(&self, result: &Result<T>) {
+        match result {
+            Ok(_) => self.mark_healthy(),
+            Err(BrokerError::Connection(_)) => self.mark_unhealthy(),
+            Err(_) => {}
+        }
+    }
+
+    /// Last known transport/credential health.
+    ///
+    /// Updated by every SDK call the broker makes. `Transport::is_connected`
+    /// is synchronous and cannot probe AWS, so it reports this flag AND-ed with
+    /// the local client state; use [`health_check`](Self::health_check) for a
+    /// real readiness probe.
+    pub fn is_connection_healthy(&self) -> bool {
+        self.connection_healthy.load(Ordering::Acquire)
+    }
+
+    // --- Receipt metadata -------------------------------------------------
+
+    /// Remember the system attributes of an in-flight message.
+    pub(crate) fn remember_receipt_metadata(
+        &mut self,
+        delivery_tag: &str,
+        metadata: ReceiptMetadata,
+    ) {
+        if self.receipt_metadata.len() >= MAX_TRACKED_RECEIPTS {
+            while self.receipt_metadata.len() >= MAX_TRACKED_RECEIPTS {
+                match self.receipt_metadata_order.pop_front() {
+                    Some(oldest) => {
+                        self.receipt_metadata.remove(&oldest);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        if self
+            .receipt_metadata
+            .insert(delivery_tag.to_string(), metadata)
+            .is_none()
+        {
+            self.receipt_metadata_order
+                .push_back(delivery_tag.to_string());
+        }
+    }
+
+    /// Drop the metadata for a message that is no longer in flight.
+    pub(crate) fn forget_receipt_metadata(&mut self, delivery_tag: &str) {
+        self.receipt_metadata.remove(delivery_tag);
+    }
+
+    /// System attributes recorded for an in-flight message.
+    ///
+    /// Populated by `consume`/`consume_batch` from the SQS message system
+    /// attributes, and dropped again on `ack`/`reject`.
+    pub fn receipt_metadata(&self, delivery_tag: &str) -> Option<&ReceiptMetadata> {
+        self.receipt_metadata.get(delivery_tag)
+    }
+
+    /// `ApproximateReceiveCount` of an in-flight message (1 on first delivery).
+    ///
+    /// This is the raw value behind [`Envelope::redelivered`], which poison
+    /// detection and DLQ analytics need in order to act on *how often* a
+    /// message failed rather than merely whether it is a redelivery.
+    pub fn receive_count(&self, delivery_tag: &str) -> Option<u32> {
+        self.receipt_metadata
+            .get(delivery_tag)
+            .map(|metadata| metadata.receive_count)
+    }
+
+    // --- Visibility heartbeats -------------------------------------------
+
+    /// Start a visibility heartbeat for one in-flight message.
+    ///
+    /// Normally driven automatically by `consume`/`consume_batch` when
+    /// [`with_visibility_heartbeat`](Self::with_visibility_heartbeat) is
+    /// enabled; call it directly to protect a message handled outside those
+    /// paths. The heartbeat is stopped by `ack`, `reject`,
+    /// [`stop_visibility_heartbeat`](Self::stop_visibility_heartbeat), or by
+    /// dropping the broker.
+    pub async fn start_visibility_heartbeat(&mut self, delivery_tag: &str) -> Result<()> {
+        let (source, handle) = crate::delivery::decode_delivery_tag(delivery_tag);
+        let queue = source
+            .map(str::to_string)
+            .unwrap_or_else(|| self.queue_name.clone());
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(&queue).await?;
+
+        let heartbeat = VisibilityHeartbeat::spawn(
+            client,
+            queue_url,
+            handle.to_string(),
+            self.visibility_timeout,
+            self.heartbeat_max_extension_secs,
+        );
+
+        if let Some(previous) = self.heartbeats.insert(delivery_tag.to_string(), heartbeat) {
+            previous.stop();
+        }
+
+        Ok(())
+    }
+
+    /// Stop the visibility heartbeat for a message, if one is running.
+    pub fn stop_visibility_heartbeat(&mut self, delivery_tag: &str) {
+        if let Some(heartbeat) = self.heartbeats.remove(delivery_tag) {
+            heartbeat.stop();
+        }
+    }
+
+    /// Stop every running visibility heartbeat.
+    pub fn stop_all_visibility_heartbeats(&mut self) {
+        for (_, heartbeat) in self.heartbeats.drain() {
+            heartbeat.stop();
+        }
+    }
+
+    /// Number of visibility heartbeats currently running.
+    pub fn active_heartbeat_count(&self) -> usize {
+        self.heartbeats.len()
+    }
+
+    /// Spawn a heartbeat for a freshly received message, if enabled.
+    pub(crate) fn maybe_start_heartbeat(
+        &mut self,
+        client: &Client,
+        queue_url: &str,
+        delivery_tag: &str,
+        receipt_handle: &str,
+    ) {
+        if !self.visibility_heartbeat_enabled {
+            return;
+        }
+
+        let heartbeat = VisibilityHeartbeat::spawn(
+            client.clone(),
+            queue_url.to_string(),
+            receipt_handle.to_string(),
+            self.visibility_timeout,
+            self.heartbeat_max_extension_secs,
+        );
+
+        if let Some(previous) = self.heartbeats.insert(delivery_tag.to_string(), heartbeat) {
+            previous.stop();
+        }
+    }
+
+    // --- Prefetch buffer --------------------------------------------------
+
+    /// Take a buffered message for a physical queue, if one is available.
+    pub(crate) fn take_prefetched(&mut self, queue: &str) -> Option<Envelope> {
+        let buffer = self.prefetch.get_mut(queue)?;
+        let envelope = buffer.pop_front();
+        if buffer.is_empty() {
+            self.prefetch.remove(queue);
+        }
+        envelope
+    }
+
+    /// Buffer surplus messages fetched by a batched `ReceiveMessage`.
+    pub(crate) fn buffer_prefetched(&mut self, queue: &str, envelopes: Vec<Envelope>) {
+        if envelopes.is_empty() {
+            return;
+        }
+
+        self.prefetch
+            .entry(queue.to_string())
+            .or_default()
+            .extend(envelopes);
+    }
+
+    /// Number of messages currently buffered by prefetching.
+    pub fn prefetched_count(&self) -> usize {
+        self.prefetch.values().map(VecDeque::len).sum()
+    }
+
+    /// Drop every buffered message without acknowledging it.
+    ///
+    /// The messages become visible again after their visibility timeout.
+    pub fn clear_prefetch(&mut self) {
+        let dropped = self.prefetched_count();
+        if dropped > 0 {
+            warn!(
+                "Discarding {} prefetched SQS message(s); they will be redelivered",
+                dropped
+            );
+        }
+        self.prefetch.clear();
     }
 }

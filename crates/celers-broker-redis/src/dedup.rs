@@ -341,6 +341,7 @@ pub fn content_hash(task: &SerializedTask) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::RedisClientExt;
 
     const TEST_REDIS_URL: &str = "redis://127.0.0.1:6379";
 
@@ -366,7 +367,7 @@ mod tests {
 
         let key = DedupStrategy::ByContent.generate_key(&task, &queue);
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .expect("connection");
         let ttl: i64 = redis::cmd("TTL")

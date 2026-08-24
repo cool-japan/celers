@@ -38,10 +38,19 @@ pub struct MysqlBroker {
     /// This is a real, indexed `celers_tasks.queue_name` column (migration
     /// `009_queue_name.sql`), bound by every enqueue path in this crate and
     /// filtered on by every claim path (`dequeue`, `dequeue_batch`,
-    /// `dequeue_with_worker_id`) as well as `queue_size` and
-    /// `get_statistics`. Two brokers pointed at the same database with
+    /// `dequeue_with_worker_id`) as well as `queue_size`, `get_statistics`,
+    /// `enqueue_deduplicated`, `enqueue_deduplicated_window` and
+    /// `purge_terminal_tasks`. Two brokers pointed at the same database with
     /// different queue names therefore never see each other's tasks. It is
     /// NOT a table name — all queues share one set of tables.
+    ///
+    /// `enqueue_deduplicated`/`enqueue_deduplicated_window`'s duplicate
+    /// lookup used to search `$.dedup_key` with no queue predicate: two
+    /// brokers on different queues sharing a `dedup_key` would collide, and
+    /// the second broker's call silently returned the first broker's task id
+    /// instead of inserting anything into its own queue — a real task loss,
+    /// not merely a cross-tenant read leak, since that id is invisible to
+    /// the second broker's (queue-scoped) `dequeue`.
     ///
     /// The same label is *also* still written into the task metadata JSON
     /// document under `$.queue` for backwards compatibility with anything

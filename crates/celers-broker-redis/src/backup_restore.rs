@@ -6,6 +6,7 @@
 //! - Snapshot creation with metadata
 //! - Queue migration between instances
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, SerializedTask};
 use chrono::{DateTime, Utc};
 use redis::{AsyncCommands, Client};
@@ -87,7 +88,7 @@ impl BackupManager {
     pub async fn create_snapshot(&self) -> Result<QueueSnapshot> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -202,7 +203,7 @@ impl BackupManager {
     ) -> Result<usize> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to get connection: {}", e)))?;
 
@@ -222,9 +223,18 @@ impl BackupManager {
         }
 
         let mut restored_count = 0;
+        // MULTI/EXEC: a restore is one state change. A partially applied
+        // snapshot is worse than a failed one — the operator is left with a
+        // queue that is neither the old state nor the snapshot.
         let mut pipe = redis::pipe();
+        pipe.atomic();
 
-        // Restore main queue
+        // Restore main queue.
+        //
+        // The snapshot was captured with `LRANGE 0 -1`, i.e. head-to-tail.
+        // Replaying it with `RPUSH` in that same order rebuilds the list
+        // element for element; `LPUSH` would reverse it, turning the oldest
+        // waiting task into the newest and vice versa.
         for task in &snapshot.main_queue {
             if let Ok(serialized) = serde_json::to_string(task) {
                 match self.mode {
@@ -240,18 +250,19 @@ impl BackupManager {
             }
         }
 
-        // Restore processing queue
+        // Restore processing queue — same head-to-tail fidelity as above.
         for task in &snapshot.processing_queue {
             if let Ok(serialized) = serde_json::to_string(task) {
-                pipe.lpush(&self.processing_queue, &serialized);
+                pipe.rpush(&self.processing_queue, &serialized);
                 restored_count += 1;
             }
         }
 
-        // Restore DLQ
+        // Restore DLQ — order matters here too: `inspect_dlq` reads from
+        // the head, so a reversed restore shows the wrong entries first.
         for task in &snapshot.dlq {
             if let Ok(serialized) = serde_json::to_string(task) {
-                pipe.lpush(&self.dlq_name, &serialized);
+                pipe.rpush(&self.dlq_name, &serialized);
                 restored_count += 1;
             }
         }
@@ -407,5 +418,88 @@ mod tests {
             total_diff: 5,
         };
         assert!(!comp.is_identical());
+    }
+
+    /// A restore must reproduce the list *in order*, not merely restore the
+    /// same set of tasks.
+    ///
+    /// Snapshots are captured head-to-tail with `LRANGE 0 -1`; replaying
+    /// them with the wrong push direction reverses every list, which turns
+    /// the oldest waiting task into the next one delivered (and shows
+    /// `inspect_dlq` the wrong end of the dead-letter queue). Nothing about
+    /// the task *counts* changes, so only an order assertion catches it.
+    #[tokio::test]
+    async fn test_restore_preserves_queue_order() {
+        let queue = format!("test-backup-order-{}", uuid::Uuid::new_v4());
+        let processing = format!("{}:processing", queue);
+        let dlq = format!("{}:dlq", queue);
+        let delayed = format!("{}:delayed", queue);
+
+        let client = Client::open("redis://127.0.0.1:6379").expect("client");
+        let manager = BackupManager::new(
+            client.clone(),
+            queue.clone(),
+            processing.clone(),
+            dlq.clone(),
+            delayed.clone(),
+            QueueMode::Fifo,
+        );
+
+        let mut conn = client
+            .celers_multiplexed_connection()
+            .await
+            .expect("connection");
+
+        let tasks: Vec<String> = ["first", "second", "third"]
+            .iter()
+            .map(|name| {
+                serde_json::to_string(&SerializedTask::new(name.to_string(), vec![]))
+                    .expect("serialize")
+            })
+            .collect();
+
+        // Lay the lists out exactly as the broker would: head push.
+        for data in &tasks {
+            let _: () = conn.lpush(&queue, data).await.expect("lpush");
+            let _: () = conn.lpush(&processing, data).await.expect("lpush");
+            let _: () = conn.lpush(&dlq, data).await.expect("lpush");
+        }
+
+        let before: Vec<String> = conn.lrange(&queue, 0, -1).await.expect("lrange");
+        let before_processing: Vec<String> = conn.lrange(&processing, 0, -1).await.expect("lrange");
+        let before_dlq: Vec<String> = conn.lrange(&dlq, 0, -1).await.expect("lrange");
+
+        let snapshot = manager.create_snapshot().await.expect("snapshot");
+        manager
+            .restore_from_snapshot(&snapshot, true)
+            .await
+            .expect("restore");
+
+        assert_eq!(
+            conn.lrange::<_, Vec<String>>(&queue, 0, -1)
+                .await
+                .expect("lrange"),
+            before,
+            "the main queue must come back in the same order it went in"
+        );
+        assert_eq!(
+            conn.lrange::<_, Vec<String>>(&processing, 0, -1)
+                .await
+                .expect("lrange"),
+            before_processing,
+            "so must the processing list"
+        );
+        assert_eq!(
+            conn.lrange::<_, Vec<String>>(&dlq, 0, -1)
+                .await
+                .expect("lrange"),
+            before_dlq,
+            "and the dead letter queue"
+        );
+
+        let _: i64 = conn
+            .del(&[queue, processing, dlq, delayed])
+            .await
+            .unwrap_or(0);
     }
 }

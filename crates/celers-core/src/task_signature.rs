@@ -3,9 +3,66 @@
 //! This module lets a producer cryptographically sign a task message and a
 //! consumer verify it, so that tampered or unsigned messages can be rejected
 //! before execution. The signature is an [HMAC] over a *canonical*
-//! serialization of the task's identifying fields — its id, name, positional
-//! arguments and keyword arguments — so two semantically identical messages
-//! always produce the same MAC regardless of incidental map ordering.
+//! serialization of the task's execution-bearing fields, so two semantically
+//! identical messages always produce the same MAC regardless of incidental map
+//! ordering.
+//!
+//! # What is and is not authenticated
+//!
+//! Scheme version: **`celers.task.sig.v2`**. The domain tag is part of the
+//! MAC input, so a `v1` tag can never verify against `v2` fields and vice
+//! versa — see [`SignedFields::canonical_bytes`].
+//!
+//! Authenticated (covered by the MAC — tampering is detected):
+//!
+//! | Field | Notes |
+//! |---|---|
+//! | `id` | task UUID |
+//! | `name` | task name |
+//! | `args` | positional arguments, in order |
+//! | `kwargs` | keyword arguments, canonically sorted by key |
+//! | `callbacks` | success links — *these name further tasks to execute* |
+//! | `errbacks` | failure links |
+//! | `chain` | the remaining chain, in order |
+//! | `chord` | the chord body callback |
+//! | `eta` | earliest execution time |
+//! | `expires` | message deadline |
+//! | `signed_at` | when the producer signed (freshness) |
+//! | `nonce` | single-use token (replay) |
+//!
+//! Every field of a [`SignedCallback`] — `task`, `task_id`, `args`, `kwargs`,
+//! `options`, `immutable`, `subtask_type` — is covered, so an attacker cannot
+//! flip a callback's `immutable` flag or rewrite its options either.
+//!
+//! **Not authenticated.** These are not part of the MAC input, and a message
+//! whose signature verifies says nothing about them:
+//!
+//! * Broker/transport headers: queue, exchange, routing key, delivery tag,
+//!   content type, compression, retry counters, `origin`/`parent_id`/`root_id`
+//!   and the `group` id that `celers-protocol`'s `EmbedOptions` carries, plus
+//!   any custom `extra` embed keys.
+//! * The message body's serialization *format*: a producer and consumer that
+//!   disagree about it will disagree about what was signed.
+//! * Confidentiality. This is an authenticity primitive only — the payload
+//!   travels in the clear.
+//!
+//! # Freshness and replay
+//!
+//! [`TaskSigner::verify`] answers "was this produced by a holder of the key?"
+//! and nothing more; a captured message stays valid forever. For replay
+//! resistance:
+//!
+//! * Set [`SignedFields::signed_at`] on the producer and verify with
+//!   [`TaskSigner::verify_fresh`] and a caller-chosen [`FreshnessWindow`].
+//!   Messages older than the window — and messages dated further into the
+//!   future than the allowed clock skew — are rejected.
+//! * Set [`SignedFields::nonce`] as well and verify through a [`ReplayGuard`],
+//!   which additionally rejects a nonce it has already seen.
+//!
+//! [`ReplayGuard`] is an **in-process** cache: two worker processes each accept
+//! the same replayed message once. A deployment that needs global single-use
+//! semantics must back the nonce check with shared storage (Redis `SET NX`,
+//! a unique index) — this type is the local half of that, not a substitute.
 //!
 //! # Why a native HMAC implementation?
 //!
@@ -42,10 +99,46 @@
 //!     .with_args(vec![TaskValue::from(2), TaskValue::from(4)]);
 //! assert!(signer.verify(&tampered, &sig).is_err());
 //! ```
+//!
+//! # Example: workflow links, freshness and replay
+//!
+//! ```rust
+//! use celers_core::task_signature::{
+//!     FreshnessWindow, ReplayGuard, SignedCallback, SignedFields, TaskSigner,
+//! };
+//! use celers_core::sanitize::TaskValue;
+//! use std::time::Duration;
+//! use uuid::Uuid;
+//!
+//! let signer = TaskSigner::new(b"super-secret-shared-key");
+//!
+//! let fields = SignedFields::new(Uuid::nil(), "billing.charge")
+//!     .with_args(vec![TaskValue::from(42)])
+//!     .with_callback(SignedCallback::new("billing.receipt"))
+//!     .signed_now()
+//!     .with_random_nonce();
+//!
+//! let sig = signer.sign(&fields);
+//!
+//! // Rewriting the callback to a different task invalidates the signature.
+//! let hijacked = fields
+//!     .clone()
+//!     .with_callbacks(vec![SignedCallback::new("attacker.exfiltrate")]);
+//! assert!(signer.verify(&hijacked, &sig).is_err());
+//!
+//! // A guard rejects the second delivery of the same message.
+//! let guard = ReplayGuard::new(FreshnessWindow::new(Duration::from_secs(300)));
+//! assert!(guard.verify(&signer, &fields, &sig).is_ok());
+//! assert!(guard.verify(&signer, &fields, &sig).is_err());
+//! ```
 
 use crate::sanitize::TaskValue;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Mutex;
+use std::time::Duration;
 use uuid::Uuid;
 
 // ===========================================================================
@@ -497,6 +590,42 @@ pub enum SignatureError {
 
     /// The signature used an algorithm this verifier does not understand.
     UnsupportedAlgorithm(String),
+
+    /// Freshness verification was requested but the message carried no
+    /// `signed_at` timestamp, so its age cannot be established.
+    MissingSignedAt,
+
+    /// The message is authentic but older than the caller's freshness window.
+    Stale {
+        /// How old the message is, in seconds.
+        age_secs: i64,
+        /// The window the caller allowed, in seconds.
+        max_age_secs: u64,
+    },
+
+    /// The message is authentic but dated further into the future than the
+    /// allowed clock skew — without this check a future-dated `signed_at`
+    /// would keep a captured message valid indefinitely.
+    FutureDated {
+        /// How far in the future the message is dated, in seconds.
+        skew_secs: i64,
+        /// The skew the caller allowed, in seconds.
+        max_skew_secs: u64,
+    },
+
+    /// The message is authentic but its own (signed) `expires` deadline has
+    /// passed.
+    MessageExpired {
+        /// How long ago the deadline passed, in seconds.
+        expired_secs_ago: i64,
+    },
+
+    /// Replay checking was requested but the message carried no nonce.
+    MissingNonce,
+
+    /// The nonce has already been seen: this is a replay of a message that was
+    /// accepted earlier.
+    Replayed(String),
 }
 
 impl fmt::Display for SignatureError {
@@ -514,6 +643,35 @@ impl fmt::Display for SignatureError {
             SignatureError::UnsupportedAlgorithm(alg) => {
                 write!(f, "unsupported task signature algorithm: {alg}")
             }
+            SignatureError::MissingSignedAt => write!(
+                f,
+                "task message has no signed_at timestamp but freshness was required"
+            ),
+            SignatureError::Stale {
+                age_secs,
+                max_age_secs,
+            } => write!(
+                f,
+                "task signature is stale: signed {age_secs}s ago, window is {max_age_secs}s"
+            ),
+            SignatureError::FutureDated {
+                skew_secs,
+                max_skew_secs,
+            } => write!(
+                f,
+                "task signature is dated {skew_secs}s in the future, allowed clock skew is {max_skew_secs}s"
+            ),
+            SignatureError::MessageExpired { expired_secs_ago } => write!(
+                f,
+                "task message expired {expired_secs_ago}s ago"
+            ),
+            SignatureError::MissingNonce => write!(
+                f,
+                "task message has no nonce but replay protection was required"
+            ),
+            SignatureError::Replayed(nonce) => {
+                write!(f, "task message replayed: nonce {nonce} was already used")
+            }
         }
     }
 }
@@ -530,12 +688,138 @@ impl From<SignatureError> for crate::CelersError {
 // Signed fields & canonical serialization
 // ===========================================================================
 
-/// The identifying fields of a task that participate in the signature.
+/// The domain-separation tag prefixed to every canonical serialization.
 ///
-/// Deliberately a *projection* of a full task message: only the fields that
-/// determine task identity and behaviour are signed (id, name, args, kwargs),
-/// so signatures are stable across transport metadata that may legitimately
-/// change in flight (timestamps, retry counters, routing hints, …).
+/// Bumped from `celers.task.sig.v1` when the signature scope grew to cover the
+/// workflow links and the scheduling fields. Because the tag is inside the MAC
+/// input, a `v1` tag can never verify against `v2` fields.
+pub const SIGNATURE_DOMAIN_TAG: &[u8] = b"celers.task.sig.v2";
+
+/// A task referenced by another task's workflow links (`callbacks`,
+/// `errbacks`, `chain`, `chord`).
+///
+/// This is `celers-core`'s local projection of `celers-protocol`'s
+/// `CallbackSignature`. It is kept structurally identical — `task`, `task_id`,
+/// `args`, `kwargs`, `options`, `immutable`, `subtask_type` — so that every
+/// field of a wire-level callback can be covered by the MAC. Projecting a
+/// protocol callback into this type is the caller's job (`celers-core` does not
+/// depend on `celers-protocol`); dropping any field while projecting reopens
+/// exactly the hole this type exists to close.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SignedCallback {
+    /// Name of the task to invoke.
+    pub task: String,
+    /// Pre-assigned task id, if the producer chose one.
+    pub task_id: Option<Uuid>,
+    /// Positional arguments.
+    pub args: Vec<TaskValue>,
+    /// Keyword arguments. Order is irrelevant — canonicalization sorts keys.
+    pub kwargs: Vec<(String, TaskValue)>,
+    /// Execution options (queue, countdown, …). Order is irrelevant.
+    pub options: Vec<(String, TaskValue)>,
+    /// Whether the parent's result is withheld from this callback.
+    pub immutable: bool,
+    /// Subtask type marker (`"chord"`, `"group"`, …).
+    pub subtask_type: Option<String>,
+}
+
+impl SignedCallback {
+    /// Create a callback that invokes `task` with no arguments.
+    #[must_use]
+    pub fn new(task: impl Into<String>) -> Self {
+        Self {
+            task: task.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Set the pre-assigned task id.
+    #[must_use]
+    pub fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    /// Set the positional arguments.
+    #[must_use]
+    pub fn with_args(mut self, args: Vec<TaskValue>) -> Self {
+        self.args = args;
+        self
+    }
+
+    /// Append a single keyword argument.
+    #[must_use]
+    pub fn with_kwarg(mut self, key: impl Into<String>, value: TaskValue) -> Self {
+        self.kwargs.push((key.into(), value));
+        self
+    }
+
+    /// Append a single execution option.
+    #[must_use]
+    pub fn with_option(mut self, key: impl Into<String>, value: TaskValue) -> Self {
+        self.options.push((key.into(), value));
+        self
+    }
+
+    /// Set the immutable flag (Celery's `.si()` / `immutable=True`).
+    #[must_use]
+    pub fn immutable(mut self, immutable: bool) -> Self {
+        self.immutable = immutable;
+        self
+    }
+
+    /// Set the subtask type marker.
+    #[must_use]
+    pub fn with_subtask_type(mut self, subtask_type: impl Into<String>) -> Self {
+        self.subtask_type = Some(subtask_type.into());
+        self
+    }
+
+    /// Canonical, collision-free byte encoding of this callback.
+    ///
+    /// Every field participates, each with its own tag, so no two structurally
+    /// different callbacks share an encoding.
+    #[must_use]
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_field(&mut out, b'T', self.task.as_bytes());
+        write_optional_field(
+            &mut out,
+            b'D',
+            self.task_id.as_ref().map(|id| id.as_bytes().as_slice()),
+        );
+
+        write_len(&mut out, b'A', self.args.len() as u64);
+        for arg in &self.args {
+            write_field(&mut out, b'a', &canonical_value_bytes(arg));
+        }
+
+        write_pairs(&mut out, b'K', b'k', b'v', &self.kwargs);
+        write_pairs(&mut out, b'P', b'p', b'q', &self.options);
+
+        write_flag(&mut out, b'M', self.immutable);
+        write_optional_field(
+            &mut out,
+            b'S',
+            self.subtask_type.as_ref().map(|s| s.as_bytes()),
+        );
+        out
+    }
+}
+
+/// The fields of a task message that participate in the signature.
+///
+/// Every field here is covered by the MAC. See the [module
+/// documentation][self] for the authoritative list of what is authenticated
+/// and — just as importantly — what is not: transport headers, routing,
+/// `parent_id`/`root_id`/`group` and any custom embed keys are outside the
+/// signature, so a verified signature says nothing about them.
+///
+/// The workflow links (`callbacks`, `errbacks`, `chain`, `chord`) are signed
+/// precisely because they *name further tasks to execute*: leaving them out
+/// would let anyone with broker write access redirect a signed message's
+/// continuation to a different registered task while the signature still
+/// verified.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SignedFields {
     /// Unique task identifier.
@@ -546,6 +830,24 @@ pub struct SignedFields {
     pub args: Vec<TaskValue>,
     /// Keyword arguments. Order is irrelevant — canonicalization sorts keys.
     pub kwargs: Vec<(String, TaskValue)>,
+    /// Tasks to run when this one succeeds (Celery's `link`).
+    pub callbacks: Vec<SignedCallback>,
+    /// Tasks to run when this one fails (Celery's `link_error`).
+    pub errbacks: Vec<SignedCallback>,
+    /// The remaining tasks of the chain this task belongs to, in order.
+    pub chain: Vec<SignedCallback>,
+    /// The chord body, run once the group completes.
+    pub chord: Option<SignedCallback>,
+    /// Earliest time at which the task may run (Celery's `eta`).
+    pub eta: Option<DateTime<Utc>>,
+    /// Deadline after which the message must not be executed (Celery's
+    /// `expires`).
+    pub expires: Option<DateTime<Utc>>,
+    /// When the producer signed the message. Required by
+    /// [`TaskSigner::verify_fresh`].
+    pub signed_at: Option<DateTime<Utc>>,
+    /// Single-use token. Required by [`ReplayGuard`].
+    pub nonce: Option<String>,
 }
 
 impl SignedFields {
@@ -555,8 +857,7 @@ impl SignedFields {
         Self {
             id,
             name: name.into(),
-            args: Vec::new(),
-            kwargs: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -588,20 +889,113 @@ impl SignedFields {
         self
     }
 
+    /// Set the success links.
+    #[must_use]
+    pub fn with_callbacks(mut self, callbacks: Vec<SignedCallback>) -> Self {
+        self.callbacks = callbacks;
+        self
+    }
+
+    /// Append one success link.
+    #[must_use]
+    pub fn with_callback(mut self, callback: SignedCallback) -> Self {
+        self.callbacks.push(callback);
+        self
+    }
+
+    /// Set the failure links.
+    #[must_use]
+    pub fn with_errbacks(mut self, errbacks: Vec<SignedCallback>) -> Self {
+        self.errbacks = errbacks;
+        self
+    }
+
+    /// Append one failure link.
+    #[must_use]
+    pub fn with_errback(mut self, errback: SignedCallback) -> Self {
+        self.errbacks.push(errback);
+        self
+    }
+
+    /// Set the remaining chain, in execution order.
+    #[must_use]
+    pub fn with_chain(mut self, chain: Vec<SignedCallback>) -> Self {
+        self.chain = chain;
+        self
+    }
+
+    /// Set the chord body callback.
+    #[must_use]
+    pub fn with_chord(mut self, chord: SignedCallback) -> Self {
+        self.chord = Some(chord);
+        self
+    }
+
+    /// Set the earliest execution time.
+    #[must_use]
+    pub fn with_eta(mut self, eta: DateTime<Utc>) -> Self {
+        self.eta = Some(eta);
+        self
+    }
+
+    /// Set the message-expiry deadline.
+    #[must_use]
+    pub fn with_expires(mut self, expires: DateTime<Utc>) -> Self {
+        self.expires = Some(expires);
+        self
+    }
+
+    /// Stamp an explicit signing time.
+    #[must_use]
+    pub fn with_signed_at(mut self, signed_at: DateTime<Utc>) -> Self {
+        self.signed_at = Some(signed_at);
+        self
+    }
+
+    /// Stamp the current time as the signing time.
+    #[must_use]
+    pub fn signed_now(self) -> Self {
+        let now = Utc::now();
+        self.with_signed_at(now)
+    }
+
+    /// Set an explicit nonce.
+    ///
+    /// The nonce only has to be unique per key and freshness window; it is not
+    /// required to be secret.
+    #[must_use]
+    pub fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
+        self.nonce = Some(nonce.into());
+        self
+    }
+
+    /// Generate a fresh 128-bit random nonce and attach it.
+    #[must_use]
+    pub fn with_random_nonce(self) -> Self {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let high: u64 = rng.random();
+        let low: u64 = rng.random();
+        self.with_nonce(format!("{high:016x}{low:016x}"))
+    }
+
     /// Produce the canonical byte serialization that is fed to the MAC.
     ///
     /// The encoding is length-prefixed and field-tagged so that no two
     /// distinct field layouts can collide (i.e. it is *unambiguous*):
     /// concatenating differently-split components can never yield the same
-    /// byte stream. Keyword arguments are sorted by key so map ordering does
-    /// not affect the result.
+    /// byte stream. Keyword arguments and callback options are sorted by key so
+    /// map ordering does not affect the result; ordered sequences (`args`,
+    /// `chain`, `callbacks`, `errbacks`) keep their order, because reordering
+    /// them changes what executes.
+    ///
+    /// The stream starts with [`SIGNATURE_DOMAIN_TAG`], which both separates
+    /// these MACs from raw HMACs of arbitrary data and pins the scheme version.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
 
-        // Domain separation tag + version, so signatures from this scheme can
-        // never be confused with raw HMACs of arbitrary data.
-        out.extend_from_slice(b"celers.task.sig.v1");
+        out.extend_from_slice(SIGNATURE_DOMAIN_TAG);
 
         // id (always 16 bytes, but length-prefix anyway for uniformity).
         write_field(&mut out, b'I', self.id.as_bytes());
@@ -617,14 +1011,27 @@ impl SignedFields {
         }
 
         // kwargs: sorted by key, count, then key/value pairs.
-        let mut sorted: Vec<&(String, TaskValue)> = self.kwargs.iter().collect();
-        sorted.sort_by(|x, y| x.0.cmp(&y.0));
-        write_len(&mut out, b'K', sorted.len() as u64);
-        for (key, value) in sorted {
-            write_field(&mut out, b'k', key.as_bytes());
-            let encoded = canonical_value_bytes(value);
-            write_field(&mut out, b'v', &encoded);
-        }
+        write_pairs(&mut out, b'K', b'k', b'v', &self.kwargs);
+
+        // Workflow links. Each list gets its own tag so moving a callback into
+        // the chain (or vice versa) changes the encoding.
+        write_callbacks(&mut out, b'C', b'c', &self.callbacks);
+        write_callbacks(&mut out, b'E', b'e', &self.errbacks);
+        write_callbacks(&mut out, b'H', b'h', &self.chain);
+        write_optional_field(
+            &mut out,
+            b'R',
+            self.chord
+                .as_ref()
+                .map(SignedCallback::canonical_bytes)
+                .as_deref(),
+        );
+
+        // Scheduling / freshness timestamps.
+        write_optional_timestamp(&mut out, b'X', self.eta);
+        write_optional_timestamp(&mut out, b'Z', self.expires);
+        write_optional_timestamp(&mut out, b'W', self.signed_at);
+        write_optional_field(&mut out, b'O', self.nonce.as_ref().map(|n| n.as_bytes()));
 
         out
     }
@@ -641,6 +1048,68 @@ fn write_field(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
 fn write_len(out: &mut Vec<u8>, tag: u8, value: u64) {
     out.push(tag);
     out.extend_from_slice(&value.to_be_bytes());
+}
+
+/// Write a tagged optional field: `tag | 0` when absent, `tag | 1 | len | bytes`
+/// when present. The presence byte keeps "absent" and "empty" distinct.
+fn write_optional_field(out: &mut Vec<u8>, tag: u8, bytes: Option<&[u8]>) {
+    out.push(tag);
+    match bytes {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            out.extend_from_slice(value);
+        }
+    }
+}
+
+/// Write a tagged boolean: `tag | 0|1`.
+fn write_flag(out: &mut Vec<u8>, tag: u8, flag: bool) {
+    out.push(tag);
+    out.push(u8::from(flag));
+}
+
+/// Write a tagged optional instant as `seconds(i64, be) | nanos(u32, be)`.
+///
+/// Encoded numerically rather than as text so two spellings of the same instant
+/// (`Z` vs `+00:00`, differing sub-second precision) cannot produce different
+/// MACs.
+fn write_optional_timestamp(out: &mut Vec<u8>, tag: u8, at: Option<DateTime<Utc>>) {
+    let encoded = at.map(|at| {
+        let mut buf = Vec::with_capacity(12);
+        buf.extend_from_slice(&at.timestamp().to_be_bytes());
+        buf.extend_from_slice(&at.timestamp_subsec_nanos().to_be_bytes());
+        buf
+    });
+    write_optional_field(out, tag, encoded.as_deref());
+}
+
+/// Write a key/value map: a tagged count followed by key/value fields, sorted
+/// by key so map iteration order cannot change the MAC.
+fn write_pairs(
+    out: &mut Vec<u8>,
+    count_tag: u8,
+    key_tag: u8,
+    value_tag: u8,
+    pairs: &[(String, TaskValue)],
+) {
+    let mut sorted: Vec<&(String, TaskValue)> = pairs.iter().collect();
+    sorted.sort_by(|x, y| x.0.cmp(&y.0));
+    write_len(out, count_tag, sorted.len() as u64);
+    for (key, value) in sorted {
+        write_field(out, key_tag, key.as_bytes());
+        write_field(out, value_tag, &canonical_value_bytes(value));
+    }
+}
+
+/// Write an ordered list of callbacks: a tagged count followed by each
+/// callback's canonical encoding, in order.
+fn write_callbacks(out: &mut Vec<u8>, count_tag: u8, item_tag: u8, callbacks: &[SignedCallback]) {
+    write_len(out, count_tag, callbacks.len() as u64);
+    for callback in callbacks {
+        write_field(out, item_tag, &callback.canonical_bytes());
+    }
 }
 
 /// Canonical, collision-free byte encoding of a single [`TaskValue`].
@@ -890,9 +1359,262 @@ impl TaskSigner {
     }
 
     /// Convenience predicate: `true` iff the message verifies.
+    ///
+    /// Authenticity only — this says nothing about freshness or replay. See
+    /// [`TaskSigner::verify_fresh`].
     #[must_use]
     pub fn is_valid(&self, fields: &SignedFields, signature: &TaskSignature) -> bool {
         self.verify(fields, signature).is_ok()
+    }
+
+    /// Verify authenticity **and** freshness against the current clock.
+    ///
+    /// Equivalent to [`TaskSigner::verify_fresh_at`] with `now = Utc::now()`.
+    ///
+    /// # Errors
+    ///
+    /// Anything [`TaskSigner::verify`] returns, plus
+    /// [`SignatureError::MissingSignedAt`], [`SignatureError::Stale`],
+    /// [`SignatureError::FutureDated`] and [`SignatureError::MessageExpired`].
+    pub fn verify_fresh(
+        &self,
+        fields: &SignedFields,
+        signature: &TaskSignature,
+        window: &FreshnessWindow,
+    ) -> Result<(), SignatureError> {
+        self.verify_fresh_at(fields, signature, window, Utc::now())
+    }
+
+    /// Verify authenticity **and** freshness against an explicit `now`.
+    ///
+    /// The order matters: the MAC is checked first, so the timestamps this
+    /// method reasons about are already known to be authentic rather than
+    /// attacker-supplied.
+    ///
+    /// Three separate conditions are enforced:
+    ///
+    /// 1. `signed_at` must be present and no older than `window.max_age`.
+    /// 2. `signed_at` must not be further in the future than
+    ///    `window.max_clock_skew` — otherwise a future-dated message would stay
+    ///    valid indefinitely.
+    /// 3. If the message carries an `expires` deadline (itself signed), that
+    ///    deadline must not have passed.
+    ///
+    /// # Errors
+    ///
+    /// See [`TaskSigner::verify_fresh`].
+    pub fn verify_fresh_at(
+        &self,
+        fields: &SignedFields,
+        signature: &TaskSignature,
+        window: &FreshnessWindow,
+        now: DateTime<Utc>,
+    ) -> Result<(), SignatureError> {
+        self.verify(fields, signature)?;
+        window.check_at(fields, now)
+    }
+}
+
+// ===========================================================================
+// Freshness & replay
+// ===========================================================================
+
+/// How old an authenticated message may be before it is rejected.
+///
+/// Both bounds are caller-supplied on purpose: the right window depends on the
+/// deployment (a few seconds for an RPC-like queue, minutes for a batch
+/// pipeline), and no default can be correct for all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreshnessWindow {
+    /// Maximum age of `signed_at` relative to now.
+    pub max_age: Duration,
+    /// Tolerance for a `signed_at` in the future (producer clock ahead).
+    pub max_clock_skew: Duration,
+}
+
+impl FreshnessWindow {
+    /// Default tolerance for a producer clock running ahead of the consumer.
+    pub const DEFAULT_CLOCK_SKEW: Duration = Duration::from_secs(60);
+
+    /// A window of `max_age` with [`Self::DEFAULT_CLOCK_SKEW`].
+    #[must_use]
+    pub const fn new(max_age: Duration) -> Self {
+        Self {
+            max_age,
+            max_clock_skew: Self::DEFAULT_CLOCK_SKEW,
+        }
+    }
+
+    /// Override the permitted clock skew.
+    #[must_use]
+    pub const fn with_max_clock_skew(mut self, max_clock_skew: Duration) -> Self {
+        self.max_clock_skew = max_clock_skew;
+        self
+    }
+
+    /// Check the freshness of already-authenticated fields against `now`.
+    ///
+    /// Exposed so a caller that verified the MAC separately (or that batches
+    /// verification) can still apply the same policy.
+    ///
+    /// # Errors
+    ///
+    /// [`SignatureError::MissingSignedAt`], [`SignatureError::Stale`],
+    /// [`SignatureError::FutureDated`] or [`SignatureError::MessageExpired`].
+    pub fn check_at(
+        &self,
+        fields: &SignedFields,
+        now: DateTime<Utc>,
+    ) -> Result<(), SignatureError> {
+        let signed_at = fields.signed_at.ok_or(SignatureError::MissingSignedAt)?;
+        let age = now - signed_at;
+
+        if age.num_seconds() < 0 {
+            let skew_secs = -age.num_seconds();
+            let max_skew_secs = self.max_clock_skew.as_secs();
+            if skew_secs > i64::try_from(max_skew_secs).unwrap_or(i64::MAX) {
+                return Err(SignatureError::FutureDated {
+                    skew_secs,
+                    max_skew_secs,
+                });
+            }
+        } else {
+            let max_age_secs = self.max_age.as_secs();
+            if age.num_seconds() > i64::try_from(max_age_secs).unwrap_or(i64::MAX) {
+                return Err(SignatureError::Stale {
+                    age_secs: age.num_seconds(),
+                    max_age_secs,
+                });
+            }
+        }
+
+        if let Some(expires) = fields.expires {
+            if now > expires {
+                return Err(SignatureError::MessageExpired {
+                    expired_secs_ago: (now - expires).num_seconds(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Rejects a signed message whose nonce has already been accepted.
+///
+/// # Scope
+///
+/// This cache lives in **one process**. It stops the same message being
+/// executed twice by the same worker, which is what a local `verify` loop can
+/// guarantee on its own; it does not coordinate between workers, so N worker
+/// processes will each accept a replayed message once. A deployment that needs
+/// global single-use semantics must back the check with shared storage (a Redis
+/// `SET key NX PX`, a unique index on the nonce) — this type is the local half
+/// of that design, not a substitute for it.
+///
+/// Entries are pruned lazily: a nonce older than the freshness window can be
+/// dropped because such a message is rejected by the freshness check anyway.
+#[derive(Debug)]
+pub struct ReplayGuard {
+    window: FreshnessWindow,
+    seen: Mutex<HashMap<String, DateTime<Utc>>>,
+}
+
+impl ReplayGuard {
+    /// Create a guard enforcing `window` plus single-use nonces.
+    #[must_use]
+    pub fn new(window: FreshnessWindow) -> Self {
+        Self {
+            window,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The freshness window this guard enforces.
+    #[must_use]
+    pub const fn window(&self) -> &FreshnessWindow {
+        &self.window
+    }
+
+    /// Number of nonces currently remembered.
+    #[must_use]
+    pub fn remembered(&self) -> usize {
+        self.lock_seen().len()
+    }
+
+    /// Full check against the current clock: MAC, freshness, and single-use
+    /// nonce.
+    ///
+    /// # Errors
+    ///
+    /// See [`ReplayGuard::verify_at`].
+    pub fn verify(
+        &self,
+        signer: &TaskSigner,
+        fields: &SignedFields,
+        signature: &TaskSignature,
+    ) -> Result<(), SignatureError> {
+        self.verify_at(signer, fields, signature, Utc::now())
+    }
+
+    /// Full check against an explicit `now`.
+    ///
+    /// The nonce is recorded only after the signature and the freshness window
+    /// have both passed, so a forged or stale message cannot poison the cache
+    /// and lock out the genuine one.
+    ///
+    /// # Errors
+    ///
+    /// Anything [`TaskSigner::verify_fresh_at`] returns, plus
+    /// [`SignatureError::MissingNonce`] when the message carries no nonce and
+    /// [`SignatureError::Replayed`] when the nonce was already accepted.
+    pub fn verify_at(
+        &self,
+        signer: &TaskSigner,
+        fields: &SignedFields,
+        signature: &TaskSignature,
+        now: DateTime<Utc>,
+    ) -> Result<(), SignatureError> {
+        signer.verify_fresh_at(fields, signature, &self.window, now)?;
+
+        let nonce = fields.nonce.as_ref().ok_or(SignatureError::MissingNonce)?;
+
+        let mut seen = self.lock_seen();
+        Self::prune(&mut seen, &self.window, now);
+        if seen.contains_key(nonce) {
+            return Err(SignatureError::Replayed(nonce.clone()));
+        }
+        seen.insert(nonce.clone(), now);
+        Ok(())
+    }
+
+    /// Drop remembered nonces that can no longer be replayed within the
+    /// freshness window.
+    pub fn prune_at(&self, now: DateTime<Utc>) {
+        let mut seen = self.lock_seen();
+        Self::prune(&mut seen, &self.window, now);
+    }
+
+    fn prune(
+        seen: &mut HashMap<String, DateTime<Utc>>,
+        window: &FreshnessWindow,
+        now: DateTime<Utc>,
+    ) {
+        let horizon = i64::try_from(
+            window
+                .max_age
+                .as_secs()
+                .saturating_add(window.max_clock_skew.as_secs()),
+        )
+        .unwrap_or(i64::MAX);
+        seen.retain(|_, accepted_at| (now - *accepted_at).num_seconds() <= horizon);
+    }
+
+    /// Lock the cache, recovering from poisoning rather than panicking: a
+    /// poisoned mutex here only means some other thread panicked mid-check, and
+    /// the remembered set is still sound to use.
+    fn lock_seen(&self) -> std::sync::MutexGuard<'_, HashMap<String, DateTime<Utc>>> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

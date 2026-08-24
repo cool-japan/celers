@@ -85,16 +85,35 @@ impl RetryStrategy {
     /// # Returns
     ///
     /// The duration to wait before the next retry attempt
+    ///
+    /// The exponent is saturated at `i32::MAX` before exponentiating: `powi`
+    /// takes an `i32`, so a plain `retry_count as i32` wraps *negative* for any
+    /// attempt above `i32::MAX` and the delay collapses to a fraction of the
+    /// base (`u32::MAX` used to yield `base / 2`) — the backoff shrinking to
+    /// nothing at exactly the point it matters most. Every finite attempt above
+    /// the cap is already pinned to `max_delay` anyway.
     pub fn calculate_delay(&self, retry_count: u32) -> Duration {
+        /// Largest exponent representable as the `i32` `powi` wants.
+        const MAX_EXPONENT: u32 = i32::MAX as u32;
+
         match self {
             RetryStrategy::Exponential {
                 base_delay,
                 max_delay,
                 multiplier,
             } => {
-                let delay_ms = base_delay.as_millis() as f64 * multiplier.powi(retry_count as i32);
-                let delay_ms = delay_ms.min(max_delay.as_millis() as f64);
-                Duration::from_millis(delay_ms as u64)
+                let exponent = retry_count.min(MAX_EXPONENT) as i32;
+                let delay_ms = base_delay.as_millis() as f64 * multiplier.powi(exponent);
+                // `min` propagates NaN's operand order, and an overflowing
+                // `powi` yields `inf`; clamping against the cap first keeps both
+                // cases at `max_delay` instead of `0`.
+                let max_ms = max_delay.as_millis() as f64;
+                let delay_ms = if delay_ms.is_nan() {
+                    max_ms
+                } else {
+                    delay_ms.min(max_ms)
+                };
+                Duration::from_millis(delay_ms.max(0.0) as u64)
             }
             RetryStrategy::Linear {
                 initial_delay,
@@ -644,5 +663,53 @@ mod tests {
         let display = format!("{}", config);
         assert!(display.contains("jitter=true"));
         assert!(display.contains("15%"));
+    }
+
+    /// Regression: `Exponential::calculate_delay` cast the attempt straight to
+    /// `i32` for `powi`, so any attempt above `i32::MAX` wrapped negative and
+    /// *shrank* the delay — `u32::MAX` produced `base / 2` (500 ms) instead of
+    /// the 60 s cap. The exponent is now saturated before exponentiating.
+    #[test]
+    fn test_exponential_delay_saturates_instead_of_wrapping_negative() {
+        let strategy = RetryStrategy::Exponential {
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+            multiplier: 2.0,
+        };
+
+        for attempt in [
+            u32::MAX,
+            u32::MAX - 1,
+            i32::MAX as u32,
+            i32::MAX as u32 + 1,
+            1_000_000,
+        ] {
+            assert_eq!(
+                strategy.calculate_delay(attempt),
+                Duration::from_secs(60),
+                "attempt {attempt} must be capped at max_delay, never shortened"
+            );
+        }
+    }
+
+    /// A multiplier below 1 shrinks the delay legitimately; saturating the
+    /// exponent must not turn that into a zero-length (hot) retry loop.
+    #[test]
+    fn test_exponential_delay_never_goes_negative_or_nan() {
+        let shrinking = RetryStrategy::Exponential {
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+            multiplier: 0.5,
+        };
+        assert_eq!(shrinking.calculate_delay(0), Duration::from_secs(1));
+        assert_eq!(shrinking.calculate_delay(1), Duration::from_millis(500));
+        assert_eq!(shrinking.calculate_delay(u32::MAX), Duration::ZERO);
+
+        let degenerate = RetryStrategy::Exponential {
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+            multiplier: f64::NAN,
+        };
+        assert_eq!(degenerate.calculate_delay(3), Duration::from_secs(60));
     }
 }

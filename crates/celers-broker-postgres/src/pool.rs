@@ -30,10 +30,15 @@
 //! * **Broken-connection detection** — an operation whose error looks like a
 //!   dropped connection (see [`is_connection_error`]) flags its slot; the next
 //!   acquisition of that slot reconnects instead of handing back a dead
-//!   client. Read-only `query` calls transparently retry once on a fresh
-//!   connection; `execute`/`transaction` do **not** auto-retry, because a
-//!   statement may have committed server-side before the socket died and
-//!   replaying it could double-apply a write.
+//!   client. A statement is retried once on a fresh connection **only if it is
+//!   a read** (see [`is_read_only_statement`]): a write may have committed
+//!   server-side before the socket died, so replaying it could double-apply
+//!   it. That test is on the SQL text, not on which method was called, because
+//!   the delivery path deliberately routes writes through
+//!   [`PgPool::query`] — `UPDATE … RETURNING` is how a claim, an ack and a
+//!   reject each stay a single atomic statement — and those must not be
+//!   replayed: a replayed claim would strand the first claim's row in
+//!   `processing` with no worker holding it.
 //! * **Backoff** — consecutive reconnect failures on a slot push out that
 //!   slot's next attempt exponentially (50 ms → 5 s cap), so a database that
 //!   is down does not turn into a reconnect spin loop.
@@ -148,6 +153,32 @@ pub fn is_connection_error(err: &OxiSqlError) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `sql` is a pure read, and therefore safe to replay on a fresh
+/// connection after a mid-flight connection failure.
+///
+/// Deliberately conservative: only a leading `SELECT`, `EXPLAIN` or `SHOW`
+/// counts. A `WITH` is *not* accepted, because a CTE may contain a data
+/// modifying statement (`WITH x AS (DELETE … RETURNING …) …`), and an
+/// `UPDATE … RETURNING` is not a read no matter that it comes back through
+/// [`PgPool::query`].
+pub fn is_read_only_statement(sql: &str) -> bool {
+    let head = sql.trim_start();
+    // Skip any leading line comments so `-- comment\nSELECT …` is still a read.
+    let head = head
+        .lines()
+        .find(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with("--")
+        })
+        .unwrap_or("")
+        .trim_start();
+    let lowered = head.to_ascii_lowercase();
+    lowered.starts_with("select ")
+        || lowered.starts_with("select\n")
+        || lowered.starts_with("explain ")
+        || lowered.starts_with("show ")
 }
 
 /// Exponential backoff for the `n`-th consecutive reconnect failure.
@@ -380,10 +411,15 @@ impl PgPool {
         }
     }
 
-    /// Run a `SELECT` on a pooled connection, retrying once on a fresh
-    /// connection if the first attempt died mid-flight.
+    /// Run a row-returning statement on a pooled connection.
     ///
-    /// Retrying is safe here precisely because the statement is a read.
+    /// If the first attempt dies from a connection failure the slot is
+    /// recycled, and the statement is retried once on a fresh connection
+    /// **only when it is a pure read** ([`is_read_only_statement`]). The
+    /// delivery path issues `UPDATE … RETURNING` through this method — that is
+    /// what makes a claim/ack/reject one atomic statement — and those must not
+    /// be replayed, because the first attempt may have committed before the
+    /// socket dropped.
     pub async fn query(
         &self,
         sql: &str,
@@ -398,6 +434,9 @@ impl PgPool {
                         return Err(e);
                     }
                     checked_out.mark_broken();
+                    if !is_read_only_statement(sql) {
+                        return Err(e);
+                    }
                     e
                 }
             }
@@ -589,6 +628,37 @@ mod tests {
         assert!(is_connection_error(&OxiSqlError::Execution(
             "db error: FATAL: terminating connection due to administrator command".into()
         )));
+    }
+
+    #[test]
+    fn only_pure_reads_are_eligible_for_replay() {
+        assert!(is_read_only_statement("SELECT 1"));
+        assert!(is_read_only_statement("  select id from celers_tasks"));
+        assert!(is_read_only_statement(
+            "\n-- a comment\nSELECT COUNT(*) as count"
+        ));
+        assert!(is_read_only_statement("EXPLAIN (ANALYZE) SELECT 1"));
+
+        // The delivery path routes writes through `query` for `RETURNING`;
+        // replaying one could strand a claimed row or double-apply a write.
+        assert!(!is_read_only_statement(&crate::sql::claim_one_sql()));
+        assert!(!is_read_only_statement(&crate::sql::claim_batch_sql()));
+        assert!(!is_read_only_statement(crate::sql::ACK_TASK));
+        assert!(!is_read_only_statement(crate::sql::FAIL_TASK));
+        assert!(!is_read_only_statement(&crate::sql::reject_requeue_sql(
+            crate::types::RetryStrategy::default()
+        )));
+        assert!(!is_read_only_statement(
+            "WITH doomed AS (DELETE FROM celers_tasks RETURNING id) SELECT * FROM doomed"
+        ));
+        assert!(!is_read_only_statement(
+            "INSERT INTO celers_tasks DEFAULT VALUES"
+        ));
+
+        // The probe and hook reads must stay replayable.
+        assert!(is_read_only_statement(crate::sql::PROBE_TASK_STATE));
+        assert!(is_read_only_statement(crate::sql::SELECT_TASK_FOR_HOOKS));
+        assert!(is_read_only_statement(crate::sql::QUEUE_SIZE));
     }
 
     #[test]

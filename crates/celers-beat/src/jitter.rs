@@ -92,17 +92,45 @@ pub fn bounded_jitter_offset(entry_name: &str, fire_time: DateTime<Utc>, window_
         return 0;
     }
 
-    let hash = stable_hash(entry_name, fire_time);
+    // Clamp defensively so an absurd window cannot overflow the signed range.
+    let window = i64::try_from(window_secs).unwrap_or(i64::MAX);
+    stable_bounded_offset(entry_name, fire_time, -window, window)
+}
 
-    // The full span is [-window, +window], i.e. (2 * window + 1) discrete
-    // positions. Reducing the hash modulo that span and subtracting `window`
-    // maps uniformly onto the symmetric range.
-    let span = window_secs
-        .saturating_mul(2)
-        .saturating_add(1)
-        .min(u64::from(u32::MAX));
-    let position = (hash % span) as i64;
-    position - window_secs as i64
+/// Compute a deterministic offset in the **inclusive** range `[min_secs,
+/// max_secs]` from the same stable FNV-1a hash used by
+/// [`bounded_jitter_offset`].
+///
+/// This is the single hash implementation behind every jitter code path — the
+/// [`crate::history::Jitter`] applied by the scheduler delegates here — so two
+/// beat instances always compute the same jittered fire instant for the same
+/// entry regardless of toolchain or platform.
+///
+/// An inverted range (`min > max`) is normalised by swapping the bounds rather
+/// than wrapping into an enormous span.
+pub(crate) fn stable_bounded_offset(
+    entry_name: &str,
+    fire_time: DateTime<Utc>,
+    min_secs: i64,
+    max_secs: i64,
+) -> i64 {
+    let (low, high) = if min_secs <= max_secs {
+        (min_secs, max_secs)
+    } else {
+        (max_secs, min_secs)
+    };
+
+    if low == high {
+        return low;
+    }
+
+    // Widen to i128 so `high - low + 1` cannot overflow for extreme bounds.
+    let span = i128::from(high) - i128::from(low) + 1;
+    let position = i128::from(stable_hash(entry_name, fire_time)) % span;
+    let offset = i128::from(low) + position;
+
+    // `offset` is in [low, high] by construction, so this conversion is exact.
+    i64::try_from(offset).unwrap_or(low)
 }
 
 /// Apply a deterministic, bounded jitter offset to a fire time.
@@ -125,7 +153,12 @@ pub fn bounded_jitter_offset(entry_name: &str, fire_time: DateTime<Utc>, window_
 /// ```
 pub fn apply_jitter(fire_time: DateTime<Utc>, entry_name: &str, window_secs: u64) -> DateTime<Utc> {
     let offset = bounded_jitter_offset(entry_name, fire_time, window_secs);
-    fire_time + Duration::seconds(offset)
+    // `Duration::seconds` panics on an out-of-range value and the addition can
+    // overflow the representable datetime range; an absurd window degrades to
+    // the un-jittered instant rather than aborting the scheduler.
+    Duration::try_seconds(offset)
+        .and_then(|delta| fire_time.checked_add_signed(delta))
+        .unwrap_or(fire_time)
 }
 
 impl ScheduledTask {

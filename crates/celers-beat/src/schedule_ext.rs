@@ -6,7 +6,7 @@
 use crate::config::ScheduleError;
 use crate::schedule::{BusinessCalendar, HolidayCalendar, Schedule};
 use crate::task::ScheduledTask;
-use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Months, Timelike, Utc};
 #[cfg(feature = "cron")]
 use chrono::{Offset, TimeZone};
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,7 @@ impl ScheduleIndex {
             Schedule::Crontab { .. } => "crontab".to_string(),
             #[cfg(feature = "solar")]
             Schedule::Solar { .. } => "solar".to_string(),
+            Schedule::MonthlyLastDay { .. } => "monthly_last_day".to_string(),
             Schedule::OneTime { .. } => "onetime".to_string(),
         }
     }
@@ -201,6 +202,32 @@ impl BlackoutPeriod {
         self
     }
 
+    /// Check whether `time`'s time-of-day falls inside the recurring window.
+    ///
+    /// Handles windows that cross midnight (e.g. 22:00 → 02:00): for those the
+    /// window is the *union* of `[start, 23:59]` and `[00:00, end]`, not the
+    /// empty intersection an ordinary `>= start && <= end` comparison yields.
+    fn matches_time_of_day(&self, time: DateTime<Utc>) -> bool {
+        let start_time = (self.start.hour(), self.start.minute());
+        let end_time = (self.end.hour(), self.end.minute());
+        let current_time = (time.hour(), time.minute());
+
+        if start_time <= end_time {
+            current_time >= start_time && current_time <= end_time
+        } else {
+            // Window wraps past midnight.
+            current_time >= start_time || current_time <= end_time
+        }
+    }
+
+    /// Whether the recurring window covers every minute of the day, which would
+    /// make "advance until out of the blackout" unsatisfiable.
+    fn covers_whole_day(&self) -> bool {
+        let start_time = (self.start.hour(), self.start.minute());
+        let end_time = (self.end.hour(), self.end.minute());
+        start_time == (0, 0) && end_time == (23, 59)
+    }
+
     /// Check if the given time is within this blackout period
     pub fn is_blackout(&self, time: DateTime<Utc>) -> bool {
         if time >= self.start && time <= self.end {
@@ -208,74 +235,95 @@ impl BlackoutPeriod {
         }
 
         // Check recurring patterns
-        if let Some(ref recurrence) = self.recurring {
-            match recurrence {
-                BlackoutRecurrence::Daily => {
-                    let start_time = (self.start.hour(), self.start.minute());
-                    let end_time = (self.end.hour(), self.end.minute());
-                    let current_time = (time.hour(), time.minute());
-                    current_time >= start_time && current_time <= end_time
-                }
-                BlackoutRecurrence::Weekly => {
-                    if time.weekday() == self.start.weekday() {
-                        let start_time = (self.start.hour(), self.start.minute());
-                        let end_time = (self.end.hour(), self.end.minute());
-                        let current_time = (time.hour(), time.minute());
-                        current_time >= start_time && current_time <= end_time
-                    } else {
-                        false
-                    }
-                }
-                BlackoutRecurrence::Monthly => {
-                    if time.day() == self.start.day() {
-                        let start_time = (self.start.hour(), self.start.minute());
-                        let end_time = (self.end.hour(), self.end.minute());
-                        let current_time = (time.hour(), time.minute());
-                        current_time >= start_time && current_time <= end_time
-                    } else {
-                        false
-                    }
-                }
+        match self.recurring {
+            Some(BlackoutRecurrence::Daily) => self.matches_time_of_day(time),
+            Some(BlackoutRecurrence::Weekly) => {
+                time.weekday() == self.start.weekday() && self.matches_time_of_day(time)
             }
-        } else {
-            false
+            Some(BlackoutRecurrence::Monthly) => {
+                time.day() == self.start.day() && self.matches_time_of_day(time)
+            }
+            None => false,
         }
     }
 
-    /// Find the next time after the blackout period
+    /// Find the next time after the blackout period.
+    ///
+    /// The returned instant is always strictly outside the blackout when one
+    /// exists, and strictly greater than `time` — callers loop on this method,
+    /// so a non-advancing result would spin. An unsatisfiable configuration (a
+    /// daily blackout covering the whole day, or a recurrence that never
+    /// clears within a year) returns the last candidate rather than looping
+    /// forever; use [`BlackoutPeriod::try_next_available_time`] to detect that
+    /// case.
     pub fn next_available_time(&self, time: DateTime<Utc>) -> DateTime<Utc> {
+        match self.try_next_available_time(time) {
+            Ok(next) => next,
+            Err(_) => time,
+        }
+    }
+
+    /// Fallible form of [`BlackoutPeriod::next_available_time`].
+    ///
+    /// # Errors
+    /// Returns [`ScheduleError::Invalid`] when the blackout can never clear —
+    /// for example a `Daily` recurrence spanning 00:00–23:59 — instead of
+    /// silently handing back an instant that is still blacked out.
+    pub fn try_next_available_time(
+        &self,
+        time: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, ScheduleError> {
         if !self.is_blackout(time) {
-            return time;
+            return Ok(time);
         }
 
-        // If in blackout, move to end of blackout
-        let mut current = self.end;
+        if self.recurring.is_some() && self.covers_whole_day() {
+            return Err(ScheduleError::Invalid(format!(
+                "blackout period '{}' recurs over the entire day and never clears",
+                self.name
+            )));
+        }
 
-        // For recurring blackouts, may need to advance further
-        if let Some(ref recurrence) = self.recurring {
-            while self.is_blackout(current) {
-                current = match recurrence {
-                    BlackoutRecurrence::Daily => current + Duration::days(1),
-                    BlackoutRecurrence::Weekly => current + Duration::weeks(1),
-                    BlackoutRecurrence::Monthly => {
-                        // Move to next month
-                        if current.month() == 12 {
-                            current
-                                .with_year(current.year() + 1)
-                                .expect("year increment should be valid")
-                                .with_month(1)
-                                .expect("month 1 is always valid")
-                        } else {
-                            current
-                                .with_month(current.month() + 1)
-                                .expect("month increment within 1-12 range should be valid")
-                        }
-                    }
-                };
+        // `is_blackout` uses an inclusive upper bound, so `self.end` is itself
+        // still inside the window: step one second past it so every pass makes
+        // strict progress.
+        let mut current = std::cmp::max(self.end + Duration::seconds(1), time);
+
+        let Some(ref recurrence) = self.recurring else {
+            return Ok(current);
+        };
+
+        // Bounded search: 366 iterations covers a full year of daily
+        // recurrences, 53 weeks of weekly ones and 12+ months of monthly ones.
+        for _ in 0..366 {
+            if !self.is_blackout(current) {
+                return Ok(current);
+            }
+
+            let advanced = match recurrence {
+                BlackoutRecurrence::Daily => Some(current + Duration::days(1)),
+                BlackoutRecurrence::Weekly => Some(current + Duration::weeks(1)),
+                // `with_month` preserves the day-of-month and returns `None`
+                // for e.g. 31 January -> 31 February; `checked_add_months`
+                // clamps to the last valid day instead.
+                BlackoutRecurrence::Monthly => current.checked_add_months(Months::new(1)),
+            };
+
+            match advanced {
+                Some(next) if next > current => current = next,
+                _ => {
+                    return Err(ScheduleError::Invalid(format!(
+                        "blackout period '{}' could not be advanced past {}",
+                        self.name, current
+                    )))
+                }
             }
         }
 
-        current
+        Err(ScheduleError::Invalid(format!(
+            "blackout period '{}' did not clear within the search horizon",
+            self.name
+        )))
     }
 }
 
@@ -342,15 +390,41 @@ impl CalendarWithBlackout {
         true
     }
 
-    /// Find the next valid execution time
-    pub fn next_valid_time(&self, mut time: DateTime<Utc>) -> DateTime<Utc> {
-        // Try up to 365 days
+    /// Find the next valid execution time.
+    ///
+    /// Returns the input instant unchanged when no valid time can be found
+    /// within the search horizon; use
+    /// [`CalendarWithBlackout::try_next_valid_time`] to distinguish "found a
+    /// valid instant" from "gave up", which a bare `DateTime` cannot express.
+    pub fn next_valid_time(&self, time: DateTime<Utc>) -> DateTime<Utc> {
+        self.try_next_valid_time(time).unwrap_or(time)
+    }
+
+    /// Fallible form of [`CalendarWithBlackout::next_valid_time`].
+    ///
+    /// # Errors
+    /// Returns [`ScheduleError::Invalid`] when the calendar is unsatisfiable —
+    /// an always-on blackout, or a combination of constraints that never clears
+    /// within the search horizon — rather than returning an instant that is
+    /// still blacked out.
+    pub fn try_next_valid_time(&self, time: DateTime<Utc>) -> Result<DateTime<Utc>, ScheduleError> {
+        let mut time = time;
+
+        // Each iteration advances `time` strictly, so the horizon bounds the
+        // search rather than merely capping a potentially stalled loop.
         for _ in 0..365 {
             // Check blackout periods first
             let mut in_blackout = false;
             for blackout in &self.blackout_periods {
                 if blackout.is_blackout(time) {
-                    time = blackout.next_available_time(time);
+                    let advanced = blackout.try_next_available_time(time)?;
+                    if advanced <= time {
+                        return Err(ScheduleError::Invalid(format!(
+                            "blackout period '{}' made no progress from {}",
+                            blackout.name, time
+                        )));
+                    }
+                    time = advanced;
                     in_blackout = true;
                     break;
                 }
@@ -369,16 +443,25 @@ impl CalendarWithBlackout {
             // Check business calendar
             if let Some(ref business) = self.business_calendar {
                 if !business.is_business_time(&time) {
-                    time = business.next_business_time(time);
+                    let advanced = business.next_business_time(time);
+                    if advanced <= time {
+                        return Err(ScheduleError::Invalid(
+                            "business calendar made no progress; check working days/hours"
+                                .to_string(),
+                        ));
+                    }
+                    time = advanced;
                     continue;
                 }
             }
 
             // All checks passed
-            return time;
+            return Ok(time);
         }
 
-        time
+        Err(ScheduleError::Invalid(
+            "no valid execution time found within the 365-iteration search horizon".to_string(),
+        ))
     }
 }
 
@@ -477,22 +560,16 @@ impl CompositeSchedule {
             ));
         }
 
-        match self.mode {
-            CompositeMode::And => {
-                // AND: all must be due, so take the latest (slowest) time
-                Ok(*next_runs
-                    .iter()
-                    .max()
-                    .expect("next_runs validated to be non-empty"))
-            }
-            CompositeMode::Or => {
-                // OR: any can be due, so take the earliest (fastest) time
-                Ok(*next_runs
-                    .iter()
-                    .min()
-                    .expect("next_runs validated to be non-empty"))
-            }
-        }
+        let selected = match self.mode {
+            // AND: all must be due, so take the latest (slowest) time
+            CompositeMode::And => next_runs.iter().max().copied(),
+            // OR: any can be due, so take the earliest (fastest) time
+            CompositeMode::Or => next_runs.iter().min().copied(),
+        };
+
+        selected.ok_or_else(|| {
+            ScheduleError::Invalid("No valid next run time from any sub-schedule".to_string())
+        })
     }
 
     /// Check if this composite schedule is due
@@ -1505,9 +1582,13 @@ impl ScheduleTemplates {
         Schedule::crontab("0", "0", "*", "1", "*")
     }
 
-    /// Last day of every month at midnight (requires `cron` feature)
+    /// Last day of every month at midnight.
     ///
-    /// Note: Uses day 28 which works for all months
+    /// Fires on the *real* last calendar day — 31 January, 28 or 29 February,
+    /// 30 April — exactly once per month. Cron cannot express this (there is no
+    /// `L` token in the `cron` crate, and a `28-31` day-of-month range fires
+    /// two to four times a month), so this uses
+    /// [`Schedule::MonthlyLastDay`].
     ///
     /// # Example
     /// ```
@@ -1515,9 +1596,25 @@ impl ScheduleTemplates {
     ///
     /// let schedule = ScheduleTemplates::monthly_last_day();
     /// ```
-    #[cfg(feature = "cron")]
     pub fn monthly_last_day() -> Schedule {
-        Schedule::crontab("0", "0", "*", "28-31", "*")
+        Schedule::monthly_last_day(0, 0)
+    }
+
+    /// Last day of every month at a specific time.
+    ///
+    /// # Arguments
+    /// * `hour` - Hour of day, UTC (0-23)
+    /// * `minute` - Minute (0-59)
+    ///
+    /// # Example
+    /// ```
+    /// use celers_beat::ScheduleTemplates;
+    ///
+    /// // Month-end reconciliation at 23:30 UTC
+    /// let schedule = ScheduleTemplates::monthly_last_day_at(23, 30);
+    /// ```
+    pub fn monthly_last_day_at(hour: u32, minute: u32) -> Schedule {
+        Schedule::monthly_last_day(hour, minute)
     }
 
     /// Every hour during business hours (9 AM - 5 PM, Mon-Fri) (requires `cron` feature)
@@ -1606,5 +1703,119 @@ impl ScheduleTemplates {
     /// ```
     pub fn every_12_hours() -> Schedule {
         Schedule::interval(43200)
+    }
+}
+
+#[cfg(test)]
+mod blackout_tests {
+    use super::{BlackoutPeriod, BlackoutRecurrence, CalendarWithBlackout};
+    use chrono::{DateTime, Datelike, TimeZone, Utc};
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    /// Regression: `with_month(month + 1)` preserves the day-of-month and
+    /// returns `None` for e.g. 31 January -> 31 February, so the `.expect`
+    /// panicked for any monthly blackout ending on the 29th-31st.
+    #[test]
+    fn monthly_blackout_ending_on_31st_does_not_panic() {
+        for (month, day) in [(1u32, 31u32), (3, 31), (5, 31), (8, 31), (10, 31)] {
+            let blackout = BlackoutPeriod::new(
+                "month-end freeze",
+                at(2026, month, day, 22, 0),
+                at(2026, month, day, 23, 0),
+            )
+            .with_recurrence(BlackoutRecurrence::Monthly);
+
+            let inside = at(2026, month, day, 22, 30);
+            assert!(blackout.is_blackout(inside));
+            // Must return a real instant instead of panicking on `with_month`.
+            let next = blackout.next_available_time(inside);
+            assert!(next > inside, "expected progress past {inside}, got {next}");
+            assert!(!blackout.is_blackout(next));
+        }
+    }
+
+    #[test]
+    fn monthly_blackout_on_29th_of_non_leap_february_does_not_panic() {
+        let blackout = BlackoutPeriod::new("freeze", at(2026, 1, 29, 1, 0), at(2026, 1, 29, 2, 0))
+            .with_recurrence(BlackoutRecurrence::Monthly);
+        let inside = at(2026, 1, 29, 1, 30);
+        let next = blackout.next_available_time(inside);
+        assert!(next > inside);
+    }
+
+    /// Regression: a window crossing midnight compared `(hour, minute)` tuples
+    /// with `>= start && <= end`, which is empty for 22:00 -> 02:00, so the
+    /// blackout was silently ignored.
+    #[test]
+    fn midnight_crossing_window_is_honoured() {
+        let blackout =
+            BlackoutPeriod::new("overnight", at(2026, 6, 13, 22, 0), at(2026, 6, 14, 2, 0))
+                .with_recurrence(BlackoutRecurrence::Daily);
+
+        // Both sides of midnight, on a later day than the anchor period.
+        assert!(blackout.is_blackout(at(2026, 7, 1, 23, 0)));
+        assert!(blackout.is_blackout(at(2026, 7, 2, 1, 0)));
+        // Outside the window.
+        assert!(!blackout.is_blackout(at(2026, 7, 2, 12, 0)));
+    }
+
+    /// Regression: a `Daily` blackout covering the whole day looped forever
+    /// (`current + 1 day` is always still in the blackout) until the date
+    /// overflowed and panicked.
+    #[test]
+    fn all_day_daily_blackout_reports_error_instead_of_looping() {
+        let blackout =
+            BlackoutPeriod::new("always", at(2026, 6, 13, 0, 0), at(2026, 6, 13, 23, 59))
+                .with_recurrence(BlackoutRecurrence::Daily);
+
+        let inside = at(2026, 6, 13, 12, 0);
+        assert!(blackout.try_next_available_time(inside).is_err());
+        // The infallible wrapper degrades instead of hanging or panicking.
+        assert_eq!(blackout.next_available_time(inside), inside);
+    }
+
+    /// Regression: `next_available_time` returned `self.end`, which
+    /// `is_blackout`'s inclusive upper bound still considers blacked out, so
+    /// `next_valid_time` made no progress and eventually returned an instant
+    /// inside the blackout.
+    #[test]
+    fn next_valid_time_escapes_a_non_recurring_blackout() {
+        let start = at(2026, 6, 13, 9, 0);
+        let end = at(2026, 6, 13, 17, 0);
+        let mut calendar = CalendarWithBlackout::new();
+        calendar.add_blackout(BlackoutPeriod::new("deploy freeze", start, end));
+
+        let inside = at(2026, 6, 13, 12, 0);
+        let next = calendar
+            .try_next_valid_time(inside)
+            .expect("a non-recurring blackout always clears");
+        assert!(next > end, "expected an instant past {end}, got {next}");
+        assert!(calendar.is_valid_time(next));
+        assert_eq!(next.day(), 13);
+    }
+
+    #[test]
+    fn next_valid_time_is_identity_when_nothing_applies() {
+        let calendar = CalendarWithBlackout::new();
+        let t = at(2026, 6, 13, 12, 0);
+        assert_eq!(calendar.next_valid_time(t), t);
+        assert_eq!(calendar.try_next_valid_time(t).expect("no constraints"), t);
+    }
+
+    #[test]
+    fn unsatisfiable_calendar_surfaces_an_error() {
+        let mut calendar = CalendarWithBlackout::new();
+        calendar.add_blackout(
+            BlackoutPeriod::new("always", at(2026, 6, 13, 0, 0), at(2026, 6, 13, 23, 59))
+                .with_recurrence(BlackoutRecurrence::Daily),
+        );
+        assert!(calendar
+            .try_next_valid_time(at(2026, 6, 13, 12, 0))
+            .is_err());
     }
 }

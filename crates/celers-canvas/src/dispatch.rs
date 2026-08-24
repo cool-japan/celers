@@ -58,6 +58,16 @@ pub const CHAIN_TAIL_KEY: &str = "chain";
 /// broker's delayed-delivery support can plausibly honour.
 pub const MAX_COUNTDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// Maximum number of tasks handed to a single [`Broker::enqueue_batch`] call
+/// from [`dispatch_all`].
+///
+/// A very large fan-out (a `Group` with tens of thousands of members) would
+/// otherwise become one oversized batch, risking a broker's message-size or
+/// pipeline limits. [`dispatch_all`] splits anything larger into chunks of at
+/// most this size — see its doc comment for the one case (a chord header)
+/// where chunking is deliberately skipped.
+pub const MAX_ENQUEUE_BATCH: usize = 500;
+
 /// One step of a chain as it travels in a task payload.
 ///
 /// A chain is not just a list of tasks: a conditional step has to be resolved
@@ -275,11 +285,35 @@ pub async fn dispatch_signature<B: Broker>(
 
 /// Dispatch a batch of tasks, preserving the caller's order in the returned ids.
 ///
-/// Tasks that are due immediately are handed to [`Broker::enqueue_batch`] in one
-/// call — real brokers implement it as a pipeline (Redis), a single transaction
+/// Tasks that are due immediately are handed to [`Broker::enqueue_batch`] —
+/// real brokers implement it as a pipeline (Redis), a single transaction
 /// (Postgres) or a batch publish (SQS), which turns N round trips into one.
 /// Deferred tasks cannot participate in the batch (they need the scheduling
 /// enqueue variants) and are dispatched individually afterwards.
+///
+/// # Chunking
+///
+/// An immediate batch larger than [`MAX_ENQUEUE_BATCH`] is split into chunks
+/// of at most that size, each its own `enqueue_batch` call, so one oversized
+/// fan-out cannot exceed a broker's message-size or pipeline limits. Order is
+/// preserved across chunks, and the ids returned to the caller are unaffected
+/// either way — they are captured up front, before the immediate/deferred
+/// split.
+///
+/// **Chunking is skipped when any task in the batch carries a `chord_id`.** A
+/// chord header is dispatched only after
+/// [`ChordState`](celers_backend_redis::ChordState) has already been written
+/// with `total` set to the *full* header count (see
+/// [`crate::Chord::register_and_dispatch`]), so the barrier is live before the
+/// first task goes out. If the header were split across chunks and a later
+/// chunk failed, the earlier chunks would already be enqueued against a
+/// barrier that can now never reach `total`: the callback would never fire and
+/// the chord would hang instead of failing loudly. Sending the whole header in
+/// one `enqueue_batch` call keeps it atomic-or-nothing, matching what the
+/// barrier was registered to expect. A plain (non-chord) fan-out has no such
+/// barrier, so chunking it is safe: a failed chunk simply surfaces a
+/// [`CanvasError`] to the caller with a partially-dispatched group, exactly as
+/// a failed single-call `enqueue_batch` would today.
 pub async fn dispatch_all<B: Broker>(
     broker: &B,
     tasks: Vec<(SerializedTask, Schedule)>,
@@ -302,10 +336,27 @@ pub async fn dispatch_all<B: Broker>(
     }
 
     if !immediate.is_empty() {
-        broker
-            .enqueue_batch(immediate)
-            .await
-            .map_err(|e| CanvasError::Broker(e.to_string()))?;
+        // A chord header's barrier is registered for the full count before
+        // any task is enqueued (see `Chord::register_and_dispatch`); splitting
+        // it across chunks could leave that barrier permanently short of
+        // `total` if a later chunk failed. Keep it as one call.
+        let is_chord_header = immediate
+            .iter()
+            .any(|task| task.metadata.chord_id.is_some());
+
+        if is_chord_header || immediate.len() <= MAX_ENQUEUE_BATCH {
+            broker
+                .enqueue_batch(immediate)
+                .await
+                .map_err(|e| CanvasError::Broker(e.to_string()))?;
+        } else {
+            for chunk in chunk_owned(immediate, MAX_ENQUEUE_BATCH) {
+                broker
+                    .enqueue_batch(chunk)
+                    .await
+                    .map_err(|e| CanvasError::Broker(e.to_string()))?;
+            }
+        }
     }
 
     for (task, schedule) in deferred {
@@ -313,6 +364,25 @@ pub async fn dispatch_all<B: Broker>(
     }
 
     Ok(task_ids)
+}
+
+/// Split `items` into chunks of at most `chunk_size` (minimum 1), preserving
+/// order and moving elements out of the original allocation rather than
+/// cloning them.
+fn chunk_owned<T>(mut items: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
+    let chunk_size = chunk_size.max(1);
+    let mut chunks = Vec::with_capacity(items.len().div_ceil(chunk_size));
+
+    while !items.is_empty() {
+        let remainder = if items.len() > chunk_size {
+            items.split_off(chunk_size)
+        } else {
+            Vec::new()
+        };
+        chunks.push(std::mem::replace(&mut items, remainder));
+    }
+
+    chunks
 }
 
 /// Build the tasks for a parallel fan-out of `signatures`, stamping every one

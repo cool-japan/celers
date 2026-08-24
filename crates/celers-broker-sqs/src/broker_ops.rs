@@ -5,7 +5,7 @@
 //! Transport, Producer, Consumer, and Broker.
 
 use async_trait::async_trait;
-use aws_sdk_sqs::types::{MessageAttributeValue, QueueAttributeName};
+use aws_sdk_sqs::types::{MessageSystemAttributeName, QueueAttributeName};
 use celers_kombu::{
     Broker, BrokerError, Consumer, Envelope, Producer, QueueMode, Result, Transport,
 };
@@ -15,177 +15,118 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::broker_core::SqsBroker;
+use crate::delivery::{
+    decode_delivery_tag, encode_delivery_tag, extract_receipt_metadata, resolve_max_messages,
+    resolve_wait_time,
+};
+use crate::retry_policy::describe_error;
 use crate::types::QueueStats;
 
 impl SqsBroker {
-    /// Publish multiple messages in a single batch (up to 10 messages)
+    /// Receive messages from a physical queue and turn them into envelopes.
     ///
-    /// This is significantly more efficient and cost-effective than individual publishes.
-    /// AWS SQS charges per API request, so batch operations reduce costs by 10x.
+    /// This is the single entry point shared by `consume` and `consume_batch`
+    /// so that both request the same attributes and produce identically shaped
+    /// delivery tags.
     ///
-    /// # Arguments
-    /// * `queue` - Queue name to publish to
-    /// * `messages` - Vector of messages to publish (max 10)
-    ///
-    /// # Returns
-    /// Number of messages successfully published
-    ///
-    /// # Note
-    /// If batch size exceeds 10, only the first 10 messages will be sent.
-    pub async fn publish_batch(&mut self, queue: &str, messages: Vec<Message>) -> Result<usize> {
-        if messages.is_empty() {
-            return Ok(0);
-        }
-
+    /// `MessageSystemAttributeNames` is requested explicitly: without it SQS
+    /// omits `ApproximateReceiveCount` and `SentTimestamp` from the response,
+    /// which is why `Envelope::redelivered` used to be permanently `false`.
+    pub(crate) async fn receive_envelopes(
+        &mut self,
+        physical_queue: &str,
+        max_messages: i32,
+        wait_time: i32,
+    ) -> Result<Vec<Envelope>> {
         let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
+        let queue_url = self.get_queue_url(physical_queue).await?;
 
-        // SQS batch limit is 10 messages
-        let batch_size = messages.len().min(10);
-        let batch_messages = &messages[..batch_size];
+        let result = client
+            .receive_message()
+            .queue_url(&queue_url)
+            .max_number_of_messages(resolve_max_messages(max_messages))
+            .visibility_timeout(self.visibility_timeout)
+            .wait_time_seconds(wait_time.clamp(0, 20))
+            .message_attribute_names("All")
+            .message_system_attribute_names(MessageSystemAttributeName::All)
+            .send()
+            .await
+            .map_err(|e| {
+                self.mark_unhealthy();
+                BrokerError::Connection(format!(
+                    "Failed to receive messages from '{}': {}",
+                    physical_queue,
+                    describe_error(&e)
+                ))
+            })?;
 
-        // Build batch entries
-        let mut entries = Vec::new();
-        for (idx, message) in batch_messages.iter().enumerate() {
-            let mut body = serde_json::to_string(message)
+        self.mark_healthy();
+
+        let mut envelopes = Vec::new();
+
+        for sqs_message in result.messages.unwrap_or_default() {
+            let body = sqs_message
+                .body()
+                .ok_or_else(|| BrokerError::OperationFailed("Message has no body".to_string()))?;
+
+            let receipt_handle = sqs_message
+                .receipt_handle()
+                .ok_or_else(|| {
+                    BrokerError::OperationFailed("Message has no receipt handle".to_string())
+                })?
+                .to_string();
+
+            let decompressed_body = self.decompress_message(body)?;
+            let mut message: Message = serde_json::from_str(&decompressed_body)
                 .map_err(|e| BrokerError::Serialization(e.to_string()))?;
 
-            // Apply compression if enabled and message exceeds threshold
-            if let Some(threshold) = self.compression_threshold {
-                let original_size = body.len();
-                if original_size > threshold {
-                    body = self.compress_message(&body)?;
-                    debug!(
-                        "Compressed batch message {} from {} to {} bytes",
-                        idx,
-                        original_size,
-                        body.len()
-                    );
+            // Celery compatibility: recover headers that only exist as SQS
+            // message attributes (a Python producer may not repeat them in the
+            // body). Gaps are filled, never overwritten, so a CeleRS-produced
+            // body stays authoritative.
+            if let (Some(mapper), Some(attributes)) = (
+                self.celery_mapper.as_ref(),
+                sqs_message.message_attributes(),
+            ) {
+                match mapper.deserialize_attributes(attributes) {
+                    Ok(headers) => mapper.apply_headers(&headers, &mut message),
+                    Err(error) => {
+                        warn!("Ignoring unreadable Celery attributes: {}", error);
+                    }
                 }
             }
 
-            let mut entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
-                .id(idx.to_string())
-                .message_body(body);
+            let metadata = extract_receipt_metadata(&sqs_message);
+            let delivery_tag = encode_delivery_tag(physical_queue, &receipt_handle);
 
-            // Add message attributes
-            let mut attributes = HashMap::new();
+            self.maybe_start_heartbeat(&client, &queue_url, &delivery_tag, &receipt_handle);
+            let redelivered = metadata.is_redelivered();
+            self.remember_receipt_metadata(&delivery_tag, metadata);
 
-            if let Some(priority) = message.properties.priority {
-                attributes.insert(
-                    "priority".to_string(),
-                    MessageAttributeValue::builder()
-                        .data_type("Number")
-                        .string_value(priority.to_string())
-                        .build()
-                        .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-                );
-            }
-
-            if let Some(ref correlation_id) = message.properties.correlation_id {
-                attributes.insert(
-                    "correlation_id".to_string(),
-                    MessageAttributeValue::builder()
-                        .data_type("String")
-                        .string_value(correlation_id)
-                        .build()
-                        .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-                );
-            }
-
-            if !attributes.is_empty() {
-                entry = entry.set_message_attributes(Some(attributes));
-            }
-
-            entries.push(
-                entry
-                    .build()
-                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-            );
+            envelopes.push(Envelope {
+                delivery_tag,
+                message,
+                redelivered,
+            });
         }
 
-        // Send batch
-        let result = client
-            .send_message_batch()
-            .queue_url(&queue_url)
-            .set_entries(Some(entries))
-            .send()
-            .await
-            .map_err(|e| BrokerError::OperationFailed(format!("Failed to send batch: {}", e)))?;
-
-        let successful = result.successful().len();
-
-        let failed = result.failed();
-        if !failed.is_empty() {
-            warn!(
-                "Batch send had {} failures out of {}",
-                failed.len(),
-                batch_size
-            );
-        }
-
-        debug!(
-            "Published {} messages in batch to SQS queue: {}",
-            successful, queue
-        );
-        Ok(successful)
-    }
-
-    /// Publish a large batch of messages with automatic chunking
-    ///
-    /// Automatically splits large batches into groups of 10 messages and sends them
-    /// in multiple API calls. This is more efficient than calling publish() repeatedly.
-    ///
-    /// # Arguments
-    /// * `queue` - Queue name to publish to
-    /// * `messages` - Vector of messages to publish (any size)
-    ///
-    /// # Returns
-    /// Number of messages successfully published
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Send 100 messages in 10 batches of 10
-    /// let messages = vec![/* ... 100 messages ... */];
-    /// let count = broker.publish_batch_chunked("my-queue", messages).await?;
-    /// println!("Published {} messages", count);
-    /// ```
-    pub async fn publish_batch_chunked(
-        &mut self,
-        queue: &str,
-        messages: Vec<Message>,
-    ) -> Result<usize> {
-        if messages.is_empty() {
-            return Ok(0);
-        }
-
-        let mut total_published = 0;
-
-        // Process in chunks of 10
-        for chunk in messages.chunks(10) {
-            let chunk_messages = chunk.to_vec();
-            let published = self.publish_batch(queue, chunk_messages).await?;
-            total_published += published;
-        }
-
-        info!(
-            "Published {} messages in {} chunks to SQS queue: {}",
-            total_published,
-            messages.len().div_ceil(10),
-            queue
-        );
-
-        Ok(total_published)
+        Ok(envelopes)
     }
 
     /// Consume multiple messages in a single batch (up to 10 messages)
     ///
     /// More efficient than polling one message at a time.
     ///
+    /// Each returned [`Envelope::delivery_tag`] carries the queue the message
+    /// was received from, so the envelopes can be acknowledged with
+    /// [`ack`](celers_kombu::Consumer::ack) even when they came from a queue
+    /// other than the broker's configured one.
+    ///
     /// # Arguments
     /// * `queue` - Queue name to consume from
     /// * `max_messages` - Maximum number of messages to receive (max 10)
-    /// * `timeout` - Long polling wait time (max 20 seconds)
+    /// * `timeout` - Long polling wait time (capped by `with_wait_time` and by
+    ///   SQS's own 20 second maximum)
     ///
     /// # Returns
     /// Vector of envelopes
@@ -195,142 +136,68 @@ impl SqsBroker {
         max_messages: i32,
         timeout: Duration,
     ) -> Result<Vec<Envelope>> {
-        let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
+        let physical_queue = self.resolve_queue_name(queue);
+        let wait_time = resolve_wait_time(timeout, self.wait_time_seconds);
 
-        let wait_time = timeout.as_secs().min(20) as i32;
-        let max_msgs = max_messages.min(10);
-
-        let result = client
-            .receive_message()
-            .queue_url(&queue_url)
-            .max_number_of_messages(max_msgs)
-            .visibility_timeout(self.visibility_timeout)
-            .wait_time_seconds(wait_time)
-            .message_attribute_names("All")
-            .send()
-            .await
-            .map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to receive messages: {}", e))
-            })?;
-
-        let mut envelopes = Vec::new();
-
-        if let Some(messages) = result.messages {
-            for sqs_message in messages {
-                let body = sqs_message.body().ok_or_else(|| {
-                    BrokerError::OperationFailed("Message has no body".to_string())
-                })?;
-
-                let receipt_handle = sqs_message
-                    .receipt_handle()
-                    .ok_or_else(|| {
-                        BrokerError::OperationFailed("Message has no receipt handle".to_string())
-                    })?
-                    .to_string();
-
-                // Decompress message if it was compressed
-                let decompressed_body = self.decompress_message(body)?;
-
-                let message: Message = serde_json::from_str(&decompressed_body)
-                    .map_err(|e| BrokerError::Serialization(e.to_string()))?;
-
-                let envelope = Envelope {
-                    delivery_tag: receipt_handle,
-                    message,
-                    redelivered: sqs_message.attributes().is_some_and(|attrs| {
-                        attrs
-                            .get(&aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
-                            .and_then(|count| count.parse::<i32>().ok())
-                            .map(|count| count > 1)
-                            .unwrap_or(false)
-                    }),
-                };
-
-                envelopes.push(envelope);
-            }
-        }
+        let envelopes = self
+            .consume_batch_physical(&physical_queue, max_messages, wait_time)
+            .await?;
 
         debug!(
             "Consumed {} messages in batch from SQS queue: {}",
             envelopes.len(),
-            queue
+            physical_queue
         );
         Ok(envelopes)
     }
 
-    /// Acknowledge (delete) multiple messages in a single batch (up to 10 messages)
+    /// Batch consume from an already-resolved (physical) queue name.
     ///
-    /// This is significantly more efficient than individual acks.
-    ///
-    /// # Arguments
-    /// * `queue` - Queue name
-    /// * `receipt_handles` - Vector of receipt handles to delete (max 10)
-    ///
-    /// # Returns
-    /// Number of messages successfully deleted
-    pub async fn ack_batch(&mut self, queue: &str, receipt_handles: Vec<String>) -> Result<usize> {
-        if receipt_handles.is_empty() {
-            return Ok(0);
+    /// Anything left in the prefetch buffer for that queue is drained first:
+    /// buffered messages are already in flight, so serving them here is what
+    /// keeps a caller that mixes `consume` and `consume_batch` from letting
+    /// them expire and be redelivered.
+    pub(crate) async fn consume_batch_physical(
+        &mut self,
+        physical_queue: &str,
+        max_messages: i32,
+        wait_time: i32,
+    ) -> Result<Vec<Envelope>> {
+        let wanted = resolve_max_messages(max_messages) as usize;
+        let mut envelopes = Vec::with_capacity(wanted);
+
+        while envelopes.len() < wanted {
+            match self.take_prefetched(physical_queue) {
+                Some(envelope) => envelopes.push(envelope),
+                None => break,
+            }
         }
 
-        let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
-
-        // SQS batch limit is 10 messages
-        let batch_size = receipt_handles.len().min(10);
-        let batch_handles = &receipt_handles[..batch_size];
-
-        // Build batch entries
-        let mut entries = Vec::new();
-        for (idx, receipt_handle) in batch_handles.iter().enumerate() {
-            entries.push(
-                aws_sdk_sqs::types::DeleteMessageBatchRequestEntry::builder()
-                    .id(idx.to_string())
-                    .receipt_handle(receipt_handle)
-                    .build()
-                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-            );
+        if envelopes.len() >= wanted {
+            return Ok(envelopes);
         }
 
-        // Delete batch
-        let result = client
-            .delete_message_batch()
-            .queue_url(&queue_url)
-            .set_entries(Some(entries))
-            .send()
-            .await
-            .map_err(|e| BrokerError::OperationFailed(format!("Failed to delete batch: {}", e)))?;
+        let still_wanted = (wanted - envelopes.len()) as i32;
+        let fetched = self
+            .receive_envelopes(physical_queue, still_wanted, wait_time)
+            .await?;
+        envelopes.extend(fetched);
 
-        let successful = result.successful().len();
-
-        let failed = result.failed();
-        if !failed.is_empty() {
-            warn!(
-                "Batch delete had {} failures out of {}",
-                failed.len(),
-                batch_size
-            );
-        }
-
-        debug!(
-            "Acknowledged {} messages in batch from SQS queue: {}",
-            successful, queue
-        );
-        Ok(successful)
+        Ok(envelopes)
     }
 
     /// Publish a message to a FIFO queue
     ///
     /// FIFO queues require a message group ID for ordering guarantees.
-    /// Optionally provide a deduplication ID for exactly-once delivery.
     ///
     /// # Arguments
     /// * `queue` - Queue name (must end with ".fifo")
     /// * `message` - The message to publish
     /// * `message_group_id` - Required for FIFO ordering
-    /// * `deduplication_id` - Optional; if None and content-based deduplication is
-    ///   disabled, a UUID will be generated
+    /// * `deduplication_id` - Optional; when omitted the task id is used unless
+    ///   the queue has content-based deduplication enabled. A *stable*
+    ///   deduplication id makes a retried send idempotent, which a freshly
+    ///   generated UUID could never be.
     pub async fn publish_fifo(
         &mut self,
         queue: &str,
@@ -338,236 +205,71 @@ impl SqsBroker {
         message_group_id: &str,
         deduplication_id: Option<&str>,
     ) -> Result<()> {
-        if !queue.ends_with(".fifo") {
+        let physical_queue = self.resolve_queue_name(queue);
+        if !physical_queue.ends_with(".fifo") {
             return Err(BrokerError::OperationFailed(
                 "FIFO queue name must end with '.fifo'".to_string(),
             ));
         }
 
         let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
+        let queue_url = self.get_queue_url(&physical_queue).await?;
 
-        // Serialize message to JSON
-        let mut body = serde_json::to_string(&message)
-            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
-
-        // Apply compression if enabled and message exceeds threshold
-        if let Some(threshold) = self.compression_threshold {
-            let original_size = body.len();
-            if original_size > threshold {
-                body = self.compress_message(&body)?;
-                debug!(
-                    "Compressed FIFO message from {} to {} bytes",
-                    original_size,
-                    body.len()
-                );
-            }
-        }
-
-        // Build message attributes
-        let mut attributes = HashMap::new();
-
-        if let Some(priority) = message.properties.priority {
-            attributes.insert(
-                "priority".to_string(),
-                MessageAttributeValue::builder()
-                    .data_type("Number")
-                    .string_value(priority.to_string())
-                    .build()
-                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-            );
-        }
-
-        if let Some(ref correlation_id) = message.properties.correlation_id {
-            attributes.insert(
-                "correlation_id".to_string(),
-                MessageAttributeValue::builder()
-                    .data_type("String")
-                    .string_value(correlation_id)
-                    .build()
-                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-            );
-        }
-
-        // Determine deduplication ID
-        let dedup_id = deduplication_id.map(String::from).or_else(|| {
-            // If content-based deduplication is enabled, SQS will handle it
-            if self
-                .fifo_config
-                .as_ref()
-                .is_some_and(|c| c.content_based_deduplication)
-            {
-                None
-            } else {
-                // Generate a UUID for deduplication
-                Some(uuid::Uuid::new_v4().to_string())
-            }
-        });
-
-        // Send message
-        let mut request = client
-            .send_message()
-            .queue_url(&queue_url)
-            .message_body(&body)
-            .message_group_id(message_group_id);
-
-        if let Some(ref dedup) = dedup_id {
-            request = request.message_deduplication_id(dedup);
-        }
-
-        if !attributes.is_empty() {
-            request = request.set_message_attributes(Some(attributes));
-        }
-
-        request.send().await.map_err(|e| {
-            BrokerError::OperationFailed(format!("Failed to send FIFO message: {}", e))
-        })?;
-
-        debug!(
-            "Published FIFO message to queue: {} (group: {})",
-            queue, message_group_id
-        );
-        Ok(())
-    }
-
-    /// Publish multiple messages to a FIFO queue in a batch
-    ///
-    /// # Arguments
-    /// * `queue` - Queue name (must end with ".fifo")
-    /// * `messages` - Vector of (message, message_group_id, optional_deduplication_id)
-    ///
-    /// # Returns
-    /// Number of messages successfully published
-    pub async fn publish_fifo_batch(
-        &mut self,
-        queue: &str,
-        messages: Vec<(Message, String, Option<String>)>,
-    ) -> Result<usize> {
-        if messages.is_empty() {
-            return Ok(0);
-        }
-
-        if !queue.ends_with(".fifo") {
-            return Err(BrokerError::OperationFailed(
-                "FIFO queue name must end with '.fifo'".to_string(),
-            ));
-        }
-
-        let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
-
-        let batch_size = messages.len().min(10);
-        let batch_messages = &messages[..batch_size];
+        let body = self.encode_body(&message)?;
+        let attributes = self.build_attributes(&message)?;
+        let group_id = crate::fifo::sanitize_fifo_id(message_group_id);
 
         let content_based_dedup = self
             .fifo_config
             .as_ref()
             .is_some_and(|c| c.content_based_deduplication);
+        let dedup_id =
+            crate::fifo::derive_deduplication_id(content_based_dedup, deduplication_id, &message);
 
-        let mut entries = Vec::new();
-        for (idx, (message, group_id, dedup_id)) in batch_messages.iter().enumerate() {
-            let mut body = serde_json::to_string(message)
-                .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+        let send_operation = || async {
+            let mut request = client
+                .send_message()
+                .queue_url(&queue_url)
+                .message_body(&body)
+                .message_group_id(&group_id);
 
-            // Apply compression if enabled and message exceeds threshold
-            if let Some(threshold) = self.compression_threshold {
-                let original_size = body.len();
-                if original_size > threshold {
-                    body = self.compress_message(&body)?;
-                    debug!(
-                        "Compressed FIFO batch message {} from {} to {} bytes",
-                        idx,
-                        original_size,
-                        body.len()
-                    );
-                }
-            }
-
-            let mut entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
-                .id(idx.to_string())
-                .message_body(body)
-                .message_group_id(group_id);
-
-            // Set deduplication ID
-            let final_dedup_id = dedup_id.clone().or_else(|| {
-                if content_based_dedup {
-                    None
-                } else {
-                    Some(uuid::Uuid::new_v4().to_string())
-                }
-            });
-
-            if let Some(ref dedup) = final_dedup_id {
-                entry = entry.message_deduplication_id(dedup);
-            }
-
-            // Add message attributes
-            let mut attributes = HashMap::new();
-            if let Some(priority) = message.properties.priority {
-                attributes.insert(
-                    "priority".to_string(),
-                    MessageAttributeValue::builder()
-                        .data_type("Number")
-                        .string_value(priority.to_string())
-                        .build()
-                        .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-                );
-            }
-
-            if let Some(ref correlation_id) = message.properties.correlation_id {
-                attributes.insert(
-                    "correlation_id".to_string(),
-                    MessageAttributeValue::builder()
-                        .data_type("String")
-                        .string_value(correlation_id)
-                        .build()
-                        .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-                );
+            if let Some(ref dedup) = dedup_id {
+                request = request.message_deduplication_id(dedup);
             }
 
             if !attributes.is_empty() {
-                entry = entry.set_message_attributes(Some(attributes));
+                request = request.set_message_attributes(Some(attributes.clone()));
             }
 
-            entries.push(
-                entry
-                    .build()
-                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-            );
-        }
+            request.send().await.map_err(|e| {
+                BrokerError::OperationFailed(format!(
+                    "Failed to send FIFO message: {}",
+                    describe_error(&e)
+                ))
+            })
+        };
 
-        let result = client
-            .send_message_batch()
-            .queue_url(&queue_url)
-            .set_entries(Some(entries))
-            .send()
-            .await
-            .map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to send FIFO batch: {}", e))
-            })?;
-
-        let successful = result.successful().len();
-
-        let failed = result.failed();
-        if !failed.is_empty() {
-            warn!(
-                "FIFO batch send had {} failures out of {}",
-                failed.len(),
-                batch_size
-            );
-        }
+        let result = self.retry_with_backoff(send_operation).await;
+        self.record_call_result(&result);
+        result?;
 
         debug!(
-            "Published {} FIFO messages in batch to queue: {}",
-            successful, queue
+            "Published FIFO message to queue: {} (group: {})",
+            physical_queue, group_id
         );
-        Ok(successful)
+        Ok(())
     }
 
     /// Get detailed queue statistics and monitoring data
     ///
     /// Returns approximate counts for messages and other queue attributes.
     pub async fn get_queue_stats(&mut self, queue: &str) -> Result<QueueStats> {
+        let physical_queue = self.resolve_queue_name(queue);
+        self.queue_stats_for_physical(&physical_queue).await
+    }
+
+    /// Queue statistics for an already-resolved (physical) queue name.
+    pub(crate) async fn queue_stats_for_physical(&mut self, queue: &str) -> Result<QueueStats> {
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -627,40 +329,53 @@ impl SqsBroker {
     /// Extend visibility timeout for a message
     ///
     /// Use this when processing takes longer than expected to prevent
-    /// the message from becoming visible to other consumers.
+    /// the message from becoming visible to other consumers. For long running
+    /// handlers prefer
+    /// [`with_visibility_heartbeat`](Self::with_visibility_heartbeat), which
+    /// does this automatically for the lifetime of the message.
     ///
     /// # Arguments
-    /// * `delivery_tag` - The receipt handle of the message
+    /// * `delivery_tag` - Delivery tag of the message (the queue it was
+    ///   received from is taken from the tag)
     /// * `timeout_seconds` - New visibility timeout (0-43200 seconds)
     pub async fn extend_visibility(
         &mut self,
         delivery_tag: &str,
         timeout_seconds: i32,
     ) -> Result<()> {
+        let (source, receipt_handle) = decode_delivery_tag(delivery_tag);
+        let queue_name = source
+            .map(str::to_string)
+            .unwrap_or_else(|| self.resolve_queue_name(&self.queue_name.clone()));
+
         let client = self.get_client().await?;
-        let queue_name = self.queue_name.clone();
         let queue_url = self.get_queue_url(&queue_name).await?;
 
         client
             .change_message_visibility()
             .queue_url(queue_url)
-            .receipt_handle(delivery_tag)
+            .receipt_handle(receipt_handle)
             .visibility_timeout(timeout_seconds.clamp(0, 43200))
             .send()
             .await
             .map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to extend visibility: {}", e))
+                BrokerError::OperationFailed(format!(
+                    "Failed to extend visibility on '{}': {}",
+                    queue_name,
+                    describe_error(&e)
+                ))
             })?;
 
         debug!(
-            "Extended visibility timeout to {} seconds for message",
-            timeout_seconds
+            "Extended visibility timeout to {} seconds for message on {}",
+            timeout_seconds, queue_name
         );
         Ok(())
     }
 
     /// Get the ARN of a queue
     pub async fn get_queue_arn(&mut self, queue: &str) -> Result<String> {
+        let queue = &self.resolve_queue_name(queue);
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -691,6 +406,7 @@ impl SqsBroker {
         dlq_arn: &str,
         max_receive_count: i32,
     ) -> Result<()> {
+        let queue = &self.resolve_queue_name(queue);
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -717,68 +433,6 @@ impl SqsBroker {
         Ok(())
     }
 
-    /// Extend visibility timeout for multiple messages in a batch
-    ///
-    /// More efficient than extending visibility for individual messages.
-    ///
-    /// # Arguments
-    /// * `queue` - Queue name
-    /// * `entries` - Vector of (receipt_handle, timeout_seconds) tuples (max 10)
-    ///
-    /// # Returns
-    /// Number of messages successfully updated
-    pub async fn extend_visibility_batch(
-        &mut self,
-        queue: &str,
-        entries: Vec<(String, i32)>,
-    ) -> Result<usize> {
-        if entries.is_empty() {
-            return Ok(0);
-        }
-
-        let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
-
-        let batch_size = entries.len().min(10);
-        let batch_entries = &entries[..batch_size];
-
-        let mut request_entries = Vec::new();
-        for (idx, (receipt_handle, timeout)) in batch_entries.iter().enumerate() {
-            request_entries.push(
-                aws_sdk_sqs::types::ChangeMessageVisibilityBatchRequestEntry::builder()
-                    .id(idx.to_string())
-                    .receipt_handle(receipt_handle)
-                    .visibility_timeout(timeout.clamp(&0, &43200).to_owned())
-                    .build()
-                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-            );
-        }
-
-        let result = client
-            .change_message_visibility_batch()
-            .queue_url(&queue_url)
-            .set_entries(Some(request_entries))
-            .send()
-            .await
-            .map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to extend visibility batch: {}", e))
-            })?;
-
-        let successful = result.successful().len();
-
-        let failed = result.failed();
-        if !failed.is_empty() {
-            warn!(
-                "Batch visibility extension had {} failures out of {}",
-                failed.len(),
-                batch_size
-            );
-        }
-
-        debug!("Extended visibility for {} messages in batch", successful);
-        Ok(successful)
-    }
-
     /// Publish a message with a custom delay
     ///
     /// The message will be invisible for the specified delay before becoming available.
@@ -787,61 +441,61 @@ impl SqsBroker {
     /// * `queue` - Queue name
     /// * `message` - The message to publish
     /// * `delay_seconds` - Delay before message becomes visible (0-900 seconds)
+    ///
+    /// # Errors
+    ///
+    /// FIFO queues do not support per-message delays (only a queue-wide
+    /// `DelaySeconds`), so this returns an error rather than letting SQS reject
+    /// the request after the retry budget has been spent.
     pub async fn publish_with_delay(
         &mut self,
         queue: &str,
         message: Message,
         delay_seconds: i32,
     ) -> Result<()> {
+        let physical_queue = self.resolve_publish_queue(queue, &message);
+
+        if self.is_fifo_queue(&physical_queue) {
+            return Err(BrokerError::OperationFailed(format!(
+                "FIFO queue '{physical_queue}' does not support per-message delays; \
+                 set DelaySeconds on the queue instead"
+            )));
+        }
+
         let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
+        let queue_url = self.get_queue_url(&physical_queue).await?;
 
-        let body = serde_json::to_string(&message)
-            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
+        let body = self.encode_body(&message)?;
+        let attributes = self.build_attributes(&message)?;
 
-        let mut attributes = HashMap::new();
+        let send_operation = || async {
+            client
+                .send_message()
+                .queue_url(&queue_url)
+                .message_body(&body)
+                .delay_seconds(delay_seconds.clamp(0, 900))
+                .set_message_attributes(if attributes.is_empty() {
+                    None
+                } else {
+                    Some(attributes.clone())
+                })
+                .send()
+                .await
+                .map_err(|e| {
+                    BrokerError::OperationFailed(format!(
+                        "Failed to send delayed message: {}",
+                        describe_error(&e)
+                    ))
+                })
+        };
 
-        if let Some(priority) = message.properties.priority {
-            attributes.insert(
-                "priority".to_string(),
-                MessageAttributeValue::builder()
-                    .data_type("Number")
-                    .string_value(priority.to_string())
-                    .build()
-                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-            );
-        }
-
-        if let Some(ref correlation_id) = message.properties.correlation_id {
-            attributes.insert(
-                "correlation_id".to_string(),
-                MessageAttributeValue::builder()
-                    .data_type("String")
-                    .string_value(correlation_id)
-                    .build()
-                    .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-            );
-        }
-
-        client
-            .send_message()
-            .queue_url(&queue_url)
-            .message_body(&body)
-            .delay_seconds(delay_seconds.clamp(0, 900))
-            .set_message_attributes(if attributes.is_empty() {
-                None
-            } else {
-                Some(attributes)
-            })
-            .send()
-            .await
-            .map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to send delayed message: {}", e))
-            })?;
+        let result = self.retry_with_backoff(send_operation).await;
+        self.record_call_result(&result);
+        result?;
 
         debug!(
             "Published message to SQS queue {} with {} second delay",
-            queue, delay_seconds
+            physical_queue, delay_seconds
         );
         Ok(())
     }
@@ -860,6 +514,7 @@ impl SqsBroker {
         message_retention: Option<i32>,
         delay_seconds: Option<i32>,
     ) -> Result<()> {
+        let queue = &self.resolve_queue_name(queue);
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -908,6 +563,7 @@ impl SqsBroker {
     ///
     /// This disables the Dead Letter Queue for the specified queue.
     pub async fn remove_redrive_policy(&mut self, queue: &str) -> Result<()> {
+        let queue = &self.resolve_queue_name(queue);
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -930,6 +586,7 @@ impl SqsBroker {
     ///
     /// Returns the DLQ ARN and max receive count if configured.
     pub async fn get_redrive_policy(&mut self, queue: &str) -> Result<Option<(String, i32)>> {
+        let queue = &self.resolve_queue_name(queue);
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -985,6 +642,7 @@ impl SqsBroker {
             return Ok(());
         }
 
+        let queue = &self.resolve_queue_name(queue);
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -1002,6 +660,7 @@ impl SqsBroker {
 
     /// Get tags for a queue
     pub async fn get_queue_tags(&mut self, queue: &str) -> Result<HashMap<String, String>> {
+        let queue = &self.resolve_queue_name(queue);
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -1023,6 +682,7 @@ impl SqsBroker {
             return Ok(());
         }
 
+        let queue = &self.resolve_queue_name(queue);
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -1052,33 +712,40 @@ impl SqsBroker {
     ///
     /// # Returns
     /// - `Ok(true)` if queue is accessible and healthy
-    /// - `Ok(false)` if queue doesn't exist or is inaccessible
-    /// - `Err(_)` if there's a connection or authentication issue
+    /// - `Ok(false)` if the queue does not exist
+    /// - `Err(_)` if there is a connection, credential or permission problem
+    ///
+    /// A missing queue and a missing IAM permission are different operational
+    /// problems and are reported differently: only `QueueDoesNotExist` yields
+    /// `Ok(false)`.
     pub async fn health_check(&mut self, queue: &str) -> Result<bool> {
-        match self.get_queue_url(queue).await {
-            Ok(queue_url) => {
-                // Try to get queue attributes to verify full access
-                let client = self.get_client().await?;
-                match client
-                    .get_queue_attributes()
-                    .queue_url(&queue_url)
-                    .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
-                    .send()
-                    .await
-                {
-                    Ok(_) => {
-                        debug!("Health check passed for queue: {}", queue);
-                        Ok(true)
-                    }
-                    Err(e) => {
-                        warn!("Health check failed for queue {}: {}", queue, e);
-                        Ok(false)
-                    }
-                }
+        let physical_queue = self.resolve_queue_name(queue);
+
+        let Some(queue_url) = self.try_get_queue_url(&physical_queue).await? else {
+            warn!("Health check: queue {} does not exist", physical_queue);
+            return Ok(false);
+        };
+
+        let client = self.get_client().await?;
+        match client
+            .get_queue_attributes()
+            .queue_url(&queue_url)
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                self.mark_healthy();
+                debug!("Health check passed for queue: {}", physical_queue);
+                Ok(true)
             }
             Err(e) => {
-                warn!("Health check failed - queue not found: {}", e);
-                Ok(false)
+                self.mark_unhealthy();
+                Err(BrokerError::Connection(format!(
+                    "GetQueueAttributes for '{}' failed: {}",
+                    physical_queue,
+                    describe_error(&e)
+                )))
             }
         }
     }
@@ -1102,21 +769,51 @@ impl SqsBroker {
     /// }
     /// ```
     pub async fn get_dlq_messages(&mut self, max_messages: i32) -> Result<Vec<Envelope>> {
-        let dlq_arn = self
+        let dlq_name = self.dlq_queue_name()?;
+        let wait_time = resolve_wait_time(Duration::from_secs(20), self.wait_time_seconds);
+
+        let envelopes = self
+            .consume_batch_physical(&dlq_name, max_messages.clamp(1, 10), wait_time)
+            .await?;
+
+        debug!(
+            "Received {} message(s) from DLQ {}",
+            envelopes.len(),
+            dlq_name
+        );
+        Ok(envelopes)
+    }
+
+    /// Physical queue name of the configured Dead Letter Queue.
+    ///
+    /// Derived from the DLQ ARN (`arn:aws:sqs:region:account:queue-name`).
+    ///
+    /// # Errors
+    ///
+    /// [`BrokerError::Configuration`] when no DLQ is configured, or when the
+    /// ARN does not carry a queue name.
+    pub fn dlq_queue_name(&self) -> Result<String> {
+        let dlq_arn = &self
             .dlq_config
             .as_ref()
-            .ok_or_else(|| BrokerError::OperationFailed("DLQ not configured".to_string()))?
-            .dlq_arn
-            .clone();
+            .ok_or_else(|| {
+                BrokerError::Configuration("DLQ not configured; call with_dlq() first".to_string())
+            })?
+            .dlq_arn;
 
-        // Extract queue name from ARN (format: arn:aws:sqs:region:account:queue-name)
-        let dlq_name = dlq_arn
-            .split(':')
-            .next_back()
-            .ok_or_else(|| BrokerError::OperationFailed("Invalid DLQ ARN format".to_string()))?;
+        let name = dlq_arn.rsplit(':').next().unwrap_or("");
+        if name.is_empty() {
+            return Err(BrokerError::Configuration(format!(
+                "Invalid DLQ ARN '{dlq_arn}': no queue name"
+            )));
+        }
 
-        self.consume_batch(dlq_name, max_messages.clamp(1, 10), Duration::from_secs(20))
-            .await
+        Ok(name.to_string())
+    }
+
+    /// Physical name of the broker's own (main) queue.
+    pub fn main_queue_name(&self) -> String {
+        self.resolve_queue_name(&self.queue_name)
     }
 
     /// Move a message from DLQ back to the main queue (redrive)
@@ -1135,24 +832,17 @@ impl SqsBroker {
     /// }
     /// ```
     pub async fn redrive_dlq_message(&mut self, envelope: &Envelope) -> Result<()> {
-        let dlq_arn = self
-            .dlq_config
-            .as_ref()
-            .ok_or_else(|| BrokerError::OperationFailed("DLQ not configured".to_string()))?
-            .dlq_arn
-            .clone();
+        let dlq_name = self.dlq_queue_name()?;
 
-        let dlq_name = dlq_arn
-            .split(':')
-            .next_back()
-            .ok_or_else(|| BrokerError::OperationFailed("Invalid DLQ ARN format".to_string()))?;
-
-        // Republish to main queue
+        // Republish to the main queue first: if the delete afterwards fails,
+        // the DLQ copy is still there and the redrive can be retried.
         self.publish(&self.queue_name.clone(), envelope.message.clone())
             .await?;
 
-        // Delete from DLQ
-        self.ack(&envelope.delivery_tag).await?;
+        // Delete from the DLQ. The receipt handle is only valid against the DLQ
+        // itself, so the delete is addressed explicitly to `dlq_name` rather
+        // than to the broker's configured main queue.
+        self.ack_on(&dlq_name, &envelope.delivery_tag).await?;
 
         info!("Redriven message from DLQ {} to main queue", dlq_name);
         Ok(())
@@ -1172,19 +862,8 @@ impl SqsBroker {
     /// println!("DLQ has {} messages", dlq_stats.approximate_message_count);
     /// ```
     pub async fn get_dlq_stats(&mut self) -> Result<QueueStats> {
-        let dlq_arn = self
-            .dlq_config
-            .as_ref()
-            .ok_or_else(|| BrokerError::OperationFailed("DLQ not configured".to_string()))?
-            .dlq_arn
-            .clone();
-
-        let dlq_name = dlq_arn
-            .split(':')
-            .next_back()
-            .ok_or_else(|| BrokerError::OperationFailed("Invalid DLQ ARN format".to_string()))?;
-
-        self.get_queue_stats(dlq_name).await
+        let dlq_name = self.dlq_queue_name()?;
+        self.queue_stats_for_physical(&dlq_name).await
     }
 
     /// Process messages in parallel with a handler function
@@ -1284,6 +963,97 @@ impl SqsBroker {
         );
         Ok(successful)
     }
+
+    /// Acknowledge (delete) a message against an explicit queue.
+    ///
+    /// [`Consumer::ack`] resolves the queue from the delivery tag; use this
+    /// when holding a bare receipt handle whose origin is known out of band.
+    pub async fn ack_on(&mut self, queue: &str, delivery_tag: &str) -> Result<()> {
+        let (source, receipt_handle) = decode_delivery_tag(delivery_tag);
+        let target_queue = source.unwrap_or(queue).to_string();
+
+        self.stop_visibility_heartbeat(delivery_tag);
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(&target_queue).await?;
+
+        client
+            .delete_message()
+            .queue_url(&queue_url)
+            .receipt_handle(receipt_handle)
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!(
+                    "Failed to delete message from '{}': {}",
+                    target_queue,
+                    describe_error(&e)
+                ))
+            })?;
+
+        self.forget_receipt_metadata(delivery_tag);
+        self.mark_healthy();
+        debug!("Acknowledged message on queue {}", target_queue);
+        Ok(())
+    }
+
+    /// Reject a message against an explicit queue.
+    ///
+    /// With `requeue` the message's visibility timeout is reset to zero so it
+    /// becomes immediately available again; without it the message is deleted.
+    pub async fn reject_on(
+        &mut self,
+        queue: &str,
+        delivery_tag: &str,
+        requeue: bool,
+    ) -> Result<()> {
+        let (source, receipt_handle) = decode_delivery_tag(delivery_tag);
+        let target_queue = source.unwrap_or(queue).to_string();
+
+        self.stop_visibility_heartbeat(delivery_tag);
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(&target_queue).await?;
+
+        if requeue {
+            client
+                .change_message_visibility()
+                .queue_url(&queue_url)
+                .receipt_handle(receipt_handle)
+                .visibility_timeout(0)
+                .send()
+                .await
+                .map_err(|e| {
+                    BrokerError::OperationFailed(format!(
+                        "Failed to requeue message on '{}': {}",
+                        target_queue,
+                        describe_error(&e)
+                    ))
+                })?;
+
+            debug!("Rejected and requeued message on queue {}", target_queue);
+        } else {
+            client
+                .delete_message()
+                .queue_url(&queue_url)
+                .receipt_handle(receipt_handle)
+                .send()
+                .await
+                .map_err(|e| {
+                    BrokerError::OperationFailed(format!(
+                        "Failed to delete message from '{}': {}",
+                        target_queue,
+                        describe_error(&e)
+                    ))
+                })?;
+
+            debug!("Rejected and deleted message on queue {}", target_queue);
+        }
+
+        self.forget_receipt_metadata(delivery_tag);
+        self.mark_healthy();
+        Ok(())
+    }
 }
 
 // --- Trait Implementations ---
@@ -1296,23 +1066,36 @@ impl Transport for SqsBroker {
         // Initialize client
         let _ = self.get_client().await?;
 
-        // Get or create queue URL and cache it (clone queue_name to avoid borrow conflict)
-        let queue_name = self.queue_name.clone();
+        // Get or create queue URL and cache it (clone to avoid a borrow conflict)
+        let queue_name = self.resolve_queue_name(&self.queue_name.clone());
         let _ = self.get_queue_url(&queue_name).await?;
 
+        self.mark_healthy();
         info!("Connected to SQS queue: {}", queue_name);
         Ok(())
     }
 
     async fn disconnect(&mut self) -> Result<()> {
+        self.stop_all_visibility_heartbeats();
+        self.clear_prefetch();
+        self.receipt_metadata.clear();
+        self.receipt_metadata_order.clear();
         self.client = None;
         self.queue_url_cache.clear();
         info!("Disconnected from SQS");
         Ok(())
     }
 
+    /// Best-effort connection state.
+    ///
+    /// This is synchronous, so it cannot probe AWS. It reports the local client
+    /// state AND-ed with the outcome of the most recent SDK call, so expired
+    /// credentials, a revoked IAM policy or a network outage flip it to `false`
+    /// as soon as one operation observes them. For a real readiness probe call
+    /// [`health_check`](SqsBroker::health_check), which performs an actual
+    /// `GetQueueAttributes` round trip.
     fn is_connected(&self) -> bool {
-        self.client.is_some() && !self.queue_url_cache.is_empty()
+        self.client.is_some() && !self.queue_url_cache.is_empty() && self.is_connection_healthy()
     }
 
     fn name(&self) -> &str {
@@ -1322,65 +1105,38 @@ impl Transport for SqsBroker {
 
 #[async_trait]
 impl Producer for SqsBroker {
+    /// Publish a message.
+    ///
+    /// FIFO queues are detected from the queue name and routed through the FIFO
+    /// path with a derived `MessageGroupId` and `MessageDeduplicationId` — SQS
+    /// rejects a FIFO `SendMessage` without a group id, which used to make
+    /// every publish through this trait fail (and then be retried, pointlessly,
+    /// `max_retries` times).
+    ///
+    /// With Celery compatibility enabled the queue name is translated by the
+    /// configured naming strategy and, when priority queues are on, the message
+    /// is routed to the queue for its priority.
+    ///
+    /// Delivery is at-least-once on standard queues: a send that times out
+    /// after AWS accepted it is retried and may duplicate. FIFO publishes carry
+    /// a stable deduplication id and are idempotent within SQS's 5-minute
+    /// deduplication interval.
     async fn publish(&mut self, queue: &str, message: Message) -> Result<()> {
-        let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
+        let physical_queue = self.resolve_publish_queue(queue, &message);
 
-        // Serialize message to JSON
-        let mut body = serde_json::to_string(&message)
-            .map_err(|e| BrokerError::Serialization(e.to_string()))?;
-
-        // Apply compression if enabled and message exceeds threshold
-        if let Some(threshold) = self.compression_threshold {
-            let original_size = body.len();
-            if original_size > threshold {
-                body = self.compress_message(&body)?;
-                debug!(
-                    "Compressed message from {} to {} bytes",
-                    original_size,
-                    body.len()
-                );
-            }
+        if self.is_fifo_queue(&physical_queue) {
+            let group_id = self.derive_group_id(&physical_queue, &message);
+            return self
+                .publish_fifo(&physical_queue, message, &group_id, None)
+                .await;
         }
 
-        // Build message attributes
-        let attributes = if let Some(ref mapper) = self.celery_mapper {
-            // Celery compatibility mode: map all Celery headers to SQS attributes
-            mapper
-                .serialize_message(&message)
-                .map_err(|e| BrokerError::OperationFailed(e.to_string()))?
-        } else {
-            // Standard mode: only map priority and correlation_id
-            let mut attrs = HashMap::new();
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(&physical_queue).await?;
 
-            // Add priority as message attribute
-            if let Some(priority) = message.properties.priority {
-                attrs.insert(
-                    "priority".to_string(),
-                    MessageAttributeValue::builder()
-                        .data_type("Number")
-                        .string_value(priority.to_string())
-                        .build()
-                        .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-                );
-            }
+        let body = self.encode_body(&message)?;
+        let attributes = self.build_attributes(&message)?;
 
-            // Add correlation ID
-            if let Some(ref correlation_id) = message.properties.correlation_id {
-                attrs.insert(
-                    "correlation_id".to_string(),
-                    MessageAttributeValue::builder()
-                        .data_type("String")
-                        .string_value(correlation_id)
-                        .build()
-                        .map_err(|e| BrokerError::OperationFailed(e.to_string()))?,
-                );
-            }
-
-            attrs
-        };
-
-        // Send message with retry logic
         let send_operation = || async {
             client
                 .send_message()
@@ -1393,12 +1149,19 @@ impl Producer for SqsBroker {
                 })
                 .send()
                 .await
-                .map_err(|e| BrokerError::OperationFailed(format!("Failed to send message: {}", e)))
+                .map_err(|e| {
+                    BrokerError::OperationFailed(format!(
+                        "Failed to send message: {}",
+                        describe_error(&e)
+                    ))
+                })
         };
 
-        self.retry_with_backoff(send_operation).await?;
+        let result = self.retry_with_backoff(send_operation).await;
+        self.record_call_result(&result);
+        result?;
 
-        debug!("Published message to SQS queue: {}", queue);
+        debug!("Published message to SQS queue: {}", physical_queue);
         Ok(())
     }
 
@@ -1409,8 +1172,8 @@ impl Producer for SqsBroker {
         message: Message,
     ) -> Result<()> {
         // SQS doesn't have exchanges, route to queue directly
-        warn!(
-            "SQS doesn't support exchanges, routing to queue: {}",
+        debug!(
+            "SQS has no exchanges; routing directly to queue: {}",
             routing_key
         );
         self.publish(routing_key, message).await
@@ -1419,139 +1182,121 @@ impl Producer for SqsBroker {
 
 #[async_trait]
 impl Consumer for SqsBroker {
+    /// Receive one message.
+    ///
+    /// When [`with_max_messages`](SqsBroker::with_max_messages) is greater than
+    /// one, a single `ReceiveMessage` fetches up to that many messages; the
+    /// first is returned and the rest are buffered *per queue* and served from
+    /// memory by later calls. Buffered messages are already in flight, so their
+    /// visibility timeout is running — see `with_max_messages` for the
+    /// trade-off.
+    ///
+    /// With Celery priority queues enabled the priority queues are polled
+    /// highest-first; only the last one uses the full long-polling wait so the
+    /// scan costs one long poll rather than one per priority level.
     async fn consume(&mut self, queue: &str, timeout: Duration) -> Result<Option<Envelope>> {
-        let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
-
-        // Determine wait time based on adaptive polling configuration
         let wait_time = if let Some(ref mut adaptive) = self.adaptive_polling {
-            adaptive.current_wait_time()
+            adaptive.current_wait_time().clamp(0, 20)
         } else {
-            timeout.as_secs().min(20) as i32
+            resolve_wait_time(timeout, self.wait_time_seconds)
         };
 
-        // Receive message with long polling
-        let result = client
-            .receive_message()
-            .queue_url(&queue_url)
-            .max_number_of_messages(1)
-            .visibility_timeout(self.visibility_timeout)
-            .wait_time_seconds(wait_time)
-            .message_attribute_names("All")
-            .send()
-            .await
-            .map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to receive message: {}", e))
-            })?;
-
-        let received_messages = result
-            .messages
-            .as_ref()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false);
-
-        // Adjust adaptive polling based on result
-        if let Some(ref mut adaptive) = self.adaptive_polling {
-            adaptive.adjust_wait_time(received_messages);
+        let mut candidates = self.priority_queues(queue);
+        if candidates.is_empty() {
+            candidates.push(self.resolve_queue_name(queue));
         }
 
-        if let Some(messages) = result.messages {
-            if let Some(sqs_message) = messages.into_iter().next() {
-                let body = sqs_message.body().ok_or_else(|| {
-                    BrokerError::OperationFailed("Message has no body".to_string())
-                })?;
-
-                let receipt_handle = sqs_message
-                    .receipt_handle()
-                    .ok_or_else(|| {
-                        BrokerError::OperationFailed("Message has no receipt handle".to_string())
-                    })?
-                    .to_string();
-
-                // Decompress message if it was compressed
-                let decompressed_body = self.decompress_message(body)?;
-
-                // Deserialize message
-                let message: Message = serde_json::from_str(&decompressed_body)
-                    .map_err(|e| BrokerError::Serialization(e.to_string()))?;
-
-                let envelope = Envelope {
-                    delivery_tag: receipt_handle,
-                    message,
-                    redelivered: sqs_message.attributes().is_some_and(|attrs| {
-                        attrs.get(&aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
-                            .and_then(|count| count.parse::<i32>().ok())
-                            .map(|count| count > 1)
-                            .unwrap_or(false)
-                    }),
-                };
-
-                debug!("Consumed message from SQS queue: {}", queue);
+        // Serve anything already prefetched before spending an API call.
+        for candidate in &candidates {
+            if let Some(envelope) = self.take_prefetched(candidate) {
+                if let Some(ref mut adaptive) = self.adaptive_polling {
+                    adaptive.adjust_wait_time(true);
+                }
                 return Ok(Some(envelope));
             }
         }
 
-        // No message received within timeout
+        let max_messages = self.max_messages;
+        let last_index = candidates.len() - 1;
+        let mut missing_queues = 0usize;
+        let mut last_missing: Option<BrokerError> = None;
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            // Only the lowest-priority (last) queue gets the long poll; the
+            // higher-priority queues are checked with a short poll so a
+            // priority scan does not multiply the wait.
+            let candidate_wait = if index == last_index { wait_time } else { 0 };
+
+            let mut envelopes = match self
+                .receive_envelopes(candidate, max_messages, candidate_wait)
+                .await
+            {
+                Ok(envelopes) => envelopes,
+                // A priority sibling that was never created is not an error as
+                // long as some other candidate exists: skip it and keep polling.
+                Err(BrokerError::QueueNotFound(queue)) if candidates.len() > 1 => {
+                    missing_queues += 1;
+                    last_missing = Some(BrokerError::QueueNotFound(queue));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            if envelopes.is_empty() {
+                continue;
+            }
+
+            let envelope = envelopes.remove(0);
+            self.buffer_prefetched(candidate, envelopes);
+
+            if let Some(ref mut adaptive) = self.adaptive_polling {
+                adaptive.adjust_wait_time(true);
+            }
+
+            debug!("Consumed message from SQS queue: {}", candidate);
+            return Ok(Some(envelope));
+        }
+
+        // Every candidate queue was missing: that is a real configuration
+        // problem, not an empty queue, and must not be reported as "no work".
+        if missing_queues == candidates.len() {
+            if let Some(error) = last_missing {
+                return Err(error);
+            }
+        }
+
+        if let Some(ref mut adaptive) = self.adaptive_polling {
+            adaptive.adjust_wait_time(false);
+        }
+
         Ok(None)
     }
 
+    /// Acknowledge a message against the queue it was received from.
+    ///
+    /// The queue is recovered from the delivery tag, so messages consumed from
+    /// any queue — including a DLQ — are deleted correctly. Tags without queue
+    /// information fall back to the broker's configured queue.
     async fn ack(&mut self, delivery_tag: &str) -> Result<()> {
-        let client = self.get_client().await?;
-        let queue_name = self.queue_name.clone();
-        let queue_url = self.get_queue_url(&queue_name).await?;
-
-        client
-            .delete_message()
-            .queue_url(&queue_url)
-            .receipt_handle(delivery_tag)
-            .send()
-            .await
-            .map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to delete message: {}", e))
-            })?;
-
-        debug!("Acknowledged message: {}", delivery_tag);
-        Ok(())
+        let fallback = self.resolve_queue_name(&self.queue_name.clone());
+        self.ack_on(&fallback, delivery_tag).await
     }
 
+    /// Reject a message against the queue it was received from.
     async fn reject(&mut self, delivery_tag: &str, requeue: bool) -> Result<()> {
-        let client = self.get_client().await?;
-        let queue_name = self.queue_name.clone();
-        let queue_url = self.get_queue_url(&queue_name).await?;
-
-        if requeue {
-            // Change visibility timeout to 0 to make message immediately available
-            client
-                .change_message_visibility()
-                .queue_url(&queue_url)
-                .receipt_handle(delivery_tag)
-                .visibility_timeout(0)
-                .send()
-                .await
-                .map_err(|e| {
-                    BrokerError::OperationFailed(format!("Failed to requeue message: {}", e))
-                })?;
-
-            debug!("Rejected and requeued message: {}", delivery_tag);
-        } else {
-            // Delete message (don't requeue)
-            client
-                .delete_message()
-                .queue_url(&queue_url)
-                .receipt_handle(delivery_tag)
-                .send()
-                .await
-                .map_err(|e| {
-                    BrokerError::OperationFailed(format!("Failed to delete message: {}", e))
-                })?;
-
-            debug!("Rejected and deleted message: {}", delivery_tag);
-        }
-
-        Ok(())
+        let fallback = self.resolve_queue_name(&self.queue_name.clone());
+        self.reject_on(&fallback, delivery_tag, requeue).await
     }
 
     async fn queue_size(&mut self, queue: &str) -> Result<usize> {
+        let physical_queue = self.resolve_queue_name(queue);
+        self.queue_size_for_physical(&physical_queue).await
+    }
+}
+
+impl SqsBroker {
+    /// Approximate message count for an already-resolved (physical) queue name.
+    pub(crate) async fn queue_size_for_physical(&mut self, queue: &str) -> Result<usize> {
         let client = self.get_client().await?;
         let queue_url = self.get_queue_url(queue).await?;
 
@@ -1562,8 +1307,15 @@ impl Consumer for SqsBroker {
             .send()
             .await
             .map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to get queue attributes: {}", e))
+                self.mark_unhealthy();
+                BrokerError::Connection(format!(
+                    "Failed to get queue attributes for '{}': {}",
+                    queue,
+                    describe_error(&e)
+                ))
             })?;
+
+        self.mark_healthy();
 
         let count = result
             .attributes()
@@ -1578,24 +1330,99 @@ impl Consumer for SqsBroker {
 #[async_trait]
 impl Broker for SqsBroker {
     async fn purge(&mut self, queue: &str) -> Result<usize> {
+        // Resolve once and use the physical name for both calls, so the count
+        // and the purge can never address two different queues.
+        let physical_queue = self.resolve_queue_name(queue);
+
         let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
+        let queue_url = self.get_queue_url(&physical_queue).await?;
 
         // Get current size before purge
-        let size = self.queue_size(queue).await?;
+        let size = self.queue_size_for_physical(&physical_queue).await?;
 
         client
             .purge_queue()
             .queue_url(&queue_url)
             .send()
             .await
-            .map_err(|e| BrokerError::OperationFailed(format!("Failed to purge queue: {}", e)))?;
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!(
+                    "Failed to purge queue '{}': {}",
+                    physical_queue,
+                    describe_error(&e)
+                ))
+            })?;
 
-        debug!("Purged SQS queue: {}", queue);
+        // Anything buffered from this queue is gone as well.
+        self.prefetch.remove(&physical_queue);
+
+        debug!("Purged SQS queue: {}", physical_queue);
         Ok(size)
     }
 
     async fn create_queue(&mut self, queue: &str, mode: QueueMode) -> Result<()> {
+        let physical_queue = self.resolve_queue_name(queue);
+        self.create_queue_physical(&physical_queue, mode).await
+    }
+    async fn delete_queue(&mut self, queue: &str) -> Result<()> {
+        let physical_queue = self.resolve_queue_name(queue);
+
+        let client = self.get_client().await?;
+        let queue_url = self.get_queue_url(&physical_queue).await?;
+
+        client
+            .delete_queue()
+            .queue_url(&queue_url)
+            .send()
+            .await
+            .map_err(|e| {
+                BrokerError::OperationFailed(format!(
+                    "Failed to delete queue '{}': {}",
+                    physical_queue,
+                    describe_error(&e)
+                ))
+            })?;
+
+        // Remove from cache
+        self.queue_url_cache.remove(&physical_queue);
+        self.prefetch.remove(&physical_queue);
+
+        debug!("Deleted SQS queue: {}", physical_queue);
+        Ok(())
+    }
+
+    async fn list_queues(&mut self) -> Result<Vec<String>> {
+        let client = self.get_client().await?;
+
+        let result =
+            client.list_queues().send().await.map_err(|e| {
+                BrokerError::OperationFailed(format!("Failed to list queues: {}", e))
+            })?;
+
+        let queues = result
+            .queue_urls()
+            .iter()
+            .filter_map(|url| {
+                // Extract queue name from URL (last segment)
+                url.rsplit('/').next().map(String::from)
+            })
+            .collect();
+
+        Ok(queues)
+    }
+}
+
+impl SqsBroker {
+    /// Create a queue using an already-resolved (physical) name.
+    ///
+    /// `get_queue_url`'s auto-creation path calls this directly: the naming
+    /// strategy has already been applied there and applying it twice would
+    /// produce `celery_celery_tasks`.
+    pub(crate) async fn create_queue_physical(
+        &mut self,
+        queue: &str,
+        mode: QueueMode,
+    ) -> Result<()> {
         // Clone values before borrowing
         let visibility_timeout = self.visibility_timeout;
         let wait_time_seconds = self.wait_time_seconds;
@@ -1719,43 +1546,5 @@ impl Broker for SqsBroker {
         }
 
         Ok(())
-    }
-
-    async fn delete_queue(&mut self, queue: &str) -> Result<()> {
-        let client = self.get_client().await?;
-        let queue_url = self.get_queue_url(queue).await?;
-
-        client
-            .delete_queue()
-            .queue_url(&queue_url)
-            .send()
-            .await
-            .map_err(|e| BrokerError::OperationFailed(format!("Failed to delete queue: {}", e)))?;
-
-        // Remove from cache
-        self.queue_url_cache.remove(queue);
-
-        debug!("Deleted SQS queue: {}", queue);
-        Ok(())
-    }
-
-    async fn list_queues(&mut self) -> Result<Vec<String>> {
-        let client = self.get_client().await?;
-
-        let result =
-            client.list_queues().send().await.map_err(|e| {
-                BrokerError::OperationFailed(format!("Failed to list queues: {}", e))
-            })?;
-
-        let queues = result
-            .queue_urls()
-            .iter()
-            .filter_map(|url| {
-                // Extract queue name from URL (last segment)
-                url.rsplit('/').next().map(String::from)
-            })
-            .collect();
-
-        Ok(queues)
     }
 }

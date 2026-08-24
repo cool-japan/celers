@@ -16,7 +16,53 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Default limit on how far back catch-up enumeration looks when a task has
+/// not run for a long time (24 hours).
+///
+/// Without a bound, a one-second interval that has not fired for a year would
+/// enumerate tens of millions of occurrences on the first tick after resume.
+/// Occurrences older than this are reported as truncated rather than silently
+/// dropped.
+pub const DEFAULT_CATCHUP_LOOKBACK_SECS: i64 = 86_400;
+
+/// Default cap on how many fires a single task may produce in one tick.
+///
+/// Acts as the rate limit the catch-up policies themselves do not provide: a
+/// `RunMultiple` / `TimeWindow` policy after a long outage cannot burst an
+/// unbounded number of dispatches into the broker in one go.
+pub const DEFAULT_MAX_CATCHUP_FIRES_PER_TICK: usize = 100;
+
+fn default_catchup_lookback_secs() -> i64 {
+    DEFAULT_CATCHUP_LOOKBACK_SECS
+}
+
+fn default_max_catchup_fires_per_tick() -> usize {
+    DEFAULT_MAX_CATCHUP_FIRES_PER_TICK
+}
+
+/// Build a process-unique scheduler instance id.
+///
+/// The id is the owner identity for every distributed lock this scheduler
+/// takes, so it **must** differ between processes and hosts: lock backends
+/// treat an owner match as a successful (re-entrant) acquire, which would turn
+/// a shared id into "no mutual exclusion at all". Combining hostname, PID and a
+/// random UUID makes the id unique per process, per host and across restarts.
+pub fn default_instance_id() -> String {
+    let host = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown-host".to_string());
+
+    format!(
+        "beat-{}-{}-{}",
+        host,
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    )
+}
 
 /// Schedule conflict severity level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,13 +299,33 @@ pub struct BeatScheduler {
     #[serde(skip)]
     pub(crate) failure_callbacks: Vec<FailureCallback>,
 
-    /// Lock manager for preventing duplicate execution
-    #[serde(default)]
+    /// Lock manager for preventing duplicate execution.
+    ///
+    /// Deliberately **not** persisted: locks are live, TTL-scoped claims tied
+    /// to a specific process. Restoring them from a state file would let a
+    /// restarted scheduler re-adopt stale locks recorded by a previous run.
+    #[serde(skip)]
     pub(crate) lock_manager: LockManager,
 
     /// Scheduler instance ID for lock ownership
-    #[serde(skip)]
+    #[serde(skip, default = "default_instance_id")]
     pub(crate) instance_id: String,
+
+    /// Count of schedule evaluations that failed (per process, not persisted).
+    #[serde(skip)]
+    pub(crate) schedule_eval_errors: Arc<AtomicU64>,
+
+    /// Count of state-file writes that failed (per process, not persisted).
+    #[serde(skip)]
+    pub(crate) persistence_errors: Arc<AtomicU64>,
+
+    /// How far back catch-up enumeration looks, in seconds.
+    #[serde(default = "default_catchup_lookback_secs")]
+    pub(crate) catchup_lookback_secs: i64,
+
+    /// Maximum number of fires a single task may produce in one tick.
+    #[serde(default = "default_max_catchup_fires_per_tick")]
+    pub(crate) max_catchup_fires_per_tick: usize,
 
     /// Alert manager for monitoring and notifications
     #[serde(default)]
@@ -283,16 +349,21 @@ pub struct BeatScheduler {
 
 impl BeatScheduler {
     pub fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        Self::with_state_file(None)
+    }
 
+    /// Shared constructor: a scheduler with a fresh, process-unique instance id.
+    pub(crate) fn with_state_file(state_file: Option<PathBuf>) -> Self {
         Self {
             tasks: HashMap::new(),
-            state_file: None,
+            state_file,
             failure_callbacks: Vec::new(),
             lock_manager: LockManager::default(),
-            instance_id: format!("scheduler-{}", id),
+            instance_id: default_instance_id(),
+            schedule_eval_errors: Arc::new(AtomicU64::new(0)),
+            persistence_errors: Arc::new(AtomicU64::new(0)),
+            catchup_lookback_secs: DEFAULT_CATCHUP_LOOKBACK_SECS,
+            max_catchup_fires_per_tick: DEFAULT_MAX_CATCHUP_FIRES_PER_TICK,
             alert_manager: AlertManager::default(),
             distributed_lock_backend: None,
             heartbeat: None,
@@ -312,70 +383,7 @@ impl BeatScheduler {
     /// // Scheduler will automatically save state to schedules.json on updates
     /// ```
     pub fn with_persistence<P: Into<PathBuf>>(state_file: P) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-
-        Self {
-            tasks: HashMap::new(),
-            state_file: Some(state_file.into()),
-            failure_callbacks: Vec::new(),
-            lock_manager: LockManager::default(),
-            instance_id: format!("scheduler-{}", id),
-            alert_manager: AlertManager::default(),
-            distributed_lock_backend: None,
-            heartbeat: None,
-        }
-    }
-
-    /// Load scheduler state from file
-    ///
-    /// Creates a new scheduler with tasks loaded from the specified file.
-    /// If the file doesn't exist or can't be read, returns an empty scheduler.
-    ///
-    /// # Arguments
-    /// * `path` - Path to the state file
-    ///
-    /// # Returns
-    /// Scheduler loaded from file, or empty scheduler if file doesn't exist
-    pub fn load_from_file<P: Into<PathBuf>>(path: P) -> Result<Self, ScheduleError> {
-        let path = path.into();
-
-        if !path.exists() {
-            // File doesn't exist, return new scheduler with persistence enabled
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-
-            return Ok(Self {
-                tasks: HashMap::new(),
-                state_file: Some(path),
-                failure_callbacks: Vec::new(),
-                lock_manager: LockManager::default(),
-                instance_id: format!("scheduler-{}", id),
-                alert_manager: AlertManager::default(),
-                distributed_lock_backend: None,
-                heartbeat: None,
-            });
-        }
-
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| ScheduleError::Persistence(format!("Failed to read state file: {}", e)))?;
-
-        let mut scheduler: BeatScheduler = serde_json::from_str(&content).map_err(|e| {
-            ScheduleError::Persistence(format!("Failed to parse state file: {}", e))
-        })?;
-
-        // Set state file and generate instance ID
-        scheduler.state_file = Some(path);
-        if scheduler.instance_id.is_empty() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-            scheduler.instance_id = format!("scheduler-{}", id);
-        }
-
-        Ok(scheduler)
+        Self::with_state_file(Some(state_file.into()))
     }
 
     /// Set the distributed lock backend for cross-instance coordination.
@@ -524,26 +532,6 @@ impl BeatScheduler {
             self.lock_manager.release_all();
             Ok(count)
         }
-    }
-
-    /// Save scheduler state to file
-    ///
-    /// Persists the current scheduler state (all tasks and their run history)
-    /// to the configured state file. If no state file is configured, this is a no-op.
-    ///
-    /// # Returns
-    /// Ok(()) if successful or no state file configured
-    pub fn save_state(&self) -> Result<(), ScheduleError> {
-        if let Some(ref path) = self.state_file {
-            let json = serde_json::to_string_pretty(&self).map_err(|e| {
-                ScheduleError::Persistence(format!("Failed to serialize state: {}", e))
-            })?;
-
-            std::fs::write(path, json).map_err(|e| {
-                ScheduleError::Persistence(format!("Failed to write state file: {}", e))
-            })?;
-        }
-        Ok(())
     }
 
     /// Export scheduler state as JSON string
@@ -704,12 +692,41 @@ impl BeatScheduler {
 
     /// Update task execution state (called after task runs)
     pub fn mark_task_run(&mut self, name: &str) -> Result<(), ScheduleError> {
-        if let Some(task) = self.tasks.get_mut(name) {
-            task.last_run_at = Some(Utc::now());
-            task.total_run_count += 1;
+        self.mark_task_run_at(name, Utc::now())
+    }
+
+    /// Update task execution state for a fire at a specific instant.
+    ///
+    /// Catch-up dispatches must record the *occurrence* instant rather than the
+    /// wall clock, otherwise the next evaluation restarts from an arbitrary
+    /// dispatch time instead of continuing along the schedule grid (and the
+    /// per-fire dispatch lock key stops matching the occurrence it guards).
+    pub fn mark_task_run_at(
+        &mut self,
+        name: &str,
+        fired_at: DateTime<Utc>,
+    ) -> Result<(), ScheduleError> {
+        if self.record_run(name, fired_at) {
             self.save_state()?;
         }
         Ok(())
+    }
+
+    /// Record a fire without persisting; returns whether the task existed.
+    ///
+    /// Lets a tick coalesce N task updates into a single state write instead of
+    /// rewriting the whole file once per dispatched task.
+    pub(crate) fn record_run(&mut self, name: &str, fired_at: DateTime<Utc>) -> bool {
+        match self.tasks.get_mut(name) {
+            Some(task) => {
+                // Advances `last_run_at`/`total_run_count` *and* drops the
+                // memoised next-run instant, so the following fire cannot reuse
+                // the dispatch-lock key of the fire that just happened.
+                task.mark_run_at(fired_at);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Mark task execution as successful
@@ -1037,7 +1054,8 @@ impl BeatScheduler {
                     Schedule::Crontab { .. } => 86400, // Assume daily
                     #[cfg(feature = "solar")]
                     Schedule::Solar { .. } => 86400, // Daily
-                    Schedule::OneTime { .. } => 0, // Won't be stuck
+                    Schedule::MonthlyLastDay { .. } => 31 * 86400, // Longest month
+                    Schedule::OneTime { .. } => 0,                 // Won't be stuck
                 };
 
                 let alert = Alert::new(
@@ -1136,7 +1154,7 @@ impl BeatScheduler {
     /// Number of tasks recovered from interruption
     ///
     /// # Example
-    /// ```
+    /// ```no_run
     /// use celers_beat::BeatScheduler;
     ///
     /// // Load scheduler from persistent state
@@ -1166,7 +1184,9 @@ impl BeatScheduler {
         }
 
         // Save state after recovery
-        let _ = self.save_state();
+        if let Err(e) = self.save_state() {
+            tracing::error!(error = %e, "failed to persist state after crash recovery");
+        }
 
         recovered_count
     }
@@ -1179,10 +1199,33 @@ impl BeatScheduler {
             .collect()
     }
 
+    /// Evaluate a task's due status, surfacing evaluation failures.
+    ///
+    /// A schedule that cannot be evaluated (an unparsable crontab from a
+    /// hand-edited state file, an unknown timezone, an exhausted solar search)
+    /// used to be mapped to "not due" and then silently never ran. It is now
+    /// logged and counted so the condition is observable; the task is still
+    /// treated as not due, since dispatching on an unknown instant would be
+    /// worse.
+    pub(crate) fn task_is_due(&self, task: &ScheduledTask) -> bool {
+        match task.is_due() {
+            Ok(due) => due,
+            Err(e) => {
+                self.schedule_eval_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    task = %task.name,
+                    error = %e,
+                    "schedule evaluation failed; task will not be dispatched"
+                );
+                false
+            }
+        }
+    }
+
     pub fn get_due_tasks(&self) -> Vec<&ScheduledTask> {
         self.tasks
             .values()
-            .filter(|task| task.enabled && task.is_due().unwrap_or(false))
+            .filter(|task| task.enabled && self.task_is_due(task))
             .collect()
     }
 
@@ -1216,36 +1259,29 @@ impl BeatScheduler {
     /// // The critical task will be first
     /// ```
     pub fn get_due_tasks_by_priority(&self) -> Vec<&ScheduledTask> {
-        let mut tasks: Vec<&ScheduledTask> = self
+        // Decorate-sort-undecorate: the sort key is computed exactly once per
+        // task instead of on every one of the O(n log n) comparisons, which
+        // matters because evaluating a schedule is not free (a crontab has to
+        // be resolved against the cron grid).
+        //
+        // The error sentinel is a fixed instant rather than `Utc::now()`: a
+        // clock read inside a comparator can order the same pair differently on
+        // two calls, violating the strict-weak-ordering contract `sort_by`
+        // requires.
+        let mut keyed: Vec<(std::cmp::Reverse<u8>, DateTime<Utc>, &ScheduledTask)> = self
             .tasks
             .values()
-            .filter(|task| task.enabled && task.is_due().unwrap_or(false))
+            .filter(|task| task.enabled && self.task_is_due(task))
+            .map(|task| {
+                let priority = task.options.priority.unwrap_or(5);
+                let next_run = task.next_run_time().unwrap_or(DateTime::<Utc>::MAX_UTC);
+                (std::cmp::Reverse(priority), next_run, task)
+            })
             .collect();
 
-        // Sort by priority (descending), then by next run time (ascending)
-        tasks.sort_by(|a, b| {
-            // Higher priority comes first (reverse order)
-            let priority_a = a.options.priority.unwrap_or(5);
-            let priority_b = b.options.priority.unwrap_or(5);
+        keyed.sort_by_key(|entry| (entry.0, entry.1));
 
-            match priority_b.cmp(&priority_a) {
-                std::cmp::Ordering::Equal => {
-                    // If same priority, sort by next run time
-                    let next_a = a
-                        .schedule
-                        .next_run(a.last_run_at)
-                        .unwrap_or_else(|_| Utc::now());
-                    let next_b = b
-                        .schedule
-                        .next_run(b.last_run_at)
-                        .unwrap_or_else(|_| Utc::now());
-                    next_a.cmp(&next_b)
-                }
-                other => other,
-            }
-        });
-
-        tasks
+        keyed.into_iter().map(|(_, _, task)| task).collect()
     }
 
     /// Get tasks ordered by priority regardless of due status
@@ -1660,7 +1696,7 @@ impl BeatScheduler {
                 }
 
                 // Check basic schedule readiness
-                if !task.is_due().unwrap_or(false) {
+                if !self.task_is_due(task) {
                     return false;
                 }
 
@@ -1799,12 +1835,15 @@ impl BeatScheduler {
     /// Perform a full scheduler tick:
     ///
     /// 1. Tick heartbeat (leader election / lease renewal)
-    /// 2. If leader, get due tasks by priority
-    /// 3. Mark due tasks as running
+    /// 2. If leader, collect the due fires by priority (catch-up included)
+    /// 3. Mark each fire as run
     /// 4. Update heartbeat info
     /// 5. Auto-save state if persistence is configured
     ///
-    /// Returns the list of due task names (empty if this instance is standby).
+    /// Returns the names of the entries dispatched (empty if this instance is
+    /// standby). A task replaying missed occurrences appears **once per fire**:
+    /// the return value is a dispatch list, not a set, so callers must not
+    /// deduplicate it or catch-up runs will be silently dropped.
     pub async fn tick(&mut self) -> Result<Vec<String>, ScheduleError> {
         // Step 1: Heartbeat tick
         let role = self.heartbeat_tick().await?;
@@ -1822,25 +1861,38 @@ impl BeatScheduler {
             return Ok(Vec::new());
         }
 
-        // Step 3: Get due tasks
-        let due_task_names: Vec<String> = self
-            .get_due_tasks_by_priority()
-            .iter()
-            .map(|t| t.name.clone())
-            .collect();
+        // Step 3: Collect the fires, catch-up included.
+        let now = Utc::now();
+        let errors_before = self.schedule_eval_error_count();
+        let due_fires = self.collect_due_fires(now);
 
-        // Step 4: Mark tasks as running
-        for name in &due_task_names {
-            let _ = self.mark_task_run(name);
+        // Step 4: Record each fire. State is written once at the end of the
+        // tick rather than once per fire.
+        let mut dispatched = Vec::with_capacity(due_fires.len());
+        for (name, instant) in due_fires {
+            if self.record_run(&name, instant) {
+                dispatched.push(name);
+            }
+        }
+
+        // A schedule that failed to evaluate leaves its task permanently inert;
+        // surface it as an alert rather than only in the logs.
+        let mut state_changed = !dispatched.is_empty();
+        if self.schedule_eval_error_count() > errors_before {
+            self.raise_schedule_evaluation_alerts();
+            state_changed = true;
         }
 
         // Step 5: Update heartbeat info
         self.update_heartbeat_info().await;
 
-        // Step 6: Auto-save state if persistence configured
-        let _ = self.save_state();
+        // Step 6: Auto-save state if persistence configured. An idle tick
+        // changed nothing, so it must not rewrite the whole state file.
+        if state_changed {
+            self.persist_after_tick().await;
+        }
 
-        Ok(due_task_names)
+        Ok(dispatched)
     }
 
     /// Gracefully shutdown the scheduler.

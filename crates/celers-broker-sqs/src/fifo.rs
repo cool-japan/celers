@@ -219,7 +219,10 @@ mod tests {
 
     #[test]
     fn sanitize_keeps_allowed_characters() {
-        assert_eq!(sanitize_fifo_id("tasks.payment.process"), "tasks.payment.process");
+        assert_eq!(
+            sanitize_fifo_id("tasks.payment.process"),
+            "tasks.payment.process"
+        );
         assert_eq!(sanitize_fifo_id("a-b_c:d"), "a-b_c:d");
     }
 

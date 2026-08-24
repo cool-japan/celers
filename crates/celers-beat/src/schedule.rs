@@ -50,11 +50,38 @@ pub enum Schedule {
         longitude: f64,
     },
 
+    /// Monthly schedule that fires on the *real* last day of every month.
+    ///
+    /// Cron cannot express "last day of month" (the `cron` crate has no `L`
+    /// token and a `28-31` day-of-month range fires two to four times per
+    /// month), so month-end scheduling has its own variant with an exact
+    /// implementation: the last calendar day of each month — 31 January, 28 or
+    /// 29 February, 30 April, and so on.
+    MonthlyLastDay {
+        /// Hour of day, UTC (0-23). Values above 23 are clamped.
+        hour: u32,
+        /// Minute of hour (0-59). Values above 59 are clamped.
+        minute: u32,
+    },
+
     /// One-time schedule (run once at specific time)
     OneTime {
         /// Exact run time (UTC)
         run_at: DateTime<Utc>,
     },
+}
+
+/// Return the last calendar day of `year`/`month`.
+///
+/// Implemented as "the day before the first of the following month", which is
+/// correct for every month length including leap Februaries.
+fn last_day_of_month(year: i32, month: u32) -> Option<chrono::NaiveDate> {
+    let (next_year, next_month) = if month >= 12 {
+        (year.checked_add(1)?, 1)
+    } else {
+        (year, month + 1)
+    };
+    chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)?.pred_opt()
 }
 
 /// Translate a standard Unix cron day-of-week field into the Quartz numbering
@@ -117,6 +144,54 @@ fn map_unix_dow(token: &str) -> Option<u32> {
         return None;
     }
     Some((value % 7) + 1)
+}
+
+/// Upper bound on distinct cron expressions memoised by [`compiled_cron`].
+///
+/// A beat deployment has a handful of distinct expressions; the cap only
+/// exists so a pathological caller generating unbounded expressions cannot
+/// grow the cache without limit.
+#[cfg(feature = "cron")]
+const CRON_CACHE_CAPACITY: usize = 1024;
+
+/// Process-wide memo of compiled cron expressions.
+///
+/// `cron::Schedule::from_str` re-parses and re-validates every field, and
+/// `Schedule::next_run` is on the beat hot path (once per task per tick, and up
+/// to `MAX_MISSED_OCCURRENCES` times inside catch-up enumeration). Compiling
+/// once per distinct expression turns that into a hash lookup plus an `Arc`
+/// clone.
+#[cfg(feature = "cron")]
+static CRON_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<cron::Schedule>>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Get the compiled form of `expr`, parsing it only the first time.
+///
+/// A poisoned cache lock degrades to an uncached parse rather than panicking.
+#[cfg(feature = "cron")]
+fn compiled_cron(expr: &str) -> Result<std::sync::Arc<cron::Schedule>, ScheduleError> {
+    use std::str::FromStr;
+
+    if let Ok(cache) = CRON_CACHE.read() {
+        if let Some(found) = cache.get(expr) {
+            return Ok(std::sync::Arc::clone(found));
+        }
+    }
+
+    let parsed = std::sync::Arc::new(
+        cron::Schedule::from_str(expr)
+            .map_err(|e| ScheduleError::Parse(format!("Invalid cron expression: {}", e)))?,
+    );
+
+    if let Ok(mut cache) = CRON_CACHE.write() {
+        if cache.len() >= CRON_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(expr.to_string(), std::sync::Arc::clone(&parsed));
+    }
+
+    Ok(parsed)
 }
 
 impl Schedule {
@@ -197,6 +272,28 @@ impl Schedule {
         }
     }
 
+    /// Create a schedule firing on the last calendar day of every month at
+    /// `hour:minute` UTC.
+    ///
+    /// # Examples
+    /// ```
+    /// use celers_beat::Schedule;
+    /// use chrono::{Datelike, TimeZone, Utc};
+    ///
+    /// let schedule = Schedule::monthly_last_day(0, 0);
+    /// let after = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+    /// let next = schedule.next_run(Some(after)).unwrap();
+    /// // February 2026 is not a leap year: the last day is the 28th.
+    /// assert_eq!(next.day(), 28);
+    /// assert_eq!(next.month(), 2);
+    /// ```
+    pub fn monthly_last_day(hour: u32, minute: u32) -> Self {
+        Self::MonthlyLastDay {
+            hour: hour.min(23),
+            minute: minute.min(59),
+        }
+    }
+
     /// Create one-time schedule
     pub fn onetime(run_at: DateTime<Utc>) -> Self {
         Self::OneTime { run_at }
@@ -221,9 +318,6 @@ impl Schedule {
                 month_of_year,
                 timezone,
             } => {
-                use cron::Schedule as CronSchedule;
-                use std::str::FromStr;
-
                 // Build cron expression from fields
                 // Cron format: sec min hour day month day_of_week year
                 // We use "0" for seconds and "*" for year
@@ -238,8 +332,11 @@ impl Schedule {
                     minute, hour, day_of_month, month_of_year, day_of_week
                 );
 
-                let cron_schedule = CronSchedule::from_str(&cron_expr)
-                    .map_err(|e| ScheduleError::Parse(format!("Invalid cron expression: {}", e)))?;
+                // Compiling a cron expression is the dominant cost of a tick:
+                // `next_run` is called at least once per task per tick and up
+                // to `MAX_MISSED_OCCURRENCES` times inside catch-up / conflict
+                // enumeration. Memoise the compiled schedule per expression.
+                let cron_schedule = compiled_cron(&cron_expr)?;
 
                 // If timezone is specified, convert to/from that timezone
                 if let Some(tz_str) = timezone {
@@ -461,6 +558,46 @@ impl Schedule {
                     "Could not find solar event in next 365 days".to_string(),
                 ))
             }
+            Schedule::MonthlyLastDay { hour, minute } => {
+                let after = last_run.unwrap_or_else(Utc::now);
+                let hour = (*hour).min(23);
+                let minute = (*minute).min(59);
+
+                // The candidate for the current month, then the next month if
+                // that instant is not strictly in the future. Two candidates
+                // always suffice: every month has exactly one last day.
+                let mut year = after.year();
+                let mut month = after.month();
+
+                for _ in 0..2 {
+                    let candidate = last_day_of_month(year, month)
+                        .and_then(|date| date.and_hms_opt(hour, minute, 0))
+                        .map(|naive| naive.and_utc())
+                        .ok_or_else(|| {
+                            ScheduleError::Invalid(format!(
+                                "Cannot compute last day of {}-{:02}",
+                                year, month
+                            ))
+                        })?;
+
+                    if candidate > after {
+                        return Ok(candidate);
+                    }
+
+                    if month >= 12 {
+                        month = 1;
+                        year = year
+                            .checked_add(1)
+                            .ok_or_else(|| ScheduleError::Invalid("Year overflow".to_string()))?;
+                    } else {
+                        month += 1;
+                    }
+                }
+
+                Err(ScheduleError::Invalid(
+                    "Could not compute next month-end occurrence".to_string(),
+                ))
+            }
             Schedule::OneTime { run_at } => {
                 // If never run before, return the scheduled time
                 // If already run, return error (one-time schedules don't repeat)
@@ -495,6 +632,11 @@ impl Schedule {
     /// Check if this is a one-time schedule
     pub fn is_onetime(&self) -> bool {
         matches!(self, Schedule::OneTime { .. })
+    }
+
+    /// Check if this is a month-end schedule
+    pub fn is_monthly_last_day(&self) -> bool {
+        matches!(self, Schedule::MonthlyLastDay { .. })
     }
 }
 
@@ -531,6 +673,9 @@ impl std::fmt::Display for Schedule {
                 latitude,
                 longitude,
             } => write!(f, "Solar[{} at ({:.4}, {:.4})]", event, latitude, longitude),
+            Schedule::MonthlyLastDay { hour, minute } => {
+                write!(f, "MonthlyLastDay[at {:02}:{:02} UTC]", hour, minute)
+            }
             Schedule::OneTime { run_at } => {
                 write!(f, "OneTime[at {}]", run_at.format("%Y-%m-%d %H:%M:%S UTC"))
             }
@@ -580,7 +725,13 @@ impl DayOfWeek {
 }
 
 /// Business hours configuration
+///
+/// Both hours are validated: they are clamped to `0..=23` on construction and
+/// **rejected** on deserialization, so a hand-edited config or state file can
+/// never feed an out-of-range hour into `DateTime::with_hour` (which returns
+/// `None` above 23).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "BusinessHoursRepr")]
 pub struct BusinessHours {
     /// Start hour (0-23)
     pub start_hour: u32,
@@ -588,17 +739,77 @@ pub struct BusinessHours {
     pub end_hour: u32,
 }
 
+/// Unvalidated wire form of [`BusinessHours`], used only as the deserialization
+/// source so out-of-range hours are rejected instead of stored.
+#[derive(Deserialize)]
+struct BusinessHoursRepr {
+    start_hour: u32,
+    end_hour: u32,
+}
+
+impl TryFrom<BusinessHoursRepr> for BusinessHours {
+    type Error = String;
+
+    /// Rejects exactly what `DateTime::with_hour` cannot represent.
+    ///
+    /// Deliberately *not* the stricter [`BusinessHours::try_new`] check: a
+    /// value that [`BusinessHours::new`] accepts must round-trip through the
+    /// state file, otherwise the scheduler could write a file it then refuses
+    /// to read. An inverted window (`start >= end`) is inert rather than
+    /// unrepresentable, and [`BusinessHours::is_valid`] reports it.
+    fn try_from(value: BusinessHoursRepr) -> Result<Self, Self::Error> {
+        if value.start_hour > 23 || value.end_hour > 23 {
+            return Err(format!(
+                "business hours must be in 0..=23, got {}..{}",
+                value.start_hour, value.end_hour
+            ));
+        }
+        Ok(Self {
+            start_hour: value.start_hour,
+            end_hour: value.end_hour,
+        })
+    }
+}
+
 impl BusinessHours {
-    /// Create a new business hours configuration
+    /// Create a new business hours configuration.
+    ///
+    /// Out-of-range hours are clamped to `23` rather than stored verbatim; use
+    /// [`BusinessHours::try_new`] to reject them instead.
     ///
     /// # Arguments
     /// * `start_hour` - Start hour (0-23)
     /// * `end_hour` - End hour (0-23)
     pub fn new(start_hour: u32, end_hour: u32) -> Self {
         Self {
+            start_hour: start_hour.min(23),
+            end_hour: end_hour.min(23),
+        }
+    }
+
+    /// Create a validated business hours configuration.
+    ///
+    /// # Errors
+    /// Returns [`ScheduleError::Invalid`] if either hour is above 23 or if
+    /// `start_hour >= end_hour` (an inverted or empty window would silently
+    /// disable the calendar for every hour of the day).
+    pub fn try_new(start_hour: u32, end_hour: u32) -> Result<Self, ScheduleError> {
+        if start_hour > 23 || end_hour > 23 {
+            return Err(ScheduleError::Invalid(format!(
+                "business hours must be in 0..=23, got {}..{}",
+                start_hour, end_hour
+            )));
+        }
+        if start_hour >= end_hour {
+            return Err(ScheduleError::Invalid(format!(
+                "business hours start_hour ({}) must be before end_hour ({})",
+                start_hour, end_hour
+            )));
+        }
+        Ok(Self {
             start_hour,
             end_hour,
-        }
+        })
     }
 
     /// Standard business hours (9 AM - 5 PM)
@@ -607,6 +818,11 @@ impl BusinessHours {
             start_hour: 9,
             end_hour: 17,
         }
+    }
+
+    /// Whether this configuration describes a usable, non-empty window.
+    pub fn is_valid(&self) -> bool {
+        self.start_hour <= 23 && self.end_hour <= 23 && self.start_hour < self.end_hour
     }
 
     /// Check if a given hour is within business hours
@@ -672,7 +888,13 @@ impl BusinessCalendar {
     /// Find the next business time after the given time
     ///
     /// This will advance to the next business day/hour if necessary.
+    ///
+    /// The hour arithmetic is fallible (`DateTime::with_hour` rejects values
+    /// above 23), so an out-of-range `start_hour` that reached this calendar
+    /// through an unvalidated path degrades to returning the input instant
+    /// instead of panicking.
     pub fn next_business_time(&self, time: DateTime<Utc>) -> DateTime<Utc> {
+        let start_hour = self.business_hours.start_hour.min(23);
         let mut current = time;
 
         // Try up to 14 days (2 weeks) to find next business time
@@ -684,14 +906,7 @@ impl BusinessCalendar {
                 let hour = current.hour();
                 if hour < self.business_hours.start_hour {
                     // Before business hours - move to start of business hours today
-                    current = current
-                        .with_hour(self.business_hours.start_hour)
-                        .expect("business hours start_hour should be valid (0-23)")
-                        .with_minute(0)
-                        .expect("minute 0 is always valid")
-                        .with_second(0)
-                        .expect("second 0 is always valid");
-                    return current;
+                    return at_hour_start(current, start_hour).unwrap_or(current);
                 } else if hour < self.business_hours.end_hour {
                     // Within business hours - this is valid
                     return current;
@@ -700,17 +915,21 @@ impl BusinessCalendar {
             }
 
             // Move to start of next day
-            current = (current + Duration::days(1))
-                .with_hour(self.business_hours.start_hour)
-                .expect("business hours start_hour should be valid (0-23)")
-                .with_minute(0)
-                .expect("minute 0 is always valid")
-                .with_second(0)
-                .expect("second 0 is always valid");
+            let next_day = current + Duration::days(1);
+            current = match at_hour_start(next_day, start_hour) {
+                Some(advanced) => advanced,
+                None => return current,
+            };
         }
 
         current
     }
+}
+
+/// Set `time` to `hour:00:00` on the same day, or `None` if the resulting
+/// instant does not exist (out-of-range hour, or a DST-style gap).
+fn at_hour_start(time: DateTime<Utc>, hour: u32) -> Option<DateTime<Utc>> {
+    time.with_hour(hour)?.with_minute(0)?.with_second(0)
 }
 
 // ============================================================================
@@ -1031,17 +1250,22 @@ impl HolidayCalendar {
         // New Year's Day (January 1)
         calendar.add("New Year's Day", year, 1, 1);
 
-        // Easter-dependent holidays computed via the Anonymous Gregorian algorithm
-        let easter = Self::compute_easter(year);
-        let good_friday = easter - chrono::Days::new(2);
-        let easter_monday = easter + chrono::Days::new(1);
-        calendar.add("Good Friday", year, good_friday.month(), good_friday.day());
-        calendar.add(
-            "Easter Monday",
-            year,
-            easter_monday.month(),
-            easter_monday.day(),
-        );
+        // Easter-dependent holidays computed via the Anonymous Gregorian
+        // algorithm. Outside its validity range (1583–4099) the Easter-derived
+        // entries are simply omitted rather than panicking.
+        if let Some(easter) = Self::compute_easter(year) {
+            if let Some(good_friday) = easter.checked_sub_days(chrono::Days::new(2)) {
+                calendar.add("Good Friday", year, good_friday.month(), good_friday.day());
+            }
+            if let Some(easter_monday) = easter.checked_add_days(chrono::Days::new(1)) {
+                calendar.add(
+                    "Easter Monday",
+                    year,
+                    easter_monday.month(),
+                    easter_monday.day(),
+                );
+            }
+        }
 
         // Early May Bank Holiday (1st Monday in May)
         if let Some((_, day)) = Self::nth_weekday(year, 5, 1, 1) {
@@ -1087,10 +1311,13 @@ impl HolidayCalendar {
         // New Year's Day (January 1)
         calendar.add("New Year's Day", year, 1, 1);
 
-        // Good Friday computed via the Anonymous Gregorian algorithm
-        let easter = Self::compute_easter(year);
-        let good_friday = easter - chrono::Days::new(2);
-        calendar.add("Good Friday", year, good_friday.month(), good_friday.day());
+        // Good Friday computed via the Anonymous Gregorian algorithm; omitted
+        // outside the algorithm's validity range instead of panicking.
+        if let Some(good_friday) =
+            Self::compute_easter(year).and_then(|e| e.checked_sub_days(chrono::Days::new(2)))
+        {
+            calendar.add("Good Friday", year, good_friday.month(), good_friday.day());
+        }
 
         // Victoria Day (Monday before May 25)
         // This is the last Monday on or before May 24
@@ -1126,8 +1353,14 @@ impl HolidayCalendar {
     /// Compute Easter Sunday for a given year using the Anonymous Gregorian
     /// (Meeus/Jones/Butcher) algorithm.
     ///
-    /// Valid for years 1583–4099 (proleptic Gregorian calendar).
-    fn compute_easter(year: i32) -> chrono::NaiveDate {
+    /// Returns `None` outside the algorithm's validity range (1583–4099) or if
+    /// the computed date is not representable, rather than panicking on an
+    /// arbitrary caller-supplied year.
+    fn compute_easter(year: i32) -> Option<chrono::NaiveDate> {
+        if !(1583..=4099).contains(&year) {
+            return None;
+        }
+
         let a = year % 19;
         let b = year / 100;
         let c = year % 100;
@@ -1142,7 +1375,9 @@ impl HolidayCalendar {
         let m = (a + 11 * h + 22 * l) / 451;
         let month = (h + l - 7 * m + 114) / 31; // 3 = March, 4 = April
         let day = (h + l - 7 * m + 114) % 31 + 1;
-        chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32).expect("valid Easter date")
+        let month = u32::try_from(month).ok()?;
+        let day = u32::try_from(day).ok()?;
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
     }
 
     /// Find the Monday on or before a specific date
@@ -1182,25 +1417,50 @@ mod easter_tests {
         // Known Easter Sundays (Gregorian)
         assert_eq!(
             HolidayCalendar::compute_easter(2024),
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 31).unwrap()
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 31)
         );
         assert_eq!(
             HolidayCalendar::compute_easter(2025),
-            chrono::NaiveDate::from_ymd_opt(2025, 4, 20).unwrap()
+            chrono::NaiveDate::from_ymd_opt(2025, 4, 20)
         );
         assert_eq!(
             HolidayCalendar::compute_easter(2026),
-            chrono::NaiveDate::from_ymd_opt(2026, 4, 5).unwrap()
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 5)
         );
         assert_eq!(
             HolidayCalendar::compute_easter(2000),
-            chrono::NaiveDate::from_ymd_opt(2000, 4, 23).unwrap()
+            chrono::NaiveDate::from_ymd_opt(2000, 4, 23)
         );
         // Earliest possible Easter Sunday in the Gregorian calendar
         assert_eq!(
             HolidayCalendar::compute_easter(1818),
-            chrono::NaiveDate::from_ymd_opt(1818, 3, 22).unwrap()
+            chrono::NaiveDate::from_ymd_opt(1818, 3, 22)
         );
+    }
+
+    /// Regression: `HolidayCalendar::uk`/`canada` used to reach an
+    /// `.expect("valid Easter date")` for years outside the Easter algorithm's
+    /// range, so an extreme year panicked instead of degrading.
+    #[test]
+    fn test_compute_easter_out_of_range_is_none_not_panic() {
+        assert!(HolidayCalendar::compute_easter(i32::MAX).is_none());
+        assert!(HolidayCalendar::compute_easter(i32::MIN).is_none());
+        assert!(HolidayCalendar::compute_easter(1582).is_none());
+        assert!(HolidayCalendar::compute_easter(4100).is_none());
+    }
+
+    #[test]
+    fn test_extreme_year_calendars_do_not_panic() {
+        // Both constructors take an arbitrary caller-supplied `i32`.
+        let uk = HolidayCalendar::uk(i32::MAX);
+        assert!(uk.holidays.iter().all(|h| h.name != "Good Friday"));
+        let canada = HolidayCalendar::canada(i32::MIN);
+        assert!(canada.holidays.iter().all(|h| h.name != "Good Friday"));
+        // In-range years still carry the Easter-derived entries.
+        assert!(HolidayCalendar::uk(2026)
+            .holidays
+            .iter()
+            .any(|h| h.name == "Good Friday"));
     }
 
     #[test]
@@ -1290,6 +1550,124 @@ mod cron_dow_tests {
             .expect("Sunday schedule should parse");
         assert_eq!(next.weekday(), Weekday::Sun);
         assert_eq!(next.hour(), 12);
+    }
+}
+
+#[cfg(test)]
+mod monthly_last_day_tests {
+    use super::{BusinessCalendar, BusinessHours, DayOfWeek, Schedule};
+    use chrono::{Datelike, TimeZone, Timelike, Utc};
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    /// Regression: `ScheduleTemplates::monthly_last_day` used a `28-31`
+    /// day-of-month cron range, firing up to four times per month. A month-end
+    /// schedule must fire exactly once, on the real last day.
+    #[test]
+    fn fires_on_real_last_day_of_each_month() {
+        let schedule = Schedule::monthly_last_day(0, 0);
+        // (start month, expected last day)
+        let cases = [
+            (at(2026, 1, 1, 0, 0), (2026, 1, 31)),
+            (at(2026, 2, 1, 0, 0), (2026, 2, 28)), // common year
+            (at(2024, 2, 1, 0, 0), (2024, 2, 29)), // leap year
+            (at(2026, 4, 1, 0, 0), (2026, 4, 30)),
+            (at(2026, 12, 1, 0, 0), (2026, 12, 31)),
+        ];
+        for (after, (y, m, d)) in cases {
+            let next = schedule.next_run(Some(after)).expect("month end computes");
+            assert_eq!((next.year(), next.month(), next.day()), (y, m, d));
+            assert_eq!((next.hour(), next.minute()), (0, 0));
+        }
+    }
+
+    #[test]
+    fn fires_exactly_once_per_month_when_iterated() {
+        let schedule = Schedule::monthly_last_day(0, 0);
+        let mut cursor = at(2026, 1, 1, 0, 0);
+        let mut days = Vec::new();
+        for _ in 0..12 {
+            cursor = schedule.next_run(Some(cursor)).expect("month end computes");
+            days.push((cursor.month(), cursor.day()));
+        }
+        assert_eq!(
+            days,
+            vec![
+                (1, 31),
+                (2, 28),
+                (3, 31),
+                (4, 30),
+                (5, 31),
+                (6, 30),
+                (7, 31),
+                (8, 31),
+                (9, 30),
+                (10, 31),
+                (11, 30),
+                (12, 31),
+            ]
+        );
+    }
+
+    #[test]
+    fn rolls_into_next_month_when_last_day_already_passed() {
+        let schedule = Schedule::monthly_last_day(9, 30);
+        // Already past 31 Jan 09:30 -> next is 28 Feb 09:30.
+        let next = schedule
+            .next_run(Some(at(2026, 1, 31, 10, 0)))
+            .expect("month end computes");
+        assert_eq!(
+            (next.month(), next.day(), next.hour(), next.minute()),
+            (2, 28, 9, 30)
+        );
+    }
+
+    #[test]
+    fn hour_and_minute_are_clamped() {
+        let schedule = Schedule::monthly_last_day(99, 99);
+        let next = schedule
+            .next_run(Some(at(2026, 3, 1, 0, 0)))
+            .expect("month end computes");
+        assert_eq!((next.hour(), next.minute()), (23, 59));
+    }
+
+    /// Regression: `BusinessHours` stored out-of-range hours verbatim and
+    /// `next_business_time` then hit `with_hour(..).expect(..)`.
+    #[test]
+    fn business_hours_out_of_range_is_clamped_and_does_not_panic() {
+        let hours = BusinessHours::new(25, 30);
+        assert!(hours.start_hour <= 23 && hours.end_hour <= 23);
+
+        let calendar = BusinessCalendar::new(
+            BusinessHours::new(25, 30),
+            vec![DayOfWeek::Monday, DayOfWeek::Tuesday],
+        );
+        // Must return rather than panic.
+        let _ = calendar.next_business_time(at(2026, 6, 13, 12, 0));
+    }
+
+    #[test]
+    fn business_hours_try_new_rejects_invalid_ranges() {
+        assert!(BusinessHours::try_new(25, 30).is_err());
+        assert!(BusinessHours::try_new(17, 9).is_err());
+        assert!(BusinessHours::try_new(9, 9).is_err());
+        assert!(BusinessHours::try_new(9, 17).is_ok());
+    }
+
+    /// Regression: deserializing an out-of-range hour used to succeed and arm a
+    /// later panic; it must now be rejected at the parse boundary.
+    #[test]
+    fn business_hours_deserialization_rejects_out_of_range() {
+        let bad = r#"{"start_hour":25,"end_hour":30}"#;
+        assert!(serde_json::from_str::<BusinessHours>(bad).is_err());
+
+        let good = r#"{"start_hour":9,"end_hour":17}"#;
+        let parsed: BusinessHours = serde_json::from_str(good).expect("valid hours parse");
+        assert_eq!((parsed.start_hour, parsed.end_hour), (9, 17));
     }
 }
 

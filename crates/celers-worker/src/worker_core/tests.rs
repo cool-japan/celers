@@ -5,6 +5,7 @@
 //! retries that never advanced, admission deferrals spinning the loop, and the
 //! configuration options the runtime silently ignored.
 
+use super::execution::ExecutionLimits;
 use super::support::{
     clamp_defer_delay, effective_max_retries, panic_message, schedulable_delay_secs,
     InFlightRegistry,
@@ -20,6 +21,7 @@ use crate::WorkerLabels;
 
 use celers_core::rate_limit::RateLimitConfig;
 use celers_core::rate_limit_distributed::InMemoryDistributedBackend;
+use celers_core::time_limit::{TimeLimitConfig, WorkerTimeLimits};
 use celers_core::{
     Broker, BrokerMessage, Event, EventEmitter, NoOpEventEmitter, Result, SerializedTask, Task,
     TaskEvent, TaskId, TaskRegistry, TaskState,
@@ -1148,4 +1150,1007 @@ async fn test_lifecycle_events_are_emitted_in_order_via_batches() {
     );
 
     handle.shutdown().await.expect("shutdown");
+}
+
+// --------------------------------------------------------------------------
+// Time limits (idx 42)
+// --------------------------------------------------------------------------
+
+/// A task that runs until its soft time limit fires, then wraps up cleanly.
+///
+/// This is the cooperative shape Celery's `SoftTimeLimitExceeded` exists for:
+/// the task is *told* it is out of time and returns partial work rather than
+/// being killed.
+struct SoftLimitAwareTask {
+    /// Set once the task observed its soft-limit signal.
+    observed_soft_limit: Arc<AtomicUsize>,
+    /// Incremented when the task returns normally.
+    finished: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Task for SoftLimitAwareTask {
+    type Input = Empty;
+    type Output = Empty;
+
+    async fn execute(&self, _input: Self::Input) -> Result<Self::Output> {
+        // Safety valve so a broken signal fails the test instead of hanging it.
+        for _ in 0..2_000 {
+            if crate::execution_context::check_soft_time_limit().is_err() {
+                self.observed_soft_limit.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        self.finished.fetch_add(1, Ordering::Relaxed);
+        Ok(Empty {})
+    }
+
+    fn name(&self) -> &'static str {
+        "soft_limit_aware_task"
+    }
+}
+
+/// A task that ignores every signal and runs effectively forever.
+struct NeverEndingTask {
+    started: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Task for NeverEndingTask {
+    type Input = Empty;
+    type Output = Empty;
+
+    async fn execute(&self, _input: Self::Input) -> Result<Self::Output> {
+        self.started.fetch_add(1, Ordering::Relaxed);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "never_ending_task"
+    }
+}
+
+#[test]
+fn test_execution_limits_deadline_is_the_earlier_bound() {
+    // No time limits: the plain execution timeout is the deadline.
+    let plain = ExecutionLimits::from_timeout(30);
+    assert_eq!(plain.deadline(), Duration::from_secs(30));
+    assert!(!plain.hard_limit_is_binding());
+
+    // A shorter hard limit wins.
+    let short_hard = ExecutionLimits::from_timeout(30).with_time_limits(
+        &TimeLimitConfig::new()
+            .with_soft_limit(Duration::from_secs(1))
+            .with_hard_limit(Duration::from_secs(5)),
+    );
+    assert_eq!(short_hard.deadline(), Duration::from_secs(5));
+    assert!(short_hard.hard_limit_is_binding());
+    assert_eq!(short_hard.soft_limit, Some(Duration::from_secs(1)));
+
+    // A longer hard limit does not extend the task's own timeout.
+    let long_hard = ExecutionLimits::from_timeout(30)
+        .with_time_limits(&TimeLimitConfig::new().with_hard_limit(Duration::from_secs(600)));
+    assert_eq!(long_hard.deadline(), Duration::from_secs(30));
+    assert!(!long_hard.hard_limit_is_binding());
+
+    // Sub-second hard limits survive (they are stored in milliseconds).
+    let sub_second = ExecutionLimits::from_timeout(30)
+        .with_time_limits(&TimeLimitConfig::new().with_hard_limit(Duration::from_millis(250)));
+    assert_eq!(sub_second.deadline(), Duration::from_millis(250));
+}
+
+#[test]
+fn test_execution_limits_report_the_limit_that_actually_fired() {
+    let task_id = TaskId::new_v4();
+
+    let plain = ExecutionLimits::from_timeout(30);
+    let failure = plain.timeout_failure(task_id, Duration::from_secs(30));
+    assert_eq!(failure.failure_type, "timeout");
+    assert!(failure.message.contains("timed out after 30s"));
+    assert_eq!(failure.metadata, vec![("timeout_secs", "30".to_string())]);
+
+    let hard = ExecutionLimits::from_timeout(30)
+        .with_time_limits(&TimeLimitConfig::new().with_hard_limit(Duration::from_secs(5)));
+    let failure = hard.timeout_failure(task_id, Duration::from_secs(5));
+    assert_eq!(failure.failure_type, "hard_time_limit");
+    assert!(
+        failure.message.contains("Hard time limit exceeded"),
+        "got {}",
+        failure.message
+    );
+    assert_eq!(
+        failure.metadata,
+        vec![("hard_limit_millis", "5000".to_string())]
+    );
+}
+
+/// idx 42: a per-task override merges onto the manager default, and both halves
+/// reach the execution loop.
+#[tokio::test]
+async fn test_worker_resolves_merged_time_limits_per_task_name() {
+    let limits = WorkerTimeLimits::with_default(
+        TimeLimitConfig::new()
+            .with_soft_limit(Duration::from_secs(30))
+            .with_hard_limit(Duration::from_secs(60)),
+    );
+    limits.set_task_limit(
+        "slow_task",
+        TimeLimitConfig::new().with_hard_limit(Duration::from_secs(600)),
+    );
+
+    let broker = RecordingBroker::new(Vec::new(), false);
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> = Worker::new_from_arc(
+        Arc::clone(&broker),
+        TaskRegistry::new(),
+        WorkerConfig::default(),
+    )
+    .with_time_limits(limits);
+
+    let task_id = TaskId::new_v4();
+    let slow = worker
+        .resolve_time_limits(task_id, "slow_task")
+        .expect("the override applies");
+    assert_eq!(
+        slow.soft_limit(),
+        Some(Duration::from_secs(30)),
+        "a hard-limit-only override must not drop the default soft limit"
+    );
+    assert_eq!(slow.hard_limit(), Some(Duration::from_secs(600)));
+
+    let other = worker
+        .resolve_time_limits(task_id, "other_task")
+        .expect("the default applies");
+    assert_eq!(other.hard_limit(), Some(Duration::from_secs(60)));
+
+    // Without a manager configured, nothing is resolved.
+    let bare: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(broker, TaskRegistry::new(), WorkerConfig::default());
+    assert!(bare.resolve_time_limits(task_id, "slow_task").is_none());
+}
+
+/// idx 42: the soft limit is a *warning*, not a disposition. It trips the
+/// cooperative signal the task observes, is counted in `WorkerStats`, and the
+/// task still finishes successfully (acked, not revoked, not dead-lettered).
+#[tokio::test]
+async fn test_soft_time_limit_warns_without_killing_the_task() {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(SoftLimitAwareTask {
+            observed_soft_limit: Arc::clone(&observed),
+            finished: Arc::clone(&finished),
+        })
+        .await;
+
+    let task = serialized("soft_limit_aware_task");
+    let task_id = task.metadata.id;
+    let broker = RecordingBroker::new(vec![BrokerMessage::new(task)], false);
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        enable_dlq: true,
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config).with_time_limits(
+            WorkerTimeLimits::with_default(
+                // Soft only: nothing may kill this task.
+                TimeLimitConfig::new().with_soft_limit(Duration::from_millis(30)),
+            ),
+        );
+    let stats = worker.stats_arc();
+    let dlq = worker.dlq_handler().cloned().expect("dlq enabled");
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    wait_until("the task to finish after its soft limit", || {
+        finished.load(Ordering::Relaxed) == 1
+    })
+    .await;
+
+    assert_eq!(
+        observed.load(Ordering::Relaxed),
+        1,
+        "the running task must observe its own soft time limit"
+    );
+    assert_eq!(
+        stats.soft_timeouts(),
+        1,
+        "the soft-limit expiry must be counted"
+    );
+    assert_eq!(stats.revoked(), 0, "a soft limit must never revoke a task");
+    wait_until("the successful task to be acked", || {
+        broker.acked() == vec![task_id]
+    })
+    .await;
+    assert!(broker.rejected().is_empty());
+    assert_eq!(dlq.size().await, 0, "a soft limit is not a failure");
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// idx 42: the hard limit *is* terminal. It aborts the task and maps onto the
+/// worker's existing timeout failure path — dead-lettered (retries exhausted)
+/// with a failure class naming the limit that fired.
+#[tokio::test]
+async fn test_hard_time_limit_aborts_the_task_with_a_timeout_failure() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(NeverEndingTask {
+            started: Arc::clone(&started),
+        })
+        .await;
+
+    // No retry budget: the first hard-limit expiry is terminal.
+    let task = serialized("never_ending_task").with_max_retries(0);
+    let task_id = task.metadata.id;
+    let broker = RecordingBroker::new(vec![BrokerMessage::new(task)], false);
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        enable_dlq: true,
+        // Far longer than the hard limit, so the hard limit is what fires.
+        default_timeout_secs: 300,
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config).with_time_limits(
+            WorkerTimeLimits::with_default(
+                TimeLimitConfig::new().with_hard_limit(Duration::from_millis(50)),
+            ),
+        );
+    let dlq = worker.dlq_handler().cloned().expect("dlq enabled");
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    wait_until("the hard limit to kill the task", || {
+        !broker.rejected().is_empty()
+    })
+    .await;
+
+    assert_eq!(started.load(Ordering::Relaxed), 1);
+    assert_eq!(broker.rejected(), vec![task_id]);
+    assert!(
+        broker.acked().is_empty(),
+        "a task killed by its hard limit must not be acked as success"
+    );
+
+    let entries = dlq.get_entries().await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].metadata.get("failure_type").map(String::as_str),
+        Some("hard_time_limit"),
+        "the DLQ entry must name the limit that fired: {:?}",
+        entries[0].metadata
+    );
+    assert_eq!(
+        entries[0]
+            .metadata
+            .get("hard_limit_millis")
+            .map(String::as_str),
+        Some("50")
+    );
+    assert!(
+        entries[0]
+            .error_message
+            .contains("Hard time limit exceeded"),
+        "got {}",
+        entries[0].error_message
+    );
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+// --------------------------------------------------------------------------
+// Workflow continuation
+// --------------------------------------------------------------------------
+
+/// The success path must advance the task's workflow. Before this,
+/// `workflows::handle_workflow_completion` had zero production callers: chain
+/// continuation, branch/switch evaluation and chord barriers were implemented
+/// and unit-proven but never invoked by a running worker, so every chain
+/// stopped after its first step.
+#[cfg(feature = "canvas")]
+#[tokio::test]
+async fn test_worker_runs_every_step_of_a_canvas_chain() {
+    let step_a = Arc::new(AtomicUsize::new(0));
+    let step_b = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(CountingTask {
+            runs: Arc::clone(&step_a),
+            name: "chain_step_a",
+        })
+        .await;
+    registry
+        .register(CountingTask {
+            runs: Arc::clone(&step_b),
+            name: "chain_step_b",
+        })
+        .await;
+
+    // `redeliver: true` makes everything the worker enqueues available for the
+    // next dequeue, so the chain's own continuation comes back around.
+    let broker = RecordingBroker::new(Vec::new(), true);
+    celers_canvas::Chain::new()
+        .then("chain_step_a", Vec::new())
+        .then("chain_step_b", Vec::new())
+        .apply(&*broker)
+        .await
+        .expect("chain dispatches");
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config);
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    wait_until("the chain's second step to run", || {
+        step_b.load(Ordering::Relaxed) == 1
+    })
+    .await;
+
+    assert_eq!(step_a.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        step_b.load(Ordering::Relaxed),
+        1,
+        "the worker must enqueue the chain tail after the head succeeds"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// The legacy `on_success_link` path (a bare successor *name*, no canvas tail)
+/// is driven by the same call site.
+#[cfg(feature = "canvas")]
+#[tokio::test]
+async fn test_worker_enqueues_a_bare_on_success_link() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(CountingTask {
+            runs: Arc::clone(&runs),
+            name: "quick_task",
+        })
+        .await;
+
+    let task = serialized("quick_task").with_on_success_link("follow_up".to_string());
+    let broker = RecordingBroker::new(vec![BrokerMessage::new(task)], false);
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config);
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    wait_until("the link to be enqueued", || {
+        broker
+            .enqueued()
+            .iter()
+            .any(|(task, _)| task.metadata.name == "follow_up")
+    })
+    .await;
+
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+// --------------------------------------------------------------------------
+// DLQ lifecycle
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_dlq_cleanup_interval_is_bounded() {
+    // Sweeping once per TTL keeps a short TTL honest...
+    assert_eq!(
+        super::support::dlq_cleanup_interval(30),
+        Duration::from_secs(30)
+    );
+    // ...without letting a multi-day TTL mean "never swept in practice".
+    assert_eq!(
+        super::support::dlq_cleanup_interval(7 * 24 * 3600),
+        Duration::from_secs(3600)
+    );
+    // `tokio::time::interval` panics on a zero period.
+    assert_eq!(
+        super::support::dlq_cleanup_interval(0),
+        Duration::from_secs(1)
+    );
+}
+
+/// A configured `ttl_seconds` used to be decoration: nothing ran the sweep, so
+/// expired dead-letter entries accumulated for the life of the process.
+#[tokio::test]
+async fn test_worker_runs_the_dlq_ttl_sweep() {
+    let broker = RecordingBroker::new(Vec::new(), false);
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        enable_dlq: true,
+        dlq_config: crate::dlq::DlqConfig::new(true).with_ttl(1),
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), TaskRegistry::new(), config);
+    let dlq = worker.dlq_handler().cloned().expect("dlq enabled");
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    // Back-date the entry so the very first sweep reclaims it.
+    let mut entry = crate::dlq::DlqEntry::new(
+        serialized("stale_task"),
+        TaskId::new_v4(),
+        0,
+        "boom".to_string(),
+        "test-host".to_string(),
+    );
+    entry.dlq_timestamp = entry.dlq_timestamp.saturating_sub(3_600);
+    dlq.add_entry(entry).await.expect("entry is recorded");
+    assert_eq!(dlq.size().await, 1);
+
+    let mut swept = false;
+    for _ in 0..300 {
+        if dlq.size().await == 0 {
+            swept = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        swept,
+        "a configured DLQ TTL must actually reclaim expired entries"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// `Worker::connect` opens the configured DLQ backend instead of silently
+/// downgrading a persistent dead-letter queue to a volatile in-memory one.
+#[tokio::test]
+async fn test_connect_opens_the_configured_dlq_backend() {
+    let config = WorkerConfig {
+        enable_dlq: true,
+        dlq_config: crate::dlq::DlqConfig::new(true),
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> = Worker::connect(
+        Arc::try_unwrap(RecordingBroker::new(Vec::new(), false))
+            .ok()
+            .expect("sole owner"),
+        TaskRegistry::new(),
+        config,
+    )
+    .await
+    .expect("the in-memory backend always connects");
+
+    let dlq = worker.dlq_handler().cloned().expect("dlq enabled");
+    assert!(dlq.is_enabled());
+    assert_eq!(dlq.size().await, 0);
+
+    // A backend whose feature is not compiled in is a hard error, not a silent
+    // downgrade to memory.
+    #[cfg(not(feature = "redis"))]
+    {
+        let config = WorkerConfig {
+            enable_dlq: true,
+            dlq_config: crate::dlq::DlqConfig::new(true).with_storage(
+                crate::dlq::DlqStorageBackend::Redis {
+                    url: "redis://127.0.0.1:6379".to_string(),
+                    key_prefix: Some("celers:test".to_string()),
+                },
+            ),
+            ..Default::default()
+        };
+        let failed: std::result::Result<Worker<RecordingBroker, NoOpEventEmitter>, _> =
+            Worker::connect(
+                Arc::try_unwrap(RecordingBroker::new(Vec::new(), false))
+                    .ok()
+                    .expect("sole owner"),
+                TaskRegistry::new(),
+                config,
+            )
+            .await;
+        assert!(
+            failed.is_err(),
+            "an unavailable DLQ backend must surface, not degrade to memory"
+        );
+    }
+}
+
+/// idx 161: the *default* coalescing key is id-scoped, so enabling coalescing
+/// can no longer silently destroy independent submissions that happen to share
+/// their arguments.
+#[tokio::test]
+async fn test_coalescing_defaults_to_the_lossless_id_scoped_key() {
+    assert!(
+        WorkerConfig::default().coalesce_require_same_task_id,
+        "the default must be the lossless key"
+    );
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(CountingTask {
+            runs: Arc::clone(&runs),
+            name: "quick_task",
+        })
+        .await;
+
+    // Three independent submissions with byte-identical payloads.
+    let messages = vec![
+        BrokerMessage::new(serialized("quick_task")),
+        BrokerMessage::new(serialized("quick_task")),
+        BrokerMessage::new(serialized("quick_task")),
+    ];
+    let broker = RecordingBroker::new(messages, false);
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        enable_batch_dequeue: true,
+        batch_size: 10,
+        enable_coalescing: true,
+        // Deliberately *not* setting `coalesce_require_same_task_id`.
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config);
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    wait_until("every distinct submission to run", || {
+        runs.load(Ordering::Relaxed) == 3
+    })
+    .await;
+    wait_until("every message to be acked", || broker.acked().len() == 3).await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// idx 172, worker-loop half: a task rejected because the *half-open* probe
+/// budget is in use is deferred (requeued), not dead-lettered. Only a genuinely
+/// OPEN circuit is terminal — a recovering circuit must not permanently fail
+/// the traffic it is about to start serving again.
+#[tokio::test]
+async fn test_half_open_probe_budget_defers_instead_of_dead_lettering() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Notify::new());
+    let registry = TaskRegistry::new();
+    registry
+        .register(BlockingTask {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+            release: Arc::clone(&release),
+        })
+        .await;
+
+    let messages = vec![
+        BrokerMessage::new(serialized("blocking_task")),
+        BrokerMessage::new(serialized("blocking_task")),
+    ];
+    let broker = RecordingBroker::new(messages, false);
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        concurrency: 4,
+        enable_dlq: true,
+        enable_circuit_breaker: true,
+        circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 5,
+            // Already past the recovery window, so the first `should_allow`
+            // flips the circuit straight to half-open.
+            timeout_secs: 0,
+            window_secs: 60,
+            half_open_max_concurrent: 1,
+        },
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config);
+    let breaker = worker.circuit_breaker.clone().expect("breaker enabled");
+    let dlq = worker.dlq_handler().cloned().expect("dlq enabled");
+
+    // Open the circuit before the worker ever polls.
+    breaker.record_failure("blocking_task").await;
+    assert!(breaker.get_state("blocking_task").await.is_open());
+
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    // The first task takes the single probe slot and blocks; the second finds
+    // the budget spent.
+    wait_until("the probe task to start", || {
+        started.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    wait_until("the over-budget task to be requeued", || {
+        !broker.requeued().is_empty()
+    })
+    .await;
+
+    assert!(
+        broker.rejected().is_empty(),
+        "a half-open probe-budget miss must never be dead-lettered"
+    );
+    assert_eq!(
+        dlq.size().await,
+        0,
+        "a deferred task is not a failed task: {:?}",
+        dlq.get_entries().await
+    );
+    assert!(
+        breaker.get_state("blocking_task").await.is_half_open(),
+        "the circuit is still probing"
+    );
+
+    release.notify_waiters();
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// The disposition token also owns advancing the workflow: a task whose
+/// delivery was already requeued by the shutdown drain must not enqueue its
+/// chain successor, or the redelivery enqueues it a second time.
+#[cfg(feature = "canvas")]
+#[tokio::test]
+async fn test_unclaimed_delivery_does_not_double_enqueue_the_chain() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Notify::new());
+    let registry = TaskRegistry::new();
+    registry
+        .register(BlockingTask {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+            release: Arc::clone(&release),
+        })
+        .await;
+
+    let task = serialized("blocking_task").with_on_success_link("follow_up".to_string());
+    let task_id = task.metadata.id;
+    let broker = RecordingBroker::new(vec![BrokerMessage::new(task)], false);
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        graceful_shutdown: true,
+        // Deadline expires while the task is still blocked, so the drain
+        // requeues the delivery and the task loses its claim.
+        shutdown_timeout_secs: 1,
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config);
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    wait_until("the task to start", || started.load(Ordering::Relaxed) == 1).await;
+    handle.shutdown().await.expect("shutdown");
+
+    wait_until("the drain deadline to requeue the delivery", || {
+        broker.requeued() == vec![task_id]
+    })
+    .await;
+
+    // Now let the task finish: it no longer owns the disposition.
+    release.notify_waiters();
+    wait_until("the task to finish", || {
+        finished.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        broker
+            .enqueued()
+            .iter()
+            .all(|(task, _)| task.metadata.name != "follow_up"),
+        "an unclaimed delivery must leave workflow continuation to its redelivery"
+    );
+    assert!(
+        broker.acked().is_empty(),
+        "and must not ack a delivery it no longer owns"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Poison-pill quarantine and health accounting
+// --------------------------------------------------------------------------
+
+/// A task that keeps failing accumulates strikes and, once quarantined, is
+/// dead-lettered without ever executing again — instead of cycling through the
+/// broker forever.
+#[tokio::test]
+async fn test_poison_pill_quarantine_stops_a_repeatedly_failing_task() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(AlwaysFailingTask {
+            runs: Arc::clone(&runs),
+        })
+        .await;
+
+    // Budget for 5 attempts; quarantine trips after 2 failed executions.
+    let task = serialized("failing_task").with_max_retries(5);
+    let task_id = task.metadata.id;
+    let broker = RecordingBroker::new(vec![BrokerMessage::new(task)], true);
+
+    let detector = Arc::new(crate::poison_pill::PoisonPillDetector::new(
+        crate::poison_pill::PoisonPillConfig::new().with_threshold(2),
+    ));
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        enable_dlq: true,
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config)
+            .with_poison_pill(Arc::clone(&detector));
+    let dlq = worker.dlq_handler().cloned().expect("dlq enabled");
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    let mut quarantined = false;
+    for _ in 0..400 {
+        if detector.is_poison(&task_id).await {
+            quarantined = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        quarantined,
+        "two failed executions must trip a threshold-2 detector (runs: {})",
+        runs.load(Ordering::Relaxed)
+    );
+
+    // Once quarantined the task is dead-lettered on its next delivery instead
+    // of being executed again.
+    wait_until("the quarantined task to be dead-lettered", || {
+        !broker.rejected().is_empty()
+    })
+    .await;
+    let runs_at_quarantine = runs.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        runs_at_quarantine,
+        "a quarantined task must never execute again"
+    );
+
+    let entries = dlq.get_entries().await;
+    assert!(
+        entries.iter().any(
+            |entry| entry.metadata.get("failure_type").map(String::as_str) == Some("poison_pill")
+        ),
+        "the quarantine must be observable in the DLQ: {:?}",
+        entries
+            .iter()
+            .map(|entry| entry.metadata.clone())
+            .collect::<Vec<_>>()
+    );
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A re-attempt whose previous failure this worker never saw (another worker's,
+/// or one that died mid-task) is the only evidence a poison pill leaves, so it
+/// gets its own strike. A retry this worker *did* fail must not be
+/// double-counted.
+#[tokio::test]
+async fn test_redelivery_strike_only_counts_unseen_failures() {
+    let broker = RecordingBroker::new(Vec::new(), false);
+    let detector = Arc::new(crate::poison_pill::PoisonPillDetector::new(
+        crate::poison_pill::PoisonPillConfig::new().with_threshold(10),
+    ));
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> = Worker::new_from_arc(
+        Arc::clone(&broker),
+        TaskRegistry::new(),
+        WorkerConfig::default(),
+    )
+    .with_poison_pill(Arc::clone(&detector));
+
+    // A first delivery is never a redelivery.
+    let fresh = TaskId::new_v4();
+    assert!(!worker.is_quarantined(fresh, 0).await);
+    assert_eq!(detector.strike_count(&fresh).await, 0);
+
+    // A re-attempt this detector has no record of: strike.
+    let foreign = TaskId::new_v4();
+    assert!(!worker.is_quarantined(foreign, 1).await);
+    assert_eq!(detector.strike_count(&foreign).await, 1);
+
+    // A re-attempt whose failure this worker already recorded: no second strike.
+    let ours = TaskId::new_v4();
+    detector.record_failure(ours, "boom").await;
+    assert_eq!(detector.strike_count(&ours).await, 1);
+    assert!(!worker.is_quarantined(ours, 2).await);
+    assert_eq!(
+        detector.strike_count(&ours).await,
+        1,
+        "a failure this worker recorded must not be counted twice on redelivery"
+    );
+
+    // Without a detector the gate is a no-op.
+    let bare: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(broker, TaskRegistry::new(), WorkerConfig::default());
+    assert!(!bare.is_quarantined(TaskId::new_v4(), 9).await);
+}
+
+/// Health accounting is fed by real executions and readable through the handle
+/// the worker leaves behind, so an embedder can serve liveness/readiness.
+#[tokio::test]
+async fn test_health_tracks_real_task_outcomes() {
+    let ok_runs = Arc::new(AtomicUsize::new(0));
+    let bad_runs = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(CountingTask {
+            runs: Arc::clone(&ok_runs),
+            name: "quick_task",
+        })
+        .await;
+    registry
+        .register(AlwaysFailingTask {
+            runs: Arc::clone(&bad_runs),
+        })
+        .await;
+
+    let messages = vec![
+        BrokerMessage::new(serialized("quick_task")),
+        BrokerMessage::new(serialized("failing_task").with_max_retries(0)),
+    ];
+    let broker = RecordingBroker::new(messages, false);
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config);
+    let health = worker.health();
+    assert_eq!(health.get_health().tasks_processed, 0);
+
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+    // The handle exposes the same shared accounting.
+    let from_handle = handle.health();
+
+    wait_until("both tasks to be accounted for", || {
+        let info = from_handle.get_health();
+        info.tasks_processed == 1 && info.tasks_failed == 1
+    })
+    .await;
+
+    let info = health.get_health();
+    assert_eq!(info.tasks_processed, 1, "one success");
+    assert_eq!(info.tasks_failed, 1, "one failure");
+    assert_eq!(info.consecutive_failures, 1);
+    wait_until("the worker to report itself idle again", || {
+        !health.get_health().is_processing
+    })
+    .await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+// --------------------------------------------------------------------------
+// Task checkpoints
+// --------------------------------------------------------------------------
+
+/// Fails on its first attempt, having checkpointed its progress; on the retry
+/// it resumes from the checkpoint and succeeds.
+struct ResumableTask {
+    /// Progress observed at the start of each attempt.
+    resumed_from: Arc<Mutex<Vec<u64>>>,
+    attempts: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Task for ResumableTask {
+    type Input = Empty;
+    type Output = Empty;
+
+    async fn execute(&self, _input: Self::Input) -> Result<Self::Output> {
+        let resume_from = crate::execution_context::load_checkpoint()
+            .await
+            .and_then(|checkpoint| String::from_utf8(checkpoint.data).ok())
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or(0);
+        self.resumed_from.lock().expect("lock").push(resume_from);
+
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+        if attempt == 0 {
+            // Record progress, then fail so the worker retries us.
+            crate::execution_context::save_checkpoint(b"42".to_vec())
+                .await
+                .expect("checkpoint saves");
+            return Err(celers_core::CelersError::TaskExecution(
+                "interrupted".to_string(),
+            ));
+        }
+        Ok(Empty {})
+    }
+
+    fn name(&self) -> &'static str {
+        "resumable_task"
+    }
+}
+
+/// A checkpoint written by one attempt is visible to the next, and the store is
+/// emptied once the task finally succeeds.
+#[tokio::test]
+async fn test_checkpoints_resume_a_retried_task_and_are_cleared_on_success() {
+    let resumed_from = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(ResumableTask {
+            resumed_from: Arc::clone(&resumed_from),
+            attempts: Arc::clone(&attempts),
+        })
+        .await;
+
+    let task = serialized("resumable_task").with_max_retries(2);
+    let task_id = task.metadata.id;
+    let broker = RecordingBroker::new(vec![BrokerMessage::new(task)], true);
+
+    let checkpoints = Arc::new(crate::checkpoint::CheckpointManager::new(
+        crate::checkpoint::CheckpointConfig::new(),
+    ));
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        ..Default::default()
+    };
+    let worker: Worker<RecordingBroker, NoOpEventEmitter> =
+        Worker::new_from_arc(Arc::clone(&broker), registry, config)
+            .with_checkpoints(Arc::clone(&checkpoints));
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    wait_until("the retry to run", || attempts.load(Ordering::Relaxed) == 2).await;
+
+    // Note the retry carries a *new* delivery of the same task id, so the
+    // checkpoint key is stable across attempts.
+    wait_until("the successful attempt to be acked", || {
+        !broker.acked().is_empty()
+    })
+    .await;
+
+    let observed = resumed_from.lock().expect("lock").clone();
+    assert_eq!(
+        observed,
+        vec![0, 42],
+        "the retry must resume from the checkpoint the first attempt wrote"
+    );
+
+    let mut cleared = false;
+    for _ in 0..200 {
+        if !checkpoints.has_checkpoint(&task_id.to_string()).await {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        cleared,
+        "a completed task's checkpoints must not be left behind"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Without a manager installed the ambient helpers are no-ops rather than
+/// errors, so task code can call them unconditionally.
+#[tokio::test]
+async fn test_checkpoint_helpers_are_noops_without_a_manager() {
+    assert!(crate::execution_context::current_checkpoints().is_none());
+    assert!(crate::execution_context::load_checkpoint().await.is_none());
+    assert!(
+        !crate::execution_context::save_checkpoint(b"ignored".to_vec())
+            .await
+            .expect("a no-op cannot fail"),
+        "reports that nothing was stored"
+    );
 }

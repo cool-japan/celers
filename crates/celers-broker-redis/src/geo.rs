@@ -48,6 +48,7 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, SerializedTask};
 use redis::{AsyncCommands, Client};
 use std::collections::HashMap;
@@ -587,7 +588,7 @@ impl GeoReplicationManager {
     ) -> Result<()> {
         let mut conn = region_client
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| {
                 CelersError::Broker(format!(
@@ -596,7 +597,11 @@ impl GeoReplicationManager {
                 ))
             })?;
 
-        conn.rpush::<_, _, ()>(queue_name, serialized)
+        // Head-push, matching `RedisBroker::enqueue`: consumers pop the
+        // tail, so replicating with `RPUSH` would land every replicated task
+        // at the *front* of the region's delivery order, ahead of everything
+        // already waiting there.
+        conn.lpush::<_, _, ()>(queue_name, serialized)
             .await
             .map_err(|e| {
                 CelersError::Broker(format!(
@@ -623,7 +628,7 @@ impl GeoReplicationManager {
     ) -> Result<()> {
         let mut conn = region_client
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| {
                 CelersError::Broker(format!(
@@ -632,7 +637,11 @@ impl GeoReplicationManager {
                 ))
             })?;
 
-        conn.rpush::<_, _, ()>(queue_name, serialized)
+        // Head-push, matching `RedisBroker::enqueue`: consumers pop the
+        // tail, so replicating with `RPUSH` would land every replicated task
+        // at the *front* of the region's delivery order, ahead of everything
+        // already waiting there.
+        conn.lpush::<_, _, ()>(queue_name, serialized)
             .await
             .map_err(|e| {
                 CelersError::Broker(format!(
@@ -852,7 +861,7 @@ impl RegionalReadRouter {
     ) -> Result<Option<SerializedTask>> {
         let mut conn = region_client
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| {
                 CelersError::Broker(format!(
@@ -1081,5 +1090,68 @@ mod tests {
         let router = RegionalReadRouter::new(regions, RoutingStrategy::RoundRobin);
 
         assert_eq!(router.strategy(), RoutingStrategy::RoundRobin);
+    }
+
+    /// Replication must write into a region's queue the same way the broker
+    /// does: head push, tail pop.
+    ///
+    /// Writing with `RPUSH` put every replicated task at the *front* of the
+    /// receiving region's delivery order — newest served first, oldest
+    /// starved — while every task count stayed correct, so only an order
+    /// assertion exposes it.
+    #[tokio::test]
+    async fn test_replication_writes_in_broker_order() {
+        let queue = format!("test-geo-order-{}", uuid::Uuid::new_v4());
+        let url = "redis://127.0.0.1:6379";
+
+        let mut manager = GeoReplicationManager::new(
+            RegionId::new("local"),
+            ReplicationConfig::builder()
+                .sync_mode(SyncMode::FullSync)
+                .build(),
+        );
+        manager
+            .add_region(Region::new(
+                RegionId::new("local"),
+                "Local",
+                url,
+                0.0,
+                0.0,
+                true,
+            ))
+            .await
+            .expect("add region");
+
+        for name in ["first", "second", "third"] {
+            manager
+                .replicate_task(&queue, &SerializedTask::new(name.to_string(), vec![]))
+                .await
+                .expect("replicate");
+        }
+
+        let client = Client::open(url).expect("client");
+        let mut conn = client
+            .celers_multiplexed_connection()
+            .await
+            .expect("connection");
+
+        // Consumers pop the tail, so popping the tail is the delivery order.
+        let mut delivered = Vec::new();
+        while let Some(data) = conn
+            .rpop::<_, Option<String>>(&queue, None)
+            .await
+            .expect("rpop")
+        {
+            let task: SerializedTask = serde_json::from_str(&data).expect("deserialize");
+            delivered.push(task.metadata.name);
+        }
+
+        assert_eq!(
+            delivered,
+            vec!["first", "second", "third"],
+            "replicated tasks must be delivered in the order they were replicated"
+        );
+
+        let _: i64 = conn.del(&queue).await.unwrap_or(0);
     }
 }

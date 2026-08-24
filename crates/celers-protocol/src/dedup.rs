@@ -5,9 +5,36 @@
 
 use crate::Message;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// FNV-1a (Fowler-Noll-Vo) 64-bit hash.
+///
+/// A small, dependency-free, non-cryptographic hash with a fixed, versioned
+/// definition -- unlike `std::collections::hash_map::DefaultHasher`, whose
+/// algorithm is explicitly documented as *not* guaranteed to be stable
+/// across Rust releases, FNV-1a's definition never changes. That stability
+/// matters here because the digest becomes part of a message's
+/// deduplication identity ([`DedupKey::ContentHash`]): a toolchain upgrade
+/// must never silently change every content hash, which would make
+/// previously-seen messages look brand new. See
+/// <http://www.isthe.com/chongo/tech/comp/fnv/> for the reference algorithm
+/// and constants.
+///
+/// `celers-protocol` cannot depend on `celers-kombu` (the dependency runs
+/// the other way), so this is a deliberate duplicate of the identical
+/// `celers_kombu::utils::fnv1a_hash`.
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
 
 /// Deduplication key for a message
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -27,11 +54,21 @@ impl DedupKey {
     }
 
     /// Create a dedup key from message content hash
+    ///
+    /// Uses [`fnv1a_hash`] rather than `DefaultHasher` so the digest -- and
+    /// therefore a message's deduplication identity -- stays stable across
+    /// Rust toolchain upgrades. `task` is length-prefixed before being
+    /// concatenated with `body` so that distinct `(task, body)` pairs which
+    /// would otherwise concatenate to the same byte stream (e.g. task="ab",
+    /// body=b"cd" vs. task="abc", body=b"d") can never collide.
     pub fn from_content(message: &Message) -> Self {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        message.headers.task.hash(&mut hasher);
-        message.body.hash(&mut hasher);
-        Self::ContentHash(hasher.finish())
+        let task_bytes = message.headers.task.as_bytes();
+        let body_bytes = message.body.as_slice();
+        let mut buf = Vec::with_capacity(task_bytes.len() + body_bytes.len() + 8);
+        buf.extend_from_slice(&(task_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(task_bytes);
+        buf.extend_from_slice(body_bytes);
+        Self::ContentHash(fnv1a_hash(&buf))
     }
 
     /// Create a custom dedup key
@@ -189,9 +226,17 @@ impl DedupCache {
 }
 
 /// Simple deduplication using a HashSet of task IDs
+///
+/// Pairs the `HashSet` with a [`VecDeque`] recording true insertion order,
+/// mirroring `celers_kombu::DeduplicationMiddleware`'s `DedupState`. A bare
+/// `HashSet` has no ordering, so evicting via `seen_ids.iter().take(n)` (the
+/// previous approach) removed an arbitrary bucket-order prefix that had no
+/// relationship to insertion recency -- it could evict an entry seen a
+/// moment ago while one seen long before survived indefinitely.
 #[derive(Debug, Clone)]
 pub struct SimpleDedupSet {
     seen_ids: HashSet<Uuid>,
+    insertion_order: VecDeque<Uuid>,
     max_size: usize,
 }
 
@@ -200,6 +245,7 @@ impl SimpleDedupSet {
     pub fn new(max_size: usize) -> Self {
         Self {
             seen_ids: HashSet::new(),
+            insertion_order: VecDeque::new(),
             max_size,
         }
     }
@@ -211,27 +257,41 @@ impl SimpleDedupSet {
 
     /// Mark a message ID as seen
     ///
-    /// Returns `true` if newly inserted, `false` if already seen
+    /// Returns `true` if newly inserted, `false` if already seen.
+    ///
+    /// Checking membership *before* evicting (rather than evicting
+    /// unconditionally once at capacity, as the previous implementation
+    /// did) also fixes a correctness bug: at capacity, re-marking an
+    /// already-seen id used to evict entries regardless, which could evict
+    /// that very id and make the subsequent `insert` report it as newly
+    /// seen -- a duplicate silently reported as novel.
     pub fn mark_seen(&mut self, message: &Message) -> bool {
-        if self.seen_ids.len() >= self.max_size {
-            // Simple eviction: clear half the set
-            let to_remove: Vec<_> = self
-                .seen_ids
-                .iter()
-                .take(self.max_size / 2)
-                .copied()
-                .collect();
-            for id in to_remove {
-                self.seen_ids.remove(&id);
+        let id = message.headers.id;
+
+        if self.seen_ids.contains(&id) {
+            return false;
+        }
+
+        self.seen_ids.insert(id);
+        self.insertion_order.push_back(id);
+
+        // Evict true FIFO (oldest-inserted first) once the set exceeds
+        // capacity.
+        while self.insertion_order.len() > self.max_size {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.seen_ids.remove(&oldest);
+            } else {
+                break;
             }
         }
 
-        self.seen_ids.insert(message.headers.id)
+        true
     }
 
     /// Clear all seen IDs
     pub fn clear(&mut self) {
         self.seen_ids.clear();
+        self.insertion_order.clear();
     }
 
     /// Get the number of seen IDs
@@ -468,5 +528,79 @@ mod tests {
 
         // Should have evicted some entries
         assert!(dedup.len() <= 4);
+    }
+
+    #[test]
+    fn test_simple_dedup_set_eviction_is_true_fifo() {
+        // Regression: eviction must remove the actual oldest-inserted ids,
+        // not an arbitrary bucket-order prefix of the underlying HashSet.
+        let mut dedup = SimpleDedupSet::new(3);
+        let messages: Vec<Message> = (0..3)
+            .map(|i| create_test_message(&format!("task{}", i)))
+            .collect();
+
+        for msg in &messages {
+            assert!(dedup.mark_seen(msg));
+        }
+        assert_eq!(dedup.len(), 3);
+
+        // A 4th distinct id must evict messages[0] specifically (the
+        // oldest), never messages[1] or messages[2].
+        let msg4 = create_test_message("task3");
+        assert!(dedup.mark_seen(&msg4));
+
+        assert!(
+            !dedup.contains(&messages[0]),
+            "the oldest entry must be the one evicted"
+        );
+        assert!(
+            dedup.contains(&messages[1]),
+            "newer entries must survive eviction"
+        );
+        assert!(
+            dedup.contains(&messages[2]),
+            "newer entries must survive eviction"
+        );
+        assert!(dedup.contains(&msg4));
+        assert_eq!(dedup.len(), 3);
+    }
+
+    #[test]
+    fn test_simple_dedup_set_duplicate_at_capacity_does_not_evict_or_report_novel() {
+        // Regression: at capacity, re-marking an *already-seen* id used to
+        // evict entries unconditionally before checking for the duplicate,
+        // which could evict that very id and make the reinsertion below
+        // report it as newly seen -- a duplicate silently treated as novel.
+        let mut dedup = SimpleDedupSet::new(2);
+        let msg1 = create_test_message("task1");
+        let msg2 = create_test_message("task2");
+
+        assert!(dedup.mark_seen(&msg1));
+        assert!(dedup.mark_seen(&msg2));
+        assert_eq!(dedup.len(), 2);
+
+        // Re-marking msg1 (already seen, set is at capacity) must report a
+        // duplicate and must not disturb membership.
+        assert!(!dedup.mark_seen(&msg1));
+        assert_eq!(dedup.len(), 2);
+        assert!(dedup.contains(&msg1));
+        assert!(dedup.contains(&msg2));
+    }
+
+    #[test]
+    fn test_dedup_key_from_content_length_prefix_avoids_ambiguous_concatenation() {
+        // Without a length prefix on `task`, ("ab", b"cd") and ("abc", b"d")
+        // would concatenate to the identical byte stream "abcd" and hash
+        // equal even though they are different (task, body) pairs.
+        let msg1 = Message::new("ab".to_string(), Uuid::new_v4(), b"cd".to_vec());
+        let msg2 = Message::new("abc".to_string(), Uuid::new_v4(), b"d".to_vec());
+
+        let key1 = DedupKey::from_content(&msg1);
+        let key2 = DedupKey::from_content(&msg2);
+
+        assert_ne!(
+            key1, key2,
+            "length-prefixing task must prevent this collision"
+        );
     }
 }

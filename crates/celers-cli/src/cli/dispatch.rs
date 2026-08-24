@@ -89,6 +89,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             concurrency,
             max_retries,
             timeout,
+            shutdown_timeout,
             config,
         } => {
             let cfg = load_config(config)?;
@@ -102,6 +103,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 concurrency,
                 max_retries,
                 timeout,
+                shutdown_timeout,
             )
             .await?;
         }
@@ -670,13 +672,14 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Commands::Doctor {
             broker,
             queue,
+            strict,
             config,
         } => {
             let cfg = load_config(config)?;
             let broker_url = broker.unwrap_or(cfg.broker.url);
             let queue_name = queue.unwrap_or(cfg.broker.queue);
 
-            crate::commands::doctor(&broker_url, &queue_name).await?;
+            crate::commands::doctor(&broker_url, &queue_name, strict).await?;
         }
 
         Commands::Schedule(schedule_cmd) => match schedule_cmd {
@@ -1091,6 +1094,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             output,
             previous,
             since,
+            allow_empty,
             config,
         } => {
             let cfg = load_config(config)?;
@@ -1101,6 +1105,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 &output,
                 previous.as_deref(),
                 since.as_deref(),
+                allow_empty,
             )
             .await?;
         }
@@ -1139,7 +1144,14 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Alias(cmd) => {
-            let mut cfg = load_config(None)?;
+            // Mutates only the on-disk `[aliases]` section via
+            // `Config::write_aliases_only` rather than re-serializing the
+            // fully env/CLI-resolved `load_config(None)` result back to
+            // disk: the latter would bake every resolved field (notably
+            // `broker.url`, which an environment variable such as a PaaS
+            // platform's auto-injected `REDIS_URL` may have supplied only
+            // for this one process) permanently into the file (idx 338).
+            let cfg = load_config(None)?;
             let mut aliases = cfg.aliases.clone().unwrap_or_default();
             let config_path = crate::config_layer::resolve_config_path(None);
             match cmd {
@@ -1150,14 +1162,12 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 }
                 AliasCommands::Add { name, expansion } => {
                     aliases.add(&name, &expansion, RESERVED_COMMAND_NAMES)?;
-                    cfg.aliases = Some(aliases);
-                    cfg.to_file(&config_path)?;
+                    crate::config::Config::write_aliases_only(&config_path, &aliases)?;
                     println!("Added alias '{name}' -> '{expansion}'");
                 }
                 AliasCommands::Remove { name } => {
                     if aliases.remove(&name) {
-                        cfg.aliases = Some(aliases);
-                        cfg.to_file(&config_path)?;
+                        crate::config::Config::write_aliases_only(&config_path, &aliases)?;
                         println!("Removed alias '{name}'");
                     } else {
                         println!("No such alias: '{name}'");

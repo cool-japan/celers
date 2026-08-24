@@ -154,16 +154,20 @@ impl PostgresBroker {
             let receipt = msg.receipt_handle.clone();
             let conn1 = self.conn.clone();
             let conn2 = self.conn.clone();
+            let queue1 = self.queue_name.clone();
+            let queue2 = self.queue_name.clone();
 
             let ack_fn = Box::new(move || {
                 let conn = conn1.clone();
+                let queue = queue1.clone();
                 let id = task_id;
                 let _receipt_clone = receipt.clone();
                 Box::pin(async move {
                     let id_param = uuid_param(&id);
                     conn.execute(
-                        "UPDATE celers_tasks SET state = 'completed', completed_at = NOW() WHERE id = $1",
-                        &[&id_param],
+                        "UPDATE celers_tasks SET state = 'completed', completed_at = NOW() \
+                         WHERE id = $1 AND queue_name = $2 AND state = 'processing'",
+                        &[&id_param, &queue],
                     )
                     .await
                     .map_err(|e| CelersError::Other(format!("Ack failed: {}", e)))?;
@@ -174,12 +178,14 @@ impl PostgresBroker {
 
             let reject_fn = Box::new(move |_error: &str| {
                 let conn = conn2.clone();
+                let queue = queue2.clone();
                 let id = task_id;
                 Box::pin(async move {
                     let id_param = uuid_param(&id);
                     conn.execute(
-                        "UPDATE celers_tasks SET retry_count = retry_count + 1 WHERE id = $1",
-                        &[&id_param],
+                        "UPDATE celers_tasks SET retry_count = retry_count + 1 \
+                         WHERE id = $1 AND queue_name = $2",
+                        &[&id_param, &queue],
                     )
                     .await
                     .map_err(|e| CelersError::Other(format!("Reject failed: {}", e)))?;
@@ -733,7 +739,7 @@ impl PostgresBroker {
             WHERE task_name = $1
               AND queue_name = $2
               AND state IN ('pending', 'processing')
-              AND created_at < NOW() - INTERVAL '1 second' * $3
+              AND created_at < NOW() - INTERVAL '1 second' * $3::bigint
             "#,
                 &[&task_name, &self.queue_name, &ttl_secs],
             )
@@ -783,7 +789,7 @@ impl PostgresBroker {
                 error_message = 'Task expired due to TTL'
             WHERE queue_name = $1
               AND state IN ('pending', 'processing')
-              AND created_at < NOW() - INTERVAL '1 second' * $2
+              AND created_at < NOW() - INTERVAL '1 second' * $2::bigint
             "#,
                 &[&self.queue_name, &ttl_secs],
             )
@@ -1124,7 +1130,7 @@ impl PostgresBroker {
             WHERE task_name = $1
               AND queue_name = $2
               AND state = 'completed'
-              AND completed_at > NOW() - INTERVAL '1 second' * $3
+              AND completed_at > NOW() - INTERVAL '1 second' * $3::bigint
             "#,
                 &[&task_name, &self.queue_name, &window_secs],
             )
@@ -1423,7 +1429,7 @@ impl PostgresBroker {
             SELECT id, task_id, task_name, retry_count, error_message, failed_at
             FROM celers_dead_letter_queue
             WHERE queue_name = $1
-              AND failed_at > NOW() - INTERVAL '1 second' * $2
+              AND failed_at > NOW() - INTERVAL '1 second' * $2::bigint
             ORDER BY failed_at DESC
             "#,
                 &[&self.queue_name, &window_secs],

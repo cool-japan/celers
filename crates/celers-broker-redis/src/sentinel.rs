@@ -2,6 +2,7 @@
 //!
 //! Provides automatic master discovery and failover detection through Redis Sentinel.
 
+use crate::connection::RedisClientExt;
 use crate::{CelersError, Result};
 use redis::Client;
 use std::sync::Arc;
@@ -234,7 +235,7 @@ impl SentinelClient {
             .map_err(|e| CelersError::Broker(format!("Failed to create sentinel client: {}", e)))?;
 
         let mut conn = client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Failed to connect to sentinel: {}", e)))?;
 
@@ -303,7 +304,7 @@ impl SentinelClient {
 
     /// Verify that a client is still connected to the current master
     async fn verify_client(&self, client: &Client) -> bool {
-        match client.get_multiplexed_async_connection().await {
+        match client.celers_multiplexed_connection().await {
             Ok(mut conn) => {
                 // Try a simple PING command
                 matches!(redis::cmd("PING").query_async::<String>(&mut conn).await, Ok(response) if response == "PONG")

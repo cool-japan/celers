@@ -20,7 +20,7 @@
 //! ```
 
 use crate::embed::{CallbackSignature, EmbedOptions, EmbeddedBody};
-use crate::{ContentEncoding, ContentType, Message, MessageHeaders, MessageProperties};
+use crate::{ContentType, Message, MessageHeaders, MessageProperties};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -441,17 +441,11 @@ impl MessageBuilder {
             reply_to: self.reply_to,
         };
 
-        // Build message. Content encoding follows content type: JSON is
-        // text (utf-8), everything else (msgpack, binary, custom formats)
-        // is treated as binary. Hardcoding utf-8 regardless of content type
-        // would declare `content-encoding: utf-8` on a binary body; this
-        // mirrors the mapping `build_v5_message` uses (see `v5.rs`) so the
-        // two construction paths agree on the same envelope field.
-        let content_encoding = if matches!(self.content_type, ContentType::Json) {
-            ContentEncoding::Utf8
-        } else {
-            ContentEncoding::Binary
-        };
+        // Build message. Content encoding follows content type via
+        // `ContentType::default_content_encoding`, shared with
+        // `build_v5_message` (see `v5.rs`) so the two message-construction
+        // paths cannot independently drift on this mapping.
+        let content_encoding = self.content_type.default_content_encoding();
 
         let message = Message {
             headers,

@@ -24,6 +24,11 @@ oxiarc-zstd = { workspace = true }
 # AMQP client
 lapin = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
+
+# Pure-Rust TLS crypto provider (installed as the process default so AMQPS
+# handshakes go through rustls-rustcrypto instead of an FFI provider)
+oxitls = { workspace = true }
 
 # HTTP client for RabbitMQ Management API
 oxihttp-client = { workspace = true }
@@ -33,13 +38,15 @@ urlencoding = { workspace = true }
 celers-protocol = { workspace = true, features = ["gzip", "zlib", "zstd-compression"] }
 celers-kombu = { workspace = true }
 celers-core = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
 
 [features]
-amqp-events = ["dep:celers-core", "dep:futures-util"]
+amqp-events = ["dep:celers-core"]
 
 [dev-dependencies]
 celers-core = { workspace = true }
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which makes the
+# deduplication-cache TTL tests deterministic without sleeping.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 criterion = { workspace = true }

@@ -142,6 +142,155 @@ impl MysqlBroker {
         Ok(deleted)
     }
 
+    /// Delete terminal tasks older than `retain_for`, in bounded chunks.
+    ///
+    /// `ack` intentionally leaves completed rows in `celers_tasks` for
+    /// auditing (see `broker_trait.rs`'s `ack`), but `celers_tasks` is also
+    /// the table every `dequeue` scans: without pruning it grows with
+    /// lifetime throughput, and both `queue_size()` and the statistics
+    /// queries degrade linearly. This is the manual, one-shot form;
+    /// [`MysqlBroker::spawn_retention_task`] runs it on a schedule.
+    ///
+    /// Scoped to this broker's own `queue_name` — unlike
+    /// [`MysqlBroker::archive_completed_tasks`] (deliberately queue-blind,
+    /// see the `queue_name` field doc on [`MysqlBroker`]), this is a new
+    /// method, not a behavior change to an existing queue-blind one.
+    ///
+    /// Returns the number of rows deleted. Each statement deletes at most
+    /// `batch_size` rows (chosen through the nested-derived-table `LIMIT` in
+    /// [`crate::sql_text::purge_terminal_tasks_sql`], which also works around
+    /// MySQL's `ERROR 1093`/`ERROR 1235` restrictions on deleting from a
+    /// table via a `LIMIT`-bearing subquery on itself) so no single sweep
+    /// holds long-lived row locks, and the loop stops early once a batch
+    /// comes back short.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use celers_broker_sql::MysqlBroker;
+    /// # use std::time::Duration;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    ///
+    /// // Delete this queue's terminal tasks older than 7 days, in chunks of
+    /// // 10,000 rows, at most 100 chunks in this call.
+    /// let deleted = broker
+    ///     .purge_terminal_tasks(Duration::from_secs(7 * 24 * 3600), 10_000, 100)
+    ///     .await?;
+    /// println!("Purged {} terminal tasks", deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn purge_terminal_tasks(
+        &self,
+        retain_for: Duration,
+        batch_size: i64,
+        max_batches: u32,
+    ) -> Result<u64> {
+        let batch_size = batch_size.clamp(1, 100_000);
+        // MySQL DATETIME/TIMESTAMP parameter convention — see `row_ext.rs`'s
+        // "DateTime<Utc> parameter convention (MySQL)" section: bind
+        // `.format("%Y-%m-%d %H:%M:%S%.6f")`, never `.to_rfc3339()`.
+        let cutoff = Utc::now() - chrono::Duration::seconds(retain_for.as_secs() as i64);
+        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let statement = crate::sql_text::purge_terminal_tasks_sql(batch_size);
+
+        let mut deleted_total = 0u64;
+        for _ in 0..max_batches {
+            let deleted = self
+                .connection()
+                .execute(&statement, &[&self.queue_name, &cutoff_str])
+                .await
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to purge terminal tasks: {}", e))
+                })?;
+            deleted_total = deleted_total.saturating_add(deleted);
+            if deleted < batch_size as u64 {
+                break;
+            }
+        }
+
+        if deleted_total > 0 {
+            tracing::info!(
+                queue = %self.queue_name,
+                deleted = deleted_total,
+                "Purged terminal tasks from the dispatch table"
+            );
+        }
+        Ok(deleted_total)
+    }
+
+    /// Start a background retention sweep for this broker's queue.
+    ///
+    /// Deliberately opt-in rather than started from a constructor: deleting a
+    /// deployment's audit history is not something a library may decide on
+    /// its own. Drop the returned handle — or call
+    /// [`tokio::task::JoinHandle::abort`] on it — to stop sweeping.
+    ///
+    /// The spawned task borrows nothing from `self`: `MyConnection` is
+    /// `Clone` and pool-backed (see `broker_core.rs`'s `connection()` doc),
+    /// so it is cloned into the task along with the queue label, and the
+    /// sweeper outlives this borrow without forcing the broker into an
+    /// `Arc`. The cutoff is recomputed from `Utc::now()` on every tick
+    /// (rather than a single upfront offset) so a sweeper left running for
+    /// days keeps using a correctly moving cutoff.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use celers_broker_sql::{MysqlBroker, RetentionConfig};
+    /// # async fn example() -> celers_core::Result<()> {
+    /// let broker = MysqlBroker::new("mysql://localhost/db").await?;
+    /// let sweeper = broker.spawn_retention_task(RetentionConfig::default());
+    /// // ... later ...
+    /// sweeper.abort();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn spawn_retention_task(&self, config: RetentionConfig) -> tokio::task::JoinHandle<()> {
+        let conn = self.connection().clone();
+        let queue_name = self.queue_name.clone();
+        let batch_size = config.batch_size.clamp(1, 100_000);
+        let statement = crate::sql_text::purge_terminal_tasks_sql(batch_size);
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(config.sweep_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let cutoff =
+                    Utc::now() - chrono::Duration::seconds(config.retain_for.as_secs() as i64);
+                let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+
+                let mut deleted_total = 0u64;
+                for _ in 0..config.max_batches_per_sweep {
+                    match conn.execute(&statement, &[&queue_name, &cutoff_str]).await {
+                        Ok(deleted) => {
+                            deleted_total = deleted_total.saturating_add(deleted);
+                            if deleted < batch_size as u64 {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                queue = %queue_name,
+                                error = %e,
+                                "Retention sweep failed; will retry on the next tick"
+                            );
+                            break;
+                        }
+                    }
+                }
+                if deleted_total > 0 {
+                    tracing::info!(
+                        queue = %queue_name,
+                        deleted = deleted_total,
+                        "Retention sweep pruned terminal tasks"
+                    );
+                }
+            }
+        })
+    }
+
     /// Calculate optimal batch size based on current queue depth and load
     ///
     /// This implements an adaptive batch sizing strategy:
@@ -729,19 +878,27 @@ impl MysqlBroker {
         dedup_key: &str,
         window_secs: i64,
     ) -> Result<TaskId> {
-        // Check for existing task within window
+        // Check for existing task within window.
+        //
+        // Scoped to `queue_name` (leading predicate, matching the
+        // `sql_text::dequeue_select_sql` convention) for the same reason as
+        // `MysqlBroker::enqueue_deduplicated`: without it, a `dedup_key`
+        // collision across two logical queues silently drops the second
+        // caller's task by handing back the first queue's id instead of
+        // inserting anything into its own queue.
         let existing_rows = self
             .connection()
             .query(
                 r#"
                 SELECT id
                 FROM celers_tasks
-                WHERE JSON_EXTRACT(metadata, '$.dedup_key') = ?
+                WHERE queue_name = ?
+                  AND JSON_EXTRACT(metadata, '$.dedup_key') = ?
                   AND created_at >= DATE_SUB(NOW(), INTERVAL ? SECOND)
                   AND state IN ('pending', 'processing')
                 LIMIT 1
                 "#,
-                &[&dedup_key, &window_secs],
+                &[&self.queue_name, &dedup_key, &window_secs],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to check for duplicates: {}", e)))?;

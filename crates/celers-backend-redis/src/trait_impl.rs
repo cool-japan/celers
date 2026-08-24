@@ -1,254 +1,425 @@
 //! ResultBackend trait implementation for RedisResultBackend
 //!
 //! Contains the `impl ResultBackend for RedisResultBackend` with all required
-//! and optimized batch operations including chunking integration.
+//! and optimized batch operations, plus the low-level inherent helpers every
+//! read/write path shares.
+//!
+//! All writes go through [`crate::codec::write_command`] and all reads through
+//! [`crate::codec::decode_many`], so compression, encryption, chunking and TTL
+//! behave identically no matter which entry point a caller uses.
 
 use async_trait::async_trait;
+use chrono::Utc;
+use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use std::time::Duration;
 use uuid::Uuid;
 
 use crate::backend::RedisResultBackend;
 use crate::result_backend_trait::ResultBackend;
+use crate::telemetry::{OperationContext, OperationSpan, OperationType as TelemetryOp};
 use crate::types::{BackendError, ChordState, Result, TaskMeta};
-use crate::{chunking, compression, encryption, metrics};
+use crate::{codec, metrics};
+
+// =============================================================================
+// Low-level shared helpers
+// =============================================================================
+
+impl RedisResultBackend {
+    /// Record a failed operation on the metrics collector.
+    ///
+    /// Without this, `BackendMetrics::error_count()` stayed at zero forever and
+    /// the health check's error-rate branch was dead code.
+    pub(crate) fn record_failure(&self, error: &BackendError) {
+        self.metrics.record_error(error.category());
+    }
+
+    /// Execute a Redis operation with the configured timeout and retry policy.
+    ///
+    /// The closure receives an owned connection handle, so it never has to
+    /// borrow `self` mutably — which is what makes retrying possible at all.
+    pub(crate) async fn run_with_retry<T, F, Fut>(&self, what: &str, mut op: F) -> Result<T>
+    where
+        F: FnMut(ConnectionManager) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let max_attempts = self.retry_strategy.max_attempts.max(1);
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+
+            let attempt_result = self
+                .with_timeout(what, async {
+                    let conn = self.connection().await?;
+                    op(conn).await
+                })
+                .await;
+
+            match attempt_result {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if attempt >= max_attempts || !self.retry_strategy.is_retryable(&error) {
+                        self.record_failure(&error);
+                        return Err(error);
+                    }
+
+                    let backoff = self.retry_strategy.backoff_duration(attempt - 1);
+                    tracing::debug!(
+                        operation = what,
+                        attempt,
+                        backoff_ms = backoff.as_millis(),
+                        error = %error,
+                        "Retrying Redis operation after transient failure"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+
+    /// Encode `meta` and write it to `key`.
+    ///
+    /// Handles chunking, cleanup of chunk keys left by a previous encoding, TTL
+    /// and the optional compare-and-swap `guard` in a single atomic
+    /// server-side step. Returns `false` only when a `guard` was supplied and
+    /// did not match the bytes currently stored.
+    pub(crate) async fn write_meta_to_key(
+        &self,
+        key: &str,
+        meta: &TaskMeta,
+        ttl: Option<Duration>,
+        guard: Option<&[u8]>,
+    ) -> Result<bool> {
+        let encoded = match codec::encode_meta(
+            meta,
+            &self.compression_config,
+            &self.encryption_config,
+            &self.chunker,
+        ) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.record_failure(&error);
+                return Err(error);
+            }
+        };
+
+        if encoded.is_chunked() {
+            tracing::debug!(
+                key,
+                chunks = encoded.chunks.len(),
+                stored_bytes = encoded.stored_size,
+                "Storing chunked task result"
+            );
+        }
+
+        let command = codec::write_command(key, &encoded, ttl, guard);
+
+        let written: i64 = self
+            .run_with_retry("write_result", |mut conn| {
+                let command = command.clone();
+                async move { Ok(command.query_async(&mut conn).await?) }
+            })
+            .await?;
+
+        self.compression_stats
+            .record(encoded.original_size, encoded.stored_size);
+        self.metrics
+            .record_data_size(encoded.original_size, encoded.stored_size);
+
+        Ok(written == 1)
+    }
+
+    /// Read and decode the values stored at `keys`, reassembling chunked ones.
+    pub(crate) async fn read_metas_from_keys(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<Option<TaskMeta>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let chunker = &self.chunker;
+        let encryption_config = &self.encryption_config;
+
+        self.run_with_retry("read_results", |mut conn| async move {
+            let mut pipe = redis::pipe();
+            for key in keys {
+                pipe.get(key);
+            }
+            let raws: Vec<Option<Vec<u8>>> = pipe.query_async(&mut conn).await?;
+            codec::decode_many(&mut conn, keys, raws, chunker, encryption_config).await
+        })
+        .await
+    }
+
+    /// Read the raw stored bytes for a key without decoding them.
+    ///
+    /// Used by [`compare_and_swap`](Self::compare_and_swap) as the optimistic
+    /// concurrency token: those exact bytes are what the server compares.
+    pub(crate) async fn read_raw(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let key = key.to_string();
+        self.run_with_retry("read_raw", |mut conn| {
+            let key = key.clone();
+            async move { Ok(conn.get::<_, Option<Vec<u8>>>(&key).await?) }
+        })
+        .await
+    }
+
+    /// Fetch a result straight from Redis, bypassing the in-memory cache.
+    ///
+    /// Polling loops and monitoring probes must use this: the cache is
+    /// authoritative only for terminal states.
+    pub async fn get_result_uncached(&mut self, task_id: Uuid) -> Result<Option<TaskMeta>> {
+        let start = std::time::Instant::now();
+        let span = OperationSpan::start(
+            self.telemetry.as_ref(),
+            OperationContext::new(TelemetryOp::Get).with_task_id(task_id),
+        );
+
+        let key = self.task_key(task_id);
+        let result = self.read_metas_from_keys(std::slice::from_ref(&key)).await;
+
+        self.metrics
+            .record_operation(metrics::OperationType::GetResult, start.elapsed());
+
+        match result {
+            Ok(mut metas) => {
+                let meta = metas.pop().flatten();
+                if let Some(ref meta) = meta {
+                    self.cache_terminal(task_id, meta);
+                }
+                span.ok(None);
+                Ok(meta)
+            }
+            Err(error) => {
+                span.err(&error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Cache a result only when it is in a terminal state.
+    ///
+    /// Caching `Pending`/`Started`/`Retry` would pin a task's observed state
+    /// for the whole cache TTL, so every later poll would return the stale
+    /// value and waiters would never see the real completion.
+    pub(crate) fn cache_terminal(&self, task_id: Uuid, meta: &TaskMeta) {
+        if meta.is_terminal() {
+            self.cache.put(task_id, meta.clone());
+        } else {
+            // A task can leave a terminal state again (a retry after failure),
+            // so drop any entry that would now be stale.
+            self.cache.invalidate(task_id);
+        }
+    }
+
+    /// Announce a result write so waiters wake up immediately instead of
+    /// waiting out their next poll interval.
+    pub(crate) async fn publish_notification(&self, task_id: Uuid, meta: &TaskMeta) {
+        if !self.notify_on_store {
+            return;
+        }
+
+        let channel = self.notify_channel(task_id);
+        let payload = meta.result.to_string();
+
+        if let Ok(mut conn) = self.connection().await {
+            if let Err(e) = conn.publish::<_, _, ()>(&channel, payload).await {
+                // Notifications are an optimisation: waiters fall back to
+                // polling, so a publish failure must never fail the write.
+                tracing::debug!(%task_id, error = %e, "Failed to publish result notification");
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ResultBackend implementation
+// =============================================================================
 
 #[async_trait]
 impl ResultBackend for RedisResultBackend {
     async fn store_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<()> {
         let start = std::time::Instant::now();
+        let span = OperationSpan::start(
+            self.telemetry.as_ref(),
+            OperationContext::new(TelemetryOp::Store).with_task_id(task_id),
+        );
 
-        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
-        let value =
-            serde_json::to_string(meta).map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let ttl = self.ttl_config.get_ttl(&meta.task_name);
 
-        let original_size = value.len();
-
-        // Apply compression if configured
-        let compressed = compression::maybe_compress(value.as_bytes(), &self.compression_config)
-            .map_err(|e| BackendError::Serialization(format!("Compression error: {}", e)))?;
-
-        // Apply encryption if configured
-        let data = encryption::encrypt(&compressed, &self.encryption_config)
-            .map_err(|e| BackendError::Serialization(format!("Encryption error: {}", e)))?;
-
-        let stored_size = data.len();
-
-        // Apply chunking for large payloads
-        if self.chunker.needs_chunking(&data) {
-            let (metadata, chunks) = self.chunker.split_chunks(&data);
-            let sentinel = self.chunker.create_sentinel(&metadata);
-
-            // Use pipeline for atomic multi-key store
-            let mut pipe = redis::pipe();
-
-            // Store sentinel at main key
-            pipe.set(&key, &sentinel);
-
-            // Store chunk metadata
-            let meta_key = chunking::ResultChunker::metadata_key(&key);
-            let meta_json = serde_json::to_vec(&metadata)
-                .map_err(|e| BackendError::Serialization(format!("Chunk metadata error: {}", e)))?;
-            pipe.set(&meta_key, &meta_json);
-
-            // Store each chunk
-            for (i, chunk) in chunks.iter().enumerate() {
-                let chunk_key = format!("{}:chunk:{}", key, i);
-                pipe.set(&chunk_key, chunk.as_slice());
+        match self.write_meta_to_key(&key, meta, ttl, None).await {
+            Ok(_) => {
+                self.cache_terminal(task_id, meta);
+                self.publish_notification(task_id, meta).await;
+                self.metrics
+                    .record_operation(metrics::OperationType::StoreResult, start.elapsed());
+                span.ok(None);
+                Ok(())
             }
-
-            // Set TTL on all keys if configured
-            if let Some(ttl) = self.ttl_config.get_ttl(&meta.task_name) {
-                let ttl_secs = ttl.as_secs() as i64;
-                pipe.expire(&key, ttl_secs);
-                pipe.expire(&meta_key, ttl_secs);
-                for i in 0..chunks.len() {
-                    let chunk_key = format!("{}:chunk:{}", key, i);
-                    pipe.expire(&chunk_key, ttl_secs);
-                }
+            Err(error) => {
+                span.err(&error);
+                Err(error)
             }
-
-            pipe.query_async::<()>(&mut conn).await?;
-
-            // Update cache
-            self.cache.put(task_id, meta.clone());
-
-            // Track compression stats
-            self.compression_stats.record(original_size, stored_size);
-
-            // Record metrics
-            self.metrics
-                .record_operation(metrics::OperationType::StoreResult, start.elapsed());
-            self.metrics.record_data_size(original_size, stored_size);
-
-            return Ok(());
         }
-
-        conn.set::<_, _, ()>(&key, &data).await?;
-
-        // Apply per-task TTL if configured
-        if let Some(ttl) = self.ttl_config.get_ttl(&meta.task_name) {
-            conn.expire::<_, ()>(&key, ttl.as_secs() as i64).await?;
-        }
-
-        // Update cache
-        self.cache.put(task_id, meta.clone());
-
-        // Track compression stats
-        self.compression_stats.record(original_size, stored_size);
-
-        // Record metrics
-        self.metrics
-            .record_operation(metrics::OperationType::StoreResult, start.elapsed());
-        self.metrics.record_data_size(original_size, stored_size);
-
-        Ok(())
     }
 
     async fn get_result(&mut self, task_id: Uuid) -> Result<Option<TaskMeta>> {
         let start = std::time::Instant::now();
 
-        // Check cache first
+        // The cache only ever holds terminal results, so a hit is authoritative.
         if let Some(meta) = self.cache.get(task_id) {
-            self.metrics.record_cache_hit();
-            self.metrics
-                .record_operation(metrics::OperationType::GetResult, start.elapsed());
-            return Ok(Some(meta));
+            if meta.is_terminal() {
+                self.metrics.record_cache_hit();
+                self.metrics
+                    .record_operation(metrics::OperationType::GetResult, start.elapsed());
+                return Ok(Some(meta));
+            }
+            // Defensive: a non-terminal entry must never be served.
+            self.cache.invalidate(task_id);
         }
 
-        // Cache miss, fetch from Redis
         self.metrics.record_cache_miss();
-
-        let mut conn = self.connection().await?;
-        let key = self.task_key(task_id);
-
-        let value: Option<Vec<u8>> = conn.get(&key).await?;
-        let result = match value {
-            Some(raw_data) => {
-                // Check if the data is chunked and reassemble if needed
-                let data = if chunking::ResultChunker::is_chunked(&raw_data) {
-                    let metadata =
-                        chunking::ResultChunker::parse_sentinel(&raw_data).map_err(|e| {
-                            BackendError::Serialization(format!("Chunk sentinel error: {}", e))
-                        })?;
-
-                    // Read all chunks using pipeline
-                    let chunk_keys =
-                        chunking::ResultChunker::chunk_keys(&key, metadata.total_chunks);
-                    let mut pipe = redis::pipe();
-                    for ck in &chunk_keys {
-                        pipe.get(ck);
-                    }
-                    let chunks: Vec<Vec<u8>> = pipe.query_async(&mut conn).await?;
-
-                    // Reassemble
-                    self.chunker
-                        .reassemble_chunks(&metadata, &chunks)
-                        .map_err(|e| {
-                            BackendError::Serialization(format!("Chunk reassembly error: {}", e))
-                        })?
-                } else {
-                    raw_data
-                };
-
-                // Decrypt if needed
-                let decrypted = encryption::decrypt(&data, &self.encryption_config)
-                    .map_err(|e| BackendError::Serialization(format!("Decryption error: {}", e)))?;
-
-                // Decompress if needed
-                let decompressed = compression::maybe_decompress(&decrypted).map_err(|e| {
-                    BackendError::Serialization(format!("Decompression error: {}", e))
-                })?;
-
-                let v = String::from_utf8(decompressed)
-                    .map_err(|e| BackendError::Serialization(format!("UTF-8 error: {}", e)))?;
-
-                let meta: TaskMeta = serde_json::from_str(&v)
-                    .map_err(|e| BackendError::Serialization(e.to_string()))?;
-
-                // Store in cache
-                self.cache.put(task_id, meta.clone());
-
-                Ok(Some(meta))
-            }
-            None => Ok(None),
-        };
-
-        // Record metrics
-        self.metrics
-            .record_operation(metrics::OperationType::GetResult, start.elapsed());
-
-        result
+        self.get_result_uncached(task_id).await
     }
 
     async fn delete_result(&mut self, task_id: Uuid) -> Result<()> {
         let start = std::time::Instant::now();
+        let span = OperationSpan::start(
+            self.telemetry.as_ref(),
+            OperationContext::new(TelemetryOp::Delete).with_task_id(task_id),
+        );
 
-        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
+        let command = codec::delete_command(&key);
 
-        // Clean up chunk keys if this was a chunked result (best-effort)
-        let meta_key = chunking::ResultChunker::metadata_key(&key);
-        if let Ok(Some(meta_bytes)) = conn.get::<_, Option<Vec<u8>>>(&meta_key).await {
-            if let Ok(metadata) = serde_json::from_slice::<chunking::ChunkMetadata>(&meta_bytes) {
-                let mut pipe = redis::pipe();
-                pipe.del(&meta_key);
-                for i in 0..metadata.total_chunks {
-                    pipe.del(format!("{}:chunk:{}", key, i));
-                }
-                // Best-effort cleanup: ignore errors from chunk deletion
-                let _ = pipe.query_async::<()>(&mut conn).await;
-            }
-        }
+        let outcome = self
+            .run_with_retry("delete_result", |mut conn| {
+                let command = command.clone();
+                async move { Ok(command.query_async::<i64>(&mut conn).await?) }
+            })
+            .await;
 
-        // Delete the main key (sentinel or normal data)
-        conn.del::<_, ()>(&key).await?;
-
-        // Invalidate cache
         self.cache.invalidate(task_id);
-
-        // Record metrics
         self.metrics
             .record_operation(metrics::OperationType::DeleteResult, start.elapsed());
 
-        Ok(())
+        match outcome {
+            Ok(_) => {
+                span.ok(None);
+                Ok(())
+            }
+            Err(error) => {
+                span.err(&error);
+                Err(error)
+            }
+        }
     }
 
     async fn set_expiration(&mut self, task_id: Uuid, ttl: Duration) -> Result<()> {
-        let mut conn = self.connection().await?;
         let key = self.task_key(task_id);
-        conn.expire::<_, ()>(&key, ttl.as_secs() as i64).await?;
-        Ok(())
+        let command = codec::expire_command(&key, ttl);
+
+        self.run_with_retry("set_expiration", |mut conn| {
+            let command = command.clone();
+            async move {
+                command.query_async::<i64>(&mut conn).await?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn chord_init(&mut self, state: ChordState) -> Result<()> {
-        let mut conn = self.connection().await?;
         let key = self.chord_key(state.chord_id);
         let counter_key = self.chord_counter_key(state.chord_id);
+        let value = match serde_json::to_string(&state) {
+            Ok(value) => value,
+            Err(e) => {
+                let error = BackendError::Serialization(e.to_string());
+                self.record_failure(&error);
+                return Err(error);
+            }
+        };
+        let ttl_secs = self.ttl_config.chord_ttl().map(|t| t.as_secs().max(1));
 
-        let value = serde_json::to_string(&state)
-            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        self.run_with_retry("chord_init", |mut conn| {
+            let key = key.clone();
+            let counter_key = counter_key.clone();
+            let value = value.clone();
+            async move {
+                // State and counter are created together, and both carry a TTL
+                // so an abandoned chord cannot leak two keys forever.
+                let mut pipe = redis::pipe();
+                pipe.atomic();
+                match ttl_secs {
+                    Some(secs) => {
+                        pipe.cmd("SET").arg(&key).arg(&value).arg("EX").arg(secs);
+                        pipe.cmd("SET").arg(&counter_key).arg(0).arg("EX").arg(secs);
+                    }
+                    None => {
+                        pipe.set(&key, &value);
+                        pipe.set(&counter_key, 0);
+                    }
+                }
+                pipe.query_async::<()>(&mut conn).await?;
+                Ok(())
+            }
+        })
+        .await
+    }
 
-        // Store chord state
-        conn.set::<_, _, ()>(&key, value).await?;
+    async fn chord_update_state(&mut self, state: ChordState) -> Result<()> {
+        let key = self.chord_key(state.chord_id);
+        let value = match serde_json::to_string(&state) {
+            Ok(value) => value,
+            Err(e) => {
+                let error = BackendError::Serialization(e.to_string());
+                self.record_failure(&error);
+                return Err(error);
+            }
+        };
+        let ttl_secs = self.ttl_config.chord_ttl().map(|t| t.as_secs().max(1));
 
-        // Initialize counter to 0
-        conn.set::<_, _, ()>(&counter_key, 0).await?;
-
-        Ok(())
+        self.run_with_retry("chord_update_state", |mut conn| {
+            let key = key.clone();
+            let value = value.clone();
+            async move {
+                // Deliberately does NOT touch the completion counter: this
+                // persists a state change, it is not a reset.
+                match ttl_secs {
+                    Some(secs) => {
+                        redis::cmd("SET")
+                            .arg(&key)
+                            .arg(&value)
+                            .arg("EX")
+                            .arg(secs)
+                            .query_async::<()>(&mut conn)
+                            .await?;
+                    }
+                    None => {
+                        conn.set::<_, _, ()>(&key, &value).await?;
+                    }
+                }
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn chord_complete_task(&mut self, chord_id: Uuid) -> Result<usize> {
         let start = std::time::Instant::now();
-
-        let mut conn = self.connection().await?;
         let counter_key = self.chord_counter_key(chord_id);
 
-        // Atomically increment and return new value
-        let count: usize = conn.incr(&counter_key, 1).await?;
+        let count: usize = self
+            .run_with_retry("chord_complete_task", |mut conn| {
+                let counter_key = counter_key.clone();
+                async move { Ok(conn.incr::<_, _, usize>(&counter_key, 1).await?) }
+            })
+            .await?;
 
-        // Record metrics
         self.metrics
             .record_operation(metrics::OperationType::ChordOperation, start.elapsed());
 
@@ -256,14 +427,38 @@ impl ResultBackend for RedisResultBackend {
     }
 
     async fn chord_get_state(&mut self, chord_id: Uuid) -> Result<Option<ChordState>> {
-        let mut conn = self.connection().await?;
         let key = self.chord_key(chord_id);
+        let counter_key = self.chord_counter_key(chord_id);
 
-        let value: Option<String> = conn.get(&key).await?;
+        let (value, counter): (Option<String>, Option<usize>) = self
+            .run_with_retry("chord_get_state", |mut conn| {
+                let key = key.clone();
+                let counter_key = counter_key.clone();
+                async move {
+                    let mut pipe = redis::pipe();
+                    pipe.get(&key);
+                    pipe.get(&counter_key);
+                    Ok(pipe.query_async(&mut conn).await?)
+                }
+            })
+            .await?;
+
         match value {
             Some(v) => {
-                let state = serde_json::from_str(&v)
-                    .map_err(|e| BackendError::Serialization(e.to_string()))?;
+                let mut state: ChordState = match serde_json::from_str(&v) {
+                    Ok(state) => state,
+                    Err(e) => {
+                        let error = BackendError::Serialization(e.to_string());
+                        self.record_failure(&error);
+                        return Err(error);
+                    }
+                };
+                // The completion count lives in its own key so it can be
+                // incremented atomically; merge it back in so `is_complete()`,
+                // `percent_complete()` and chord cleanup all see reality.
+                if let Some(completed) = counter {
+                    state.completed = completed.max(state.completed);
+                }
                 Ok(Some(state))
             }
             None => Ok(None),
@@ -273,7 +468,9 @@ impl ResultBackend for RedisResultBackend {
     async fn chord_cancel(&mut self, chord_id: Uuid, reason: Option<String>) -> Result<()> {
         if let Some(mut state) = self.chord_get_state(chord_id).await? {
             state.cancel(reason);
-            self.chord_init(state).await?;
+            // Must not reset the completion counter: tasks that already
+            // finished stay finished.
+            self.chord_update_state(state).await?;
         }
         Ok(())
     }
@@ -286,38 +483,73 @@ impl ResultBackend for RedisResultBackend {
         }
 
         let start = std::time::Instant::now();
+        let span = OperationSpan::start(
+            self.telemetry.as_ref(),
+            OperationContext::new(TelemetryOp::BatchStore).with_batch_size(results.len()),
+        );
 
-        let mut conn = self.connection().await?;
-        let mut pipe = redis::pipe();
+        let batch_limit = self.pipeline_config.max_batch_size.max(1);
+        let mut stored_total = 0usize;
 
-        for (task_id, meta) in results {
-            let key = self.task_key(*task_id);
-            let value = serde_json::to_string(meta)
-                .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        for group in results.chunks(batch_limit) {
+            let mut commands = Vec::with_capacity(group.len());
 
-            let original_size = value.len();
+            for (task_id, meta) in group {
+                let key = self.task_key(*task_id);
+                let encoded = match codec::encode_meta(
+                    meta,
+                    &self.compression_config,
+                    &self.encryption_config,
+                    &self.chunker,
+                ) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        self.record_failure(&error);
+                        span.err(&error);
+                        return Err(error);
+                    }
+                };
 
-            // Apply compression if configured
-            let compressed =
-                compression::maybe_compress(value.as_bytes(), &self.compression_config).map_err(
-                    |e| BackendError::Serialization(format!("Compression error: {}", e)),
-                )?;
+                stored_total += encoded.stored_size;
+                self.metrics
+                    .record_data_size(encoded.original_size, encoded.stored_size);
+                self.compression_stats
+                    .record(encoded.original_size, encoded.stored_size);
 
-            // Apply encryption if configured
-            let data = encryption::encrypt(&compressed, &self.encryption_config)
-                .map_err(|e| BackendError::Serialization(format!("Encryption error: {}", e)))?;
+                // The batch path applies exactly the same TTL policy as the
+                // single-key path.
+                let ttl = self.ttl_config.get_ttl(&meta.task_name);
+                commands.push(codec::write_command(&key, &encoded, ttl, None));
+            }
 
-            let stored_size = data.len();
+            let outcome = self
+                .run_with_retry("store_results_batch", |mut conn| {
+                    let commands = commands.clone();
+                    async move {
+                        let mut pipe = redis::pipe();
+                        for command in commands {
+                            pipe.add_command(command);
+                        }
+                        pipe.query_async::<Vec<i64>>(&mut conn).await?;
+                        Ok(())
+                    }
+                })
+                .await;
 
-            self.metrics.record_data_size(original_size, stored_size);
-            pipe.set(&key, data);
+            if let Err(error) = outcome {
+                span.err(&error);
+                return Err(error);
+            }
         }
 
-        pipe.query_async::<()>(&mut conn).await?;
+        // Keep the cache consistent with what was just written.
+        for (task_id, meta) in results {
+            self.cache_terminal(*task_id, meta);
+        }
 
-        // Record metrics
         self.metrics
             .record_operation(metrics::OperationType::StoreBatch, start.elapsed());
+        span.ok(Some(stored_total));
 
         Ok(())
     }
@@ -328,46 +560,34 @@ impl ResultBackend for RedisResultBackend {
         }
 
         let start = std::time::Instant::now();
+        let span = OperationSpan::start(
+            self.telemetry.as_ref(),
+            OperationContext::new(TelemetryOp::BatchGet).with_batch_size(task_ids.len()),
+        );
 
-        let mut conn = self.connection().await?;
-        let mut pipe = redis::pipe();
+        let batch_limit = self.pipeline_config.max_batch_size.max(1);
+        let mut results = Vec::with_capacity(task_ids.len());
 
-        for task_id in task_ids {
-            let key = self.task_key(*task_id);
-            pipe.get(&key);
-        }
-
-        let values: Vec<Option<Vec<u8>>> = pipe.query_async(&mut conn).await?;
-
-        let mut results = Vec::with_capacity(values.len());
-        for value_opt in values {
-            match value_opt {
-                Some(data) => {
-                    // Decrypt if needed
-                    let decrypted =
-                        encryption::decrypt(&data, &self.encryption_config).map_err(|e| {
-                            BackendError::Serialization(format!("Decryption error: {}", e))
-                        })?;
-
-                    // Decompress if needed
-                    let decompressed = compression::maybe_decompress(&decrypted).map_err(|e| {
-                        BackendError::Serialization(format!("Decompression error: {}", e))
-                    })?;
-
-                    let v = String::from_utf8(decompressed)
-                        .map_err(|e| BackendError::Serialization(format!("UTF-8 error: {}", e)))?;
-
-                    let meta = serde_json::from_str(&v)
-                        .map_err(|e| BackendError::Serialization(e.to_string()))?;
-                    results.push(Some(meta));
+        for group in task_ids.chunks(batch_limit) {
+            let keys: Vec<String> = group.iter().map(|id| self.task_key(*id)).collect();
+            match self.read_metas_from_keys(&keys).await {
+                Ok(metas) => results.extend(metas),
+                Err(error) => {
+                    span.err(&error);
+                    return Err(error);
                 }
-                None => results.push(None),
             }
         }
 
-        // Record metrics
+        for (task_id, meta) in task_ids.iter().zip(results.iter()) {
+            if let Some(meta) = meta {
+                self.cache_terminal(*task_id, meta);
+            }
+        }
+
         self.metrics
             .record_operation(metrics::OperationType::GetBatch, start.elapsed());
+        span.ok(None);
 
         Ok(results)
     }
@@ -378,21 +598,59 @@ impl ResultBackend for RedisResultBackend {
         }
 
         let start = std::time::Instant::now();
+        let batch_limit = self.pipeline_config.max_batch_size.max(1);
 
-        let mut conn = self.connection().await?;
-        let mut pipe = redis::pipe();
+        for group in task_ids.chunks(batch_limit) {
+            let commands: Vec<redis::Cmd> = group
+                .iter()
+                .map(|id| codec::delete_command(&self.task_key(*id)))
+                .collect();
 
-        for task_id in task_ids {
-            let key = self.task_key(*task_id);
-            pipe.del(&key);
+            self.run_with_retry("delete_results_batch", |mut conn| {
+                let commands = commands.clone();
+                async move {
+                    let mut pipe = redis::pipe();
+                    for command in commands {
+                        pipe.add_command(command);
+                    }
+                    pipe.query_async::<Vec<i64>>(&mut conn).await?;
+                    Ok(())
+                }
+            })
+            .await?;
         }
 
-        pipe.query_async::<()>(&mut conn).await?;
+        // Deleted results must not keep being served from the cache.
+        for task_id in task_ids {
+            self.cache.invalidate(*task_id);
+        }
 
-        // Record metrics
         self.metrics
             .record_operation(metrics::OperationType::DeleteBatch, start.elapsed());
 
+        Ok(())
+    }
+
+    async fn store_versioned_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<u32> {
+        self.store_versioned_result_impl(task_id, meta).await
+    }
+
+    async fn get_result_version(
+        &mut self,
+        task_id: Uuid,
+        version: u32,
+    ) -> Result<Option<TaskMeta>> {
+        self.get_result_version_impl(task_id, version).await
+    }
+
+    async fn mark_completed(&mut self, task_id: Uuid, result: crate::TaskResult) -> Result<()> {
+        // Read through Redis rather than the cache so a concurrently updated
+        // record is not clobbered with a stale copy.
+        if let Some(mut meta) = self.get_result_uncached(task_id).await? {
+            meta.result = result;
+            meta.completed_at = Some(Utc::now());
+            self.store_result(task_id, &meta).await?;
+        }
         Ok(())
     }
 }

@@ -616,6 +616,7 @@ mod task_serde_roundtrip {
             updated_at in arb_datetime(),
             max_retries in any::<u32>(),
             timeout_secs in proptest::option::of(any::<u64>()),
+            expires_at in proptest::option::of(arb_datetime()),
             priority in any::<i32>(),
             group_id in proptest::option::of(arb_uuid()),
             chord_id in proptest::option::of(arb_uuid()),
@@ -630,6 +631,7 @@ mod task_serde_roundtrip {
                 updated_at,
                 max_retries,
                 timeout_secs,
+                expires_at,
                 priority,
                 group_id,
                 chord_id,
@@ -659,6 +661,7 @@ mod task_serde_roundtrip {
         prop_assert_eq!(a.updated_at, b.updated_at);
         prop_assert_eq!(a.max_retries, b.max_retries);
         prop_assert_eq!(a.timeout_secs, b.timeout_secs);
+        prop_assert_eq!(a.expires_at, b.expires_at);
         prop_assert_eq!(a.priority, b.priority);
         prop_assert_eq!(a.group_id, b.group_id);
         prop_assert_eq!(a.chord_id, b.chord_id);

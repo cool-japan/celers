@@ -194,7 +194,7 @@ impl std::fmt::Display for TaskResult {
 }
 
 /// Progress information for long-running tasks
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgressInfo {
     /// Current progress value (e.g., items processed)
     pub current: u64,
@@ -268,7 +268,7 @@ impl std::fmt::Display for ProgressInfo {
 }
 
 /// Task metadata stored in result backend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskMeta {
     /// Task ID
     pub task_id: Uuid,
@@ -487,6 +487,8 @@ pub struct TaskTtlConfig {
     default_ttl: Option<Duration>,
     /// Per-task-type TTL overrides (task_name -> TTL)
     task_ttls: HashMap<String, Duration>,
+    /// TTL applied to chord state and counter keys (falls back to `default_ttl`)
+    chord_ttl: Option<Duration>,
 }
 
 impl Default for TaskTtlConfig {
@@ -501,6 +503,7 @@ impl TaskTtlConfig {
         Self {
             default_ttl: None,
             task_ttls: HashMap::new(),
+            chord_ttl: None,
         }
     }
 
@@ -509,6 +512,7 @@ impl TaskTtlConfig {
         Self {
             default_ttl: Some(ttl),
             task_ttls: HashMap::new(),
+            chord_ttl: None,
         }
     }
 
@@ -527,7 +531,7 @@ impl TaskTtlConfig {
 
     /// Check if this configuration has any TTLs configured
     pub fn is_empty(&self) -> bool {
-        self.default_ttl.is_none() && self.task_ttls.is_empty()
+        self.default_ttl.is_none() && self.task_ttls.is_empty() && self.chord_ttl.is_none()
     }
 
     /// Get the default TTL
@@ -549,6 +553,25 @@ impl TaskTtlConfig {
     pub fn task_ttl_count(&self) -> usize {
         self.task_ttls.len()
     }
+
+    /// Get the TTL applied to chord state and counter keys.
+    ///
+    /// Falls back to the default result TTL when no chord-specific value is
+    /// configured, so chords never outlive the results they coordinate.
+    pub fn chord_ttl(&self) -> Option<Duration> {
+        self.chord_ttl.or(self.default_ttl)
+    }
+
+    /// Set an explicit TTL for chord state and counter keys.
+    pub fn set_chord_ttl(&mut self, ttl: Duration) {
+        self.chord_ttl = Some(ttl);
+    }
+
+    /// Builder form of [`Self::set_chord_ttl`].
+    pub fn with_chord_ttl(mut self, ttl: Duration) -> Self {
+        self.chord_ttl = Some(ttl);
+        self
+    }
 }
 
 /// Chord state (for barrier synchronization)
@@ -565,6 +588,24 @@ pub struct ChordState {
 
     /// Callback task to execute when chord completes
     pub callback: Option<String>,
+
+    /// Task to enqueue as a bare, name-only successor once the chord
+    /// callback task itself completes.
+    ///
+    /// Without this, the callback task built from [`Self::callback`] carries
+    /// no continuation at all, so a chord can never be a non-terminal step
+    /// of a chain — whatever was supposed to run after the callback is
+    /// silently dropped. Deliberately mirrors
+    /// `celers_core::TaskMetadata::on_success_link`'s name-only idiom rather
+    /// than embedding a full successor signature: it carries no args,
+    /// kwargs, or options of its own, so the successor runs with the
+    /// callback's raw result as its payload (the same "bare `on_success_link`,
+    /// no chain tail" path `celers-worker`'s workflow module already
+    /// implements for ordinary tasks). A successor that needs its own
+    /// arguments or further chain steps needs the full canvas chain-tail
+    /// representation instead, which this field does not attempt to replace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_on_success_link: Option<String>,
 
     /// Task IDs in the chord
     pub task_ids: Vec<Uuid>,
@@ -601,6 +642,7 @@ impl ChordState {
             total,
             completed: 0,
             callback: None,
+            callback_on_success_link: None,
             task_ids,
             created_at: Utc::now(),
             timeout: None,
@@ -620,6 +662,14 @@ impl ChordState {
     /// Set the callback task
     pub fn with_callback(mut self, callback: String) -> Self {
         self.callback = Some(callback);
+        self
+    }
+
+    /// Set the bare, name-only successor to enqueue once the callback task
+    /// completes. See [`Self::callback_on_success_link`] for what this can
+    /// and cannot carry.
+    pub fn with_callback_on_success_link(mut self, task_name: String) -> Self {
+        self.callback_on_success_link = Some(task_name);
         self
     }
 
@@ -686,6 +736,11 @@ impl ChordState {
     /// Check if the chord has a callback
     pub fn has_callback(&self) -> bool {
         self.callback.is_some()
+    }
+
+    /// Check if the chord's callback has a bare, name-only successor
+    pub fn has_callback_on_success_link(&self) -> bool {
+        self.callback_on_success_link.is_some()
     }
 
     /// Check if the chord has a timeout

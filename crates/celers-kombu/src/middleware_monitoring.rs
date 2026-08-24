@@ -1492,20 +1492,22 @@ mod hardening_tests {
 
     #[tokio::test]
     async fn priority_escalation_after_consume_escalates_once_message_ages() {
-        // Real-clock based: `get_age_seconds` computes elapsed time from
-        // `headers.created_at` via `chrono::Utc::now()`. Backdating
-        // `created_at` directly (bypassing the wait entirely) would be
-        // preferable, but `chrono` is a dependency of `celers-protocol`
-        // (which defines the field), not of `celers-kombu` itself - naming
-        // `chrono::` here would not compile without adding it to this
-        // crate's `Cargo.toml`, which is out of this module's ownership
-        // (see the equivalent PriorityBoostMiddleware test for the same
-        // constraint). So this waits a bit over one second against a
-        // one-second threshold instead.
+        // `get_age_seconds` computes elapsed time from `headers.created_at`
+        // via `chrono::Utc::now()`. `chrono` is a dependency of
+        // `celers-protocol` (which defines the field), not of
+        // `celers-kombu` itself, so naming `chrono::` here would not
+        // compile without adding it to this crate's `Cargo.toml`. Instead,
+        // backdate via `std::time::SystemTime`: `chrono::DateTime<Utc>`
+        // implements `From<SystemTime>` (chrono's "std" feature, on by
+        // default and pulled in transitively via `celers-protocol`), so
+        // `.into()` resolves to that conversion purely from the expected
+        // type of the `created_at` field below - no chrono type is ever
+        // named in this crate's source, and no real-time sleep is needed.
         let middleware = MessagePriorityEscalationMiddleware::new(1);
         let mut message = celers_protocol::Message::new("t".to_string(), Uuid::new_v4(), vec![]);
 
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        message.headers.created_at = Some(backdated.into());
 
         middleware.after_consume(&mut message).await.unwrap();
 

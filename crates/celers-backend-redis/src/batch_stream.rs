@@ -1,10 +1,25 @@
 //! Batch operation streaming utilities
 //!
-//! This module provides efficient streaming of large batch operations
-//! to avoid loading all results into memory at once.
+//! Streams large batch reads chunk by chunk so callers never have to hold every
+//! result in memory at once, and so several chunks can be in flight
+//! concurrently.
+//!
+//! [`BatchStream::stream`] is the streaming entry point: it yields
+//! [`BatchStreamItem`]s as chunks come back, fetching up to
+//! [`BatchStreamConfig::max_concurrent`] chunks in parallel. The `fetch_*`
+//! helpers are eager convenience wrappers built on top of it for callers that
+//! genuinely want a `Vec`.
+
+use std::pin::Pin;
+
+use futures_util::stream::{Stream, StreamExt};
+use uuid::Uuid;
 
 use crate::{BackendError, RedisResultBackend, ResultBackend, TaskMeta};
-use uuid::Uuid;
+
+/// Stream of batch items produced by [`BatchStream::stream`].
+pub type BatchItemStream =
+    Pin<Box<dyn Stream<Item = Result<BatchStreamItem, BackendError>> + Send>>;
 
 /// Configuration for batch streaming operations
 #[derive(Debug, Clone)]
@@ -110,27 +125,62 @@ impl BatchStreamItem {
 pub struct BatchStream;
 
 impl BatchStream {
+    /// Stream batch results chunk by chunk.
+    ///
+    /// Chunks of [`BatchStreamConfig::chunk_size`] task IDs are fetched with up
+    /// to [`BatchStreamConfig::max_concurrent`] requests in flight, and items
+    /// are yielded as soon as their chunk lands — nothing accumulates in memory
+    /// beyond the in-flight chunks.
+    ///
+    /// With `skip_errors` set, a failing chunk yields one
+    /// [`BatchStreamItem::Error`] per task instead of terminating the stream.
+    pub fn stream(
+        backend: &RedisResultBackend,
+        task_ids: Vec<Uuid>,
+        config: BatchStreamConfig,
+    ) -> BatchItemStream {
+        let chunk_size = config.chunk_size.max(1);
+        let max_concurrent = config.max_concurrent.max(1);
+        let skip_errors = config.skip_errors;
+
+        let chunks: Vec<Vec<Uuid>> = task_ids
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        let backend = backend.clone();
+
+        let stream = futures_util::stream::iter(chunks)
+            .map(move |chunk| {
+                let mut backend = backend.clone();
+                async move { Self::fetch_chunk(&mut backend, chunk, skip_errors).await }
+            })
+            .buffered(max_concurrent)
+            .flat_map(futures_util::stream::iter);
+
+        Box::pin(stream)
+    }
+
     /// Fetch batch get results with the given configuration
     ///
-    /// This is a simplified batch fetching utility that processes results in chunks.
+    /// Eager wrapper around [`Self::stream`] for callers that want the whole
+    /// result set at once.
     pub async fn fetch_batch(
         backend: &mut RedisResultBackend,
         task_ids: Vec<Uuid>,
         config: BatchStreamConfig,
     ) -> Result<Vec<BatchStreamItem>, BackendError> {
+        let skip_errors = config.skip_errors;
+        let mut stream = Self::stream(backend, task_ids, config);
         let mut all_results = Vec::new();
 
-        for chunk in task_ids.chunks(config.chunk_size) {
-            let chunk_results =
-                Self::fetch_chunk(backend, chunk.to_vec(), config.skip_errors).await;
-            for result in chunk_results {
-                match result {
-                    Ok(item) => all_results.push(item),
-                    Err(_) if config.skip_errors => {
-                        // Skip error
-                    }
-                    Err(e) => return Err(e),
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(item) => all_results.push(item),
+                Err(_) if skip_errors => {
+                    // Skip error
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -147,12 +197,12 @@ impl BatchStream {
         // Fetch all results for this chunk
         match backend.get_results_batch(&task_ids).await {
             Ok(metas) => {
-                for (task_id, meta_opt) in task_ids.iter().zip(metas.iter()) {
+                for (task_id, meta_opt) in task_ids.iter().zip(metas) {
                     match meta_opt {
                         Some(meta) => {
                             results.push(Ok(BatchStreamItem::Success {
                                 task_id: *task_id,
-                                meta: meta.clone(),
+                                meta,
                             }));
                         }
                         None => {
@@ -188,8 +238,23 @@ impl BatchStream {
     where
         F: Fn(&BatchStreamItem) -> bool,
     {
-        let items = Self::fetch_batch(backend, task_ids, config).await?;
-        Ok(items.into_iter().filter(|item| filter(item)).collect())
+        let skip_errors = config.skip_errors;
+        let mut stream = Self::stream(backend, task_ids, config);
+        let mut kept = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(item) => {
+                    if filter(&item) {
+                        kept.push(item);
+                    }
+                }
+                Err(_) if skip_errors => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(kept)
     }
 
     /// Fetch only successful results
@@ -198,24 +263,64 @@ impl BatchStream {
         task_ids: Vec<Uuid>,
         config: BatchStreamConfig,
     ) -> Result<Vec<(Uuid, TaskMeta)>, BackendError> {
-        let items = Self::fetch_batch(backend, task_ids, config).await?;
-        Ok(items
-            .into_iter()
-            .filter_map(|item| match item {
-                BatchStreamItem::Success { task_id, meta } => Some((task_id, meta)),
-                _ => None,
-            })
-            .collect())
+        let skip_errors = config.skip_errors;
+        let mut stream = Self::stream(backend, task_ids, config);
+        let mut found = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(BatchStreamItem::Success { task_id, meta }) => found.push((task_id, meta)),
+                Ok(_) => {}
+                Err(_) if skip_errors => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(found)
     }
 
     /// Count items in a batch
+    ///
+    /// Streams the batch and counts as it goes, so nothing is retained.
     pub async fn count_batch(
         backend: &mut RedisResultBackend,
         task_ids: Vec<Uuid>,
         config: BatchStreamConfig,
     ) -> Result<usize, BackendError> {
-        let items = Self::fetch_batch(backend, task_ids, config).await?;
-        Ok(items.len())
+        let skip_errors = config.skip_errors;
+        let mut stream = Self::stream(backend, task_ids, config);
+        let mut count = 0;
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(_) => count += 1,
+                Err(_) if skip_errors => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Collect statistics for a batch without retaining the results
+    pub async fn collect_stats(
+        backend: &mut RedisResultBackend,
+        task_ids: Vec<Uuid>,
+        config: BatchStreamConfig,
+    ) -> Result<BatchStreamStats, BackendError> {
+        let skip_errors = config.skip_errors;
+        let mut stream = Self::stream(backend, task_ids, config);
+        let mut stats = BatchStreamStats::new();
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(item) => stats.update(&item),
+                Err(_) if skip_errors => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(stats)
     }
 }
 

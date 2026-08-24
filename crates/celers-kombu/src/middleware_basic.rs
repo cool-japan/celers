@@ -537,18 +537,33 @@ impl CompressionMiddleware {
     /// Header key used to record the compression encoding so the consumer
     /// can decompress the body with the matching codec.
     ///
-    /// Note: this intentionally reuses the same string as the envelope's
-    /// own top-level `content_encoding` field / a conventional
-    /// `content-encoding` header name for backward compatibility with
-    /// existing deployments and tests. If your producer also sets its own
-    /// `content-encoding` header for an unrelated purpose, do not combine
-    /// it with this middleware on the same message: `after_consume` will
-    /// treat any value found there as this middleware's own compression
-    /// marker and attempt to decompress the body accordingly (it will fail
-    /// loudly with a "unknown compression encoding" or decompression error
-    /// rather than silently corrupting the body, but the message will
-    /// still be rejected).
-    const COMPRESSION_HEADER: &'static str = "content-encoding";
+    /// Namespaced under an `x-` prefix (matching
+    /// [`ORIGINAL_CONTENT_ENCODING_HEADER`](Self::ORIGINAL_CONTENT_ENCODING_HEADER)
+    /// and every other middleware-internal header in this crate) rather
+    /// than the bare `content-encoding` name this middleware previously
+    /// used: `headers.extra` is a general-purpose custom-headers bag that a
+    /// producer may also populate with its own entries, and a plain
+    /// `content-encoding` key was plausible enough for a producer to pick
+    /// for an unrelated purpose that it collided with this middleware's own
+    /// compression marker (`after_consume` would then treat that unrelated
+    /// value as a compression codec name and attempt to decompress the body
+    /// accordingly). The namespaced key makes collisions with
+    /// application-chosen header names unlikely.
+    ///
+    /// `after_consume` also still *reads*
+    /// [`LEGACY_COMPRESSION_HEADER`](Self::LEGACY_COMPRESSION_HEADER) as a
+    /// fallback: `headers.extra` is `#[serde(flatten)]`-ed onto the wire,
+    /// so a message published by a pre-rename build and still in flight
+    /// (queued, or requeued after a failed delivery) during an upgrade
+    /// carries the old key, not this one. Without the fallback, such a
+    /// message would silently skip decompression instead of failing loudly.
+    const COMPRESSION_HEADER: &'static str = "x-compression-encoding";
+    /// Pre-rename compression-marker key (see
+    /// [`COMPRESSION_HEADER`](Self::COMPRESSION_HEADER)). `before_publish`
+    /// never writes this any more; `after_consume` still reads it so
+    /// already-published messages keep decompressing correctly across the
+    /// upgrade.
+    const LEGACY_COMPRESSION_HEADER: &'static str = "content-encoding";
     /// Header key used to stash the message's pre-compression
     /// `content_encoding` field so it can be restored exactly on consume.
     const ORIGINAL_CONTENT_ENCODING_HEADER: &'static str = "x-original-content-encoding";
@@ -622,9 +637,17 @@ impl MessageMiddleware for CompressionMiddleware {
     }
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
-        // Check whether this message was compressed on publish. If the flag
-        // is absent the body was never compressed, so we leave it untouched.
-        let encoding = match message.headers.extra.get(Self::COMPRESSION_HEADER) {
+        // Check whether this message was compressed on publish. If neither
+        // flag is present the body was never compressed, so we leave it
+        // untouched. The legacy key is checked second (a message using it
+        // was published before the rename to the namespaced key above, and
+        // `before_publish` on this build never writes it).
+        let encoding = match message
+            .headers
+            .extra
+            .get(Self::COMPRESSION_HEADER)
+            .or_else(|| message.headers.extra.get(Self::LEGACY_COMPRESSION_HEADER))
+        {
             Some(serde_json::Value::String(encoding)) => encoding.clone(),
             _ => return Ok(()),
         };
@@ -658,9 +681,15 @@ impl MessageMiddleware for CompressionMiddleware {
             .unwrap_or_else(|| "utf-8".to_string());
         message.content_encoding = restored_encoding;
 
-        // Remove the flag so the consumed message is clean and is not
-        // mistaken for a still-compressed payload by downstream consumers.
+        // Remove both possible flags so the consumed message is clean and
+        // is not mistaken for a still-compressed payload by downstream
+        // consumers, regardless of which key this particular message
+        // happened to carry.
         message.headers.extra.remove(Self::COMPRESSION_HEADER);
+        message
+            .headers
+            .extra
+            .remove(Self::LEGACY_COMPRESSION_HEADER);
 
         Ok(())
     }
@@ -1411,5 +1440,55 @@ mod hardening_tests {
         // Round trip restores both the body and the original encoding.
         assert_eq!(msg.body, original_body);
         assert_eq!(msg.content_encoding, original_encoding);
+    }
+
+    // -------------------------------------------------------------------
+    // idx123 residual: renaming `COMPRESSION_HEADER` off the collision-
+    // prone bare "content-encoding" key must not silently break
+    // decompression for a message that is still in flight (queued, or
+    // requeued after a failed delivery) across the upgrade that ships the
+    // rename.
+    // -------------------------------------------------------------------
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn compression_after_consume_still_decompresses_legacy_marker_key() {
+        use celers_protocol::compression::CompressionType;
+
+        let middleware = CompressionMiddleware::new(CompressionType::Gzip).with_min_size(16);
+        let original_body = b"compress me ".repeat(64);
+        let mut msg = Message::new("test".to_string(), Uuid::new_v4(), original_body.clone());
+        let original_encoding = msg.content_encoding.clone();
+
+        middleware.before_publish(&mut msg).await.unwrap();
+        assert_eq!(msg.content_encoding, "gzip");
+
+        // Simulate a message published under the pre-rename marker key:
+        // move the value `before_publish` just wrote under the new
+        // (namespaced) key over to the old (bare) one, as if a build from
+        // before the rename had published it.
+        let encoding_value = msg
+            .headers
+            .extra
+            .remove(CompressionMiddleware::COMPRESSION_HEADER)
+            .expect("before_publish sets the marker header for a large enough body");
+        msg.headers.extra.insert(
+            CompressionMiddleware::LEGACY_COMPRESSION_HEADER.to_string(),
+            encoding_value,
+        );
+
+        middleware.after_consume(&mut msg).await.unwrap();
+
+        // Still decompresses correctly, and cleans up the legacy key too.
+        assert_eq!(msg.body, original_body);
+        assert_eq!(msg.content_encoding, original_encoding);
+        assert!(!msg
+            .headers
+            .extra
+            .contains_key(CompressionMiddleware::COMPRESSION_HEADER));
+        assert!(!msg
+            .headers
+            .extra
+            .contains_key(CompressionMiddleware::LEGACY_COMPRESSION_HEADER));
     }
 }

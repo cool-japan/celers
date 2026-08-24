@@ -46,6 +46,7 @@
 //! # }
 //! ```
 
+use crate::connection::RedisClientExt;
 use celers_core::{CelersError, Result, SerializedTask};
 use oxihttp_client::{Client as HttpClient, HttpsClient};
 use redis::{AsyncCommands, Client};
@@ -269,7 +270,7 @@ impl DLQArchivalManager {
     pub async fn archive_old_tasks(&self, min_age_secs: u64) -> Result<usize> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -486,7 +487,7 @@ impl DLQArchivalManager {
     pub async fn restore_from_archive(&self, archive_ids: Vec<String>) -> Result<usize> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -637,7 +638,7 @@ impl DLQArchivalManager {
             StorageBackend::Redis { key_prefix } => {
                 let mut conn = self
                     .client
-                    .get_multiplexed_async_connection()
+                    .celers_multiplexed_connection()
                     .await
                     .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -717,7 +718,7 @@ impl DLQArchivalManager {
             StorageBackend::Redis { key_prefix } => {
                 let mut conn = self
                     .client
-                    .get_multiplexed_async_connection()
+                    .celers_multiplexed_connection()
                     .await
                     .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -776,7 +777,7 @@ impl DLQArchivalManager {
     async fn get_redis_archive_stats(&self, key_prefix: &str) -> Result<ArchiveStats> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -877,7 +878,7 @@ impl DLQArchivalManager {
     ) -> Result<Vec<ArchivedTask>> {
         let mut conn = self
             .client
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .map_err(|e| CelersError::Broker(format!("Connection error: {}", e)))?;
 
@@ -1089,7 +1090,7 @@ mod tests {
 
         let mut conn = Client::open("redis://127.0.0.1:6379")
             .unwrap()
-            .get_multiplexed_async_connection()
+            .celers_multiplexed_connection()
             .await
             .unwrap();
         let dlq_key = format!("{}:dlq", queue_name);

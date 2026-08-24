@@ -169,9 +169,7 @@ impl ReceiptMetadata {
 }
 
 /// Extract [`ReceiptMetadata`] from a received SQS message.
-pub(crate) fn extract_receipt_metadata(
-    message: &aws_sdk_sqs::types::Message,
-) -> ReceiptMetadata {
+pub(crate) fn extract_receipt_metadata(message: &aws_sdk_sqs::types::Message) -> ReceiptMetadata {
     use aws_sdk_sqs::types::MessageSystemAttributeName;
 
     let attributes = message.attributes();
@@ -208,7 +206,10 @@ mod tests {
     #[test]
     fn tag_round_trips_for_fifo_queue_names() {
         let tag = encode_delivery_tag("orders.fifo", "AQEB-handle");
-        assert_eq!(decode_delivery_tag(&tag), (Some("orders.fifo"), "AQEB-handle"));
+        assert_eq!(
+            decode_delivery_tag(&tag),
+            (Some("orders.fifo"), "AQEB-handle")
+        );
     }
 
     #[test]

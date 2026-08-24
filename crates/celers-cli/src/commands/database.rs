@@ -331,6 +331,11 @@ const POSTGRES_MIGRATIONS: &[MigrationFile] = &[
             "../../../celers-broker-postgres/migrations/006_deduplication_columns.sql"
         ),
     },
+    MigrationFile {
+        version: "007",
+        name: "queue_identity",
+        sql: include_str!("../../../celers-broker-postgres/migrations/007_queue_identity.sql"),
+    },
 ];
 
 /// Ordered MySQL migrations applied by `celers db migrate up`.
@@ -899,6 +904,22 @@ mod migration_tests {
             assert!(!m.sql.trim().is_empty(), "{} has empty SQL", m.version);
             assert!(!m.name.is_empty());
         }
+    }
+
+    /// Regression test: `POSTGRES_MIGRATIONS` used to stop at `006`, mirroring
+    /// only part of `PostgresBroker::migrate()`'s own selection -- `celers db
+    /// migrate` produced a schema missing the `queue_name`/`attempt_count`
+    /// columns `007_queue_identity.sql` adds, and the broker then failed on
+    /// every statement that assumed they existed.
+    #[test]
+    fn postgres_migrations_include_queue_identity() {
+        let m = POSTGRES_MIGRATIONS
+            .iter()
+            .find(|m| m.version == "007")
+            .expect("migration 007 (queue_identity) must be present");
+        assert_eq!(m.name, "queue_identity");
+        assert!(m.sql.contains("queue_name"));
+        assert!(m.sql.contains("attempt_count"));
     }
 
     #[test]

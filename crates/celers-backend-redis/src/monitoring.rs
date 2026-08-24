@@ -177,21 +177,25 @@ impl BackendMonitor {
     /// Test round-trip time for a write-read operation
     ///
     /// This creates a temporary task result, stores it, reads it back,
-    /// and cleans up. Returns the total time in milliseconds.
+    /// and cleans up. Returns the total time.
+    ///
+    /// The read deliberately bypasses the in-memory cache: a cached answer
+    /// would measure a `HashMap` lookup rather than a Redis round trip.
     pub async fn measure_roundtrip(
         backend: &mut RedisResultBackend,
     ) -> Result<Duration, BackendError> {
-        use crate::TaskMeta;
+        use crate::{TaskMeta, TaskResult};
 
         let start = Instant::now();
         let test_id = Uuid::new_v4();
 
-        // Store test result
-        let meta = TaskMeta::new(test_id, "monitoring.roundtrip_test".to_string());
+        // Store test result (terminal, so it exercises the cache-write path too)
+        let mut meta = TaskMeta::new(test_id, "monitoring.roundtrip_test".to_string());
+        meta.result = TaskResult::Success(serde_json::json!({"probe": true}));
         backend.store_result(test_id, &meta).await?;
 
-        // Read it back
-        let _retrieved = backend.get_result(test_id).await?;
+        // Read it back from Redis, not from the cache
+        let _retrieved = backend.get_result_uncached(test_id).await?;
 
         // Clean up
         backend.delete_result(test_id).await?;

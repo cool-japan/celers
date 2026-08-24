@@ -4,7 +4,29 @@
 
 ## Status: ✅ STABLE (v0.3.1) — 149 tests passing, 26 ignored (require a real PostgreSQL instance) + 179 doc tests passing, 6 ignored | Updated: 2026-07-13
 
-## queue_name schema drift (2026-07)
+## queue_name schema drift (2026-07) — RESOLVED (migration 007)
+
+> **Status: fixed.** `queue_name` is now a REAL column on `celers_tasks` and
+> `celers_dead_letter_queue` (see `migrations/007_queue_identity.sql`,
+> backfilled from the legacy `metadata->>'queue'` label, indexed for the
+> dispatch predicate, and carried across by `move_to_dlq()`), so every
+> `WHERE queue_name = $n` filter listed below is now valid SQL against a
+> column that exists. Every remaining bug-(B) site that spliced the queue
+> label into SQL text as if it were a TABLE NAME
+> (`scheduling.rs`, `convenience.rs`, `query_optimization.rs`) now targets
+> `celers_tasks` literally and binds the label as a parameter. The label is
+> additionally validated at construction (`[A-Za-z0-9_-]{1,64}`), and
+> `dequeue()`/`queue_size()`/`get_statistics()` are queue-scoped, so brokers
+> on different logical queues no longer cross-serve each other's tasks.
+>
+> Also fixed alongside it: the `timeout_secs` column referenced by
+> `analytics.rs`'s copy/replay INSERTs (removed — no such column), and those
+> INSERTs' missing `id` value.
+>
+> The audit below is retained as the historical record of what was wrong.
+
+### Historical audit (unchanged)
+
 
 `PostgresBroker::queue_name` (see the field doc comment in `src/broker_core.rs`) is a
 **logical label stored in `celers_tasks.metadata->>'queue'`** — it is set at enqueue

@@ -1,32 +1,19 @@
 #![cfg(test)]
 
-use crate::types::{DynamicConfig, WorkerConfig, WorkerMode, WorkerStats};
+use crate::types::{WorkerConfig, WorkerStats};
 use crate::worker_core::Worker;
 
 use celers_core::{Broker, NoOpEventEmitter, Result, TaskRegistry};
-use std::sync::atomic::AtomicU8;
-use std::sync::{Arc, RwLock};
 
 #[test]
 fn test_backoff_calculation() {
     let config = WorkerConfig::default();
-    let dynamic_config = DynamicConfig::default();
-    let worker: Worker<MockBroker, NoOpEventEmitter> = Worker {
-        broker: Arc::new(MockBroker),
-        registry: Arc::new(TaskRegistry::new()),
-        config,
-        circuit_breaker: None,
-        dlq_handler: None,
-        shutdown_tx: None,
-        event_emitter: Arc::new(NoOpEventEmitter::new()),
-        stats: Arc::new(WorkerStats::new()),
-        mode: Arc::new(AtomicU8::new(WorkerMode::Normal as u8)),
-        dynamic_config: Arc::new(RwLock::new(dynamic_config)),
-        middleware_stack: None,
-        revocation_watcher: None,
-        rate_limit_coordinator: None,
-        affinity_registry: None,
-    };
+    // Built through the public constructor rather than an exhaustive struct
+    // literal: a literal here turns every new `Worker` field into a compile
+    // error in this test, which is how the result-store and time-limit fields
+    // ended up blocked on "update this test first".
+    let worker: Worker<MockBroker, NoOpEventEmitter> =
+        Worker::new(MockBroker, TaskRegistry::new(), config);
 
     assert_eq!(worker.calculate_backoff_delay(0).as_millis(), 1000);
     assert_eq!(worker.calculate_backoff_delay(1).as_millis(), 2000);
@@ -992,9 +979,16 @@ mod execution_loop_integration {
         }
     }
 
-    /// With coalescing enabled, a batch of duplicate tasks (same coalescing key)
-    /// is collapsed in the worker loop: only one survivor executes and the
-    /// dropped duplicates are acked (removed) rather than executed.
+    /// With coalescing enabled *and the id restriction explicitly turned off*,
+    /// a batch of tasks sharing the args-based coalescing key is collapsed in
+    /// the worker loop: only one survivor executes and the dropped duplicates
+    /// are acked (removed) rather than executed.
+    ///
+    /// The opt-out is spelled out here because
+    /// [`WorkerConfig::coalesce_require_same_task_id`] now defaults to `true`
+    /// (the lossless setting); this test pins the *opt-in* args-based mode,
+    /// while `worker_core::tests::test_id_scoped_coalescing_keeps_distinct_submissions`
+    /// pins the default.
     #[tokio::test]
     async fn test_loop_coalesces_duplicate_tasks() {
         use crate::batching::{BatchConfig, CoalesceStrategy};
@@ -1026,6 +1020,9 @@ mod execution_loop_integration {
             enable_batch_dequeue: true,
             batch_size: 10,
             enable_coalescing: true,
+            // Opt out of the (default) lossless id-scoped key so distinct
+            // submissions with identical payloads coalesce.
+            coalesce_require_same_task_id: false,
             coalescing_config: BatchConfig {
                 max_batch_size: 10,
                 max_wait_ms: 0,
