@@ -219,6 +219,77 @@ pub(crate) struct DeadLetterRequest<'a> {
     pub(crate) dispose: bool,
 }
 
+/// A dequeued message that did not pass signature verification.
+pub(crate) struct UnverifiedMessage<'a> {
+    /// The message, exactly as the broker delivered it.
+    pub(crate) task: &'a SerializedTask,
+    /// The delivery's receipt handle, if any.
+    pub(crate) receipt_handle: Option<&'a str>,
+    /// Why verification failed.
+    pub(crate) error: &'a celers_core::task_signature::SignatureError,
+}
+
+/// Refuse a message that failed signature verification, before it is dispatched.
+///
+/// Emits a `task-rejected` event naming the cause, then disposes of the message
+/// through [`dead_letter`]: recorded in the dead-letter queue when one is
+/// configured, and in either case rejected **without requeue** so a forged or
+/// replayed message cannot cycle straight back into the queue.
+///
+/// The payload is never logged or echoed into the event: an unauthenticated one
+/// is attacker-controlled, and a log line is the last place it should land.
+pub(crate) async fn reject_unverified<B: Broker>(
+    broker: &Arc<B>,
+    dlq_handler: Option<&Arc<DlqHandler>>,
+    events: &EventSink,
+    hostname: &str,
+    pid: u32,
+    req: UnverifiedMessage<'_>,
+) {
+    let UnverifiedMessage {
+        task,
+        receipt_handle,
+        error,
+    } = req;
+    let task_id = task.metadata.id;
+    let task_name = task.metadata.name.clone();
+
+    warn!(
+        "Rejecting task {} ('{}'): signature verification failed: {}",
+        task_id, task_name, error
+    );
+
+    events.emit(Event::Task(TaskEvent::Rejected {
+        task_id,
+        task_name: Some(task_name.clone()),
+        hostname: hostname.to_string(),
+        timestamp: chrono::Utc::now(),
+        reason: format!("Signature verification failed: {error}"),
+    }));
+
+    dead_letter(
+        broker,
+        dlq_handler,
+        events,
+        hostname,
+        pid,
+        DeadLetterRequest {
+            task,
+            task_id,
+            receipt_handle,
+            retry_count: spent_retries(task),
+            error_msg: "Task signature verification failed",
+            failure_type: "signature_verification",
+            extra_metadata: vec![
+                ("task_name", task_name),
+                ("signature_error", error.to_string()),
+            ],
+            dispose: true,
+        },
+    )
+    .await;
+}
+
 /// Emit the terminal failure signals for a task and remove it from the broker.
 ///
 /// Shared by the execution-error, timeout, oversized-result and open-circuit
@@ -417,10 +488,14 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
     let soft_timer = arm_soft_time_limit(
         exec_context.as_ref(),
         &limits,
-        task_id,
-        &task_name,
-        &stats,
         start_time,
+        SoftLimitReporter {
+            task_id,
+            task_name: &task_name,
+            hostname: &hostname,
+            stats: &stats,
+            events: &events,
+        },
     );
 
     let exec_outcome = drive_task(
@@ -832,6 +907,23 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
     // released — including on an unwind past this point.
 }
 
+/// Who a soft-limit expiry is reported to.
+///
+/// Bundled so [`arm_soft_time_limit`] keeps a readable signature: the limit and
+/// the reporting targets are two separate concerns.
+pub(crate) struct SoftLimitReporter<'a> {
+    /// The task whose limit is being armed.
+    pub(crate) task_id: TaskId,
+    /// The task's registered name.
+    pub(crate) task_name: &'a str,
+    /// The worker publishing the event.
+    pub(crate) hostname: &'a str,
+    /// Counters the expiry is recorded in.
+    pub(crate) stats: &'a Arc<WorkerStats>,
+    /// Lifecycle event sink the `task-soft-time-limit-exceeded` event goes to.
+    pub(crate) events: &'a EventSink,
+}
+
 /// Arm the task's **soft** time limit, if one is configured.
 ///
 /// Returns the timer's [`JoinHandle`](tokio::task::JoinHandle) so the caller can
@@ -839,17 +931,17 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
 /// [`SoftTimeout`](crate::execution_context::SoftTimeout) — which a cooperative
 /// handler observes through
 /// [`check_soft_time_limit`](crate::execution_context::check_soft_time_limit) —
-/// counts the expiry in [`WorkerStats`] and logs a warning. It deliberately does
+/// counts the expiry in [`WorkerStats`], logs a warning and publishes a
+/// `task-soft-time-limit-exceeded` event so a monitor sees the breach instead of
+/// having to infer it from a later hard-limit failure. It deliberately does
 /// **not** touch the cancellation token: tripping that would make the worker
 /// treat the task as revoked (acked, never retried), whereas a soft-limit expiry
 /// leaves the task running until it finishes or hits its hard limit.
 fn arm_soft_time_limit(
     exec_context: Option<&TaskExecutionContext>,
     limits: &ExecutionLimits,
-    task_id: TaskId,
-    task_name: &str,
-    stats: &Arc<WorkerStats>,
     start_time: Instant,
+    reporter: SoftLimitReporter<'_>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let soft_limit = limits.soft_limit?;
     let signal = exec_context?.soft_timeout().clone();
@@ -858,16 +950,33 @@ fn arm_soft_time_limit(
         return None;
     }
 
+    let SoftLimitReporter {
+        task_id,
+        task_name,
+        hostname,
+        stats,
+        events,
+    } = reporter;
     let stats = Arc::clone(stats);
     let task_name = task_name.to_string();
+    let events = events.clone();
+    let hostname = hostname.to_string();
     Some(tokio::spawn(async move {
         sleep(soft_limit).await;
-        if signal.expire(start_time.elapsed()) {
+        let elapsed = start_time.elapsed();
+        // `expire` returns false when the signal had already tripped, so the
+        // event is published exactly once per task.
+        if signal.expire(elapsed) {
             stats.task_soft_timeout();
             warn!(
                 "Soft time limit of {:?} exceeded for task {} ('{}'); the task may wrap up \
                  cooperatively until its hard limit",
                 soft_limit, task_id, task_name
+            );
+            events.emit(
+                TaskEventBuilder::new(task_id, &task_name)
+                    .hostname(&hostname)
+                    .soft_time_limit_exceeded(elapsed, soft_limit),
             );
         }
     }))

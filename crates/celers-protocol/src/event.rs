@@ -1,7 +1,18 @@
-//! Celery event message format
+//! Celery event message format — the on-the-wire event model
 //!
-//! This module provides Celery-compatible event messages for task lifecycle
-//! and worker state events.
+//! [`EventMessage`] is **the** shape CeleRS publishes to event transports and
+//! the shape a Celery monitor (`celery events`, Flower, a custom consumer)
+//! parses: a `type` string, a float Unix `timestamp`, and the
+//! `hostname`/`utcoffset`/`pid`/`clock` envelope, with every remaining field
+//! flattened alongside them. [`TaskEvent`] and [`WorkerEvent`] add typed
+//! accessors for the event-specific fields Celery defines (`uuid`, `name`,
+//! `runtime`, `sw_ident`, ...).
+//!
+//! Workers build events with `celers_core::event::Event`, the typed *internal*
+//! model, and render this shape through `Event::to_wire_json()` before it
+//! reaches a transport; `Event::from_wire_str()` is the inverse. The two models
+//! agree field for field — the round trip is covered by
+//! `celers-backend-redis`, the crate that depends on both.
 //!
 //! # Event Types
 //!
@@ -14,6 +25,8 @@
 //! - `task-rejected` - Task was rejected by a worker
 //! - `task-revoked` - Task was revoked
 //! - `task-retried` - Task is being retried
+//! - `task-soft-time-limit-exceeded` - Task passed its soft time limit
+//!   (a `CeleRS` extension; Celery publishes no event for this)
 //!
 //! ## Worker Events
 //! - `worker-online` - Worker came online
@@ -38,6 +51,9 @@ pub enum EventType {
     TaskRejected,
     TaskRevoked,
     TaskRetried,
+    /// Task passed its soft time limit (a `CeleRS` extension; not a Celery
+    /// core event type, but emitted on the same stream).
+    TaskSoftTimeLimitExceeded,
 
     // Worker events
     WorkerOnline,
@@ -62,6 +78,7 @@ impl EventType {
             EventType::TaskRejected => "task-rejected",
             EventType::TaskRevoked => "task-revoked",
             EventType::TaskRetried => "task-retried",
+            EventType::TaskSoftTimeLimitExceeded => "task-soft-time-limit-exceeded",
             EventType::WorkerOnline => "worker-online",
             EventType::WorkerOffline => "worker-offline",
             EventType::WorkerHeartbeat => "worker-heartbeat",
@@ -82,6 +99,7 @@ impl EventType {
                 | EventType::TaskRejected
                 | EventType::TaskRevoked
                 | EventType::TaskRetried
+                | EventType::TaskSoftTimeLimitExceeded
         )
     }
 
@@ -114,12 +132,42 @@ impl std::str::FromStr for EventType {
             "task-rejected" => Ok(EventType::TaskRejected),
             "task-revoked" => Ok(EventType::TaskRevoked),
             "task-retried" => Ok(EventType::TaskRetried),
+            "task-soft-time-limit-exceeded" => Ok(EventType::TaskSoftTimeLimitExceeded),
             "worker-online" => Ok(EventType::WorkerOnline),
             "worker-offline" => Ok(EventType::WorkerOffline),
             "worker-heartbeat" => Ok(EventType::WorkerHeartbeat),
             other => Ok(EventType::Custom(other.to_string())),
         }
     }
+}
+
+/// Render a UTC instant as the float Unix seconds Celery puts on the wire.
+///
+/// The result carries microsecond resolution; sub-microsecond digits cannot
+/// survive an IEEE-754 double at present-day epoch values.
+#[must_use]
+pub fn to_wire_timestamp(timestamp: DateTime<Utc>) -> f64 {
+    let seconds = timestamp.timestamp();
+    let micros = timestamp.timestamp_subsec_micros();
+    #[allow(clippy::cast_precision_loss)]
+    let seconds = seconds as f64;
+    seconds + f64::from(micros) / 1_000_000.0
+}
+
+/// Rebuild a UTC instant from Celery's float Unix seconds.
+///
+/// Returns `None` for a non-finite value or one outside the range
+/// `DateTime<Utc>` can represent. Values are rounded to the nearest
+/// microsecond, so an instant produced by [`to_wire_timestamp`] is recovered
+/// exactly.
+#[must_use]
+pub fn from_wire_timestamp(seconds: f64) -> Option<DateTime<Utc>> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let micros = (seconds * 1_000_000.0).round() as i64;
+    DateTime::from_timestamp_micros(micros)
 }
 
 /// Base event message structure
@@ -158,8 +206,11 @@ impl EventMessage {
     pub fn new(event_type: EventType) -> Self {
         Self {
             event_type: event_type.as_str().to_string(),
-            timestamp: Utc::now().timestamp() as f64
-                + (Utc::now().timestamp_subsec_nanos() as f64 / 1_000_000_000.0),
+            // One clock reading, not two: sampling `Utc::now()` separately for
+            // the seconds and the sub-second part puts the timestamp a whole
+            // second in the past whenever the two readings straddle a second
+            // boundary.
+            timestamp: to_wire_timestamp(Utc::now()),
             hostname: None,
             utcoffset: Some(0),
             pid: None,
@@ -170,8 +221,7 @@ impl EventMessage {
 
     /// Create an event with a specific timestamp
     pub fn with_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
-        self.timestamp = timestamp.timestamp() as f64
-            + (timestamp.timestamp_subsec_nanos() as f64 / 1_000_000_000.0);
+        self.timestamp = to_wire_timestamp(timestamp);
         self
     }
 
@@ -204,13 +254,22 @@ impl EventMessage {
         &self.event_type
     }
 
-    /// Get the timestamp as DateTime
+    /// Get the timestamp as `DateTime`
+    ///
+    /// Returns `None` when the wire value is not a finite, representable
+    /// instant. The old behaviour — silently substituting "now" — turned a
+    /// corrupt event into a plausible-looking recent one.
+    #[must_use]
+    pub fn datetime(&self) -> Option<DateTime<Utc>> {
+        from_wire_timestamp(self.timestamp)
+    }
+
+    /// Get the timestamp as `DateTime`, falling back to the Unix epoch for an
+    /// unrepresentable wire value.
+    #[must_use]
     pub fn get_datetime(&self) -> DateTime<Utc> {
-        DateTime::from_timestamp(
-            self.timestamp as i64,
-            ((self.timestamp.fract()) * 1_000_000_000.0) as u32,
-        )
-        .unwrap_or_else(Utc::now)
+        self.datetime()
+            .unwrap_or_else(|| DateTime::from_timestamp_nanos(0))
     }
 
     /// Serialize to JSON bytes
@@ -221,6 +280,16 @@ impl EventMessage {
     /// Deserialize from JSON bytes
     pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
+    }
+
+    /// Render as a `serde_json::Value` in the wire shape.
+    pub fn to_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    /// Parse from an already-decoded `serde_json::Value`.
+    pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value)
     }
 }
 
@@ -389,6 +458,23 @@ impl TaskEvent {
                 .fields
                 .insert("signum".to_string(), serde_json::json!(sig));
         }
+        event
+    }
+
+    /// Create a task-soft-time-limit-exceeded event
+    ///
+    /// A `CeleRS` extension: the task is still running (only the hard limit
+    /// ends it), so this carries how long it had run and the limit it passed.
+    pub fn soft_time_limit_exceeded(task_id: Uuid, elapsed_secs: f64, limit_secs: f64) -> Self {
+        let mut event = Self::new(EventType::TaskSoftTimeLimitExceeded, task_id);
+        event
+            .base
+            .fields
+            .insert("elapsed_secs".to_string(), serde_json::json!(elapsed_secs));
+        event
+            .base
+            .fields
+            .insert("limit_secs".to_string(), serde_json::json!(limit_secs));
         event
     }
 
@@ -643,10 +729,71 @@ mod tests {
             EventType::WorkerHeartbeat
         );
 
+        assert_eq!(
+            EventType::from_str("task-soft-time-limit-exceeded").unwrap(),
+            EventType::TaskSoftTimeLimitExceeded
+        );
+
         // Test custom event type
         match EventType::from_str("custom-event").unwrap() {
             EventType::Custom(s) => assert_eq!(s, "custom-event"),
             _ => panic!("Expected Custom variant"),
+        }
+    }
+
+    #[test]
+    fn test_soft_time_limit_exceeded_event() {
+        let task_id = Uuid::new_v4();
+        let event = TaskEvent::soft_time_limit_exceeded(task_id, 30.5, 30.0);
+
+        assert_eq!(event.base.event_type, "task-soft-time-limit-exceeded");
+        assert!(EventType::TaskSoftTimeLimitExceeded.is_task_event());
+        assert_eq!(event.base.fields.get("elapsed_secs"), Some(&json!(30.5)));
+        assert_eq!(event.base.fields.get("limit_secs"), Some(&json!(30.0)));
+
+        let decoded = TaskEvent::from_json(&event.to_json().unwrap()).unwrap();
+        assert_eq!(decoded.uuid, task_id);
+    }
+
+    #[test]
+    fn test_timestamp_helpers_round_trip() {
+        let instant = DateTime::parse_from_rfc3339("2026-03-04T05:06:07.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let seconds = to_wire_timestamp(instant);
+        assert_eq!(from_wire_timestamp(seconds), Some(instant));
+
+        let message = EventMessage::new(EventType::TaskSent).with_timestamp(instant);
+        assert_eq!(message.datetime(), Some(instant));
+        assert_eq!(message.get_datetime(), instant);
+    }
+
+    #[test]
+    fn test_unrepresentable_timestamp_is_not_silently_now() {
+        // Regression: `get_datetime` used to substitute `Utc::now()`, turning a
+        // corrupt event into a plausible-looking recent one.
+        let mut message = EventMessage::new(EventType::TaskSent);
+        message.timestamp = f64::NAN;
+
+        assert!(message.datetime().is_none());
+        assert_eq!(message.get_datetime().timestamp(), 0);
+    }
+
+    #[test]
+    fn test_event_message_timestamp_is_one_clock_reading() {
+        // Regression: sampling `Utc::now()` twice (seconds from one call,
+        // sub-second from another) put the timestamp a whole second in the past
+        // whenever the readings straddled a second boundary.
+        for _ in 0..2_000 {
+            let before = to_wire_timestamp(Utc::now());
+            let message = EventMessage::new(EventType::TaskStarted);
+            let after = to_wire_timestamp(Utc::now());
+            assert!(
+                message.timestamp >= before && message.timestamp <= after,
+                "timestamp {} outside [{before}, {after}]",
+                message.timestamp
+            );
         }
     }
 

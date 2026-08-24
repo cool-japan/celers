@@ -468,6 +468,23 @@ pub struct TaskMetadata {
     /// Task dependencies (tasks that must complete before this task can execute)
     #[serde(skip_serializing_if = "HashSet::is_empty", default)]
     pub dependencies: HashSet<TaskId>,
+
+    /// Producer-supplied message signature, when the message was signed.
+    ///
+    /// Attached by
+    /// [`task_security::sign_task`](crate::task_security::sign_task) and
+    /// checked by
+    /// [`task_security::verify_task`](crate::task_security::verify_task);
+    /// nothing in `celers-core` produces or consumes it on its own. `None` —
+    /// the default, and the only value a producer that never signs will ever
+    /// write — means *unsigned*, which a consumer may accept or reject
+    /// according to its
+    /// [`SignaturePolicy`](crate::task_security::SignaturePolicy).
+    ///
+    /// Optional and defaulted on the wire, so messages produced before this
+    /// field existed still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<crate::task_security::SignatureEnvelope>,
 }
 
 /// Configurable bounds applied by [`TaskMetadata::validate_with_limits`].
@@ -530,6 +547,7 @@ impl TaskMetadata {
             chord_id: None,
             on_success_link: None,
             dependencies: HashSet::new(),
+            signature: None,
         }
     }
 
@@ -1075,6 +1093,10 @@ impl TaskMetadata {
             chord_id: self.chord_id,
             on_success_link: self.on_success_link.clone(),
             dependencies: self.dependencies.clone(),
+            // Deliberately dropped: the task id is part of what a signature
+            // covers, so carrying the old envelope onto a new id would produce
+            // a message that always fails verification. The caller re-signs.
+            signature: None,
         }
     }
 }

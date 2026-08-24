@@ -1,8 +1,27 @@
 //! Task argument sanitization.
 //!
-//! Task arguments and keyword arguments frequently originate from untrusted
-//! callers (HTTP handlers, message brokers, user input). Before such a payload
-//! is logged, persisted, or executed it is prudent to:
+//! # What is automatic, and what is opt-in
+//!
+//! **Nothing here runs automatically.** A [`Sanitizer`] cleans the arguments
+//! you hand it and nothing else; CeleRS does not sanitize a task's payload on
+//! enqueue, on dequeue, or before execution, and a task always executes the
+//! exact bytes its producer sent.
+//!
+//! | Where | Sanitized? | How to turn it on |
+//! |---|---|---|
+//! | The payload a task executes | **never** — by design | not available: rewriting it would change what the caller asked for, and would invalidate the message's signature |
+//! | The `inspect active` payload preview, and the worker's `debug!` rendering of arguments | only when configured | set `WorkerConfig::payload_hygiene` (see [`crate::task_security::PayloadHygiene`]) |
+//! | Dead-letter entries | **no** | not available: a DLQ entry is replayable, so its payload is an executing payload |
+//! | Result-backend records | nothing to sanitize | CeleRS stores no task arguments in any result backend |
+//! | Your own logging / persistence | only when you call it | call [`Sanitizer::sanitize_call`] on your copy |
+//!
+//! The `security_wiring` example in the `celers` crate shows the whole wiring.
+//!
+//! # Why sanitize a copy at all
+//!
+//! Task arguments frequently originate from untrusted callers (HTTP handlers,
+//! message brokers, user input). Before such a payload is *logged or persisted*
+//! it is prudent to:
 //!
 //! * **bound its size** — reject pathologically large strings/blobs and
 //!   excessively long argument lists (a cheap denial-of-service vector);
@@ -17,6 +36,13 @@
 //! The work is driven by a [`SanitizerConfig`] so each deployment can tune the
 //! policy, and the [`Sanitizer`] returns a [`SanitizeReport`] describing every
 //! action it took (useful for audit logging and tests).
+//!
+//! Note that the size and kind limits are *errors*, not redactions:
+//! [`Sanitizer::sanitize_call`] returns [`SanitizeError`] for a payload that
+//! violates one, and [`SanitizerConfig::default`] disallows
+//! [`ValueKind::Bytes`] outright. A caller using this for logging must treat
+//! that as "render a placeholder", never as "reject the task" — which is what
+//! [`crate::task_security::PayloadHygiene`] does.
 //!
 //! All of this operates over a small, JSON-like value model — [`TaskValue`] —
 //! which is shared by the signature and PII modules so the three security

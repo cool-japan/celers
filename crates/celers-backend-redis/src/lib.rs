@@ -112,6 +112,10 @@ mod tests;
 #[path = "tests_ops.rs"]
 mod tests_ops;
 
+#[cfg(test)]
+#[path = "tests_event_wire.rs"]
+mod tests_event_wire;
+
 // ── Re-exports: preserve public API ──────────────────────────────────
 
 // types

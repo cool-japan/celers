@@ -82,6 +82,7 @@ pub mod routing;
 pub mod row_ext;
 pub mod sandbox;
 pub mod scheduler;
+pub mod security;
 pub mod shutdown;
 pub mod streaming;
 pub(crate) mod sysinfo;
@@ -198,6 +199,7 @@ pub use scheduler::{
     AvailableResources, ScheduledTask, SchedulerConfig, TaskPriority, TaskRequirements,
     TaskScheduler,
 };
+pub use security::SignatureVerification;
 pub use shutdown::wait_for_signal;
 pub use streaming::{
     ChunkReceiver, ChunkSender, DataChunk, ResultStreamer, StreamConfig, StreamStats,

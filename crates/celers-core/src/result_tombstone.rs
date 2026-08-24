@@ -11,8 +11,34 @@
 //! The [`crate::result::ResultTombstone`] type (defined in [`crate::result`])
 //! carries the marker payload (`task_id`, `deleted_at`, `reason`,
 //! `deleted_by`, optional `tombstone_ttl`). This module adds the *semantics*
-//! around it: a tri-state existence enum, an in-memory registry, and a set of
-//! helper methods, all of which are purely additive new types.
+//! around it: a tri-state existence enum, an in-memory registry, and the
+//! [`AsyncResult`](crate::result::AsyncResult) integration that populates it.
+//!
+//! # What is automatic, and what is opt-in
+//!
+//! | Behaviour | Automatic? |
+//! |---|---|
+//! | `AsyncResult::forget()` deletes the result from the backend | **yes**, always — this is what it always did |
+//! | `AsyncResult::forget()` records a tombstone | **only** after [`AsyncResult::with_tombstone_registry`](crate::result::AsyncResult::with_tombstone_registry) |
+//! | `AsyncResult::existence()` can answer "tombstoned" | only when a registry is attached, or the backend overrides [`ResultStore::get_tombstone`](crate::result::ResultStore::get_tombstone) |
+//! | `AsyncResult::get()` fails fast on a forgotten result instead of polling forever | **yes** when the tombstone is visible (registry attached or a tombstone-aware backend), and [`AsyncResultConfig::fail_on_tombstone`](crate::result::AsyncResultConfig::fail_on_tombstone) is on by default |
+//! | Some other component populating the registry | **no** — the registry is written by `forget` and by whatever else you call [`TombstoneRegistry::insert`] / [`TombstoneRegistry::mark_forgotten`] from |
+//!
+//! Without a registry, `forget()` is byte-for-byte the call it always was, and
+//! a deleted result is indistinguishable from one that never existed.
+//!
+//! # Scope
+//!
+//! [`TombstoneRegistry`] is **in-process**: another worker or another CLI
+//! invocation sees nothing it recorded. Cross-process visibility needs a
+//! backend that overrides
+//! [`ResultStore::store_tombstone`](crate::result::ResultStore::store_tombstone)
+//! and [`ResultStore::get_tombstone`](crate::result::ResultStore::get_tombstone)
+//! — `forget` offers the tombstone to the backend as well as to the registry,
+//! so such a backend gets it for free. Entries are also bounded (see
+//! [`DEFAULT_TOMBSTONE_TTL`] and [`DEFAULT_MAX_TOMBSTONES`]), so a tombstone is
+//! a *finite-lifetime* record: once it expires the result reads as `Absent`
+//! again.
 //!
 //! # Example
 //!
@@ -382,6 +408,100 @@ impl TombstoneRegistry {
         let count = guard.len();
         guard.clear();
         count
+    }
+}
+
+// ===========================================================================
+// AsyncResult integration
+//
+// This is the *runtime wiring* half of the module: without it the registry
+// above is a type nobody ever writes to. It lives here rather than in
+// `result.rs` so the tombstone semantics stay in one file (and so `result.rs`
+// stays under the 2000-line ceiling).
+// ===========================================================================
+
+impl<S: crate::result::ResultStore + Clone> crate::result::AsyncResult<S> {
+    /// Record forgotten results in a shared [`TombstoneRegistry`].
+    ///
+    /// **Opt-in.** Without it, forgetting a result makes it indistinguishable
+    /// from one that never existed: [`Self::existence`] reports
+    /// [`ResultExistence::Absent`] and
+    /// [`AsyncResult::get`](crate::result::AsyncResult::get) keeps polling for
+    /// a result that will never arrive. With a registry attached,
+    /// [`AsyncResult::forget`](crate::result::AsyncResult::forget) writes a
+    /// tombstone both into the registry (always, whatever the backend
+    /// supports) and through
+    /// [`ResultStore::forget_with_tombstone`](crate::result::ResultStore::forget_with_tombstone)
+    /// (so a tombstone-aware backend persists it for other processes too).
+    ///
+    /// The registry is shared state: clone the [`Arc`](std::sync::Arc) into
+    /// every `AsyncResult` that should see the same tombstones.
+    #[must_use]
+    pub fn with_tombstone_registry(mut self, registry: std::sync::Arc<TombstoneRegistry>) -> Self {
+        self.tombstones = Some(registry);
+        self
+    }
+
+    /// The attached tombstone registry, if [`Self::with_tombstone_registry`]
+    /// was called.
+    #[inline]
+    #[must_use]
+    pub fn tombstone_registry(&self) -> Option<&std::sync::Arc<TombstoneRegistry>> {
+        self.tombstones.as_ref()
+    }
+
+    /// The tri-state existence of this task's result: present, tombstoned
+    /// (explicitly forgotten) or absent (never existed, as far as anyone knows).
+    ///
+    /// The attached registry is consulted first, because it is authoritative
+    /// for anything *this process* forgot even when the backend cannot store
+    /// tombstones; otherwise the question goes to
+    /// [`ResultStore::result_existence`](crate::result::ResultStore::result_existence),
+    /// whose default only ever distinguishes present from absent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any backend error from `ResultStore::result_existence`.
+    pub async fn existence(&self) -> crate::Result<ResultExistence> {
+        if let Some(ref registry) = self.tombstones {
+            let local = registry.lookup(self.task_id());
+            if local.is_tombstoned() {
+                return Ok(local);
+            }
+        }
+        self.store.result_existence(self.task_id()).await
+    }
+
+    /// Forget the task result, recording `reason` on the tombstone.
+    ///
+    /// The reason is what
+    /// [`AsyncResult::get`](crate::result::AsyncResult::get) reports to a
+    /// caller waiting on a result that has since been deleted, so it is worth
+    /// making it say who deleted it and why ("GDPR erasure request", "nightly
+    /// purge").
+    ///
+    /// With no registry attached the reason is discarded along with the
+    /// tombstone: only
+    /// [`ResultStore::forget`](crate::result::ResultStore::forget) runs,
+    /// exactly as it did before this method existed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the backend's deletion error. The registry is written only
+    /// *after* the backend deletion succeeds, so a failed delete never leaves a
+    /// tombstone for a result that is still there.
+    pub async fn forget_with_reason(&self, reason: impl Into<String>) -> crate::Result<()> {
+        let Some(ref registry) = self.tombstones else {
+            return self.store.forget(self.task_id()).await;
+        };
+
+        let tombstone = ResultTombstone::new(self.task_id()).with_reason(reason);
+        // The backend gets the tombstone too, so a tombstone-aware store can
+        // answer other processes; the registry is the in-process record that
+        // works even when the backend cannot store one.
+        self.store.forget_with_tombstone(tombstone.clone()).await?;
+        registry.insert(tombstone);
+        Ok(())
     }
 }
 

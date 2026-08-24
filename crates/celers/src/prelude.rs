@@ -51,6 +51,23 @@ pub use crate::Worker;
 pub use crate::WorkerConfig;
 pub use celers_worker::WorkerConfigBuilder;
 
+// Security types.
+//
+// Every one of these is a building block for an **opt-in** control: nothing in
+// CeleRS signs, verifies, redacts or tombstones until a runtime is configured
+// to. See the `security_wiring` example.
+pub use crate::PayloadHygiene;
+pub use crate::PiiConfig;
+pub use crate::PiiDetector;
+pub use crate::ResultExistence;
+pub use crate::Sanitizer;
+pub use crate::SanitizerConfig;
+pub use crate::SignatureVerification;
+pub use crate::SigningOptions;
+pub use crate::TaskSigner;
+pub use crate::TombstoneRegistry;
+pub use crate::{sign_task, verify_task};
+
 // Broker helper functions
 pub use crate::broker_helper::{create_broker, create_broker_from_env, BrokerConfigError};
 

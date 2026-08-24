@@ -2,9 +2,32 @@
 //!
 //! This module scans task arguments (and arbitrary strings) for common kinds
 //! of PII and can mask the matches it finds, returning a [`PiiReport`] that
-//! records what was detected and where. It is useful for redacting sensitive
-//! data before task arguments are written to logs, traces, or a result
-//! backend.
+//! records what was detected and where.
+//!
+//! # What is automatic, and what is opt-in
+//!
+//! **Nothing here runs automatically.** A [`PiiDetector`] masks the values you
+//! hand it and nothing else. CeleRS never masks a task's payload: a task
+//! executes the exact bytes its producer sent, because masking them would
+//! change the work and would invalidate the message's signature.
+//!
+//! | Where | Masked? | How to turn it on |
+//! |---|---|---|
+//! | The payload a task executes | **never** — by design | not available |
+//! | The `inspect active` payload preview, and the worker's `debug!` rendering of arguments | only when configured | set `WorkerConfig::payload_hygiene` (see [`crate::task_security::PayloadHygiene`]) |
+//! | Dead-letter entries | **no** | not available: a DLQ entry is replayable |
+//! | Result-backend records | nothing to mask | CeleRS stores no task arguments in any result backend; an integration that adds one must call [`PiiDetector::mask_call`] on the copy it writes |
+//! | Your own logs / traces | only when you call it | call [`PiiDetector::mask_str`] or [`PiiDetector::mask_call`] on your copy |
+//!
+//! The `security_wiring` example in the `celers` crate shows the whole wiring.
+//!
+//! # Detection is best-effort
+//!
+//! These are pattern detectors, not a compliance control. They will miss PII
+//! that does not match one of the four shapes below (names, addresses, free
+//! text, an id in a format they do not know), and they can match a value that
+//! merely looks like PII. Treat a clean [`PiiReport`] as "nothing recognized",
+//! never as "no PII present".
 //!
 //! The detectors are **hand-written byte/char scanners** (no regular-expression
 //! engine) so they are fast, allocation-light, and have predictable behaviour:

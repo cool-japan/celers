@@ -9,7 +9,9 @@ use crate::feature_flags::{FeatureFlags, TaskFeatureRequirements};
 use crate::metadata::WorkerMetadata;
 use crate::retry::{RetryConfig, RetryStrategy};
 use crate::routing::{RoutingStrategy, WorkerTags};
+use crate::security::SignatureVerification;
 
+use celers_core::task_security::PayloadHygiene;
 use celers_core::Result;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -277,6 +279,25 @@ pub struct WorkerConfig {
     /// (requeued) for a worker that does. Tasks with no entry here are admitted
     /// unconditionally, so this is a no-op until populated.
     pub task_feature_requirements: HashMap<String, TaskFeatureRequirements>,
+
+    // Security options
+    /// Message authentication applied to every dequeued message *before*
+    /// dispatch.
+    ///
+    /// `None` — the default — means the worker executes whatever the broker
+    /// hands it, signed or not. Set it to a
+    /// [`SignatureVerification`](crate::SignatureVerification) and a message
+    /// that does not verify is rejected before dispatch: dead-lettered when a
+    /// DLQ is configured, dropped otherwise. See [`crate::security`].
+    pub signature_verification: Option<SignatureVerification>,
+
+    /// Redaction applied to the payload *copies* the worker shows to operators
+    /// (`inspect active`, debug logging).
+    ///
+    /// `None` — the default — means previews are reported verbatim. Setting it
+    /// never affects the payload a task executes; see [`crate::security`] for
+    /// exactly which copies are covered.
+    pub payload_hygiene: Option<PayloadHygiene>,
 }
 
 impl Default for WorkerConfig {
@@ -318,6 +339,11 @@ impl Default for WorkerConfig {
             metadata: WorkerMetadata::default(),
             feature_flags: FeatureFlags::default(),
             task_feature_requirements: HashMap::new(),
+            // Both security controls are opt-in: turning either on by default
+            // would silently reject every message a pre-existing producer sends
+            // (nothing signs today) or silently rewrite what operators see.
+            signature_verification: None,
+            payload_hygiene: None,
         }
     }
 }
@@ -922,6 +948,31 @@ impl WorkerConfigBuilder {
         self
     }
 
+    /// Authenticate every dequeued message before it is dispatched.
+    ///
+    /// Off by default. A message that does not verify is rejected before
+    /// dispatch — dead-lettered when a DLQ is configured, dropped otherwise —
+    /// and never reaches a task handler. See [`crate::security`].
+    ///
+    /// The signing key is *not* read from the environment by
+    /// [`WorkerConfig::from_env`]: a secret that a stray `CELERS_*` variable can
+    /// switch on or off is worse than one the program passes explicitly.
+    pub fn signature_verification(mut self, verification: SignatureVerification) -> Self {
+        self.config.signature_verification = Some(verification);
+        self
+    }
+
+    /// Redact the payload copies the worker shows to operators.
+    ///
+    /// Off by default. Applies to the `inspect active` payload preview and the
+    /// worker's debug rendering of task arguments only — never to the payload a
+    /// task executes, and never to a (replayable) dead-letter entry. See
+    /// [`crate::security`].
+    pub fn payload_hygiene(mut self, hygiene: PayloadHygiene) -> Self {
+        self.config.payload_hygiene = Some(hygiene);
+        self
+    }
+
     /// Preset: High throughput configuration
     ///
     /// - High concurrency (16 tasks)
@@ -1032,6 +1083,11 @@ pub struct WorkerStats {
     /// Total number of tasks whose **soft** time limit expired while they were
     /// still running (Celery's `SoftTimeLimitExceeded`)
     soft_timeouts: AtomicU64,
+    /// Total number of messages refused by signature verification (unsigned,
+    /// tampered, stale or replayed). Always `0` unless
+    /// [`WorkerConfig::signature_verification`](crate::WorkerConfig::signature_verification)
+    /// is set.
+    signature_rejected: AtomicU64,
 }
 
 impl WorkerStats {
@@ -1072,6 +1128,17 @@ impl WorkerStats {
     /// affinity, feature flags or rate limiting)
     pub fn deferred(&self) -> u64 {
         self.deferred.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of messages refused by signature verification.
+    ///
+    /// Counts every rejection cause: unsigned when a signature was required,
+    /// a MAC mismatch, a stale or future-dated message, and a replay. Stays `0`
+    /// while
+    /// [`WorkerConfig::signature_verification`](crate::WorkerConfig::signature_verification)
+    /// is unset, so a non-zero value means something actually tried.
+    pub fn signature_rejected(&self) -> u64 {
+        self.signature_rejected.load(Ordering::Relaxed)
     }
 
     /// Get the number of task handlers that panicked
@@ -1131,6 +1198,11 @@ impl WorkerStats {
         self.deferred.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record that a message was refused by signature verification
+    pub fn task_signature_rejected(&self) {
+        self.signature_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record that a task handler panicked
     pub fn task_panicked(&self) {
         self.panicked.fetch_add(1, Ordering::Relaxed);
@@ -1153,6 +1225,7 @@ impl Clone for WorkerStats {
             deferred: AtomicU64::new(self.deferred.load(Ordering::Relaxed)),
             panicked: AtomicU64::new(self.panicked.load(Ordering::Relaxed)),
             soft_timeouts: AtomicU64::new(self.soft_timeouts.load(Ordering::Relaxed)),
+            signature_rejected: AtomicU64::new(self.signature_rejected.load(Ordering::Relaxed)),
         }
     }
 }

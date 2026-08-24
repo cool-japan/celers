@@ -91,9 +91,9 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// [`with_control_transport`](Self::with_control_transport), which binds
     /// the service the run loop actually uses.
     pub fn control_service(&self) -> ControlService {
-        ControlService::new(Arc::new(
-            self.control_surface(support::InFlightRegistry::with_args_capture()),
-        ))
+        ControlService::new(Arc::new(self.control_surface(
+            support::InFlightRegistry::with_args_capture(self.config.payload_hygiene.clone()),
+        )))
     }
 
     /// Assemble the handles the control protocol dispatches against.

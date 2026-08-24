@@ -8,6 +8,7 @@
 use crate::retry::RetryConfig;
 use crate::types::WorkerStats;
 
+use celers_core::task_security::PayloadHygiene;
 use celers_core::{Event, EventEmitter, TaskId};
 
 use std::collections::HashMap;
@@ -91,6 +92,11 @@ pub(crate) struct InFlightRegistry {
     /// Whether to retain a payload preview per task. Off unless the remote
     /// control protocol is wired up, so an ordinary worker pays nothing.
     capture_args: bool,
+    /// Redaction applied to the retained preview, when
+    /// [`WorkerConfig::payload_hygiene`](crate::WorkerConfig::payload_hygiene)
+    /// is configured. The preview is a *copy*: the payload the task executes is
+    /// never routed through this.
+    hygiene: Option<PayloadHygiene>,
 }
 
 impl InFlightRegistry {
@@ -101,10 +107,16 @@ impl InFlightRegistry {
 
     /// Create an empty registry that retains a bounded payload preview per
     /// task, so `inspect active` can report task arguments.
-    pub(crate) fn with_args_capture() -> Self {
+    ///
+    /// `hygiene` redacts that preview — secret-looking keys and PII — before it
+    /// is retained, so what an operator inspects never carries what the payload
+    /// carried. `None` retains the payload verbatim, which is what a worker
+    /// with no hygiene configured has always done.
+    pub(crate) fn with_args_capture(hygiene: Option<PayloadHygiene>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             capture_args: true,
+            hygiene,
         }
     }
 
@@ -131,7 +143,7 @@ impl InFlightRegistry {
             name: task.metadata.name.clone(),
             started: unix_now(),
             args_preview: if self.capture_args {
-                Some(args_preview(&task.payload))
+                Some(args_preview(&task.payload, self.hygiene.as_ref()))
             } else {
                 None
             },
@@ -186,19 +198,34 @@ fn unix_now() -> f64 {
 /// `CeleRS` payloads are JSON produced by `serde_json`, so the common case
 /// renders verbatim; a binary payload (msgpack, a compressed body) is reported
 /// by size rather than mangled into replacement characters.
-fn args_preview(payload: &[u8]) -> String {
-    match std::str::from_utf8(payload) {
-        Ok(text) if text.len() <= ARGS_PREVIEW_LIMIT => text.to_string(),
-        Ok(text) => {
-            // Truncate on a character boundary, never mid-code-point.
-            let mut end = ARGS_PREVIEW_LIMIT;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}… ({} bytes)", &text[..end], payload.len())
-        }
-        Err(_) => format!("<binary payload, {} bytes>", payload.len()),
+///
+/// With `hygiene` configured the rendering is the *redacted* one — secret-looking
+/// keyword values replaced, PII masked — computed on a copy. `payload` itself is
+/// only ever read.
+pub(crate) fn args_preview(payload: &[u8], hygiene: Option<&PayloadHygiene>) -> String {
+    match hygiene.filter(|h| h.is_enabled()) {
+        Some(hygiene) => truncate_preview(&hygiene.redact_payload(payload).text, payload.len()),
+        None => match std::str::from_utf8(payload) {
+            Ok(text) => truncate_preview(text, payload.len()),
+            Err(_) => format!("<binary payload, {} bytes>", payload.len()),
+        },
     }
+}
+
+/// Clip `text` to [`ARGS_PREVIEW_LIMIT`], never mid-code-point.
+///
+/// `source_len` is the size of the payload the text was rendered from, reported
+/// alongside the ellipsis so an operator can tell a clipped preview from a short
+/// payload.
+fn truncate_preview(text: &str, source_len: usize) -> String {
+    if text.len() <= ARGS_PREVIEW_LIMIT {
+        return text.to_string();
+    }
+    let mut end = ARGS_PREVIEW_LIMIT;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({source_len} bytes)", &text[..end])
 }
 
 /// A non-blocking sink for task/worker lifecycle events.
@@ -217,6 +244,7 @@ fn args_preview(payload: &[u8]) -> String {
 pub(crate) struct EventSink {
     tx: Option<mpsc::Sender<Event>>,
     dropped: Arc<AtomicU64>,
+    emit_failures: Arc<AtomicU64>,
 }
 
 impl EventSink {
@@ -225,6 +253,7 @@ impl EventSink {
         Self {
             tx: None,
             dropped: Arc::new(AtomicU64::new(0)),
+            emit_failures: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -239,6 +268,8 @@ impl EventSink {
     ) -> (Self, JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel::<Event>(capacity.max(1));
         let max_batch = max_batch.max(1);
+        let emit_failures = Arc::new(AtomicU64::new(0));
+        let drainer_failures = Arc::clone(&emit_failures);
 
         let handle = tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
@@ -252,7 +283,19 @@ impl EventSink {
                 }
                 let batched = batch.len();
                 if let Err(e) = emitter.emit_batch(batch).await {
-                    debug!("Failed to emit {} buffered event(s): {}", batched, e);
+                    // A permanently dead event pipeline (unreachable broker,
+                    // wrong credentials) must not be invisible: count every
+                    // failure and warn — rate-limited so a sustained outage
+                    // cannot itself flood the log.
+                    let failures = drainer_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    if failures == 1 || failures.is_multiple_of(100) {
+                        warn!(
+                            "Failed to emit {} buffered event(s) ({} emit failure(s) so far): {}",
+                            batched, failures, e
+                        );
+                    } else {
+                        debug!("Failed to emit {} buffered event(s): {}", batched, e);
+                    }
                 }
             }
         });
@@ -261,6 +304,7 @@ impl EventSink {
             Self {
                 tx: Some(tx),
                 dropped: Arc::new(AtomicU64::new(0)),
+                emit_failures,
             },
             handle,
         )
@@ -285,6 +329,14 @@ impl EventSink {
     /// Number of events dropped because the buffer was full or closed.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Number of `emit_batch` calls the transport rejected.
+    ///
+    /// Non-zero means the event pipeline is failing downstream of this sink
+    /// (dead broker, bad credentials) even though nothing was dropped locally.
+    pub(crate) fn emit_failures(&self) -> u64 {
+        self.emit_failures.load(Ordering::Relaxed)
     }
 }
 

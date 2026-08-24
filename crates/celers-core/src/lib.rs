@@ -138,6 +138,7 @@ pub mod router;
 pub mod sanitize;
 pub mod state;
 pub mod task;
+pub mod task_security;
 pub mod task_signature;
 pub mod tenant_rate_limit;
 pub mod time_limit;
@@ -169,11 +170,12 @@ pub use control_transport::{
 pub use dag::{DagNode, TaskDag};
 pub use error::{CelersError, Result};
 pub use event::{
-    Alert, AlertCondition, AlertContext, AlertHandler, AlertManager, AlertSeverity,
-    CompositeEventEmitter, Event, EventDispatcher, EventEmitter, EventFilter, EventMonitor,
-    EventReceiver, EventStats, EventStorage, EventStream, FileEventStorage, InMemoryEventEmitter,
-    InMemoryEventStorage, LogLevel, LoggingAlertHandler, LoggingEventEmitter, NoOpEventEmitter,
-    TaskEvent, TaskEventBuilder, WorkerEvent, WorkerEventBuilder,
+    event_timestamp_now, Alert, AlertCondition, AlertContext, AlertHandler, AlertManager,
+    AlertSeverity, CompositeEventEmitter, Event, EventDispatcher, EventEmitter, EventEnvelope,
+    EventFilter, EventMonitor, EventReceiver, EventStats, EventStorage, EventStream,
+    FileEventStorage, InMemoryEventEmitter, InMemoryEventStorage, LogLevel, LoggingAlertHandler,
+    LoggingEventEmitter, NoOpEventEmitter, TaskEvent, TaskEventBuilder, WorkerEvent,
+    WorkerEventBuilder,
 };
 pub use event_filter::{
     CollectingEventHandler, CompositeEventFilter, DispatchReport, EventFilterTrait,
@@ -226,6 +228,10 @@ pub use sanitize::{
 };
 pub use state::{StateHistory, StateTransition, TaskState};
 pub use task::{SerializedTask, Task, TaskId, TaskMetadata};
+pub use task_security::{
+    sign_task, signed_fields, task_call_from_payload, verify_task, CallShape, HygieneReport,
+    PayloadHygiene, RedactedPayload, SignatureEnvelope, SignaturePolicy, SigningOptions, TaskCall,
+};
 pub use task_signature::{
     FreshnessWindow, HmacSha256, ReplayGuard, Sha256, SignatureAlgorithm, SignatureError,
     SignedCallback, SignedFields, TaskSignature, TaskSigner,

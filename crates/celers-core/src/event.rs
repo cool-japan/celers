@@ -1,49 +1,86 @@
 //! Real-time event types for task and worker lifecycle
 //!
-//! This module provides Celery-compatible event types for monitoring task execution
-//! and worker status. Events can be published to various transports (Redis pub/sub,
-//! AMQP fanout, etc.) for real-time monitoring.
+//! [`Event`] is CeleRS' **typed internal model** of the task and worker
+//! lifecycle: strongly typed variants, `DateTime<Utc>` timestamps and Rust
+//! field names (`task_id`, `task_name`). It is what workers pass around
+//! in-process, what [`EventFilter`] and [`EventDispatcher`] match on, and what
+//! the event persisters store.
+//!
+//! It is **not** the on-the-wire shape. A Celery monitor (`celery events`,
+//! Flower, a custom consumer) expects float Unix timestamps and Celery's own
+//! field names (`uuid`, `name`), plus the `clock`/`utcoffset`/`pid` envelope.
+//! That shape is produced by [`Event::to_wire_json`] and parsed back by
+//! [`Event::from_wire_str`]; see the [`wire`] module for the full mapping. It
+//! is exactly the shape `celers_protocol::event::EventMessage` describes, and
+//! it is what every network transport in the workspace
+//! (`celers_backend_redis::event_transport`,
+//! `celers_broker_amqp::event_transport`) puts on the wire.
+//!
+//! In short: **typed model in memory and in storage, Celery wire shape on the
+//! network.** Do not hand `serde_json::to_string(&event)` to a monitor — that
+//! is the internal shape.
+//!
+//! [`Event::from_wire_str`] reads both directions of a mixed cluster: events
+//! CeleRS published and events a real Python Celery worker published on the
+//! same `celeryev` channel. See [`wire`] for the two fields Celery omits and
+//! the defaults they come back with.
 //!
 //! # Event Types
 //!
 //! ## Task Events
-//! - `TaskSent` - Task was sent to the queue
-//! - `TaskReceived` - Task was received by a worker
-//! - `TaskStarted` - Task execution started
-//! - `TaskSucceeded` - Task completed successfully
-//! - `TaskFailed` - Task execution failed
-//! - `TaskRetried` - Task is being retried
-//! - `TaskRevoked` - Task was revoked/cancelled
-//! - `TaskRejected` - Task was rejected by worker
+//! - `task-sent` - Task was sent to the queue
+//! - `task-received` - Task was received by a worker
+//! - `task-started` - Task execution started
+//! - `task-succeeded` - Task completed successfully
+//! - `task-failed` - Task execution failed
+//! - `task-retried` - Task is being retried
+//! - `task-revoked` - Task was revoked/cancelled
+//! - `task-rejected` - Task was rejected by worker
+//! - `task-soft-time-limit-exceeded` - Task passed its soft time limit
+//!   (a CeleRS extension: Celery has no such event, so a Celery monitor sees
+//!   it as an unknown/custom event type rather than failing to parse)
 //!
 //! ## Worker Events
-//! - `WorkerOnline` - Worker came online
-//! - `WorkerOffline` - Worker going offline
-//! - `WorkerHeartbeat` - Periodic worker heartbeat
+//! - `worker-online` - Worker came online
+//! - `worker-offline` - Worker going offline
+//! - `worker-heartbeat` - Periodic worker heartbeat
 //!
 //! # Example
 //!
 //! ```rust
-//! use celers_core::event::{Event, TaskEvent, WorkerEvent};
+//! use celers_core::event::{Event, TaskEvent};
+//! use celers_core::event::wire::event_timestamp_now;
 //! use uuid::Uuid;
-//! use chrono::Utc;
 //!
 //! // Create a task started event
+//! let task_id = Uuid::new_v4();
 //! let event = Event::Task(TaskEvent::Started {
-//!     task_id: Uuid::new_v4(),
+//!     task_id,
 //!     task_name: "my_task".to_string(),
 //!     hostname: "worker-1".to_string(),
-//!     timestamp: Utc::now(),
+//!     timestamp: event_timestamp_now(),
 //!     pid: std::process::id(),
 //! });
 //!
-//! // Serialize for transport
-//! let json = serde_json::to_string(&event).unwrap();
+//! // Render the Celery-compatible wire shape a monitor can parse.
+//! let json = event.to_wire_json().unwrap();
+//! assert!(json.contains(r#""type":"task-started""#));
+//! assert!(json.contains(&format!(r#""uuid":"{task_id}""#)));
+//!
+//! // ...and read it back into the typed model.
+//! assert_eq!(Event::from_wire_str(&json).unwrap(), event);
 //! ```
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+pub mod wire;
+
+pub use wire::{
+    adjust_event_clock, current_event_clock, event_timestamp_now, forward_event_clock,
+    from_wire_timestamp, to_wire_timestamp, truncate_to_wire_precision, EventEnvelope,
+};
 
 /// Task lifecycle events (Celery-compatible)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -83,6 +120,7 @@ pub enum TaskEvent {
         /// Unique task ID
         task_id: Uuid,
         /// Task name
+        #[serde(default)]
         task_name: String,
         /// Worker hostname
         hostname: String,
@@ -98,6 +136,11 @@ pub enum TaskEvent {
         /// Unique task ID
         task_id: Uuid,
         /// Task name
+        ///
+        /// Python Celery omits `name` on every event after `task-received`
+        /// (a monitor correlates by `uuid`), so an inbound Celery event
+        /// deserializes with this empty. CeleRS always emits it.
+        #[serde(default)]
         task_name: String,
         /// Worker hostname
         hostname: String,
@@ -113,6 +156,11 @@ pub enum TaskEvent {
         /// Unique task ID
         task_id: Uuid,
         /// Task name
+        ///
+        /// Python Celery omits `name` on every event after `task-received`
+        /// (a monitor correlates by `uuid`), so an inbound Celery event
+        /// deserializes with this empty. CeleRS always emits it.
+        #[serde(default)]
         task_name: String,
         /// Worker hostname
         hostname: String,
@@ -131,6 +179,11 @@ pub enum TaskEvent {
         /// Unique task ID
         task_id: Uuid,
         /// Task name
+        ///
+        /// Python Celery omits `name` on every event after `task-received`
+        /// (a monitor correlates by `uuid`), so an inbound Celery event
+        /// deserializes with this empty. CeleRS always emits it.
+        #[serde(default)]
         task_name: String,
         /// Worker hostname
         hostname: String,
@@ -149,6 +202,11 @@ pub enum TaskEvent {
         /// Unique task ID
         task_id: Uuid,
         /// Task name
+        ///
+        /// Python Celery omits `name` on every event after `task-received`
+        /// (a monitor correlates by `uuid`), so an inbound Celery event
+        /// deserializes with this empty. CeleRS always emits it.
+        #[serde(default)]
         task_name: String,
         /// Worker hostname
         hostname: String,
@@ -157,6 +215,10 @@ pub enum TaskEvent {
         /// Exception that caused retry
         exception: String,
         /// Current retry attempt number
+        ///
+        /// Python Celery's `task-retried` carries no retry count, so an
+        /// inbound Celery event deserializes with this at `0`.
+        #[serde(default)]
         retries: u32,
     },
 
@@ -192,7 +254,34 @@ pub enum TaskEvent {
         /// Event timestamp
         timestamp: DateTime<Utc>,
         /// Rejection reason
+        ///
+        /// Python Celery's `task-rejected` reports only `requeue`, so an
+        /// inbound Celery event deserializes with this empty.
+        #[serde(default)]
         reason: String,
+    },
+
+    /// Task passed its soft time limit and was asked to wrap up
+    ///
+    /// A `CeleRS` extension: Celery raises `SoftTimeLimitExceeded` inside the
+    /// task but publishes no event for it, so a monitor sees this as a custom
+    /// event type. The task is still running — the hard time limit, not this
+    /// event, is what ends it.
+    #[serde(rename = "task-soft-time-limit-exceeded")]
+    SoftTimeLimitExceeded {
+        /// Unique task ID
+        task_id: Uuid,
+        /// Task name
+        #[serde(default)]
+        task_name: String,
+        /// Worker hostname
+        hostname: String,
+        /// Event timestamp
+        timestamp: DateTime<Utc>,
+        /// Seconds the task had been running when the limit tripped
+        elapsed_secs: f64,
+        /// The configured soft limit, in seconds
+        limit_secs: f64,
     },
 }
 
@@ -267,6 +356,7 @@ impl Event {
             Event::Task(TaskEvent::Retried { .. }) => "task-retried",
             Event::Task(TaskEvent::Revoked { .. }) => "task-revoked",
             Event::Task(TaskEvent::Rejected { .. }) => "task-rejected",
+            Event::Task(TaskEvent::SoftTimeLimitExceeded { .. }) => "task-soft-time-limit-exceeded",
             Event::Worker(WorkerEvent::Online { .. }) => "worker-online",
             Event::Worker(WorkerEvent::Offline { .. }) => "worker-offline",
             Event::Worker(WorkerEvent::Heartbeat { .. }) => "worker-heartbeat",
@@ -286,7 +376,8 @@ impl Event {
                 | TaskEvent::Failed { timestamp, .. }
                 | TaskEvent::Retried { timestamp, .. }
                 | TaskEvent::Revoked { timestamp, .. }
-                | TaskEvent::Rejected { timestamp, .. } => *timestamp,
+                | TaskEvent::Rejected { timestamp, .. }
+                | TaskEvent::SoftTimeLimitExceeded { timestamp, .. } => *timestamp,
             },
             Event::Worker(e) => match e {
                 WorkerEvent::Online { timestamp, .. }
@@ -309,7 +400,8 @@ impl Event {
                 | TaskEvent::Failed { task_id, .. }
                 | TaskEvent::Retried { task_id, .. }
                 | TaskEvent::Revoked { task_id, .. }
-                | TaskEvent::Rejected { task_id, .. } => *task_id,
+                | TaskEvent::Rejected { task_id, .. }
+                | TaskEvent::SoftTimeLimitExceeded { task_id, .. } => *task_id,
             }),
             Event::Worker(_) => None,
         }
@@ -326,7 +418,8 @@ impl Event {
                 | TaskEvent::Succeeded { hostname, .. }
                 | TaskEvent::Failed { hostname, .. }
                 | TaskEvent::Retried { hostname, .. }
-                | TaskEvent::Rejected { hostname, .. } => Some(hostname),
+                | TaskEvent::Rejected { hostname, .. }
+                | TaskEvent::SoftTimeLimitExceeded { hostname, .. } => Some(hostname),
                 TaskEvent::Sent { .. } | TaskEvent::Revoked { .. } => None,
             },
             Event::Worker(e) => match e {
@@ -392,7 +485,7 @@ impl TaskEventBuilder {
             task_id: self.task_id,
             task_name: self.task_name,
             queue: queue.into(),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             args: None,
             kwargs: None,
             eta: None,
@@ -408,7 +501,7 @@ impl TaskEventBuilder {
             task_id: self.task_id,
             task_name: self.task_name,
             hostname: self.hostname.unwrap_or_else(|| "unknown".to_string()),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             pid: self.pid.unwrap_or(0),
         })
     }
@@ -420,7 +513,7 @@ impl TaskEventBuilder {
             task_id: self.task_id,
             task_name: self.task_name,
             hostname: self.hostname.unwrap_or_else(|| "unknown".to_string()),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             pid: self.pid.unwrap_or(0),
         })
     }
@@ -432,7 +525,7 @@ impl TaskEventBuilder {
             task_id: self.task_id,
             task_name: self.task_name,
             hostname: self.hostname.unwrap_or_else(|| "unknown".to_string()),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             runtime,
             result: None,
         })
@@ -444,7 +537,7 @@ impl TaskEventBuilder {
             task_id: self.task_id,
             task_name: self.task_name,
             hostname: self.hostname.unwrap_or_else(|| "unknown".to_string()),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             exception: exception.into(),
             traceback: None,
         })
@@ -456,9 +549,29 @@ impl TaskEventBuilder {
             task_id: self.task_id,
             task_name: self.task_name,
             hostname: self.hostname.unwrap_or_else(|| "unknown".to_string()),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             exception: exception.into(),
             retries,
+        })
+    }
+
+    /// Build a task-soft-time-limit-exceeded event
+    ///
+    /// `elapsed` is how long the task had been running when the limit tripped
+    /// and `limit` is the configured soft limit; both are reported in seconds.
+    #[must_use]
+    pub fn soft_time_limit_exceeded(
+        self,
+        elapsed: std::time::Duration,
+        limit: std::time::Duration,
+    ) -> Event {
+        Event::Task(TaskEvent::SoftTimeLimitExceeded {
+            task_id: self.task_id,
+            task_name: self.task_name,
+            hostname: self.hostname.unwrap_or_else(|| "unknown".to_string()),
+            timestamp: wire::event_timestamp_now(),
+            elapsed_secs: elapsed.as_secs_f64(),
+            limit_secs: limit.as_secs_f64(),
         })
     }
 }
@@ -482,7 +595,7 @@ impl WorkerEventBuilder {
     pub fn online(self) -> Event {
         Event::Worker(WorkerEvent::Online {
             hostname: self.hostname,
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             sw_ident: "celers".to_string(),
             sw_ver: env!("CARGO_PKG_VERSION").to_string(),
             sw_sys: std::env::consts::OS.to_string(),
@@ -494,7 +607,7 @@ impl WorkerEventBuilder {
     pub fn offline(self) -> Event {
         Event::Worker(WorkerEvent::Offline {
             hostname: self.hostname,
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
         })
     }
 
@@ -510,7 +623,7 @@ impl WorkerEventBuilder {
 
         Event::Worker(WorkerEvent::Heartbeat {
             hostname: self.hostname,
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             active,
             processed,
             loadavg: loadavg_opt,
@@ -842,7 +955,8 @@ impl EventFilter {
                         | TaskEvent::Started { task_name, .. }
                         | TaskEvent::Succeeded { task_name, .. }
                         | TaskEvent::Failed { task_name, .. }
-                        | TaskEvent::Retried { task_name, .. } => task_name == name,
+                        | TaskEvent::Retried { task_name, .. }
+                        | TaskEvent::SoftTimeLimitExceeded { task_name, .. } => task_name == name,
                         TaskEvent::Revoked { task_name, .. }
                         | TaskEvent::Rejected { task_name, .. } => {
                             matches!(task_name.as_ref(), Some(tn) if tn == name)
@@ -860,8 +974,9 @@ impl EventFilter {
                         | TaskEvent::Succeeded { hostname, .. }
                         | TaskEvent::Failed { hostname, .. }
                         | TaskEvent::Retried { hostname, .. }
-                        | TaskEvent::Rejected { hostname, .. } => Some(hostname),
-                        _ => None,
+                        | TaskEvent::Rejected { hostname, .. }
+                        | TaskEvent::SoftTimeLimitExceeded { hostname, .. } => Some(hostname),
+                        TaskEvent::Sent { .. } | TaskEvent::Revoked { .. } => None,
                     },
                     Event::Worker(worker_event) => match worker_event {
                         WorkerEvent::Online { hostname, .. }
@@ -1256,7 +1371,7 @@ mod tests {
     fn test_worker_event_serialization() {
         let event = Event::Worker(WorkerEvent::Heartbeat {
             hostname: "worker-1".to_string(),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             active: 5,
             processed: 100,
             loadavg: Some([1.0, 0.8, 0.5]),
@@ -1277,7 +1392,7 @@ mod tests {
             task_id: Uuid::new_v4(),
             task_name: "test".to_string(),
             queue: "celery".to_string(),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             args: None,
             kwargs: None,
             eta: None,
@@ -1466,7 +1581,7 @@ mod tests {
             task_id: Uuid::new_v4(),
             task_name: "t".to_string(),
             hostname: "w1".to_string(),
-            timestamp: Utc::now(),
+            timestamp: wire::event_timestamp_now(),
             pid: 1,
         })
     }

@@ -286,6 +286,7 @@ mod tests {
                 on_success_link: None,
                 dependencies: HashSet::new(),
                 expires_at: None,
+                signature: None,
             },
             payload: b"test payload".to_vec(),
         }

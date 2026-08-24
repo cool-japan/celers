@@ -1,11 +1,39 @@
 //! Task message signature verification (HMAC-SHA256).
 //!
 //! This module lets a producer cryptographically sign a task message and a
-//! consumer verify it, so that tampered or unsigned messages can be rejected
-//! before execution. The signature is an [HMAC] over a *canonical*
+//! consumer verify it. The signature is an [HMAC] over a *canonical*
 //! serialization of the task's execution-bearing fields, so two semantically
 //! identical messages always produce the same MAC regardless of incidental map
 //! ordering.
+//!
+//! # What is automatic, and what is opt-in
+//!
+//! **Nothing here runs automatically.** This module is the primitive: it signs
+//! and verifies a [`SignedFields`] value. It does not sign anything on enqueue
+//! and does not reject anything on dequeue.
+//!
+//! | Behaviour | Automatic? | How to turn it on |
+//! |---|---|---|
+//! | Messages leave a producer signed | **no** | call [`crate::task_security::sign_task`] on the message before enqueueing it |
+//! | The worker refuses an unsigned or tampered message before dispatch | **no** | set `WorkerConfig::signature_verification` to a `SignatureVerification` (`celers-worker`) |
+//! | Freshness (`signed_at`) is enforced | only if the verifier asks | `SignatureVerification::with_freshness` |
+//! | Replays are rejected | only if the verifier asks, and only within one process | `SignatureVerification::with_replay_guard`; see [`ReplayGuard`] |
+//! | Broker headers, routing, or delivery metadata are protected | **no**, ever | out of scope — see *What is and is not authenticated* below |
+//!
+//! Until a worker is configured with a verifier, a signature on a message is
+//! inert decoration: nothing checks it. The `security_wiring` example in the
+//! `celers` crate shows both halves wired together.
+//!
+//! # Where the signature travels
+//!
+//! On a [`SerializedTask`](crate::SerializedTask) the MAC lives in
+//! [`TaskMetadata::signature`](crate::TaskMetadata::signature), as a
+//! [`SignatureEnvelope`](crate::task_security::SignatureEnvelope) carrying the
+//! tag plus the `signed_at` and `nonce` the producer stamped (both are MAC
+//! *inputs*, so a verifier cannot reconstruct them). The projection from a
+//! message to the [`SignedFields`] below is
+//! [`crate::task_security::signed_fields`] — producer and consumer must use
+//! that same function or every verification fails.
 //!
 //! # What is and is not authenticated
 //!
@@ -45,6 +73,10 @@
 //!   disagree about it will disagree about what was signed.
 //! * Confidentiality. This is an authenticity primitive only — the payload
 //!   travels in the clear.
+//! * The [`TaskMetadata`](crate::TaskMetadata) fields a broker legitimately
+//!   rewrites in flight — `state`, `created_at`/`updated_at`, `priority`,
+//!   `max_retries`, `timeout_secs`, `group_id`, `chord_id`, `dependencies`.
+//!   [`crate::task_security::signed_fields`] lists the exact split.
 //!
 //! # Freshness and replay
 //!

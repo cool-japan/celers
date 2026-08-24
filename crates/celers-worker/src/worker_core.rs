@@ -25,7 +25,7 @@ use crate::poison_pill::PoisonPillDetector;
 use crate::routing::RoutingStrategy;
 use crate::types::{DynamicConfig, WorkerConfig, WorkerHandle, WorkerMode, WorkerStats};
 
-use execution::{DeadLetterRequest, ExecutionLimits, TaskDispatch};
+use execution::{DeadLetterRequest, ExecutionLimits, TaskDispatch, UnverifiedMessage};
 use support::{
     clamp_defer_delay, effective_max_retries, ActiveTaskGuard, EventSink, InFlightRegistry,
 };
@@ -865,7 +865,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         // shutdown, and a second `run()` inheriting entries from the first would
         // requeue messages that were already disposed of.
         let in_flight = if self.control_transport.is_some() {
-            InFlightRegistry::with_args_capture()
+            InFlightRegistry::with_args_capture(self.config.payload_hygiene.clone())
         } else {
             InFlightRegistry::new()
         };
@@ -930,6 +930,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         // Flush buffered lifecycle events before the offline event, so consumers
         // never see "offline" ahead of a task's terminal event.
         let dropped_events = events.dropped();
+        let event_emit_failures = events.emit_failures();
         drop(events);
         if let Some(drainer) = event_drainer {
             if timeout(EVENT_FLUSH_TIMEOUT, drainer).await.is_err() {
@@ -940,6 +941,13 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             warn!(
                 "Dropped {} lifecycle event(s) while the event buffer was full",
                 dropped_events
+            );
+        }
+        if event_emit_failures > 0 {
+            warn!(
+                "The event transport rejected {} lifecycle event batch(es); monitors saw an \
+                 incomplete event stream for this worker",
+                event_emit_failures
             );
         }
 
@@ -975,7 +983,9 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                 WorkerEventBuilder::new(&hostname).heartbeat(active, processed, loadavg, freq);
 
             if let Err(e) = event_emitter.emit(event).await {
-                debug!("Failed to emit worker-heartbeat event: {}", e);
+                // A heartbeat nobody receives is how a monitor decides this
+                // worker is dead, so a failure here is operationally visible.
+                warn!("Failed to emit worker-heartbeat event: {}", e);
             }
         }
     }
@@ -1234,7 +1244,39 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                 .received(),
                         );
 
-                        // Revocation comes first: a task an operator has
+                        // Message authentication comes before *everything*
+                        // else, admission checks included. The checks below
+                        // write worker-local state keyed on the message's own
+                        // task id and name — the revocation registry
+                        // (`revocations.revoke`) and the poison-pill strike
+                        // table (`record_redelivery`) — so letting an
+                        // unauthenticated message reach them would let an
+                        // attacker seed both. A message that fails is rejected
+                        // here and never dispatched.
+                        //
+                        // No-op (a single `Option` check) unless
+                        // `WorkerConfig::signature_verification` is set.
+                        if let Some(ref verification) = self.config.signature_verification {
+                            if let Err(e) = verification.verify(&msg.task) {
+                                self.stats.task_signature_rejected();
+                                execution::reject_unverified(
+                                    &self.broker,
+                                    self.dlq_handler.as_ref(),
+                                    events,
+                                    hostname,
+                                    pid,
+                                    UnverifiedMessage {
+                                        task: &msg.task,
+                                        receipt_handle: msg.receipt_handle.as_deref(),
+                                        error: &e,
+                                    },
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+
+                        // Revocation comes next: a task an operator has
                         // revoked must not run, must not be deferred back into
                         // the queue, and must not be dead-lettered — it is
                         // simply dropped. This is what makes
@@ -1650,6 +1692,22 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             }
                             None => exec_context,
                         };
+
+                        // Redacted rendering of the arguments, for whoever reads
+                        // the logs. Built from a *copy* of the payload and only
+                        // when hygiene is configured; `debug!` evaluates its
+                        // arguments only when the level is enabled, so a worker
+                        // running at `info` pays nothing for it.
+                        if let Some(ref hygiene) = self.config.payload_hygiene {
+                            if hygiene.is_enabled() {
+                                debug!(
+                                    "Task {} ('{}') args (redacted): {}",
+                                    task_id,
+                                    task_name,
+                                    support::args_preview(&msg.task.payload, Some(hygiene))
+                                );
+                            }
+                        }
 
                         // The task's own retry request, capped by the worker's
                         // (runtime updatable) retry budget.

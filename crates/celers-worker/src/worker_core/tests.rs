@@ -21,6 +21,7 @@ use crate::WorkerLabels;
 
 use celers_core::rate_limit::RateLimitConfig;
 use celers_core::rate_limit_distributed::InMemoryDistributedBackend;
+use celers_core::task_security::PayloadHygiene;
 use celers_core::time_limit::{TimeLimitConfig, WorkerTimeLimits};
 use celers_core::{
     Broker, BrokerMessage, Event, EventEmitter, NoOpEventEmitter, Result, SerializedTask, Task,
@@ -226,7 +227,10 @@ impl CapturingEmitter {
                 Event::Task(TaskEvent::Retried { .. }) => Some("retried"),
                 Event::Task(TaskEvent::Rejected { .. }) => Some("rejected"),
                 Event::Task(TaskEvent::Revoked { .. }) => Some("revoked"),
-                _ => None,
+                Event::Task(TaskEvent::SoftTimeLimitExceeded { .. }) => {
+                    Some("soft-time-limit-exceeded")
+                }
+                Event::Task(TaskEvent::Sent { .. }) | Event::Worker(_) => None,
             })
             .collect()
     }
@@ -450,7 +454,9 @@ fn test_in_flight_registry_claims_exactly_once() {
 fn test_in_flight_registry_snapshot_reports_task_identity() {
     // `inspect active` reads this snapshot: the counters know how many tasks
     // are running, only the registry knows which.
-    let registry = InFlightRegistry::with_args_capture();
+    // No payload hygiene configured: the preview is the payload verbatim, which
+    // is the baseline the opt-in redaction has to be measured against.
+    let registry = InFlightRegistry::with_args_capture(None);
     let task = SerializedTask::new("send_email".to_string(), br#"{"to":"a@b.c"}"#.to_vec());
     let task_id = task.metadata.id;
     registry.register(task_id, None, &task);
@@ -462,6 +468,33 @@ fn test_in_flight_registry_snapshot_reports_task_identity() {
     assert_eq!(entry.name, "send_email");
     assert_eq!(entry.args_preview.as_deref(), Some(r#"{"to":"a@b.c"}"#));
     assert!(entry.started > 0.0);
+}
+
+#[test]
+fn test_in_flight_registry_redacts_the_preview_when_hygiene_is_configured() {
+    // Same payload as the baseline above; the only difference is the opt-in.
+    let registry = InFlightRegistry::with_args_capture(Some(PayloadHygiene::recommended()));
+    let raw = br#"{"to":"alice@example.com","api_token":"sk-live-9"}"#.to_vec();
+    let task = SerializedTask::new("send_email".to_string(), raw.clone());
+    let task_id = task.metadata.id;
+    registry.register(task_id, None, &task);
+
+    let snapshot = registry.snapshot();
+    let preview = snapshot[0]
+        .1
+        .args_preview
+        .clone()
+        .expect("args capture is on");
+
+    assert!(
+        !preview.contains("alice@example.com"),
+        "PII survived: {preview}"
+    );
+    assert!(!preview.contains("sk-live-9"), "secret survived: {preview}");
+    assert!(preview.contains("\"to\""), "keys are kept: {preview}");
+
+    // The executing payload is untouched — this is the whole point.
+    assert_eq!(task.payload, raw);
 }
 
 #[test]
@@ -1399,6 +1432,94 @@ async fn test_soft_time_limit_warns_without_killing_the_task() {
     .await;
     assert!(broker.rejected().is_empty());
     assert_eq!(dlq.size().await, 0, "a soft limit is not a failure");
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// idx 7: a soft-limit expiry is published as a `task-soft-time-limit-exceeded`
+/// event. It used to surface only as a `WorkerStats` counter and a `warn!`, so
+/// a monitor watching the event stream could not tell a slow task from a
+/// healthy one until the hard limit turned it into a failure.
+#[tokio::test]
+async fn test_soft_time_limit_emits_a_lifecycle_event() {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(SoftLimitAwareTask {
+            observed_soft_limit: Arc::clone(&observed),
+            finished: Arc::clone(&finished),
+        })
+        .await;
+
+    let task = serialized("soft_limit_aware_task");
+    let task_id = task.metadata.id;
+    let broker = RecordingBroker::new(vec![BrokerMessage::new(task)], false);
+
+    let config = WorkerConfig {
+        poll_interval_ms: 10,
+        enable_events: true,
+        hostname: "celery@test-host".to_string(),
+        ..Default::default()
+    };
+    let emitter = CapturingEmitter::default();
+    let worker =
+        Worker::with_event_emitter_from_arc(Arc::clone(&broker), registry, config, emitter.clone())
+            .with_time_limits(WorkerTimeLimits::with_default(
+                TimeLimitConfig::new().with_soft_limit(Duration::from_millis(30)),
+            ));
+    let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+    wait_until("a task-soft-time-limit-exceeded event", || {
+        emitter
+            .task_event_names()
+            .contains(&"soft-time-limit-exceeded")
+    })
+    .await;
+
+    let breaches: Vec<Event> = emitter
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, Event::Task(TaskEvent::SoftTimeLimitExceeded { .. })))
+        .collect();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "the expiry must be reported exactly once, not once per poll"
+    );
+
+    let Event::Task(TaskEvent::SoftTimeLimitExceeded {
+        task_id: event_task_id,
+        ref task_name,
+        ref hostname,
+        elapsed_secs,
+        limit_secs,
+        ..
+    }) = breaches[0]
+    else {
+        panic!("filtered to soft-limit events");
+    };
+    assert_eq!(event_task_id, task_id);
+    assert_eq!(task_name, "soft_limit_aware_task");
+    assert_eq!(hostname, "celery@test-host");
+    assert!(
+        (limit_secs - 0.030).abs() < 1e-9,
+        "the event must report the configured limit, got {limit_secs}"
+    );
+    assert!(
+        elapsed_secs >= limit_secs,
+        "the task ran at least as long as the limit ({elapsed_secs} < {limit_secs})"
+    );
+
+    // The event must also be publishable in the Celery wire shape.
+    let wire = breaches[0].to_wire_json().expect("renders to the wire");
+    assert!(wire.contains(r#""type":"task-soft-time-limit-exceeded""#));
+    assert!(wire.contains(&format!(r#""uuid":"{task_id}""#)));
+
+    wait_until("the task to finish after its soft limit", || {
+        finished.load(Ordering::Relaxed) == 1
+    })
+    .await;
 
     handle.shutdown().await.expect("shutdown");
 }

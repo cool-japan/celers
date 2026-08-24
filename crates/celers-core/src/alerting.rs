@@ -221,7 +221,12 @@ impl EventSnapshotBuilder {
                 TaskEvent::Failed { .. } => self.failed += 1,
                 TaskEvent::Retried { .. } => self.retried += 1,
                 TaskEvent::Revoked { .. } => self.revoked += 1,
-                TaskEvent::Received { .. } | TaskEvent::Rejected { .. } => {}
+                // A soft-limit breach is a warning, not a terminal state: the
+                // task is still running and will still land in one of the
+                // counters above, so it must not move any of them here.
+                TaskEvent::Received { .. }
+                | TaskEvent::Rejected { .. }
+                | TaskEvent::SoftTimeLimitExceeded { .. } => {}
             },
             Event::Worker(worker) => match worker {
                 WorkerEvent::Online { hostname, .. } | WorkerEvent::Heartbeat { hostname, .. } => {

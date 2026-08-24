@@ -4,6 +4,20 @@
 //! It implements the `EventEmitter` trait from `celers-core` and publishes
 //! events to Redis channels following Celery's event protocol.
 //!
+//! # Wire format
+//!
+//! Events travel in the **Celery wire shape**, not CeleRS' internal one: a
+//! `type` string, a float Unix `timestamp`, Celery's `uuid`/`name` field names
+//! and the `clock`/`utcoffset`/`pid`/`hostname` envelope. That is exactly what
+//! `celers_protocol::event::EventMessage` describes, so `celery events`,
+//! Flower and any other Celery monitor parse what this emitter publishes.
+//! [`celers_core::event::Event::to_wire_json`] renders it and
+//! [`celers_core::event::Event::from_wire_str`] parses it back, so
+//! [`RedisEventEmitter`] and [`RedisEventReceiver`] stay a matched pair.
+//!
+//! [`RedisEventReceiver`] also reads events published by a real Python Celery
+//! worker on the same channel, so a mixed cluster monitors as one stream.
+//!
 //! # Celery Event Channels
 //!
 //! Events are published to the following Redis channels:
@@ -28,7 +42,7 @@
 //! ```
 
 use async_trait::async_trait;
-use celers_core::event::{Event, EventEmitter};
+use celers_core::event::{Event, EventEmitter, EventEnvelope};
 use celers_core::{CelersError, Result};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
@@ -61,6 +75,13 @@ pub struct RedisEventConfig {
 
     /// Whether the emitter is enabled
     pub enabled: bool,
+
+    /// Hostname stamped onto events that do not carry one of their own
+    ///
+    /// `task-sent` and `task-revoked` have no `hostname` field, so a monitor
+    /// otherwise cannot tell which node published them. Leave `None` to omit
+    /// the field entirely.
+    pub hostname: Option<String>,
 }
 
 impl Default for RedisEventConfig {
@@ -71,6 +92,7 @@ impl Default for RedisEventConfig {
             worker_channel: Some(WORKER_CHANNEL.to_string()),
             publish_to_type_channels: true,
             enabled: true,
+            hostname: None,
         }
     }
 }
@@ -108,6 +130,12 @@ impl RedisEventConfig {
     /// Enable or disable the emitter
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    /// Set the fallback hostname stamped onto events that carry none
+    pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = Some(hostname.into());
         self
     }
 }
@@ -215,6 +243,30 @@ impl RedisEventEmitter {
     pub fn channel(&self) -> &str {
         &self.config.channel
     }
+
+    /// Render one event in the Celery wire shape.
+    ///
+    /// Each call stamps a fresh envelope, so every published event gets its own
+    /// logical clock tick — a monitor can order two events that share a
+    /// wall-clock timestamp.
+    fn render(&self, event: &Event) -> Result<String> {
+        let mut envelope = EventEnvelope::stamp();
+        if let Some(ref hostname) = self.config.hostname {
+            envelope = envelope.with_hostname(hostname);
+        }
+        event.to_wire_json_with(&envelope)
+    }
+
+    /// The type-specific channel an event also belongs on, if any.
+    fn type_channel(&self, event: &Event) -> Option<&str> {
+        if !self.config.publish_to_type_channels {
+            return None;
+        }
+        match event {
+            Event::Task(_) => self.config.task_channel.as_deref(),
+            Event::Worker(_) => self.config.worker_channel.as_deref(),
+        }
+    }
 }
 
 #[async_trait]
@@ -224,28 +276,28 @@ impl EventEmitter for RedisEventEmitter {
             return Ok(());
         }
 
-        // Serialize the event to JSON
-        let event_json = serde_json::to_string(&event)
-            .map_err(|e| CelersError::Other(format!("Event serialization error: {}", e)))?;
+        // Render the Celery wire shape, not the internal model.
+        let event_json = self.render(&event)?;
 
-        // Publish to main channel
-        self.publish(&self.config.channel, &event_json).await?;
+        // One round trip, not two: the main channel and the type-specific
+        // channel carry the identical payload, so they are pipelined together.
+        let Some(type_channel) = self.type_channel(&event) else {
+            return self.publish(&self.config.channel, &event_json).await;
+        };
 
-        // Publish to type-specific channel if enabled
-        if self.config.publish_to_type_channels {
-            match &event {
-                Event::Task(_) => {
-                    if let Some(ref task_channel) = self.config.task_channel {
-                        self.publish(task_channel, &event_json).await?;
-                    }
-                }
-                Event::Worker(_) => {
-                    if let Some(ref worker_channel) = self.config.worker_channel {
-                        self.publish(worker_channel, &event_json).await?;
-                    }
-                }
-            }
-        }
+        let mut conn = self
+            .get_connection()
+            .await
+            .map_err(|e| CelersError::Other(format!("Redis connection error: {}", e)))?;
+
+        redis::pipe()
+            .publish(&self.config.channel, &event_json)
+            .ignore()
+            .publish(type_channel, &event_json)
+            .ignore()
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| CelersError::Other(format!("Redis publish error: {}", e)))?;
 
         Ok(())
     }
@@ -264,26 +316,16 @@ impl EventEmitter for RedisEventEmitter {
         let mut pipe = redis::pipe();
 
         for event in &events {
-            let event_json = serde_json::to_string(event)
-                .map_err(|e| CelersError::Other(format!("Event serialization error: {}", e)))?;
+            // Render the Celery wire shape, not the internal model. Each event
+            // gets its own envelope, so the logical clock still orders them.
+            let event_json = self.render(event)?;
 
             // Add to main channel
-            pipe.publish(&self.config.channel, &event_json);
+            pipe.publish(&self.config.channel, &event_json).ignore();
 
             // Add to type-specific channel if enabled
-            if self.config.publish_to_type_channels {
-                match event {
-                    Event::Task(_) => {
-                        if let Some(ref task_channel) = self.config.task_channel {
-                            pipe.publish(task_channel, &event_json);
-                        }
-                    }
-                    Event::Worker(_) => {
-                        if let Some(ref worker_channel) = self.config.worker_channel {
-                            pipe.publish(worker_channel, &event_json);
-                        }
-                    }
-                }
+            if let Some(type_channel) = self.type_channel(event) {
+                pipe.publish(type_channel, &event_json).ignore();
             }
         }
 
@@ -417,8 +459,8 @@ impl RedisEventReceiver {
         while let Some(msg) = stream.next().await {
             let payload: String = msg.get_payload()?;
 
-            // Deserialize the event
-            match serde_json::from_str::<Event>(&payload) {
+            // Parse the Celery wire shape back into the typed model.
+            match Event::from_wire_str(&payload) {
                 Ok(event) => {
                     handler(event).await?;
                 }
@@ -505,6 +547,7 @@ mod tests {
         assert_eq!(config.worker_channel, Some("celeryev.worker".to_string()));
         assert!(config.publish_to_type_channels);
         assert!(config.enabled);
+        assert!(config.hostname.is_none());
     }
 
     #[test]
@@ -514,12 +557,14 @@ mod tests {
             .task_channel(None)
             .worker_channel(Some("my-worker-events".to_string()))
             .publish_to_type_channels(false)
-            .enabled(true);
+            .enabled(true)
+            .hostname("celery@publisher");
 
         assert_eq!(config.channel, "my-events");
         assert!(config.task_channel.is_none());
         assert_eq!(config.worker_channel, Some("my-worker-events".to_string()));
         assert!(!config.publish_to_type_channels);
         assert!(config.enabled);
+        assert_eq!(config.hostname, Some("celery@publisher".to_string()));
     }
 }

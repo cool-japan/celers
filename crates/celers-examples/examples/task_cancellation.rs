@@ -1,7 +1,19 @@
 //! Task Cancellation example for CeleRS
 //!
-//! This example demonstrates how to cancel running tasks using Redis Pub/Sub.
-//! Workers subscribe to a cancellation channel and abort tasks when notified.
+//! Cancelling a task has two halves, and this example shows both:
+//!
+//! - [`Broker::revoke`] records the revocation in the queue's durable
+//!   revoked-id set (so a task still sitting in the queue is refused when it is
+//!   finally dequeued, even by a worker that starts later) and publishes it on
+//!   the queue's revocation channel.
+//! - `Worker::with_broker_revocation` subscribes the worker to that channel and
+//!   consults that set, so a task that is *already running* has its
+//!   cancellation token tripped. The task body observes it through
+//!   [`is_cancelled`] and returns early — this is Celery's
+//!   `task.is_aborted()`.
+//!
+//! Cancellation is cooperative: a task that never checks its token keeps
+//! running until its next `.await`, at which point the worker drops it.
 //!
 //! Prerequisites:
 //! - Redis running on localhost:6379
@@ -19,22 +31,17 @@
 //! ```
 
 use celers_broker_redis::RedisBroker;
-use celers_core::{Broker, SerializedTask, Task, TaskId, TaskRegistry};
+use celers_core::revocation_channel::RevocationStream;
+use celers_core::{Broker, SerializedTask, Task, TaskRegistry};
+use celers_worker::execution_context::is_cancelled;
 use celers_worker::{Worker, WorkerConfig};
-use futures_util::stream::StreamExt;
-use redis::aio::PubSub;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 
 // ===== Task Definition =====
 
-#[allow(dead_code)]
-struct LongRunningTask {
-    cancelled_tasks: Arc<RwLock<std::collections::HashSet<TaskId>>>,
-}
+struct LongRunningTask;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct LongTaskInput {
@@ -60,13 +67,30 @@ impl Task for LongRunningTask {
             input.id, input.message, input.duration_secs
         );
 
-        // Simulate long-running work with cancellation checkpoints
+        // Simulate long-running work with cancellation checkpoints.
         for i in 0..input.duration_secs {
             sleep(Duration::from_secs(1)).await;
 
-            // Check if this task has been cancelled
-            // Note: In a real implementation, tasks would need to pass their ID
-            // through task context. For this demo, we'll just show the pattern.
+            // The cancellation token of the task being executed is ambient: the
+            // worker installs it for the duration of this future, so nothing
+            // has to be threaded through. This check is the whole cooperative
+            // contract.
+            if is_cancelled() {
+                println!(
+                    "[REVOKED] Task #{} stopping after {}/{} seconds",
+                    input.id,
+                    i + 1,
+                    input.duration_secs
+                );
+                // Stop working and hand back what was finished. The worker
+                // races this future against the cancellation token, so it
+                // records the task as Revoked — never Succeeded — whichever of
+                // the two wins, and never retries it.
+                return Ok(LongTaskOutput {
+                    completed: false,
+                    iterations: i + 1,
+                });
+            }
 
             println!(
                 "  [PROGRESS] Task #{}: {}/{} seconds",
@@ -90,32 +114,32 @@ impl Task for LongRunningTask {
 
 // ===== Cancellation Listener =====
 
-async fn listen_for_cancellations(
-    mut pubsub: PubSub,
-    channel: String,
-    cancelled_tasks: Arc<RwLock<std::collections::HashSet<TaskId>>>,
-) -> anyhow::Result<()> {
-    pubsub.subscribe(&channel).await?;
-    println!("✓ Subscribed to cancellation channel: {}", channel);
-
-    let mut msg_stream = pubsub.on_message();
-
-    while let Some(msg) = msg_stream.next().await {
-        let payload: String = msg.get_payload()?;
-
-        if let Ok(task_id) = payload.parse::<uuid::Uuid>() {
-            println!("\n⚠️  CANCELLATION SIGNAL received for task: {}", task_id);
-
-            // Add to cancelled set
-            let mut cancelled = cancelled_tasks.write().await;
-            cancelled.insert(task_id);
-
-            println!("   Task {} marked for cancellation", task_id);
-            println!("   (In a full implementation, the worker would abort this task)\n");
+/// Print every revocation as it crosses the queue's revocation channel.
+///
+/// Purely an observer, for the demo's benefit: the worker acts on these by
+/// itself, through the same subscription, because it was built with
+/// `with_broker_revocation`. Nothing here is required to make cancellation
+/// work.
+async fn watch_revocations(mut stream: Box<dyn RevocationStream>) {
+    loop {
+        match stream.recv().await {
+            Ok(Some(notice)) => {
+                println!(
+                    "\n⚠️  REVOCATION received for task {} (terminate={})",
+                    notice.task_id, notice.terminate
+                );
+                if notice.terminate {
+                    println!("   A worker running it will trip its cancellation token\n");
+                } else {
+                    println!("   It will be refused if it has not started yet\n");
+                }
+            }
+            // The connection closed; the worker's own bridge resubscribes, but
+            // this observer is a demo and simply stops.
+            Ok(None) => return,
+            Err(e) => eprintln!("Revocation stream error: {e}"),
         }
     }
-
-    Ok(())
 }
 
 // ===== Main Functions =====
@@ -126,29 +150,16 @@ async fn run_worker() -> anyhow::Result<()> {
     let broker = RedisBroker::new("redis://localhost:6379", "cancel_demo_queue")?;
     println!("✓ Connected to Redis broker");
 
-    // Create shared state for cancelled tasks
-    let cancelled_tasks = Arc::new(RwLock::new(std::collections::HashSet::new()));
-
-    // Set up cancellation listener
-    let cancel_channel = broker.cancel_channel().to_string();
-    let pubsub = broker.create_pubsub().await?;
-    let cancelled_tasks_clone = Arc::clone(&cancelled_tasks);
-
-    tokio::spawn(async move {
-        if let Err(e) =
-            listen_for_cancellations(pubsub, cancel_channel, cancelled_tasks_clone).await
-        {
-            eprintln!("Cancellation listener error: {}", e);
-        }
-    });
+    // An observer on the same channel the worker's bridge reads, so the demo
+    // can show the revocation arriving.
+    if let Some(stream) = broker.subscribe_revocations().await? {
+        println!("✓ Watching revocation channel: {}", broker.cancel_channel());
+        tokio::spawn(watch_revocations(stream));
+    }
 
     // Create task registry
     let registry = TaskRegistry::new();
-    registry
-        .register(LongRunningTask {
-            cancelled_tasks: Arc::clone(&cancelled_tasks),
-        })
-        .await;
+    registry.register(LongRunningTask).await;
     println!("✓ Registered tasks: {:?}", registry.list_tasks().await);
 
     // Configure worker
@@ -160,8 +171,10 @@ async fn run_worker() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    // Create and run worker
-    let worker = Worker::new(broker, registry, config);
+    // Create and run worker. `with_broker_revocation` is what connects the
+    // queue's revocation channel and revoked-id set to this worker; without it
+    // the worker would run happily and ignore every `cancel` command.
+    let worker = Worker::new(broker, registry, config).with_broker_revocation();
     println!("\n✓ Worker started with cancellation support");
     println!(
         "✓ Tasks can be cancelled via: cargo run --example task_cancellation -- cancel <task-id>\n"
@@ -221,18 +234,19 @@ async fn cancel_task(task_id_str: &str) -> anyhow::Result<()> {
         .parse::<uuid::Uuid>()
         .map_err(|_| anyhow::anyhow!("Invalid task ID format"))?;
 
-    println!("Sending cancellation signal for task: {}", task_id);
+    println!("Revoking task: {}", task_id);
 
-    let cancelled = broker.cancel(&task_id).await?;
+    // `terminate = true` is Celery's `revoke(id, terminate=True)`: it also asks
+    // a worker that is already running the task to abort it. Plain `cancel`
+    // (or `revoke(id, false)`) only stops it from starting.
+    broker.revoke(&task_id, true).await?;
 
-    if cancelled {
-        println!("✓ Cancellation signal sent to worker(s)");
-        println!("  The task will be aborted if it's currently running");
-        println!("  Check the worker terminal to see the cancellation");
-    } else {
-        println!("⚠️  No workers subscribed to cancellation channel");
-        println!("  Make sure the worker is running");
-    }
+    println!("✓ Revocation recorded in the queue's revoked set");
+    println!("  A task still in the queue will be refused when it is dequeued,");
+    println!("  even if no worker is running right now.");
+    println!("✓ Revocation published on the queue's revocation channel");
+    println!("  A worker already running the task will abort it at its next");
+    println!("  cancellation checkpoint — watch the worker terminal.");
 
     Ok(())
 }
@@ -242,9 +256,12 @@ async fn demo_info() -> anyhow::Result<()> {
     println!("This example demonstrates task cancellation using Redis Pub/Sub.\n");
 
     println!("How it works:");
-    println!("1. Workers subscribe to a cancellation channel");
-    println!("2. When a task is cancelled, a message is published");
-    println!("3. Workers receive the message and abort the task\n");
+    println!("1. `revoke` records the task id in the queue's durable revoked set");
+    println!("   and publishes a notice on the queue's revocation channel");
+    println!("2. A worker built with `with_broker_revocation` reads both: the set");
+    println!("   before running anything it dequeues, the channel continuously");
+    println!("3. For a running task it trips the cancellation token; the task");
+    println!("   observes it at its next `check_cancelled()` and returns early\n");
 
     println!("Try it:");
     println!("  Terminal 1: cargo run --example task_cancellation -- worker");
@@ -253,9 +270,9 @@ async fn demo_info() -> anyhow::Result<()> {
 
     println!("Features:");
     println!("  ✓ Real-time cancellation via Redis Pub/Sub");
-    println!("  ✓ Multiple workers can listen");
-    println!("  ✓ Instant notification to all subscribers");
-    println!("  ✓ Graceful task abortion\n");
+    println!("  ✓ Durable revoked-id set, so a queued task is refused too");
+    println!("  ✓ Multiple workers can listen; every one of them acts");
+    println!("  ✓ Cooperative abortion: the task decides where it is safe to stop\n");
 
     Ok(())
 }

@@ -4,6 +4,20 @@
 //! It implements the `EventEmitter` trait from `celers-core` and publishes
 //! events to a RabbitMQ fanout exchange following Celery's event protocol.
 //!
+//! # Wire format
+//!
+//! Events travel in the **Celery wire shape**, not CeleRS' internal one: a
+//! `type` string, a float Unix `timestamp`, Celery's `uuid`/`name` field names
+//! and the `clock`/`utcoffset`/`pid`/`hostname` envelope. That is exactly what
+//! `celers_protocol::event::EventMessage` describes, so `celery events`,
+//! Flower and any other Celery monitor parse what this emitter publishes.
+//! [`celers_core::event::Event::to_wire_json`] renders it and
+//! [`celers_core::event::Event::from_wire_str`] parses it back, so
+//! [`AmqpEventEmitter`] and [`AmqpEventReceiver`] stay a matched pair.
+//!
+//! [`AmqpEventReceiver`] also reads events published by a real Python Celery
+//! worker on the same exchange, so a mixed cluster monitors as one stream.
+//!
 //! # Celery Event Exchange
 //!
 //! Events are published to a fanout exchange (default: `celeryev`) that broadcasts
@@ -27,7 +41,7 @@
 //! ```
 
 use async_trait::async_trait;
-use celers_core::event::{Event, EventEmitter};
+use celers_core::event::{Event, EventEmitter, EventEnvelope};
 use celers_core::{CelersError, Result};
 use lapin::{
     options::*, types::FieldTable, BasicProperties, Channel, Connection, ConnectionProperties,
@@ -70,6 +84,13 @@ pub struct AmqpEventConfig {
 
     /// Serialization format (default: "json")
     pub serialization: String,
+
+    /// Hostname stamped onto events that do not carry one of their own
+    ///
+    /// `task-sent` and `task-revoked` have no `hostname` field, so a monitor
+    /// otherwise cannot tell which node published them. Leave `None` to omit
+    /// the field entirely.
+    pub hostname: Option<String>,
 }
 
 impl Default for AmqpEventConfig {
@@ -82,6 +103,7 @@ impl Default for AmqpEventConfig {
             enabled: true,
             batch_size: DEFAULT_BATCH_SIZE,
             serialization: "json".to_string(),
+            hostname: None,
         }
     }
 }
@@ -131,6 +153,12 @@ impl AmqpEventConfig {
     /// Set the serialization format
     pub fn serialization(mut self, serialization: impl Into<String>) -> Self {
         self.serialization = serialization.into();
+        self
+    }
+
+    /// Set the fallback hostname stamped onto events that carry none
+    pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = Some(hostname.into());
         self
     }
 
@@ -270,6 +298,19 @@ impl AmqpEventEmitter {
     /// Get a reference to the configuration
     pub fn config(&self) -> &AmqpEventConfig {
         &self.config
+    }
+
+    /// Render one event in the Celery wire shape.
+    ///
+    /// Each call stamps a fresh envelope, so every published event gets its own
+    /// logical clock tick — a monitor can order two events that share a
+    /// wall-clock timestamp.
+    fn render(&self, event: &Event) -> Result<String> {
+        let mut envelope = EventEnvelope::stamp();
+        if let Some(ref hostname) = self.config.hostname {
+            envelope = envelope.with_hostname(hostname);
+        }
+        event.to_wire_json_with(&envelope)
     }
 
     /// Check if the emitter is active
@@ -422,8 +463,8 @@ impl EventEmitter for AmqpEventEmitter {
             return Ok(());
         }
 
-        let event_json = serde_json::to_string(&event)
-            .map_err(|e| CelersError::Other(format!("Event serialization error: {}", e)))?;
+        // Render the Celery wire shape, not the internal model.
+        let event_json = self.render(&event)?;
 
         let payload = event_json.as_bytes();
         let payload_len = payload.len() as u64;
@@ -471,8 +512,10 @@ impl EventEmitter for AmqpEventEmitter {
             let mut confirms = Vec::with_capacity(chunk.len());
 
             for event in chunk {
-                let event_json = serde_json::to_string(event)
-                    .map_err(|e| CelersError::Other(format!("Event serialization error: {}", e)))?;
+                // Render the Celery wire shape, not the internal model. Each
+                // event gets its own envelope, so the logical clock still
+                // orders them.
+                let event_json = self.render(event)?;
 
                 let confirm = channel
                     .basic_publish(
@@ -757,7 +800,7 @@ impl AmqpEventReceiver {
                         CelersError::Other(format!("Invalid UTF-8 in event payload: {}", e))
                     })?;
 
-                    match serde_json::from_str::<Event>(payload) {
+                    match Event::from_wire_str(payload) {
                         Ok(event) => {
                             handler(event).await?;
                         }
@@ -895,7 +938,7 @@ impl AmqpEventReceiver {
                             CelersError::Other(format!("Invalid UTF-8 in event payload: {}", e))
                         })?;
 
-                        match serde_json::from_str::<Event>(payload) {
+                        match Event::from_wire_str(payload) {
                             Ok(event) => {
                                 if tx.send(event).await.is_err() {
                                     debug!("Event receiver dropped, stopping consumer");
@@ -950,6 +993,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.serialization, "json");
+        assert!(config.hostname.is_none());
     }
 
     #[test]
@@ -961,7 +1005,8 @@ mod tests {
             .durable(true)
             .enabled(false)
             .batch_size(50)
-            .serialization("msgpack");
+            .serialization("msgpack")
+            .hostname("celery@publisher");
 
         assert_eq!(config.exchange, "my-events");
         assert_eq!(config.exchange_type, "topic");
@@ -970,6 +1015,7 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.batch_size, 50);
         assert_eq!(config.serialization, "msgpack");
+        assert_eq!(config.hostname, Some("celery@publisher".to_string()));
     }
 
     #[test]
@@ -1019,34 +1065,44 @@ mod tests {
         assert!((stats.success_rate() - 66.666).abs() < 0.1);
     }
 
+    /// The emitter publishes the Celery wire shape and the receiver parses it
+    /// back, so the two must round trip through *that* format — not through
+    /// `Event`'s internal serde representation, which never reaches a broker.
     #[test]
-    fn test_event_serialization_roundtrip_task_event() {
+    fn test_event_wire_roundtrip_task_event() {
         let task_id = Uuid::new_v4();
         let event = TaskEventBuilder::new(task_id, "tasks.add")
             .hostname("worker-1")
+            .pid(4242)
             .started();
 
-        let json = serde_json::to_string(&event).expect("task event should serialize");
-        let deserialized: Event =
-            serde_json::from_str(&json).expect("task event should deserialize");
+        let json = event.to_wire_json().expect("task event should render");
 
-        assert_eq!(deserialized.event_type(), event.event_type());
-        assert_eq!(deserialized.task_id(), event.task_id());
+        // Celery's field names, not CeleRS' internal ones.
+        assert!(json.contains(r#""type":"task-started""#), "{json}");
+        assert!(json.contains(&format!(r#""uuid":"{task_id}""#)), "{json}");
+        assert!(json.contains(r#""name":"tasks.add""#), "{json}");
+        assert!(!json.contains("task_id"), "{json}");
+        assert!(!json.contains("task_name"), "{json}");
+
+        let deserialized = Event::from_wire_str(&json).expect("task event should parse back");
+        assert_eq!(deserialized, event);
     }
 
     #[test]
-    fn test_event_serialization_roundtrip_worker_event() {
+    fn test_event_wire_roundtrip_worker_event() {
         let event = WorkerEventBuilder::new("worker-1").online();
 
-        let json = serde_json::to_string(&event).expect("worker event should serialize");
-        let deserialized: Event =
-            serde_json::from_str(&json).expect("worker event should deserialize");
+        let json = event.to_wire_json().expect("worker event should render");
+        assert!(json.contains(r#""type":"worker-online""#), "{json}");
+        assert!(json.contains(r#""clock":"#), "{json}");
 
-        assert_eq!(deserialized.event_type(), event.event_type());
+        let deserialized = Event::from_wire_str(&json).expect("worker event should parse back");
+        assert_eq!(deserialized, event);
     }
 
     #[test]
-    fn test_event_serialization_roundtrip_batch() {
+    fn test_event_wire_roundtrip_batch() {
         let events = vec![
             WorkerEventBuilder::new("worker-1").online(),
             TaskEventBuilder::new(Uuid::new_v4(), "tasks.add")
@@ -1056,10 +1112,9 @@ mod tests {
         ];
 
         for event in &events {
-            let json = serde_json::to_string(event).expect("event should serialize");
-            let deserialized: Event =
-                serde_json::from_str(&json).expect("event should deserialize");
-            assert_eq!(deserialized.event_type(), event.event_type());
+            let json = event.to_wire_json().expect("event should render");
+            let deserialized = Event::from_wire_str(&json).expect("event should parse back");
+            assert_eq!(&deserialized, event);
         }
     }
 

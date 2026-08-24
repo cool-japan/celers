@@ -250,40 +250,27 @@ pub async fn cancel_task(broker_url: &str, queue: &str, task_id_str: &str) -> an
     println!("✓ Connected to Redis: {}", broker_url.cyan());
     println!();
 
-    // Send cancellation signal
-    println!("Sending cancellation signal...");
-    let cancelled = broker.cancel(&task_id).await?;
+    // Record the revocation. This is durable: the id goes into the queue's
+    // revoked-id set (with a TTL) and pending copies are removed, so the
+    // cancellation holds whether or not a worker is running right now. A
+    // notice is published on the queue's revocation channel as well, for
+    // workers that are listening.
+    println!("Revoking...");
+    broker.cancel(&task_id).await?;
 
-    if cancelled {
-        println!(
-            "{}",
-            "✓ Cancellation signal sent successfully".green().bold()
-        );
-        println!();
-        println!("The task will be cancelled if:");
-        println!("  • It's currently running and has cancellation checkpoints");
-        println!("  • It's pending in the queue (will be removed)");
-        println!("  • Workers are subscribed to the cancellation channel");
-        println!();
-        println!(
-            "{}",
-            "Note: Task cancellation depends on worker implementation".yellow()
-        );
-    } else {
-        println!(
-            "{}",
-            "⚠️  No workers subscribed to cancellation channel"
-                .yellow()
-                .bold()
-        );
-        println!();
-        println!("Possible reasons:");
-        println!("  • No workers are currently running");
-        println!("  • Workers don't support cancellation");
-        println!("  • The task has already completed");
-        println!();
-        println!("Make sure workers are running and support task cancellation.");
-    }
+    println!("{}", "✓ Revocation recorded".green().bold());
+    println!();
+    println!("What this does:");
+    println!("  • Pending copies are removed from the queue now");
+    println!("  • A worker that dequeues it later refuses it (durable revoked set)");
+    println!("  • Listening workers are notified at once");
+    println!();
+    println!(
+        "{}",
+        "A task already running is left alone: use `celers control revoke --terminate <id>` \
+         to ask workers to abort it."
+            .yellow()
+    );
 
     Ok(())
 }

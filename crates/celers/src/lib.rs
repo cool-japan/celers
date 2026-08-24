@@ -975,14 +975,36 @@
 pub use celers_core::{
     ActiveTaskInfo, AsyncResult, Broker, BrokerStats, CompositeEventEmitter, ControlClient,
     ControlCommand, ControlEnvelope, ControlReply, ControlResponse, ControlTransport, DeliveryInfo,
-    Event, EventEmitter, GlobPattern, InMemoryControlTransport, InMemoryEventEmitter,
-    InspectCommand, InspectResponse, LogLevel, LoggingEventEmitter, NoOpEventEmitter,
-    PatternMatcher, PoolStats, QueueStats, RateLimitConfig, RateLimiter, RegexPattern, RequestInfo,
-    ReservedTaskInfo, ResultStore, RouteResult, RouteRule, Router, RouterBuilder, RoutingConfig,
-    ScheduledTaskInfo, SerializedTask, SlidingWindow, TaskEvent, TaskEventBuilder, TaskRateLimiter,
-    TaskResultValue, TaskState, TokenBucket, WorkerConf, WorkerEvent, WorkerEventBuilder,
-    WorkerRateLimiter, WorkerReport, WorkerStats,
+    Event, EventEmitter, GlobPattern, InMemoryBroker, InMemoryControlTransport,
+    InMemoryEventEmitter, InMemoryResultBackend, InspectCommand, InspectResponse, LogLevel,
+    LoggingEventEmitter, NoOpEventEmitter, PatternMatcher, PoolStats, QueueStats, RateLimitConfig,
+    RateLimiter, RegexPattern, RequestInfo, ReservedTaskInfo, ResultStore, RouteResult, RouteRule,
+    Router, RouterBuilder, RoutingConfig, ScheduledTaskInfo, SerializedTask, SlidingWindow,
+    TaskEvent, TaskEventBuilder, TaskRateLimiter, TaskRegistry, TaskResultValue, TaskState,
+    TokenBucket, WorkerConf, WorkerEvent, WorkerEventBuilder, WorkerRateLimiter, WorkerReport,
+    WorkerStats,
 };
+
+// Re-export the security building blocks.
+//
+// These are the primitives behind the runtime's opt-in security controls: the
+// worker's `WorkerConfig::signature_verification` and
+// `WorkerConfig::payload_hygiene`, and `AsyncResult::with_tombstone_registry`.
+// None of them do anything until a runtime is configured to use them — see the
+// `security_wiring` example for the wiring, end to end.
+pub use celers_core::pii::{PiiConfig, PiiDetector, PiiKind, PiiMatch, PiiReport};
+pub use celers_core::result_tombstone::{ResultExistence, TombstoneExt, TombstoneRegistry};
+pub use celers_core::sanitize::{SanitizeReport, Sanitizer, SanitizerConfig, TaskValue};
+pub use celers_core::task_security::{
+    sign_task, signed_fields, verify_task, PayloadHygiene, SignatureEnvelope, SignaturePolicy,
+    SigningOptions,
+};
+pub use celers_core::task_signature::{
+    FreshnessWindow, ReplayGuard, SignatureError, SignedCallback, SignedFields, TaskSignature,
+    TaskSigner,
+};
+pub use celers_core::time_limit::{TimeLimitConfig, WorkerTimeLimits};
+pub use celers_core::ResultTombstone;
 
 // Re-export protocol types
 pub use celers_protocol::{
@@ -997,7 +1019,8 @@ pub use celers_kombu::{
 
 // Re-export worker types
 pub use celers_worker::{
-    ControlService, RuntimeRateLimitDecision, RuntimeRateLimits, Worker, WorkerConfig,
+    ControlService, RuntimeRateLimitDecision, RuntimeRateLimits, SignatureVerification, Worker,
+    WorkerConfig,
 };
 
 // Re-export canvas types

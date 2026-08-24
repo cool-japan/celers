@@ -637,6 +637,10 @@ mod task_serde_roundtrip {
                 chord_id,
                 on_success_link,
                 dependencies,
+                // Signature material is produced by
+                // `celers_core::task_security::sign_task`, not by an arbitrary
+                // generator: an unsigned message is what the CLI round-trips.
+                signature: None,
             }
         }
     }

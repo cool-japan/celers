@@ -46,6 +46,7 @@ use crate::state::TaskState;
 use crate::TaskId;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Result store trait for `AsyncResult` API
@@ -454,8 +455,11 @@ pub struct AsyncResult<S: ResultStore> {
     /// Task ID
     task_id: TaskId,
 
-    /// Result store for retrieving results
-    store: S,
+    /// Result store for retrieving results.
+    ///
+    /// Crate-visible so the tombstone integration in
+    /// [`crate::result_tombstone`] can reach it.
+    pub(crate) store: S,
 
     /// Parent result (for chained tasks)
     parent: Option<Box<AsyncResult<S>>>,
@@ -465,6 +469,14 @@ pub struct AsyncResult<S: ResultStore> {
 
     /// Polling behaviour for the blocking accessors
     config: AsyncResultConfig,
+
+    /// Where [`Self::forget`] records that this result was deleted.
+    ///
+    /// `None` (the default) keeps `forget` byte-for-byte what it always was:
+    /// a plain [`ResultStore::forget`] with no tombstone written anywhere.
+    /// The tombstone-aware accessors live in
+    /// [`crate::result_tombstone`], which is why this is crate-visible.
+    pub(crate) tombstones: Option<Arc<crate::result_tombstone::TombstoneRegistry>>,
 }
 
 impl<S: ResultStore + Clone> AsyncResult<S> {
@@ -476,6 +488,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
             parent: None,
             children: Vec::new(),
             config: AsyncResultConfig::default(),
+            tombstones: None,
         }
     }
 
@@ -501,6 +514,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
             parent: Some(Box::new(parent)),
             children: Vec::new(),
             config: AsyncResultConfig::default(),
+            tombstones: None,
         }
     }
 
@@ -512,6 +526,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
             parent: None,
             children,
             config: AsyncResultConfig::default(),
+            tombstones: None,
         }
     }
 
@@ -666,7 +681,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
                 // this the loop polled forever for a forgotten or TTL-expired
                 // result.
                 if let crate::result_tombstone::ResultExistence::Tombstoned(tombstone) =
-                    self.store.result_existence(self.task_id).await?
+                    self.existence().await?
                 {
                     let reason = tombstone
                         .reason
@@ -734,8 +749,18 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
     }
 
     /// Forget the task result (delete from store)
+    ///
+    /// With no tombstone registry attached this is exactly
+    /// [`ResultStore::forget`] and nothing records that the result ever
+    /// existed. Attach one with
+    /// [`with_tombstone_registry`](Self::with_tombstone_registry) to make
+    /// *forgotten* distinguishable from *never existed*.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the backend's deletion error.
     pub async fn forget(&self) -> crate::Result<()> {
-        self.store.forget(self.task_id).await
+        self.forget_with_reason("result was forgotten").await
     }
 
     /// Wait for the task to complete and return the result
