@@ -7,11 +7,14 @@ are compiled-in Rust code, not modules a generic binary loads at runtime the way
 CLI binary this repository ships (and the `Dockerfile` at the repo root builds) is an *operational* tool --
 `status`, `inspect`, `control`, `queue`, `dlq`, `schedule`, `backup`/`restore`, `doctor`, and friends -- not a task
 executor. Running `celers worker` from that image starts a real worker that connects to your broker and joins the
-remote-control channel, but it registers **zero tasks**, so it can never execute one
+remote-control channel, but by default it registers **zero tasks**, so it can never execute one
 (`crates/celers-cli/src/commands/worker.rs` builds the registry with `TaskRegistry::new()` and prints a warning
-about it). Every deployment below that shows `worker` running from the stock image is demonstrating broker
-connectivity, CLI operations, and worker lifecycle -- not task execution. To execute tasks you build your own
-binary that links `celers-worker` and registers your tasks, and deploy *that* image instead.
+about it at startup). Passing `--demo-tasks` registers three harmless built-ins (`demo.echo`, `demo.sleep`,
+`demo.fail`) so you can smoke-test broker connectivity end-to-end -- enqueue, dequeue, execute, ack/DLQ -- before
+any real task code exists; it is a smoke test, not a path to running your own tasks. Every deployment below that
+shows `worker` running from the stock image (with or without `--demo-tasks`) is demonstrating broker connectivity,
+CLI operations, and worker lifecycle -- not real task execution. To execute your own tasks you build your own
+binary that links `celers-worker` and registers them, and deploy *that* image instead.
 
 ## Table of Contents
 
@@ -22,6 +25,7 @@ binary that links `celers-worker` and registers your tasks, and deploy *that* im
 - [Cloud Platforms](#cloud-platforms)
 - [Monitoring & Observability](#monitoring--observability)
 - [Performance Tuning](#performance-tuning)
+- [Running Beat (the periodic scheduler)](#running-beat-the-periodic-scheduler)
 - [Security Best Practices](#security-best-practices)
 - [Troubleshooting](#troubleshooting)
 
@@ -36,8 +40,8 @@ binary that links `celers-worker` and registers your tasks, and deploy *that* im
 
 ### Local Development
 
-`docker-compose.yml` at the repo root starts Redis, PostgreSQL, RabbitMQ, Prometheus, Grafana, and a demo
-`celers` worker container (connectivity only -- see the note above and
+`docker-compose.yml` at the repo root starts Redis, PostgreSQL, RabbitMQ, Prometheus, Grafana, and a `celers`
+worker container running with `--demo-tasks` (smoke test only -- see the note above and
 [Building a Worker Image](#building-a-worker-image)):
 
 ```bash
@@ -51,8 +55,8 @@ docker-compose --profile test up -d
 # View logs
 docker-compose logs -f worker
 
-# Scale the demo worker container (still an empty registry -- this proves
-# broker fan-out, not task throughput)
+# Scale the demo worker container (still only demo.echo/demo.sleep/demo.fail
+# -- this proves broker fan-out, not your own task throughput)
 docker-compose up -d --scale worker=4
 
 # Stop all services
@@ -200,7 +204,7 @@ docker run --rm -e RUST_LOG=info celers:0.3.1 status --broker redis://redis:6379
 If you publish your own image under your own registry namespace, replace every `celers:0.3.1` below with that
 tag, and replace `worker` invocations with your own worker image where the example is meant to execute tasks.
 
-### Single Worker Instance (connectivity demo)
+### Single Worker Instance (smoke test)
 
 ```bash
 docker build -t celers:0.3.1 .
@@ -210,19 +214,21 @@ docker build -t celers:0.3.1 .
 # under "Building a Worker Image"), or a real hostname/IP if Redis is
 # external. A bare `redis://redis:6379` only resolves if you also attach
 # this container to the network a host named "redis" is actually on.
+# --demo-tasks registers demo.echo/demo.sleep/demo.fail so this proves
+# broker connectivity end-to-end; it does not run your own tasks.
 docker run -d \
   --name celers-worker \
   --network celers_celers-network \
   -e RUST_LOG=info \
   celers:0.3.1 \
-  worker --broker redis://redis:6379 --concurrency 8
+  worker --broker redis://redis:6379 --concurrency 8 --demo-tasks
 ```
 
 ### Multi-Worker with Docker Compose
 
 Create `docker-compose.prod.yml` (swap `image: my-worker:latest` for your own worker image built per
 [Building a Worker Image](#building-a-worker-image) to actually execute tasks; using `celers:0.3.1` here, as
-below, reproduces the same empty-registry demo as the root `docker-compose.yml`):
+below, reproduces the same demo-tasks-only smoke test as the root `docker-compose.yml`):
 
 ```yaml
 services:
@@ -577,10 +583,12 @@ wire `tracing-subscriber` however your logging pipeline expects; it is not tied 
 
 ### Worker Configuration
 
-`celers worker --help` is the source of truth for what the stock CLI accepts; as of 0.3.1 that is `--broker`,
-`--queue`, `--mode`, `--concurrency`, `--max-retries`, `--timeout`, `--shutdown-timeout`, and `--config`. There is
-no `--enable-batch-dequeue`, `--batch-size`, `--poll-interval`, `--enable-circuit-breaker`, or `--max-result-size`
-flag on this command.
+`celers worker --help` is the source of truth for what the stock CLI accepts -- it changes between releases, so
+treat any flag list here (including this one) as a snapshot, not a promise. As of 0.3.1 it includes `--broker`,
+`--queue`, `--mode`, `--concurrency`, `--max-retries`, `--timeout`, `--shutdown-timeout`, `--no-connect-check`,
+`--broker-connect-timeout`, `--demo-tasks` (see [Building a Worker Image](#building-a-worker-image)), and
+`--config`. There is no `--enable-batch-dequeue`, `--batch-size`, `--poll-interval`, `--enable-circuit-breaker`,
+or `--max-result-size` flag on this command.
 
 ```bash
 # Higher concurrency, longer per-task budget
@@ -636,6 +644,31 @@ ALTER SYSTEM SET maintenance_work_mem = '512MB';
 ALTER SYSTEM SET checkpoint_completion_target = 0.9;
 ```
 
+## Running Beat (the periodic scheduler)
+
+`celers-beat` is a library you embed the same way you embed the worker — build a binary, construct a
+`BeatScheduler`, register your `ScheduledTask`s, and run it beside (not inside) your workers.
+
+Two things decide whether it is safe to run more than one replica:
+
+* **Where the schedule catalog lives.** `BeatScheduler` persists through the `ScheduleStore` seam.
+  `FileScheduleStore` (the default) is a local file, which does not survive an ephemeral container
+  filesystem and is not shared between replicas. `RedisScheduleStore` (feature `redis-store`) gives
+  every replica the same durable catalog. Note that `save` is **last-write-wins** — no
+  compare-and-swap — so two replicas both writing means the last to finish a tick decides what the
+  next restart sees.
+* **Which replica may dispatch.** That is a *different* problem, solved by `dispatch_lock`: a
+  short-lived distributed lock scoped to one `(entry, fire instant)` pair, taken before dispatching,
+  so two instances racing on the same due entry do not both fire it. Wire it up before running more
+  than one beat instance against a shared store.
+
+The safe default is a single active beat replica (a `Deployment` with `replicas: 1` and
+`strategy.type: Recreate`, or a `StatefulSet` with one pod), with `dispatch_lock` configured anyway so
+a rolling restart's overlap window cannot double-fire.
+
+**Do not use solar schedules in 0.3.1** — `Schedule::Solar::next_run` errors for every input; see
+[TODO.md](../TODO.md#known-gaps--the-roadmap-after-031).
+
 ## Security Best Practices
 
 ### Network Security
@@ -656,6 +689,48 @@ requirepass your_strong_password
 REDIS_URL=redis://:your_strong_password@redis:6379
 celers worker --broker "$REDIS_URL"
 ```
+
+### Message authentication (task signatures)
+
+Redis `requirepass` keeps strangers off the broker; it does nothing about a compromised *producer*
+inside your network. `celers-worker` can require every dequeued message to carry a valid HMAC-SHA256
+signature, checked **before dispatch** — before the revocation registry, the poison-pill strike table
+or routing, so an unauthenticated message never seeds worker-local state keyed on its own id or name.
+It is **off by default**.
+
+```rust
+use celers_core::TaskSigner;
+use celers_worker::{SignatureVerification, WorkerConfig};
+
+let key = std::env::var("CELERS_TASK_SIGNING_KEY")?;   // from your secret manager
+let signer = TaskSigner::new(key.as_bytes());
+
+// Require a valid signature on every message. During rollout, append
+// `.allow_unsigned()` to verify signed messages while still admitting unsigned ones.
+let config = WorkerConfig {
+    signature_verification: Some(SignatureVerification::new(signer)),
+    ..Default::default()
+};
+```
+
+Operational notes:
+
+* **Every producer must hold the key.** A message that fails verification is not executed and not
+  requeued: with a DLQ configured it is recorded there with
+  `failure_type = "signature_verification"`, otherwise it is dropped. Either way a `task-rejected`
+  event fires and `WorkerStats::signature_rejected` counts it — alert on that counter.
+* Roll it out with `.allow_unsigned()` first (verifies signed messages, still admits unsigned ones),
+  then drop that call once every producer is signing. While it is on, an attacker only has to omit
+  the signature — it is a migration step, not a posture.
+* The worker re-signs the messages it produces itself — retry attempts and workflow continuations —
+  so chains and chords keep working under a verifying fleet.
+* `celers-cli loadtest` takes `--signing-key`, falling back to `CELERS_TASK_SIGNING_KEY`. Without one
+  a verifying fleet dead-letters every synthetic task.
+* Freshness windows and `ReplayGuard` are at odds with at-least-once redelivery — the same signed
+  bytes legitimately arrive twice — and `ReplayGuard` is per-process. Read its module docs before
+  enabling either in production.
+
+`crates/celers/examples/security_wiring.rs` is a runnable end-to-end walkthrough.
 
 ### Secrets Management
 

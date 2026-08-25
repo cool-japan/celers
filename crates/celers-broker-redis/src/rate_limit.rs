@@ -368,8 +368,14 @@ end
 pub enum QueueRateLimiter {
     /// Local token bucket limiter
     Local(TokenBucketLimiter),
-    /// Redis-backed distributed limiter
-    Distributed(DistributedRateLimiter),
+    /// Redis-backed distributed limiter.
+    ///
+    /// Boxed because [`DistributedRateLimiter`] owns a [`redis::Client`], whose
+    /// `ConnectionAddr::TcpTls` variant carries the rustls trust store and
+    /// client-certificate chain now that the `tls-rustls` feature is enabled.
+    /// That makes it roughly three times the size of the `Local` variant, so an
+    /// unboxed enum would pay 352 bytes for every purely local limiter.
+    Distributed(Box<DistributedRateLimiter>),
 }
 
 impl QueueRateLimiter {
@@ -384,7 +390,9 @@ impl QueueRateLimiter {
         queue_name: &str,
         config: QueueRateLimitConfig,
     ) -> Self {
-        QueueRateLimiter::Distributed(DistributedRateLimiter::new(client, queue_name, config))
+        QueueRateLimiter::Distributed(Box::new(DistributedRateLimiter::new(
+            client, queue_name, config,
+        )))
     }
 
     /// Try to acquire a permit (sync for local, async stub for distributed)

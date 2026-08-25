@@ -16,6 +16,14 @@ use celers_backend_redis::{ChordState, ResultBackend};
 /// when a step fails for good. [`to_chain`](Self::to_chain) produces that
 /// chain and [`apply`](Self::apply) dispatches it; see
 /// [`CompensationWorkflow::to_chain`] for the exact shape and its caveats.
+///
+/// The `celers` facade builds the same rollback shape straight from tuples with
+/// `celers::advanced_patterns::create_saga_workflow`. That helper *replaces*
+/// each step's failure route with the rollback, so it is equivalent to this
+/// lowering exactly for the input it accepts — bare task names and arguments,
+/// with no per-step handlers of their own. Only [`to_chain`](Self::to_chain)
+/// keeps a handler a step already declared (see
+/// [`CompensationWorkflow::to_chain`]).
 pub struct Saga {
     /// Compensation workflow
     pub workflow: CompensationWorkflow,
@@ -171,7 +179,10 @@ const FANOUT_SOURCE_NOT_SEQUENCEABLE: &str =
 ///
 /// The `scatter` step is **not** part of that chord — see
 /// [`apply_after_scatter`](Self::apply_after_scatter) for why and for what to
-/// do instead.
+/// do instead. When the workers' inputs are known up front, so no scatter step
+/// is needed at all, `celers::advanced_patterns::create_parallel_chains` builds
+/// the same shape from the facade — parallel branches plus an aggregate — with
+/// a dispatch method that establishes the barrier for you.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScatterGather {
     /// Scatter task (distributes work)

@@ -223,6 +223,45 @@ pub(crate) fn write_command(
     cmd
 }
 
+/// Build the `PUBLISH` command that announces a result write on the
+/// Celery-compatible channel: the channel name is the result key itself,
+/// and the message is the *exact* bytes just written there.
+///
+/// This is the Rust side of `BaseKeyValueStoreBackend._set`'s "SET and
+/// PUBLISH" contract (see `celery/backends/redis.py`): a real Celery
+/// Python client's `AsyncResult.get()` subscribes to a pub/sub channel
+/// named after the result key, and decodes whatever arrives on it exactly
+/// as it would decode a `GET` of that key. Publishing anything other than
+/// `encoded.main` — a lighter summary, a different channel name — leaves
+/// that client either unable to decode the notification or never woken at
+/// all.
+pub(crate) fn publish_command(key: &str, payload: &[u8]) -> redis::Cmd {
+    let mut cmd = redis::cmd("PUBLISH");
+    cmd.arg(key).arg(payload);
+    cmd
+}
+
+/// [`write_command`] plus (when `notify`) the matching [`publish_command`]
+/// for the same key and the exact bytes the write command stores — the pair
+/// a caller pushes into one pipeline so a waiter sees the write the instant
+/// it lands. `notify` must be `false` for a write that is not to the live
+/// result key (archival copies, historical versions): nothing ever
+/// subscribes to those, and a client waiting on the live key must not wake
+/// up over an archive/version write that leaves its own result unchanged.
+pub(crate) fn write_and_notify_commands(
+    key: &str,
+    encoded: &EncodedResult,
+    ttl: Option<Duration>,
+    guard: Option<&[u8]>,
+    notify: bool,
+) -> Vec<redis::Cmd> {
+    let mut commands = vec![write_command(key, encoded, ttl, guard)];
+    if notify {
+        commands.push(publish_command(key, &encoded.main));
+    }
+    commands
+}
+
 /// Build the `EVAL` command that deletes `key` and all of its chunk keys.
 pub(crate) fn delete_command(key: &str) -> redis::Cmd {
     let mut cmd = redis::cmd("EVAL");
@@ -461,5 +500,94 @@ mod tests {
         assert!(chunked.is_chunked());
         let cmd = write_command("k", &chunked, None, None);
         assert_eq!(cmd.args_iter().count(), FIXED_ARGS + chunked.chunks.len());
+    }
+
+    /// Flatten a `redis::Cmd`'s arguments (including the command name
+    /// itself) to owned bytes, so a hermetic test can inspect exactly what
+    /// would be sent over the wire without a live connection.
+    fn cmd_args(cmd: &redis::Cmd) -> Vec<Vec<u8>> {
+        cmd.args_iter()
+            .map(|arg| match arg {
+                redis::Arg::Simple(bytes) => bytes.to_vec(),
+                // `Arg` is `#[non_exhaustive]`; `Cursor` (a SCAN-style
+                // cursor placeholder) and anything added later never appear
+                // in the fixed-shape commands this helper inspects.
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_publish_command_channel_is_the_key_and_payload_is_verbatim() {
+        let payload = b"exact-bytes-as-stored\x00\xffnot-utf8".to_vec();
+        let cmd = publish_command("celery-task-meta-abc", &payload);
+        assert_eq!(
+            cmd_args(&cmd),
+            vec![
+                b"PUBLISH".to_vec(),
+                b"celery-task-meta-abc".to_vec(),
+                payload
+            ],
+            "the channel must be exactly the key, and the message exactly the given bytes \
+             (including bytes that are not valid UTF-8 -- an encrypted or compressed payload)"
+        );
+    }
+
+    /// The property that actually matters for Celery interop: whatever a
+    /// `write_and_notify_commands(..., notify: true)` pipeline SETs at the
+    /// key is *identically* what it PUBLISHes on the channel named after
+    /// that key. A test that only checks `publish_command` echoes its own
+    /// arguments back would not catch a caller accidentally publishing on
+    /// the wrong channel (e.g. a `:notify`-suffixed one) or a pre-encoding
+    /// payload -- this asserts the cross-command pairing instead, by
+    /// picking the write command's own `KEYS[1]`/`ARGV[3]` out of its
+    /// argument list.
+    #[test]
+    fn test_write_and_notify_commands_publish_matches_the_write_exactly() {
+        let chunker = ResultChunker::new(ChunkingConfig::disabled());
+        let meta = sample_meta(64);
+        let encoded = encode_meta(
+            &meta,
+            &compression::CompressionConfig::disabled(),
+            &EncryptionConfig::disabled(),
+            &chunker,
+        )
+        .expect("encode");
+
+        let key = "celery-task-meta-cross-check";
+
+        // notify: false -- archival/versioned writes must never publish.
+        let silent = write_and_notify_commands(key, &encoded, None, None, false);
+        assert_eq!(silent.len(), 1, "notify: false must not add a PUBLISH");
+
+        // notify: true -- the live-key write path.
+        let notifying = write_and_notify_commands(key, &encoded, None, None, true);
+        assert_eq!(
+            notifying.len(),
+            2,
+            "notify: true must add exactly one PUBLISH"
+        );
+
+        let write_args = cmd_args(&notifying[0]);
+        let publish_args = cmd_args(&notifying[1]);
+
+        // The write is `EVAL script numkeys KEYS[1] KEYS[2] ARGV[1] ARGV[2]
+        // ARGV[3] ARGV[4]` (see `write_command`): KEYS[1] is args[3],
+        // ARGV[3] (the main value) is args[7].
+        let write_key = &write_args[3];
+        let write_main_value = &write_args[7];
+
+        assert_eq!(
+            publish_args,
+            vec![
+                b"PUBLISH".to_vec(),
+                write_key.clone(),
+                write_main_value.clone()
+            ],
+            "PUBLISH must target the exact same key the write targets (KEYS[1]) and carry \
+             the exact same stored bytes (ARGV[3]), byte for byte"
+        );
+        assert_eq!(write_key.as_slice(), key.as_bytes());
+        assert_eq!(write_main_value.as_slice(), encoded.main.as_slice());
     }
 }

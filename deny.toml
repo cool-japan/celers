@@ -6,31 +6,35 @@
 # VERIFIED GREEN as of 2026-08-25 against the Cargo.lock at this commit:
 #   cargo deny check  ->  advisories ok, bans ok, licenses ok, sources ok
 #
-# The single `[graph] exclude` entry below is the only thing keeping it green;
-# deleting it is the acceptance test for the remaining Pure-Rust SQS work.
+# `[graph] exclude` is now EMPTY: every workspace member, `celers-broker-sqs`
+# included, is checked. Do not add entries back — an exclusion hides a whole
+# subtree from every ban, not just the one that motivated it.
 
 [graph]
 all-features = true
 no-default-features = false
-# celers-broker-amqp is NO LONGER excluded: the workspace-level
+# celers-broker-amqp is NOT excluded: the workspace-level
 # `lapin = { default-features = false, features = ["default-runtime",
 # "rustls-webpki-roots-certs"] }` declaration removed `rustls--aws_lc_rs` from
 # the AMQP chain, and `celers_broker_amqp::install_pure_tls_provider()`
 # supplies the Pure-Rust `rustls-rustcrypto` provider at runtime.
 #
-# celers-broker-sqs remains excluded. `aws-smithy-runtime`'s
-# `default-https-client` feature hard-selects
+# celers-broker-sqs is NOT excluded either, as of the Pure-Rust SQS transport.
+# `aws-smithy-runtime`'s `default-https-client` feature hard-selects
 # `aws-smithy-http-client/rustls-aws-lc` (its only other TLS options are
-# `rustls-ring`, `rustls-aws-lc-fips` and `s2n-tls`, all C/asm), and dropping
-# the feature entirely leaves the SDK with no HTTPS at all. Eliminating
-# aws-lc-sys therefore requires implementing a custom `HttpClient` on top of
-# `oxihttp-client` (aws-smithy-runtime-api `HttpConnector`/
-# `SharedHttpConnector`, http::Request<SdkBody> mapping, HttpConnectorSettings
-# timeouts) and installing it via `aws_config::defaults(..).http_client(..)`.
-# That is tracked as a followup; until it lands, the `sqs` feature of the
-# `celers` facade is documented as a Pure-Rust policy exception (it is
-# off by default, as is `celers-broker-sqs` itself).
-exclude = ["celers-broker-sqs"]
+# `rustls-ring`, `rustls-aws-lc-fips` and `s2n-tls`, all C/asm), so that
+# feature is no longer enabled on `aws-config` / `aws-sdk-sqs` /
+# `aws-sdk-cloudwatch`. `aws-smithy-http-client` therefore leaves the graph
+# entirely (it is an optional dependency reachable only through that feature
+# and `tls-rustls`/`connector-hyper-0-14-x`), taking `aws-lc-rs` and
+# `aws-lc-sys` with it. HTTPS comes instead from
+# `celers_broker_sqs::pure_http`, an `HttpClient` implemented over
+# `oxihttp-client` (rustls + rustls-rustcrypto via oxitls) and installed with
+# `aws_config::defaults(..).http_client(..)`.
+#
+# Verify with:  cargo tree -e features -i aws-lc-sys --all-features
+#               (must report "did not match any packages")
+exclude = []
 
 [bans]
 multiple-versions = "deny"
@@ -51,7 +55,14 @@ deny = [
     # flate2/miniz_oxide are Pure Rust here (rust_backend, verified via
     # `cargo tree -e features -i flate2`), but banned as a DIRECT dependency.
     # `wrappers` allows only the transitive parents that exist today.
-    { crate = "flate2", use-instead = "oxiarc-deflate", wrappers = ["mysql_async", "mysql_common"] },
+    #
+    # aws-sdk-cloudwatch declares `flate2` unconditionally (there is no feature
+    # to turn it off) and pulls `aws-smithy-compression`, which declares it
+    # again — both for the request-compression path `PutMetricData` uses. They
+    # became visible once `celers-broker-sqs` was removed from `[graph] exclude`
+    # above; nothing in this workspace can drop them short of dropping
+    # CloudWatch metrics support.
+    { crate = "flate2", use-instead = "oxiarc-deflate", wrappers = ["mysql_async", "mysql_common", "aws-sdk-cloudwatch", "aws-smithy-compression"] },
     { crate = "libz-sys",       reason = "C zlib backend for flate2" },
     { crate = "libz-ng-sys",    reason = "C zlib-ng backend for flate2" },
     { crate = "zstd",           use-instead = "oxiarc-zstd" },
@@ -113,6 +124,17 @@ skip = [
     # declares 0.23 for its own crates.
     { crate = "base64" },
     { crate = "fiat-crypto" }, { crate = "r-efi" }, { crate = "wasi" },
+    # http 0.2 / http-body 0.4 alongside http 1.x / http-body 1.x.
+    #
+    # Every generated AWS SDK client (aws-sdk-sqs, aws-sdk-cloudwatch,
+    # aws-sdk-sso, aws-sdk-ssooidc, aws-sdk-sts) and aws-sigv4 declare BOTH
+    # `http = "0.2"` and `http-1x = "1"` as unconditional dependencies — the
+    # 0.2 types are still part of their public API (`aws_smithy_runtime_api`
+    # keeps `TryFrom<http_02x::Request<B>>` impls behind no feature at all).
+    # There is no feature to drop the old pair, and this workspace's own crates
+    # are all on http 1.x. Became visible when `celers-broker-sqs` left
+    # `[graph] exclude`; upstream item, not fixable from here.
+    { crate = "http" }, { crate = "http-body" },
 ]
 
 [advisories]
@@ -161,6 +183,13 @@ allow = [
     "CDLA-Permissive-2.0",
     # clipboard-win / error-code (via rustyline), xxhash-rust (via redis)
     "BSL-1.0",
+    # minicbor (via aws-smithy-cbor -> aws-sdk-cloudwatch). OSI-approved and
+    # permissive — it grants copyright and patent licences with no copyleft and
+    # no notice requirement beyond preserving the licence text, i.e. weaker
+    # obligations than MIT. Became visible when `celers-broker-sqs` left
+    # `[graph] exclude`; aws-sdk-cloudwatch declares aws-smithy-cbor
+    # unconditionally, so it cannot be feature-gated away.
+    "BlueOak-1.0.0",
 ]
 confidence-threshold = 0.9
 

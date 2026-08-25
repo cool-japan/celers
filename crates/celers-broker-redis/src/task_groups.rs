@@ -189,7 +189,7 @@ pub struct TaskGroup {
 impl TaskGroup {
     /// Create a new task group
     pub fn new(redis_url: &str, group_id: &str, config: GroupConfig) -> Result<Self> {
-        let client = Client::open(redis_url)
+        let client = crate::connection::open_client(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
         Ok(Self {

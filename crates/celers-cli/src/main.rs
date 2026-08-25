@@ -117,6 +117,18 @@ fn expand_aliases(raw_args: &[String]) -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // First thing, before anything can build a `rustls::ClientConfig`.
+    //
+    // No rustls crypto-provider *feature* is enabled anywhere in this
+    // workspace, so a bare `rustls::ClientConfig::builder()` — which the
+    // `redis` crate uses for `rediss://` — panics unless a process-default
+    // provider is already installed. This binary opens `redis::Client` values
+    // directly in a dozen commands (`queue`, `backup`, `monitor`, ...), not
+    // only through `celers-broker-redis`'s constructors, so installing the
+    // provider once here is what covers all of them. Whoever installs first
+    // wins; calling it again from a broker constructor is a no-op.
+    celers_broker_redis::install_pure_tls_provider();
+
     let raw_args: Vec<String> = std::env::args().collect();
     let expanded_args = expand_aliases(&raw_args);
     let cli = match Cli::try_parse_from(expanded_args) {

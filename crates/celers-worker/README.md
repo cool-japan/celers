@@ -1,6 +1,6 @@
 # celers-worker
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 958 (`--all-features`, excluding `#[ignore]`d) + 68 doctests | Updated: 2026-08-26**
 
 Production-ready worker runtime for consuming and executing CeleRS tasks with comprehensive monitoring, memory optimization, and workflow support.
 

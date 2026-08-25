@@ -51,7 +51,10 @@ pub const CELERY_V2_HEADERS: &[&str] = &[
 pub const REQUIRED_V2_HEADERS: &[&str] = &["task", "id", "lang"];
 
 /// The queue Celery uses when a task names none (`task_default_queue`).
-pub const DEFAULT_CELERY_QUEUE: &str = "celery";
+///
+/// Re-exported from the crate root, where [`crate::DeliveryInfo`] uses the same
+/// constant as its default routing key -- the two must never drift apart.
+pub use crate::DEFAULT_CELERY_QUEUE;
 
 /// How deep `celery.utils.saferepr` descends before eliding a container.
 ///
@@ -245,7 +248,7 @@ fn python_float_repr(value: f64) -> String {
     };
     let exponent: i32 = exponent_text.parse().unwrap_or(0);
 
-    if exponent >= FLOAT_EXPONENT_THRESHOLD || exponent < FLOAT_EXPONENT_FLOOR {
+    if !(FLOAT_EXPONENT_FLOOR..FLOAT_EXPONENT_THRESHOLD).contains(&exponent) {
         let sign = if exponent < 0 { '-' } else { '+' };
         return format!("{}e{}{:02}", mantissa, sign, exponent.abs());
     }
@@ -269,9 +272,14 @@ fn with_float_point(text: &str) -> String {
 /// 1. The envelope carries `headers`, `properties`, `body`, `content-type` and
 ///    `content-encoding` (kombu's hyphenated spellings).
 /// 2. Every key in [`REQUIRED_V2_HEADERS`] is present in `headers`.
-/// 3. `properties.delivery_mode` is 1 or 2, and `properties.body_encoding` is
+/// 3. `properties.delivery_mode` is 1 or 2, `properties.body_encoding` is
 ///    `"base64"` -- without which a kombu consumer never base64-decodes the
-///    body and hands the encoded text to the content-type deserializer.
+///    body and hands the encoded text to the content-type deserializer -- and
+///    `properties.delivery_tag` / `properties.delivery_info` are both present,
+///    the latter with `exchange` and `routing_key`. kombu's
+///    `Message.__init__` indexes those two without a default, so omitting
+///    either raises `KeyError` inside the consumer callback and takes the
+///    worker's event loop down with it.
 /// 4. `body` is a base64 string that decodes to the protocol v2 tuple
 ///    `[args, kwargs, embed]`: a list, an object, and an embed object. This
 ///    step applies only when `content-type` is `application/json`; other
@@ -328,6 +336,40 @@ pub fn verify_message_format(msg: &Message) -> Result<(), String> {
                  kombu only base64-decodes the body when this property says so.",
                 BODY_ENCODING_BASE64, other
             ))
+        }
+    }
+
+    // The two properties a kombu consumer indexes without a default.
+    match properties.get("delivery_tag").and_then(|v| v.as_str()) {
+        Some(tag) if !tag.is_empty() => {}
+        other => {
+            return Err(format!(
+                "Invalid 'properties.delivery_tag': expected a non-empty string, got {:?}. \
+                 kombu.transport.virtual.base.Message.__init__ indexes it directly, so a \
+                 missing one raises KeyError inside the consumer callback.",
+                other
+            ))
+        }
+    }
+    let delivery_info = properties
+        .get("delivery_info")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            "Missing 'properties.delivery_info': kombu indexes \
+             delivery_info['exchange'] directly, which raises KeyError and kills \
+             the consumer loop when the property is absent"
+                .to_string()
+        })?;
+    for key in ["exchange", "routing_key"] {
+        if !delivery_info
+            .get(key)
+            .is_some_and(serde_json::Value::is_string)
+        {
+            return Err(format!(
+                "Invalid 'properties.delivery_info.{}': expected a string, got {:?}",
+                key,
+                delivery_info.get(key)
+            ));
         }
     }
 
@@ -396,6 +438,19 @@ pub fn verify_message_format(msg: &Message) -> Result<(), String> {
 /// `stamps`. A real worker reads headers with `.get()`, and the interop suite
 /// under `tests/python-compat` proves an envelope built here executes on an
 /// unmodified Celery worker.
+///
+/// # Deterministic by design
+///
+/// Every field of the result is a function of the arguments: `reply_to` and
+/// `delivery_tag` are the **nil UUID** and `origin` is a fixed string, so the
+/// bytes are reproducible and can be compared against a committed capture
+/// (`celers_envelope_accepted_by_celery.json`). That is what makes this a
+/// fixture builder rather than a producer: kombu mints a *fresh* delivery tag
+/// per publish, and a consumer keys its unacknowledged-message table by it, so
+/// two of these envelopes in flight on one channel share a tag. Publish real
+/// work through [`crate::builder::MessageBuilder`], whose
+/// [`crate::MessageProperties`] carry a unique tag and a routing key naming the
+/// queue.
 ///
 /// # Errors
 ///

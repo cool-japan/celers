@@ -684,3 +684,231 @@ async fn test_queue_controller_handles_share_emergency_stop() {
 
     cleanup(&broker).await;
 }
+
+// ---------------------------------------------------------------------------
+// Retry-neutral deferral (`Broker::defer`)
+// ---------------------------------------------------------------------------
+
+/// The whole point of `defer`: a message the worker never ran comes back with
+/// its retry accounting untouched, while `reject(requeue = true)` on the very
+/// same broker spends it.
+///
+/// Both halves are asserted against one broker in one test on purpose. A test
+/// that only checked `defer` would still pass if `defer` fell through to the
+/// default `reject(requeue = true)` forwarding on a broker that happened not to
+/// record retry state — the contrast is what makes it evidence.
+#[tokio::test]
+async fn test_defer_returns_the_message_without_spending_retry_budget() {
+    use celers_core::TaskState;
+
+    let broker = test_broker(QueueMode::Fifo).with_block_timeout(0.0);
+    broker
+        .enqueue(task_named("admission-miss"))
+        .await
+        .expect("enqueue");
+
+    let delivered = broker.dequeue().await.expect("dequeue").expect("a message");
+    assert_eq!(delivered.task.metadata.state, TaskState::Pending);
+
+    broker
+        .defer(
+            &delivered.task.metadata.id,
+            delivered.receipt_handle.as_deref(),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("defer");
+
+    let redelivered = broker
+        .dequeue()
+        .await
+        .expect("dequeue")
+        .expect("a deferred message comes straight back");
+    assert_eq!(
+        redelivered.task.metadata.state,
+        TaskState::Pending,
+        "a deferral is not an attempt: the retry counter must not move"
+    );
+    assert_eq!(redelivered.task.metadata.id, delivered.task.metadata.id);
+
+    // The contrast: the same message, rejected-with-requeue, is charged.
+    broker
+        .reject(
+            &redelivered.task.metadata.id,
+            redelivered.receipt_handle.as_deref(),
+            true,
+        )
+        .await
+        .expect("reject");
+
+    let retried = broker
+        .dequeue()
+        .await
+        .expect("dequeue")
+        .expect("a requeued message comes back too");
+    assert_eq!(
+        retried.task.metadata.state,
+        TaskState::Retrying(1),
+        "reject(requeue = true) is a retry and must be counted"
+    );
+
+    cleanup(&broker).await;
+}
+
+/// A deferral with a real delay goes to the delayed set — invisible until due —
+/// and leaves both in-flight structures clean, with the payload unchanged.
+#[tokio::test]
+async fn test_defer_with_a_delay_holds_the_message_in_the_delayed_set() {
+    use celers_core::TaskState;
+
+    let broker = test_broker(QueueMode::Fifo).with_block_timeout(0.0);
+    broker
+        .enqueue(task_named("rate-limited"))
+        .await
+        .expect("enqueue");
+
+    let delivered = broker.dequeue().await.expect("dequeue").expect("a message");
+    broker
+        .defer(
+            &delivered.task.metadata.id,
+            delivered.receipt_handle.as_deref(),
+            std::time::Duration::from_secs(3_600),
+        )
+        .await
+        .expect("defer");
+
+    assert_eq!(
+        dequeued_name(&broker).await,
+        None,
+        "a message deferred for an hour must not be deliverable now"
+    );
+    assert_eq!(
+        broker.promote_delayed_tasks().await.expect("promote"),
+        0,
+        "nor promotable before it is due"
+    );
+
+    let mut conn = raw_connection().await;
+    let held: Vec<String> = conn
+        .zrange(broker.delayed_queue_name(), 0, -1)
+        .await
+        .expect("read the delayed set");
+    assert_eq!(held.len(), 1, "the message must be held, not lost");
+    let task: SerializedTask = serde_json::from_str(&held[0]).expect("the held payload is a task");
+    assert_eq!(task.metadata.id, delivered.task.metadata.id);
+    assert_eq!(
+        task.metadata.state,
+        TaskState::Pending,
+        "the held payload is the delivered bytes, retry state and all"
+    );
+
+    // Nothing may still look in flight, or the reaper would redeliver it while
+    // the delayed copy is also waiting to be promoted.
+    let unacked: usize = conn
+        .zcard(&broker.keys().unacked)
+        .await
+        .expect("read the unacked set");
+    let processing: usize = conn
+        .llen(&broker.keys().processing)
+        .await
+        .expect("read the processing list");
+    assert_eq!(unacked, 0, "the visibility deadline must be cleared");
+    assert_eq!(processing, 0, "the processing list must be cleared");
+
+    cleanup(&broker).await;
+}
+
+/// Deferring a message that is no longer in flight must not resurrect it —
+/// on **either** route.
+///
+/// An acknowledged message has been disposed of; re-adding it from a late
+/// `defer` would run the task a second time. The race is real: a deferral can
+/// lose to the reaper (any worker's dequeue may sweep), to an `ack` from a
+/// concurrent path, or to a revocation.
+#[tokio::test]
+async fn test_defer_after_ack_does_not_resurrect_the_message() {
+    // Both branches of the ready/delayed split, since they take different
+    // routes through the script.
+    for delay in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(60),
+    ] {
+        let broker = test_broker(QueueMode::Fifo).with_block_timeout(0.0);
+        broker
+            .enqueue(task_named("finished"))
+            .await
+            .expect("enqueue");
+
+        let delivered = broker.dequeue().await.expect("dequeue").expect("a message");
+        broker
+            .ack(
+                &delivered.task.metadata.id,
+                delivered.receipt_handle.as_deref(),
+            )
+            .await
+            .expect("ack");
+
+        broker
+            .defer(
+                &delivered.task.metadata.id,
+                delivered.receipt_handle.as_deref(),
+                delay,
+            )
+            .await
+            .expect("a late deferral is not an error");
+
+        let mut conn = raw_connection().await;
+        let held: Vec<String> = conn
+            .zrange(broker.delayed_queue_name(), 0, -1)
+            .await
+            .expect("read the delayed set");
+        assert!(
+            held.is_empty(),
+            "delay {delay:?}: an acknowledged message must not come back \
+             through the delayed set"
+        );
+        assert_eq!(
+            broker.queue_size().await.expect("size"),
+            0,
+            "delay {delay:?}: nor through the ready queue"
+        );
+
+        cleanup(&broker).await;
+    }
+}
+
+/// Priority mode keeps its ordering across a deferral: the requeued payload is
+/// re-scored from the task's own priority rather than dropped to the default.
+#[tokio::test]
+async fn test_defer_preserves_priority_ordering() {
+    let broker = test_broker(QueueMode::Priority).with_block_timeout(0.0);
+
+    broker
+        .enqueue(task_with_priority("urgent", 9))
+        .await
+        .expect("enqueue");
+
+    let delivered = broker.dequeue().await.expect("dequeue").expect("a message");
+    broker
+        .defer(
+            &delivered.task.metadata.id,
+            delivered.receipt_handle.as_deref(),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("defer");
+
+    // A lower-priority task queued after the deferral must still lose to it.
+    broker
+        .enqueue(task_with_priority("background", 0))
+        .await
+        .expect("enqueue");
+
+    assert_eq!(
+        dequeued_name(&broker).await.as_deref(),
+        Some("urgent"),
+        "a deferred high-priority task must keep its place"
+    );
+
+    cleanup(&broker).await;
+}

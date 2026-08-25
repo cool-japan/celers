@@ -167,9 +167,8 @@ async fn probe_broker_connectivity(broker: &RedisBroker, budget: Duration) -> an
                 let now = Instant::now();
                 if now >= deadline {
                     anyhow::bail!(
-                        "invalid broker url or unreachable broker: could not reach Redis \
-                         after {attempt} attempt(s) over {:.1}s: {e}. Pass --no-connect-check \
-                         to skip this probe and start anyway.",
+                        "could not reach the broker after {attempt} attempt(s) over {:.1}s: \
+                         {e}. Pass --no-connect-check to skip this probe and start anyway.",
                         budget.as_secs_f64(),
                     );
                 }
@@ -1159,7 +1158,7 @@ pub async fn drain_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celers_core::Task;
+    use celers_core::{Broker, Task};
 
     /// Local Redis used by this module's live-broker regression tests.
     const TEST_BROKER_URL: &str = "redis://127.0.0.1:6379";
@@ -1413,6 +1412,13 @@ mod tests {
         assert!(
             err.to_string().contains("--no-connect-check"),
             "the failure must point at the escape hatch: {err}"
+        );
+        assert!(
+            !err.to_string()
+                .to_lowercase()
+                .contains("invalid broker url"),
+            "a probe timeout is a connectivity failure, not a malformed URL -- it must not \
+             misclassify via `errors::classify_anyhow`'s E_BAD_BROKER_URL bucket: {err}"
         );
         assert!(
             elapsed >= budget,

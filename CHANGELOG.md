@@ -7,6 +7,383 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1] - Unreleased
 
+0.3.1 is a hardening release, not a feature drop: 475 files changed against 0.3.0. The headline
+additions are the ones that make a CeleRS deployment operable and defensible in production — a
+remote control protocol with `celers inspect` / `celers control` in front of it, revocations that
+survive a worker restart because the *broker* holds them, an event stream a Python Celery monitor
+can actually parse, opt-in message authentication on the worker receive path, soft/hard time
+limits, and workflow patterns (chord aggregation, saga compensation, conditional branches) that a
+worker really executes instead of only building. The whole workspace is now Pure Rust with an empty
+`deny.toml` `[graph] exclude`.
+
+Celery compatibility is now **proved rather than asserted — at the protocol layer**: a new
+`tests/python-compat/` suite exchanges tasks and results with a real Python Celery 5.6.3 in both
+directions, and `crates/celers-protocol/tests/fixtures/` holds verbatim Celery wire captures. The
+boundary is stated plainly in the rewritten `docs/CELERY_COMPATIBILITY.md`: the **broker and result
+backend still carry CeleRS-shaped payloads**, so a Python Celery worker and a CeleRS worker cannot
+share a queue yet.
+
+**Read the breaking-changes section first if you consume CeleRS' event stream, subscribe to a Redis
+`<queue>:cancel` channel, `match` exhaustively on `TaskEvent`, or rely on task coalescing.**
+
+### ⚠️ Breaking changes
+
+#### Wire format
+
+- **The event stream now emits the Celery wire shape.** Everything CeleRS publishes on the Redis
+  `celeryev*` channels and the AMQP `celeryev` exchange is now the shape a Celery monitor parses —
+  `uuid`, `name`, a **float** Unix `timestamp`, `hostname`, `pid`, `clock`, `utcoffset`, plus
+  Celery's own names for the payload fields — instead of the previous serde projection of the typed
+  `Event` enum (`{"type": "…", "timestamp": "<RFC 3339 string>", "task_id": …}`). A 0.3.0 consumer
+  that parsed the old shape **must be updated**; a Python Celery monitor, `celery events` or Flower
+  now works without one. The exact bytes are pinned by `celers_core::event::wire`'s
+  `wire_json_is_byte_for_byte_stable` test — they are a published interface, so changing them again
+  is a breaking change.
+  The *receive* direction accepts both: CeleRS' event receivers parse the Celery shape (including
+  events published by a real Python worker, whose sparser `task-retried` / `task-rejected` /
+  post-`task-received` events fill `task_name`, `retries` and `reason` with documented defaults) and
+  still parse the legacy CeleRS projection, so a mixed-version cluster on one channel does not lose
+  events during a rolling upgrade
+- **The queue cancel channel now carries JSON.** `<queue>:cancel` used to carry a bare task-id
+  string; it now carries a `RevocationNotice` document, `{"task_id": "…", "terminate": <bool>}`,
+  because a revocation has to say whether a *running* copy must be aborted (Celery's
+  `revoke(id, terminate=True)`) or only a queued one refused (`revoke(id)`).
+  `RevocationNotice::from_wire` accepts both forms — a bare id reads as `terminate: false`, which is
+  the honest reading of what the old payload meant — so an old publisher still reaches a new worker.
+  A *reader* that expected a bare id (a hand-rolled monitor, a `redis-cli SUBSCRIBE` script) must be
+  updated
+- `TaskEvent::Revoked` gained a `hostname` field, so a monitor can tell *which* worker revoked a
+  task. `task-revoked` now carries the emitting worker's own hostname rather than falling back to
+  the publisher hostname configured on the event emitter, matching Python Celery, which stamps the
+  field on every worker-emitted event. Inbound events without `hostname` still parse (the field
+  reads as empty) so a rolling upgrade is not lossy
+- `celers_protocol::event::EventMessage::get_datetime()` now falls back to the Unix epoch for a
+  non-finite or unrepresentable timestamp instead of `Utc::now()`. A corrupt timestamp used to read
+  as "just now", which is indistinguishable from a healthy event; it now reads as obviously wrong
+
+#### Source compatibility
+
+- `TaskEvent` gained a `SoftTimeLimitExceeded` variant and **is not `#[non_exhaustive]`**: a
+  downstream `match` over `TaskEvent` without a wildcard arm stops compiling until the arm is added
+- `celers_core::Broker` gained four methods — `revoke(&TaskId, terminate)`, `is_revoked(&TaskId)`,
+  `subscribe_revocations()` and `defer(task_id, receipt_handle, delay)`. All four have trait
+  defaults (`revoke` forwards to `cancel`, `is_revoked` answers `false`, `subscribe_revocations`
+  answers `None`, `defer` forwards to `reject(requeue = true)`), so an existing `impl Broker` keeps
+  compiling — it just gets the inert behaviour until it overrides them
+
+#### Defaults
+
+- **Task coalescing now requires the same task id.** `WorkerConfig::coalesce_require_same_task_id`
+  is new and defaults to `true`, which is the only lossless setting: coalescing then collapses
+  genuine redeliveries of *one* task and nothing else. The previous behaviour — now reachable only
+  by setting the flag to `false` — widened the coalescing key to `(task name, payload hash)`, so two
+  *independent* submissions with identical arguments collapsed into one: the dropped submission
+  never ran, never produced a result, and left its caller waiting forever on an `AsyncResult` that
+  could never resolve. Turn it off only for idempotent, fire-and-forget work where nobody awaits the
+  second submission
+
+#### Manifests and features
+
+- `rust-version` is now declared: **1.89** for the workspace (set by the `oxisql` 0.4.1 and `oxitls`
+  0.3.0 chains) and **1.94.1** for `celers-broker-sqs`, whose AWS SDK dependencies are not optional
+  — so `celers/sqs`, `celers/full` and any `--all-features` build require 1.94.1 too. The root
+  manifest documents how to re-derive both numbers
+- `celers` facade: new `canvas` and `workflows` features, forwarding `celers-worker/canvas` and
+  `celers-worker/workflows`, both now part of `full`. Without them a facade user could build and
+  apply a `Chord` but the worker they built had the barrier and chain continuation compiled out, so
+  the callback never ran. `workflows` also pulls `backend-redis`, because the barrier is counted in
+  a result backend; `backend-redis` additionally forwards `celers-canvas/backend-redis`. The
+  README's install snippet — which advertised a `workflows` feature that did not exist and failed to
+  build as printed — now matches the manifest
+- `celers-broker-sqs`: new **default-on** `pure-http` feature selecting the crate's own
+  `oxihttp-client`-backed AWS SDK transport. Building with `default-features = false` and nothing
+  else leaves the SDK with no HTTP client at all — the deliberate escape hatch for a deployment that
+  wants the stock (non-Pure-Rust) transport, which must then enable
+  `aws-config/default-https-client` itself
+- `celers-beat`: new off-by-default `redis-store` feature (`RedisScheduleStore`)
+- `celers-worker`: the `redis` feature now also enables `oxitls`, mandatory rather than optional —
+  no rustls provider *feature* is enabled anywhere in this workspace, so the bare
+  `rustls::ClientConfig::builder()` the `redis` crate uses for `rediss://` panics unless a
+  process-default provider was installed first
+- Workspace `redis` is now built with `tokio-rustls-comp` + `tls-rustls-webpki-roots` (`rediss://`
+  support); workspace `lapin` stays pinned to `default-features = false` +
+  `rustls-webpki-roots-certs`. Both trust the Mozilla bundle rather than the OS store; a private CA
+  is supplied per connection (`RedisConfig::tls(…)`) or via `celers-broker-amqp/tls-native-certs`
+- `deny.toml` is committed at the workspace root and its `[graph] exclude` list is **empty** — no
+  crate is hidden from `cargo deny check bans` any more
+
+### Added
+
+#### Remote worker control (`celers inspect` / `celers control`)
+
+- A complete remote control protocol: `celers_core::control` defines the command vocabulary
+  (`ControlCommand` / `ControlResponse`), `celers_core::control_transport` the broadcast-plus-reply
+  wire framing (`ControlClient`, `ControlTransport`), and `celers_worker::control`'s `ControlService`
+  the worker-side handler that dispatches each command into the running worker. A worker joins the
+  channel with `Worker::with_control_transport`; the run loop starts the subscriber alongside the
+  revocation watcher and stops it on shutdown. `celers_broker_redis::RedisControlTransport` is the
+  Redis Pub/Sub implementation (RESP3 server pushes, so Redis 6.0+)
+- `celers inspect` (read-only; 11 subcommands: `ping`, `active`, `scheduled`, `reserved`, `revoked`,
+  `registered`, `stats`, `queues`, `report`, `conf`, `circuit-breakers`) and `celers control`
+  (mutating; 10: `ping`, `shutdown`, `revoke`, `revoke-pattern`, `rate-limit`, `time-limit`,
+  `add-consumer`, `cancel-consumer`, `queue-length`, `reset-circuit-breaker`). Both broadcast a
+  request and print every reply that arrives before a timeout, so "no worker answered" means nothing
+  was listening rather than that the command failed. There is no separate daemon to run.
+  This is a CeleRS-native protocol: it does **not** interoperate with `celery -A app inspect`
+  against a Python worker — there is no kombu pidbox codec yet (see `TODO.md`, "Known gaps")
+- `RateLimit` installs a per-task-name token bucket consulted before every dispatch; `TimeLimit`
+  sets the soft/hard limits the worker resolves per task; `AddConsumer` / `CancelConsumer` resume and
+  suspend consumption of the worker's queue; `ResetCircuitBreaker` closes one or every per-task-type
+  breaker. `Inspect(Scheduled)` and `Inspect(Reserved)` deliberately answer empty and say why in
+  their module docs rather than inventing a number
+
+#### Broker-fed revocation
+
+- Revocations now live in the broker, not only in the worker that received them.
+  `Broker::revoke(task_id, terminate)` records the revocation durably **and** publishes a live
+  notice; `Broker::is_revoked` is the dequeue-time lookup; `Broker::subscribe_revocations` is the
+  live feed a running task is aborted from. The two halves cover different failures and neither is
+  redundant: the persisted set survives a worker restart and refuses a task that was revoked while
+  it sat in the queue; the Pub/Sub feed is what makes an in-flight abort prompt
+- `celers-broker-redis` implements all three: a durable `<queue>:revoked` sorted set scored by
+  expiry, checked inside the dequeue Lua scripts (`POP_TO_UNACKED` / `POP_BATCH_TO_UNACKED` drop a
+  revoked message and charge it an attempt), plus the `<queue>:cancel` subscription.
+  `celers-broker-postgres` and `celers-broker-sql` persist revocations in new tables (migrations
+  `008_revocation.sql` and `011_revocation.sql`). `InMemoryBroker` implements the same contract
+  in-process. AMQP and SQS keep the inert trait defaults
+- `Worker::with_broker_revocation` opts a worker into the dequeue-time check (one lookup per
+  message, which is why it is opt-in); `celers worker` turns it on. `celers control revoke <id>`
+  therefore also blocks a task that is still queued, or one whose worker has not started yet
+- `RedisBroker::queue_names()` deliberately does not list `<queue>:revoked`, so `purge_all_queues()`
+  leaves recorded revocations in place — purging messages must not un-revoke anything
+
+#### Celery-compatible event wire
+
+- `celers_core::event::wire` renders and parses the Celery event shape (`Event::to_wire_value` /
+  `to_wire_json` / `from_wire_value` / `from_wire_json`, `EventEnvelope`), over the lossless typed
+  `Event` ⇄ `celers_protocol::event::EventMessage` conversion in `celers_core::event::message`
+- Celery's Lamport clock on both halves: `forward_event_clock` (one tick per emitted event) and
+  `adjust_event_clock` (folding a remote worker's clock into your own), so a monitor can order
+  events whose wall-clock timestamps are unreliable
+- `utcoffset` is always `0` because CeleRS always timestamps in UTC;
+  `EventEnvelope::with_utcoffset` exists for bridges re-publishing events captured from a non-UTC
+  producer
+- `TaskEvent::SoftTimeLimitExceeded` (`task-soft-time-limit-exceeded`) — a CeleRS extension for the
+  moment Celery would raise `SoftTimeLimitExceeded` inside the task
+
+#### Task security, wired into the worker
+
+- Opt-in message authentication on the receive path (`celers_worker::security`): set
+  `WorkerConfig::signature_verification` and every dequeued message is verified **before dispatch**
+  — before the revocation registry, the poison-pill strike table, routing, or any other admission
+  decision — so an unauthenticated message can never seed worker-local state keyed on its own task
+  id or name. A message that fails verification is not executed and not requeued: it is recorded in
+  the DLQ with `failure_type = "signature_verification"` if one is configured, dropped otherwise;
+  either way a `task-rejected` event is emitted and `WorkerStats::signature_rejected` counts it. A
+  migration mode admits unsigned messages while still rejecting forged ones
+- The producer side is `celers_core::task_security::sign_task`, and the two sides share the field
+  projection in `signed_fields`, so what the producer signed is exactly what the worker checks.
+  `TaskMetadata` gained `signature: Option<SignatureEnvelope>` (serde-defaulted, so old payloads
+  still parse). The worker re-signs its own retry attempts and workflow continuations
+- Payload hygiene: `celers inspect active` reports a redacted argument preview rather than raw
+  payloads
+- All of it is **off by default**: a worker built from `WorkerConfig::default()` verifies no
+  signatures and redacts nothing, exactly as before
+
+#### Time limits
+
+- Soft and hard per-task time limits, resolvable per task and settable at runtime over the control
+  channel (`celers control time-limit`). The soft limit is cooperative —
+  `execution_context::check_soft_time_limit()` / `soft_time_limit_exceeded()` let a task body notice
+  it and wind down, the Rust equivalent of Celery raising `SoftTimeLimitExceeded` inside the task —
+  and emits `task-soft-time-limit-exceeded`; the hard limit terminates
+
+#### Workflows that actually run
+
+- Chord aggregation, saga compensation and conditional branches are executed end to end by the
+  worker, not merely built by the canvas crate. `celers_canvas::Saga`, `Pipeline`, `FanIn`, `FanOut`
+  and `ScatterGather` *lower* onto the executable primitives (a chain, a group, a chord, a rollback
+  route), and `celers_worker::workflows::patterns_e2e` proves the lowered graph runs: a four-step
+  saga rolls its two completed steps back in reverse when the third fails, a chord's aggregator
+  fires exactly once with every member's result, a fan-out's consumers all get their message
+- `celers_canvas::Branch` / `Switch` conditional routing is executed by the worker's error-route and
+  continuation machinery (`celers_worker::error_links`), covered by the new `workflow_semantics`
+  integration tests in both `celers-worker` and the `celers` facade: a true condition takes the
+  success arm only, a false one the failure arm only, a switch picks exactly one case, and a chord
+  over chains runs its aggregate once after every chain finishes
+- `SagaIsolation` is documented as advisory metadata, not an enforced guarantee — a task queue has
+  no rollback segment, so isolation belongs in the steps themselves
+
+#### Broker and backend hardening
+
+- `Broker::defer(task_id, receipt_handle, delay)` — a retry-neutral way to return a delivered
+  message to the queue. `reject(requeue = true)` means "this task ran and failed", and the Redis
+  broker implements it that way (it rewrites the payload to `Retrying(n + 1)`); an admission miss
+  (wrong worker, unmet affinity, a disabled feature flag, a saturated rate limiter, a half-open
+  circuit's spent probe budget, a draining worker) means "this task never ran", and now goes through
+  `defer` instead. Previously such a task was charged a retry every time it visited a worker that
+  could not serve it, and was eventually dead-lettered without ever executing
+- Redis `defer` splits on the delay: under one second the message goes straight back to the ready
+  queue (unchanged bytes, so another worker can take it at once), one second or more into the
+  delayed sorted set via the new `DEFER_UNACKED` Lua script (`SCRIPT_VERSION` is now `3`).
+  `InMemoryBroker` honours the delay through its scheduled set
+- `rediss://` support in `celers-broker-redis`, `celers-backend-redis` and `celers-worker`, each
+  with an `install_pure_tls_provider()` that installs OxiTLS' Pure-Rust `rustls-rustcrypto` provider
+  as the process default before any `redis::Client` is opened. Custom CA and client certificates go
+  through `RedisConfig::tls(TlsConfig::new().ca_cert(…).client_cert(…, …))`
+- `celers-beat`: `ScheduleStore`, a pluggable byte-oriented backend for scheduler state
+  (`load`/`save`/`remove`). `FileScheduleStore` is the previous file-based behaviour behind the
+  trait — nothing changes for a caller who never touches the module — and `RedisScheduleStore`
+  (feature `redis-store`) gives several beat instances a shared, durable schedule catalog. The
+  module documents what it deliberately does *not* solve: `save` is last-write-wins, so per-fire
+  duplicate-dispatch prevention remains `dispatch_lock`'s job and a single active writer is still
+  the recommended deployment
+- `impl From<CancellationError> for CelersError`, mapping onto `CelersError::Cancelled`. A
+  cooperative task body can now write `execution_context::check_cancelled()?` directly — which its
+  documentation had always promised — and the resulting error is recognisable downstream
+  (`is_cancelled()`, not retryable) instead of an opaque string
+
+#### CLI
+
+- `celers worker` performs a real startup connectivity probe: a bounded exponential-backoff retry
+  loop that issues an actual Redis `PING` (and a control-channel subscribe) before reporting
+  success. `--broker-connect-timeout` sets the budget and `--no-connect-check` skips the probe for
+  an operator who has already verified connectivity another way. Previously the command reported a
+  successful broker connection after zero network I/O
+- `celers worker --demo-tasks` registers three harmless built-ins (`demo.echo`, `demo.sleep`,
+  `demo.fail`) so a fresh deployment can be smoke-tested end to end — enqueue, dequeue, execute,
+  ack/DLQ — before any application task code exists. Without it the command now prints an explicit
+  warning that its registry is empty and points at the README, instead of starting silently and
+  letting tasks accumulate unexecuted
+- `celers config validate` (and `celers worker` startup) now validate the broker URL — non-empty,
+  a real `scheme://` separator, and a scheme among the known broker schemes — instead of passing any
+  string clean and failing later, mid-connection
+
+#### Testing and proof
+
+- **`tests/python-compat`**: a live interoperability suite running a real Python Celery client and a
+  real `celery -A tasks worker` against a real Redis, with the CeleRS side going through
+  `celers-protocol`'s own public API via the new `crates/celers-protocol/examples/celery_bridge.rs`.
+  It covers both directions (Python publishes → CeleRS consumes and answers; CeleRS publishes → a
+  real worker executes) and skips visibly without `CELERS_TEST_REDIS_URL` / `CELERS_PYTHON`.
+  Reachable from cargo as `cargo test -p celers-protocol --test python_interop`
+- **Verbatim Celery wire captures** in `crates/celers-protocol/tests/fixtures/`, recorded from
+  Celery 5.6.3 / kombu 5.6.2 / Python 3.14.6 by `tests/python-compat/capture_fixtures.py` with only
+  four environment-specific substrings normalised. `tests/celery_golden.rs` checks this crate
+  against them with no services required. The canonical CeleRS envelope fixture
+  (`celers_envelope_accepted_by_celery.json`) is recorded **only after a real Celery worker executed
+  it**, so it is no longer generated by the code it validates
+- Property-based round-trip tests for `celers-protocol` (`tests/proptest_roundtrip.rs`)
+- A `trybuild` compile-fail UI harness for `celers-macros` (`tests/ui_compile_fail.rs`), plus
+  validator suites (`validators_ids.rs`, `validators_geo.rs`, `validators_practical.rs`).
+  `celers-macros` now dev-depends on `celers-core`, so generated code is checked against the real
+  `Task` / `CelersError` types instead of a hand-rolled mirror that could drift
+- Byte-exact event-wire golden tests in both directions (`celers-backend-redis`'s
+  `tests_event_wire.rs`), broker hardening suites for AMQP, MySQL and PostgreSQL, an in-crate
+  LocalStack suite for SQS, and `security_wiring` / `workflow_semantics` integration tests for the
+  worker and the facade
+- `docker-compose.yml` gained `mysql` and `localstack` behind a `test` profile and `python-celery`
+  behind a `python-compat` profile, so every env-gated suite has a service it can run against.
+  `tests/integration/README.md` maps each gate variable to its service and its exact invocation, and
+  explains how to tell a real run from a silent skip
+
+### Changed
+
+- Dependency upgrades: `oxisql-core` / `-postgres` / `-mysql` 0.3.2→**0.4.1** (which, with `oxitls`,
+  sets the declared 1.89 MSRV), `oxitls` 0.2.0→**0.3.0**, `oxicode` 0.2.4→**0.2.6**,
+  `oxihttp-client` 0.2.0→**0.2.1** (plus a new direct `oxihttp-core` 0.2.1 for the request-body
+  type the SQS transport hands to it), `oxiarc-deflate` / `-zstd` / `-archive` 0.3.5→**0.4.1**,
+  `redis` 1.3.0→**1.6.0** (with `tokio-rustls-comp`
+  + `tls-rustls-webpki-roots` for `rediss://`), `tokio` 1.52.3→1.53.1, `serde` 1.0.228→1.0.229, and
+  the AWS SDK crates (`aws-config` 1.11.0, `aws-sdk-sqs` 1.107.0, `aws-sdk-cloudwatch` 1.126.0), all
+  now declared with `default-features = false` so `default-https-client` stays out of the graph.
+  `aws-smithy-runtime-api` and `aws-smithy-types` are new workspace dependencies, used by
+  `celers-broker-sqs`' Pure-Rust transport
+- `celers-kombu` now depends on `tracing` and emits its diagnostics through it instead of writing
+  straight to stderr; `celers-beat` no longer mixes `eprintln!` and `tracing` in the same function
+- `celers-metrics`' trend and forecast alert tests inject deterministic timestamps through
+  `record_batch` and assert the real verdict, instead of calling `should_alert` only to check that
+  it does not panic. `tests_core.rs` was split at a `#[test]` boundary into `tests_core_extra.rs` to
+  stay under the 2000-line-per-file convention
+- The canvas and `celers-backend-redis` chord tests that were named for barrier races but exercised
+  `tokio` and `AtomicUsize` (or set the counter by direct field assignment) are renamed for what
+  they actually pin, and the increment path is now covered by real contention against the barrier
+- `celers-beat`'s scheduler tests replace timing-dependent sleeps with deterministic
+  next-occurrence assertions wherever the behaviour allows, and document the cases that genuinely
+  need elapsed time
+- `celers-worker/src/worker_core.rs` was split (`execution.rs`, `control_wiring.rs`,
+  `broker_revocation.rs`, `runtime.rs`, `support.rs`) to stay under the 2000-line-per-file
+  convention; `celers-beat`'s `schedule_store` and `celers-broker-redis`'s `defer` are likewise
+  their own modules
+- The Docker image no longer installs `ca-certificates`: on Debian bookworm it carries a hard
+  `Depends: openssl`, which would put OpenSSL into a Pure-Rust image through the OS package manager.
+  `celers-cli` resolves TLS through the compiled-in `webpki-roots` bundle and never reads
+  `/etc/ssl/certs`
+
+### Fixed
+
+- **Solar schedules now fire at all.** `Schedule::Solar::next_run` previously returned
+  `Err(ScheduleError::Invalid)` for *every* input, so a solar beat entry never ran: the branch
+  called the deprecated `sunrise::sunrise_sunset`, whose `(i64, i64)` return is a pair of Unix
+  **seconds** timestamps, and divided each as "minutes since midnight" — producing an hour count in
+  the tens of millions that `NaiveDate::and_hms_opt` rejected on the first loop iteration. The
+  branch now resolves events through `sunrise`'s `SolarDay::event_time`, which returns an absolute
+  `DateTime<Utc>` and needs no unit conversion. Three further defects went with it:
+  civil/nautical/astronomical twilight were approximated as flat ±30/60/90-minute offsets from
+  sunrise/sunset and are now true 6°/12°/18° elevation solves; polar day and polar night (where the
+  event genuinely does not occur) are skipped rather than treated as errors, so a Svalbard sunrise
+  schedule resolves to the first sunrise after the midnight sun ends; and out-of-range coordinates
+  now return `ScheduleError::Invalid` instead of panicking inside the `sunrise` crate and taking the
+  beat process down. The search also starts a day earlier, because the event for a given *local*
+  date routinely falls on a neighbouring UTC date. `test_solar_schedule_{sunrise,sunset}` are
+  un-`#[ignore]`d and assert real almanac instants (Tokyo's 2026 solstice sunrise is
+  `2026-06-21T19:25:59Z` = 04:25 JST), alongside new tests for negative longitudes, twilight
+  ordering, polar day and invalid coordinates
+
+- A task that reports its *own* cancellation — `Err(CelersError::Cancelled)`, which is what
+  `check_cancelled()?` now produces — is disposed of as revoked (acked, no DLQ entry, `task-revoked`
+  with `terminated: false`) instead of being read as an execution failure and re-dispatched up to
+  `max_retries` times. `CelersError::TaskRevoked` returned from a handler is terminal for the same
+  reason. Previously the polite form of cancellation was punished while the abrupt form (the
+  revocation watcher aborting the future) was already terminal
+- Redis `defer` re-adds a message only if it was still in flight, so a deferral that loses a race to
+  the reaper, an `ack` or a revocation cannot duplicate the message
+- `create_python_celery_message` no longer writes Rust `Debug` formatting into the Celery
+  `argsrepr` / `kwargsrepr` headers. Both are now rendered the way `celery.utils.saferepr` renders
+  them — Python literals (`True`, `None`, tuple versus list parentheses) with the same third-level
+  container elision — checked against a recorded `celery.utils.saferepr` table in both Rust
+  (`celery_golden.rs`) and Python (`tests/python-compat/test_reprs.py`)
+- The Docker image builds again: the builder stage was pinned to `rust:1.75`, far below the
+  dependency MSRV, and its `COPY --from=builder` named `target/release/celers-cli` — a binary the
+  build never produces, because `celers-cli`'s `[[bin]]` is named `celers`
+- The docker-compose monitoring stack no longer mounts nonexistent paths: `docs/prometheus.yml`,
+  `docs/grafana/datasources/` and `docs/grafana/dashboards/` (with a real `celers-overview.json`)
+  are committed, and `docs/DEPLOYMENT.md` points at what exists
+
+### Security
+
+- Message authentication is now enforceable end to end: HMAC-SHA256 task signatures are verified on
+  the worker receive path before any admission decision, and the worker re-signs the messages it
+  produces itself (retries, workflow continuations) — see Added → Task security. Freshness and
+  replay-guard settings are documented as being at odds with at-least-once redelivery, and
+  `ReplayGuard` remains per-process by construction; a deployment needing global single-use-nonce
+  semantics must back it with shared storage
+- The whole workspace is now Pure Rust — no C, C++, Fortran or vendored assembly in a default build,
+  with `--all-features`, or under `celers/full` — and `deny.toml`'s `[graph] exclude` is empty, so
+  `cargo deny check bans` checks every member. The last exception, `celers-broker-sqs`, was closed
+  by `celers_broker_sqs::pure_http`: an AWS SDK `HttpClient` implemented over `oxihttp-client`
+  (hyper 1.x + `tokio-rustls` + OxiTLS' `rustls-rustcrypto` provider, webpki roots) and installed at
+  every `aws_config::defaults(…)`, replacing the SDK's `default-https-client` →
+  `aws-smithy-http-client/rustls-aws-lc` → `aws-lc-sys` chain. Removing that dependency also removed
+  the ~12 s `rustls_native_certs::load_native_certs()` walk it performed at client construction on
+  macOS
+- `celers-broker-amqp` is Pure Rust for the same reason at the AMQP layer: `lapin` is pinned to
+  `default-features = false` + `rustls-webpki-roots-certs`, and `install_pure_tls_provider()`
+  supplies the crypto provider. Deployments behind a private CA can enable the (also Pure Rust)
+  `tls-native-certs` feature
+- Verify both claims yourself with `cargo tree -e features -i aws-lc-sys --all-features` (must
+  report "did not match any packages") and `cargo deny check bans`
+
 ## [0.3.0] - 2026-07-12
 
 ### Added
@@ -473,16 +850,20 @@ celers-cli test count pending final release-check re-verification before publish
 ## Project Information
 
 ### Workspace Structure
-- Total crates: 18
+- Published crates: 18, plus 2 unpublished members (`celers-examples`, `celers-facade-test`)
 - Facade: 1 (celers)
 - Core/Protocol: 4 (celers-core, celers-protocol, celers-kombu, celers-macros)
-- Brokers: 5 (Redis, PostgreSQL, SQL, AMQP, SQS)
+- Brokers: 5 crates — 3 implement `celers_core::Broker` and can back a worker (Redis, PostgreSQL,
+  SQL/MySQL); 2 are `celers-kombu` transports only, with no `celers_core::Broker` adapter yet
+  (AMQP, SQS)
 - Result Backends: 3 (Redis, Database, RPC)
 - Runtime: 3 (worker, canvas, beat)
 - Utilities: 2 (cli, metrics)
 
 ### Supported Rust Versions
-- Minimum Supported Rust Version (MSRV): 1.70+
+- Minimum Supported Rust Version (MSRV): **1.89**, declared as `rust-version` in the workspace
+  manifest since 0.3.1 — except `celers-broker-sqs`, which declares **1.94.1**, and therefore so do
+  `celers/sqs`, `celers/full` and any `--all-features` build
 - Edition: 2021
 
 ### License

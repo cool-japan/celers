@@ -138,11 +138,31 @@ fn test_task_result_status_serialization() {
     assert_eq!(deserialized, status);
 }
 
+/// The MySQL connection string for the legacy `#[ignore]`-gated integration
+/// tests below.
+///
+/// Prefers `CELERS_TEST_MYSQL_URL`, the name every other integration test in
+/// the workspace (this crate's [`test_mysql_url`] helper, `celers-broker-sql`'s
+/// `tests_hardening` module, `celers-broker-postgres`'s `CELERS_TEST_POSTGRES_URL`
+/// equivalent) already standardized on. The old bare `MYSQL_URL` name is kept
+/// as a documented fallback so any environment still exporting it keeps
+/// working unchanged. An empty value (set-but-blank, e.g. `FOO=`) is treated
+/// the same as unset for both names, matching [`test_mysql_url`]'s guard
+/// below. Neither variable being set falls back to a conventional local
+/// default; these tests are `#[ignore]`d and only run under an explicit
+/// `--ignored` invocation against a real MySQL instance, so an unreachable
+/// default is safe.
+fn legacy_mysql_url() -> String {
+    let non_empty = |key: &str| std::env::var(key).ok().filter(|url| !url.trim().is_empty());
+    non_empty("CELERS_TEST_MYSQL_URL")
+        .or_else(|| non_empty("MYSQL_URL"))
+        .unwrap_or_else(|| "mysql://root:password@localhost/celers_test".to_string())
+}
+
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_mysql_broker_creation() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await;
     assert!(broker.is_ok());
@@ -151,8 +171,7 @@ async fn test_mysql_broker_creation() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_mysql_broker_lifecycle() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -184,8 +203,7 @@ async fn test_mysql_broker_lifecycle() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_mysql_queue_pause_resume() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -216,8 +234,7 @@ async fn test_mysql_queue_pause_resume() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_mysql_statistics() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -229,8 +246,7 @@ async fn test_mysql_statistics() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_mysql_health_check() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
 
@@ -244,8 +260,7 @@ async fn test_mysql_health_check() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_batch_operations() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -277,8 +292,7 @@ async fn test_batch_operations() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_task_chain() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -301,8 +315,7 @@ async fn test_task_chain() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_connection_diagnostics() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
 
@@ -315,8 +328,7 @@ async fn test_connection_diagnostics() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_performance_metrics() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -331,8 +343,7 @@ async fn test_performance_metrics() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_migration_tracking() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -351,8 +362,7 @@ async fn test_migration_tracking() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_is_ready() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
 
@@ -365,8 +375,7 @@ async fn test_is_ready() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_concurrent_dequeue() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -417,8 +426,7 @@ async fn test_concurrent_dequeue() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_skip_locked_behavior() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker1 = MysqlBroker::new(&database_url).await.unwrap();
     broker1.migrate().await.unwrap();
@@ -532,8 +540,7 @@ fn test_retry_statistics_serialization() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_cancel_batch() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -560,8 +567,7 @@ async fn test_cancel_batch() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_worker_statistics() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -603,8 +609,7 @@ async fn test_worker_statistics() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_count_by_state_quick() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -636,8 +641,7 @@ async fn test_count_by_state_quick() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_task_age_distribution() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -663,8 +667,7 @@ async fn test_task_age_distribution() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_retry_statistics() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -696,8 +699,7 @@ async fn test_retry_statistics() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_list_active_workers() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -730,8 +732,7 @@ async fn test_list_active_workers() {
 #[tokio::test]
 #[ignore] // Requires MySQL running
 async fn test_get_all_worker_statistics() {
-    let database_url = std::env::var("MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+    let database_url = legacy_mysql_url();
 
     let broker = MysqlBroker::new(&database_url).await.unwrap();
     broker.migrate().await.unwrap();
@@ -784,20 +785,37 @@ fn test_circuit_breaker_config_default() {
     assert_eq!(config.success_threshold, 2);
 }
 
+/// The connection string to test against, printing a visible, greppable skip
+/// line when it is not configured.
+///
+/// `test_circuit_breaker_stats`/`test_circuit_breaker_reset` used to connect
+/// to a hardcoded, never-reachable `mysql://test:test@localhost/test` and
+/// silently `return` on any connection error — a skipped run and a real run
+/// both reported `ok`, and there was no way to tell the two apart from the
+/// test output, or to actually run this pair anywhere. Gating on
+/// `CELERS_TEST_MYSQL_URL`, like every other integration test in this crate,
+/// fixes both: it is real gating (a wrong-but-set URL now fails loudly via
+/// `.expect`, rather than being swallowed as "connection failed, skip"), and
+/// it is visible (the skip line names the test and the variable to set).
+fn test_mysql_url(test_name: &str) -> Option<String> {
+    match std::env::var("CELERS_TEST_MYSQL_URL") {
+        Ok(url) if !url.trim().is_empty() => Some(url),
+        _ => {
+            eprintln!("SKIPPED: {test_name} (set CELERS_TEST_MYSQL_URL to run)");
+            None
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_circuit_breaker_stats() {
-    // Create a broker with circuit breaker
-    let database_url = "mysql://test:test@localhost/test";
-    let result = MysqlBroker::new(database_url).await;
-
-    // Even if connection fails, we can test circuit breaker stats on the struct
-    if result.is_err() {
-        // Test with manual struct construction would go here
-        // For now, just pass the test
+    let Some(database_url) = test_mysql_url("test_circuit_breaker_stats") else {
         return;
-    }
+    };
 
-    let broker = result.unwrap();
+    let broker = MysqlBroker::new(&database_url)
+        .await
+        .expect("connecting to CELERS_TEST_MYSQL_URL should succeed");
     let stats = broker.get_circuit_breaker_stats();
 
     assert_eq!(stats.state, CircuitBreakerState::Closed);
@@ -807,14 +825,13 @@ async fn test_circuit_breaker_stats() {
 
 #[tokio::test]
 async fn test_circuit_breaker_reset() {
-    let database_url = "mysql://test:test@localhost/test";
-    let result = MysqlBroker::new(database_url).await;
-
-    if result.is_err() {
+    let Some(database_url) = test_mysql_url("test_circuit_breaker_reset") else {
         return;
-    }
+    };
 
-    let broker = result.unwrap();
+    let broker = MysqlBroker::new(&database_url)
+        .await
+        .expect("connecting to CELERS_TEST_MYSQL_URL should succeed");
 
     // Manually trigger some failures
     for _ in 0..3 {

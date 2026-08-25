@@ -1,0 +1,5 @@
+error: invalid `input` type 'not a valid type <<<': unexpected token. Expected a valid Rust type, e.g. #[task(input = "MyType")]
+  --> tests/ui/derive_unparsable_input_type.rs:12:16
+   |
+12 | #[task(input = "not a valid type <<<")]
+   |                ^^^^^^^^^^^^^^^^^^^^^^

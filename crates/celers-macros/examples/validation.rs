@@ -16,38 +16,10 @@
 
 use celers_macros::task;
 
-// Mock the celers_core types that the macro expects
-mod celers_core {
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug)]
-    pub enum CelersError {
-        TaskExecution(String),
-    }
-
-    impl std::fmt::Display for CelersError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                CelersError::TaskExecution(msg) => write!(f, "{}", msg),
-            }
-        }
-    }
-
-    impl std::error::Error for CelersError {}
-
-    pub type Result<T> = std::result::Result<T, CelersError>;
-
-    #[async_trait::async_trait]
-    pub trait Task: Send + Sync {
-        type Input: Serialize + for<'de> Deserialize<'de> + Send;
-        type Output: Serialize + for<'de> Deserialize<'de> + Send;
-
-        async fn execute(&self, input: Self::Input) -> Result<Self::Output>;
-        #[allow(dead_code)]
-        fn name(&self) -> &str;
-    }
-}
-
+// Uses the real `celers_core` crate (a dev-dependency of this package) so
+// the generated macro code is checked against the actual `Task` trait and
+// `CelersError` enum rather than a hand-rolled mirror that can drift out of
+// sync with them.
 use celers_core::Task;
 
 // Example 1: Numeric range validation

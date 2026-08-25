@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Core traits and types for CeleRS distributed task queue"
 readme = "README.md"
 keywords = ["celery", "task-queue", "distributed", "async", "traits"]

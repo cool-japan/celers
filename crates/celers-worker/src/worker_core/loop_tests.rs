@@ -178,8 +178,8 @@ async fn holds_within(budget: Duration, mut cond: impl FnMut() -> bool) -> bool 
 /// accident would lose messages, so this is pinned rather than inferred.
 #[test]
 fn test_only_the_in_memory_broker_is_treated_as_cancel_safe_by_default() {
-    assert!(broker_dequeue_is_cancel_safe::<InMemoryBroker>());
-    assert!(!broker_dequeue_is_cancel_safe::<NeverReturnsBroker>());
+    assert!(broker_dequeue_is_cancel_safe(&InMemoryBroker::new()));
+    assert!(!broker_dequeue_is_cancel_safe(&NeverReturnsBroker));
 }
 
 /// The auto-detection reaches the built worker, and whoever built it can

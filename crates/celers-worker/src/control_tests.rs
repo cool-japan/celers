@@ -908,8 +908,43 @@ async fn add_consumer_cannot_cancel_a_shutdown_in_progress() {
     // A shutdown is one-way. Writing `Normal` over `Draining` would, in the
     // window before the run loop notices, resurrect a worker the operator
     // believes has stopped — and afterwards report success while doing nothing.
-    let harness = Harness::start("one-way-worker", TaskRegistry::new()).await;
+    //
+    // That window exists exactly while the worker is *draining*: `shutdown`
+    // sets `Draining` and nudges the shutdown channel, the run loop breaks, and
+    // once the drain finishes the control listener is torn down and there is
+    // nobody left to refuse anything. This test used to rely on the loop being
+    // parked forever in `InMemoryBroker::dequeue` instead — which stopped being
+    // true once the loop learned to race a cancel-safe dequeue against that
+    // nudge, and was never true for a broker with a block timeout. So the
+    // worker is given one in-flight task to hold the drain open, which is what
+    // "a shutdown in progress" actually looks like.
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let registry = TaskRegistry::new();
+    registry
+        .register(BlockingTask {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        })
+        .await;
 
+    let harness = Harness::start("one-way-worker", registry).await;
+
+    let payload = serde_json::to_vec(&Empty {}).expect("payload");
+    harness
+        .broker
+        .enqueue(SerializedTask::new("blocking_task".to_string(), payload))
+        .await
+        .expect("enqueue");
+    let running = Arc::clone(&started);
+    wait_until("the blocking task to start", || {
+        running.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // `None` keeps the configured drain deadline (`fast_config`'s 5s), which
+    // is the window the two commands below have to land inside -- ample for a
+    // pair of in-memory round trips.
     let reply = harness.send(ControlCommand::shutdown(None)).await;
     assert!(matches!(
         reply.response,
@@ -937,6 +972,9 @@ async fn add_consumer_cannot_cancel_a_shutdown_in_progress() {
             "a refused command must not have changed the mode"
         );
     }
+
+    // Let the drain finish rather than leaving the worker on its deadline.
+    release.notify_waiters();
 }
 
 /// A broker that is always empty and never blocks.

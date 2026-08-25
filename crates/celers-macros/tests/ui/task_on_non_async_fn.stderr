@@ -1,0 +1,5 @@
+error: the #[task] attribute can only be applied to async functions. Add 'async' before 'fn'
+ --> tests/ui/task_on_non_async_fn.rs:7:1
+  |
+7 | fn not_async() -> celers_core::Result<()> {
+  | ^^

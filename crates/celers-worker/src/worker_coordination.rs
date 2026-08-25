@@ -286,7 +286,7 @@ impl WorkerCoordinator {
     pub async fn new(config: CoordinatorConfig) -> Result<Self> {
         config.validate().map_err(CelersError::Other)?;
 
-        let client = redis::Client::open(config.redis_url.as_str())
+        let client = crate::redis_tls::open_client(config.redis_url.as_str())
             .map_err(|e| CelersError::Other(format!("Redis connection error: {}", e)))?;
 
         // Test connection

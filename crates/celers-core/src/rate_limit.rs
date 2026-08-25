@@ -600,22 +600,19 @@ pub fn create_rate_limiter(config: RateLimitConfig) -> Box<dyn RateLimiter> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use celers_core::rate_limit::{DistributedRateLimiter, RateLimitConfig};
+/// ```
+/// use celers_core::rate_limit::DistributedRateLimiter;
 ///
-/// // Create a distributed rate limiter backed by Redis
-/// let config = RateLimitConfig::new(100.0).with_burst(200);
-/// let limiter = DistributedRateLimiter::redis(
-///     "redis://localhost:6379",
-///     "my_task",
-///     config,
-/// ).await?;
-///
-/// // Try to acquire a permit across all workers
-/// if limiter.try_acquire().await? {
-///     println!("Task can execute");
-/// } else {
-///     println!("Rate limited cluster-wide");
+/// // `DistributedRateLimiter` is the trait a backend implements; the Redis
+/// // implementation lives in the crate that owns the Redis dependency. A
+/// // caller only ever holds one as a trait object.
+/// async fn admit(limiter: &dyn DistributedRateLimiter) -> celers_core::Result<bool> {
+///     if limiter.try_acquire().await? {
+///         return Ok(true);
+///     }
+///     // Rate limited cluster-wide: the backend says when to come back.
+///     let _wait = limiter.time_until_available().await?;
+///     Ok(false)
 /// }
 /// ```
 use async_trait::async_trait;
@@ -1035,21 +1032,22 @@ impl DistributedSlidingWindowSpec {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
 /// use celers_core::rate_limit::{DistributedRateLimiterCoordinator, RateLimitConfig};
 ///
 /// let coordinator = DistributedRateLimiterCoordinator::new("myapp");
 ///
-/// // Set cluster-wide rate limit for a task
-/// coordinator.set_task_rate(
-///     "send_email",
-///     RateLimitConfig::new(100.0).with_burst(200),
-/// );
+/// // Set a cluster-wide rate limit for a task.
+/// coordinator.set_task_rate("send_email", RateLimitConfig::new(100.0).with_burst(200));
+/// assert!(coordinator.has_rate_limit("send_email"));
 ///
-/// // Try to acquire across the cluster
-/// if coordinator.try_acquire("send_email").await? {
-///     send_email().await?;
-/// }
+/// // This is the key the cluster-wide state lives under; a backend crate
+/// // (celers-backend-redis) owns the atomic operations on it.
+/// assert_eq!(coordinator.redis_key("send_email"), "myapp:ratelimit:send_email");
+///
+/// // When the backend is unreachable, the coordinator degrades to a local
+/// // bucket rather than failing the task outright.
+/// assert!(coordinator.try_acquire_fallback("send_email"));
 /// ```
 #[derive(Debug, Clone)]
 pub struct DistributedRateLimiterCoordinator {

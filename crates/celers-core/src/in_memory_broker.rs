@@ -539,9 +539,31 @@ impl crate::Broker for InMemoryBroker {
         }
     }
 
+    /// A real non-blocking dequeue: [`Self::poll_once`] promotes what is due,
+    /// takes a deliverable entry if there is one, and returns either way. It
+    /// never waits on [`Self::acquire_permit`], which is the only thing
+    /// [`Broker::dequeue`](crate::Broker::dequeue) parks on.
     async fn try_dequeue(&self) -> Result<Option<BrokerMessage>> {
         let (message, _) = self.poll_once().await;
         Ok(message)
+    }
+
+    /// Verified cancel-safe: `dequeue` holds no message across an `.await`.
+    ///
+    /// The only place a message is taken is [`Self::try_dequeue_locked`], a
+    /// synchronous function called under the state lock inside
+    /// [`Self::poll_once`]. Once that lock await has resolved, `poll_once` runs
+    /// straight through to its return — permit bookkeeping included — and
+    /// `dequeue` returns the message immediately. There is no poll boundary
+    /// between "the message left the ready queue" and "the caller has it", so
+    /// dropping the future can never take a message with it.
+    ///
+    /// A drop while `dequeue` is *waiting* can abandon an already-acquired
+    /// readiness permit. The message that permit stood for stays in the queue;
+    /// the only cost is that a concurrent consumer may park until the next
+    /// enqueue.
+    fn dequeue_is_cancel_safe(&self) -> bool {
+        true
     }
 
     async fn ack(&self, _task_id: &TaskId, receipt_handle: Option<&str>) -> Result<()> {
@@ -601,6 +623,60 @@ impl crate::Broker for InMemoryBroker {
             }
             guard.push_ready(task, seq);
         }
+        self.release_permits(1);
+        Ok(())
+    }
+
+    /// Return the message to the queue with its retry state untouched.
+    ///
+    /// This broker's [`reject`](Self::reject) already leaves `Retrying(n)`
+    /// alone, so the retry-neutrality half of the contract is free here. What
+    /// the override buys is the other half: `delay` is honoured through the
+    /// same scheduled set [`enqueue_after`](Self::enqueue_after) uses, so a
+    /// deferred message is genuinely invisible until it is due instead of being
+    /// re-delivered to the very worker that just refused it.
+    async fn defer(
+        &self,
+        _task_id: &TaskId,
+        receipt_handle: Option<&str>,
+        delay: Duration,
+    ) -> Result<()> {
+        let Some(handle) = receipt_handle else {
+            return Err(CelersError::Broker(
+                "in-memory broker defer requires a receipt handle".to_string(),
+            ));
+        };
+        let task = {
+            let mut guard = self.state.lock().await;
+            match guard.in_flight.remove(handle) {
+                Some(task) => task,
+                None => {
+                    return Err(CelersError::Broker(format!(
+                        "unknown receipt handle on defer: {handle}"
+                    )));
+                }
+            }
+        };
+
+        let task_id = task.metadata.id;
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut guard = self.state.lock().await;
+            // A revocation that landed while the task was in flight outranks
+            // the deferral: there is no point holding a slot for work that has
+            // been called off. Same rule `reject` applies.
+            if guard.cancelled.remove(&task_id).is_some() {
+                return Ok(());
+            }
+            if delay.is_zero() {
+                guard.push_ready(task, seq);
+            } else {
+                guard.push_scheduled(task, seq, Instant::now() + delay);
+            }
+        }
+        // One permit either way: a ready entry is deliverable now, and a
+        // scheduled one wakes a parked consumer so it re-arms its wait on the
+        // new due time (see `dequeue`).
         self.release_permits(1);
         Ok(())
     }
@@ -974,6 +1050,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn defer_without_a_delay_returns_the_task_immediately() {
+        let broker = InMemoryBroker::new();
+        let id = broker.enqueue(task("a")).await.unwrap();
+        let msg = broker.dequeue().await.unwrap().unwrap();
+
+        broker
+            .defer(&id, msg.receipt_handle.as_deref(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        // Straight back to the ready queue: nothing is held back.
+        assert_eq!(broker.queue_size().await.unwrap(), 1);
+        assert_eq!(broker.scheduled_len().await, 0);
+        assert_eq!(broker.in_flight_len().await, 0);
+        assert_eq!(broker.dequeue().await.unwrap().unwrap().task_id(), id);
+    }
+
+    /// A deferral must leave the task's retry accounting exactly as delivered.
+    ///
+    /// This broker does not rewrite retry state on `reject` either, so what
+    /// this pins is the invariant rather than a difference: whichever path a
+    /// deferral takes here, the payload that comes back must be the payload
+    /// that went in.
+    #[tokio::test]
+    async fn defer_does_not_advance_retry_state() {
+        let broker = InMemoryBroker::new();
+        let mut queued = task("a");
+        queued.metadata.state = TaskState::Retrying(2);
+        let id = broker.enqueue(queued).await.unwrap();
+
+        let msg = broker.dequeue().await.unwrap().unwrap();
+        assert_eq!(msg.task.metadata.state, TaskState::Retrying(2));
+
+        broker
+            .defer(&id, msg.receipt_handle.as_deref(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        let again = broker.dequeue().await.unwrap().unwrap();
+        assert_eq!(
+            again.task.metadata.state,
+            TaskState::Retrying(2),
+            "a deferral is not an attempt and must not spend retry budget"
+        );
+    }
+
+    /// The delay is real: a deferred message is invisible until it is due, and
+    /// a parked consumer wakes exactly when it comes due.
+    #[tokio::test(start_paused = true)]
+    async fn defer_with_a_delay_holds_the_task_until_it_is_due() {
+        let broker = std::sync::Arc::new(InMemoryBroker::new());
+        let id = broker.enqueue(task("deferred")).await.unwrap();
+        let msg = broker.dequeue().await.unwrap().unwrap();
+
+        broker
+            .defer(&id, msg.receipt_handle.as_deref(), Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert_eq!(broker.in_flight_len().await, 0);
+        assert_eq!(broker.scheduled_len().await, 1);
+        assert_eq!(
+            broker.queue_size().await.unwrap(),
+            0,
+            "a deferred message must not be deliverable before it is due"
+        );
+        assert!(broker.try_dequeue().await.unwrap().is_none());
+
+        let consumer = broker.clone();
+        let handle = tokio::spawn(async move { consumer.dequeue().await });
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        let redelivered = handle.await.unwrap().unwrap().expect("deferred message");
+        assert_eq!(redelivered.task_id(), id);
+        assert_eq!(broker.scheduled_len().await, 0);
+    }
+
+    /// A revocation that lands while the task is in flight outranks a deferral:
+    /// holding a slot for work that has been called off would deliver it again.
+    #[tokio::test]
+    async fn defer_drops_a_task_cancelled_while_in_flight() {
+        let broker = InMemoryBroker::new();
+        let id = broker.enqueue(task("a")).await.unwrap();
+        let msg = broker.dequeue().await.unwrap().unwrap();
+        assert!(broker.cancel(&id).await.unwrap());
+
+        broker
+            .defer(&id, msg.receipt_handle.as_deref(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(broker.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn defer_without_a_receipt_handle_is_an_error() {
+        let broker = InMemoryBroker::new();
+        let id = broker.enqueue(task("a")).await.unwrap();
+        let _msg = broker.dequeue().await.unwrap().unwrap();
+
+        assert!(broker.defer(&id, None, Duration::ZERO).await.is_err());
+        assert!(
+            broker
+                .defer(&id, Some("not-a-handle"), Duration::ZERO)
+                .await
+                .is_err(),
+            "an unknown handle must be reported, not silently ignored"
+        );
+    }
+
+    #[tokio::test]
     async fn reject_without_requeue_drops_task() {
         let broker = InMemoryBroker::new();
         let id = broker.enqueue(task("a")).await.unwrap();
@@ -1176,6 +1363,47 @@ mod tests {
 
         assert!(h1.await.unwrap().unwrap().is_some());
         assert!(h2.await.unwrap().unwrap().is_some());
+    }
+
+    /// The cancel-safety claim, exercised rather than asserted.
+    ///
+    /// [`crate::Broker::dequeue_is_cancel_safe`] says this broker's `dequeue`
+    /// future may be dropped mid-flight, which is what lets a worker race it
+    /// against a shutdown signal. Dropping it must therefore either hand the
+    /// message over or leave it in the queue — never neither.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_dequeue_future_never_loses_a_message() {
+        let broker = InMemoryBroker::new();
+        assert!(broker.dequeue_is_cancel_safe());
+
+        // Dropped while parked on an empty queue: nothing is lost and nothing
+        // is invented.
+        assert!(tokio::time::timeout(Duration::ZERO, broker.dequeue())
+            .await
+            .is_err());
+        assert!(broker.is_empty().await);
+
+        // With a message queued, the same race must account for it either way.
+        let id = broker.enqueue(task("kept")).await.unwrap();
+        let taken = match tokio::time::timeout(Duration::ZERO, broker.dequeue()).await {
+            Ok(result) => {
+                let msg = result.unwrap().expect("a queued message");
+                assert_eq!(msg.task_id(), id);
+                true
+            }
+            Err(_elapsed) => false,
+        };
+        assert_eq!(
+            broker.queue_size().await.unwrap() + broker.in_flight_len().await,
+            1,
+            "the dropped future stranded the message"
+        );
+
+        if !taken {
+            // Still deliverable to the next consumer, unchanged.
+            let msg = broker.dequeue().await.unwrap().expect("still queued");
+            assert_eq!(msg.task_id(), id);
+        }
     }
 
     #[tokio::test(start_paused = true)]

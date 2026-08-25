@@ -6,49 +6,10 @@
 
 use celers_macros::task;
 
-// Mock celers_core for the example.
-//
-// `CelersError` mirrors the real `celers_core::CelersError` enum shape (see
-// crates/celers-core/src/error.rs) rather than a tuple struct: the macros in
-// this crate generate `celers_core::CelersError::TaskExecution(..)`
-// construction calls, so a mock that models the real error as a tuple
-// struct would silently diverge from what the real crate accepts.
-mod celers_core {
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug)]
-    pub enum CelersError {
-        TaskExecution(String),
-    }
-
-    impl std::fmt::Display for CelersError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                CelersError::TaskExecution(msg) => write!(f, "{}", msg),
-            }
-        }
-    }
-
-    impl std::error::Error for CelersError {}
-
-    impl From<String> for CelersError {
-        fn from(s: String) -> Self {
-            CelersError::TaskExecution(s)
-        }
-    }
-
-    pub type Result<T> = std::result::Result<T, CelersError>;
-
-    #[async_trait::async_trait]
-    pub trait Task: Send + Sync {
-        type Input: Serialize + for<'de> Deserialize<'de> + Send;
-        type Output: Serialize + for<'de> Deserialize<'de> + Send;
-
-        async fn execute(&self, input: Self::Input) -> Result<Self::Output>;
-        fn name(&self) -> &str;
-    }
-}
-
+// Uses the real `celers_core` crate (a dev-dependency of this package) so
+// the generated macro code is checked against the actual `Task` trait and
+// `CelersError` enum rather than a hand-rolled mirror that can drift out of
+// sync with them.
 use celers_core::Task;
 
 // Example 1: Simple addition task

@@ -2,7 +2,28 @@
 
 RabbitMQ/AMQP broker implementation for CeleRS, providing a full-featured message broker with exchange/queue topology management, publisher confirms, and advanced features like priority queues, dead letter exchanges, and transactions.
 
-**Version: 0.3.1 | Status: [Stable] | Tests: 244 | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-08-26**
+
+> **Two traits are in play, and `AmqpBroker` implements the lower one.** `AmqpBroker` is a
+> `celers_kombu` `Producer` / `Consumer` / `Transport` / `Broker` — the message-transport
+> abstraction (`publish` / `consume` / `purge` / `create_queue`). `celers_worker::Worker` consumes
+> the *task-queue* abstraction `celers_core::Broker` (`enqueue` / `dequeue` / `ack` / `reject` /
+> `defer` / `cancel`).
+>
+> * **`AmqpBroker::into_core_broker(queue)` bridges them**, yielding an `AmqpCoreBroker` that a
+>   worker can run against. Behind the `core-broker` feature, which is **on by default**. See
+>   [`src/core_broker.rs`](src/core_broker.rs) for what maps onto what — batching is prefetch-drain
+>   in the default subscribed mode and a `basic.get` loop in poll mode.
+> * Broker-fed revocation (`revoke` / `is_revoked` / `subscribe_revocations`) keeps the trait's inert
+>   defaults, and `cancel` reports `false`: AMQP has no operation that addresses one *queued* message
+>   by id. See the "Revocation" section in `src/lib.rs`.
+> * The AMQP body is a JSON-serialized `celers_protocol::Message` envelope, which is **not** what a
+>   Python Celery AMQP consumer expects (kombu maps the v2 headers onto AMQP basic-properties
+>   headers and carries only `[args, kwargs, embed]` in the payload). No test exercises this against
+>   a real Celery AMQP consumer, so the adapter makes RabbitMQ *worker-usable*, not *Celery-interoperable*.
+>
+> Use the transport traits directly when you want AMQP with CeleRS' topology, confirms, DLX and
+> routing machinery without the task-queue layer — that part is complete and tested too.
 
 ## Features
 
@@ -101,59 +122,61 @@ The `examples/` directory contains 16 comprehensive examples demonstrating vario
 
 ```bash
 # Basic publish/consume workflow
-cargo run --example basic_publish_consume
+cargo run -p celers-broker-amqp --example basic_publish_consume
 
 # High-throughput batch operations
-cargo run --example batch_publish
+cargo run -p celers-broker-amqp --example batch_publish
 
 # Priority-based message processing
-cargo run --example priority_queue
+cargo run -p celers-broker-amqp --example amqp_priority_queue
 
 # Dead Letter Exchange configuration
-cargo run --example dead_letter_exchange
+cargo run -p celers-broker-amqp --example dead_letter_exchange
 
 # AMQP transaction support
-cargo run --example transaction
+cargo run -p celers-broker-amqp --example transaction
 
 # Async streaming consumer pattern
-cargo run --example streaming_consumer
+cargo run -p celers-broker-amqp --example streaming_consumer
 ```
 
 ### Advanced Examples
 
 ```bash
 # RabbitMQ Management API usage
-cargo run --example management_api
+cargo run -p celers-broker-amqp --example management_api
 
 # Modern queue features (quorum, stream, lazy mode)
-cargo run --example modern_queue_features
+cargo run -p celers-broker-amqp --example modern_queue_features
 
 # Advanced monitoring & batch consumption (v4)
-cargo run --example advanced_monitoring
+cargo run -p celers-broker-amqp --example advanced_monitoring
 
 # Monitoring & utility functions demo (v5)
-cargo run --example monitoring_utilities
+cargo run -p celers-broker-amqp --example amqp_monitoring_utilities
 
 # v6 features: circuit breaker, retry, compression, topology, tracing, consumer groups
-cargo run --example v6_features_demo
+cargo run -p celers-broker-amqp --example v6_features_demo
 
 # Production patterns: complete integration of all v6 features
-cargo run --example production_patterns
+cargo run -p celers-broker-amqp --example production_patterns
 
 # v7 features: rate limiting, bulkhead, scheduling, metrics export
-cargo run --example v7_features_demo
+cargo run -p celers-broker-amqp --example v7_features_demo
 
 # v8 features: hooks, DLX analytics, adaptive batching, profiling
-cargo run --example v8_features_demo
+cargo run -p celers-broker-amqp --example v8_features_demo
 
 # v9 features: backpressure, poison detection, routing, optimization
-cargo run --example v9_features_demo
+cargo run -p celers-broker-amqp --example v9_features_demo
 
 # v9 production integration: complete production-ready integration of all v9 features (RECOMMENDED)
-cargo run --example v9_production_integration
+cargo run -p celers-broker-amqp --example v9_production_integration
 ```
 
-**Note**: Most examples require a running RabbitMQ instance. See the setup guide below.
+**Note**: Most examples require a running RabbitMQ instance (`docker-compose up -d rabbitmq` from the repository root). See the setup guide below.
+
+The repository root is a virtual workspace with no `[package]` of its own, which is why every command above passes `-p celers-broker-amqp`; a bare `cargo run --example <name>` cannot select a package.
 
 ## RabbitMQ Setup Guide
 
@@ -1078,12 +1101,23 @@ Typical performance on modest hardware (4 CPU cores, 8GB RAM):
 
 ## Celery Compatibility
 
-This implementation is 100% compatible with Python Celery:
+**Not verified, and known to diverge.** No test in this repository exchanges a message between this
+crate and a real Python Celery AMQP consumer. What is true:
 
-- Uses same exchange ("celery") and routing patterns
-- Compatible message format (JSON serialization)
-- Supports priority queues (x-max-priority)
-- Follows Celery's queue naming conventions
+- Uses the same exchange name (`celery`) and routing patterns
+- Supports priority queues (`x-max-priority`) and Celery's queue naming conventions
+- Serializes with JSON
+
+What is not:
+
+- The AMQP body is a JSON-serialized `celers_protocol::Message` envelope. Kombu's AMQP transport
+  maps the protocol-v2 headers onto AMQP basic-properties headers and carries only
+  `[args, kwargs, embed]` in the payload, so the framing differs.
+- `AmqpEventEmitter` publishes every event with a single configured routing key (default empty, so
+  fanout). Celery uses a topic exchange keyed by event type (`task.started`, `worker.heartbeat`, …).
+
+See [docs/CELERY_COMPATIBILITY.md](../../docs/CELERY_COMPATIBILITY.md) for the workspace-wide,
+row-by-row picture.
 
 ## Known Limitations
 
@@ -1091,14 +1125,23 @@ This implementation is 100% compatible with Python Celery:
 - Connection and channel pools require explicit configuration
 - Maximum message size limited by RabbitMQ (default: 128MB)
 - The RabbitMQ Management API HTTP client now uses `oxihttp-client` (Pure Rust), replacing the former `reqwest`-based implementation
-- This crate still carries `ring`/`aws-lc-sys` transitively via `lapin` (the AMQP protocol client). This is an accepted, tracked, upstream-blocked limitation rather than a regression — no drop-in Pure-Rust AMQP client exists yet in the COOLJAPAN ecosystem
+- **Pure Rust as of 0.3.1.** This crate no longer carries `ring` or `aws-lc-sys`: `lapin` is pinned
+  workspace-wide to `default-features = false` + `rustls-webpki-roots-certs`, and
+  `celers_broker_amqp::install_pure_tls_provider()` installs OxiTLS' `rustls-rustcrypto` provider as
+  the process default (call it yourself, first thing in `main`, if your application builds rustls
+  clients through other libraries earlier in startup — whoever installs first wins). Deployments
+  behind a private CA should enable the also-Pure-Rust `tls-native-certs` feature to add the OS trust
+  store. Verify with `cargo tree -e features -i aws-lc-sys --all-features`, which must report
+  "did not match any packages"
+- A `celers_worker::Worker` consumes from this crate through `AmqpBroker::into_core_broker(queue)`
+  (`core-broker` feature, on by default) — see the note at the top of this README
 
 ## Resources
 
 - [RabbitMQ Documentation](https://www.rabbitmq.com/documentation.html)
 - [AMQP 0-9-1 Specification](https://www.rabbitmq.com/resources/specs/amqp0-9-1.pdf)
 - [Celery Documentation](https://docs.celeryproject.org/)
-- [CeleRS GitHub](https://github.com/yourusername/celers)
+- [CeleRS GitHub](https://github.com/cool-japan/celers)
 
 ## License
 

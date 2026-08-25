@@ -7,7 +7,7 @@
 use celers_protocol::{
     builder::MessageBuilder,
     negotiation::{detect_protocol, negotiate_protocol},
-    result::{ResultMessage, TaskStatus},
+    result::{ResultChild, ResultMessage, TaskStatus},
     ProtocolVersion,
 };
 use serde_json::json;
@@ -64,15 +64,23 @@ fn main() {
     println!("{}\n", json);
 
     // Example 5: Result message with children (workflow)
+    //
+    // Celery stores a child as the whole result tree `AsyncResult.as_tuple()`
+    // renders -- `[[id, parent], group_results]` -- not as a bare id, so a
+    // chained child carries its parent and a group carries its members.
     println!("5. Result message with children (workflow):");
     let child1 = Uuid::new_v4();
     let child2 = Uuid::new_v4();
+    let chained_parent = Uuid::new_v4();
 
     let workflow_result = ResultMessage::success(
         Uuid::parse_str("550e8400-e29b-41d4-a716-446655440002").unwrap(),
         json!("workflow done"),
     )
-    .with_children(vec![child1, child2]);
+    .with_children(vec![child1, child2])
+    .with_child_result(
+        ResultChild::new(Uuid::new_v4()).with_parent(ResultChild::new(chained_parent)),
+    );
 
     let json = serde_json::to_string_pretty(&workflow_result).unwrap();
     println!("{}\n", json);

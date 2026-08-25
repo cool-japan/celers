@@ -174,7 +174,7 @@ pub enum TransactionState {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// use celers_kombu::{MessageTransaction, IsolationLevel};
 ///
 /// let mut broker = MyBroker::new();
@@ -187,6 +187,9 @@ pub enum TransactionState {
 /// // Commit transaction (both messages published atomically)
 /// broker.commit_transaction(&tx_id).await?;
 /// ```
+///
+/// (Illustrative only: `MyBroker` is a stand-in for any type implementing
+/// this trait, not a type this crate provides.)
 #[async_trait]
 pub trait MessageTransaction: Send + Sync {
     /// Begin a new transaction

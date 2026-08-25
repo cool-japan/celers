@@ -136,17 +136,29 @@ pub struct ExceptionInfo {
     #[serde(rename = "exc_type")]
     pub exc_type: String,
 
-    /// Exception message.
+    /// Python's `exc.args`, verbatim.
     ///
-    /// Serialized as a one-element list to match Python's `exc.args`;
-    /// deserialization accepts both the list form and a bare string (joining a
-    /// multi-element list with `", "`).
+    /// A list, because `celery.backends.base.Backend.exception_to_python`
+    /// splats it into the exception constructor as `*args` -- `raise
+    /// ValueError("a", "b")` travels as `["a", "b"]` and must be reconstructed
+    /// as two arguments, not one. The entries are [`serde_json::Value`]s
+    /// because Python's arguments need not be strings (`OSError(2, "no such
+    /// file")` is an int and a string).
+    ///
+    /// Regression: this used to be a `String` that joined a multi-element list
+    /// with `", "`, so a Python client rebuilding the exception from a CeleRS
+    /// record got one argument where the raiser passed several, and an integer
+    /// argument came back as text. [`ExceptionInfo::message`] renders the same
+    /// joined form for display, without the wire format losing anything.
+    ///
+    /// Deserialization also accepts a bare string (the legacy CeleRS form) and
+    /// `null`.
     #[serde(
         rename = "exc_message",
-        serialize_with = "serialize_exc_message",
-        deserialize_with = "deserialize_exc_message"
+        deserialize_with = "deserialize_exc_message",
+        default
     )]
-    pub exc_message: String,
+    pub exc_message: Vec<serde_json::Value>,
 
     /// Python module the exception class lives in (e.g. `"builtins"`).
     ///
@@ -162,44 +174,67 @@ pub struct ExceptionInfo {
     pub traceback: Option<String>,
 }
 
-/// Serialize an exception message as Python's `exc.args` list.
-fn serialize_exc_message<S: serde::Serializer>(
-    message: &str,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    use serde::ser::SerializeSeq;
-    let mut seq = serializer.serialize_seq(Some(1))?;
-    seq.serialize_element(message)?;
-    seq.end()
-}
-
-/// Deserialize an exception message from either the list or the string form.
+/// Deserialize `exc.args` from the list form, the legacy bare-string form, or
+/// `null`.
 fn deserialize_exc_message<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<String, D::Error> {
+) -> Result<Vec<serde_json::Value>, D::Error> {
     match serde_json::Value::deserialize(deserializer)? {
-        serde_json::Value::String(message) => Ok(message),
-        serde_json::Value::Array(items) => Ok(items
-            .iter()
-            .map(|item| match item {
-                serde_json::Value::String(text) => text.clone(),
-                other => other.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ")),
-        serde_json::Value::Null => Ok(String::new()),
-        other => Ok(other.to_string()),
+        // Celery's own shape.
+        serde_json::Value::Array(items) => Ok(items),
+        // What CeleRS wrote before `exc_message` modelled the argument list,
+        // and what a hand-written record is likely to carry.
+        serde_json::Value::Null => Ok(Vec::new()),
+        // A bare string (or any other scalar) is a single argument.
+        other => Ok(vec![other]),
+    }
+}
+
+/// Render one `exc.args` entry the way it reads in a message.
+fn exc_arg_text(argument: &serde_json::Value) -> String {
+    match argument {
+        // A string argument is *the* message; quoting it would be noise.
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
 impl ExceptionInfo {
-    /// Create new exception info
+    /// Create new exception info from a single message argument.
+    ///
+    /// The message becomes the one entry of [`ExceptionInfo::exc_message`],
+    /// which is Python's `exc.args`. Use [`ExceptionInfo::with_args`] for an
+    /// exception raised with several arguments.
     pub fn new(exc_type: impl Into<String>, exc_message: impl Into<String>) -> Self {
         Self {
             exc_type: exc_type.into(),
-            exc_message: exc_message.into(),
+            exc_message: vec![serde_json::Value::String(exc_message.into())],
             exc_module: None,
             traceback: None,
+        }
+    }
+
+    /// Set the whole `exc.args` list (builder pattern).
+    ///
+    /// This is what `raise ValueError("a", "b")` puts on the wire, and what
+    /// Celery splats back into the exception constructor.
+    #[must_use]
+    pub fn with_args(mut self, args: Vec<serde_json::Value>) -> Self {
+        self.exc_message = args;
+        self
+    }
+
+    /// The exception's arguments rendered as one human-readable message.
+    ///
+    /// Multiple arguments are joined with `", "`, the way Python's own
+    /// `str(exc)` renders a multi-argument exception's tuple contents in a log
+    /// line. Nothing on the wire depends on this: it exists so callers that
+    /// want a single string do not have to reach into the list.
+    pub fn message(&self) -> String {
+        match self.exc_message.as_slice() {
+            [] => String::new(),
+            [only] => exc_arg_text(only),
+            many => many.iter().map(exc_arg_text).collect::<Vec<_>>().join(", "),
         }
     }
 
@@ -236,6 +271,242 @@ impl ExceptionInfo {
         }
         serde_json::from_value(value.clone()).ok()
     }
+}
+
+/// One entry of a result record's `children` list.
+///
+/// Celery does not store child *ids*: it stores whole result trees. A child is
+/// rendered by `celery.result.AsyncResult.as_tuple`, which is
+///
+/// ```python
+/// def as_tuple(self):
+///     parent = self.parent
+///     return (self.id, parent and parent.as_tuple()), None
+/// ```
+///
+/// -- so on the wire one child looks like
+///
+/// ```text
+/// [[task_id, parent_or_null], null]
+/// ```
+///
+/// where `parent_or_null` is recursively a whole node of the same shape, and
+/// the trailing slot holds a [`GroupResult`'s][group] own results (a list)
+/// instead of `null`. Any retried task, and any task with a chain or group
+/// parent, carries one, so this is not an exotic shape: a `children` list of
+/// bare id strings is not something Celery ever writes.
+///
+/// [group]: https://docs.celeryq.dev/en/stable/reference/celery.result.html
+///
+/// # Reading
+///
+/// [`Deserialize`] accepts every form `celery.result.result_from_tuple`
+/// accepts, plus the legacy CeleRS form:
+///
+/// | wire | meaning |
+/// |---|---|
+/// | `"<uuid>"` | legacy CeleRS: a bare child id |
+/// | `[[id, parent], null]` | an `AsyncResult` with a parent chain |
+/// | `[[id, parent], [child, ...]]` | a `GroupResult` and its members |
+/// | `[id, nodes]` | Celery's short form: the id without a parent |
+///
+/// Note that the *second* slot of a two-element node is always the group's
+/// results, never the parent -- mirroring `result_from_tuple`, which unpacks
+/// `res, nodes = r` and only then splits `res` into `(id, parent)`.
+///
+/// [`Serialize`] always writes the canonical `[[id, parent], children]` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultChild {
+    /// The child task's id.
+    pub task_id: Uuid,
+
+    /// The child's own parent result, if it has one.
+    ///
+    /// Boxed because the shape is recursive: a chain three tasks deep carries
+    /// three nested nodes.
+    pub parent: Option<Box<ResultChild>>,
+
+    /// A `GroupResult`'s members.
+    ///
+    /// [`None`] for an ordinary `AsyncResult` -- which is *not* the same as
+    /// `Some(vec![])`, an empty group, so the distinction is preserved rather
+    /// than normalized away.
+    pub children: Option<Vec<ResultChild>>,
+}
+
+impl ResultChild {
+    /// A plain child result: no parent, not a group.
+    pub fn new(task_id: Uuid) -> Self {
+        Self {
+            task_id,
+            parent: None,
+            children: None,
+        }
+    }
+
+    /// Attach the parent result this child was spawned from (builder pattern).
+    #[must_use]
+    pub fn with_parent(mut self, parent: ResultChild) -> Self {
+        self.parent = Some(Box::new(parent));
+        self
+    }
+
+    /// Make this node a `GroupResult` carrying `children` (builder pattern).
+    #[must_use]
+    pub fn with_children(mut self, children: Vec<ResultChild>) -> Self {
+        self.children = Some(children);
+        self
+    }
+
+    /// Whether this node is a group (`GroupResult.as_tuple`) rather than a
+    /// single result.
+    #[inline]
+    pub fn is_group(&self) -> bool {
+        self.children.is_some()
+    }
+
+    /// The ids of this node and every node below it, parents included.
+    ///
+    /// Depth-first, this node first. Useful for the common case of "which
+    /// tasks does this record reference?" without walking the tree by hand.
+    pub fn descendant_ids(&self) -> Vec<Uuid> {
+        let mut ids = Vec::new();
+        self.collect_ids(&mut ids);
+        ids
+    }
+
+    fn collect_ids(&self, ids: &mut Vec<Uuid>) {
+        ids.push(self.task_id);
+        if let Some(parent) = self.parent.as_ref() {
+            parent.collect_ids(ids);
+        }
+        for child in self.children.iter().flatten() {
+            child.collect_ids(ids);
+        }
+    }
+
+    /// Parse one `children` entry; see the type-level table.
+    fn from_celery_value(value: &serde_json::Value) -> Result<Self, String> {
+        match value {
+            // Legacy CeleRS: `children` was a list of bare ids.
+            serde_json::Value::String(id) => Ok(Self::new(parse_child_id(id)?)),
+            serde_json::Value::Array(node) => {
+                let [head, nodes] = node.as_slice() else {
+                    return Err(format!(
+                        "a result child is a 2-element [result, group_results] \
+                         node, got {} element(s)",
+                        node.len()
+                    ));
+                };
+                // `result_from_tuple`: `id, parent = res if isinstance(res,
+                // (list, tuple)) else (res, None)`.
+                let (task_id, parent) = match head {
+                    serde_json::Value::String(id) => (parse_child_id(id)?, None),
+                    serde_json::Value::Array(pair) => {
+                        let [id, parent] = pair.as_slice() else {
+                            return Err(format!(
+                                "a result child's head is the pair [id, parent], \
+                                 got {} element(s)",
+                                pair.len()
+                            ));
+                        };
+                        let id = id
+                            .as_str()
+                            .ok_or_else(|| format!("a result child's id must be a string: {id}"))?;
+                        let parent = match parent {
+                            serde_json::Value::Null => None,
+                            other => Some(Box::new(Self::from_celery_value(other)?)),
+                        };
+                        (parse_child_id(id)?, parent)
+                    }
+                    other => {
+                        return Err(format!(
+                            "a result child's head is an id or an [id, parent] \
+                             pair, got {other}"
+                        ))
+                    }
+                };
+                let children = match nodes {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::Array(members) => Some(
+                        members
+                            .iter()
+                            .map(Self::from_celery_value)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                    other => {
+                        return Err(format!(
+                            "a result child's group results are a list or null, \
+                             got {other}"
+                        ))
+                    }
+                };
+                Ok(Self {
+                    task_id,
+                    parent,
+                    children,
+                })
+            }
+            other => Err(format!(
+                "a result child is an id string or a [result, group_results] \
+                 node, got {other}"
+            )),
+        }
+    }
+}
+
+/// Parse a task id out of a result tuple, naming the offender on failure.
+fn parse_child_id(id: &str) -> Result<Uuid, String> {
+    id.parse::<Uuid>()
+        .map_err(|e| format!("a result child's id must be a UUID ({id:?}): {e}"))
+}
+
+impl From<Uuid> for ResultChild {
+    fn from(task_id: Uuid) -> Self {
+        Self::new(task_id)
+    }
+}
+
+/// The `[id, parent]` head of a serialized [`ResultChild`].
+struct ResultChildHead<'a>(&'a ResultChild);
+
+impl Serialize for ResultChildHead<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut head = serializer.serialize_seq(Some(2))?;
+        head.serialize_element(&self.0.task_id)?;
+        head.serialize_element(&self.0.parent)?;
+        head.end()
+    }
+}
+
+impl Serialize for ResultChild {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut node = serializer.serialize_seq(Some(2))?;
+        node.serialize_element(&ResultChildHead(self))?;
+        node.serialize_element(&self.children)?;
+        node.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ResultChild {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_celery_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Deserialize a record's `children` list.
+///
+/// `null` is accepted as "no children": Celery's own
+/// `Backend.current_task_children` returns `None` when a result is stored
+/// outside a task context (a client calling `mark_as_failure`, a chord
+/// callback), so `{"children": null}` is a record a real backend writes.
+fn deserialize_children<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ResultChild>, D::Error> {
+    Option::<Vec<ResultChild>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Task result message (Celery-compatible format)
@@ -302,8 +573,10 @@ pub struct ResultMessage {
     /// Group ID (for grouped tasks)
     pub group_id: Option<Uuid>,
 
-    /// Children task IDs
-    pub children: Vec<Uuid>,
+    /// The result trees this task spawned; see [`ResultChild`].
+    ///
+    /// Celery stores whole `AsyncResult.as_tuple()` nodes here, not bare ids.
+    pub children: Vec<ResultChild>,
 
     /// Additional metadata
     pub meta: HashMap<String, serde_json::Value>,
@@ -338,7 +611,7 @@ struct ResultMessageRepr<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     group_id: Option<&'a Uuid>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    children: &'a Vec<Uuid>,
+    children: &'a Vec<ResultChild>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     meta: &'a HashMap<String, serde_json::Value>,
 }
@@ -378,8 +651,8 @@ struct ResultMessageDe {
     root_id: Option<Uuid>,
     #[serde(default)]
     group_id: Option<Uuid>,
-    #[serde(default)]
-    children: Vec<Uuid>,
+    #[serde(default, deserialize_with = "deserialize_children")]
+    children: Vec<ResultChild>,
     #[serde(default)]
     meta: HashMap<String, serde_json::Value>,
 }
@@ -604,17 +877,41 @@ impl ResultMessage {
     }
 
     /// Add a child task ID
+    ///
+    /// The id becomes a leaf [`ResultChild`] (no parent, not a group), which is
+    /// what a task that simply spawned another one records. Use
+    /// [`ResultMessage::with_child_result`] to attach a whole tree.
     #[must_use]
     pub fn with_child(mut self, child_id: Uuid) -> Self {
-        self.children.push(child_id);
+        self.children.push(ResultChild::new(child_id));
+        self
+    }
+
+    /// Add a child result tree; see [`ResultChild`].
+    #[must_use]
+    pub fn with_child_result(mut self, child: ResultChild) -> Self {
+        self.children.push(child);
         self
     }
 
     /// Set children task IDs
     #[must_use]
     pub fn with_children(mut self, children: Vec<Uuid>) -> Self {
+        self.children = children.into_iter().map(ResultChild::new).collect();
+        self
+    }
+
+    /// Set the children as whole result trees; see [`ResultChild`].
+    #[must_use]
+    pub fn with_child_results(mut self, children: Vec<ResultChild>) -> Self {
         self.children = children;
         self
+    }
+
+    /// The ids of the direct children, ignoring their parent chains and group
+    /// members.
+    pub fn child_ids(&self) -> Vec<Uuid> {
+        self.children.iter().map(|child| child.task_id).collect()
     }
 
     /// Add metadata
@@ -818,7 +1115,8 @@ mod tests {
 
         let exc = result.get_exception().unwrap();
         assert_eq!(exc.exc_type, "ValueError");
-        assert_eq!(exc.exc_message, "Invalid input");
+        assert_eq!(exc.exc_message, vec![json!("Invalid input")]);
+        assert_eq!(exc.message(), "Invalid input");
     }
 
     #[test]
@@ -891,7 +1189,8 @@ mod tests {
         assert_eq!(result.parent_id, Some(parent_id));
         assert_eq!(result.root_id, Some(root_id));
         assert_eq!(result.group_id, Some(group_id));
-        assert_eq!(result.children, vec![child_id]);
+        assert_eq!(result.child_ids(), vec![child_id]);
+        assert_eq!(result.children, vec![ResultChild::new(child_id)]);
         assert_eq!(result.meta.get("custom"), Some(&json!("value")));
     }
 
@@ -1010,8 +1309,9 @@ mod tests {
 
         let exception = result.get_exception().expect("exception reconstructed");
         assert_eq!(exception.exc_type, "ValueError");
-        // The one-element `exc_message` list collapses back to a string.
-        assert_eq!(exception.exc_message, "Invalid input");
+        // `exc_message` is Python's `exc.args`, kept as the list it is.
+        assert_eq!(exception.exc_message, vec![json!("Invalid input")]);
+        assert_eq!(exception.message(), "Invalid input");
         assert_eq!(exception.exc_module.as_deref(), Some("builtins"));
         // The sibling traceback is attached to the exception too.
         assert!(exception
@@ -1031,13 +1331,68 @@ mod tests {
             r#"{"exc_type":"TypeError","exc_message":["expected int","got str"],"exc_module":"builtins"}"#,
         )
         .expect("multi-arg exc_message must parse");
-        assert_eq!(multi.exc_message, "expected int, got str");
+        assert_eq!(
+            multi.exc_message,
+            vec![json!("expected int"), json!("got str")]
+        );
+        assert_eq!(multi.message(), "expected int, got str");
 
         let legacy: ExceptionInfo =
             serde_json::from_str(r#"{"exc_type":"ValueError","exc_message":"plain string"}"#)
                 .expect("legacy string exc_message must parse");
-        assert_eq!(legacy.exc_message, "plain string");
+        assert_eq!(legacy.exc_message, vec![json!("plain string")]);
         assert_eq!(legacy.exc_module, None);
+
+        let empty: ExceptionInfo =
+            serde_json::from_str(r#"{"exc_type":"RuntimeError","exc_message":null}"#)
+                .expect("a null exc_message must parse");
+        assert!(empty.exc_message.is_empty());
+        assert_eq!(empty.message(), "");
+    }
+
+    /// Regression: `exc_message` was a `String` that joined a multi-element
+    /// list with `", "`, so `raise ValueError("a", "b")` came back out of
+    /// CeleRS as the *single* argument `"a, b"` -- and Celery splats
+    /// `exc_message` into the exception constructor, so a Python client
+    /// rebuilt a different exception than the one that was raised.
+    #[test]
+    fn test_multi_argument_exceptions_keep_their_argument_boundaries() {
+        let record = r#"{
+            "status": "FAILURE",
+            "task_id": "6d5b1f1e-6a4f-4a3c-9b6c-1f8f5f1a2b3c",
+            "result": {
+                "exc_type": "OSError",
+                "exc_message": [2, "no such file"],
+                "exc_module": "builtins"
+            }
+        }"#;
+
+        let parsed = ResultMessage::from_json(record.as_bytes()).expect("deserialize");
+        let exception = parsed.get_exception().expect("exception");
+        // Two arguments, and the integer is still an integer.
+        assert_eq!(exception.exc_message, vec![json!(2), json!("no such file")]);
+        assert_eq!(exception.message(), "2, no such file");
+
+        // Re-serialized, the argument boundaries survive for the Python side.
+        let value: serde_json::Value =
+            serde_json::from_slice(&parsed.to_json().expect("serialize")).expect("parse");
+        assert_eq!(value["result"]["exc_message"], json!([2, "no such file"]));
+    }
+
+    /// An exception built in Rust with several arguments serializes the same
+    /// way Celery would have written it.
+    #[test]
+    fn test_exception_with_args_serializes_as_a_list() {
+        let result = ResultMessage::failure_with_exception(
+            Uuid::new_v4(),
+            ExceptionInfo::new("OSError", "ignored")
+                .with_args(vec![json!(2), json!("no such file")])
+                .with_exc_module("builtins"),
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&result.to_json().expect("serialize")).expect("parse");
+        assert_eq!(value["result"]["exc_message"], json!([2, "no such file"]));
     }
 
     /// The failure mirroring must be lossless in both directions.
@@ -1093,7 +1448,8 @@ mod tests {
             ExceptionInfo::new("TypeError", "Expected int, got str").with_traceback("at line 42");
 
         assert_eq!(exc.exc_type, "TypeError");
-        assert_eq!(exc.exc_message, "Expected int, got str");
+        assert_eq!(exc.exc_message, vec![json!("Expected int, got str")]);
+        assert_eq!(exc.message(), "Expected int, got str");
         assert_eq!(exc.traceback, Some("at line 42".to_string()));
     }
 
@@ -1102,7 +1458,8 @@ mod tests {
         let exc = ExceptionInfo::default();
 
         assert_eq!(exc.exc_type, "");
-        assert_eq!(exc.exc_message, "");
+        assert!(exc.exc_message.is_empty());
+        assert_eq!(exc.message(), "");
         assert_eq!(exc.traceback, None);
 
         // Test that default can be used in builder patterns
@@ -1118,7 +1475,172 @@ mod tests {
 
         let result = ResultMessage::success(task_id, json!(null)).with_children(children.clone());
 
-        assert_eq!(result.children, children);
+        assert_eq!(result.child_ids(), children);
+        // Bare ids become leaf nodes: no parent, not a group.
+        assert!(result.children.iter().all(|child| child.parent.is_none()));
+        assert!(result.children.iter().all(|child| !child.is_group()));
+    }
+
+    /// The `children` list Celery writes is a list of *result trees*, not of
+    /// ids: `AsyncResult.as_tuple()` renders one child as
+    /// `((task_id, parent_tuple), None)`.
+    ///
+    /// Regression: `children` was `Vec<Uuid>`, so `from_json` rejected the
+    /// record of every retried, chained or grouped task outright.
+    #[test]
+    fn test_parses_a_celery_record_with_nested_children() {
+        const RECORD: &str = r#"{
+            "status": "SUCCESS",
+            "result": 2,
+            "traceback": null,
+            "children": [[["00b0d7c2-9c80-4dc3-b5a7-671a099b92ea", null], null]],
+            "date_done": "2026-01-01T00:00:00+00:00",
+            "task_id": "7b1a0d1e-0000-4000-8000-000000000001"
+        }"#;
+
+        let parsed = ResultMessage::from_json(RECORD.as_bytes())
+            .expect("a record with children must deserialize");
+
+        assert_eq!(parsed.status, TaskStatus::Success);
+        assert_eq!(
+            parsed.child_ids(),
+            vec![Uuid::parse_str("00b0d7c2-9c80-4dc3-b5a7-671a099b92ea").expect("uuid")]
+        );
+        assert_eq!(parsed.children[0].parent, None);
+        assert!(!parsed.children[0].is_group());
+
+        // And it goes back out in the shape Celery reads.
+        let value: serde_json::Value =
+            serde_json::from_slice(&parsed.to_json().expect("serialize")).expect("parse");
+        assert_eq!(
+            value["children"],
+            json!([[["00b0d7c2-9c80-4dc3-b5a7-671a099b92ea", null], null]])
+        );
+    }
+
+    /// A chained task's child carries its parent, recursively, and a group's
+    /// child carries its members in the trailing slot.
+    #[test]
+    fn test_parses_parent_chains_and_group_children() {
+        const RECORD: &str = r#"{
+            "status": "SUCCESS",
+            "task_id": "7b1a0d1e-0000-4000-8000-000000000001",
+            "children": [
+                [["11111111-1111-4111-8111-111111111111",
+                  [["22222222-2222-4222-8222-222222222222", null], null]], null],
+                [["33333333-3333-4333-8333-333333333333", null],
+                 [[["44444444-4444-4444-8444-444444444444", null], null]]]
+            ]
+        }"#;
+
+        let parsed = ResultMessage::from_json(RECORD.as_bytes()).expect("deserialize");
+        assert_eq!(parsed.children.len(), 2);
+
+        let chained = &parsed.children[0];
+        let parent = chained.parent.as_ref().expect("the parent tuple is kept");
+        assert_eq!(
+            parent.task_id,
+            Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid")
+        );
+        assert!(!chained.is_group());
+
+        let group = &parsed.children[1];
+        let members = group
+            .children
+            .as_ref()
+            .expect("a group carries its members");
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0].task_id,
+            Uuid::parse_str("44444444-4444-4444-8444-444444444444").expect("uuid")
+        );
+        assert_eq!(
+            group.descendant_ids(),
+            vec![
+                Uuid::parse_str("33333333-3333-4333-8333-333333333333").expect("uuid"),
+                Uuid::parse_str("44444444-4444-4444-8444-444444444444").expect("uuid"),
+            ]
+        );
+
+        // Every node survives the round trip, group-ness included.
+        let round_tripped =
+            ResultMessage::from_json(&parsed.to_json().expect("serialize")).expect("deserialize");
+        assert_eq!(round_tripped.children, parsed.children);
+    }
+
+    /// `celery.result.result_from_tuple` also accepts the short
+    /// `[id, group_results]` node, and the legacy CeleRS form was a bare id
+    /// string. Both must still parse.
+    #[test]
+    fn test_children_accept_the_short_and_legacy_forms() {
+        const RECORD: &str = r#"{
+            "status": "SUCCESS",
+            "task_id": "7b1a0d1e-0000-4000-8000-000000000001",
+            "children": [
+                "55555555-5555-4555-8555-555555555555",
+                ["66666666-6666-4666-8666-666666666666", null]
+            ]
+        }"#;
+
+        let parsed = ResultMessage::from_json(RECORD.as_bytes()).expect("deserialize");
+        assert_eq!(
+            parsed.child_ids(),
+            vec![
+                Uuid::parse_str("55555555-5555-4555-8555-555555555555").expect("uuid"),
+                Uuid::parse_str("66666666-6666-4666-8666-666666666666").expect("uuid"),
+            ]
+        );
+        // Both normalize to the canonical form on the way out.
+        let value: serde_json::Value =
+            serde_json::from_slice(&parsed.to_json().expect("serialize")).expect("parse");
+        assert_eq!(
+            value["children"],
+            json!([
+                [["55555555-5555-4555-8555-555555555555", null], null],
+                [["66666666-6666-4666-8666-666666666666", null], null]
+            ])
+        );
+    }
+
+    /// An empty group (`Some(vec![])`) is not the same thing as "not a group"
+    /// (`None`), and the wire form keeps them apart.
+    #[test]
+    fn test_an_empty_group_is_not_a_missing_group() {
+        let empty_group = ResultChild::new(Uuid::new_v4()).with_children(Vec::new());
+        let not_a_group = ResultChild::new(empty_group.task_id);
+
+        assert_ne!(empty_group, not_a_group);
+        assert_eq!(
+            serde_json::to_value(&empty_group).expect("serialize")[1],
+            json!([])
+        );
+        assert_eq!(
+            serde_json::to_value(&not_a_group).expect("serialize")[1],
+            json!(null)
+        );
+    }
+
+    /// `Backend.current_task_children` returns `None` when a result is stored
+    /// outside a task context (a client's `mark_as_failure`, a chord
+    /// callback), so `"children": null` is a record a real backend writes.
+    #[test]
+    fn test_null_children_parse_as_no_children() {
+        let parsed = ResultMessage::from_json(
+            br#"{"task_id":"7b1a0d1e-0000-4000-8000-000000000001","status":"SUCCESS","children":null}"#,
+        )
+        .expect("a null children list must deserialize");
+
+        assert!(parsed.children.is_empty());
+    }
+
+    /// A malformed child is an error, not a silently dropped one.
+    #[test]
+    fn test_a_malformed_child_is_rejected() {
+        let err = ResultMessage::from_json(
+            br#"{"task_id":"7b1a0d1e-0000-4000-8000-000000000001","status":"SUCCESS","children":[["not-a-uuid", null]]}"#,
+        )
+        .expect_err("a non-UUID child id must be rejected");
+        assert!(err.to_string().contains("UUID"), "unexpected error: {err}");
     }
 
     #[test]

@@ -9,10 +9,70 @@
 
 use celers_core::{CelersError, Result};
 use redis::{
-    aio::MultiplexedConnection, Client, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
+    aio::MultiplexedConnection, Client, ClientTlsConfig, ConnectionAddr, ConnectionInfo,
+    IntoConnectionInfo, TlsCertificates,
 };
 use std::future::Future;
+use std::sync::Once;
 use std::time::Duration;
+use tracing::{debug, trace};
+
+static TLS_PROVIDER_INIT: Once = Once::new();
+
+/// Install the Pure-Rust (`rustls-rustcrypto`) crypto provider as the process
+/// default, once per process.
+///
+/// # Why this is mandatory, not an optimisation
+///
+/// The workspace declares `rustls` with `default-features = false`, so **no**
+/// rustls crypto-provider feature is enabled anywhere in this build. The
+/// `redis` crate's `create_rustls_config` goes through the bare
+/// `rustls::ClientConfig::builder()`, which resolves a provider by looking at
+/// (a) the process default, then (b) the single enabled provider feature. With
+/// no provider feature, a missing process default is a **panic**, not an error.
+///
+/// Every `redis::Client` this crate constructs therefore goes through
+/// [`open_client`] or [`RedisConfig::build_client`], both of which call this
+/// first. The same guard exists in `celers-backend-redis` and
+/// `celers-broker-amqp` for their own transports.
+///
+/// Installing a default can only succeed once. A second attempt — or an attempt
+/// after another component installed its own — is not an error here; it just
+/// means somebody else already made the choice.
+///
+/// **Ordering matters**: whoever builds a `rustls::ClientConfig` first wins. An
+/// application that creates TLS clients through other libraries earlier in
+/// startup should call this itself, first thing in `main`.
+pub fn install_pure_tls_provider() {
+    TLS_PROVIDER_INIT.call_once(|| {
+        // `CryptoProvider::install_default` consumes the provider by value.
+        if oxitls::pure_provider()
+            .as_ref()
+            .clone()
+            .install_default()
+            .is_ok()
+        {
+            debug!("Installed Pure-Rust rustls crypto provider for Redis TLS");
+        } else {
+            trace!("A rustls crypto provider was already installed for this process");
+        }
+    });
+}
+
+/// Open a [`redis::Client`] with the Pure-Rust TLS provider installed first.
+///
+/// A drop-in replacement for [`redis::Client::open`] and the only form this
+/// crate uses, so that a `rediss://` URL reaching any code path finds a crypto
+/// provider when the handshake starts — see [`install_pure_tls_provider`] for
+/// why its absence is a panic rather than an error.
+///
+/// # Errors
+///
+/// Returns whatever [`redis::Client::open`] returns for an unusable URL.
+pub fn open_client<T: IntoConnectionInfo>(params: T) -> redis::RedisResult<Client> {
+    install_pure_tls_provider();
+    Client::open(params)
+}
 
 /// How long a normal (non-blocking) command may take before the *client*
 /// gives up on it.
@@ -208,6 +268,48 @@ impl TlsConfig {
         self.max_tls_version = Some(version.into());
         self
     }
+
+    /// Whether any certificate file is configured.
+    ///
+    /// Used by [`RedisConfig::build_client`] to tell "no TLS wanted" apart from
+    /// "TLS wanted but the address is plaintext", which are the same shape in
+    /// this struct but very different mistakes.
+    pub(crate) fn has_certificate_material(&self) -> bool {
+        self.ca_cert_path.is_some()
+            || self.client_cert_path.is_some()
+            || self.client_key_path.is_some()
+    }
+
+    /// Refuse settings that this stack cannot actually enforce.
+    ///
+    /// Cipher suites and protocol-version bounds have no expression in the
+    /// `redis` API at all: [`redis::TlsCertificates`] carries exactly two
+    /// fields (`client_tls` and `root_cert`), and `redis`'s
+    /// `create_rustls_config` builds its `ClientConfig` with neither
+    /// `with_protocol_versions` nor a cipher-suite list. Accepting them
+    /// silently would connect on whatever the provider defaults to while the
+    /// operator believed they had pinned something — a security downgrade.
+    ///
+    /// The certificate knobs, by contrast, *are* honoured; see
+    /// [`RedisConfig::tls_certificates`].
+    ///
+    /// # Errors
+    ///
+    /// [`CelersError::Broker`] if a cipher suite or a TLS version bound is set.
+    fn reject_unhonourable_settings(&self) -> Result<()> {
+        if self.cipher_suites.is_some()
+            || self.min_tls_version.is_some()
+            || self.max_tls_version.is_some()
+        {
+            return Err(CelersError::Broker(
+                "TLS cipher suite / protocol version pinning is not expressible through the \
+                 `redis` client API; configure it on the Redis server instead of setting it here, \
+                 where it would be silently ignored"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Redis connection configuration
@@ -373,32 +475,7 @@ impl RedisConfig {
     /// Upgrade the connection address to TLS, refusing to continue if any
     /// requested TLS setting cannot actually be honoured.
     fn apply_tls(&self, info: ConnectionInfo) -> Result<ConnectionInfo> {
-        // `redis` builds its TLS parameters from its own feature-gated
-        // machinery; there is no public constructor for them. Rather than
-        // connect *without* the certificates or protocol bounds the operator
-        // asked for -- a silent security downgrade -- refuse the config.
-        if self.tls.ca_cert_path.is_some()
-            || self.tls.client_cert_path.is_some()
-            || self.tls.client_key_path.is_some()
-        {
-            return Err(CelersError::Broker(
-                "TLS custom CA / client certificates are not supported by this build: rebuild \
-                 with the `redis` crate's `tls-rustls` feature and pass the certificates through \
-                 `redis::Client::build_with_tls`"
-                    .to_string(),
-            ));
-        }
-        if self.tls.cipher_suites.is_some()
-            || self.tls.min_tls_version.is_some()
-            || self.tls.max_tls_version.is_some()
-        {
-            return Err(CelersError::Broker(
-                "TLS cipher suite / protocol version pinning is not configurable through the \
-                 `redis` client; configure it on the Redis server instead of setting it here, \
-                 where it would be silently ignored"
-                    .to_string(),
-            ));
-        }
+        self.tls.reject_unhonourable_settings()?;
 
         // A `rediss://` URL only parses when the redis crate was compiled with
         // TLS support, which makes it a reliable probe: without it, a TLS
@@ -452,9 +529,107 @@ impl RedisConfig {
         Ok(info)
     }
 
+    /// Read the configured PEM material into the shape `redis` wants.
+    ///
+    /// Returns `Ok(None)` when nothing beyond the default trust store was
+    /// asked for, which is the signal to take the plain
+    /// [`redis::Client::open`] path.
+    ///
+    /// # Errors
+    ///
+    /// * [`CelersError::Broker`] if a client certificate is configured without
+    ///   its key (or the other way round) — an mTLS setup that is half
+    ///   configured must fail loudly, never fall back to server-only auth.
+    /// * [`CelersError::Broker`] if any configured file cannot be read.
+    fn tls_certificates(&self) -> Result<Option<TlsCertificates>> {
+        let root_cert = match &self.tls.ca_cert_path {
+            Some(path) => Some(read_pem(path, "CA certificate")?),
+            None => None,
+        };
+
+        let client_tls = match (&self.tls.client_cert_path, &self.tls.client_key_path) {
+            (Some(cert_path), Some(key_path)) => Some(ClientTlsConfig {
+                client_cert: read_pem(cert_path, "client certificate")?,
+                client_key: read_pem(key_path, "client key")?,
+            }),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(CelersError::Broker(
+                    "TLS client certificate configured without a client key; mTLS needs both \
+                     (use TlsConfig::client_cert(cert_path, key_path))"
+                        .to_string(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(CelersError::Broker(
+                    "TLS client key configured without a client certificate; mTLS needs both \
+                     (use TlsConfig::client_cert(cert_path, key_path))"
+                        .to_string(),
+                ))
+            }
+        };
+
+        if root_cert.is_none() && client_tls.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(TlsCertificates {
+            client_tls,
+            root_cert,
+        }))
+    }
+
     /// Build a Redis client from this configuration
+    ///
+    /// # TLS
+    ///
+    /// Installs the Pure-Rust crypto provider first — see
+    /// [`install_pure_tls_provider`] for why that is load-bearing rather than
+    /// decorative.
+    ///
+    /// When [`TlsConfig::ca_cert`] or [`TlsConfig::client_cert`] is set, the
+    /// client is built through [`redis::Client::build_with_tls`] so the
+    /// certificates actually take effect. Note the trust-store semantics that
+    /// come with `redis`: a configured CA **replaces** the built-in Mozilla
+    /// bundle rather than adding to it, which is what you want for a private
+    /// Redis CA and is worth knowing if you expected both to be trusted.
+    ///
+    /// # Errors
+    ///
+    /// [`CelersError::Broker`] if the URL is unusable, if a requested TLS
+    /// setting cannot be honoured, or if configured certificate files cannot be
+    /// read or parsed.
     pub fn build_client(&self) -> Result<Client> {
+        install_pure_tls_provider();
+
         let info = self.connection_info()?;
+
+        // Keyed off the *resolved* address rather than `tls.enabled`, so a
+        // `rediss://` URL (which `redis` parses straight into `TcpTls`) picks
+        // up the configured certificates too. Keying off the flag would drop
+        // them for exactly the URL form that most obviously means TLS.
+        if matches!(info.addr(), ConnectionAddr::TcpTls { .. }) {
+            // Also runs for a `rediss://` URL with `tls.enabled` left false, a
+            // path `apply_tls` never sees. Without it, cipher-suite and
+            // version settings would be silently dropped for exactly the URL
+            // form that most obviously means TLS.
+            self.tls.reject_unhonourable_settings()?;
+
+            if let Some(certificates) = self.tls_certificates()? {
+                return Client::build_with_tls(info, certificates).map_err(|e| {
+                    CelersError::Broker(format!("Failed to create Redis TLS client: {}", e))
+                });
+            }
+        } else if self.tls.has_certificate_material() {
+            // Certificates on a plaintext connection are not "inert extra
+            // configuration", they are a config the operator believes is
+            // encrypted. Say so instead of connecting in the clear.
+            return Err(CelersError::Broker(
+                "TLS certificates are configured but this connection is plaintext; use a \
+                 `rediss://` URL or `TlsConfig::enabled(true)`"
+                    .to_string(),
+            ));
+        }
 
         Client::open(info)
             .map_err(|e| CelersError::Broker(format!("Failed to create Redis client: {}", e)))
@@ -521,6 +696,17 @@ impl RedisConfig {
         }
         url
     }
+}
+
+/// Read a PEM file, naming what it was supposed to be when it cannot be read.
+///
+/// `redis` takes certificate material as raw PEM bytes, so the only thing this
+/// adds is an error message that identifies the file and its role — a bare
+/// `No such file or directory (os error 2)` at connect time is exactly the kind
+/// of failure that costs an operator an afternoon.
+fn read_pem(path: &str, role: &str) -> Result<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| CelersError::Broker(format!("Failed to read TLS {} '{}': {}", role, path, e)))
 }
 
 /// Connection statistics
@@ -780,26 +966,304 @@ mod tests {
     }
 
     /// Settings the client cannot honour must be rejected rather than
-    /// quietly ignored -- silently connecting without the requested client
-    /// certificate is a security downgrade.
+    /// quietly ignored -- silently connecting on whatever the provider
+    /// defaults to, while the operator believes they pinned TLS 1.3, is a
+    /// security downgrade.
+    ///
+    /// Cipher suites and version bounds are the two that remain unhonourable:
+    /// `redis::TlsCertificates` has exactly two fields and
+    /// `create_rustls_config` sets neither a version list nor a suite list.
     #[test]
     fn test_unsupported_tls_options_are_rejected() {
-        let config = RedisConfig::from_url("redis://example.com:6379").tls(
+        for tls in [
+            TlsConfig::new().enabled(true).min_tls_version("1.3"),
+            TlsConfig::new().enabled(true).max_tls_version("1.2"),
             TlsConfig::new()
                 .enabled(true)
-                .client_cert("/tmp/client.crt", "/tmp/client.key"),
-        );
-        assert!(config.build_client().is_err());
+                .cipher_suites("TLS_AES_256_GCM_SHA384"),
+        ] {
+            let config = RedisConfig::from_url("redis://example.com:6379").tls(tls);
+            let error = config
+                .build_client()
+                .expect_err("an unhonourable TLS setting must not be ignored")
+                .to_string();
+            assert!(error.contains("not expressible"), "{error}");
+        }
 
-        let config = RedisConfig::from_url("redis://example.com:6379")
-            .tls(TlsConfig::new().enabled(true).min_tls_version("1.3"));
-        assert!(config.build_client().is_err());
-
-        // With TLS disabled the same options are inert, not an error.
+        // With TLS disabled the same options are inert, not an error: nothing
+        // about a plaintext connection claims to honour them.
         let config = RedisConfig::from_url("redis://example.com:6379")
             .tls(TlsConfig::new().min_tls_version("1.3"));
         assert!(config.build_client().is_ok());
+
+        // But a `rediss://` URL *is* a TLS connection even with the `enabled`
+        // flag left false, so the same setting must be refused there. This is
+        // the path `apply_tls` never sees.
+        let config = RedisConfig::from_url("rediss://example.com:6379")
+            .tls(TlsConfig::new().min_tls_version("1.3"));
+        let error = config
+            .build_client()
+            .expect_err("a rediss:// URL must not silently drop a version pin")
+            .to_string();
+        assert!(error.contains("not expressible"), "{error}");
     }
+
+    /// The `redis` crate must actually have TLS compiled in — the whole
+    /// `rediss://` story rests on the workspace's `tokio-rustls-comp` feature,
+    /// and losing it would otherwise show up only as a connect-time failure in
+    /// production.
+    #[test]
+    fn test_the_redis_crate_has_tls_support() {
+        let info = "rediss://127.0.0.1:6379"
+            .into_connection_info()
+            .expect("rediss:// must parse; is the `redis` tls-rustls feature still enabled?");
+        assert!(matches!(info.addr(), ConnectionAddr::TcpTls { .. }));
+    }
+
+    /// A `rediss://` URL must produce a TLS client without any extra builder
+    /// call, and building it must not panic — which is the observable form of
+    /// "the Pure-Rust crypto provider was installed first".
+    #[test]
+    fn test_rediss_url_builds_a_tls_client() {
+        let config = RedisConfig::from_url("rediss://example.com:6379");
+        let client = config.build_client().expect("client");
+        assert!(matches!(
+            client.get_connection_info().addr(),
+            ConnectionAddr::TcpTls { .. }
+        ));
+    }
+
+    /// Installing the provider must be safe to repeat: every constructor in
+    /// this crate calls it, so it runs many times per process.
+    #[test]
+    fn test_install_pure_tls_provider_is_idempotent() {
+        install_pure_tls_provider();
+        install_pure_tls_provider();
+    }
+
+    /// `open_client` is the crate-wide replacement for `redis::Client::open`;
+    /// it must behave identically for ordinary URLs and accept `rediss://`.
+    #[test]
+    fn test_open_client_matches_client_open() {
+        let client = open_client("redis://example.com:6379/4").expect("client");
+        assert_eq!(client.get_connection_info().redis_settings().db(), 4);
+
+        let tls_client = open_client("rediss://example.com:6379").expect("tls client");
+        assert!(matches!(
+            tls_client.get_connection_info().addr(),
+            ConnectionAddr::TcpTls { .. }
+        ));
+
+        assert!(open_client("invalid://bad-url").is_err());
+    }
+
+    /// A CA certificate must reach `redis::Client::build_with_tls`, i.e. the
+    /// resulting client must carry TLS parameters. Before this wiring existed
+    /// the same config was rejected outright.
+    #[test]
+    fn test_custom_ca_certificate_is_wired_through() {
+        let dir = std::env::temp_dir().join(format!("celers-redis-tls-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&ca_path, SELF_SIGNED_CA_PEM).expect("write ca");
+
+        let config = RedisConfig::from_url("rediss://example.com:6379")
+            .tls(TlsConfig::new().ca_cert(ca_path.to_string_lossy().to_string()));
+
+        let client = config.build_client().expect("client with custom CA");
+        match client.get_connection_info().addr() {
+            ConnectionAddr::TcpTls { tls_params, .. } => assert!(
+                tls_params.is_some(),
+                "a configured CA must produce TLS parameters, not the default trust store"
+            ),
+            other => panic!("expected a TLS address, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A CA path that does not exist must fail with a message naming the file
+    /// and its role, not with a bare OS error at connect time.
+    #[test]
+    fn test_missing_ca_certificate_is_reported_clearly() {
+        let missing = std::env::temp_dir().join("celers-redis-tls-does-not-exist.pem");
+        let config = RedisConfig::from_url("rediss://example.com:6379")
+            .tls(TlsConfig::new().ca_cert(missing.to_string_lossy().to_string()));
+
+        let error = config
+            .build_client()
+            .expect_err("a missing CA file must fail")
+            .to_string();
+        assert!(error.contains("CA certificate"), "{error}");
+        assert!(error.contains("celers-redis-tls-does-not-exist"), "{error}");
+    }
+
+    /// Half-configured mTLS must fail loudly. Falling back to server-only
+    /// authentication because the key path was forgotten is exactly the silent
+    /// downgrade this module exists to prevent.
+    #[test]
+    fn test_client_certificate_without_key_is_rejected() {
+        let mut tls = TlsConfig::new().enabled(true);
+        tls.client_cert_path = Some("/tmp/celers-client.pem".to_string());
+
+        let error = RedisConfig::from_url("redis://example.com:6379")
+            .tls(tls)
+            .build_client()
+            .expect_err("a certificate without a key must not connect")
+            .to_string();
+        assert!(error.contains("client key"), "{error}");
+
+        let mut tls = TlsConfig::new().enabled(true);
+        tls.client_key_path = Some("/tmp/celers-client.key".to_string());
+
+        let error = RedisConfig::from_url("redis://example.com:6379")
+            .tls(tls)
+            .build_client()
+            .expect_err("a key without a certificate must not connect")
+            .to_string();
+        assert!(error.contains("client certificate"), "{error}");
+    }
+
+    /// Certificates on a plaintext connection mean the operator thinks the
+    /// connection is encrypted. Connecting anyway would be the downgrade.
+    #[test]
+    fn test_certificates_on_a_plaintext_connection_are_rejected() {
+        let config = RedisConfig::from_url("redis://example.com:6379")
+            .tls(TlsConfig::new().ca_cert("/tmp/celers-ca.pem"));
+
+        let error = config
+            .build_client()
+            .expect_err("certificates must not be dropped silently")
+            .to_string();
+        assert!(error.contains("plaintext"), "{error}");
+    }
+
+    /// A syntactically valid but semantically useless PEM must be rejected by
+    /// `redis` rather than producing a client that fails much later.
+    #[test]
+    fn test_unparseable_ca_certificate_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("celers-redis-tls-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&ca_path, b"-----BEGIN CERTIFICATE-----\nnot base64\n").expect("write");
+
+        let config = RedisConfig::from_url("rediss://example.com:6379")
+            .tls(TlsConfig::new().ca_cert(ca_path.to_string_lossy().to_string()));
+
+        assert!(
+            config.build_client().is_err(),
+            "a malformed CA PEM must not yield a usable client"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- live-server TLS probe ----------------------------------------------
+    //
+    // Needs a real Redis. Skipped, visibly, when `CELERS_TEST_REDIS_URL` is
+    // unset, so the default suite stays hermetic.
+
+    /// The live-server URL, or `None` when the suite is not enabled.
+    fn live_url() -> Option<String> {
+        std::env::var("CELERS_TEST_REDIS_URL")
+            .ok()
+            .filter(|url| !url.is_empty())
+    }
+
+    /// A `rediss://` URL must get as far as the TLS handshake.
+    ///
+    /// This is the test that would catch the failure mode the whole
+    /// [`install_pure_tls_provider`] machinery exists to prevent: with no
+    /// rustls provider feature enabled anywhere in this workspace, `redis`'s
+    /// bare `rustls::ClientConfig::builder()` **panics** when no process
+    /// default has been installed. A unit test cannot see that — the config is
+    /// built lazily, at connect time — so it takes a real socket.
+    ///
+    /// The local Redis speaks no TLS, so the handshake is expected to *fail*.
+    /// What matters is *how*: the plaintext control connection must succeed
+    /// (proving the server is up and the URL is right) while the `rediss://`
+    /// one must return an ordinary transport error (proving we reached the TLS
+    /// layer and came back with a `Result`, not a panic or a silent plaintext
+    /// downgrade).
+    #[tokio::test]
+    async fn live_rediss_url_reaches_the_tls_handshake() {
+        let Some(url) = live_url() else {
+            eprintln!(
+                "SKIPPED: live_rediss_url_reaches_the_tls_handshake \
+                 (set CELERS_TEST_REDIS_URL to run)"
+            );
+            return;
+        };
+
+        // Control: the same server, in the clear, must be reachable. Without
+        // this the TLS failure below would also "pass" against a dead server.
+        let plaintext = open_client(url.as_str()).expect("plaintext client");
+        plaintext
+            .celers_multiplexed_connection()
+            .await
+            .expect("the control connection must succeed; is CELERS_TEST_REDIS_URL correct?");
+
+        let tls_url = url.replacen("redis://", "rediss://", 1);
+        assert!(
+            tls_url.starts_with("rediss://"),
+            "CELERS_TEST_REDIS_URL must be a redis:// URL to derive a rediss:// one, got {url}"
+        );
+
+        let tls_client = open_client(tls_url.as_str()).expect("rediss:// must parse into a client");
+        assert!(
+            matches!(
+                tls_client.get_connection_info().addr(),
+                ConnectionAddr::TcpTls { .. }
+            ),
+            "a rediss:// URL must never resolve to a plaintext address"
+        );
+
+        // A short budget on purpose. A plaintext Redis reads the ClientHello
+        // as an inline command and simply keeps buffering, so the handshake
+        // does not fail fast — it stalls. The crate default of
+        // `DEFAULT_CONNECTION_TIMEOUT` (10 s) would make this the slowest test
+        // in the suite for no extra signal.
+        let probe = redis::AsyncConnectionConfig::new()
+            .set_connection_timeout(Some(Duration::from_secs(3)))
+            .set_response_timeout(Some(Duration::from_secs(3)));
+
+        // The panic this guards against would abort the test process here.
+        let error = tls_client
+            .get_multiplexed_async_connection_with_config(&probe)
+            .await
+            .expect_err("a plaintext Redis must not complete a TLS handshake");
+
+        // Whether the server stalls (timeout) or answers with a RESP error
+        // line that rustls rejects as a corrupt record, the failure is a
+        // transport failure. What it must never be is `InvalidClientConfig`,
+        // which is what `redis` reports when the TLS configuration itself is
+        // unusable — i.e. when this crate's TLS wiring is wrong rather than the
+        // server's.
+        assert_ne!(
+            error.kind(),
+            redis::ErrorKind::InvalidClientConfig,
+            "the failure must come from the handshake, not from an unusable TLS config: {error}"
+        );
+    }
+
+    /// A throwaway self-signed CA (P-256, `CN=celers-test-ca`, valid to 2126),
+    /// generated once and pasted here so the test suite needs no
+    /// certificate-minting dependency and no network. Its private key was
+    /// discarded: it can authenticate nothing, and exists only to prove that
+    /// PEM bytes travel from [`TlsConfig::ca_cert`] into `redis`'s
+    /// `TlsConnParams` and parse as a real trust anchor on the way.
+    const SELF_SIGNED_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIBiDCCAS+gAwIBAgIUREhFQykc82cn85aSS5aL1AevE9gwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOY2VsZXJzLXRlc3QtY2EwIBcNMjYwODI1MTYwNzQ4WhgPMjEy
+NjA4MDExNjA3NDhaMBkxFzAVBgNVBAMMDmNlbGVycy10ZXN0LWNhMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEKv8djUYTeR/2hdteo241Xlzcm0FgC9EDt3x0eJya
+iOr9HeL/kwQVEA7jSz0xCJ0BSVlsd37wik1DfzG4+zLHEKNTMFEwHQYDVR0OBBYE
+FM64osaR94Hu3TNNK05xMkmdbPb/MB8GA1UdIwQYMBaAFM64osaR94Hu3TNNK05x
+MkmdbPb/MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgax8JRtx+
+OS3DkbL8yOM6NzXsw1aDVkvFFl+UbCmE95YCIAHTBoGUGFbnVweCT62DcLZCZwWg
+Dteb9wDC3Ie+jao0
+-----END CERTIFICATE-----
+";
 
     #[test]
     fn test_manager_config_carries_timeouts() {

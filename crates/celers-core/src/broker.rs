@@ -1,5 +1,6 @@
 use crate::revocation_channel::RevocationStream;
 use crate::{CelersError, Result, SerializedTask, TaskId};
+use std::time::Duration;
 
 /// Message envelope for broker operations
 #[derive(Debug, Clone)]
@@ -194,42 +195,112 @@ pub trait Broker: Send + Sync {
         Ok(task_ids)
     }
 
+    /// Whether this broker's [`dequeue`](Broker::dequeue) future may be
+    /// **dropped** mid-flight without losing the message it was fetching.
+    ///
+    /// A cancel-safe `dequeue` never holds a message across an `.await`: every
+    /// poll either leaves the message where it was or runs synchronously
+    /// through to the return. Only such an implementation may be raced against
+    /// another future (a shutdown signal, a timer), because the loser's future
+    /// is dropped.
+    ///
+    /// The default is `false`, which is the only answer that is safe without
+    /// having read the implementation. A broker whose `dequeue` removes the
+    /// message from the queue at one `.await` point and returns it at a later
+    /// one — the shape of nearly every network broker, where the pop is already
+    /// committed server-side before the reply is read — would silently lose
+    /// messages if it answered `true`.
+    ///
+    /// [`celers_core::InMemoryBroker`](crate::InMemoryBroker) overrides this to
+    /// `true`; see its implementation for what "verified" means here.
+    ///
+    /// A *decorator* over a cancel-safe broker (a wrapper that records delays,
+    /// injects faults, ...) inherits `false` unless it forwards this method to
+    /// the broker it wraps — its own `dequeue` may well hold the inner
+    /// message across an await.
+    fn dequeue_is_cancel_safe(&self) -> bool {
+        false
+    }
+
     /// Try to dequeue a task without waiting for one to arrive.
     ///
-    /// Returns `Ok(None)` immediately when no message is currently available.
-    /// This is the non-blocking counterpart of [`Broker::dequeue`] and is what
-    /// [`Broker::dequeue_batch`] uses to drain a batch without ever parking.
+    /// Returns `Ok(None)` when the broker has no message available *right now*.
+    /// This is the non-blocking counterpart of [`Broker::dequeue`]: an
+    /// implementation must be a genuine "take it if it is there" primitive
+    /// (Redis `LPOP`, AMQP `basic_get`, SQS `ReceiveMessage` with
+    /// `WaitTimeSeconds=0`, a `try_lock` over an in-process queue).
     ///
-    /// The default implementation polls `dequeue()` exactly once and treats a
-    /// pending poll as "nothing available", which is correct for brokers whose
-    /// `dequeue` returns immediately when the queue is empty. Brokers whose
-    /// `dequeue` waits for a message (and brokers whose `dequeue` is not
-    /// cancel-safe) **should override this** with a genuinely non-blocking
-    /// implementation.
+    /// # The default refuses
+    ///
+    /// There is no way to synthesise a non-blocking dequeue out of a blocking
+    /// one. Polling `dequeue()` once and calling a pending poll "empty" — which
+    /// this default used to do — is wrong twice over: for any broker that does
+    /// I/O the first poll is *always* pending, so it reports an empty queue no
+    /// matter how much work is waiting; and dropping that half-polled future
+    /// abandons whatever it had already committed to, which for a broker that
+    /// pops server-side before reading the reply strands the message until its
+    /// visibility timeout expires.
+    ///
+    /// So the default returns [`CelersError::Broker`] — the same shape of named
+    /// refusal [`enqueue_at`](Self::enqueue_at) uses — rather than a plausible
+    /// lie. Nothing in this crate's defaults calls it:
+    /// [`dequeue_batch`](Self::dequeue_batch) drains with `queue_size` +
+    /// `dequeue` instead, so a broker that does not override this keeps working.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always returns [`CelersError::Broker`].
+    /// Overrides return whatever their transport reports.
     async fn try_dequeue(&self) -> Result<Option<BrokerMessage>> {
-        use std::future::Future;
-        use std::task::Poll;
-
-        let fut = self.dequeue();
-        tokio::pin!(fut);
-        std::future::poll_fn(move |cx| match fut.as_mut().poll(cx) {
-            Poll::Ready(result) => Poll::Ready(result),
-            // The broker would have to wait: report "nothing available" rather
-            // than parking the caller.
-            Poll::Pending => Poll::Ready(Ok(None)),
-        })
-        .await
+        Err(CelersError::Broker(
+            "this broker does not support non-blocking dequeue (try_dequeue)".to_string(),
+        ))
     }
 
     /// Dequeue multiple tasks in a single operation (batch)
     ///
     /// Returns up to `count` messages from the queue.
     ///
-    /// The default implementation waits (via [`Broker::dequeue`]) for the first
-    /// message and then drains any further immediately-available messages with
-    /// [`Broker::try_dequeue`], so it returns as soon as the queue runs dry
-    /// instead of blocking forever inside the loop.
-    /// Brokers should override this for better performance.
+    /// # Default implementation
+    ///
+    /// The first message is waited for with [`Broker::dequeue`]; the rest are
+    /// drained by asking [`Broker::queue_size`] whether anything is left and
+    /// calling `dequeue` again only when it says yes. That ordering is the
+    /// whole design:
+    ///
+    /// * **No `dequeue` future is ever dropped.** Every one this method creates
+    ///   is awaited to completion, so a broker that commits the pop before its
+    ///   first `.await` cannot have a message stranded by the batch path.
+    /// * **It does not park on an empty queue.** `dequeue` is only called
+    ///   speculatively once — for the first message, where waiting is the
+    ///   documented behaviour. The drain stops as soon as `queue_size` reports
+    ///   nothing, so it returns the messages already in hand instead of
+    ///   blocking inside the loop.
+    ///
+    /// The cost is one `queue_size` round trip per extra message, and a drain
+    /// that can only be as accurate as `queue_size` is. **Brokers with a real
+    /// batch primitive (`LRANGE`, a multi-row `DELETE ... RETURNING`,
+    /// `ReceiveMessage(MaxNumberOfMessages)`) should override this**, and every
+    /// broker in this workspace that talks to a network does.
+    ///
+    /// Two contract notes for anyone relying on the default:
+    ///
+    /// * `queue_size` must count messages `dequeue` can actually return. A
+    ///   broker whose `queue_size` also counts in-flight or not-yet-due
+    ///   messages, *and* whose `dequeue` has no block timeout, can park here —
+    ///   such a broker must override `dequeue_batch`.
+    /// * With several consumers on one queue another may take the message
+    ///   between the probe and the `dequeue`. Nothing is lost: that `dequeue`
+    ///   waits as long as the broker's own block timeout and then ends the
+    ///   drain.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failure of the *first* `dequeue`. Once at least one message
+    /// is in hand a later probe or drain failure ends the drain instead of
+    /// failing the call: those messages have already left the queue, and
+    /// discarding them to report an error on a message that was never taken
+    /// would turn a transient fault into lost work.
     async fn dequeue_batch(&self, count: usize) -> Result<Vec<BrokerMessage>> {
         let mut messages = Vec::with_capacity(count.min(64));
         if count == 0 {
@@ -240,13 +311,92 @@ pub trait Broker: Send + Sync {
             Some(msg) => messages.push(msg),
             None => return Ok(messages),
         }
-        for _ in 1..count {
-            match self.try_dequeue().await? {
-                Some(msg) => messages.push(msg),
-                None => break,
+        while messages.len() < count {
+            // Ask before taking: `dequeue` is allowed to park on an empty
+            // queue, so it must never be called speculatively here.
+            match self.queue_size().await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        collected = messages.len(),
+                        "queue_size probe failed; returning the batch drained so far"
+                    );
+                    break;
+                }
+            }
+            match self.dequeue().await {
+                Ok(Some(msg)) => messages.push(msg),
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        collected = messages.len(),
+                        "dequeue failed mid-drain; returning the batch drained so far"
+                    );
+                    break;
+                }
             }
         }
         Ok(messages)
+    }
+
+    /// Return a delivered message to the queue for a later attempt, **without**
+    /// spending any of the task's retry budget.
+    ///
+    /// # Why this is not `reject(requeue = true)`
+    ///
+    /// A worker refuses a message for two very different reasons, and only one
+    /// of them is the task's fault:
+    ///
+    /// * The task **ran and failed** — that is a retry, and it must count
+    ///   against `max_retries` or a permanently failing task loops forever.
+    /// * The task **never ran**: this worker cannot route it, its labels do not
+    ///   satisfy the task's affinity, a feature flag is off, a rate limiter is
+    ///   saturated, a circuit breaker's half-open probe budget is spoken for,
+    ///   or the worker is draining. Nothing is known to be wrong with the task.
+    ///   Spending a retry here means a task that merely visited the wrong
+    ///   worker `max_retries` times is dead-lettered without ever executing.
+    ///
+    /// `reject(requeue = true)` is the first meaning, and a broker that records
+    /// retry state (the Redis broker rewrites the payload to `Retrying(n + 1)`)
+    /// implements it that way. `defer` is the second: the message goes back
+    /// exactly as delivered.
+    ///
+    /// # `delay`
+    ///
+    /// How long the message should stay invisible. A broker with a delayed
+    /// queue holds it there and releases it when due; one without releases it
+    /// immediately, which is a latency difference rather than a correctness
+    /// one. `Duration::ZERO` asks for the ready queue directly.
+    ///
+    /// `Duration` rather than whole seconds is deliberate: the worker's default
+    /// admission deferral is 250 ms, which truncates to zero as an integer
+    /// number of seconds.
+    ///
+    /// # Default implementation
+    ///
+    /// Forwards to `reject(requeue = true)` and drops the delay. That is the
+    /// only universally available way to return a message, and refusing (as
+    /// [`enqueue_at`](Self::enqueue_at) does for scheduling) would strand
+    /// deferred work on every broker that has not overridden this. The cost is
+    /// documented rather than hidden: **on a broker that rewrites retry state
+    /// on requeue, the default still spends retry budget**, so such a broker
+    /// must override this method. In this workspace `RedisBroker` and
+    /// `InMemoryBroker` do.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying return-to-queue operation reports.
+    async fn defer(
+        &self,
+        task_id: &TaskId,
+        receipt_handle: Option<&str>,
+        delay: Duration,
+    ) -> Result<()> {
+        let _ = delay;
+        self.reject(task_id, receipt_handle, true).await
     }
 
     /// Acknowledge multiple tasks in a single operation (batch)
@@ -581,6 +731,81 @@ mod tests {
         }
     }
 
+    /// A broker that takes the message out of its queue *before* its first
+    /// `.await`, exactly like a server-side pop whose reply has not been read
+    /// yet (a Redis `EVAL`, an SQS receive). A future dropped after that point
+    /// takes the staged message with it.
+    struct StagingBroker {
+        ready: tokio::sync::Mutex<Vec<SerializedTask>>,
+        /// Messages popped from `ready` but not yet returned to a caller. A
+        /// non-empty `staged` after a completed call means a message was
+        /// stranded.
+        staged: std::sync::Mutex<Vec<SerializedTask>>,
+    }
+
+    impl StagingBroker {
+        fn new() -> Self {
+            Self {
+                ready: tokio::sync::Mutex::new(Vec::new()),
+                staged: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn stranded(&self) -> usize {
+            self.staged.lock().expect("staged lock").len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for StagingBroker {
+        async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
+            let id = task.metadata.id;
+            self.ready.lock().await.push(task);
+            Ok(id)
+        }
+
+        async fn dequeue(&self) -> Result<Option<BrokerMessage>> {
+            // Commit the pop first...
+            let popped = self.ready.lock().await.pop();
+            match popped {
+                Some(task) => self.staged.lock().expect("staged lock").push(task),
+                // Empty: a real broker waits here. Never resolves, so a
+                // speculative `dequeue` in a default path shows up as a hung
+                // test rather than a silent pass.
+                None => {
+                    std::future::pending::<()>().await;
+                    unreachable!("pending future never completes")
+                }
+            }
+            // ...then await, the way a client awaits the server's reply. A
+            // future dropped here loses the staged message.
+            tokio::task::yield_now().await;
+            let task = self.staged.lock().expect("staged lock").pop();
+            Ok(task.map(BrokerMessage::new))
+        }
+
+        async fn ack(&self, _task_id: &TaskId, _receipt_handle: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reject(
+            &self,
+            _task_id: &TaskId,
+            _receipt_handle: Option<&str>,
+            _requeue: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn queue_size(&self) -> Result<usize> {
+            Ok(self.ready.lock().await.len())
+        }
+
+        async fn cancel(&self, _task_id: &TaskId) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
     #[tokio::test]
     async fn default_dequeue_batch_returns_when_queue_drains() {
         // Regression: the default `dequeue_batch` looped on the *blocking*
@@ -595,9 +820,84 @@ mod tests {
         let messages = broker.dequeue_batch(10).await.unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(broker.queue_size().await.unwrap(), 0);
+    }
 
-        // And `try_dequeue` reports "nothing available" rather than parking.
-        assert!(broker.try_dequeue().await.unwrap().is_none());
+    #[tokio::test]
+    async fn default_dequeue_batch_never_strands_a_staged_message() {
+        // Regression, and the reason the poll-once default had to go: the
+        // drain used to poll a `dequeue()` future exactly once and drop it on
+        // `Poll::Pending`. For a broker that commits the pop before its first
+        // await — every network broker — that dropped future carried a real
+        // message away with it, invisible until the visibility timeout.
+        let broker = StagingBroker::new();
+        for _ in 0..3 {
+            broker.enqueue(create_test_task()).await.unwrap();
+        }
+
+        let messages = tokio::time::timeout(Duration::from_secs(5), broker.dequeue_batch(10))
+            .await
+            .expect("the drain must not park on a queue it has emptied")
+            .unwrap();
+
+        assert_eq!(messages.len(), 3, "every queued message must be delivered");
+        assert_eq!(broker.stranded(), 0, "a message was left staged in flight");
+        assert_eq!(broker.queue_size().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn default_try_dequeue_refuses_instead_of_reporting_a_false_empty() {
+        // A blocking `dequeue` cannot be turned into a non-blocking one. The
+        // default says so by name rather than answering "nothing available",
+        // which for an I/O broker was true exactly never.
+        let broker = StagingBroker::new();
+        broker.enqueue(create_test_task()).await.unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), broker.try_dequeue())
+            .await
+            .expect("the refusal must be immediate")
+            .expect_err("the default must not claim the queue is empty");
+        assert!(err.is_broker(), "unexpected error kind: {err}");
+        assert!(err.to_string().contains("try_dequeue"), "unexpected: {err}");
+
+        // Refusing touched nothing: the message is still queued, not staged.
+        assert_eq!(broker.stranded(), 0);
+        assert_eq!(broker.queue_size().await.unwrap(), 1);
+    }
+
+    #[test]
+    fn dequeue_cancel_safety_is_opt_in() {
+        // The conservative default is what makes racing a `dequeue` against a
+        // shutdown signal safe to enable per broker rather than everywhere.
+        let broker = BlockingBroker {
+            queue: tokio::sync::Mutex::new(Vec::new()),
+        };
+        assert!(!broker.dequeue_is_cancel_safe());
+        assert!(!StagingBroker::new().dequeue_is_cancel_safe());
+        // The one implementation in this crate that has been read and verified.
+        assert!(crate::InMemoryBroker::new().dequeue_is_cancel_safe());
+    }
+
+    #[tokio::test]
+    async fn default_dequeue_batch_stops_at_the_requested_count() {
+        let broker = BlockingBroker {
+            queue: tokio::sync::Mutex::new(Vec::new()),
+        };
+        for _ in 0..5 {
+            broker.enqueue(create_test_task()).await.unwrap();
+        }
+
+        let messages = tokio::time::timeout(Duration::from_secs(5), broker.dequeue_batch(2))
+            .await
+            .expect("the drain must respect `count` rather than probing forever")
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(broker.queue_size().await.unwrap(), 3);
+
+        // `count == 0` asks for nothing and must not touch the queue at all
+        // (in particular it must not park in the first `dequeue`).
+        let none = broker.dequeue_batch(0).await.unwrap();
+        assert!(none.is_empty());
+        assert_eq!(broker.queue_size().await.unwrap(), 3);
     }
 
     #[tokio::test]
@@ -617,6 +917,74 @@ mod tests {
         assert!(err.is_broker());
         // Crucially, nothing was executed immediately.
         assert_eq!(broker.queue_size().await.unwrap(), 0);
+    }
+
+    /// The default `defer` must actually return the message.
+    ///
+    /// It is the one trait default that deliberately degrades instead of
+    /// erroring (unlike `enqueue_at`), because a broker with no delayed queue
+    /// can still give a message back — and a `defer` that quietly did nothing
+    /// would lose every message a worker refused on admission grounds.
+    #[tokio::test]
+    async fn default_defer_returns_the_message_through_reject() {
+        /// Records the exact `reject` the default `defer` is documented to make.
+        struct RecordingBroker {
+            rejected: tokio::sync::Mutex<Vec<(TaskId, Option<String>, bool)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Broker for RecordingBroker {
+            async fn enqueue(&self, task: SerializedTask) -> Result<TaskId> {
+                Ok(task.metadata.id)
+            }
+
+            async fn dequeue(&self) -> Result<Option<BrokerMessage>> {
+                Ok(None)
+            }
+
+            async fn ack(&self, _task_id: &TaskId, _receipt_handle: Option<&str>) -> Result<()> {
+                Ok(())
+            }
+
+            async fn reject(
+                &self,
+                task_id: &TaskId,
+                receipt_handle: Option<&str>,
+                requeue: bool,
+            ) -> Result<()> {
+                self.rejected.lock().await.push((
+                    *task_id,
+                    receipt_handle.map(str::to_string),
+                    requeue,
+                ));
+                Ok(())
+            }
+
+            async fn queue_size(&self) -> Result<usize> {
+                Ok(0)
+            }
+
+            async fn cancel(&self, _task_id: &TaskId) -> Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let broker = RecordingBroker {
+            rejected: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let task_id = create_test_task().metadata.id;
+
+        broker
+            .defer(&task_id, Some("handle"), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let calls = broker.rejected.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![(task_id, Some("handle".to_string()), true)],
+            "the default must requeue the message, not swallow it"
+        );
     }
 
     #[test]

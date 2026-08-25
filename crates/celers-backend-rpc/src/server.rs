@@ -412,6 +412,7 @@ mod tests {
         meta.memory_bytes = Some(2048);
         meta.retries = Some(1);
         meta.queue = Some("default".to_string());
+        meta.ignored_error = Some("suppressed on the wire".to_string());
 
         // Nothing stored yet.
         assert!(
@@ -485,6 +486,150 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("server task panicked")
+            .expect("server returned an error");
+    }
+
+    /// A compressed `result_data` must round-trip over the *real* gRPC
+    /// wire, not just through the in-process `codec` unit tests: this
+    /// proves prost actually encodes/decodes the new `bytes`/`string`
+    /// optional fields correctly, and that the reference server's
+    /// `from_proto_meta` decode (config-free, unconditional) correctly
+    /// decompresses a request a compression-enabled client sent.
+    #[tokio::test]
+    async fn test_client_server_round_trip_with_compression_enabled() {
+        let (incoming, addr) = bind_loopback();
+        let server = RpcBackendServer::new(InMemoryBackend::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(server.into_service())
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = GrpcResultBackend::connect(&format!("http://{addr}"))
+            .await
+            .expect("client failed to connect to in-process server")
+            .with_compression(crate::compression::CompressionConfig::new(16, "zstd"));
+
+        let task_id = Uuid::new_v4();
+        let large_items: Vec<serde_json::Value> = (0..512)
+            .map(
+                |i| serde_json::json!({"seq": i, "note": "same shape every time, compresses well"}),
+            )
+            .collect();
+        let original = serde_json::json!({ "items": large_items });
+        let mut meta = TaskMeta::new(task_id, "compressed_wire_round_trip".to_string());
+        meta.result = TaskResult::Success(original.clone());
+
+        <GrpcResultBackend as ResultBackend>::store_result(&mut client, task_id, &meta)
+            .await
+            .expect("store_result failed");
+
+        let fetched = <GrpcResultBackend as ResultBackend>::get_result(&mut client, task_id)
+            .await
+            .expect("get_result failed")
+            .expect("expected a stored result");
+        match fetched.result {
+            TaskResult::Success(v) => assert_eq!(
+                v, original,
+                "the large payload must decode back to the exact original value"
+            ),
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("server task panicked")
+            .expect("server returned an error");
+    }
+
+    /// `TaskResultValue::Ignored` must survive the *real* gRPC wire through
+    /// the same `celers_core::result::ResultStore` interface application
+    /// code actually calls -- not just the pure `to_task_result`/
+    /// `ignored_error`/`from_task_result` unit tests in `result_store.rs`,
+    /// and not just the raw `TaskMeta::ignored_error` field covered by
+    /// `test_client_server_round_trip` above. This exercises both in one
+    /// pass: the `Ignored` <-> `Success(null)` + `ignored_error` marker
+    /// projection, *and* prost actually carrying that marker through
+    /// `extra_json` (proto field 14) end to end.
+    #[tokio::test]
+    async fn test_client_server_round_trip_ignored_result_via_result_store() {
+        use celers_core::result::{ResultStore, TaskResultValue};
+
+        let (incoming, addr) = bind_loopback();
+        let server = RpcBackendServer::new(InMemoryBackend::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(server.into_service())
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = GrpcResultBackend::connect(&format!("http://{addr}"))
+            .await
+            .expect("client failed to connect to in-process server");
+
+        let task_id = Uuid::new_v4();
+        let ignored = TaskResultValue::Ignored {
+            error: "task failed but ignore_errors was set".to_string(),
+        };
+
+        <GrpcResultBackend as ResultStore>::store_result(&client, task_id, ignored)
+            .await
+            .expect("store_result failed");
+
+        let fetched = <GrpcResultBackend as ResultStore>::get_result(&client, task_id)
+            .await
+            .expect("get_result failed")
+            .expect("expected a stored result");
+        match fetched {
+            TaskResultValue::Ignored { error } => assert_eq!(
+                error, "task failed but ignore_errors was set",
+                "the suppressed error text must survive the round trip through \
+                 ResultStore -> TaskMeta -> gRPC wire -> TaskMeta -> ResultStore"
+            ),
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+
+        // The wire-level projection this is built on: the low-level
+        // `ResultBackend::get_result` (what a caller inspecting the raw
+        // `TaskMeta` sees) must show the `Success(null)` + `ignored_error`
+        // pair `to_task_result`/`ignored_error` write together -- not some
+        // other encoding of "ignored".
+        let mut raw_client = GrpcResultBackend::connect(&format!("http://{addr}"))
+            .await
+            .expect("second client failed to connect");
+        let raw_meta = <GrpcResultBackend as ResultBackend>::get_result(&mut raw_client, task_id)
+            .await
+            .expect("get_result failed")
+            .expect("expected a stored result");
+        assert!(
+            matches!(
+                raw_meta.result,
+                TaskResult::Success(serde_json::Value::Null)
+            ),
+            "an Ignored result's core `result` field must still project onto Success(null): {:?}",
+            raw_meta.result
+        );
+        assert_eq!(
+            raw_meta.ignored_error.as_deref(),
+            Some("task failed but ignore_errors was set"),
+            "the suppressed error must be carried in TaskMeta::ignored_error over the wire"
         );
 
         let _ = shutdown_tx.send(());

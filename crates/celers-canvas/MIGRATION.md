@@ -751,12 +751,11 @@ let workflow_id = workflow.apply(&broker).await?;
 
 ## Getting Help
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/celers/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/celers/discussions)
-- **Discord**: [celers Discord Server](#)
+- **Issues**: [GitHub Issues](https://github.com/cool-japan/celers/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/cool-japan/celers/discussions)
 
 ---
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](../../CONTRIBUTING.md) for guidelines.
+We welcome contributions. There is no `CONTRIBUTING.md` yet; the root [README.md](../../README.md#-contributing) lists the gates to run before opening a PR.

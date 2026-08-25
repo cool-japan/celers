@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Celery Protocol v2/v5 implementation for CeleRS"
 readme = "README.md"
 keywords = ["celery", "protocol", "messaging", "serialization", "kombu"]
@@ -54,6 +55,7 @@ all-serializers = ["msgpack", "yaml", "protobuf", "bson-format"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
 
 [[bench]]
 name = "message_benchmarks"

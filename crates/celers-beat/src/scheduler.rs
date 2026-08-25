@@ -9,6 +9,7 @@ use crate::heartbeat::BeatHeartbeat;
 use crate::history::{DependencyStatus, ExecutionRecord, ExecutionResult, HealthCheckResult};
 use crate::lock::LockManager;
 use crate::schedule::Schedule;
+use crate::schedule_store::ScheduleStore;
 use crate::task::ScheduledTask;
 use crate::FailureCallback;
 use celers_core::lock::DistributedLockBackend;
@@ -345,6 +346,16 @@ pub struct BeatScheduler {
     /// where only the leader executes scheduled tasks.
     #[serde(skip)]
     pub(crate) heartbeat: Option<BeatHeartbeat>,
+
+    /// Optional pluggable backend for scheduler state persistence.
+    ///
+    /// When set, [`BeatScheduler::save_state_async`] persists through this
+    /// store instead of the local file named by `state_file` — see
+    /// `schedule_store.rs` for the trait, the built-in file/Redis
+    /// implementations, and exactly what durability guarantee this does and
+    /// does not provide across multiple beat instances.
+    #[serde(skip)]
+    pub(crate) schedule_store: Option<Arc<dyn ScheduleStore>>,
 }
 
 impl BeatScheduler {
@@ -367,6 +378,7 @@ impl BeatScheduler {
             alert_manager: AlertManager::default(),
             distributed_lock_backend: None,
             heartbeat: None,
+            schedule_store: None,
         }
     }
 
@@ -428,6 +440,71 @@ impl BeatScheduler {
     /// Get a reference to the heartbeat manager, if configured.
     pub fn heartbeat(&self) -> Option<&BeatHeartbeat> {
         self.heartbeat.as_ref()
+    }
+
+    /// Set the pluggable [`ScheduleStore`] this scheduler persists state
+    /// through.
+    ///
+    /// Once set, [`Self::save_state_async`] (and, transitively,
+    /// [`Self::persist_after_tick`]) writes through `store` instead of the
+    /// local file named by `state_file` — `state_file` is otherwise
+    /// unaffected (sync [`Self::save_state`] still uses it, unchanged) and
+    /// can be left unset entirely when a store is configured.
+    ///
+    /// # A store is not written to synchronously
+    ///
+    /// [`Self::add_task`] and this crate's other mutators persist via sync
+    /// [`Self::save_state`], which never touches `store` — nothing here can
+    /// synchronously await its I/O. A running beat instance still reaches
+    /// `store` within one tick regardless ([`Self::persist_after_tick`] calls
+    /// [`Self::save_state_async`] every tick), but a caller needing the store
+    /// updated immediately (or that never ticks, e.g. a one-shot CLI command)
+    /// must call [`Self::save_state_async`] explicitly.
+    ///
+    /// Prefer [`Self::load_from_store`] over calling this directly when
+    /// starting up: it also loads any previously saved state, which
+    /// constructing a fresh `Self` and calling this alone does not.
+    pub fn with_schedule_store(&mut self, store: Arc<dyn ScheduleStore>) -> &mut Self {
+        self.schedule_store = Some(store);
+        self
+    }
+
+    /// Get a reference to the configured [`ScheduleStore`], if any.
+    pub fn schedule_store(&self) -> Option<&Arc<dyn ScheduleStore>> {
+        self.schedule_store.as_ref()
+    }
+
+    /// Load scheduler state through a [`ScheduleStore`], and configure the
+    /// returned scheduler to keep persisting through the same store.
+    ///
+    /// The store-backed counterpart to [`Self::load_from_file`]: `Ok(None)`
+    /// from [`ScheduleStore::load`] (nothing saved yet) yields a fresh
+    /// scheduler, exactly like a missing state file does, rather than an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScheduleError::Persistence`] if the store cannot be read, or
+    /// if what it returns does not deserialize as a `BeatScheduler`.
+    pub async fn load_from_store(store: Arc<dyn ScheduleStore>) -> Result<Self, ScheduleError> {
+        let mut scheduler = match store.load().await? {
+            Some(bytes) => {
+                let mut scheduler: Self = serde_json::from_slice(&bytes).map_err(|e| {
+                    ScheduleError::Persistence(format!(
+                        "Failed to parse state loaded from ScheduleStore: {e}"
+                    ))
+                })?;
+                // Mirrors `load_from_file`'s own `ensure_instance_id` step: a
+                // state blob written by an older build has no instance id.
+                if scheduler.instance_id.is_empty() {
+                    scheduler.instance_id = default_instance_id();
+                }
+                scheduler
+            }
+            None => Self::with_state_file(None),
+        };
+        scheduler.schedule_store = Some(store);
+        Ok(scheduler)
     }
 
     /// Check if this scheduler instance is the leader.
@@ -1173,10 +1250,10 @@ impl BeatScheduler {
         for task_name in crashed_task_names {
             if let Some(task) = self.tasks.get_mut(&task_name) {
                 if let Some(duration) = task.recover_from_interruption() {
-                    eprintln!(
-                        "Recovered task '{}' from interrupted execution (was running for {}s)",
-                        task_name,
-                        duration.num_seconds()
+                    tracing::warn!(
+                        task_name = %task_name,
+                        duration_secs = duration.num_seconds(),
+                        "Recovered task from interrupted execution"
                     );
                     recovered_count += 1;
                 }

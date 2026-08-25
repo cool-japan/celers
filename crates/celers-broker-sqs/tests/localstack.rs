@@ -330,3 +330,165 @@ async fn health_check_distinguishes_missing_queue_from_broken_connection() {
 
     broker.delete_queue(&queue).await.expect("cleanup");
 }
+
+/// End-to-end coverage of the `celers_core::Broker` adapter
+/// ([`SqsBroker::into_core_broker`]).
+///
+/// The unit suite pins the request shaping offline; only a live queue can show
+/// that a worker-shaped `enqueue` -> `dequeue` -> `ack` cycle actually moves
+/// messages, and that `dequeue_batch` returns a *batch* rather than one message
+/// per call.
+#[cfg(feature = "core-broker")]
+mod core_adapter {
+    use super::{endpoint, unique_queue};
+    use celers_broker_sqs::{SqsBroker, SqsCoreBroker};
+    use celers_core::{Broker as CoreBroker, SerializedTask};
+    use celers_kombu::{Broker as KombuBroker, Transport};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    /// Build an adapter over a freshly created queue.
+    async fn live_core_broker(queue: &str, endpoint_url: &str) -> SqsCoreBroker {
+        std::env::set_var("AWS_ENDPOINT_URL", endpoint_url);
+
+        let broker = SqsBroker::new(queue)
+            .await
+            .expect("broker constructed")
+            .with_auto_create_queue(true)
+            .with_visibility_timeout(30)
+            .with_wait_time(2)
+            // The ceiling on one `ReceiveMessage`; without it batch dequeue
+            // could only ever return a single message.
+            .with_max_messages(10)
+            .into_core_broker(queue);
+
+        broker.connect().await.expect("connect");
+        broker
+    }
+
+    async fn drop_queue(queue: &str) {
+        let mut broker = SqsBroker::new(queue).await.expect("broker");
+        if broker.connect().await.is_ok() {
+            let _ = broker.delete_queue(queue).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CELERS_TEST_SQS_URL (LocalStack)"]
+    async fn a_worker_can_enqueue_dequeue_and_ack_through_the_adapter() {
+        let endpoint_url = require_endpoint!();
+        let queue = unique_queue("celers-core-roundtrip");
+        let broker = live_core_broker(&queue, &endpoint_url).await;
+
+        let task =
+            SerializedTask::new("tasks.roundtrip".to_string(), vec![1, 2, 3]).with_max_retries(6);
+        let task_id = broker.enqueue(task).await.expect("enqueue");
+
+        let message = broker
+            .dequeue()
+            .await
+            .expect("dequeue")
+            .expect("the message just enqueued is available");
+        assert_eq!(message.task.metadata.id, task_id);
+        assert_eq!(
+            message.task.metadata.max_retries, 6,
+            "metadata must survive the SQS round trip"
+        );
+        assert_eq!(message.task.payload, vec![1, 2, 3]);
+
+        broker
+            .ack(&task_id, message.receipt_handle.as_deref())
+            .await
+            .expect("ack");
+
+        drop_queue(&queue).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CELERS_TEST_SQS_URL (LocalStack)"]
+    async fn dequeue_batch_returns_more_than_one_message_per_call() {
+        let endpoint_url = require_endpoint!();
+        let queue = unique_queue("celers-core-batch");
+        let broker = live_core_broker(&queue, &endpoint_url).await;
+
+        let tasks: Vec<SerializedTask> = (0..5u8)
+            .map(|i| SerializedTask::new(format!("tasks.batch_{i}"), vec![i]))
+            .collect();
+        let ids = broker.enqueue_batch(tasks).await.expect("enqueue_batch");
+        assert_eq!(ids.len(), 5, "SendMessageBatch must report every entry");
+
+        // SQS `ReceiveMessage` is allowed to return fewer messages than asked
+        // for even when more are available, so this asserts "a batch", not
+        // "exactly five" — one message per call is the regression it catches.
+        let mut collected = Vec::new();
+        for _ in 0..3 {
+            let batch = broker.dequeue_batch(5).await.expect("dequeue_batch");
+            if batch.len() > 1 {
+                collected = batch;
+                break;
+            }
+            collected.extend(batch);
+        }
+        assert!(
+            collected.len() > 1,
+            "batch dequeue must return a batch, got {} message(s)",
+            collected.len()
+        );
+
+        let acks: Vec<(Uuid, Option<String>)> = collected
+            .iter()
+            .map(|m| (m.task.metadata.id, m.receipt_handle.clone()))
+            .collect();
+        broker.ack_batch(&acks).await.expect("ack_batch");
+
+        drop_queue(&queue).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CELERS_TEST_SQS_URL (LocalStack)"]
+    async fn defer_returns_the_message_without_spending_a_retry() {
+        let endpoint_url = require_endpoint!();
+        let queue = unique_queue("celers-core-defer");
+        let broker = live_core_broker(&queue, &endpoint_url).await;
+
+        let task_id = broker
+            .enqueue(SerializedTask::new("tasks.defer".to_string(), vec![1]))
+            .await
+            .expect("enqueue");
+
+        let message = broker.dequeue().await.expect("dequeue").expect("a message");
+        let state_before = message.task.metadata.state.clone();
+
+        // A one second hold: long enough to be a real
+        // `ChangeMessageVisibility`, short enough not to slow the suite down.
+        broker
+            .defer(
+                &task_id,
+                message.receipt_handle.as_deref(),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("defer");
+
+        let mut returned = None;
+        for _ in 0..5 {
+            if let Some(message) = broker.dequeue().await.expect("dequeue") {
+                returned = Some(message);
+                break;
+            }
+        }
+        let returned = returned.expect("a deferred message comes back");
+        assert_eq!(returned.task.metadata.id, task_id);
+        assert_eq!(
+            returned.task.metadata.state, state_before,
+            "defer must not move the task's retry state"
+        );
+
+        broker
+            .ack(&task_id, returned.receipt_handle.as_deref())
+            .await
+            .expect("ack");
+
+        drop_queue(&queue).await;
+    }
+}

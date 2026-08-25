@@ -157,6 +157,54 @@ pub enum CancellationError {
     Cancelled(TaskId),
 }
 
+/// A cancellation is a first-class task outcome, not an opaque worker-internal
+/// error.
+///
+/// Without this conversion a cooperative task body could not write
+/// `check_cancelled()?` at all: a `Task::execute` returns
+/// [`celers_core::Result`], and `?` needs a `From` to carry
+/// `CancellationError` into it. Mapping onto
+/// [`CelersError::Cancelled`](celers_core::CelersError::Cancelled) — rather
+/// than a stringly-typed `Other` — is what keeps the outcome recognisable
+/// downstream: `is_cancelled()` answers `true`, `is_retryable()` answers
+/// `false` (the request was withdrawn, so re-running it is the opposite of
+/// what was asked), and `withdrawn_task_id()` still yields the cancelled
+/// task's id.
+///
+/// ```
+/// use celers_core::{CelersError, Result};
+/// use celers_worker::cancellation::{CancellationError, CancellationToken};
+///
+/// // A cooperative step, exactly as a task body would write it.
+/// fn step(token: &CancellationToken) -> Result<()> {
+///     token.check_cancelled()?;
+///     // ... real work ...
+///     Ok(())
+/// }
+///
+/// let task_id = uuid::Uuid::new_v4();
+/// let token = CancellationToken::new(task_id);
+/// assert!(step(&token).is_ok());
+///
+/// token.cancel();
+/// let err = step(&token).expect_err("a cancelled token stops the task");
+/// assert!(err.is_cancelled());
+/// assert!(!err.is_retryable());
+/// assert_eq!(err.withdrawn_task_id(), Some(task_id));
+/// assert!(matches!(err, CelersError::Cancelled(id) if id == task_id));
+///
+/// // The standalone conversion is available too.
+/// let converted: CelersError = CancellationError::Cancelled(task_id).into();
+/// assert!(converted.is_cancelled());
+/// ```
+impl From<CancellationError> for celers_core::CelersError {
+    fn from(error: CancellationError) -> Self {
+        match error {
+            CancellationError::Cancelled(task_id) => celers_core::CelersError::cancelled(task_id),
+        }
+    }
+}
+
 /// Registry for managing cancellation tokens
 pub struct CancellationRegistry {
     tokens: Arc<RwLock<HashMap<TaskId, CancellationToken>>>,

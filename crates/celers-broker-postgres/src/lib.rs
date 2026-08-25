@@ -140,6 +140,7 @@ mod partitions;
 mod query_optimization;
 mod queue_ops;
 mod results;
+mod revocation;
 mod scheduling;
 mod workflows;
 
@@ -148,8 +149,9 @@ pub mod monitoring;
 pub mod utilities;
 
 // Re-export all public types
-pub use broker_core::PostgresBroker;
+pub use broker_core::{PostgresBroker, DEFAULT_REVOCATION_TTL_SECS};
 pub use notifications::TaskNotificationListener;
+pub use revocation::PgRevocationStream;
 pub use types::*;
 pub use workflows::TenantBroker;
 

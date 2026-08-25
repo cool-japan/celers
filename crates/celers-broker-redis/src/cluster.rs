@@ -76,7 +76,15 @@ impl ClusterConfig {
     }
 
     /// Build a ClusterClient from this configuration
+    ///
+    /// Installs the Pure-Rust rustls provider first, for the same reason every
+    /// other client constructor in this crate does: a `rediss://` node URL
+    /// reaches `redis`'s bare `rustls::ClientConfig::builder()`, which panics
+    /// when no process-default `CryptoProvider` has been installed. See
+    /// [`crate::connection::install_pure_tls_provider`].
     pub fn build_client(&self) -> Result<ClusterClient> {
+        crate::connection::install_pure_tls_provider();
+
         ClusterClient::new(self.nodes.clone())
             .map_err(|e| CelersError::Broker(format!("Failed to create cluster client: {}", e)))
     }

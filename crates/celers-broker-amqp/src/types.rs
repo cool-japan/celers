@@ -231,10 +231,11 @@ impl QueueConfig {
     /// Set queue type (Classic, Quorum, or Stream) - RabbitMQ 3.8+
     ///
     /// # Examples
-    /// ```ignore
+    /// ```
     /// use celers_broker_amqp::{QueueConfig, QueueType};
     ///
     /// let config = QueueConfig::new().with_queue_type(QueueType::Quorum);
+    /// assert_eq!(config.queue_type, Some(QueueType::Quorum));
     /// ```
     pub fn with_queue_type(mut self, queue_type: QueueType) -> Self {
         self.queue_type = Some(queue_type);
@@ -247,10 +248,11 @@ impl QueueConfig {
     /// for very long queues (millions of messages) or when dealing with large messages.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```
     /// use celers_broker_amqp::{QueueConfig, QueueLazyMode};
     ///
     /// let config = QueueConfig::new().with_queue_mode(QueueLazyMode::Lazy);
+    /// assert_eq!(config.queue_mode, Some(QueueLazyMode::Lazy));
     /// ```
     pub fn with_queue_mode(mut self, mode: QueueLazyMode) -> Self {
         self.queue_mode = Some(mode);
@@ -260,12 +262,17 @@ impl QueueConfig {
     /// Set overflow behavior when max-length is reached
     ///
     /// # Examples
-    /// ```ignore
+    /// ```
     /// use celers_broker_amqp::{QueueConfig, QueueOverflowBehavior};
     ///
     /// let config = QueueConfig::new()
     ///     .with_max_length(1000)
     ///     .with_overflow_behavior(QueueOverflowBehavior::RejectPublish);
+    /// assert_eq!(config.max_length, Some(1000));
+    /// assert_eq!(
+    ///     config.overflow_behavior,
+    ///     Some(QueueOverflowBehavior::RejectPublish)
+    /// );
     /// ```
     pub fn with_overflow_behavior(mut self, behavior: QueueOverflowBehavior) -> Self {
         self.overflow_behavior = Some(behavior);
@@ -278,10 +285,11 @@ impl QueueConfig {
     /// This is useful for ensuring ordered message processing.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```
     /// use celers_broker_amqp::QueueConfig;
     ///
     /// let config = QueueConfig::new().with_single_active_consumer(true);
+    /// assert!(config.single_active_consumer);
     /// ```
     pub fn with_single_active_consumer(mut self, enabled: bool) -> Self {
         self.single_active_consumer = enabled;

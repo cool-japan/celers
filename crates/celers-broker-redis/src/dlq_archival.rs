@@ -228,7 +228,7 @@ impl ArchivalConfig {
 impl DLQArchivalManager {
     /// Create a new DLQ archival manager
     pub async fn new(redis_url: &str, queue_name: &str, config: ArchivalConfig) -> Result<Self> {
-        let client = Client::open(redis_url)
+        let client = crate::connection::open_client(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
         let http_client = HttpClient::builder()

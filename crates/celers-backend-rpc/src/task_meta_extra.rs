@@ -50,6 +50,9 @@ pub(crate) struct TaskMetaExtra {
     pub retries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
+    /// See [`TaskMeta::ignored_error`](celers_backend_redis::TaskMeta::ignored_error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_error: Option<String>,
 }
 
 impl TaskMetaExtra {
@@ -65,6 +68,7 @@ impl TaskMetaExtra {
             memory_bytes: meta.memory_bytes,
             retries: meta.retries,
             queue: meta.queue.clone(),
+            ignored_error: meta.ignored_error.clone(),
         }
     }
 
@@ -107,6 +111,7 @@ impl TaskMetaExtra {
         meta.memory_bytes = self.memory_bytes;
         meta.retries = self.retries;
         meta.queue = self.queue;
+        meta.ignored_error = self.ignored_error;
     }
 }
 
@@ -129,6 +134,7 @@ mod tests {
         meta.memory_bytes = Some(4096);
         meta.retries = Some(2);
         meta.queue = Some("high".to_string());
+        meta.ignored_error = Some("suppressed: boom".to_string());
         meta
     }
 
@@ -152,6 +158,12 @@ mod tests {
         assert_eq!(restored.memory_bytes, Some(4096));
         assert_eq!(restored.retries, Some(2));
         assert_eq!(restored.queue.as_deref(), Some("high"));
+        // `ignored_error` is what carries `TaskResultValue::Ignored`'s
+        // suppressed error text through this same JSON tail (see
+        // `celers_backend_rpc::result_store`) -- it must round-trip through
+        // real serialization exactly like every other extended field, not
+        // just through an in-memory struct assignment.
+        assert_eq!(restored.ignored_error.as_deref(), Some("suppressed: boom"));
     }
 
     #[test]
@@ -160,6 +172,12 @@ mod tests {
         assert_eq!(extra.version, 0);
         assert!(extra.tags.is_empty());
         assert!(extra.progress.is_none());
+        // A message from a writer that predates `ignored_error` (absent
+        // `extra_json`) must never spuriously decode as an `Ignored`
+        // result -- see `celers_backend_rpc::result_store::from_task_result`,
+        // which trusts this being `None` to fall back to the plain `result`
+        // mapping.
+        assert!(extra.ignored_error.is_none());
     }
 
     #[test]

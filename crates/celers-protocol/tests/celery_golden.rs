@@ -252,6 +252,48 @@ fn a_real_celery_success_record_parses() {
     assert_eq!(result.result, Some(json!(9)));
     assert!(result.traceback.is_none());
     assert!(result.date_done.is_some(), "Celery always stamps date_done");
+    // A task that spawned nothing still gets the key, as an empty list.
+    assert!(result.children.is_empty());
+}
+
+/// `children` is a list of whole result trees, not of ids.
+///
+/// `celery.result.AsyncResult.as_tuple()` renders one child as
+/// `((task_id, parent_tuple), None)` and the backend stores that verbatim, so
+/// every retried, chained or grouped task's record carries one. The live proof
+/// -- children built by the installed Celery's own `as_tuple()` and fed back
+/// through `result_from_tuple` -- is
+/// `tests/python-compat/test_celers_to_python.py::test_celers_parses_a_celery_record_that_has_children`;
+/// this pins the shape without a Python.
+///
+/// Regression: `ResultMessage::children` was `Vec<Uuid>`, so `from_json`
+/// rejected such a record outright.
+#[test]
+fn a_result_record_with_nested_children_parses_and_is_written_back_unchanged() {
+    let children = json!([
+        // An AsyncResult with a parent: [[id, parent], null].
+        [["11111111-1111-4111-8111-111111111111", null], null],
+        // A GroupResult: its members live in the trailing slot.
+        [
+            ["22222222-2222-4222-8222-222222222222", null],
+            [[["33333333-3333-4333-8333-333333333333", null], null]]
+        ]
+    ]);
+    let mut record: Value = serde_json::from_str(RESULT_SUCCESS).expect("fixture is valid JSON");
+    record["children"] = children.clone();
+
+    let parsed = ResultMessage::from_json(record.to_string().as_bytes())
+        .expect("a record with children must parse");
+    assert_eq!(parsed.child_ids().len(), 2);
+    assert!(!parsed.children[0].is_group());
+    assert!(parsed.children[1].is_group());
+
+    let written: Value =
+        serde_json::from_slice(&parsed.to_json().expect("serialize")).expect("parse");
+    assert_eq!(
+        written["children"], children,
+        "the children Celery wrote must go back out unchanged"
+    );
 }
 
 #[test]
@@ -338,6 +380,53 @@ fn the_celers_envelope_round_trips_through_the_parser() {
     for key in ["callbacks", "errbacks", "chain", "chord"] {
         assert_eq!(tuple[2][key], json!(null), "embed is missing {key}");
     }
+}
+
+/// The two properties a kombu consumer indexes without a default survive the
+/// parser: a message read off a queue and written back out must still carry the
+/// producer's own `delivery_tag` and `delivery_info`, not a replacement.
+///
+/// Regression: `MessageProperties` accepted and then *discarded* both, so
+/// anything that round-tripped a captured envelope (a middleware, a retry
+/// re-publish, the zero-copy path) emitted a message
+/// `kombu.transport.virtual.base.Message.__init__` raises `KeyError` on --
+/// which kills the consumer loop rather than one message.
+#[test]
+fn the_kombu_delivery_properties_survive_a_round_trip() {
+    for (name, fixture) in task_fixtures() {
+        let raw: Value = serde_json::from_str(fixture).expect("fixture is valid JSON");
+        let message = parse(fixture);
+
+        assert_eq!(
+            json!(message.properties.delivery_tag),
+            raw["properties"]["delivery_tag"],
+            "{name}: the producer's delivery tag was replaced"
+        );
+        assert_eq!(
+            serde_json::to_value(&message.properties.delivery_info).expect("serialize"),
+            raw["properties"]["delivery_info"],
+            "{name}: delivery_info drifted"
+        );
+
+        let round_tripped = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(
+            round_tripped["properties"]["delivery_tag"], raw["properties"]["delivery_tag"],
+            "{name}: the delivery tag did not reach the wire"
+        );
+        assert_eq!(
+            round_tripped["properties"]["delivery_info"], raw["properties"]["delivery_info"],
+            "{name}: delivery_info did not reach the wire"
+        );
+    }
+}
+
+/// Celery's own captures name the queue they were published to, and CeleRS
+/// reads that rather than assuming the default.
+#[test]
+fn a_captured_envelope_names_the_queue_it_was_published_to() {
+    let message = parse(POSITIONAL_TUPLE);
+    assert_eq!(message.properties.routing_key(), "celers-compat-capture");
+    assert_eq!(message.properties.delivery_info.exchange, "");
 }
 
 // =============================================================================

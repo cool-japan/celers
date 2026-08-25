@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Prometheus metrics and observability for CeleRS"
 readme = "README.md"
 keywords = ["celery", "metrics", "prometheus", "monitoring", "observability"]

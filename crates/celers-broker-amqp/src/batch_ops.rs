@@ -37,9 +37,14 @@ impl AmqpBroker {
     /// Number of messages successfully published
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
+    /// # use celers_protocol::Message;
+    /// # async fn example(mut broker: AmqpBroker, messages: Vec<Message>) -> Result<(), Box<dyn std::error::Error>> {
     /// // Publish with pipeline depth of 100 (send 100 messages before waiting for confirms)
-    /// let count = broker.publish_pipeline("my_queue", messages, 100).await?;
+    /// let _count = broker.publish_pipeline("my_queue", messages, 100).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn publish_pipeline(
         &mut self,
@@ -391,9 +396,13 @@ impl AmqpBroker {
     /// Vector of envelopes containing all drained messages
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
+    /// # async fn example(mut broker: AmqpBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// let messages = broker.drain_queue("my_queue").await?;
     /// println!("Drained {} messages", messages.len());
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn drain_queue(&mut self, queue: &str) -> Result<Vec<Envelope>> {
         self.drain_queue_limited(queue, Self::DEFAULT_DRAIN_LIMIT)
@@ -471,12 +480,16 @@ impl AmqpBroker {
     /// * `queue_configs` - Vector of tuples (queue_name, QueueConfig)
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::{AmqpBroker, QueueConfig};
+    /// # async fn example(mut broker: AmqpBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// let configs = vec![
     ///     ("queue1", QueueConfig::default()),
-    ///     ("queue2", QueueConfig::default().with_priority(10)),
+    ///     ("queue2", QueueConfig::default().with_max_priority(10)),
     /// ];
     /// broker.declare_queues_batch(configs).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn declare_queues_batch(
         &mut self,
@@ -648,16 +661,20 @@ impl AmqpBroker {
     /// Reply message from the RPC server
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
     /// use std::time::Duration;
-    /// use celers_protocol::MessageBuilder;
+    /// use celers_protocol::builder::MessageBuilder;
     ///
+    /// # async fn example(mut broker: AmqpBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// let request = MessageBuilder::new("tasks.calculate")
     ///     .args(vec![serde_json::json!({"x": 10, "y": 20})])
     ///     .build()?;
     ///
     /// let reply = broker.rpc_call("rpc_queue", request, Duration::from_secs(5)).await?;
     /// println!("RPC result: {:?}", reply);
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn rpc_call(
         &mut self,
@@ -845,17 +862,25 @@ impl AmqpBroker {
     /// * `reply` - Reply message to send
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
+    /// use std::time::Duration;
+    /// use celers_kombu::Consumer;
+    /// use celers_protocol::builder::MessageBuilder;
+    ///
+    /// # async fn example(mut broker: AmqpBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// // In RPC server
     /// if let Some(envelope) = broker.consume("rpc_queue", Duration::from_secs(1)).await? {
     ///     // Process request and create reply
     ///     let reply = MessageBuilder::new("result")
-    ///         .body(serde_json::json!({"result": 42}))
+    ///         .args(vec![serde_json::json!({"result": 42})])
     ///         .build()?;
     ///
     ///     broker.rpc_reply(&envelope, reply).await?;
     ///     broker.ack(&envelope.delivery_tag).await?;
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn rpc_reply(&mut self, request_envelope: &Envelope, reply: Message) -> Result<()> {
         // The reply address is whatever the requester asked for; it is never
@@ -915,7 +940,7 @@ impl AmqpBroker {
     /// will be acknowledged atomically.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// use celers_broker_amqp::AmqpBroker;
     /// use celers_kombu::{Transport, Consumer};
     ///
@@ -958,8 +983,9 @@ impl AmqpBroker {
     /// Uses NACK to reject multiple messages atomically.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// use celers_broker_amqp::AmqpBroker;
+    /// use celers_kombu::Transport;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
@@ -1012,12 +1038,19 @@ impl AmqpBroker {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
+    /// use celers_kombu::Consumer;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example(mut broker: AmqpBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// let envelopes = broker.consume_batch("my_queue", 100, Duration::from_secs(1)).await?;
     /// for envelope in envelopes {
     ///     // Process message
     ///     broker.ack(&envelope.delivery_tag).await?;
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn consume_batch(
         &mut self,
@@ -1161,11 +1194,15 @@ impl AmqpBroker {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
+    /// # async fn example(mut broker: AmqpBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// let messages = broker.peek_queue("my_queue", 10).await?;
     /// for msg in messages {
     ///     println!("Message ID: {}", msg.headers.id);
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn peek_queue(&mut self, queue: &str, max_messages: usize) -> Result<Vec<Message>> {
         let max_messages = max_messages.min(100); // Cap at 100 for safety
@@ -1251,10 +1288,14 @@ impl AmqpBroker {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
+    /// # async fn example(broker: AmqpBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// if broker.check_aliveness(None).await? {
     ///     println!("RabbitMQ is alive!");
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn check_aliveness(&self, vhost: Option<&str>) -> Result<bool> {
         let mgmt_api = self
@@ -1303,10 +1344,13 @@ impl AmqpBroker {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
+    /// # async fn example(broker: AmqpBroker) {
     /// if let Some(metrics) = broker.get_connection_pool_metrics().await {
     ///     println!("Pool utilization: {:.2}%", metrics.utilization() * 100.0);
     /// }
+    /// # }
     /// ```
     pub async fn get_connection_pool_metrics(&self) -> Option<ConnectionPoolMetrics> {
         match &self.connection_pool {
@@ -1324,10 +1368,13 @@ impl AmqpBroker {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_amqp::AmqpBroker;
+    /// # async fn example(broker: AmqpBroker) {
     /// if let Some(metrics) = broker.get_channel_pool_metrics().await {
     ///     println!("Pool utilization: {:.2}%", metrics.utilization() * 100.0);
     /// }
+    /// # }
     /// ```
     pub async fn get_channel_pool_metrics(&self) -> Option<ChannelPoolMetrics> {
         match &self.channel_pool {

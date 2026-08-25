@@ -97,7 +97,7 @@ impl RedisResultBackend {
     /// Celery's `result_expires`. Use [`Self::without_ttl`] for permanent
     /// results or [`Self::with_ttl_config`] for per-task-type expiry.
     pub fn new(url: &str) -> Result<Self> {
-        let client = Client::open(url).map_err(|e| {
+        let client = crate::tls::open_client(url).map_err(|e| {
             BackendError::Connection(format!("Failed to create Redis client: {}", e))
         })?;
 
@@ -186,11 +186,23 @@ impl RedisResultBackend {
         &self.versioning
     }
 
-    /// Enable or disable the pub/sub notification published on every write.
+    /// Enable or disable the pub/sub notifications published on every write.
     ///
-    /// The notification is what lets
-    /// [`wait_for_result`](Self::wait_for_result) return as soon as a result
-    /// lands instead of waiting for the next poll.
+    /// This one flag now gates *two* channels, both fired from the same
+    /// write:
+    ///
+    /// * CeleRS' own `:notify`-suffixed channel, which is what lets
+    ///   [`wait_for_result`](Self::wait_for_result) return as soon as a
+    ///   result lands instead of waiting for the next poll.
+    /// * The Celery-compatible channel named after the result key itself,
+    ///   carrying the exact bytes just stored — the "SET and PUBLISH"
+    ///   contract a real Celery Python client's `AsyncResult.get()` depends
+    ///   on (see `celery.backends.redis.BaseKeyValueStoreBackend._set`).
+    ///
+    /// Disabling this (`false`) therefore also stops a genuine Celery
+    /// client's wait from being woken by a write — it falls back to
+    /// blocking until its own poll timeout, exactly as if this backend were
+    /// a plain Redis `SET` with no pub/sub at all.
     pub fn with_store_notifications(mut self, enabled: bool) -> Self {
         self.notify_on_store = enabled;
         self
@@ -697,7 +709,8 @@ impl RedisResultBackend {
         // One atomic write with `SET ... EX`: a crash can never leave the
         // result stored without its expiry.
         let key = self.task_key(task_id);
-        self.write_meta_to_key(&key, meta, Some(ttl), None).await?;
+        self.write_meta_to_key(&key, meta, Some(ttl), None, true)
+            .await?;
         self.cache_terminal(task_id, meta);
         self.publish_notification(task_id, meta).await;
         Ok(())
@@ -1232,7 +1245,16 @@ impl RedisResultBackend {
             // An explicit `ttl` wins; otherwise fall back to the configured
             // per-task-type policy so atomic writes expire like normal ones.
             let effective_ttl = ttl.or_else(|| self.ttl_config.get_ttl(&meta.task_name));
-            commands.push(codec::write_command(&key, &encoded, effective_ttl, None));
+            // No CAS guard here either, so — as in `store_results_batch` —
+            // the PUBLISH can ride the same MULTI/EXEC transaction
+            // unconditionally; Redis allows PUBLISH inside a transaction.
+            commands.extend(codec::write_and_notify_commands(
+                &key,
+                &encoded,
+                effective_ttl,
+                None,
+                self.notify_on_store,
+            ));
         }
 
         self.run_with_retry("atomic_store_multiple", |mut conn| {
@@ -1429,7 +1451,7 @@ impl RedisResultBackend {
 
         let ttl = self.ttl_config.get_ttl(&new_value.task_name);
         let swapped = self
-            .write_meta_to_key(&key, new_value, ttl, Some(&raw))
+            .write_meta_to_key(&key, new_value, ttl, Some(&raw), true)
             .await?;
 
         if swapped {

@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Periodic task scheduler for CeleRS (Celery Beat equivalent)"
 readme = "README.md"
 keywords = ["celery", "scheduler", "cron", "periodic", "beat"]
@@ -33,10 +34,22 @@ cron = { workspace = true, optional = true }
 # Optional: Solar event calculation
 sunrise = { workspace = true, optional = true }
 
+# Optional: Redis-backed ScheduleStore, for a schedule catalog shared across
+# beat instances instead of one process's local file.
+redis = { workspace = true, optional = true }
+
+# Supplies the Pure-Rust rustls crypto provider that the `redis-store` module
+# installs as the process default. Optional and enabled only alongside `redis`:
+# no rustls provider *feature* is enabled anywhere in this workspace, so the
+# bare `rustls::ClientConfig::builder()` the `redis` crate uses for `rediss://`
+# panics without it.
+oxitls = { workspace = true, optional = true }
+
 [features]
 default = []
 cron = ["dep:cron"]
 solar = ["dep:sunrise"]
+redis-store = ["dep:redis", "dep:oxitls"]
 
 [dev-dependencies]
 tokio = { workspace = true }

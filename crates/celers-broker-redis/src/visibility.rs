@@ -131,6 +131,7 @@ pub struct VisibilityManager {
     pop_batch_script: Script,
     ack_unacked_script: Script,
     nack_unacked_script: Script,
+    defer_unacked_script: Script,
     reap_script: Script,
     promote_script: Script,
     revoke_script: Script,
@@ -149,6 +150,7 @@ impl VisibilityManager {
             pop_batch_script: Script::new(lua_scripts::POP_BATCH_TO_UNACKED),
             ack_unacked_script: Script::new(lua_scripts::ACK_UNACKED),
             nack_unacked_script: Script::new(lua_scripts::NACK_UNACKED),
+            defer_unacked_script: Script::new(lua_scripts::DEFER_UNACKED),
             reap_script: Script::new(lua_scripts::REAP_EXPIRED),
             promote_script: Script::new(lua_scripts::PROMOTE_DELAYED),
             revoke_script: Script::new(lua_scripts::REVOKE_TASK),
@@ -411,6 +413,42 @@ impl VisibilityManager {
             .arg(score)
             .invoke_async(conn)
             .await
+    }
+
+    /// Return a message delivered by [`Self::pop_to_unacked`] to the queue with
+    /// its payload — and therefore its retry state — untouched.
+    ///
+    /// `execute_at` is an absolute Unix timestamp in whole seconds, the same
+    /// scale [`Self::promote_delayed`] compares against; `0` means "deliverable
+    /// now" and routes the message to the ready queue instead of the delayed
+    /// set. `score` is used only for the immediate route in Priority mode.
+    ///
+    /// Returns `true` if the message was still in flight and has been returned,
+    /// `false` if it was not (already acknowledged, reaped or revoked), in
+    /// which case nothing was re-added.
+    pub async fn defer_unacked<C: ConnectionLike + Send>(
+        &self,
+        conn: &mut C,
+        keys: &QueueKeys,
+        message: &str,
+        execute_at: u64,
+        mode: QueueMode,
+        score: f64,
+    ) -> redis::RedisResult<bool> {
+        let deferred: i64 = self
+            .defer_unacked_script
+            .key(&keys.unacked)
+            .key(&keys.processing)
+            .key(&keys.delayed)
+            .key(&keys.queue)
+            .arg(message)
+            .arg(execute_at)
+            .arg(mode_arg(mode))
+            .arg(score)
+            .invoke_async(conn)
+            .await?;
+
+        Ok(deferred == 1)
     }
 
     /// Requeue in-flight messages whose visibility timeout has expired, and

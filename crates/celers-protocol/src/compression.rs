@@ -17,14 +17,17 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use celers_protocol::compression::{Compressor, CompressionType};
 //!
+//! # #[cfg(feature = "gzip")]
+//! # {
 //! let compressor = Compressor::new(CompressionType::Gzip);
 //! let data = b"Hello, World!".repeat(100);
 //! let compressed = compressor.compress(&data).unwrap();
 //! let decompressed = compressor.decompress(&compressed).unwrap();
 //! assert_eq!(data, decompressed);
+//! # }
 //! ```
 
 use serde::{Deserialize, Serialize};

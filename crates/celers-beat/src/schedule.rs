@@ -371,184 +371,141 @@ impl Schedule {
                 latitude,
                 longitude,
             } => {
-                #[allow(deprecated)]
-                use sunrise::sunrise_sunset;
+                use sunrise::{Coordinates, DawnType, SolarDay, SolarEvent};
 
-                // Start from last_run or now
+                // `Coordinates::new` validates the pair and returns `None` for
+                // out-of-range values. The deprecated `sunrise_sunset` helper
+                // this branch used to call panicked on them instead
+                // (`.expect("invalid coordinates")` inside the crate), which
+                // would have taken the whole beat process down on a bad
+                // schedule entry; report it as an error instead.
+                let coordinates = Coordinates::new(*latitude, *longitude).ok_or_else(|| {
+                    ScheduleError::Invalid(format!(
+                        "Invalid coordinates for solar event '{event}': latitude {latitude} must \
+                         be within [-90, 90] and longitude {longitude} within [-180, 180]"
+                    ))
+                })?;
+
+                // Resolve the event name ONCE, before the date search: an
+                // unknown name is a configuration error that no later date can
+                // fix, so it must not be re-derived inside the loop.
+                //
+                // The twilight arms use the `sunrise` crate's own `Dawn`/`Dusk`
+                // events, which solve for the exact solar elevation each name
+                // documents (civil 6°, nautical 12°, astronomical 18° below the
+                // horizon). They previously approximated those angles as fixed
+                // ±30/60/90-minute offsets from sunrise/sunset -- roughly right
+                // at low latitudes, badly wrong towards the poles and at the
+                // solstices.
+                let (base_event, offset) = match event.to_lowercase().as_str() {
+                    "sunrise" => (SolarEvent::Sunrise, Duration::zero()),
+                    "sunset" => (SolarEvent::Sunset, Duration::zero()),
+                    "civil_twilight_begin" | "dawn" => {
+                        (SolarEvent::Dawn(DawnType::Civil), Duration::zero())
+                    }
+                    "civil_twilight_end" | "dusk" => {
+                        (SolarEvent::Dusk(DawnType::Civil), Duration::zero())
+                    }
+                    "nautical_twilight_begin" => {
+                        (SolarEvent::Dawn(DawnType::Nautical), Duration::zero())
+                    }
+                    "nautical_twilight_end" => {
+                        (SolarEvent::Dusk(DawnType::Nautical), Duration::zero())
+                    }
+                    "astronomical_twilight_begin" => {
+                        (SolarEvent::Dawn(DawnType::Astronomical), Duration::zero())
+                    }
+                    "astronomical_twilight_end" => {
+                        (SolarEvent::Dusk(DawnType::Astronomical), Duration::zero())
+                    }
+                    // Golden hour: the sun between 0° (the horizon) and 6° of
+                    // elevation, prized in photography for soft, warm light.
+                    // These used to be flat ±0/30-minute offsets from
+                    // sunrise/sunset -- roughly right at low latitudes, badly
+                    // wrong towards the poles and at the solstices, exactly
+                    // like the twilight arms above before their fix. Now a
+                    // true `SolarEvent::Elevation` solve, like those.
+                    //
+                    // `SolarEvent::Elevation { elevation, morning }`'s
+                    // `elevation` field is **not** the sun's true elevation:
+                    // it feeds the same `-sin(elevation + refraction)` term
+                    // the crate uses internally for Sunrise/Sunset/Dawn/Dusk,
+                    // where a positive value means "this many radians *below*
+                    // the horizon" (see `DawnType::positive_angle` and
+                    // `SolarEvent::Sunrise`'s fixed 5/6° depression). A target
+                    // true elevation `e` above the horizon is therefore
+                    // passed as `elevation: -e`, confirmed against the
+                    // `sunrise` crate's own `test_order`/`test_elevation`
+                    // integration tests (`elevation: -0.1, morning: true`
+                    // resolves shortly *after* sunrise, i.e. above the
+                    // horizon) since this sign convention is otherwise
+                    // undocumented.
+                    //
+                    // `golden_hour_begin` is the morning boundary: the sun's
+                    // centre crossing the true (unrefracted) horizon, `e =
+                    // 0°`, so `elevation: -0°` (0.0 either way). It therefore
+                    // resolves a few minutes *after* `SolarEvent::Sunrise`,
+                    // whose 5/6° depression accounts for atmospheric
+                    // refraction and the solar disc's radius.
+                    // `golden_hour_end` is the evening boundary: the sun
+                    // descending through `e = 6°`, `elevation: -6°`, which
+                    // resolves well *before* `SolarEvent::Sunset` -- golden
+                    // light fades before the sun actually sets.
+                    "golden_hour_begin" => (
+                        SolarEvent::Elevation {
+                            elevation: 0.0,
+                            morning: true,
+                        },
+                        Duration::zero(),
+                    ),
+                    "golden_hour_end" => (
+                        SolarEvent::Elevation {
+                            elevation: -(6.0_f64.to_radians()),
+                            morning: false,
+                        },
+                        Duration::zero(),
+                    ),
+                    _ => {
+                        return Err(ScheduleError::Invalid(format!(
+                            "Unknown solar event: {}. Supported events: sunrise, sunset, civil_twilight_begin/end, nautical_twilight_begin/end, astronomical_twilight_begin/end, golden_hour_begin/end, dawn, dusk",
+                            event
+                        )))
+                    }
+                };
+
                 let start_time = last_run.unwrap_or_else(Utc::now);
-                let mut current_date = start_time.date_naive();
 
-                // Search for next occurrence (up to 365 days ahead)
-                for _ in 0..365 {
-                    #[allow(deprecated)]
-                    let (sunrise_time, sunset_time) = sunrise_sunset(
-                        *latitude,
-                        *longitude,
-                        current_date.year(),
-                        current_date.month(),
-                        current_date.day(),
-                    );
+                // Begin the scan one day BEFORE the start date.
+                // `SolarDay::event_time` returns an absolute UTC instant, and
+                // the event belonging to local date D routinely falls on a
+                // different UTC date: Tokyo sunrise for date D is ~19:25Z on
+                // D-1, while a western-hemisphere sunset for D lands early on
+                // D+1. Anchoring the scan at `start_time.date_naive()` would
+                // therefore skip a still-future event owned by the previous
+                // nominal date. The `> start_time` comparison below is what
+                // actually decides which instant is next.
+                let mut current_date = start_time
+                    .date_naive()
+                    .checked_sub_days(chrono::Days::new(1))
+                    .ok_or_else(|| ScheduleError::Invalid("Date underflow".to_string()))?;
 
-                    let event_time = match event.to_lowercase().as_str() {
-                        "sunrise" => {
-                            // sunrise_time is minutes since midnight
-                            let hours = (sunrise_time / 60) as u32;
-                            let minutes = (sunrise_time % 60) as u32;
-                            current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunrise time: {} minutes",
-                                        sunrise_time
-                                    ))
-                                })?
-                                .and_utc()
+                // 367 = the extra leading day + a full 366-day (leap) year, so
+                // the horizon promised by the error message below still holds.
+                for _ in 0..367 {
+                    // `event_time` returns `None` when the event genuinely does
+                    // not occur on this date -- polar day and polar night, where
+                    // the sun never crosses the requested elevation. That is not
+                    // an error: advance a day and keep looking. Only running out
+                    // of days is a failure.
+                    if let Some(instant) =
+                        SolarDay::new(coordinates, current_date).event_time(base_event)
+                    {
+                        let event_time = instant + offset;
+                        if event_time > start_time {
+                            return Ok(event_time);
                         }
-                        "sunset" => {
-                            // sunset_time is minutes since midnight
-                            let hours = (sunset_time / 60) as u32;
-                            let minutes = (sunset_time % 60) as u32;
-                            current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunset time: {} minutes",
-                                        sunset_time
-                                    ))
-                                })?
-                                .and_utc()
-                        }
-                        // Civil twilight (sun 6° below horizon) - approximate 30 min before/after sunrise/sunset
-                        "civil_twilight_begin" | "dawn" => {
-                            let hours = (sunrise_time / 60) as u32;
-                            let minutes = (sunrise_time % 60) as u32;
-                            let sunrise = current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunrise time: {} minutes",
-                                        sunrise_time
-                                    ))
-                                })?
-                                .and_utc();
-                            sunrise - Duration::minutes(30)
-                        }
-                        "civil_twilight_end" | "dusk" => {
-                            let hours = (sunset_time / 60) as u32;
-                            let minutes = (sunset_time % 60) as u32;
-                            let sunset = current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunset time: {} minutes",
-                                        sunset_time
-                                    ))
-                                })?
-                                .and_utc();
-                            sunset + Duration::minutes(30)
-                        }
-                        // Nautical twilight (sun 12° below horizon) - approximate 60 min before/after sunrise/sunset
-                        "nautical_twilight_begin" => {
-                            let hours = (sunrise_time / 60) as u32;
-                            let minutes = (sunrise_time % 60) as u32;
-                            let sunrise = current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunrise time: {} minutes",
-                                        sunrise_time
-                                    ))
-                                })?
-                                .and_utc();
-                            sunrise - Duration::minutes(60)
-                        }
-                        "nautical_twilight_end" => {
-                            let hours = (sunset_time / 60) as u32;
-                            let minutes = (sunset_time % 60) as u32;
-                            let sunset = current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunset time: {} minutes",
-                                        sunset_time
-                                    ))
-                                })?
-                                .and_utc();
-                            sunset + Duration::minutes(60)
-                        }
-                        // Astronomical twilight (sun 18° below horizon) - approximate 90 min before/after sunrise/sunset
-                        "astronomical_twilight_begin" => {
-                            let hours = (sunrise_time / 60) as u32;
-                            let minutes = (sunrise_time % 60) as u32;
-                            let sunrise = current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunrise time: {} minutes",
-                                        sunrise_time
-                                    ))
-                                })?
-                                .and_utc();
-                            sunrise - Duration::minutes(90)
-                        }
-                        "astronomical_twilight_end" => {
-                            let hours = (sunset_time / 60) as u32;
-                            let minutes = (sunset_time % 60) as u32;
-                            let sunset = current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunset time: {} minutes",
-                                        sunset_time
-                                    ))
-                                })?
-                                .and_utc();
-                            sunset + Duration::minutes(90)
-                        }
-                        // Golden hour (sun 0-6° above horizon) - approximate 30 min after sunrise / before sunset
-                        "golden_hour_begin" => {
-                            let hours = (sunrise_time / 60) as u32;
-                            let minutes = (sunrise_time % 60) as u32;
-                            current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunrise time: {} minutes",
-                                        sunrise_time
-                                    ))
-                                })?
-                                .and_utc()
-                            // Golden hour starts at sunrise
-                        }
-                        "golden_hour_end" => {
-                            let hours = (sunset_time / 60) as u32;
-                            let minutes = (sunset_time % 60) as u32;
-                            let sunset = current_date
-                                .and_hms_opt(hours, minutes, 0)
-                                .ok_or_else(|| {
-                                    ScheduleError::Invalid(format!(
-                                        "Invalid sunset time: {} minutes",
-                                        sunset_time
-                                    ))
-                                })?
-                                .and_utc();
-                            // Golden hour ends ~30 min before sunset
-                            sunset - Duration::minutes(30)
-                        }
-                        _ => {
-                            return Err(ScheduleError::Invalid(format!(
-                                "Unknown solar event: {}. Supported events: sunrise, sunset, civil_twilight_begin/end, nautical_twilight_begin/end, astronomical_twilight_begin/end, golden_hour_begin/end, dawn, dusk",
-                                event
-                            )))
-                        }
-                    };
-
-                    // If this event time is in the future, return it
-                    if event_time > start_time {
-                        return Ok(event_time);
                     }
 
-                    // Move to next day
                     current_date = current_date
                         .checked_add_days(chrono::Days::new(1))
                         .ok_or_else(|| ScheduleError::Invalid("Date overflow".to_string()))?;

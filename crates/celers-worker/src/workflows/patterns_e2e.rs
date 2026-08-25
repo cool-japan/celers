@@ -413,6 +413,37 @@ async fn pipeline_stages_run_in_order_each_fed_by_the_previous_one() {
     assert_eq!(observed[2].args, vec![serde_json::json!("transform-done")]);
 }
 
+/// A stage that fails for good ends the pipeline: the stages behind it never
+/// run, because a chain step is only enqueued by the *success* path of the one
+/// before it.
+#[tokio::test]
+async fn pipeline_stops_at_a_stage_that_fails() {
+    let broker = InMemoryBroker::new();
+
+    Pipeline::new()
+        .stage(sig("extract"))
+        .stage(sig("transform"))
+        .stage(sig("load"))
+        .apply(&broker)
+        .await
+        .expect("pipeline dispatches");
+
+    let observed = run_workflow(&broker, None, |step| {
+        if step.name == "transform" {
+            Outcome::Failure("malformed row")
+        } else {
+            Outcome::json(serde_json::json!(format!("{}-done", step.name)))
+        }
+    })
+    .await;
+
+    assert_eq!(
+        names(&observed),
+        vec!["extract", "transform"],
+        "the stages after a failed one must not run"
+    );
+}
+
 // ============================================================================
 // FanOut
 // ============================================================================
@@ -449,6 +480,38 @@ async fn fan_out_delivers_to_every_consumer_and_stops_there() {
             "each consumer keeps the arguments the source handed it"
         );
     }
+}
+
+/// One consumer failing must not take the others with it: a fan-out's members
+/// are independent, so the group has no shared fate.
+#[tokio::test]
+async fn fan_out_consumers_are_independent_when_one_fails() {
+    let broker = InMemoryBroker::new();
+
+    FanOut::new(sig("publish_event"))
+        .consumer(sig("update_search_index"))
+        .consumer(sig("send_webhook"))
+        .consumer(sig("invalidate_cache"))
+        .apply_after_source(&broker)
+        .await
+        .expect("consumers dispatch");
+
+    let observed = run_workflow(&broker, None, |step| {
+        if step.name == "send_webhook" {
+            Outcome::Failure("endpoint returned 500")
+        } else {
+            Outcome::json(serde_json::json!("ack"))
+        }
+    })
+    .await;
+
+    let mut ran = names(&observed);
+    ran.sort_unstable();
+    assert_eq!(
+        ran,
+        vec!["invalidate_cache", "send_webhook", "update_search_index"],
+        "the surviving consumers still run: a failed member has no successor to cancel"
+    );
 }
 
 // ============================================================================

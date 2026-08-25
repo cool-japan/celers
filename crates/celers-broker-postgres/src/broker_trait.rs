@@ -469,6 +469,49 @@ impl Broker for PostgresBroker {
         Ok(rows_affected > 0)
     }
 
+    /// Revoke a task, optionally aborting a copy that is already running.
+    ///
+    /// The revocation is **durable**: the id is recorded in
+    /// `celers_revoked_tasks` (scored by `expires_at`, pruned on every call)
+    /// and [`is_revoked`](Self::is_revoked) refuses it for as long as that
+    /// row lives — so a task that is still `pending` really is cancelled, and
+    /// one enqueued again under the same id before the record lapses is
+    /// refused too. See `revocation.rs` for the full design and why the
+    /// claim query itself is not filtered against this table.
+    ///
+    /// A [`RevocationNotice`](celers_core::revocation_channel::RevocationNotice)
+    /// is then published (via `pg_notify`) on `celers_revoked_<queue>` for
+    /// workers already executing the task — the channel
+    /// [`subscribe_revocations`](Self::subscribe_revocations) reads. That
+    /// notification is fire-and-forget, exactly like the durable row is not:
+    /// a worker that is restarting or momentarily disconnected never sees it,
+    /// which is why an implementation that only published would cancel
+    /// nothing durable at all.
+    ///
+    /// Returns `true` once the revocation is recorded.
+    async fn revoke(&self, task_id: &TaskId, terminate: bool) -> Result<bool> {
+        self.record_revocation(task_id, terminate).await
+    }
+
+    /// Whether `task_id` is listed in the durable `celers_revoked_tasks` set
+    /// for this broker's queue, with a still-live `expires_at`.
+    async fn is_revoked(&self, task_id: &TaskId) -> Result<bool> {
+        self.read_revocation(task_id).await
+    }
+
+    /// Subscribe to `celers_revoked_<queue>`, the channel
+    /// [`revoke`](Self::revoke) notifies on.
+    ///
+    /// Opens a dedicated `LISTEN` connection (a long-lived listener must not
+    /// share the broker's pooled query connections — see
+    /// `create_notification_listener` for the same rationale applied to task
+    /// notifications).
+    async fn subscribe_revocations(
+        &self,
+    ) -> Result<Option<Box<dyn celers_core::revocation_channel::RevocationStream>>> {
+        Ok(Some(Box::new(self.open_revocation_listener().await?)))
+    }
+
     /// Schedule a task for execution at a specific Unix timestamp (seconds)
     async fn enqueue_at(&self, task: SerializedTask, execute_at: i64) -> Result<TaskId> {
         let task_id = task.metadata.id;

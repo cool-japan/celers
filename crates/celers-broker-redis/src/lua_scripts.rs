@@ -421,6 +421,63 @@ redis.call('LPUSH', KEYS[4], ARGV[1])
 return 'dlq'
 "#;
 
+/// Return a message staged by [`POP_TO_UNACKED`] to the queue **unchanged**.
+///
+/// This is the retry-neutral counterpart of [`NACK_UNACKED`]'s requeue branch.
+/// Both clear the two in-flight structures and put the message back, but this
+/// one writes `ARGV[1]` *itself* — no retry-count rewrite — and can route it
+/// either to the ready queue or to the delayed sorted set, where it stays
+/// invisible until [`PROMOTE_DELAYED`] finds it due.
+///
+/// The whole sequence is one script for the same reason `NACK_UNACKED` is:
+/// clearing the in-flight structures and re-adding the message must not be
+/// interruptible, or a crash between the two loses the message outright (or,
+/// the other way round, leaves it deliverable *and* in flight).
+///
+/// Unlike `NACK_UNACKED` it re-adds **only if the message was still in
+/// flight**. A deferral can race the reaper (any worker's dequeue may run a
+/// sweep), an `ack`, or a revocation; re-adding unconditionally after one of
+/// those has disposed of the message would duplicate it.
+///
+/// `KEYS[1]`: unacked sorted set
+/// `KEYS[2]`: processing list
+/// `KEYS[3]`: delayed sorted set
+/// `KEYS[4]`: queue name (list in FIFO mode, sorted set in Priority mode)
+/// `ARGV[1]`: message data (as delivered)
+/// `ARGV[2]`: execution time (Unix timestamp), or `0` for "deliverable now"
+/// `ARGV[3]`: queue mode (`priority` or `fifo`)
+/// `ARGV[4]`: sorted-set score to requeue with (Priority mode, immediate only)
+///
+/// Returns: `1` if the message was still in flight and has been returned, `0`
+/// if it was not — in which case nothing is re-added.
+pub const DEFER_UNACKED: &str = r#"
+local unacked = KEYS[1]
+local processing = KEYS[2]
+local delayed = KEYS[3]
+local queue = KEYS[4]
+local msg = ARGV[1]
+local execute_at = tonumber(ARGV[2])
+local mode = ARGV[3]
+local score = tonumber(ARGV[4])
+
+local staged = redis.call('ZREM', unacked, msg)
+local listed = redis.call('LREM', processing, 1, msg)
+
+if staged == 0 and listed == 0 then
+    return 0
+end
+
+if execute_at > 0 then
+    redis.call('ZADD', delayed, execute_at, msg)
+elseif mode == 'priority' then
+    redis.call('ZADD', queue, score, msg)
+else
+    redis.call('LPUSH', queue, msg)
+end
+
+return 1
+"#;
+
 /// Reclaim in-flight messages whose visibility timeout has expired.
 ///
 /// Runs in two phases:
@@ -623,7 +680,10 @@ return moved
 "#;
 
 /// Current script version (increment when scripts change)
-pub const SCRIPT_VERSION: u32 = 2;
+///
+/// Bumped to 3 by the addition of [`DEFER_UNACKED`], the retry-neutral
+/// in-flight -> delayed move behind `Broker::defer`.
+pub const SCRIPT_VERSION: u32 = 3;
 
 /// Script identifier for easy lookup
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -648,6 +708,8 @@ pub enum ScriptId {
     AckUnacked,
     /// Reject a message staged by [`ScriptId::PopToUnacked`]
     NackUnacked,
+    /// Defer a message staged by [`ScriptId::PopToUnacked`] into the delayed set
+    DeferUnacked,
     /// Reclaim in-flight messages past their visibility deadline
     ReapExpired,
     /// Promote due delayed tasks onto the main queue
@@ -672,6 +734,7 @@ impl ScriptId {
             ScriptId::PopBatchToUnacked => POP_BATCH_TO_UNACKED,
             ScriptId::AckUnacked => ACK_UNACKED,
             ScriptId::NackUnacked => NACK_UNACKED,
+            ScriptId::DeferUnacked => DEFER_UNACKED,
             ScriptId::ReapExpired => REAP_EXPIRED,
             ScriptId::PromoteDelayed => PROMOTE_DELAYED,
             ScriptId::RevokeTask => REVOKE_TASK,
@@ -692,6 +755,7 @@ impl ScriptId {
             ScriptId::PopBatchToUnacked => "pop_batch_to_unacked",
             ScriptId::AckUnacked => "ack_unacked",
             ScriptId::NackUnacked => "nack_unacked",
+            ScriptId::DeferUnacked => "defer_unacked",
             ScriptId::ReapExpired => "reap_expired",
             ScriptId::PromoteDelayed => "promote_delayed",
             ScriptId::RevokeTask => "revoke_task",
@@ -712,6 +776,7 @@ impl ScriptId {
             ScriptId::PopBatchToUnacked,
             ScriptId::AckUnacked,
             ScriptId::NackUnacked,
+            ScriptId::DeferUnacked,
             ScriptId::ReapExpired,
             ScriptId::PromoteDelayed,
             ScriptId::RevokeTask,
@@ -1035,6 +1100,11 @@ mod tests {
         assert!(ACK_UNACKED.contains("LREM"));
         assert!(REAP_EXPIRED.contains("ZRANGEBYSCORE"));
         assert!(PROMOTE_DELAYED.contains("ZREM"));
+        // A deferral clears both in-flight structures and re-adds the message
+        // to the delayed set; missing either half loses or duplicates it.
+        assert!(DEFER_UNACKED.contains("ZREM"));
+        assert!(DEFER_UNACKED.contains("LREM"));
+        assert!(DEFER_UNACKED.contains("ZADD"));
         assert!(REVOKE_TASK.contains("ZREMRANGEBYSCORE"));
         assert!(REPLAY_DLQ.contains("LREM"));
     }
@@ -1060,6 +1130,7 @@ mod tests {
             NACK_MESSAGE,
             RECOVER_TIMED_OUT,
             NACK_UNACKED,
+            DEFER_UNACKED,
             REAP_EXPIRED,
             PROMOTE_DELAYED,
             REPLAY_DLQ,
@@ -1145,6 +1216,7 @@ mod tests {
         assert_eq!(ScriptId::PopBatchToUnacked.source(), POP_BATCH_TO_UNACKED);
         assert_eq!(ScriptId::AckUnacked.source(), ACK_UNACKED);
         assert_eq!(ScriptId::NackUnacked.source(), NACK_UNACKED);
+        assert_eq!(ScriptId::DeferUnacked.source(), DEFER_UNACKED);
         assert_eq!(ScriptId::ReapExpired.source(), REAP_EXPIRED);
         assert_eq!(ScriptId::PromoteDelayed.source(), PROMOTE_DELAYED);
         assert_eq!(ScriptId::RevokeTask.source(), REVOKE_TASK);
@@ -1167,6 +1239,7 @@ mod tests {
         );
         assert_eq!(ScriptId::PopToUnacked.name(), "pop_to_unacked");
         assert_eq!(ScriptId::PopBatchToUnacked.name(), "pop_batch_to_unacked");
+        assert_eq!(ScriptId::DeferUnacked.name(), "defer_unacked");
         assert_eq!(ScriptId::ReapExpired.name(), "reap_expired");
         assert_eq!(ScriptId::PromoteDelayed.name(), "promote_delayed");
         assert_eq!(ScriptId::RevokeTask.name(), "revoke_task");
@@ -1176,7 +1249,7 @@ mod tests {
     #[test]
     fn test_script_id_all() {
         let all_scripts = ScriptId::all();
-        assert_eq!(all_scripts.len(), 14);
+        assert_eq!(all_scripts.len(), 15);
 
         // Every variant must be reachable through `all()` (and therefore be
         // loaded by `load_all`), and no variant may appear twice.
@@ -1247,9 +1320,13 @@ mod tests {
         assert_eq!(perf.avg_duration(), None);
     }
 
+    /// The declared version must move whenever the script set does, so a
+    /// [`ScriptManager`] cache built against an older set is recognisable.
+    /// Bumping this together with the constant is the point: an accidental
+    /// script edit that leaves the version behind fails here.
     #[test]
     fn test_script_version() {
-        assert_eq!(SCRIPT_VERSION, 2);
+        assert_eq!(SCRIPT_VERSION, 3);
     }
 
     /// The Lua field patterns are only safe because of the exact JSON layout

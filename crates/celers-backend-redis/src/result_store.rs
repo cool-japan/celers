@@ -26,10 +26,16 @@ fn to_task_result(value: &TaskResultValue) -> TaskResult {
         // change this backend's on-the-wire result format. A deliberately
         // suppressed failure is terminal and non-failing, and the value the
         // workflow carries forward is JSON `null`, so it projects onto exactly
-        // that. The suppressed error text does not survive the round trip
-        // through this backend (`celers_core::InMemoryResultBackend` keeps it);
-        // mapping it to `Failure` instead would resurrect the very error the
-        // caller asked to ignore, which is the worse loss.
+        // that. `TaskMeta` now has an `ignored_error` field carrying exactly
+        // this text (added so `celers-backend-db`/`celers-backend-rpc` could
+        // stop losing it — see their `result_store.rs`), but this adapter
+        // does not populate or read it: doing so is a second, independent
+        // wire-format decision for *this* backend's `TaskMeta` blob
+        // specifically, and is tracked as a followup rather than folded in
+        // here. Until then, the suppressed error text does not survive the
+        // round trip through this backend (`celers_core::InMemoryResultBackend`
+        // keeps it); mapping it to `Failure` instead would resurrect the very
+        // error the caller asked to ignore, which is the worse loss.
         TaskResultValue::Ignored { .. } => TaskResult::Success(serde_json::Value::Null),
     }
 }

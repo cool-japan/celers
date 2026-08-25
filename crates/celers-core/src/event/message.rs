@@ -147,6 +147,7 @@ impl From<&Event> for EventMessage {
                 }
                 TaskEvent::Revoked {
                     task_name,
+                    hostname: host,
                     terminated,
                     signum,
                     expired,
@@ -156,6 +157,7 @@ impl From<&Event> for EventMessage {
                     put(&mut fields, "terminated", *terminated);
                     put_opt(&mut fields, "signum", *signum);
                     put(&mut fields, "expired", *expired);
+                    hostname = Some(host.clone());
                 }
                 TaskEvent::Rejected {
                     task_name,
@@ -406,6 +408,18 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| self.missing("hostname"))
     }
 
+    /// The emitting host for an event whose variant gained `hostname` after
+    /// the wire format was first published.
+    ///
+    /// `task-revoked` is the only such event: Python Celery always stamps it,
+    /// and CeleRS does now, but a payload written by CeleRS 0.3.0 carries
+    /// none. Reading it strictly would reject the whole revocation during a
+    /// rolling upgrade, so the field falls back to `""` — the same trade
+    /// [`Self::str_or_default`] makes for the keys Celery itself omits.
+    fn hostname_or_default(&self) -> String {
+        self.message.hostname.clone().unwrap_or_default()
+    }
+
     /// The emitting process id, likewise a named field.
     fn pid(&self) -> Result<u32> {
         self.message.pid.ok_or_else(|| self.missing("pid"))
@@ -476,6 +490,7 @@ impl TryFrom<&EventMessage> for Event {
             "task-revoked" => Event::Task(TaskEvent::Revoked {
                 task_id: read.uuid()?,
                 task_name: read.opt_str(WIRE_NAME)?,
+                hostname: read.hostname_or_default(),
                 timestamp,
                 terminated: read.bool("terminated")?,
                 signum: read.opt_i32("signum")?,
@@ -531,12 +546,7 @@ impl TryFrom<&EventMessage> for Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn at(rfc3339: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(rfc3339)
-            .expect("valid RFC3339 fixture")
-            .with_timezone(&Utc)
-    }
+    use crate::event::test_events::{at, every_event};
 
     /// The one hand-rolled formatting decision in this file. If `chrono` ever
     /// changes how it serializes a `DateTime<Utc>`, this test fails here rather
@@ -610,7 +620,7 @@ mod tests {
 
     #[test]
     fn typed_round_trip_is_lossless() {
-        for event in super::super::wire::tests::every_event() {
+        for event in every_event() {
             let message = EventMessage::from(&event);
             let back = Event::try_from(&message)
                 .unwrap_or_else(|e| panic!("{} should convert back: {e}", event.event_type()));

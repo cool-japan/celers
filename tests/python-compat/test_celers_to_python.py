@@ -100,27 +100,26 @@ def test_failure_carries_the_python_traceback_back_to_celers(
     assert decoded["exc_type"] == "ValueError"
     assert decoded["exc_module"] == "builtins"
     # Celery writes `exc_message` as a list -- it is `exc.args`, splatted into
-    # the exception constructor on the way back. CeleRS models it as a single
-    # String and joins a multi-element list with ", " (documented on
-    # `ExceptionInfo::exc_message`), so a one-argument exception arrives whole.
-    assert decoded["exc_message"] == "from python"
+    # the exception constructor on the way back -- and CeleRS keeps it as one.
+    # `exc_message_text` is the joined rendering, for display only.
+    assert decoded["exc_message"] == ["from python"]
+    assert decoded["exc_message_text"] == "from python"
     assert decoded["traceback"].startswith("Traceback (most recent call last):")
     assert "ValueError: from python" in decoded["traceback"]
 
 
-def test_a_multi_argument_exception_loses_its_argument_boundaries(
+def test_a_multi_argument_exception_keeps_its_argument_boundaries(
     client, keyring, queue_name, module_worker
 ):
-    """Pin what CeleRS does with `raise ValueError("a", "b")`.
+    """`raise ValueError("a", "b")` must survive CeleRS with two arguments.
 
-    Python's `exc.args` is a tuple, and Celery preserves it as a JSON list.
-    `ExceptionInfo::exc_message` is a `String`, so the two arguments are joined
-    into `"a, b"` and re-serialize as the single-element list `["a, b"]` -- a
-    Python client rebuilding the exception from CeleRS' record therefore gets
-    one argument where it sent two.
+    Python's `exc.args` is a tuple, Celery preserves it as a JSON list, and
+    `celery.backends.base.Backend.exception_to_python` splats that list into the
+    exception constructor. A CeleRS record that collapsed it would make a Python
+    client rebuild a *different* exception than the one that was raised.
 
-    This is documented behaviour rather than a silent surprise, and asserting
-    it means a future change to `ExceptionInfo` cannot go unnoticed.
+    Regression: `ExceptionInfo::exc_message` used to be a `String` that joined
+    the list with ", ".
     """
     record = {
         "status": "FAILURE",
@@ -134,7 +133,50 @@ def test_a_multi_argument_exception_loses_its_argument_boundaries(
         "task_id": new_id(),
     }
     decoded = harness.run_bridge("decode-result", record)
-    assert decoded["exc_message"] == "first, second"
+    assert decoded["exc_message"] == ["first", "second"]
+    # The joined form is still available, as display text rather than as the
+    # wire value.
+    assert decoded["exc_message_text"] == "first, second"
+
+
+def test_a_python_exception_rebuilt_from_a_celers_record_keeps_its_args(
+    client, keyring, queue_name, module_worker
+):
+    """The end the argument list exists for: Celery reconstructing the error.
+
+    A CeleRS-written FAILURE record goes through Celery's own
+    ``exception_to_python``; the exception that comes out must carry the same
+    ``args`` -- including a non-string one -- that the record described.
+    """
+    import tasks
+
+    task_id = new_id()
+    key = keyring.track_task(task_id)
+    meta = {
+        "status": "FAILURE",
+        "result": {
+            "exc_type": "OSError",
+            "exc_message": [2, "no such file"],
+            "exc_module": "builtins",
+        },
+        "traceback": "Traceback (most recent call last):\nOSError: no such file",
+        "children": [],
+        "task_id": task_id,
+    }
+    # Round-trip the record through CeleRS first: what Celery reads is what
+    # `ResultMessage` re-serialized, not the literal above.
+    decoded = harness.run_bridge("decode-result", meta)
+    assert decoded["exc_message"] == [2, "no such file"]
+
+    harness.store_celers_result(client, task_id, meta)
+    assert client.exists(key)
+
+    rebuilt = tasks.app.AsyncResult(task_id).result
+    assert isinstance(rebuilt, OSError)
+    assert rebuilt.args == (2, "no such file"), (
+        "Celery splats exc_message into the exception constructor; a collapsed "
+        "list rebuilds the wrong exception"
+    )
 
 
 def test_retry_with_countdown(client, keyring, queue_name, module_worker):
@@ -179,33 +221,111 @@ def test_retry_with_countdown(client, keyring, queue_name, module_worker):
     assert "Retry" in module_worker.log_text() or "retry" in module_worker.log_text()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ResultMessage::children in crates/celers-protocol/src/result.rs is "
-        "Vec<Uuid>, but Celery serialises children as nested result tuples -- "
-        "[[[task_id, parent], None]] -- so from_json() rejects every record a "
-        "retried or chained task produces. Un-xfail when result.rs models it."
-    ),
-)
-def test_celers_parses_a_celery_record_that_has_children():
+def test_celers_parses_a_celery_record_that_has_children(celery_app):
     """Celery's ``children`` is not a list of ids.
 
     ``celery.result.AsyncResult.as_tuple()`` renders a child as
     ``((task_id, parent_tuple), None)``, and the backend stores that structure
     verbatim. Any retried task, and any task with a chain or group parent,
     carries one -- so this is not an exotic shape.
+
+    The children here are built by *Celery's own* ``as_tuple``, not written out
+    by hand, so this cannot drift from what the installed Celery emits.
+
+    Regression: ``ResultMessage::children`` was ``Vec<Uuid>``, so ``from_json``
+    rejected every record a retried or chained task produced.
     """
+    from celery.result import AsyncResult, GroupResult
+
+    child_id, parent_id, group_id, member_id = (new_id() for _ in range(4))
+
+    chained = AsyncResult(child_id, app=celery_app)
+    chained.parent = AsyncResult(parent_id, app=celery_app)
+    group = GroupResult(
+        id=group_id, results=[AsyncResult(member_id, app=celery_app)], app=celery_app
+    )
+
     record = {
         "status": "SUCCESS",
         "result": 2,
         "traceback": None,
-        "children": [[["00b0d7c2-9c80-4dc3-b5a7-671a099b92ea", None], None]],
+        "children": [chained.as_tuple(), group.as_tuple()],
         "date_done": "2026-01-01T00:00:00+00:00",
-        "task_id": "7b1a0d1e-0000-4000-8000-000000000001",
+        "task_id": new_id(),
     }
     decoded = harness.run_bridge("decode-result", record)
+
     assert decoded["status"] == "SUCCESS"
+    assert [child["task_id"] for child in decoded["children"]] == [child_id, group_id]
+    # The parent chain survives...
+    assert decoded["children"][0]["parent"]["task_id"] == parent_id
+    assert decoded["children"][0]["is_group"] is False
+    # ...and so does the group's membership, which is a different slot.
+    assert decoded["children"][1]["is_group"] is True
+    assert [m["task_id"] for m in decoded["children"][1]["children"]] == [member_id]
+
+    # What CeleRS writes back is what Celery reads: `result_from_tuple` turns it
+    # into the same results it started from.
+    from celery.result import result_from_tuple
+
+    restored = [
+        result_from_tuple(node, app=celery_app) for node in decoded["children_wire"]
+    ]
+    assert [r.id for r in restored] == [child_id, group_id]
+    assert restored[0].parent.id == parent_id
+    assert [r.id for r in restored[1].results] == [member_id]
+
+
+def test_celers_parses_the_children_celerys_own_backend_writes(celery_app):
+    """The same shape, produced by Celery's result-backend code path.
+
+    ``Backend._get_result_meta`` is what actually writes a meta record, and its
+    ``children`` come from ``current_task_children`` -- so this asserts against
+    the function that puts the bytes in Redis rather than against a literal.
+    """
+
+    class FakeRequest:
+        """The attributes ``_get_result_meta`` reads off a task request."""
+
+        def __init__(self, children):
+            self.children = children
+            self.group = None
+            self.parent_id = None
+
+    from celery.result import AsyncResult
+
+    child_id = new_id()
+    task_id = new_id()
+    meta = celery_app.backend._get_result_meta(
+        result=7,
+        state="SUCCESS",
+        traceback=None,
+        request=FakeRequest([AsyncResult(child_id, app=celery_app)]),
+    )
+    meta["task_id"] = task_id
+
+    assert meta["children"], "Celery must have recorded the child"
+    decoded = harness.run_bridge("decode-result", meta)
+    assert decoded["status"] == "SUCCESS"
+    assert [child["task_id"] for child in decoded["children"]] == [child_id]
+
+
+def test_a_record_stored_outside_a_task_context_has_null_children(celery_app):
+    """``current_task_children`` returns ``None`` with no request in scope.
+
+    That is what a client-side ``mark_as_failure`` writes, so ``children: null``
+    is a real record -- and one CeleRS used to reject outright, because
+    ``#[serde(default)]`` covers a *missing* key, not a null one.
+    """
+    meta = celery_app.backend._get_result_meta(
+        result=1, state="SUCCESS", traceback=None, request=None
+    )
+    assert meta["children"] is None, "Celery still writes a null children slot"
+
+    meta["task_id"] = new_id()
+    decoded = harness.run_bridge("decode-result", meta)
+    assert decoded["status"] == "SUCCESS"
+    assert decoded["children"] == []
 
 
 def test_eta_delays_execution(client, keyring, queue_name, module_worker):
@@ -223,9 +343,9 @@ def test_eta_delays_execution(client, keyring, queue_name, module_worker):
             "id": task_id,
             "args": [1, 2],
             "eta": eta.isoformat(),
+            "queue": queue_name,
         },
     )
-    envelope = _kombu_deliverable(envelope, queue_name)
     publish(client, queue_name, envelope)
 
     started = time.monotonic()
@@ -242,23 +362,6 @@ def test_eta_delays_execution(client, keyring, queue_name, module_worker):
 # =============================================================================
 # What kombu requires of any producer
 # =============================================================================
-
-
-def _kombu_deliverable(envelope: dict, queue_name: str) -> dict:
-    """Add the two properties kombu indexes unconditionally.
-
-    See ``test_kombu_requires_delivery_tag_and_delivery_info``: without these,
-    a Celery worker cannot even construct the message. The canonical
-    ``encode-task`` envelope already carries them; the ``MessageBuilder`` one
-    does not, so tests that exercise the builder patch them in here and the gap
-    itself is asserted separately.
-    """
-    envelope = json.loads(json.dumps(envelope))
-    envelope["properties"].setdefault("delivery_tag", str(uuid.uuid4()))
-    envelope["properties"].setdefault(
-        "delivery_info", {"exchange": "", "routing_key": queue_name}
-    )
-    return envelope
 
 
 @pytest.fixture
@@ -313,37 +416,19 @@ def test_kombu_requires_delivery_tag_and_delivery_info(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "MessageProperties serialization in crates/celers-protocol/src/types.rs "
-        "omits delivery_tag and delivery_info, so a MessageBuilder envelope kills "
-        "a Celery worker with KeyError. When that is fixed, delete this xfail and "
-        "the _kombu_deliverable() patching above."
-    ),
-)
-def test_message_builder_envelope_is_deliverable_as_is(client, keyring, queue_name):
-    """The ordinary CeleRS producer path should need no patching.
-
-    ``MessageBuilder`` is what a CeleRS application uses; ``create_python_celery_message``
-    is a fixture helper. Today only the helper emits an envelope kombu can read.
-    """
-    envelope = harness.run_bridge(
-        "build-task",
-        {"task": "tasks.add", "id": new_id(), "args": [1, 1], "kwargs": {}},
-    )
-    assert "delivery_tag" in envelope["properties"]
-    assert "delivery_info" in envelope["properties"]
-
-
-def test_message_builder_envelope_runs_once_the_properties_are_supplied(
+def test_message_builder_envelope_is_deliverable_as_is(
     client, keyring, queue_name, module_worker
 ):
-    """With the two properties added, the builder's envelope executes.
+    """The ordinary CeleRS producer path needs no patching.
 
-    This is what makes the gap above a *missing field* rather than a deeper
-    incompatibility: `lang: "rust"`, the absent `argsrepr` and the absent
-    `timelimit` are all tolerated by a real worker.
+    ``MessageBuilder`` is what a CeleRS application uses;
+    ``create_python_celery_message`` is a fixture helper. Both must emit an
+    envelope a real worker can construct a message from and execute.
+
+    Regression: the builder used to omit ``delivery_tag`` and ``delivery_info``,
+    which is not a lost message but a dead worker -- see
+    ``test_kombu_requires_delivery_tag_and_delivery_info``. Nothing here patches
+    the envelope: it is published exactly as CeleRS serialized it.
     """
     task_id = new_id()
     keyring.track_task(task_id)
@@ -354,11 +439,53 @@ def test_message_builder_envelope_runs_once_the_properties_are_supplied(
             "id": task_id,
             "args": ["Ada"],
             "kwargs": {"loud": True},
+            "queue": queue_name,
         },
     )
+
+    assert "delivery_tag" in envelope["properties"]
+    assert envelope["properties"]["delivery_info"] == {
+        "exchange": "",
+        "routing_key": queue_name,
+    }, "the routing key must name the queue the message is actually on"
     assert envelope["headers"]["lang"] == "rust", "the builder stamps the Rust lang"
-    publish(client, queue_name, _kombu_deliverable(envelope, queue_name))
+
+    publish(client, queue_name, envelope)
 
     decoded = harness.run_bridge("decode-result", harness.await_result(client, task_id))
     assert decoded["status"] == "SUCCESS", module_worker.log_text()[-2000:]
     assert decoded["result"] == "HELLO, ADA!"
+
+
+def test_message_builder_stamps_the_argument_reprs_a_monitor_displays(
+    client, queue_name
+):
+    """``argsrepr`` / ``kwargsrepr`` are Python literals, not Rust ``Debug``.
+
+    Flower, ``celery events`` and ``celery inspect`` read these headers rather
+    than deserializing the body, so a producer that omits them shows a blank
+    argument list for every task. The strings must be what Python's own
+    ``celery.utils.saferepr`` would have produced -- ``test_reprs.py`` pins the
+    rendering rules; this pins that the *builder* emits them at all.
+    """
+    from celery.utils.saferepr import saferepr
+
+    envelope = harness.run_bridge(
+        "build-task",
+        {
+            "task": "tasks.greet",
+            "id": new_id(),
+            "args": ["Ada"],
+            "kwargs": {"loud": True},
+            "queue": queue_name,
+        },
+    )
+
+    assert envelope["headers"]["argsrepr"] == saferepr(("Ada",)) == "('Ada',)"
+    assert envelope["headers"]["kwargsrepr"] == saferepr({"loud": True})
+
+    # And they describe the body that was actually encoded.
+    decoded = harness.run_bridge("decode-task", envelope)
+    assert decoded["args"] == ["Ada"]
+    assert decoded["kwargs"] == {"loud": True}
+    assert decoded["argsrepr"] == envelope["headers"]["argsrepr"]

@@ -5,6 +5,15 @@
 //! can fall back to, an async variant that keeps the blocking file I/O off the
 //! runtime worker threads, and failure counters so a scheduler running without
 //! durable state is observable rather than silent.
+//!
+//! This is the *local-file* mechanism specifically. [`crate::schedule_store`]
+//! wraps the same durability guarantee behind a pluggable
+//! [`ScheduleStore`](crate::schedule_store::ScheduleStore) trait — set one
+//! via [`BeatScheduler::with_schedule_store`]/[`BeatScheduler::load_from_store`]
+//! and [`BeatScheduler::save_state_async`] below writes through it instead,
+//! which is what makes a shared (e.g. Redis-backed) schedule catalog possible
+//! across more than one beat instance. Sync [`BeatScheduler::save_state`]
+//! always uses the local file, regardless of whether a store is configured.
 
 use crate::config::ScheduleError;
 use crate::scheduler::{default_instance_id, BeatScheduler};
@@ -131,8 +140,24 @@ impl BeatScheduler {
     /// `save_state` performs synchronous file I/O; calling it directly from an
     /// async task stalls a runtime worker thread for the duration of the write.
     /// This variant serializes on the caller (cheap, needs `&self`) and hands
-    /// the write to `spawn_blocking`.
+    /// the write to `spawn_blocking` — except when a
+    /// [`ScheduleStore`](crate::schedule_store::ScheduleStore) is configured
+    /// ([`BeatScheduler::with_schedule_store`]/[`BeatScheduler::load_from_store`]),
+    /// in which case it writes through that store instead and `state_file` is
+    /// not consulted at all. Sync [`Self::save_state`] is unaffected either
+    /// way — it always uses `state_file`, never the store — see
+    /// `schedule_store.rs`'s module doc for why a store-aware save needed to
+    /// be async-only.
     pub async fn save_state_async(&self) -> Result<(), ScheduleError> {
+        if let Some(store) = self.schedule_store.clone() {
+            let bytes = self.serialize_state()?;
+            let result = store.save(&bytes).await;
+            if result.is_err() {
+                self.persistence_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            return result;
+        }
+
         let Some(path) = self.state_file.clone() else {
             return Ok(());
         };
@@ -262,5 +287,128 @@ impl BeatScheduler {
                 "failed to persist beat scheduler state"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schedule::Schedule;
+    use crate::schedule_store::{FileScheduleStore, ScheduleStore};
+    use crate::task::ScheduledTask;
+    use std::sync::Arc;
+
+    fn temp_store_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "celers-beat-scheduler-persistence-store-test-{}-{}.json",
+            std::process::id(),
+            name
+        ))
+    }
+
+    #[tokio::test]
+    async fn save_state_async_prefers_the_store_over_the_file_when_both_are_set() {
+        let store_path = temp_store_path("prefers_store");
+        let file_path = temp_store_path("prefers_store_unused_file");
+        let store = Arc::new(FileScheduleStore::new(&store_path));
+
+        let mut scheduler = BeatScheduler::with_state_file(Some(file_path.clone()));
+        scheduler.with_schedule_store(store.clone());
+        scheduler
+            .add_task(ScheduledTask::new(
+                "via_store".to_string(),
+                Schedule::interval(60),
+            ))
+            .expect("add_task");
+
+        // `add_task` itself calls the *synchronous* `save_state` (scheduler.rs,
+        // unrelated to and unchanged by the ScheduleStore work), which is
+        // documented and separately tested
+        // (`sync_save_state_still_uses_the_file_even_with_a_store_configured`,
+        // below) to always target `state_file` regardless of any configured
+        // store — sync code cannot await the store's async I/O. So `file_path`
+        // legitimately exists at this point; that is not what this test is
+        // about. Clear it before exercising `save_state_async` so the
+        // assertion below isolates that one method's own behaviour rather
+        // than being contaminated by `add_task`'s unrelated, already-correct
+        // side effect.
+        let _ = std::fs::remove_file(&file_path);
+
+        scheduler.save_state_async().await.expect("save via store");
+
+        assert!(
+            store.load().await.expect("store load").is_some(),
+            "save_state_async must write through the configured store"
+        );
+        assert!(
+            !file_path.exists(),
+            "save_state_async itself must not touch state_file once a schedule_store is configured"
+        );
+
+        store.remove().await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn load_from_store_round_trips_registered_tasks() {
+        let store_path = temp_store_path("round_trip");
+        let store = Arc::new(FileScheduleStore::new(&store_path));
+
+        let mut original = BeatScheduler::with_state_file(None);
+        original.with_schedule_store(store.clone());
+        original
+            .add_task(ScheduledTask::new(
+                "roundtrip_task".to_string(),
+                Schedule::interval(30),
+            ))
+            .expect("add_task");
+        original.save_state_async().await.expect("save");
+
+        let restored = BeatScheduler::load_from_store(store.clone())
+            .await
+            .expect("load_from_store");
+
+        assert!(restored.get_task("roundtrip_task").is_some());
+        assert!(
+            restored.schedule_store().is_some(),
+            "load_from_store must leave the scheduler wired to the same store"
+        );
+
+        store.remove().await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn load_from_store_yields_a_fresh_scheduler_when_nothing_was_saved() {
+        let store_path = temp_store_path("fresh");
+        let store = Arc::new(FileScheduleStore::new(&store_path));
+
+        let scheduler = BeatScheduler::load_from_store(store.clone())
+            .await
+            .expect("load_from_store");
+
+        assert!(scheduler.get_task("anything").is_none());
+        assert!(!scheduler.instance_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_save_state_still_uses_the_file_even_with_a_store_configured() {
+        let store_path = temp_store_path("sync_uses_file");
+        let file_path = temp_store_path("sync_uses_file_target");
+        let store = Arc::new(FileScheduleStore::new(&store_path));
+
+        let mut scheduler = BeatScheduler::with_state_file(Some(file_path.clone()));
+        scheduler.with_schedule_store(store.clone());
+
+        scheduler.save_state().expect("sync save_state");
+
+        assert!(
+            file_path.exists(),
+            "sync save_state must be unaffected by schedule_store, per its own doc"
+        );
+        assert!(
+            store.load().await.expect("store load").is_none(),
+            "sync save_state must not touch the store"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
     }
 }

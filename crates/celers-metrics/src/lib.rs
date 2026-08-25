@@ -30,6 +30,8 @@ mod tests_advanced;
 #[cfg(test)]
 mod tests_core;
 #[cfg(test)]
+mod tests_core_extra;
+#[cfg(test)]
 mod tests_enhanced;
 
 // Re-export everything for backward compatibility

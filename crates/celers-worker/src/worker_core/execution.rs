@@ -234,7 +234,16 @@ enum ExecOutcome {
     /// Task exceeded its timeout.
     TimedOut,
     /// Task was cancelled/revoked while running.
-    Cancelled,
+    Cancelled {
+        /// Whether the worker *terminated* the running task (aborted the
+        /// future mid-await) rather than the task having observed its own
+        /// cancellation and returned at a checkpoint.
+        ///
+        /// Celery's `task-revoked` reports this as `terminated`, and the
+        /// difference is real: a terminated task was cut off wherever it
+        /// happened to be, while a cooperative one stopped where it chose to.
+        terminated: bool,
+    },
 }
 
 /// A terminal failure that must be observable by the caller: emits
@@ -832,6 +841,25 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
         );
     }
 
+    // A cooperative task that observed its own cancellation and returned
+    // `Err(CelersError::Cancelled(..))` — the ergonomics `check_cancelled()?`
+    // exists for — is in exactly the state the watcher's abort produces, and
+    // gets exactly the same disposition. Without this the polite form of
+    // cancellation would be *punished*: it would be read as an execution
+    // failure and re-dispatched up to `max_retries` times, while the abrupt
+    // form is terminal. `CelersError::TaskRevoked` joins it: both mean the work
+    // was withdrawn, which is the one thing a retry must never answer.
+    let exec_outcome = match exec_outcome {
+        ExecOutcome::Completed(Err(ref e)) if e.withdrawn_task_id().is_some() => {
+            debug!(
+                "Task {} reported its own cancellation ({}); disposing of it as revoked",
+                task_id, e
+            );
+            ExecOutcome::Cancelled { terminated: false }
+        }
+        other => other,
+    };
+
     match exec_outcome {
         ExecOutcome::Completed(Ok(result)) => {
             let duration = start_time.elapsed();
@@ -1265,14 +1293,21 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                 .await;
             }
         }
-        ExecOutcome::Cancelled => {
+        ExecOutcome::Cancelled { terminated } => {
             // Task was revoked while running: transition to Revoked and stop.
-            // The work is abandoned (the inner execution task was aborted); a
-            // deliberately revoked task is never retried.
+            // The work is abandoned — either the inner execution future was
+            // aborted (`terminated`) or the task returned at a cancellation
+            // checkpoint of its own — and a revoked task is never retried.
             let duration = start_time.elapsed();
             info!(
-                "Task {} revoked after {:?}, transitioning to Revoked",
-                task_id, duration
+                "Task {} revoked after {:?} ({}), transitioning to Revoked",
+                task_id,
+                duration,
+                if terminated {
+                    "terminated mid-execution"
+                } else {
+                    "stopped cooperatively"
+                }
             );
 
             if let Some(ref mw) = middleware {
@@ -1291,8 +1326,9 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
             events.emit(Event::Task(TaskEvent::Revoked {
                 task_id,
                 task_name: Some(task_name.clone()),
+                hostname: hostname.clone(),
                 timestamp: chrono::Utc::now(),
-                terminated: true,
+                terminated,
                 signum: None,
                 expired: false,
             }));
@@ -1464,7 +1500,7 @@ async fn drive_task(
         }
         Ok(None) => {
             handle.abort();
-            ExecOutcome::Cancelled
+            ExecOutcome::Cancelled { terminated: true }
         }
         Err(_elapsed) => {
             handle.abort();

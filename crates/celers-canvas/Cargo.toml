@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Workflow primitives for CeleRS (Chain, Chord, Group, Map)"
 readme = "README.md"
 keywords = ["celery", "workflow", "canvas", "chain", "chord"]

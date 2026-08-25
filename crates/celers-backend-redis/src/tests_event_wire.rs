@@ -58,6 +58,7 @@ fn worker_emitted_events() -> Vec<Event> {
         Event::Task(TaskEvent::Revoked {
             task_id,
             task_name: Some("tasks.add".to_string()),
+            hostname: HOSTNAME.to_string(),
             timestamp: celers_core::event::event_timestamp_now(),
             terminated: true,
             signum: Some(9),
@@ -73,6 +74,112 @@ fn worker_emitted_events() -> Vec<Event> {
         WorkerEventBuilder::new(HOSTNAME).online(),
         WorkerEventBuilder::new(HOSTNAME).heartbeat(3, 100, [1.0, 0.8, 0.5], 2.0),
         WorkerEventBuilder::new(HOSTNAME).offline(),
+    ]
+}
+
+/// Events with every varying part pinned, so their wire rendering is a
+/// constant that can be compared byte for byte.
+fn golden_events() -> Vec<Event> {
+    use celers_core::event::WorkerEvent;
+    let task_id: Uuid = "7b1a0d1e-0000-4000-8000-000000000001"
+        .parse()
+        .expect("fixed task id");
+    let at = |secs: i64, micros: u32| -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(secs, micros * 1000).expect("valid instant")
+    };
+    vec![
+        Event::Task(TaskEvent::Sent {
+            task_id,
+            task_name: "tasks.add".to_string(),
+            queue: "celery".to_string(),
+            timestamp: at(1_774_000_000, 100),
+            args: None,
+            kwargs: None,
+            eta: None,
+            expires: None,
+            retries: None,
+        }),
+        Event::Task(TaskEvent::Received {
+            task_id,
+            task_name: "tasks.add".to_string(),
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_000, 200),
+            pid: 4242,
+        }),
+        Event::Task(TaskEvent::Started {
+            task_id,
+            task_name: "tasks.add".to_string(),
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_000, 300),
+            pid: 4242,
+        }),
+        Event::Task(TaskEvent::Succeeded {
+            task_id,
+            task_name: "tasks.add".to_string(),
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_000, 400),
+            runtime: 1.25,
+            result: None,
+        }),
+        Event::Task(TaskEvent::Failed {
+            task_id,
+            task_name: "tasks.add".to_string(),
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_001, 0),
+            exception: "ValueError('bad input')".to_string(),
+            traceback: None,
+        }),
+        Event::Task(TaskEvent::Retried {
+            task_id,
+            task_name: "tasks.add".to_string(),
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_001, 100),
+            exception: "Timeout".to_string(),
+            retries: 2,
+        }),
+        Event::Task(TaskEvent::Revoked {
+            task_id,
+            task_name: Some("tasks.add".to_string()),
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_001, 200),
+            terminated: true,
+            signum: Some(9),
+            expired: false,
+        }),
+        Event::Task(TaskEvent::Rejected {
+            task_id,
+            task_name: Some("tasks.add".to_string()),
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_001, 300),
+            reason: "queue full".to_string(),
+        }),
+        Event::Task(TaskEvent::SoftTimeLimitExceeded {
+            task_id,
+            task_name: "tasks.slow".to_string(),
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_001, 400),
+            elapsed_secs: 30.5,
+            limit_secs: 30.0,
+        }),
+        Event::Worker(WorkerEvent::Online {
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_002, 0),
+            sw_ident: "celers".to_string(),
+            sw_ver: "0.3.1".to_string(),
+            sw_sys: "Linux".to_string(),
+        }),
+        Event::Worker(WorkerEvent::Heartbeat {
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_002, 100),
+            active: 3,
+            processed: 100,
+            loadavg: Some([1.0, 0.8, 0.5]),
+            freq: 2.0,
+        }),
+        Event::Worker(WorkerEvent::Offline {
+            hostname: HOSTNAME.to_string(),
+            timestamp: at(1_774_000_002, 200),
+        }),
     ]
 }
 
@@ -199,6 +306,7 @@ fn task_events_populate_the_typed_celery_task_fields() {
     let event = Event::Task(TaskEvent::Revoked {
         task_id,
         task_name: Some("tasks.add".to_string()),
+        hostname: HOSTNAME.to_string(),
         timestamp: celers_core::event::event_timestamp_now(),
         terminated: true,
         signum: Some(9),
@@ -436,6 +544,172 @@ async fn published_events_reach_subscribers_in_the_celery_wire_shape() {
         assert!(
             types.iter().any(|seen| seen == expected_type),
             "{expected_type} never reached the subscriber: {types:?}"
+        );
+    }
+}
+
+// =============================================================================
+// Outbound goldens: the exact bytes a Celery monitor receives
+// =============================================================================
+
+/// The envelope every outbound golden is rendered with.
+///
+/// `EventEnvelope::stamp()` reads a process-wide logical clock and the real
+/// pid, so a golden has to pin both or it could never be a constant.
+fn golden_envelope() -> celers_core::event::EventEnvelope {
+    celers_core::event::EventEnvelope::stamp()
+        .with_clock(7)
+        .with_pid(4242)
+        .with_hostname("celery@publisher")
+}
+
+/// What each event family renders to, byte for byte.
+///
+/// Every string here was produced by this code and then read: they are a
+/// *snapshot*, not an independent source of truth, and that is precisely their
+/// job. The inbound direction is pinned by verbatim Python captures
+/// (`celers-core/src/event/wire.rs`, `python_celery_events_parse_into_the_typed_model`);
+/// what was missing was any assertion that an added, renamed or dropped
+/// **outbound** key would be noticed. `every_worker_event_parses_as_a_celery_event_message`
+/// cannot notice: it serializes with CeleRS and parses with CeleRS, so both
+/// sides move together.
+///
+/// A diff here means the wire contract changed. That is allowed -- but it must
+/// be a decision, checked against what a Python monitor reads, not a side
+/// effect of an unrelated edit.
+const OUTBOUND_GOLDENS: &[(&str, &str)] = &[
+    (
+        "task-sent",
+        r#"{"clock":7,"hostname":"celery@publisher","name":"tasks.add","pid":4242,"queue":"celery","timestamp":1774000000.0001,"type":"task-sent","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "task-received",
+        r#"{"clock":7,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"timestamp":1774000000.0002,"type":"task-received","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "task-started",
+        r#"{"clock":7,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"timestamp":1774000000.0003,"type":"task-started","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "task-succeeded",
+        r#"{"clock":7,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"runtime":1.25,"timestamp":1774000000.0004,"type":"task-succeeded","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "task-failed",
+        r#"{"clock":7,"exception":"ValueError('bad input')","hostname":"celery@worker-1","name":"tasks.add","pid":4242,"timestamp":1774000001.0,"type":"task-failed","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "task-retried",
+        r#"{"clock":7,"exception":"Timeout","hostname":"celery@worker-1","name":"tasks.add","pid":4242,"retries":2,"timestamp":1774000001.0001,"type":"task-retried","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "task-revoked",
+        r#"{"clock":7,"expired":false,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"signum":9,"terminated":true,"timestamp":1774000001.0002,"type":"task-revoked","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "task-rejected",
+        r#"{"clock":7,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"reason":"queue full","timestamp":1774000001.0003,"type":"task-rejected","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "task-soft-time-limit-exceeded",
+        r#"{"clock":7,"elapsed_secs":30.5,"hostname":"celery@worker-1","limit_secs":30.0,"name":"tasks.slow","pid":4242,"timestamp":1774000001.0004,"type":"task-soft-time-limit-exceeded","utcoffset":0,"uuid":"7b1a0d1e-0000-4000-8000-000000000001"}"#,
+    ),
+    (
+        "worker-online",
+        r#"{"clock":7,"hostname":"celery@worker-1","pid":4242,"sw_ident":"celers","sw_sys":"Linux","sw_ver":"0.3.1","timestamp":1774000002.0,"type":"worker-online","utcoffset":0}"#,
+    ),
+    (
+        "worker-heartbeat",
+        r#"{"active":3,"clock":7,"freq":2.0,"hostname":"celery@worker-1","loadavg":[1.0,0.8,0.5],"pid":4242,"processed":100,"timestamp":1774000002.0001,"type":"worker-heartbeat","utcoffset":0}"#,
+    ),
+    (
+        "worker-offline",
+        r#"{"clock":7,"hostname":"celery@worker-1","pid":4242,"timestamp":1774000002.0002,"type":"worker-offline","utcoffset":0}"#,
+    ),
+];
+
+#[test]
+fn every_outbound_event_renders_to_its_golden_bytes() {
+    let events = golden_events();
+    assert_eq!(
+        events.len(),
+        OUTBOUND_GOLDENS.len(),
+        "every event family needs a golden; add one for the new variant"
+    );
+
+    for (event, (expected_type, expected)) in events.iter().zip(OUTBOUND_GOLDENS) {
+        assert_eq!(
+            &event.event_type(),
+            expected_type,
+            "the goldens are out of order with `golden_events`"
+        );
+        let rendered = event
+            .to_wire_json_with(&golden_envelope())
+            .unwrap_or_else(|e| panic!("{expected_type} should render: {e}"));
+        assert_eq!(
+            rendered, *expected,
+            "{expected_type} no longer renders to the bytes a Celery monitor was \
+             pinned against. If the change is intended, verify against a real \
+             monitor and update the golden."
+        );
+    }
+}
+
+/// The goldens must stay parseable, or they would pin a shape nothing reads.
+///
+/// This is the guard against "fixed the diff, broke the contract": a golden
+/// updated carelessly still has to satisfy the typed model in both directions.
+#[test]
+fn the_golden_bytes_are_still_celery_events() {
+    for (expected_type, payload) in OUTBOUND_GOLDENS {
+        let message = protocol::EventMessage::from_json(payload.as_bytes())
+            .unwrap_or_else(|e| panic!("{expected_type} golden is not a Celery event: {e}"));
+        assert_eq!(message.get_type(), *expected_type);
+        assert_eq!(message.clock, Some(7));
+        assert_eq!(message.pid, Some(4242));
+        assert_eq!(message.utcoffset, Some(0));
+        assert!(
+            message.hostname.is_some(),
+            "{expected_type} needs a hostname"
+        );
+
+        let event = Event::from_wire_str(payload)
+            .unwrap_or_else(|e| panic!("{expected_type} golden does not parse back: {e}"));
+        assert_eq!(event.event_type(), *expected_type);
+    }
+}
+
+/// The key names, spelled out. A golden diff shows *that* something changed;
+/// this says which names a Python monitor actually indexes.
+#[test]
+fn the_golden_bytes_use_celerys_key_names() {
+    for (expected_type, payload) in OUTBOUND_GOLDENS {
+        let value: Value = serde_json::from_str(payload).expect("golden is valid JSON");
+        let object = value.as_object().expect("an event is a JSON object");
+
+        for required in ["type", "timestamp", "clock", "utcoffset", "pid", "hostname"] {
+            assert!(
+                object.contains_key(required),
+                "{expected_type}: a Celery monitor reads `{required}`"
+            );
+        }
+        // Celery's names, not CeleRS' internal ones.
+        for internal in ["task_id", "task_name", "event_type"] {
+            assert!(
+                !object.contains_key(internal),
+                "{expected_type}: internal name `{internal}` reached the wire"
+            );
+        }
+        if expected_type.starts_with("task-") {
+            assert!(
+                object.contains_key("uuid"),
+                "{expected_type}: Celery identifies a task by `uuid`"
+            );
+        }
+        // A float, not a string or an integer: Celery does arithmetic on it.
+        assert!(
+            object["timestamp"].is_f64(),
+            "{expected_type}: `timestamp` must be float Unix seconds"
         );
     }
 }

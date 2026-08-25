@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Broker abstraction layer for CeleRS (inspired by Python Kombu)"
 readme = "README.md"
 keywords = ["celery", "kombu", "messaging", "amqp", "queue"]
@@ -15,6 +16,7 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 
@@ -24,9 +26,22 @@ hex = { workspace = true, optional = true }
 # Core protocol
 celers-protocol = { workspace = true }
 
+# Optional: the task-queue model the `core-adapter` feature bridges this crate's
+# transports onto. `celers-core` does not depend on `celers-kombu`, so this is
+# not a cycle — it is the one direction the dependency can point. Optional so a
+# crate that only wants the transport traits keeps the smaller graph.
+celers-core = { workspace = true, optional = true }
+# Optional: `tokio::sync::Mutex`, which is what lets a `&self` task-queue broker
+# drive a `&mut self` transport. Only reachable through `core-adapter`, whose
+# `celers-core` already pulls tokio in.
+tokio = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 criterion = { workspace = true }
+# Test-only: the `core-adapter` tests build a `TaskMetadata` expiry deadline,
+# which is a `chrono::DateTime<Utc>`. Nothing in the library needs a clock.
+chrono = { workspace = true }
 
 [[bench]]
 name = "broker_bench"
@@ -34,6 +49,11 @@ harness = false
 
 [features]
 default = []
+# `celers_core::Broker` adapter over this crate's transports (see
+# `core_adapter`). Off by default so the transport traits stay usable without
+# the task-queue model; the broker crates that ship a worker-usable broker
+# (`celers-broker-amqp`, `celers-broker-sqs`) turn it on for you.
+core-adapter = ["dep:celers-core", "dep:tokio"]
 # Compression middleware (requires celers-protocol compression features)
 compression = ["celers-protocol/gzip"]
 # Message signing middleware (requires celers-protocol signing feature)

@@ -20,8 +20,20 @@
 //!
 //! # Celery Event Exchange
 //!
-//! Events are published to a fanout exchange (default: `celeryev`) that broadcasts
-//! to all bound queues. This mirrors Celery's `celery.events` exchange behavior.
+//! Events are published to a **topic** exchange (default: `celeryev`), matching
+//! real Celery's `celery.events` exchange rather than a fanout: [`EventRoutingMode`]
+//! (default [`EventRoutingMode::PerEventType`]) publishes each event under a key
+//! derived from its own wire `type` (`task-started` becomes `task.started`,
+//! `worker-heartbeat` becomes `worker.heartbeat`), the same translation
+//! `celery.events.dispatcher.EventDispatcher` applies before publishing. A
+//! consumer can then bind `task.#` for every task event, `worker.#` for every
+//! worker event, or `#` for everything — [`AmqpEventReceiver`] does the latter
+//! by default (see [`AmqpEventConfig::receiver_binding_key`]).
+//!
+//! The pre-topic-routing behaviour — every event under one fixed
+//! [`AmqpEventConfig::routing_key`] — is kept as [`EventRoutingMode::Fixed`], an
+//! explicit opt-in for a fanout exchange (where RabbitMQ ignores the routing key
+//! outright) or a direct exchange bound on one key.
 //!
 //! # Example
 //!
@@ -56,10 +68,35 @@ use tracing::{debug, error, warn};
 const DEFAULT_EXCHANGE: &str = "celeryev";
 
 /// Default exchange type for event broadcasting
-const DEFAULT_EXCHANGE_TYPE: &str = "fanout";
+///
+/// `"topic"`, matching the real `celery.events.dispatcher.EventDispatcher`'s
+/// `celeryev` exchange — not `"fanout"`. A mixed cluster with a Python Celery
+/// worker publishing onto the real topic exchange would otherwise collide with
+/// this emitter declaring the same name as a different kind.
+const DEFAULT_EXCHANGE_TYPE: &str = "topic";
 
 /// Default batch size for batch publishing
 const DEFAULT_BATCH_SIZE: usize = 100;
+
+/// How the routing key is chosen for each event this emitter publishes.
+///
+/// See the module documentation for the topic-exchange rationale.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EventRoutingMode {
+    /// Derive the routing key from the event's own wire `type`
+    /// ([`celers_core::event::Event::event_type`]): every `-` becomes a `.`,
+    /// so `task-started` publishes under `task.started` and
+    /// `worker-heartbeat` under `worker.heartbeat`. This is what
+    /// [`AmqpEventConfig::publish_routing_key`] computes, matches what real
+    /// Celery puts on the wire for the same exchange, and is the default.
+    #[default]
+    PerEventType,
+    /// Publish every event under the fixed [`AmqpEventConfig::routing_key`],
+    /// regardless of its type. The pre-topic-routing behaviour, kept as an
+    /// explicit choice for a fanout exchange (where RabbitMQ ignores the
+    /// routing key outright) or a direct exchange bound on one fixed key.
+    Fixed,
+}
 
 /// Configuration for AMQP event transport
 #[derive(Debug, Clone)]
@@ -67,10 +104,22 @@ pub struct AmqpEventConfig {
     /// Exchange name for events (default: "celeryev")
     pub exchange: String,
 
-    /// Exchange type (default: "fanout")
+    /// Exchange type (default: "topic")
     pub exchange_type: String,
 
+    /// How the routing key is chosen per event (default:
+    /// [`EventRoutingMode::PerEventType`])
+    pub routing_mode: EventRoutingMode,
+
     /// Routing key for published messages (default: "")
+    ///
+    /// Consulted in two places: as the fixed publish key when `routing_mode`
+    /// is [`EventRoutingMode::Fixed`] (see
+    /// [`AmqpEventConfig::publish_routing_key`]), and, unconditionally, as the
+    /// literal binding pattern `AmqpEventReceiver` requests — unless it is left
+    /// at this default *and* the exchange is a topic, in which case
+    /// [`AmqpEventConfig::receiver_binding_key`] substitutes Celery's
+    /// catch-all `"#"` rather than binding on a key nothing publishes under.
     pub routing_key: String,
 
     /// Whether the exchange is durable (default: false)
@@ -87,9 +136,10 @@ pub struct AmqpEventConfig {
 
     /// Hostname stamped onto events that do not carry one of their own
     ///
-    /// `task-sent` and `task-revoked` have no `hostname` field, so a monitor
-    /// otherwise cannot tell which node published them. Leave `None` to omit
-    /// the field entirely.
+    /// `task-sent` is the only such event left — it is published by the
+    /// *client*, which is not a worker and has no hostname of its own — so a
+    /// monitor otherwise cannot tell which node published it. Leave `None` to
+    /// omit the field entirely.
     pub hostname: Option<String>,
 }
 
@@ -98,6 +148,7 @@ impl Default for AmqpEventConfig {
         Self {
             exchange: DEFAULT_EXCHANGE.to_string(),
             exchange_type: DEFAULT_EXCHANGE_TYPE.to_string(),
+            routing_mode: EventRoutingMode::default(),
             routing_key: String::new(),
             durable: false,
             enabled: true,
@@ -129,6 +180,12 @@ impl AmqpEventConfig {
     /// Set the routing key
     pub fn routing_key(mut self, routing_key: impl Into<String>) -> Self {
         self.routing_key = routing_key.into();
+        self
+    }
+
+    /// Set how the routing key is chosen per event; see [`EventRoutingMode`].
+    pub fn routing_mode(mut self, mode: EventRoutingMode) -> Self {
+        self.routing_mode = mode;
         self
     }
 
@@ -170,6 +227,49 @@ impl AmqpEventConfig {
             "topic" => ExchangeKind::Topic,
             "headers" => ExchangeKind::Headers,
             other => ExchangeKind::Custom(other.to_string()),
+        }
+    }
+
+    /// The routing key an emitter publishes an event of `event_type` under.
+    ///
+    /// `event_type` is the wire `type` string
+    /// ([`celers_core::event::Event::event_type`]), e.g. `"task-started"` or
+    /// `"worker-heartbeat"`.
+    ///
+    /// Under [`EventRoutingMode::PerEventType`] (the default) every `-` in
+    /// `event_type` becomes a `.` — `"task-started"` publishes as
+    /// `"task.started"`, `"worker-heartbeat"` as `"worker.heartbeat"` — which
+    /// is what a real Celery `EventDispatcher` puts on the wire for the same
+    /// `celeryev` exchange, and is what lets a topic-exchange consumer bind
+    /// `task.#` / `worker.#` / `#` usefully.
+    ///
+    /// Under [`EventRoutingMode::Fixed`], `event_type` is ignored and the
+    /// configured [`AmqpEventConfig::routing_key`] is returned verbatim.
+    pub fn publish_routing_key(&self, event_type: &str) -> String {
+        match self.routing_mode {
+            EventRoutingMode::PerEventType => event_type.replace('-', "."),
+            EventRoutingMode::Fixed => self.routing_key.clone(),
+        }
+    }
+
+    /// The binding pattern [`AmqpEventReceiver`] subscribes with.
+    ///
+    /// An explicit (non-empty) [`AmqpEventConfig::routing_key`] is always
+    /// honoured verbatim, whatever the exchange type. Left at its default
+    /// (empty) on a **topic** exchange this returns Celery's own catch-all
+    /// pattern `"#"` instead: binding on the literal empty string would only
+    /// match events an emitter running [`EventRoutingMode::Fixed`] with an
+    /// equally-empty key deliberately publishes there, which is not how
+    /// [`EventRoutingMode::PerEventType`] — the default — publishes anything.
+    /// On any other exchange type the key is taken literally, empty or not:
+    /// `#`/`*` wildcards are a topic-exchange concept and bind nothing extra
+    /// on a fanout (which ignores the routing key regardless) or a direct
+    /// exchange (exact match only).
+    pub fn receiver_binding_key(&self) -> &str {
+        if self.routing_key.is_empty() && self.exchange_type == "topic" {
+            "#"
+        } else {
+            self.routing_key.as_str()
         }
     }
 }
@@ -412,8 +512,13 @@ impl AmqpEventEmitter {
         Ok(new_channel)
     }
 
-    /// Publish a serialized event payload to the exchange
-    async fn publish_payload(&self, payload: &[u8]) -> std::result::Result<(), CelersError> {
+    /// Publish a serialized event payload to the exchange under the routing
+    /// key `event_type` resolves to; see [`AmqpEventConfig::publish_routing_key`].
+    async fn publish_payload(
+        &self,
+        event_type: &str,
+        payload: &[u8],
+    ) -> std::result::Result<(), CelersError> {
         let channel = self.get_channel().await?;
 
         self.ensure_exchange(&channel).await?;
@@ -422,10 +527,11 @@ impl AmqpEventEmitter {
             .with_content_type("application/json".into())
             .with_delivery_mode(if self.config.durable { 2 } else { 1 });
 
+        let routing_key = self.config.publish_routing_key(event_type);
         let confirmation = channel
             .basic_publish(
                 self.config.exchange.as_str().into(),
-                self.config.routing_key.as_str().into(),
+                routing_key.as_str().into(),
                 BasicPublishOptions::default(),
                 payload,
                 properties,
@@ -469,7 +575,7 @@ impl EventEmitter for AmqpEventEmitter {
         let payload = event_json.as_bytes();
         let payload_len = payload.len() as u64;
 
-        match self.publish_payload(payload).await {
+        match self.publish_payload(event.event_type(), payload).await {
             Ok(()) => {
                 let mut stats = self.stats.write().await;
                 stats.record_success(payload_len);
@@ -516,11 +622,12 @@ impl EventEmitter for AmqpEventEmitter {
                 // event gets its own envelope, so the logical clock still
                 // orders them.
                 let event_json = self.render(event)?;
+                let routing_key = self.config.publish_routing_key(event.event_type());
 
                 let confirm = channel
                     .basic_publish(
                         self.config.exchange.as_str().into(),
-                        self.config.routing_key.as_str().into(),
+                        routing_key.as_str().into(),
                         BasicPublishOptions::default(),
                         event_json.as_bytes(),
                         properties.clone(),
@@ -579,6 +686,7 @@ impl std::fmt::Debug for AmqpEventEmitter {
         f.debug_struct("AmqpEventEmitter")
             .field("exchange", &self.config.exchange)
             .field("exchange_type", &self.config.exchange_type)
+            .field("routing_mode", &self.config.routing_mode)
             .field("enabled", &self.config.enabled)
             .field("durable", &self.config.durable)
             .finish()
@@ -755,7 +863,7 @@ impl AmqpEventReceiver {
             .queue_bind(
                 queue.name().as_str().into(),
                 self.config.exchange.as_str().into(),
-                self.config.routing_key.as_str().into(),
+                self.config.receiver_binding_key().into(),
                 QueueBindOptions::default(),
                 FieldTable::default(),
             )
@@ -900,7 +1008,7 @@ impl AmqpEventReceiver {
             .queue_bind(
                 queue.name().as_str().into(),
                 self.config.exchange.as_str().into(),
-                self.config.routing_key.as_str().into(),
+                self.config.receiver_binding_key().into(),
                 QueueBindOptions::default(),
                 FieldTable::default(),
             )
@@ -987,13 +1095,23 @@ mod tests {
     fn test_amqp_event_config_default() {
         let config = AmqpEventConfig::default();
         assert_eq!(config.exchange, "celeryev");
-        assert_eq!(config.exchange_type, "fanout");
+        assert_eq!(
+            config.exchange_type, "topic",
+            "must match the real celery.events.dispatcher exchange, not fanout"
+        );
+        assert_eq!(config.routing_mode, EventRoutingMode::PerEventType);
         assert_eq!(config.routing_key, "");
         assert!(!config.durable);
         assert!(config.enabled);
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.serialization, "json");
         assert!(config.hostname.is_none());
+    }
+
+    #[test]
+    fn test_amqp_event_config_routing_mode_builder() {
+        let config = AmqpEventConfig::new().routing_mode(EventRoutingMode::Fixed);
+        assert_eq!(config.routing_mode, EventRoutingMode::Fixed);
     }
 
     #[test]
@@ -1170,8 +1288,107 @@ mod tests {
     }
 
     #[test]
-    fn test_config_exchange_kind_default_is_fanout() {
+    fn test_config_exchange_kind_default_is_topic() {
         let config = AmqpEventConfig::default();
-        assert!(matches!(config.exchange_kind(), ExchangeKind::Fanout));
+        assert!(matches!(config.exchange_kind(), ExchangeKind::Topic));
+    }
+
+    // --- Per-event-type routing keys (idx: topic-exchange routing) ---
+
+    /// The default mode derives a dotted routing key from each event's own
+    /// wire `type`, matching what a real Celery `EventDispatcher` publishes
+    /// on the same exchange.
+    #[test]
+    fn test_publish_routing_key_derives_a_dotted_key_per_event_type() {
+        let config = AmqpEventConfig::default();
+        assert_eq!(config.routing_mode, EventRoutingMode::PerEventType);
+
+        assert_eq!(config.publish_routing_key("task-started"), "task.started");
+        assert_eq!(
+            config.publish_routing_key("worker-heartbeat"),
+            "worker.heartbeat"
+        );
+        assert_eq!(
+            config.publish_routing_key("task-soft-time-limit-exceeded"),
+            "task.soft.time.limit.exceeded"
+        );
+        // No hyphens: nothing to translate.
+        assert_eq!(config.publish_routing_key("taskstarted"), "taskstarted");
+    }
+
+    /// The routing key an emitter would actually pass to `basic_publish` for
+    /// every event type this crate emits, pinned so a typo in the
+    /// hyphen-to-dot translation (or in `Event::event_type` itself) shows up
+    /// here rather than only against a live broker.
+    #[test]
+    fn test_publish_routing_key_covers_every_known_event_type() {
+        use celers_core::event::{Event, TaskEventBuilder, WorkerEventBuilder};
+
+        let config = AmqpEventConfig::default();
+        let task_id = Uuid::new_v4();
+        let events: Vec<Event> = vec![
+            TaskEventBuilder::new(task_id, "t").sent("celery"),
+            TaskEventBuilder::new(task_id, "t").received(),
+            TaskEventBuilder::new(task_id, "t").started(),
+            WorkerEventBuilder::new("w").online(),
+            WorkerEventBuilder::new("w").offline(),
+            WorkerEventBuilder::new("w").heartbeat(0, 0, [0.0, 0.0, 0.0], 1.0),
+        ];
+        for event in events {
+            let key = config.publish_routing_key(event.event_type());
+            assert!(!key.contains('-'), "key must be fully dotted: {key}");
+            assert_eq!(key, event.event_type().replace('-', "."));
+        }
+    }
+
+    /// `Fixed` mode ignores the event type entirely -- the pre-topic-routing
+    /// behaviour, preserved for a fanout exchange (which ignores the routing
+    /// key outright) or a direct exchange bound on one key.
+    #[test]
+    fn test_publish_routing_key_fixed_mode_ignores_the_event_type() {
+        let config = AmqpEventConfig::new()
+            .routing_mode(EventRoutingMode::Fixed)
+            .routing_key("celery");
+
+        assert_eq!(config.publish_routing_key("task-started"), "celery");
+        assert_eq!(config.publish_routing_key("worker-heartbeat"), "celery");
+        assert_eq!(config.publish_routing_key(""), "celery");
+    }
+
+    /// On the default topic exchange, an unset routing key must not leave the
+    /// receiver bound to a pattern nothing under `PerEventType` ever
+    /// publishes to.
+    #[test]
+    fn test_receiver_binding_key_defaults_to_the_topic_catchall() {
+        let config = AmqpEventConfig::default();
+        assert_eq!(config.exchange_type, "topic");
+        assert_eq!(config.receiver_binding_key(), "#");
+    }
+
+    /// An explicit routing key is always honoured verbatim as the binding
+    /// pattern, on any exchange type.
+    #[test]
+    fn test_receiver_binding_key_honours_an_explicit_key() {
+        let topic = AmqpEventConfig::new()
+            .exchange_type("topic")
+            .routing_key("task.#");
+        assert_eq!(topic.receiver_binding_key(), "task.#");
+
+        let fanout = AmqpEventConfig::new()
+            .exchange_type("fanout")
+            .routing_key("ignored-by-fanout");
+        assert_eq!(fanout.receiver_binding_key(), "ignored-by-fanout");
+    }
+
+    /// The `"#"` substitution is specifically a topic-exchange concept: on a
+    /// fanout or direct exchange an empty key is taken literally, because
+    /// `#`/`*` wildcards mean nothing to either.
+    #[test]
+    fn test_receiver_binding_key_is_literal_off_topic() {
+        let fanout = AmqpEventConfig::new().exchange_type("fanout");
+        assert_eq!(fanout.receiver_binding_key(), "");
+
+        let direct = AmqpEventConfig::new().exchange_type("direct");
+        assert_eq!(direct.receiver_binding_key(), "");
     }
 }

@@ -243,6 +243,41 @@ SELECT COUNT(*) as count
    AND state = 'pending'
 "#;
 
+// ── Revocation ─────────────────────────────────────────────────────────────
+//
+// See `revocation.rs`. `$1` = task id, `$2` = queue_name, `$3` = terminate,
+// `$4` = expires_at (bound as `.to_rfc3339()` through the crate's
+// `$n::text::timestamptz` convention — see `row_ext.rs`).
+
+/// Record (or refresh) a durable revocation. A second `revoke()` call for the
+/// same task — e.g. escalating `terminate` from `false` to `true` — replaces
+/// the row rather than erroring, and refreshes `revoked_at` too.
+pub(crate) const UPSERT_REVOKED_TASK: &str = r#"
+INSERT INTO celers_revoked_tasks (task_id, queue_name, terminate, expires_at)
+VALUES ($1, $2, $3, $4::text::timestamptz)
+ON CONFLICT (queue_name, task_id)
+DO UPDATE SET terminate = EXCLUDED.terminate,
+              expires_at = EXCLUDED.expires_at,
+              revoked_at = NOW()
+"#;
+
+/// Opportunistic prune, run on every `revoke()` call so the table stays
+/// bounded by the revocation TTL rather than growing forever. No dedicated
+/// sweep task exists (unlike `spawn_retention_task` for terminal tasks)
+/// because this table is expected to stay small: only *currently revoked*
+/// ids survive past their `expires_at`.
+pub(crate) const PRUNE_EXPIRED_REVOCATIONS: &str = r#"
+DELETE FROM celers_revoked_tasks WHERE expires_at < NOW()
+"#;
+
+/// `$1` = task id, `$2` = queue_name.
+pub(crate) const IS_REVOKED: &str = r#"
+SELECT 1 FROM celers_revoked_tasks
+ WHERE task_id = $1
+   AND queue_name = $2
+   AND expires_at > NOW()
+"#;
+
 /// Batch ack. `$1..$n` are task ids, `${n+1}` is the queue name.
 pub(crate) fn ack_batch_sql(id_count: usize) -> String {
     let placeholders: Vec<String> = (1..=id_count).map(|i| format!("${i}")).collect();
@@ -430,6 +465,22 @@ mod tests {
         assert!(CANCEL_TASK.contains("AND state IN ('pending', 'processing')"));
         assert!(CANCEL_TASK.contains("queue_name = $2"));
         assert!(QUEUE_SIZE.contains("queue_name = $1"));
+    }
+
+    #[test]
+    fn revocation_statements_are_queue_scoped_and_ttl_guarded() {
+        assert!(UPSERT_REVOKED_TASK.contains("ON CONFLICT (queue_name, task_id)"));
+        assert!(UPSERT_REVOKED_TASK.contains("$4::text::timestamptz"));
+        assert!(
+            UPSERT_REVOKED_TASK.contains("revoked_at = NOW()"),
+            "re-revoking must refresh revoked_at, not just terminate/expires_at"
+        );
+        assert!(PRUNE_EXPIRED_REVOCATIONS.contains("expires_at < NOW()"));
+        assert!(IS_REVOKED.contains("queue_name = $2"));
+        assert!(
+            IS_REVOKED.contains("expires_at > NOW()"),
+            "a lapsed revocation must not still block dispatch"
+        );
     }
 
     #[test]

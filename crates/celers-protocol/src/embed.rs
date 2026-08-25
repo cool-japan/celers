@@ -62,7 +62,7 @@ where
 }
 
 /// Callback signature for link/errback
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallbackSignature {
     /// Task name
     pub task: String,
@@ -154,7 +154,7 @@ impl CallbackSignature {
 ///
 /// Both directions honour that shape: an explicit `null` decodes to an empty
 /// list, and an empty list encodes back to `null`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EmbedOptions {
     /// Callbacks to execute on success (link)
     #[serde(
@@ -283,7 +283,7 @@ impl EmbedOptions {
 }
 
 /// Complete embedded body format [args, kwargs, embed]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EmbeddedBody {
     /// Positional arguments
     pub args: Vec<Value>,

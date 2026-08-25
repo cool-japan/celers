@@ -10,8 +10,10 @@
 //! Flower, a custom consumer) expects float Unix timestamps and Celery's own
 //! field names (`uuid`, `name`), plus the `clock`/`utcoffset`/`pid` envelope.
 //! That shape is produced by [`Event::to_wire_json`] and parsed back by
-//! [`Event::from_wire_str`]; see the [`wire`] module for the full mapping. It
-//! is exactly the shape `celers_protocol::event::EventMessage` describes, and
+//! [`Event::from_wire_str`]; see the [`wire`] module for the encoding and
+//! [`message`] for the typed field mapping. It is exactly the shape
+//! `celers_protocol::event::EventMessage` describes — the two are connected by
+//! real `From`/`TryFrom` impls, not by a string-keyed rename — and
 //! it is what every network transport in the workspace
 //! (`celers_backend_redis::event_transport`,
 //! `celers_broker_amqp::event_transport`) puts on the wire.
@@ -77,6 +79,9 @@ use uuid::Uuid;
 
 pub mod message;
 pub mod wire;
+
+#[cfg(test)]
+pub(crate) mod test_events;
 
 pub use wire::{
     adjust_event_clock, current_event_clock, event_timestamp_now, forward_event_clock,
@@ -231,6 +236,19 @@ pub enum TaskEvent {
         /// Task name
         #[serde(skip_serializing_if = "Option::is_none")]
         task_name: Option<String>,
+        /// Worker hostname
+        ///
+        /// Python Celery's `task-revoked` is emitted by the worker through the
+        /// event dispatcher, so it carries `hostname` like every other worker
+        /// event — a monitor uses it to tell *which* worker dropped the task.
+        /// CeleRS always emits it.
+        ///
+        /// It is `#[serde(default)]` because a payload written by CeleRS 0.3.0
+        /// (before this field existed) carries no `hostname` of its own, and
+        /// during a rolling upgrade rejecting those outright would lose the
+        /// revocation entirely rather than lose one field of it.
+        #[serde(default)]
+        hostname: String,
         /// Event timestamp
         timestamp: DateTime<Utc>,
         /// Whether to terminate running task
@@ -419,9 +437,10 @@ impl Event {
                 | TaskEvent::Succeeded { hostname, .. }
                 | TaskEvent::Failed { hostname, .. }
                 | TaskEvent::Retried { hostname, .. }
+                | TaskEvent::Revoked { hostname, .. }
                 | TaskEvent::Rejected { hostname, .. }
                 | TaskEvent::SoftTimeLimitExceeded { hostname, .. } => Some(hostname),
-                TaskEvent::Sent { .. } | TaskEvent::Revoked { .. } => None,
+                TaskEvent::Sent { .. } => None,
             },
             Event::Worker(e) => match e {
                 WorkerEvent::Online { hostname, .. }
@@ -975,9 +994,10 @@ impl EventFilter {
                         | TaskEvent::Succeeded { hostname, .. }
                         | TaskEvent::Failed { hostname, .. }
                         | TaskEvent::Retried { hostname, .. }
+                        | TaskEvent::Revoked { hostname, .. }
                         | TaskEvent::Rejected { hostname, .. }
                         | TaskEvent::SoftTimeLimitExceeded { hostname, .. } => Some(hostname),
-                        TaskEvent::Sent { .. } | TaskEvent::Revoked { .. } => None,
+                        TaskEvent::Sent { .. } => None,
                     },
                     Event::Worker(worker_event) => match worker_event {
                         WorkerEvent::Online { hostname, .. }

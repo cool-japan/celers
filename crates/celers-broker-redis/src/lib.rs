@@ -44,6 +44,7 @@ pub mod connection;
 pub mod control;
 pub mod cron_scheduler;
 pub mod dedup;
+pub mod defer;
 pub mod degradation;
 pub mod dlq_analytics;
 pub mod dlq_archival;
@@ -97,8 +98,9 @@ pub use cluster::{
 #[allow(deprecated)]
 pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionStats, Compressor};
 pub use connection::{
-    blocking_response_timeout, ConnectionStats, RedisClientExt, RedisConfig, TlsConfig,
-    BLOCKING_RESPONSE_MARGIN, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_RESPONSE_TIMEOUT,
+    blocking_response_timeout, install_pure_tls_provider, open_client, ConnectionStats,
+    RedisClientExt, RedisConfig, TlsConfig, BLOCKING_RESPONSE_MARGIN, DEFAULT_CONNECTION_TIMEOUT,
+    DEFAULT_RESPONSE_TIMEOUT,
 };
 pub use control::RedisControlTransport;
 pub use cron_scheduler::{CronExpression, CronScheduler, ScheduledTask};
@@ -361,7 +363,7 @@ impl RedisBroker {
 
     /// Create a new Redis broker with specified queue mode
     pub fn with_mode(redis_url: &str, queue_name: &str, mode: QueueMode) -> Result<Self> {
-        let client = Client::open(redis_url)
+        let client = connection::open_client(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
         Ok(Self::from_client(
@@ -1540,6 +1542,21 @@ impl Broker for RedisBroker {
             }
         }
         Ok(())
+    }
+
+    /// Return a message to the queue with its retry state untouched.
+    ///
+    /// [`reject`](Self::reject) with `requeue = true` rewrites the payload to
+    /// `Retrying(n + 1)`, which is right for a task that ran and failed and
+    /// wrong for one that never ran. See [`crate::defer`] for the ready-queue /
+    /// delayed-set split this makes.
+    async fn defer(
+        &self,
+        task_id: &TaskId,
+        receipt_handle: Option<&str>,
+        delay: std::time::Duration,
+    ) -> Result<()> {
+        self.defer_delivery(task_id, receipt_handle, delay).await
     }
 
     async fn queue_size(&self) -> Result<usize> {

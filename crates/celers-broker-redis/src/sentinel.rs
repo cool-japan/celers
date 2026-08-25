@@ -231,7 +231,7 @@ impl SentinelClient {
             format!("redis://{}/0", sentinel_addr)
         };
 
-        let client = Client::open(sentinel_url.as_str())
+        let client = crate::connection::open_client(sentinel_url.as_str())
             .map_err(|e| CelersError::Broker(format!("Failed to create sentinel client: {}", e)))?;
 
         let mut conn = client
@@ -298,7 +298,7 @@ impl SentinelClient {
             format!("redis://{}:{}/{}", master.host, master.port, self.config.db)
         };
 
-        Client::open(url.as_str())
+        crate::connection::open_client(url.as_str())
             .map_err(|e| CelersError::Broker(format!("Failed to create Redis client: {}", e)))
     }
 

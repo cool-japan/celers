@@ -277,12 +277,12 @@ pub trait MiddlewareConsumer: Consumer {
         match chain.process_after_consume(&mut envelope.message).await {
             Ok(MiddlewareDecision::Accept) => Ok(Some(envelope)),
             Ok(MiddlewareDecision::Drop { middleware, reason }) => {
-                eprintln!(
-                    "[middleware] dropping message {} (task={}): {} reported: {}",
-                    envelope.delivery_tag,
-                    envelope.task_name(),
-                    middleware,
-                    reason
+                tracing::warn!(
+                    delivery_tag = %envelope.delivery_tag,
+                    task = %envelope.task_name(),
+                    middleware = %middleware,
+                    reason = %reason,
+                    "Dropping message"
                 );
                 // Best-effort: settling the tag matters more than the
                 // settle call itself succeeding (the message is being

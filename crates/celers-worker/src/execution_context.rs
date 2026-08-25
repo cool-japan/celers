@@ -403,8 +403,61 @@ pub fn is_cancelled() -> bool {
 /// Convenience: return [`CancellationError::Cancelled`] if the currently
 /// executing task has been cancelled, otherwise `Ok(())`.
 ///
-/// Cooperative tasks can `?` this at natural checkpoints to bail out cleanly.
-/// Outside of a task scope this is always `Ok(())`.
+/// Cooperative tasks can `?` this at natural checkpoints to bail out cleanly:
+/// [`CancellationError`] converts into
+/// [`CelersError::Cancelled`](celers_core::CelersError::Cancelled), which is
+/// the error type a [`Task::execute`](celers_core::Task::execute) body
+/// returns, so the `?` needs no `map_err`. The resulting error answers
+/// `is_cancelled()` and is **not** retryable — a withdrawn request must not be
+/// re-run.
+///
+/// Outside of a task scope this is always `Ok(())`: there is no ambient token,
+/// so there is nothing to cancel.
+///
+/// ```
+/// use celers_core::Result;
+/// use celers_worker::execution_context::check_cancelled;
+///
+/// // A cooperative task body: one `?` per checkpoint, no `map_err`.
+/// fn checkpoint() -> Result<()> {
+///     check_cancelled()?;
+///     Ok(())
+/// }
+///
+/// // Called outside a task scope there is no ambient token, so it passes.
+/// assert!(checkpoint().is_ok());
+/// ```
+///
+/// Inside a cancelled task scope the same call fails with a recognisable
+/// cancellation:
+///
+/// ```
+/// use celers_core::{CelersError, Result};
+/// use celers_worker::cancellation::CancellationToken;
+/// use celers_worker::execution_context::{check_cancelled, TaskExecutionContext};
+///
+/// fn checkpoint() -> Result<()> {
+///     check_cancelled()?;
+///     Ok(())
+/// }
+///
+/// # tokio::runtime::Builder::new_current_thread()
+/// #     .enable_all()
+/// #     .build()
+/// #     .expect("runtime")
+/// #     .block_on(async {
+/// let task_id = uuid::Uuid::new_v4();
+/// let ctx = TaskExecutionContext::new(CancellationToken::new(task_id));
+/// ctx.token().cancel();
+///
+/// let err: CelersError = ctx
+///     .scope(async { checkpoint() })
+///     .await
+///     .expect_err("a cancelled scope stops the task");
+/// assert!(err.is_cancelled());
+/// assert_eq!(err.withdrawn_task_id(), Some(task_id));
+/// # });
+/// ```
 pub fn check_cancelled() -> Result<(), CancellationError> {
     match CURRENT_CONTEXT.try_with(|ctx| ctx.token.clone()) {
         Ok(token) => token.check_cancelled(),

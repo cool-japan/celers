@@ -185,16 +185,17 @@ services:
     networks:
       - celers-network
 
-  # CeleRS worker -- CONNECTIVITY DEMO ONLY. This builds the shipped
-  # `celers` CLI image, which constructs an EMPTY task registry (see
-  # crates/celers-cli/src/commands/worker.rs and docs/DEPLOYMENT.md's
-  # "Building a worker image" section). It connects to Redis, joins the
-  # remote-control channel so `celers inspect`/`celers control` have
-  # something to talk to, and logs -- but it can never execute a task,
-  # because CeleRS tasks are compiled-in Rust code, not something a
-  # generic binary can load at runtime. To run real tasks, build your own
-  # image from a binary that links `celers-worker` and registers your
-  # tasks, per docs/DEPLOYMENT.md.
+  # CeleRS worker -- SMOKE TEST ONLY, not a real task executor. This builds
+  # the shipped `celers` CLI image, which by default constructs an EMPTY
+  # task registry (see crates/celers-cli/src/commands/worker.rs and
+  # docs/DEPLOYMENT.md's "Building a Worker Image" section). `--demo-tasks`
+  # below registers three harmless built-ins (demo.echo, demo.sleep,
+  # demo.fail) so this service can prove enqueue -> dequeue -> execute ->
+  # ack/DLQ end-to-end against the rest of the stack -- it does NOT make
+  # this a general-purpose worker. It also joins the remote-control channel
+  # so `celers inspect`/`celers control` have something to talk to. To run
+  # your own tasks, build your own image from a binary that links
+  # `celers-worker` and registers them, per docs/DEPLOYMENT.md.
   worker:
     build:
       context: .
@@ -210,7 +211,7 @@ services:
     # `celers worker` builds a RedisBroker unconditionally regardless of the
     # URL scheme passed to --broker (crates/celers-cli/src/commands/worker.rs),
     # so this service only ever needs -- and only ever waits on -- Redis.
-    command: worker --broker redis://redis:6379 --concurrency 4
+    command: worker --broker redis://redis:6379 --concurrency 4 --demo-tasks
 
 volumes:
   redis-data:

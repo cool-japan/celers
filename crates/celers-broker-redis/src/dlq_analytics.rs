@@ -245,7 +245,7 @@ impl ErrorCategory {
 impl DLQAnalyzer {
     /// Create a new DLQ analyzer
     pub async fn new(redis_url: &str, queue_name: &str) -> Result<Self> {
-        let client = Client::open(redis_url)
+        let client = crate::connection::open_client(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
         Ok(Self {

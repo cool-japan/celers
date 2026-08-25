@@ -28,12 +28,30 @@
 //!    [`crate::task_meta_extra::TaskMetaExtra`] instead of being silently
 //!    dropped to their defaults on every encode.
 
+use crate::compression::CompressionConfig;
 use crate::proto::{self, TaskResultState};
 use crate::task_meta_extra::TaskMetaExtra;
 use celers_backend_redis::{BackendError, ChordState, Result, TaskMeta, TaskResult};
+use celers_core::ResultCompressor;
 use chrono::{TimeZone, Utc};
+use std::sync::OnceLock;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// The codec registry [`from_proto_meta`] decompresses
+/// `result_data_compressed` with.
+///
+/// Decoding needs no configuration beyond "every codec this build was
+/// compiled with is registered" — which is true for `ResultCompressor`
+/// regardless of any writer-side threshold or algorithm choice — so a
+/// single lazily-built, process-wide instance is shared by every decode
+/// rather than reconstructing the (small, but non-zero) codec map on every
+/// call. The threshold value passed to `new` is irrelevant here: nothing
+/// on the decode path calls `should_compress`.
+fn decompressor() -> &'static ResultCompressor {
+    static DECOMPRESSOR: OnceLock<ResultCompressor> = OnceLock::new();
+    DECOMPRESSOR.get_or_init(|| ResultCompressor::new(0))
+}
 
 /// Convert a domain [`TaskMeta`] into its protobuf representation.
 ///
@@ -89,7 +107,57 @@ pub(crate) fn to_proto_meta(meta: &TaskMeta) -> Result<proto::TaskMeta> {
             .unwrap_or(0),
         worker: meta.worker.clone(),
         extra_json: Some(extra_json),
+        result_data_compressed: None,
+        result_compression_algorithm: None,
     })
+}
+
+/// [`to_proto_meta`] plus optional compression of `result_data`: when
+/// `config` is enabled and the encoded `result_data` string is at or above
+/// its threshold, the plain `result_data` field is cleared and replaced
+/// with `result_data_compressed`/`result_compression_algorithm`.
+///
+/// A message built by [`to_proto_meta`] itself (compression disabled,
+/// below threshold, or nothing to compress because `result_state` is not
+/// `SUCCESS`) is returned unchanged — this function's job is purely
+/// additive on top of it.
+///
+/// # Errors
+///
+/// Propagates whatever [`to_proto_meta`] returns, plus a compression
+/// failure from the configured codec.
+pub(crate) fn to_proto_meta_with_compression(
+    meta: &TaskMeta,
+    config: &CompressionConfig,
+) -> Result<proto::TaskMeta> {
+    let mut proto_meta = to_proto_meta(meta)?;
+
+    if !config.is_enabled() {
+        return Ok(proto_meta);
+    }
+    let Some(result_data) = &proto_meta.result_data else {
+        return Ok(proto_meta);
+    };
+
+    if !config.compressor().should_compress(result_data.as_bytes()) {
+        return Ok(proto_meta);
+    }
+
+    let compressed = config
+        .compressor()
+        .compress(result_data.as_bytes(), config.algorithm())
+        .map_err(|e| BackendError::Serialization(format!("failed to compress result_data: {e}")))?;
+
+    // Not worth the two extra fields if the codec could not actually
+    // shrink it.
+    if compressed.len() >= result_data.len() {
+        return Ok(proto_meta);
+    }
+
+    proto_meta.result_data = None;
+    proto_meta.result_data_compressed = Some(compressed);
+    proto_meta.result_compression_algorithm = Some(config.algorithm().to_string());
+    Ok(proto_meta)
 }
 
 /// Convert a protobuf `TaskMeta` back into the domain type.
@@ -110,14 +178,49 @@ pub(crate) fn from_proto_meta(proto_meta: proto::TaskMeta) -> Result<TaskMeta> {
         TaskResultState::Pending => TaskResult::Pending,
         TaskResultState::Started => TaskResult::Started,
         TaskResultState::Success => {
-            let data = match proto_meta.result_data {
-                Some(s) => serde_json::from_str(&s).map_err(|e| {
+            // `result_data_compressed` is checked first and, when present,
+            // is authoritative -- a writer with compression enabled clears
+            // `result_data` (see `to_proto_meta_with_compression`), so the
+            // two are never both set by this crate's own encoder. Decoding
+            // it needs no config of the reader's own: any `ResultCompressor`
+            // this build constructs has every codec it was compiled with
+            // registered, regardless of whether *this* side ever turns
+            // compression on for its own writes.
+            let data = if let Some(compressed) = &proto_meta.result_data_compressed {
+                let algorithm = proto_meta
+                    .result_compression_algorithm
+                    .as_deref()
+                    .ok_or_else(|| {
+                        BackendError::Serialization(format!(
+                            "result_data_compressed set without result_compression_algorithm \
+                                 for task {}",
+                            proto_meta.task_id
+                        ))
+                    })?;
+                let raw = decompressor()
+                    .decompress(compressed, algorithm)
+                    .map_err(|e| {
+                        BackendError::Serialization(format!(
+                            "failed to decompress result_data for task {}: {e}",
+                            proto_meta.task_id
+                        ))
+                    })?;
+                serde_json::from_slice(&raw).map_err(|e| {
                     BackendError::Serialization(format!(
-                        "corrupt result_data for task {}: {e}",
+                        "corrupt decompressed result_data for task {}: {e}",
                         proto_meta.task_id
                     ))
-                })?,
-                None => serde_json::Value::Null,
+                })?
+            } else {
+                match proto_meta.result_data {
+                    Some(s) => serde_json::from_str(&s).map_err(|e| {
+                        BackendError::Serialization(format!(
+                            "corrupt result_data for task {}: {e}",
+                            proto_meta.task_id
+                        ))
+                    })?,
+                    None => serde_json::Value::Null,
+                }
             };
             TaskResult::Success(data)
         }
@@ -169,6 +272,7 @@ pub(crate) fn from_proto_meta(proto_meta: proto::TaskMeta) -> Result<TaskMeta> {
         memory_bytes: None,
         retries: None,
         queue: None,
+        ignored_error: None,
     };
     extra.apply_to(&mut meta);
     Ok(meta)
@@ -251,6 +355,7 @@ mod tests {
             memory_bytes: None,
             retries: None,
             queue: None,
+            ignored_error: None,
         }
     }
 
@@ -542,5 +647,142 @@ mod tests {
         assert_eq!(proto_state.created_at_nanos, 42);
         let round_tripped = from_proto_chord(proto_state).unwrap();
         assert_eq!(round_tripped.created_at, precise);
+    }
+
+    // ── result_data compression ──────────────────────────────────────────
+
+    /// A payload with real structure -- repetitive enough that a real
+    /// codec beats it, not a single repeated byte.
+    fn compressible_payload() -> serde_json::Value {
+        let items: Vec<serde_json::Value> = (0..256)
+            .map(|i| serde_json::json!({"task": "tasks.add", "seq": i, "note": "same shape"}))
+            .collect();
+        serde_json::json!({ "items": items })
+    }
+
+    #[test]
+    fn disabled_compression_leaves_the_plain_result_data_field_set() {
+        let mut meta = base_meta();
+        meta.result = TaskResult::Success(compressible_payload());
+
+        let proto_meta = to_proto_meta_with_compression(
+            &meta,
+            &crate::compression::CompressionConfig::disabled(),
+        )
+        .unwrap();
+
+        assert!(proto_meta.result_data.is_some());
+        assert!(proto_meta.result_data_compressed.is_none());
+        assert!(proto_meta.result_compression_algorithm.is_none());
+    }
+
+    #[test]
+    fn below_threshold_is_not_compressed() {
+        let mut meta = base_meta();
+        meta.result = TaskResult::Success(serde_json::json!({"tiny": true}));
+
+        let config = crate::compression::CompressionConfig::new(1024 * 1024, "zstd");
+        let proto_meta = to_proto_meta_with_compression(&meta, &config).unwrap();
+
+        assert!(proto_meta.result_data.is_some());
+        assert!(proto_meta.result_data_compressed.is_none());
+    }
+
+    /// The full round trip: an eligible payload is compressed into the new
+    /// fields (with the plain field cleared), and `from_proto_meta`
+    /// reconstructs the exact original value from them.
+    #[test]
+    fn eligible_result_data_round_trips_through_compression() {
+        let mut meta = base_meta();
+        let original = compressible_payload();
+        meta.result = TaskResult::Success(original.clone());
+
+        let config = crate::compression::CompressionConfig::new(16, "zstd");
+        let proto_meta = to_proto_meta_with_compression(&meta, &config).unwrap();
+
+        assert!(
+            proto_meta.result_data.is_none(),
+            "the plain field must be cleared once compression is used"
+        );
+        assert!(proto_meta.result_data_compressed.is_some());
+        assert_eq!(
+            proto_meta.result_compression_algorithm.as_deref(),
+            Some("zstd")
+        );
+
+        let decoded = from_proto_meta(proto_meta).unwrap();
+        match decoded.result {
+            TaskResult::Success(v) => assert_eq!(v, original),
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    /// A message from a writer that predates these fields (both unset) must
+    /// still decode via the plain `result_data` string exactly as before --
+    /// the core backward-compatibility property these two optional fields
+    /// exist to preserve.
+    #[test]
+    fn a_message_with_neither_compression_field_set_decodes_the_plain_field() {
+        let mut meta = base_meta();
+        meta.result = TaskResult::Success(serde_json::json!({"ordinary": true}));
+        let proto_meta = to_proto_meta(&meta).unwrap();
+        assert!(proto_meta.result_data_compressed.is_none());
+
+        let decoded = from_proto_meta(proto_meta).unwrap();
+        assert_eq!(decoded.result, meta.result);
+    }
+
+    /// Decoding a compressed message needs no compression config of its
+    /// own on the reader's side: a client with compression disabled must
+    /// still correctly decode a response a compression-enabled peer
+    /// produced.
+    #[test]
+    fn decoding_a_compressed_message_needs_no_config_on_the_reader_side() {
+        let mut meta = base_meta();
+        let original = compressible_payload();
+        meta.result = TaskResult::Success(original.clone());
+
+        let writer_config = crate::compression::CompressionConfig::new(16, "zstd");
+        let proto_meta = to_proto_meta_with_compression(&meta, &writer_config).unwrap();
+        assert!(proto_meta.result_data_compressed.is_some());
+
+        // `from_proto_meta` takes no config parameter at all -- this test
+        // exists to document and pin that, not to exercise a branch.
+        let decoded = from_proto_meta(proto_meta).unwrap();
+        match decoded.result {
+            TaskResult::Success(v) => assert_eq!(v, original),
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_data_compressed_without_an_algorithm_is_a_decode_error() {
+        let mut meta = base_meta();
+        meta.result = TaskResult::Success(serde_json::json!({"ok": true}));
+        let mut proto_meta = to_proto_meta(&meta).unwrap();
+
+        proto_meta.result_data = None;
+        proto_meta.result_data_compressed = Some(b"whatever".to_vec());
+        proto_meta.result_compression_algorithm = None;
+
+        let err = from_proto_meta(proto_meta)
+            .expect_err("a compressed payload with no named algorithm must not decode");
+        assert!(err.is_serialization());
+    }
+
+    #[test]
+    fn a_truncated_compressed_payload_is_a_decode_error_not_silent_corruption() {
+        let mut meta = base_meta();
+        meta.result = TaskResult::Success(compressible_payload());
+
+        let config = crate::compression::CompressionConfig::new(16, "zstd");
+        let mut proto_meta = to_proto_meta_with_compression(&meta, &config).unwrap();
+
+        let compressed = proto_meta.result_data_compressed.take().unwrap();
+        proto_meta.result_data_compressed = Some(compressed[..compressed.len() / 2].to_vec());
+
+        let err = from_proto_meta(proto_meta)
+            .expect_err("a truncated compressed payload must not decode as if valid");
+        assert!(err.is_serialization());
     }
 }

@@ -19,8 +19,11 @@
 //! assert_eq!(message.task_name(), "tasks.add");
 //! ```
 
+use crate::compat::{python_args_repr, python_kwargs_repr};
 use crate::embed::{CallbackSignature, EmbedOptions, EmbeddedBody};
-use crate::{ContentType, Message, MessageHeaders, MessageProperties};
+use crate::{
+    ContentType, DeliveryInfo, Message, MessageHeaders, MessageProperties, DEFAULT_CELERY_QUEUE,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -384,6 +387,16 @@ impl MessageBuilder {
             embed = embed.with_root(root_id);
         }
 
+        // Render the observability headers before the args and kwargs are
+        // moved into the body.
+        let argsrepr = python_args_repr(&self.args);
+        let kwargsrepr = python_kwargs_repr(&Value::Object(
+            self.kwargs
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ));
+
         // Build embedded body
         let embedded_body = EmbeddedBody::new()
             .with_args(self.args)
@@ -395,8 +408,17 @@ impl MessageBuilder {
             .encode()
             .map_err(|e| BuilderError::SerializationError(e.to_string()))?;
 
-        // Build headers
-        let mut headers = MessageHeaders::new(self.task.clone(), task_id);
+        // Build headers.
+        //
+        // `argsrepr` / `kwargsrepr` are rendered from the *same* args and
+        // kwargs that went into the body above, as Python literals -- see
+        // `compat::python_args_repr`. Without them Flower, `celery events` and
+        // `celery inspect` show a blank argument list for every task this
+        // builder publishes, because those tools read the headers and never
+        // deserialize the body.
+        let mut headers = MessageHeaders::new(self.task.clone(), task_id)
+            .with_argsrepr(argsrepr)
+            .with_kwargsrepr(kwargsrepr);
         headers.eta = eta;
         headers.expires = self.expires;
         headers.retries = self.retries;
@@ -433,12 +455,26 @@ impl MessageBuilder {
             headers.extra.insert(key, value);
         }
 
-        // Build properties
+        // Build properties.
+        //
+        // `delivery_info.routing_key` names where the message is actually
+        // going, so a worker's retry and `link` re-publishes come back to the
+        // same queue. An explicit `.routing_key(...)` wins over `.queue(...)`;
+        // with neither, the message is on Celery's default queue and says so.
+        // `delivery_tag` comes from `MessageProperties::default`, which mints a
+        // fresh one per message the way kombu's producer does.
+        let routing_key = self
+            .routing_key
+            .clone()
+            .or_else(|| self.queue.clone())
+            .unwrap_or_else(|| DEFAULT_CELERY_QUEUE.to_string());
         let properties = MessageProperties {
             priority: self.priority,
             delivery_mode: if self.persistent { 2 } else { 1 },
             correlation_id: Some(task_id.to_string()),
             reply_to: self.reply_to,
+            delivery_info: DeliveryInfo::new(routing_key),
+            ..MessageProperties::default()
         };
 
         // Build message. Content encoding follows content type via
@@ -781,6 +817,128 @@ mod tests {
             .unwrap();
 
         assert_eq!(message.content_encoding, "binary");
+    }
+
+    /// Regression: a `MessageBuilder` envelope used to omit `delivery_tag` and
+    /// `delivery_info`, the two properties
+    /// `kombu.transport.virtual.base.Message.__init__` indexes without a
+    /// default -- so every message the ordinary CeleRS producer path published
+    /// raised `KeyError` inside a Celery worker's consumer callback and took
+    /// the worker's event loop down with it.
+    ///
+    /// `tests/python-compat/test_celers_to_python.py` proves the same thing
+    /// against a live worker; this pins it without one.
+    #[test]
+    fn test_built_envelope_carries_the_properties_kombu_indexes() {
+        let message = MessageBuilder::new("tasks.add")
+            .args(vec![json!(4), json!(5)])
+            .build()
+            .unwrap();
+
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert!(
+            value["properties"]["delivery_tag"].is_string(),
+            "kombu indexes properties['delivery_tag'] directly"
+        );
+        assert_eq!(
+            value["properties"]["delivery_info"],
+            json!({"exchange": "", "routing_key": "celery"})
+        );
+
+        // The structural verifier agrees, which is what the interop suite and
+        // every other producer path lean on.
+        crate::compat::verify_message_format(&message).expect("a deliverable v2 envelope");
+    }
+
+    /// Two built messages are two deliveries: sharing a tag would make one
+    /// acknowledgement drop the other message from a consumer's unacked table.
+    #[test]
+    fn test_each_built_message_gets_its_own_delivery_tag() {
+        let first = MessageBuilder::new("tasks.add").build().unwrap();
+        let second = MessageBuilder::new("tasks.add").build().unwrap();
+
+        assert_ne!(
+            first.properties.delivery_tag,
+            second.properties.delivery_tag
+        );
+    }
+
+    /// The routing key must name the queue the message is actually on: a
+    /// Celery worker re-publishes retries and `link` callbacks with
+    /// `self.request.delivery_info`, so a wrong one sends a task's retries to a
+    /// queue nobody consumes.
+    #[test]
+    fn test_built_envelope_routing_key_names_the_queue() {
+        let queued = MessageBuilder::new("tasks.add")
+            .queue("payments")
+            .build()
+            .unwrap();
+        assert_eq!(queued.properties.routing_key(), "payments");
+
+        // An explicit routing key wins over the queue name, matching Celery's
+        // own `apply_async(queue=..., routing_key=...)`.
+        let routed = MessageBuilder::new("tasks.add")
+            .queue("payments")
+            .routing_key("payments.high")
+            .build()
+            .unwrap();
+        assert_eq!(routed.properties.routing_key(), "payments.high");
+
+        // With neither, the message is on Celery's default queue and says so.
+        let plain = MessageBuilder::new("tasks.add").build().unwrap();
+        assert_eq!(plain.properties.routing_key(), DEFAULT_CELERY_QUEUE);
+        assert_eq!(plain.properties.delivery_info.exchange, "");
+    }
+
+    /// Regression: `build()` never set `argsrepr` / `kwargsrepr`, so every task
+    /// published through the ordinary producer path showed a blank argument
+    /// list in Flower, `celery events` and `celery inspect` -- all of which
+    /// read those headers rather than deserializing the body.
+    #[test]
+    fn test_built_envelope_carries_python_arg_reprs() {
+        let message = MessageBuilder::new("tasks.greet")
+            .args(vec![json!("Ada")])
+            .kwarg("loud", json!(true))
+            .build()
+            .unwrap();
+
+        // Python literals, not Rust `Debug`: a one-element tuple keeps its
+        // comma and `true` renders as `True`.
+        assert_eq!(message.headers.argsrepr(), Some("('Ada',)"));
+        assert_eq!(message.headers.kwargsrepr(), Some("{'loud': True}"));
+
+        let empty = MessageBuilder::new("tasks.noop").build().unwrap();
+        assert_eq!(empty.headers.argsrepr(), Some("()"));
+        assert_eq!(empty.headers.kwargsrepr(), Some("{}"));
+    }
+
+    /// The reprs describe the body that was actually encoded, so a monitor
+    /// never shows arguments the worker did not receive.
+    #[test]
+    fn test_built_arg_reprs_describe_the_encoded_body() {
+        let message = MessageBuilder::new("tasks.add")
+            .args(vec![json!(4), json!(5)])
+            .build()
+            .unwrap();
+
+        let body = crate::embed::EmbeddedBody::decode(&message.body).expect("decode body");
+        assert_eq!(
+            message.headers.argsrepr(),
+            Some(crate::compat::python_args_repr(&body.args).as_str())
+        );
+    }
+
+    /// An explicit `.header("argsrepr", ...)` still wins, since caller extras
+    /// are merged after the computed headers.
+    #[test]
+    fn test_explicit_argsrepr_header_overrides_the_computed_one() {
+        let message = MessageBuilder::new("tasks.add")
+            .args(vec![json!(4)])
+            .header("argsrepr", json!("(redacted)"))
+            .build()
+            .unwrap();
+
+        assert_eq!(message.headers.argsrepr(), Some("(redacted)"));
     }
 
     #[test]

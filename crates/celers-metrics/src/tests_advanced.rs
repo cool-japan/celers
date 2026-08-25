@@ -310,24 +310,28 @@ fn test_cardinality_limiter_duplicate_labels() {
 }
 
 // --- Tests for Trend-Based Alerting ---
+//
+// Like the forecast tests above, these inject deterministic timestamps via
+// `record_batch` instead of `thread::sleep`-separated `record()` calls, so
+// the trend (and therefore `should_alert`'s verdict) is exact rather than a
+// "doesn't panic" smoke check.
 #[test]
 fn test_trend_alert_increasing() {
-    use std::thread;
-    use std::time::Duration;
-
     let history = MetricHistory::new(10);
 
-    // Create an increasing trend
-    for i in 1..=6 {
-        history.record((i * 10) as f64);
-        thread::sleep(Duration::from_millis(100));
-    }
+    // Perfect linear trend of 10.0/s: values 10,20,...,60 one second apart.
+    let base = 1_758_700_000_u64;
+    let batch: Vec<(u64, f64)> = (0..6).map(|i| (base + i, ((i + 1) * 10) as f64)).collect();
+    history.record_batch(&batch);
 
     let alert = TrendAlertCondition::new(5.0, TrendDirection::Increasing);
 
-    // Should alert on increasing trend if rate > 5.0 per second
-    // This test is timing-dependent, so we just verify it doesn't panic
-    let _ = alert.should_alert(&history);
+    // trend = (60 - 10) / (5s) = 10.0/s, which is > the 5.0 threshold.
+    assert!(
+        alert.should_alert(&history),
+        "trend was {:?}, expected > 5.0",
+        history.trend()
+    );
 }
 
 #[test]
@@ -345,22 +349,22 @@ fn test_trend_alert_insufficient_samples() {
 
 #[test]
 fn test_trend_alert_stable() {
-    use std::thread;
-    use std::time::Duration;
-
     let history = MetricHistory::new(10);
 
-    // Create stable values
-    for _ in 0..6 {
-        history.record(100.0);
-        thread::sleep(Duration::from_millis(100));
-    }
+    // Deterministic stable series: identical value 100.0 at six distinct
+    // one-second-apart timestamps, so the trend is exactly 0.0.
+    let base = 1_758_700_000_u64;
+    let batch: Vec<(u64, f64)> = (0..6).map(|i| (base + i, 100.0)).collect();
+    history.record_batch(&batch);
 
     let alert = TrendAlertCondition::new(0.1, TrendDirection::Stable);
 
-    // Should alert on stable trend (small threshold)
-    // This test is timing-dependent, so we just verify it doesn't panic
-    let _ = alert.should_alert(&history);
+    // trend = (100 - 100) / (5s) = 0.0, well within the 0.1 stable threshold.
+    assert!(
+        alert.should_alert(&history),
+        "trend was {:?}, expected |trend| < 0.1",
+        history.trend()
+    );
 }
 
 // --- Tests for Correlation Analysis ---
@@ -430,25 +434,26 @@ fn test_correlation_insufficient_samples() {
 
 #[test]
 fn test_are_metrics_correlated() {
-    use std::thread;
-    use std::time::Duration;
-
     let history_a = MetricHistory::new(10);
     let history_b = MetricHistory::new(10);
 
-    // Create highly correlated data
-    for i in 1..=5 {
-        let val = (i * 10) as f64;
-        history_a.record(val);
-        history_b.record(val + 5.0); // Slightly offset but still highly correlated
-        thread::sleep(Duration::from_millis(100));
-    }
+    // Deterministic, perfectly correlated data at identical timestamps:
+    // `calculate_correlation` pairs samples by exact timestamp match, and
+    // `b = a + 5` is an exact linear relationship, so the Pearson
+    // coefficient is exactly 1.0 (no tolerance needed).
+    let base = 1_758_700_000_u64;
+    let batch_a: Vec<(u64, f64)> = (0..5).map(|i| (base + i, ((i + 1) * 10) as f64)).collect();
+    let batch_b: Vec<(u64, f64)> = (0..5)
+        .map(|i| (base + i, ((i + 1) * 10) as f64 + 5.0))
+        .collect();
+    history_a.record_batch(&batch_a);
+    history_b.record_batch(&batch_b);
 
-    // Should detect strong correlation with threshold 0.8
-    let is_correlated = are_metrics_correlated(&history_a, &history_b, 0.8);
-
-    // This might be timing-dependent, so we just verify it doesn't panic
-    let _ = is_correlated;
+    assert!(
+        are_metrics_correlated(&history_a, &history_b, 0.8),
+        "coefficient was {:?}, expected >= 0.8",
+        calculate_correlation(&history_a, &history_b).map(|c| c.coefficient)
+    );
 }
 
 // --- Tests for Windowed Statistics ---

@@ -50,12 +50,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod compression;
+pub mod compression_config;
 
 pub use compression::{builtin_codecs, CompressionCodec, IdentityCodec, ResultCompressor};
 #[cfg(feature = "compression-deflate")]
 pub use compression::{GzipCodec, ZlibCodec, DEFAULT_DEFLATE_LEVEL};
 #[cfg(feature = "compression-zstd")]
 pub use compression::{ZstdCodec, DEFAULT_ZSTD_LEVEL};
+pub use compression_config::{
+    CompressionConfig, ResultCompressionPolicy, DEFAULT_COMPRESSION_MIN_SIZE, NO_COMPRESSION,
+};
 
 /// Result store trait for `AsyncResult` API
 ///
@@ -996,11 +1000,42 @@ impl ResultMetadata {
         original_size: usize,
         compressed_size: usize,
     ) -> Self {
+        self.mark_compression(algorithm, original_size, compressed_size);
+        self
+    }
+
+    /// Record that the stored payload was compressed with `algorithm`.
+    ///
+    /// The in-place form of [`with_compression`](Self::with_compression), for a
+    /// backend that is filling in metadata it already owns — see
+    /// [`ResultCompressionPolicy::compress`](crate::ResultCompressionPolicy::compress).
+    ///
+    /// Only call this when the compressed bytes are the ones actually stored: a
+    /// reader looks the algorithm up by name and will hand the payload to that
+    /// codec, so marking a verbatim payload as compressed makes it unreadable.
+    pub fn mark_compression(
+        &mut self,
+        algorithm: impl Into<String>,
+        original_size: usize,
+        compressed_size: usize,
+    ) {
         self.compressed = true;
         self.compression_algorithm = Some(algorithm.into());
         self.original_size = Some(original_size);
         self.compressed_size = Some(compressed_size);
-        self
+    }
+
+    /// Record that the stored payload is *not* compressed.
+    ///
+    /// Clears the algorithm and both sizes as well, so no stale reading of a
+    /// previous marking survives to send a verbatim payload through a codec.
+    /// Compressing conditionally (below a size threshold, or when the codec
+    /// made the payload bigger) goes through here.
+    pub fn clear_compression(&mut self) {
+        self.compressed = false;
+        self.compression_algorithm = None;
+        self.original_size = None;
+        self.compressed_size = None;
     }
 
     /// Mark as chunked

@@ -59,7 +59,17 @@ pub struct PostgresBroker {
     pub(crate) paused: AtomicBool,
     pub(crate) retry_strategy: RetryStrategy,
     pub(crate) hooks: Arc<tokio::sync::RwLock<TaskHooks>>,
+    /// How long a durable revocation record survives, in seconds — see
+    /// `revocation.rs`. Mirrors `celers-broker-redis`'s
+    /// `DEFAULT_REVOCATION_TTL_SECS`/`with_revocation_ttl`.
+    pub(crate) revocation_ttl_secs: u64,
 }
+
+/// Default lifetime of a durable revocation record: 24 hours, matching
+/// `celers-broker-redis::DEFAULT_REVOCATION_TTL_SECS`. Long enough to outlive
+/// any task's `max_retries` backoff window, short enough that the table does
+/// not accumulate ids forever for tasks nobody re-enqueues under the same id.
+pub const DEFAULT_REVOCATION_TTL_SECS: u64 = 86_400;
 
 impl PostgresBroker {
     /// Create a new PostgreSQL broker
@@ -139,7 +149,22 @@ impl PostgresBroker {
             paused: AtomicBool::new(false),
             retry_strategy: RetryStrategy::default(),
             hooks: Arc::new(tokio::sync::RwLock::new(TaskHooks::new())),
+            revocation_ttl_secs: DEFAULT_REVOCATION_TTL_SECS,
         })
+    }
+
+    /// Override how long a durable revocation record survives.
+    ///
+    /// The default is [`DEFAULT_REVOCATION_TTL_SECS`]. Shorten it to exercise
+    /// expiry in a test without waiting a day for a record to lapse.
+    pub fn with_revocation_ttl(mut self, ttl_secs: u64) -> Self {
+        self.revocation_ttl_secs = ttl_secs;
+        self
+    }
+
+    /// The currently configured revocation TTL, in seconds.
+    pub fn revocation_ttl(&self) -> u64 {
+        self.revocation_ttl_secs
     }
 
     /// Set the retry strategy for failed tasks
@@ -467,6 +492,14 @@ impl PostgresBroker {
             .map_err(|e| {
                 CelersError::Other(format!("Migration 007_queue_identity failed: {}", e))
             })?;
+
+        // Durable revoked-task set backing `Broker::revoke`/`is_revoked` —
+        // see `revocation.rs`.
+        let revocation_sql = include_str!("../migrations/008_revocation.sql");
+        self.conn
+            .execute_batch(revocation_sql)
+            .await
+            .map_err(|e| CelersError::Other(format!("Migration 008_revocation failed: {}", e)))?;
 
         Ok(())
     }

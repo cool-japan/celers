@@ -78,9 +78,10 @@ pub struct RedisEventConfig {
 
     /// Hostname stamped onto events that do not carry one of their own
     ///
-    /// `task-sent` and `task-revoked` have no `hostname` field, so a monitor
-    /// otherwise cannot tell which node published them. Leave `None` to omit
-    /// the field entirely.
+    /// `task-sent` is the only such event left — it is published by the
+    /// *client*, which is not a worker and has no hostname of its own — so a
+    /// monitor otherwise cannot tell which node published it. Leave `None` to
+    /// omit the field entirely.
     pub hostname: Option<String>,
 }
 
@@ -169,7 +170,7 @@ impl RedisEventEmitter {
     /// let emitter = RedisEventEmitter::new("redis://localhost").unwrap();
     /// ```
     pub fn new(url: &str) -> std::result::Result<Self, crate::BackendError> {
-        let client = Client::open(url).map_err(|e| {
+        let client = crate::tls::open_client(url).map_err(|e| {
             crate::BackendError::Connection(format!("Failed to create Redis client: {}", e))
         })?;
 
@@ -189,7 +190,7 @@ impl RedisEventEmitter {
         url: &str,
         config: RedisEventConfig,
     ) -> std::result::Result<Self, crate::BackendError> {
-        let client = Client::open(url).map_err(|e| {
+        let client = crate::tls::open_client(url).map_err(|e| {
             crate::BackendError::Connection(format!("Failed to create Redis client: {}", e))
         })?;
 
@@ -352,7 +353,7 @@ pub struct RedisEventReceiver {
 impl RedisEventReceiver {
     /// Create a new event receiver subscribing to default channels
     pub fn new(url: &str) -> std::result::Result<Self, crate::BackendError> {
-        let client = Client::open(url).map_err(|e| {
+        let client = crate::tls::open_client(url).map_err(|e| {
             crate::BackendError::Connection(format!("Failed to create Redis client: {}", e))
         })?;
 
@@ -367,7 +368,7 @@ impl RedisEventReceiver {
         url: &str,
         channels: Vec<String>,
     ) -> std::result::Result<Self, crate::BackendError> {
-        let client = Client::open(url).map_err(|e| {
+        let client = crate::tls::open_client(url).map_err(|e| {
             crate::BackendError::Connection(format!("Failed to create Redis client: {}", e))
         })?;
 
@@ -376,7 +377,7 @@ impl RedisEventReceiver {
 
     /// Subscribe to all default event channels (main, task, worker)
     pub fn subscribe_all(url: &str) -> std::result::Result<Self, crate::BackendError> {
-        let client = Client::open(url).map_err(|e| {
+        let client = crate::tls::open_client(url).map_err(|e| {
             crate::BackendError::Connection(format!("Failed to create Redis client: {}", e))
         })?;
 

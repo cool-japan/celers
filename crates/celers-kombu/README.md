@@ -2,7 +2,7 @@
 
 Broker abstraction layer for CeleRS, inspired by Python's Kombu library. Provides unified traits for message broker implementations.
 
-**Status: [Stable] — v0.3.1 (2026-07-13) — 343 tests (+ 145 doc tests)**
+**Status: [Stable] — v0.3.1 (2026-08-26) — 441 tests + 149 doctests**
 
 ## Overview
 
@@ -28,6 +28,28 @@ Production-ready broker abstraction with:
   - **Feature-gated** (3): Compression (Gzip), Signing (HMAC), Encryption (AES-256-GCM)
   - Compression now records its codec and actually decompresses on consume, and Signing now verifies (and rejects tampered/unsigned bodies) on consume — both were previously silent no-ops on the consume side; fixed in 0.3.0
 - ✅ **Utilities Module**: 75 helper functions for optimization, monitoring, and operational excellence
+- ✅ **Task-queue Adapter** (`core-adapter` feature): `KombuBrokerAdapter` implements
+  `celers_core::Broker` over any transport here, so a `celers_worker::Worker` can consume from one.
+  See below.
+
+## Running a worker against a transport
+
+The traits in this crate move `celers_protocol::Message`s. A `celers_worker::Worker` consumes
+`celers_core::Broker`, which moves *tasks* (`enqueue` / `dequeue` / `ack` / `reject` / `defer`).
+The `core_adapter` module joins the two:
+
+```rust,ignore
+use celers_kombu::core_adapter::KombuBrokerAdapter;
+
+let broker = KombuBrokerAdapter::new(transport, "celery");
+// ... now usable anywhere a `celers_core::Broker` is expected.
+```
+
+A transport opts in with an empty `impl CoreBrokerTransport for MyTransport {}` and overrides only
+the operations it can do natively — batch receive/send, returning a message with a delay, delayed
+publishing. `celers-broker-amqp` and `celers-broker-sqs` each ship a ready-made alias and
+constructor (`AmqpBroker::into_core_broker`, `SqsBroker::into_core_broker`) and enable the feature
+for you.
 
 ## Architecture
 

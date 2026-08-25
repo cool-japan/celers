@@ -14,12 +14,16 @@
 //! puts in a message's `content-encoding` header, so a result compressed here
 //! and a message body compressed there agree on what a name means:
 //!
-//! | name       | codec                  | Cargo feature          |
-//! |------------|------------------------|------------------------|
-//! | `"none"`   | [`IdentityCodec`]      | always available       |
-//! | `"gzip"`   | [`GzipCodec`]          | `compression-deflate`  |
-//! | `"zlib"`   | [`ZlibCodec`]          | `compression-deflate`  |
-//! | `"zstd"`   | [`ZstdCodec`]          | `compression-zstd`     |
+//! (The codec types are not linked here: each exists only when its feature is
+//! enabled, and a link to an absent item is a broken doc link in exactly the
+//! build that omits it.)
+//!
+//! | name       | codec            | Cargo feature          |
+//! |------------|------------------|------------------------|
+//! | `"none"`   | [`IdentityCodec`] | always available      |
+//! | `"gzip"`   | `GzipCodec`      | `compression-deflate`  |
+//! | `"zlib"`   | `ZlibCodec`      | `compression-deflate`  |
+//! | `"zstd"`   | `ZstdCodec`      | `compression-zstd`     |
 //!
 //! `"none"` is CeleRS' spelling of "stored verbatim"; the protocol crate
 //! writes that same state as the `utf-8`/`identity` content encoding.
@@ -63,8 +67,9 @@ use std::sync::Arc;
 
 /// A pluggable compression codec.
 ///
-/// The codecs CeleRS ships ([`GzipCodec`], [`ZlibCodec`], [`ZstdCodec`]) are
-/// registered by [`ResultCompressor::new`] already; this trait is the seam for
+/// The codecs CeleRS ships (`GzipCodec`, `ZlibCodec`, `ZstdCodec` — each gated
+/// on its own feature, see the module docs) are registered by
+/// [`ResultCompressor::new`] already; this trait is the seam for
 /// anything else — a codec whose dependency lives in a backend crate, a
 /// dictionary-trained zstd, an encrypt-then-compress wrapper.
 ///
@@ -418,9 +423,9 @@ impl ZstdCodec {
 
     /// A zstd codec at an explicit level, clamped to the format's `1..=22`.
     ///
-    /// Clamping rather than erroring for the same reason as
-    /// [`GzipCodec::with_level`]: a mis-configured level must not turn storing
-    /// a result into a failure.
+    /// Clamping rather than erroring for the same reason the DEFLATE codecs
+    /// clamp: a mis-configured level must not turn storing a result into a
+    /// failure.
     #[must_use]
     pub const fn with_level(level: i32) -> Self {
         let level = if level < 1 {

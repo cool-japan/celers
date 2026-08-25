@@ -11,8 +11,12 @@
 //! Workers build events with `celers_core::event::Event`, the typed *internal*
 //! model, and render this shape through `Event::to_wire_json()` before it
 //! reaches a transport; `Event::from_wire_str()` is the inverse. The two models
-//! agree field for field — the round trip is covered by
-//! `celers-backend-redis`, the crate that depends on both.
+//! agree field for field, and the mapping itself lives in `celers-core`:
+//! `celers_core::event::message` owns the typed `Event <-> EventMessage`
+//! conversion and proves it lossless, while `celers_core::event::wire` wraps it
+//! with the envelope and the JSON encoding and pins the exact bytes.
+//! `celers-backend-redis` adds the transport-level check that what it publishes
+//! to a Celery monitor's channel is that same shape.
 //!
 //! # Event Types
 //!

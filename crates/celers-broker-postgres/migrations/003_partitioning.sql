@@ -55,16 +55,16 @@ CREATE OR REPLACE FUNCTION create_tasks_partitions_range(
     end_date DATE
 ) RETURNS TABLE(partition_name TEXT, status TEXT) AS $$
 DECLARE
-    current_date DATE;
+    v_current_date DATE;
 BEGIN
-    current_date := DATE_TRUNC('month', start_date);
+    v_current_date := DATE_TRUNC('month', start_date);
 
-    WHILE current_date <= end_date LOOP
-        partition_name := 'celers_tasks_' || TO_CHAR(current_date, 'YYYY_MM');
-        status := create_tasks_partition(current_date);
+    WHILE v_current_date <= end_date LOOP
+        partition_name := 'celers_tasks_' || TO_CHAR(v_current_date, 'YYYY_MM');
+        status := create_tasks_partition(v_current_date);
         RETURN NEXT;
 
-        current_date := current_date + INTERVAL '1 month';
+        v_current_date := v_current_date + INTERVAL '1 month';
     END LOOP;
 END;
 $$ LANGUAGE plpgsql;
@@ -182,17 +182,17 @@ CREATE OR REPLACE FUNCTION maintain_tasks_partitions(
     months_ahead INTEGER DEFAULT 3
 ) RETURNS TEXT AS $$
 DECLARE
-    current_date DATE;
+    v_current_date DATE;
     end_date DATE;
     result TEXT;
 BEGIN
-    current_date := DATE_TRUNC('month', NOW());
-    end_date := current_date + (months_ahead || ' months')::INTERVAL;
+    v_current_date := DATE_TRUNC('month', NOW());
+    end_date := v_current_date + (months_ahead || ' months')::INTERVAL;
 
     -- Create partitions for current month + months_ahead
-    PERFORM create_tasks_partitions_range(current_date, end_date);
+    PERFORM create_tasks_partitions_range(v_current_date, end_date);
 
-    RETURN format('Ensured partitions exist from %s to %s', current_date, end_date);
+    RETURN format('Ensured partitions exist from %s to %s', v_current_date, end_date);
 END;
 $$ LANGUAGE plpgsql;
 

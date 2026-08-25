@@ -1978,3 +1978,8 @@ fn test_chunking_delete_cleans_chunks() {
     let meta_key = chunking::ResultChunker::metadata_key(base_key);
     assert!(meta_key.ends_with(":chunks"));
 }
+
+// Publish-on-set (SET+PUBLISH, Celery's `AsyncResult.get()` wake-up
+// contract) has its own gated live-Redis test in `tests_publish.rs` --
+// broken out into its own file rather than appended here, to keep this one
+// under the workspace's 2000-line-per-file policy.

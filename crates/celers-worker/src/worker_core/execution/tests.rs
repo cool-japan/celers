@@ -208,6 +208,38 @@ impl Task for AlwaysFailingTask {
     }
 }
 
+/// A cooperative task that observes cancellation and returns
+/// [`CelersError::Cancelled`] at a checkpoint.
+///
+/// The token is one the task *holds* (handed to it at construction, as a
+/// parent scope or a library would), not the worker's ambient one: a tripped
+/// ambient token is intercepted by the revocation watcher, which aborts the
+/// future before the body can report anything. This is the shape that actually
+/// reaches the disposition path carrying an error value.
+struct CooperativelyCancelledTask {
+    runs: Arc<AtomicUsize>,
+    token: crate::cancellation::CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl Task for CooperativelyCancelledTask {
+    type Input = Empty;
+    type Output = Empty;
+
+    async fn execute(&self, _input: Self::Input) -> Result<Self::Output> {
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        // The `?` compiles only because `CancellationError` converts into
+        // `CelersError::Cancelled` — the ergonomics this disposition rule
+        // exists to make honest.
+        self.token.check_cancelled()?;
+        Ok(Empty {})
+    }
+
+    fn name(&self) -> &'static str {
+        "cooperative_task"
+    }
+}
+
 /// Sleeps far longer than any deadline a test configures.
 struct SleepyTask {
     started: Arc<AtomicUsize>,
@@ -835,6 +867,130 @@ async fn test_revoked_task_is_acked_without_retry_or_dead_letter() {
 
     let observed = events.drain().await;
     assert!(has_revoked(&observed), "expected a task-revoked event");
+}
+
+/// A task that reports its *own* cancellation gets the revoked disposition,
+/// not the failure/retry one.
+///
+/// `check_cancelled()?` is the documented way to write a cooperative task, and
+/// `CancellationError` converts into `CelersError::Cancelled` so that `?`
+/// compiles. If the disposition path read the result as an ordinary execution
+/// error it would re-dispatch the task up to `max_retries` times — punishing
+/// the polite form of cancellation, while the abrupt form (the watcher
+/// aborting the future) is terminal. The two must dispose identically.
+///
+/// The one thing that does differ is Celery's `terminated` flag: this task
+/// stopped where it chose to, so nothing terminated it.
+#[tokio::test]
+async fn test_a_self_reported_cancellation_is_revoked_not_retried() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let token = crate::cancellation::CancellationToken::new(uuid::Uuid::new_v4());
+    token.cancel();
+
+    let fixture = DispatchFixture::new(CooperativelyCancelledTask {
+        runs: Arc::clone(&runs),
+        token,
+    })
+    .await;
+    let events = Events::new();
+
+    let task = plain_task("cooperative_task");
+    let task_id = task.metadata.id;
+
+    let dispatch = fixture.dispatch(
+        task,
+        // Generous on both axes: neither the deadline nor the retry budget may
+        // change the outcome.
+        ExecutionLimits::from_timeout(3_600),
+        5,
+        &events.sink,
+        None,
+    );
+    fixture.run(dispatch).await;
+
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        1,
+        "the handler must actually have run and reported the cancellation \
+         itself — otherwise this is testing the watcher's abort path instead"
+    );
+    assert_eq!(fixture.broker.acked(), vec![task_id]);
+    assert!(
+        fixture.broker.enqueued().is_empty(),
+        "a withdrawn task must never be re-enqueued for a retry"
+    );
+    assert!(fixture.broker.rejected().is_empty());
+    assert!(
+        fixture.dlq.get_entries().await.is_empty(),
+        "a cancellation is not a failure"
+    );
+    assert_eq!(fixture.stats.revoked(), 1);
+    assert_eq!(fixture.stats.retried(), 0);
+
+    let observed = events.drain().await;
+    assert!(has_revoked(&observed), "expected a task-revoked event");
+    assert!(
+        !observed
+            .iter()
+            .any(|event| matches!(event, Event::Task(TaskEvent::Failed { .. }))),
+        "a withdrawal of work must not be published as a failure"
+    );
+    let terminated = observed.iter().find_map(|event| match event {
+        Event::Task(TaskEvent::Revoked { terminated, .. }) => Some(*terminated),
+        _ => None,
+    });
+    assert_eq!(
+        terminated,
+        Some(false),
+        "nothing terminated a task that stopped at its own checkpoint"
+    );
+}
+
+/// The rule is about the error value, not about a token: a task returning
+/// `CelersError::TaskRevoked` — the dispatch-time refusal, which a handler can
+/// also raise for work it discovers has been called off — is disposed of the
+/// same way.
+#[tokio::test]
+async fn test_a_task_revoked_error_is_also_terminal() {
+    struct WithdrawnTask;
+
+    #[async_trait::async_trait]
+    impl Task for WithdrawnTask {
+        type Input = Empty;
+        type Output = Empty;
+
+        async fn execute(&self, _input: Self::Input) -> Result<Self::Output> {
+            Err(CelersError::TaskRevoked(uuid::Uuid::nil()))
+        }
+
+        fn name(&self) -> &'static str {
+            "withdrawn_task"
+        }
+    }
+
+    let fixture = DispatchFixture::new(WithdrawnTask).await;
+    let events = Events::new();
+
+    let task = plain_task("withdrawn_task");
+    let task_id = task.metadata.id;
+
+    let dispatch = fixture.dispatch(
+        task,
+        ExecutionLimits::from_timeout(3_600),
+        5,
+        &events.sink,
+        None,
+    );
+    fixture.run(dispatch).await;
+
+    assert_eq!(fixture.broker.acked(), vec![task_id]);
+    assert!(fixture.broker.enqueued().is_empty());
+    assert!(fixture.dlq.get_entries().await.is_empty());
+    assert_eq!(fixture.stats.revoked(), 1);
+    assert_eq!(fixture.stats.retried(), 0);
+
+    let observed = events.drain().await;
+    assert!(has_revoked(&observed));
 }
 
 // --------------------------------------------------------------------------

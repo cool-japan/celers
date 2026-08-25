@@ -326,6 +326,27 @@ pub struct TaskMeta {
     /// Queue the task was consumed from
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
+
+    /// The original error text of a deliberately suppressed failure
+    /// ([`celers_core::TaskResultValue::Ignored`]), when `result` is the
+    /// `Success(Value::Null)` projection a backend without a first-class
+    /// "ignored" wire representation stores it as.
+    ///
+    /// `None` for every other result, including a genuine `Success`: a
+    /// backend that reconstructs `TaskResultValue` from a stored
+    /// `TaskMeta` must treat `Some(_)` here as authoritative over
+    /// `result` being `Success(Null)` (see `celers-backend-db` and
+    /// `celers-backend-rpc`'s `result_store.rs`), and must set this back
+    /// to `None` on every write that is not itself an `Ignored` value —
+    /// otherwise a later genuine `Success` for the same task would still
+    /// read back as `Ignored`.
+    ///
+    /// `#[serde(default)]` so records written before this field existed
+    /// (`None` in the JSON, or the key absent entirely) deserialize
+    /// unchanged, reading back exactly as they did before: a plain
+    /// `Success(Null)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_error: Option<String>,
 }
 
 impl TaskMeta {
@@ -347,6 +368,7 @@ impl TaskMeta {
             memory_bytes: None,
             retries: None,
             queue: None,
+            ignored_error: None,
         }
     }
 

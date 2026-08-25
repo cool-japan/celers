@@ -2,7 +2,7 @@
 
 PostgreSQL-based broker implementation for CeleRS using `FOR UPDATE SKIP LOCKED`.
 
-**Version: 0.3.1 | Status: [Stable] | Tests: 149 (26 ignored, require PostgreSQL) + 179 doc tests | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 210 (`--all-features`, excluding `#[ignore]`d) + 188 doctests | Updated: 2026-08-26**
 
 ## Overview
 
@@ -618,9 +618,9 @@ See the `examples/` directory for comprehensive usage examples (verified against
 
 Run examples with:
 ```bash
-cargo run --example postgres_basic_usage
-cargo run --example postgres_monitoring_performance
-cargo run --example postgres_advanced_utilities
+cargo run -p celers-broker-postgres --example postgres_basic_usage
+cargo run -p celers-broker-postgres --example postgres_monitoring_performance
+cargo run -p celers-broker-postgres --example postgres_advanced_utilities
 ```
 
 ## See Also

@@ -1,7 +1,25 @@
 # ADR-004: Celery Protocol Compatibility
 
 ## Status
-Accepted
+Accepted — see the 0.3.1 amendment below before relying on the Context section.
+
+## Amendment (0.3.1, 2026-08-26)
+
+This ADR records the decision as it was taken. Two of its premises have since been measured against a
+real Celery, and the current, evidence-backed picture lives in
+[docs/CELERY_COMPATIBILITY.md](../CELERY_COMPATIBILITY.md):
+
+1. **"Protocol v5: Latest (Celery 5.3+)" in Context is not supported by anything in this repository.**
+   `ProtocolVersion::V5` is a CeleRS-internal version label. The interop suite pins
+   `task_protocol = 2`, every wire capture in `crates/celers-protocol/tests/fixtures/` was recorded
+   from Celery 5.6.3 at protocol 2, and no test exercises a "v5" message against Celery. Treat v5 as
+   a CeleRS-to-CeleRS feature.
+2. **The decision is now *proved* at the protocol layer, and only there.** `tests/python-compat/`
+   exchanges tasks and results with a live Celery 5.6.3 in both directions. But
+   `celers-broker-redis` enqueues its own `SerializedTask`, and the Redis result backends store a
+   CeleRS-shaped record under the (correctly named) `celery-task-meta-<uuid>` key — so requirement 4
+   in Context, "Result Storage: `celery-task-meta-{uuid}` key format in Redis", is satisfied for the
+   *key* and not for the *value*, and a Python worker and a CeleRS worker cannot share a queue.
 
 ## Context
 

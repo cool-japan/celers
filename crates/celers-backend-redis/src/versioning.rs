@@ -66,7 +66,10 @@ impl RedisResultBackend {
 
         if self.versioning.enabled && self.versioning.max_versions > 0 {
             let version_key = self.version_key(task_id, new_version);
-            self.write_meta_to_key(&version_key, &versioned_meta, ttl, None)
+            // Not the live key: nothing subscribes to a historical version's
+            // channel, and `store_result` above already announced the
+            // *live* record's write.
+            self.write_meta_to_key(&version_key, &versioned_meta, ttl, None, false)
                 .await?;
 
             // Drop the version that just fell out of the retention window.

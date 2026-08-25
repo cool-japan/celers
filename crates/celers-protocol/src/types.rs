@@ -33,6 +33,13 @@ pub(crate) const DEFAULT_LANG: &str = "rust";
 /// therefore required for a Python consumer to read a CeleRS message at all.
 pub const BODY_ENCODING_BASE64: &str = "base64";
 
+/// The queue a task is published to when nothing names one.
+///
+/// Celery's `task_default_queue`. It is also the routing key
+/// [`DeliveryInfo::default`] claims, because a message that names no queue is,
+/// by definition, on this one.
+pub const DEFAULT_CELERY_QUEUE: &str = "celery";
+
 /// Celery header carrying the task time limits as `[soft, hard]` (seconds).
 ///
 /// See [`MessageHeaders::with_timelimit`].
@@ -654,6 +661,64 @@ impl MessageHeaders {
     }
 }
 
+/// Where a message was published: kombu's `properties.delivery_info`.
+///
+/// `kombu.transport.virtual.base.Channel.basic_publish` stamps this pair onto
+/// every message it puts on a queue, and a consumer reads it back as
+/// `Message.delivery_info`. It is not decoration:
+///
+/// * kombu indexes `properties['delivery_info']['exchange']` with no default,
+///   so a message without it raises `KeyError` *inside the consumer callback*,
+///   which takes down a Celery worker's event loop rather than losing one
+///   message;
+/// * a Celery worker re-publishes with `self.request.delivery_info` when a task
+///   calls `retry()`, and routes `link` callbacks the same way -- so a message
+///   that sits on `payments` while claiming the routing key `celery` sends its
+///   own retries to a queue nobody consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryInfo {
+    /// AMQP exchange the message was published to.
+    ///
+    /// Empty for kombu's direct-to-queue routing, which is what every virtual
+    /// transport (Redis, SQS, ...) uses.
+    #[serde(default)]
+    pub exchange: String,
+
+    /// AMQP routing key, which is the queue name under direct routing.
+    #[serde(default = "default_routing_key")]
+    pub routing_key: String,
+}
+
+fn default_routing_key() -> String {
+    DEFAULT_CELERY_QUEUE.to_string()
+}
+
+impl Default for DeliveryInfo {
+    fn default() -> Self {
+        Self {
+            exchange: String::new(),
+            routing_key: default_routing_key(),
+        }
+    }
+}
+
+impl DeliveryInfo {
+    /// Direct-to-queue delivery info for `routing_key` (empty exchange).
+    pub fn new(routing_key: impl Into<String>) -> Self {
+        Self {
+            exchange: String::new(),
+            routing_key: routing_key.into(),
+        }
+    }
+
+    /// Set the exchange (builder pattern).
+    #[must_use]
+    pub fn with_exchange(mut self, exchange: impl Into<String>) -> Self {
+        self.exchange = exchange.into();
+        self
+    }
+}
+
 /// Message properties (AMQP-like)
 ///
 /// # Wire format
@@ -666,9 +731,12 @@ impl MessageHeaders {
 /// [`Serialize`] impl below rather than stored as a field, since the encoding
 /// is a property of the envelope and not independently selectable.
 ///
-/// Deserialization accepts and ignores `body_encoding` along with the other
-/// virtual-transport keys kombu adds on the consumer side (`delivery_info`,
-/// `delivery_tag`), so a message captured off a Redis/SQS queue round-trips.
+/// [`MessageProperties::delivery_tag`] and [`MessageProperties::delivery_info`]
+/// are the two properties `kombu.transport.virtual.base.Message.__init__`
+/// indexes directly -- no `.get()`, no default -- so a message missing either
+/// one raises `KeyError` inside the consumer callback and kills the worker's
+/// event loop. They are always emitted, and a payload read back off a
+/// Redis/SQS queue round-trips them verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageProperties {
     /// Correlation ID for RPC-style calls
@@ -682,10 +750,43 @@ pub struct MessageProperties {
 
     /// Priority (0-9, higher = more priority)
     pub priority: Option<u8>,
+
+    /// kombu's handle on this delivery, unique per message.
+    ///
+    /// A consumer keys its unacknowledged-message table by this string
+    /// (`kombu.transport.virtual.base.QoS.append`), so two in-flight messages
+    /// sharing a tag make one acknowledgement drop the other. Every
+    /// CeleRS-constructed value therefore gets a fresh UUID, matching kombu's
+    /// own `Channel._next_delivery_tag`; a value parsed from the wire keeps the
+    /// tag its producer stamped.
+    pub delivery_tag: String,
+
+    /// Where the message was published; see [`DeliveryInfo`].
+    pub delivery_info: DeliveryInfo,
 }
 
 const fn default_delivery_mode() -> u8 {
     2 // Persistent by default
+}
+
+/// Mint a delivery tag for a newly constructed message.
+///
+/// kombu's producer side does exactly this (`Channel._next_delivery_tag`
+/// returns a fresh `uuid()` per publish), and the uniqueness is load-bearing --
+/// see [`MessageProperties::delivery_tag`].
+fn new_delivery_tag() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// The delivery tag assumed for a payload that carries none.
+///
+/// Deterministic on purpose: parsing the same bytes twice must yield equal
+/// values, so this cannot mint a fresh UUID. The nil tag is *present*, which is
+/// what keeps a hand-rolled envelope from killing a worker on `KeyError`; every
+/// envelope kombu ever wrote carries a real tag, so this default is only ever
+/// reached by a payload no kombu producer built.
+fn absent_delivery_tag() -> String {
+    Uuid::nil().to_string()
 }
 
 /// Serialization shape of [`MessageProperties`].
@@ -703,13 +804,19 @@ struct MessagePropertiesRepr<'a> {
     priority: Option<u8>,
     /// kombu's body codec selector; see [`BODY_ENCODING_BASE64`].
     body_encoding: &'static str,
+    /// kombu's per-delivery handle; see [`MessageProperties::delivery_tag`].
+    delivery_tag: &'a str,
+    /// Where the message is being published; see [`DeliveryInfo`].
+    delivery_info: &'a DeliveryInfo,
 }
 
 /// Deserialization shape of [`MessageProperties`].
 ///
-/// `body_encoding`, `delivery_info` and `delivery_tag` are accepted (and
-/// deliberately discarded) so that a payload produced by this crate, or read
-/// back off a kombu virtual transport, deserializes cleanly.
+/// `body_encoding` is accepted and deliberately discarded (it is implied by the
+/// envelope, and re-emitted by the [`Serialize`] impl); `delivery_tag` and
+/// `delivery_info` are kept, so a payload read back off a kombu virtual
+/// transport round-trips them instead of losing the two properties a consumer
+/// cannot do without.
 #[derive(Deserialize)]
 struct MessagePropertiesDe {
     #[serde(default)]
@@ -723,6 +830,10 @@ struct MessagePropertiesDe {
     #[serde(default)]
     #[allow(dead_code)]
     body_encoding: Option<String>,
+    #[serde(default = "absent_delivery_tag")]
+    delivery_tag: String,
+    #[serde(default)]
+    delivery_info: DeliveryInfo,
 }
 
 impl Serialize for MessageProperties {
@@ -733,6 +844,8 @@ impl Serialize for MessageProperties {
             delivery_mode: self.delivery_mode,
             priority: self.priority,
             body_encoding: BODY_ENCODING_BASE64,
+            delivery_tag: &self.delivery_tag,
+            delivery_info: &self.delivery_info,
         }
         .serialize(serializer)
     }
@@ -746,6 +859,8 @@ impl<'de> Deserialize<'de> for MessageProperties {
             reply_to: repr.reply_to,
             delivery_mode: repr.delivery_mode,
             priority: repr.priority,
+            delivery_tag: repr.delivery_tag,
+            delivery_info: repr.delivery_info,
         })
     }
 }
@@ -757,6 +872,8 @@ impl Default for MessageProperties {
             reply_to: None,
             delivery_mode: default_delivery_mode(),
             priority: None,
+            delivery_tag: new_delivery_tag(),
+            delivery_info: DeliveryInfo::default(),
         }
     }
 }
@@ -793,6 +910,41 @@ impl MessageProperties {
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = Some(priority);
         self
+    }
+
+    /// Set the kombu delivery tag (builder pattern).
+    ///
+    /// Only needed to reproduce a specific tag (a capture, a fixture); every
+    /// freshly constructed value already carries a unique one. See
+    /// [`MessageProperties::delivery_tag`].
+    #[must_use]
+    pub fn with_delivery_tag(mut self, delivery_tag: impl Into<String>) -> Self {
+        self.delivery_tag = delivery_tag.into();
+        self
+    }
+
+    /// Set the whole [`DeliveryInfo`] (builder pattern).
+    #[must_use]
+    pub fn with_delivery_info(mut self, delivery_info: DeliveryInfo) -> Self {
+        self.delivery_info = delivery_info;
+        self
+    }
+
+    /// Name the queue this message is published to (builder pattern).
+    ///
+    /// Sets `delivery_info.routing_key`, leaving the exchange alone. A message
+    /// that claims the wrong routing key sends its own retries elsewhere; see
+    /// [`DeliveryInfo`].
+    #[must_use]
+    pub fn with_routing_key(mut self, routing_key: impl Into<String>) -> Self {
+        self.delivery_info.routing_key = routing_key.into();
+        self
+    }
+
+    /// The queue this message claims to be on (`delivery_info.routing_key`).
+    #[inline]
+    pub fn routing_key(&self) -> &str {
+        &self.delivery_info.routing_key
     }
 
     /// The kombu body codec these properties advertise on the wire.
@@ -1147,11 +1299,71 @@ mod wire_format_tests {
 
     /// A payload written before `body_encoding` existed must still parse
     /// (the field is serde-defaulted, not required).
+    ///
+    /// The same goes for the two kombu properties: a payload that carries no
+    /// `delivery_tag` parses to the *nil* tag rather than a freshly minted one,
+    /// so parsing the same bytes twice yields equal values -- and the tag is
+    /// still present when the message is written back out, which is what keeps
+    /// a consumer from dying on `KeyError`.
     #[test]
     fn test_properties_without_body_encoding_still_parse() {
         let props: MessageProperties =
             serde_json::from_str(r#"{"delivery_mode":2}"#).expect("legacy properties must parse");
-        assert_eq!(props, MessageProperties::default());
+
+        assert_eq!(props.delivery_mode, 2);
+        assert_eq!(props.correlation_id, None);
+        assert_eq!(props.reply_to, None);
+        assert_eq!(props.priority, None);
+        assert_eq!(props.delivery_tag, uuid::Uuid::nil().to_string());
+        assert_eq!(props.delivery_info, DeliveryInfo::default());
+
+        let again: MessageProperties =
+            serde_json::from_str(r#"{"delivery_mode":2}"#).expect("legacy properties must parse");
+        assert_eq!(props, again, "parsing must be deterministic");
+
+        // Written back out, the properties a consumer indexes are there.
+        let value = serde_json::to_value(&props).expect("serialize");
+        assert_eq!(value["delivery_tag"], json!(uuid::Uuid::nil().to_string()));
+        assert_eq!(
+            value["delivery_info"],
+            json!({"exchange": "", "routing_key": "celery"})
+        );
+    }
+
+    /// The two properties `kombu.transport.virtual.base.Message.__init__`
+    /// indexes without a default must be on the wire for *every* message this
+    /// crate produces: a missing one raises `KeyError` inside the consumer
+    /// callback, which kills a Celery worker's event loop rather than losing a
+    /// single message.
+    #[test]
+    fn test_serialized_properties_carry_delivery_tag_and_delivery_info() {
+        let msg = Message::new(
+            "tasks.add".to_string(),
+            uuid::Uuid::new_v4(),
+            b"[[1, 2], {}, {}]".to_vec(),
+        );
+
+        let value = serde_json::to_value(&msg).expect("serialize");
+
+        let tag = value["properties"]["delivery_tag"]
+            .as_str()
+            .expect("delivery_tag is a string");
+        assert!(
+            uuid::Uuid::parse_str(tag).is_ok_and(|parsed| !parsed.is_nil()),
+            "a constructed message carries a freshly minted tag, got {tag:?}"
+        );
+        assert_eq!(
+            value["properties"]["delivery_info"],
+            json!({"exchange": "", "routing_key": "celery"})
+        );
+
+        // A tag read off the wire is kept, not replaced.
+        let restored: Message = serde_json::from_value(value).expect("round-trip");
+        assert_eq!(
+            restored.properties.delivery_tag,
+            msg.properties.delivery_tag
+        );
+        assert_eq!(restored, msg);
     }
 
     /// Regression: a canvas-configured time limit had nowhere to go on the

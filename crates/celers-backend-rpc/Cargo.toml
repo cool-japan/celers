@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "gRPC/RPC result backend for CeleRS"
 readme = "README.md"
 keywords = ["celery", "grpc", "rpc", "backend", "microservices"]

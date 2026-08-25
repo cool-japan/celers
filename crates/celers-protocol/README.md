@@ -1,15 +1,21 @@
 # celers-protocol
 
-Celery protocol v2/v5 implementation for CeleRS. Ensures wire-level compatibility with Python Celery workers and brokers.
+Celery protocol implementation for CeleRS: the v2 wire format Python Celery actually speaks, plus a
+CeleRS-internal "v5" version label for CeleRS-to-CeleRS use. This is the crate whose compatibility is
+*proved* — see [Wire Format Compatibility](#wire-format-compatibility).
 
-**Status: [Stable] — v0.3.1 (2026-07-13) — 503 tests**
+**Status: [Stable] — v0.3.1 (2026-08-26) — 608 tests + 27 doctests**
 
 ## Overview
 
 Production-ready protocol implementation with:
 
-- ✅ **Celery Protocol v2**: Compatible with Celery 4.x+
-- ✅ **Celery Protocol v5**: Compatible with Celery 5.x+
+- ✅ **Celery Protocol v2**: the format Celery 4.x/5.x puts on the wire — **interop-verified against a
+  live Celery 5.6.3** (`tests/python_interop.rs`) and against verbatim captures (`tests/celery_golden.rs`)
+- 🟢 **"Protocol v5"**: a **CeleRS-internal** version label, not something proved to exist on the
+  Celery wire. Nothing in the interop suite or the recorded captures exercises it — the suite pins
+  `task_protocol = 2` and every fixture was captured from Celery 5.6.3 at protocol 2. Use it between
+  CeleRS peers
 - ✅ **JSON Serialization**: Default, universally compatible
 - ✅ **MessagePack**: Optional high-performance binary format
 - ✅ **BSON Serialization**: Optional `bson-format` feature
@@ -416,60 +422,105 @@ let json = serde_json::to_string(&message)?;
 
 ### Python Celery Interoperability
 
-**Send from Rust, receive in Python:**
+> **Scope.** Interoperability lives at *this* layer. `celers-broker-redis` does **not** put a Celery
+> envelope on the queue — it enqueues its own `SerializedTask` — so you cannot point a
+> `celers_worker::Worker` at a Celery queue and you cannot use `Broker::enqueue` to reach a Celery
+> worker. What works today is producing and consuming Celery envelopes with this crate and doing the
+> transport yourself. See
+> [docs/CELERY_COMPATIBILITY.md](../../docs/CELERY_COMPATIBILITY.md).
+
+**Send from Rust, execute in Python.** Build the canonical envelope and put it on the queue with a
+Redis client. Use `create_python_celery_message_on_queue` when the queue is not `celery`: the
+`routing_key` is load-bearing, because a Celery worker re-publishes `task.retry()` through it.
 
 ```rust
-// Rust: Send task
-let message = Message::new("python_task".to_string(), task_id, body);
-broker.enqueue(message).await?;
+use celers_protocol::compat::create_python_celery_message_on_queue;
+use serde_json::json;
+use uuid::Uuid;
+
+let envelope = create_python_celery_message_on_queue(
+    "tasks.add",
+    Uuid::new_v4(),
+    vec![json!(4), json!(5)],
+    json!({}),
+    "celery",
+)?;
+// `envelope` is the full kombu envelope (headers / properties / base64 body).
+// LPUSH serde_json::to_string(&envelope)? onto the queue with your Redis client.
 ```
 
 ```python
-# Python: Receive and execute
+# Python: a plain, unmodified Celery worker executes it
 from celery import Celery
 
 app = Celery('myapp', broker='redis://localhost:6379')
 
-@app.task(name='python_task')
-def python_task(arg1, arg2):
-    return arg1 + arg2
+@app.task(name='tasks.add')
+def add(x, y):
+    return x + y
 ```
 
-**Send from Python, receive in Rust:**
+`MessageBuilder` is the ergonomic producer, and its envelope is deliverable as it stands: it
+serializes `properties.delivery_tag` (a fresh one per message, as kombu's producer mints it) and
+`properties.delivery_info` (`{exchange, routing_key}`, the routing key naming the queue
+`.queue(...)` / `.routing_key(...)` chose), which kombu indexes without a default. The interop
+suite publishes that envelope **unpatched** to a real worker. `compat::create_python_celery_message`
+remains the deterministic *fixture* builder — reproducible bytes, so it pins a nil `delivery_tag`
+rather than a unique one; publish real work through `MessageBuilder`.
+
+**Send from Python, parse in Rust.** Pop the envelope off the queue yourself and hand the bytes to
+this crate:
+
+```rust
+use celers_protocol::Message;
+
+// `raw` is one JSON document popped from the Celery queue.
+let message: Message = serde_json::from_slice(raw)?;
+assert_eq!(message.headers.task, "rust_task");
+// `message.body` is already base64-decoded: it holds the raw
+// `[args, kwargs, embed]` JSON tuple, ready for serde_json::from_slice.
+```
 
 ```python
-# Python: Send task
+# Python: send it
 from celery import Celery
 
 app = Celery('myapp', broker='redis://localhost:6379')
 app.send_task('rust_task', args=[1, 2])
 ```
 
-```rust
-// Rust: Receive and execute
-use celers_core::TaskRegistry;
-
-let mut registry = TaskRegistry::new();
-registry.register("rust_task", |args: Vec<i32>| async move {
-    Ok(args[0] + args[1])
-});
-```
+Both directions are exercised for real — against a live `celery` worker and a live Redis — by
+[`tests/python-compat/`](../../tests/python-compat/), driven from Rust by
+`cargo test -p celers-protocol --test python_interop`.
 
 ### Wire Format Compatibility
 
-CeleRS messages are 100% compatible with Celery wire format:
+This crate's protocol-v2 wire format is **interop-verified against a live Python Celery 5.6.3** —
+`tests/python_interop.rs` drives the suite in `tests/python-compat/`, and `tests/celery_golden.rs`
+checks this crate against verbatim Celery captures in `tests/fixtures/` with no services required.
 
-| Component | CeleRS | Celery | Compatible? |
-|-----------|--------|--------|-------------|
-| Headers | ✅ | ✅ | ✅ Yes |
-| Properties | ✅ | ✅ | ✅ Yes |
-| Body format | JSON/MessagePack | JSON/MessagePack/Pickle | ✅ Yes* |
-| UUIDs | ✅ | ✅ | ✅ Yes |
-| Timestamps | ISO8601 | ISO8601 | ✅ Yes |
+| Component | CeleRS | Celery | Status |
+|---|---|---|---|
+| Headers (`task`, `id`, `lang`, `eta`, `expires`, `group`, `root_id`, `parent_id`, …) | ✅ | ✅ | ✅ Interop-verified |
+| `argsrepr` / `kwargsrepr` (Python literals, `saferepr` elision) | ✅ | ✅ | ✅ Interop-verified |
+| Body framing (base64 `[args, kwargs, embed]`) | ✅ | ✅ | ✅ Interop-verified |
+| Result records (`status` / `result` / `traceback` / `date_done`) | ✅ | ✅ | ✅ Interop-verified |
+| Serialization | JSON, MessagePack, YAML | JSON, MessagePack, YAML, Pickle | ✅ JSON interop-verified; the others Rust-tested only |
+| `properties.delivery_tag` / `delivery_info` | ✅ | required | ✅ Interop-verified — every producer path emits both (kombu indexes them without a default, so a missing one kills the consumer loop, not just the message) |
+| `ResultMessage::children` | `ResultChild` trees | nested result tuples | ✅ Interop-verified — `[[id, parent], group_results]`, the shape `AsyncResult.as_tuple()` renders; legacy id lists and `children: null` still parse |
+| Exception `exc_message` (Python's `exc.args`) | `Vec<Value>` | list | ✅ Interop-verified — a multi-argument exception keeps its argument boundaries through Celery's `exception_to_python` |
+| Pickle | ⛔ | ✅ | ⛔ Deliberately absent (arbitrary-code-execution risk) |
+| "Protocol v5" | ✅ | — | 🟢 A **CeleRS-internal** version label; nothing in the interop suite or the captures exercises it |
 
-*Pickle not supported in CeleRS (security reasons)
+The full, workspace-wide picture — including which layers are *not* interoperable — is in
+[docs/CELERY_COMPATIBILITY.md](../../docs/CELERY_COMPATIBILITY.md).
 
 ## Message Examples
+
+The `properties` blocks below are **abridged** — they show the fields each example is about. A
+message this crate serializes always also carries kombu's `body_encoding`, `delivery_tag` and
+`delivery_info`; a consumer indexes the last two without a default, so do not treat these snippets
+as a template for a hand-built envelope. `compat::verify_message_format` checks for all of them.
 
 ### Simple Task
 

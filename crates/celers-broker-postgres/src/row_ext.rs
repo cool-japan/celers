@@ -65,12 +65,15 @@ impl RowExt for Row {
 ///
 /// Usage mirrors the shape of the target struct:
 ///
-/// ```ignore
+/// ```text
 /// let infos: Vec<TaskInfo> = rows
 ///     .iter()
 ///     .map(row_to!(TaskInfo { task_name: "task_name" }))
 ///     .collect::<Result<_, _>>()?;
 /// ```
+///
+/// (Illustrative only — exercising it for real needs a live `Row`, which
+/// this crate has no in-process way to construct outside a real query.)
 ///
 /// This crate's own call sites map multi-field structs (`TaskInfo`,
 /// `TaskResult`, ...) by hand across several fields with mixed typed helpers
@@ -129,9 +132,15 @@ pub(crate) use row_to;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use celers_broker_postgres::row_ext::uuid_param;
+/// use oxisql_core::Value;
+/// use uuid::Uuid;
+///
 /// let id = Uuid::new_v4();
-/// conn.execute("INSERT INTO t (id) VALUES ($1)", &[&uuid_param(&id)]).await?;
+/// let param = uuid_param(&id);
+/// assert_eq!(param, Value::Uuid(id.as_u128()));
+/// // Bind it: conn.execute("INSERT INTO t (id) VALUES ($1)", &[&param]).await?;
 /// ```
 #[allow(dead_code)]
 pub fn uuid_param(u: &uuid::Uuid) -> oxisql_core::Value {
@@ -165,9 +174,13 @@ pub fn opt_uuid_from_row(row: &Row, col: &str) -> Result<Option<uuid::Uuid>, Oxi
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use celers_broker_postgres::row_ext::json_param;
+///
 /// let payload = serde_json::json!({ "k": "v" });
-/// conn.execute("INSERT INTO t (data) VALUES ($1)", &[&json_param(&payload)]).await?;
+/// let param = json_param(&payload);
+/// assert_eq!(param, r#"{"k":"v"}"#);
+/// // Bind it: conn.execute("INSERT INTO t (data) VALUES ($1)", &[&param]).await?;
 /// ```
 #[allow(dead_code)]
 pub fn json_param(v: &serde_json::Value) -> String {

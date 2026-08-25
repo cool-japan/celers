@@ -54,10 +54,10 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! use celers_broker_amqp::{AmqpBroker, AmqpConfig};
-//! use celers_kombu::{Transport, Producer, Consumer};
-//! use celers_protocol::{Message, MessageBuilder};
+//! use celers_kombu::{Broker, Transport, Producer, Consumer};
+//! use celers_protocol::builder::MessageBuilder;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Basic usage
@@ -74,7 +74,7 @@
 //! broker.publish("my_queue", message).await?;
 //!
 //! // Consume messages
-//! let envelope = broker.consume("my_queue", std::time::Duration::from_secs(5)).await?;
+//! let _envelope = broker.consume("my_queue", std::time::Duration::from_secs(5)).await?;
 //!
 //! // With Management API for monitoring
 //! let config = AmqpConfig::default()
@@ -116,6 +116,60 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Running a worker against RabbitMQ
+//!
+//! [`AmqpBroker`] itself implements `celers_kombu`'s lower-level
+//! [`Producer`](celers_kombu::Producer)/[`Consumer`](celers_kombu::Consumer)/
+//! [`Transport`](celers_kombu::Transport)/[`Broker`](celers_kombu::Broker)
+//! traits — a message-transport abstraction (`publish`/`consume`/`purge`/
+//! `create_queue`/...) over [`celers_protocol::Message`]. A
+//! `celers_worker::Worker` consumes the *task-queue* abstraction
+//! [`celers_core::Broker`] (`enqueue`/`dequeue`/`ack`/`reject`/`defer`/...)
+//! instead, so the two do not meet on their own.
+//!
+//! [`AmqpBroker::into_core_broker`] bridges them, yielding an
+//! [`AmqpCoreBroker`]:
+//!
+//! ```no_run
+//! use celers_broker_amqp::AmqpBroker;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let broker = AmqpBroker::new("amqp://localhost:5672", "celery")
+//!     .await?
+//!     .into_core_broker("celery");
+//! // ... hand `broker` to `celers_worker::Worker::new`.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! See the [`core_broker`] module for what the adapter maps onto what
+//! (batching, `defer`, delayed publishing) and for the trade-offs it inherits.
+//! It is behind the `core-broker` feature, which is **on by default**.
+//!
+//! This does not make the queue readable by a Python Celery worker: the
+//! envelope is a JSON-serialized [`celers_protocol::Message`] carrying the
+//! task's own metadata, not a Celery v2 task message. See
+//! `docs/CELERY_COMPATIBILITY.md`.
+//!
+//! # Revocation
+//!
+//! `celers-broker-postgres`, `celers-broker-sql` and `celers-broker-redis` each
+//! implement
+//! [`celers_core::Broker::revoke`]/[`is_revoked`](celers_core::Broker::is_revoked)/
+//! [`subscribe_revocations`](celers_core::Broker::subscribe_revocations).
+//! [`AmqpCoreBroker`] keeps the trait's inert defaults, and
+//! [`cancel`](celers_core::Broker::cancel) always reports `false`: AMQP hands a
+//! consumer whatever is next in the queue and has no operation that addresses
+//! one *queued* message by id, so there is no pending copy to withdraw and no
+//! server-side revoked set to consult (as a SQL table or a Redis key would be).
+//!
+//! An AMQP-native revocation channel is now buildable rather than meaningless —
+//! a fanout exchange every worker binds an auto-delete queue to for the
+//! *already-running-task* notice, backed by a durable table of the kind
+//! `celers-broker-postgres` uses for the *queued-task* guarantee — but it is not
+//! implemented here, and claiming a revocation was recorded when nothing
+//! recorded it would be worse than the honest `false`.
 
 // --- Internal modules (split from original lib.rs) ---
 mod batch_ops;
@@ -153,6 +207,13 @@ pub mod utilities;
 #[cfg(feature = "amqp-events")]
 pub mod event_transport;
 
+/// `celers_core::Broker` over this crate's transport, so a worker can consume
+/// from RabbitMQ.
+///
+/// Requires the `core-broker` feature (on by default).
+#[cfg(feature = "core-broker")]
+pub mod core_broker;
+
 // --- Re-exports: types ---
 pub use types::{
     AmqpConfig, AmqpExchangeType, ChannelMetrics, ChannelPoolMetrics, ConnectionPoolMetrics,
@@ -169,6 +230,10 @@ pub use management::{
 
 // --- Re-exports: core broker ---
 pub use broker_core::AmqpBroker;
+
+// --- Re-exports: task-queue adapter ---
+#[cfg(feature = "core-broker")]
+pub use core_broker::AmqpCoreBroker;
 
 // --- Re-exports: Pure-Rust TLS provider installation ---
 pub use connect::install_pure_tls_provider;

@@ -55,12 +55,31 @@
     },
     {
       "value": [
+        -0.0,
+        0.0001,
+        1e-05,
+        9.999e-05,
+        1000000000000000.0,
+        1e+16
+      ],
+      "repr": "(-0.0, 0.0001, 1e-05, 9.999e-05, 1000000000000000.0, 1e+16)"
+    },
+    {
+      "value": [
         "it's",
         "a\"b",
         "plain",
         "back\\slash"
       ],
       "repr": "('it\\'s', 'a\"b', 'plain', 'back\\slash')"
+    },
+    {
+      "value": [
+        "line\nbreak",
+        "tab\there",
+        "cr\rhere"
+      ],
+      "repr": "('line\nbreak', 'tab\there', 'cr\rhere')"
     },
     {
       "value": [
@@ -168,6 +187,20 @@
         }
       },
       "repr": "{'a': {'b': {'c': [...]}}}"
+    },
+    {
+      "value": {
+        "it's": 1,
+        "plain": 2
+      },
+      "repr": "{'it\\'s': 1, 'plain': 2}"
+    },
+    {
+      "value": {
+        "line\nbreak": 1,
+        "": 2
+      },
+      "repr": "{'': 2, 'line\nbreak': 1}"
     }
   ]
 }

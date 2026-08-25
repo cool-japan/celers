@@ -11,17 +11,20 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use celers_beat::heartbeat::{BeatHeartbeat, HeartbeatConfig};
 //! use celers_beat::lock::InMemoryLockBackend;
 //! use std::sync::Arc;
 //!
+//! # async fn example() {
 //! let backend = Arc::new(InMemoryLockBackend::new());
 //! let config = HeartbeatConfig::new();
 //! let heartbeat = BeatHeartbeat::new("instance-1".to_string(), backend, config);
 //!
 //! // Try to become the leader
 //! let is_leader = heartbeat.try_become_leader().await.unwrap();
+//! # let _ = is_leader;
+//! # }
 //! ```
 
 use celers_core::lock::DistributedLockBackend;

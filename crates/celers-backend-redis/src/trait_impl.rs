@@ -84,12 +84,22 @@ impl RedisResultBackend {
     /// and the optional compare-and-swap `guard` in a single atomic
     /// server-side step. Returns `false` only when a `guard` was supplied and
     /// did not match the bytes currently stored.
+    ///
+    /// `notify` controls the Celery-compatible pub/sub announcement (see
+    /// [`codec::publish_command`]): `true` for a write to the *live* result
+    /// key (a real Celery client's `AsyncResult.get()` waits on exactly that
+    /// channel), `false` for a write to any other key derived from it —
+    /// an archival copy or a historical version — which nothing ever
+    /// subscribes to. The publish only fires when the write actually
+    /// happened (`written == 1`); a rejected compare-and-swap changes
+    /// nothing, so there is nothing to announce.
     pub(crate) async fn write_meta_to_key(
         &self,
         key: &str,
         meta: &TaskMeta,
         ttl: Option<Duration>,
         guard: Option<&[u8]>,
+        notify: bool,
     ) -> Result<bool> {
         let encoded = match codec::encode_meta(
             meta,
@@ -127,7 +137,43 @@ impl RedisResultBackend {
         self.metrics
             .record_data_size(encoded.original_size, encoded.stored_size);
 
+        if written == 1 && notify {
+            self.publish_key_notification(key, &encoded.main).await;
+        }
+
         Ok(written == 1)
+    }
+
+    /// Publish the exact bytes just written to `key`, on the Celery-compatible
+    /// channel named after the key itself.
+    ///
+    /// This is the other half of `write_meta_to_key`'s "SET and PUBLISH"
+    /// contract — see [`codec::publish_command`] for why the channel and the
+    /// payload must be exactly what they are. Distinct from
+    /// [`publish_notification`](Self::publish_notification)'s
+    /// `:notify`-suffixed channel, which is CeleRS' own internal wait
+    /// mechanism and carries a different (lighter) payload; both fire so a
+    /// waiter using either mechanism is woken.
+    ///
+    /// Best-effort, exactly like `publish_notification`: a publish failure
+    /// is logged and swallowed rather than propagated, because the result
+    /// itself is already durably stored and a waiter that misses the
+    /// notification simply falls back to polling.
+    pub(crate) async fn publish_key_notification(&self, key: &str, payload: &[u8]) {
+        if !self.notify_on_store {
+            return;
+        }
+
+        if let Ok(mut conn) = self.connection().await {
+            let cmd = codec::publish_command(key, payload);
+            if let Err(e) = cmd.query_async::<i64>(&mut conn).await {
+                tracing::debug!(
+                    key,
+                    error = %e,
+                    "Failed to publish Celery-compatible result notification"
+                );
+            }
+        }
     }
 
     /// Read and decode the values stored at `keys`, reassembling chunked ones.
@@ -250,7 +296,7 @@ impl ResultBackend for RedisResultBackend {
         let key = self.task_key(task_id);
         let ttl = self.ttl_config.get_ttl(&meta.task_name);
 
-        match self.write_meta_to_key(&key, meta, ttl, None).await {
+        match self.write_meta_to_key(&key, meta, ttl, None, true).await {
             Ok(_) => {
                 self.cache_terminal(task_id, meta);
                 self.publish_notification(task_id, meta).await;
@@ -519,7 +565,18 @@ impl ResultBackend for RedisResultBackend {
                 // The batch path applies exactly the same TTL policy as the
                 // single-key path.
                 let ttl = self.ttl_config.get_ttl(&meta.task_name);
-                commands.push(codec::write_command(&key, &encoded, ttl, None));
+                // No CAS guard on a batch write, so it always lands — the
+                // Celery-compatible PUBLISH can safely ride the same
+                // pipeline unconditionally (see `write_meta_to_key`'s doc
+                // comment for why the single-key path cannot do this when a
+                // guard is present).
+                commands.extend(codec::write_and_notify_commands(
+                    &key,
+                    &encoded,
+                    ttl,
+                    None,
+                    self.notify_on_store,
+                ));
             }
 
             let outcome = self

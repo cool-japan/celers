@@ -1,6 +1,6 @@
 # celers-macros
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-08-26**
 
 Procedural macros for simplified CeleRS task definitions.
 
@@ -15,7 +15,12 @@ else in this crate — code generation, the 37 predefined validators — is inte
 through those two entry points; there is no other public Rust API to version.
 
 _No functional changes landed in this crate during the 0.3.0 release cycle (verified against
-`CHANGELOG.md`); the version bump reflects the workspace-wide release only._
+`CHANGELOG.md`); that version bump reflected the workspace-wide release only. 0.3.1 added test
+infrastructure rather than macro behaviour: a `trybuild` compile-fail UI harness
+(`tests/ui_compile_fail.rs`) that asserts on the exact diagnostics bad `#[task(...)]` /
+`#[derive(Task)]` usage produces, three validator suites (`validators_ids.rs`, `validators_geo.rs`,
+`validators_practical.rs`), and a `celers-core` dev-dependency so the generated code is checked
+against the real `Task` / `CelersError` types instead of a hand-rolled mirror that could drift._
 
 ## Features
 
@@ -257,10 +262,11 @@ cargo expand --example basic_task
 
 ## Testing Status
 
-- ✅ 21 unit tests (attribute parsing, type detection, name conversion)
-- ✅ 200 integration tests (all features, validators, and custom validators)
-- ✅ 221/221 passing — verified via `cargo nextest run -p celers-macros --all-features` (2026-07-13)
-- ℹ️ 23 doc examples in `src/lib.rs`, all marked `` ```ignore `` — they reference macro-generated
+- ✅ 227/227 passing — verified via `cargo nextest run -p celers-macros --all-features` (2026-08-26),
+  spread across unit tests (attribute parsing, type detection, name conversion), integration tests
+  (all features, validators, custom validators), the three validator suites, and the `trybuild`
+  compile-fail UI harness
+- ✅ 7 doctests passing; 15 more are marked `` ```ignore `` because they reference macro-generated
   types that only exist after expansion inside a real crate, so `cargo test --doc` reports them
   `ignored` rather than compiled/run
 - ✅ Zero compiler warnings

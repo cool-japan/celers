@@ -316,7 +316,7 @@ pub(crate) fn open_resp3(info: redis::ConnectionInfo) -> Result<Client> {
         .redis_settings()
         .clone()
         .set_protocol(ProtocolVersion::RESP3);
-    Client::open(info.set_redis_settings(redis_settings))
+    crate::connection::open_client(info.set_redis_settings(redis_settings))
         .map_err(|e| CelersError::Broker(format!("failed to open control channel client: {e}")))
 }
 

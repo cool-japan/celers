@@ -1,20 +1,34 @@
 # CeleRS - Enterprise Distributed Task Queue for Rust
 
-**🎉 100% COMPLETE - ALL 18/18 CRATES IMPLEMENTED! 🎉**
+**CeleRS** (Celery + Rust) is a Celery-protocol-compatible distributed task queue library for Rust: a
+type-safe, Pure-Rust task runtime that speaks Python Celery's message format.
 
-**CeleRS** (Celery + Rust) is a production-ready, Celery-compatible distributed task queue library for Rust. Built from the ground up to provide binary-level protocol compatibility with Python Celery while delivering superior performance, type safety, and reliability.
+**Status (v0.3.1)**: ✅ 0 errors | ✅ 0 warnings | ✅ `cargo deny check bans` clean, `[graph] exclude` empty
+| ✅ **7,529 tests + 1,165 doctests passing** (`--all-features`)
 
-**Status**: ✅ Production-Ready | ✅ 0 Errors | ✅ 0 Warnings | ✅ 5 Brokers | ✅ 3 Backends | ✅ 5,676 Tests Passing (`--all-features`)
+### What is and is not verified
+
+CeleRS' **protocol layer is interop-verified against a real Python Celery 5.6.3**, both directions, by
+[`tests/python-compat/`](tests/python-compat/) — a suite that runs a real Celery client and a real
+`celery -A tasks worker` against a real Redis, with no mock anywhere in the loop — and by verbatim Celery
+wire captures in [`crates/celers-protocol/tests/fixtures/`](crates/celers-protocol/tests/fixtures/).
+
+What is **not** interoperable: the **broker and the result backend**. `celers-broker-redis` puts its own
+`SerializedTask` JSON on the queue and both Redis result backends store a CeleRS-shaped record, so **a
+Python Celery worker and a CeleRS worker cannot share a queue today.** Read
+[docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md) before planning a migration: every row there
+carries the test that proves it, or an honest statement that nothing does.
 
 ## 🎯 Vision
 
 CeleRS aims to be the definitive task queue solution for Rust, offering:
 
-- **🔄 Celery Compatibility**: Drop-in replacement for Python Celery workers
-- **⚡ Performance**: 10x throughput compared to Python Celery
+- **🔄 Celery protocol compatibility**: exchange tasks and results with Python Celery at the wire level
+- **⚡ Performance**: a compiled, `tokio`-based runtime with no GIL and no per-task process fork
 - **🔒 Type Safety**: Compile-time guarantees for task signatures
-- **🏢 Enterprise-Ready**: Battle-tested patterns for production deployments
-- **🌐 Multi-Language**: Interoperate with Python, JavaScript, and other Celery clients
+- **🦀 Pure Rust**: no C, C++, Fortran or vendored assembly anywhere in the tree, enforced by `cargo deny`
+- **🏢 Production concerns first class**: remote control, durable revocation, message authentication,
+  time limits, DLQ, circuit breakers
 
 ## ✨ Features
 
@@ -26,28 +40,60 @@ CeleRS aims to be the definitive task queue solution for Rust, offering:
 - ✅ **Retry Logic**: Exponential backoff with configurable max retries
 - ✅ **Timeout Enforcement**: Task-level and worker-level timeout controls
 - ✅ **Graceful Shutdown**: Clean worker termination with in-flight task completion
-- ✅ **Task Security**: HMAC-SHA256 signature verification, argument sanitization, PII detection & masking
+- ✅ **Soft & Hard Time Limits**: cooperative soft deadline (`execution_context::check_soft_time_limit()`,
+  emits `task-soft-time-limit-exceeded`) plus a hard kill, both settable at runtime over the control channel
 - ✅ **Local Development Mode**: In-memory broker/backend (`InMemoryBroker`, `InMemoryResultBackend`) — no external services required
 
-### Broker Support (5 Types)
-- ✅ **Redis**: High-throughput with Lua scripts and pipelining
+### Remote Control & Revocation
+- ✅ **Remote control protocol**: `celers inspect` (read-only) and `celers control` (mutating) reach every
+  running worker over a Redis pub/sub channel workers join automatically — no daemon to run. Enable on a
+  worker with `Worker::with_control_transport`. **CeleRS-native: it does not interoperate with
+  `celery -A app inspect`** (no kombu pidbox codec yet)
+- ✅ **Broker-fed revocation**: `Broker::revoke` / `is_revoked` / `subscribe_revocations` record a
+  revocation durably *and* publish it live, so a task revoked while queued is refused at dequeue even by a
+  worker that was offline at the time. Implemented by the Redis, PostgreSQL, MySQL and in-memory brokers;
+  opt a worker in with `Worker::with_broker_revocation` (`celers worker` does)
+- ✅ **Message authentication**: opt-in HMAC-SHA256 signature verification **before dispatch**, plus
+  argument sanitization and PII detection/masking. A failing message is dead-lettered with
+  `failure_type = "signature_verification"`, never executed and never requeued. Off by default
+
+### Brokers
+
+A `celers_worker::Worker` consumes from a `celers_core::Broker`. These implement it:
+
+- ✅ **Redis**: High-throughput with Lua scripts and pipelining; `rediss://` TLS
 - ✅ **PostgreSQL**: ACID guarantees with `FOR UPDATE SKIP LOCKED`
 - ✅ **MySQL**: Full SQL support with batch operations
-- ✅ **RabbitMQ (AMQP)**: Enterprise message routing and exchanges
-- ✅ **AWS SQS**: Cloud-native serverless queue integration
+- ✅ **In-memory**: `InMemoryBroker`, for local development and tests
+
+These ship as **`celers-kombu` transports** (publish/consume/purge over `celers_protocol::Message`) and do
+**not** yet implement `celers_core::Broker`, so a `Worker` cannot consume from them — an adapter is the
+missing piece, tracked in [TODO.md](TODO.md#known-gaps--the-roadmap-after-031):
+
+- 🟡 **RabbitMQ (AMQP)**: exchanges, topic routing, publisher confirms, management API
+- 🟡 **AWS SQS**: long polling, FIFO queues, batch operations, visibility extension
 
 ### Result Backends (3 Types)
 - ✅ **Redis Backend**: Fast in-memory storage with automatic TTL
 - ✅ **Database Backend**: PostgreSQL/MySQL with SQL analytics and durability
 - ✅ **gRPC Backend**: Microservices-ready RPC result storage
-- ✅ **Chord Support**: Distributed barrier synchronization across all backends
+- ✅ All three carry **chord barrier synchronization** through the `ResultStore` adapters
 
 ### Workflow Primitives (Canvas)
+
+Every primitive below is executed end to end by the worker, covered by
+`crates/celers-worker/tests/workflow_semantics.rs` and `celers_worker::workflows::patterns_e2e`. From the
+`celers` facade they need the `workflows` feature (which pulls `canvas` and `backend-redis`) — without it a
+chord's callback is compiled out of the worker you build.
+
 - ✅ **Chain**: Sequential task execution with result passing
 - ✅ **Group**: Parallel task execution
-- ✅ **Chord**: Map-reduce with distributed barrier callback
-- ✅ **Map/Starmap**: Distributed mapping operations
+- ✅ **Chord**: Map-reduce with a distributed barrier callback that receives the ordered header results
+- ✅ **Map/Starmap/Chunks**: Distributed mapping operations
 - ✅ **Signature**: Task signatures for workflow composition
+- ✅ **Saga**: forward steps with compensating actions, rolled back newest-first on failure
+- ✅ **Branch/Switch**: conditional routing on a task's outcome
+- ✅ **Pipeline / FanIn / FanOut / ScatterGather**: higher-level patterns that lower onto the above
 
 ### Observability
 - ✅ **Prometheus Metrics**: Task throughput, latency, queue depth (native histograms + P² streaming quantile summaries)
@@ -55,8 +101,12 @@ CeleRS aims to be the definitive task queue solution for Rust, offering:
 - ✅ **SLA/SLO Tracking & Anomaly Detection**: Error-budget burn alerts plus EWMA-based statistical anomaly detection
 - ✅ **Audit Log**: Task lifecycle audit trail (ring-buffer + JSONL file sinks, queryable)
 - ✅ **Health Checks**: Kubernetes-compatible liveness/readiness probes
-- ✅ **OpenTelemetry**: Distributed tracing integration
-- ✅ **Grafana Dashboards**: Pre-built visualization templates
+- ✅ **OpenTelemetry**: Distributed tracing integration (facade feature `tracing`)
+- ✅ **Celery-compatible event stream**: `celeryev` pub/sub carrying the shape `celery events` and Flower
+  parse, with Celery's Lamport clock. **Breaking change in 0.3.1** for anyone who consumed the previous
+  CeleRS-shaped events — see [CHANGELOG.md](CHANGELOG.md)
+- ✅ **Grafana + Prometheus config**: a scrape config (`docs/prometheus.yml`) and an overview dashboard
+  (`docs/grafana/`), both mounted by the `docker-compose.yml` monitoring stack
 
 ### Developer Experience
 - ✅ **Procedural Macros**: `#[celers::task]` for automatic task registration
@@ -98,7 +148,7 @@ CeleRS follows a **layered architecture** inspired by Python Celery's design:
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Workspace Crates (18 published - 100% Complete)
+### Workspace Crates (18 published)
 
 The workspace has two further members that are never published
 (`publish = false`): `celers-examples` (the runnable examples and benchmarks)
@@ -109,15 +159,16 @@ dependency set `#[celers::task]` needs downstream). Both are in `members` so
 #### Core & Protocol Layer
 - **celers**: Facade crate with unified API
 - **celers-core**: Core traits (`Task`, `Broker`, `ResultBackend`, `TaskExecutor`)
-- **celers-protocol**: Celery Protocol v2/v5 message format
-- **celers-kombu**: Kombu-compatible messaging abstraction
+- **celers-protocol**: Celery protocol v2 message format (plus a CeleRS-internal "v5" version label
+  that nothing in the interop suite exercises — the suite and every capture pin `task_protocol = 2`)
+- **celers-kombu**: Kombu-style messaging abstraction (`Producer`/`Consumer`/`Transport`)
 
-#### Broker Layer (5 Implementations)
-- **celers-broker-redis**: Redis with Lua scripts and pipelining
-- **celers-broker-postgres**: PostgreSQL with `FOR UPDATE SKIP LOCKED`
-- **celers-broker-sql**: MySQL with batch operations
-- **celers-broker-amqp**: RabbitMQ/AMQP with exchanges and routing
-- **celers-broker-sqs**: AWS SQS with long polling
+#### Broker Layer (3 task-queue brokers, 2 transports)
+- **celers-broker-redis**: Redis with Lua scripts and pipelining — implements `celers_core::Broker`
+- **celers-broker-postgres**: PostgreSQL with `FOR UPDATE SKIP LOCKED` — implements `celers_core::Broker`
+- **celers-broker-sql**: MySQL with batch operations — implements `celers_core::Broker`
+- **celers-broker-amqp**: RabbitMQ/AMQP with exchanges and routing — `celers-kombu` transport only
+- **celers-broker-sqs**: AWS SQS with long polling — `celers-kombu` transport only
 
 #### Result Backend Layer (3 Implementations)
 - **celers-backend-redis**: Redis with TTL and chord synchronization
@@ -126,30 +177,46 @@ dependency set `#[celers::task]` needs downstream). Both are in `members` so
 
 #### Runtime & Workflow Layer
 - **celers-worker**: Task execution runtime with concurrency control
-- **celers-canvas**: Workflow primitives (Chain, Chord, Group, Map)
-- **celers-beat**: Periodic task scheduler (Cron, Interval, Solar)
+- **celers-canvas**: Workflow primitives (Chain, Chord, Group, Map, Saga, Branch/Switch)
+- **celers-beat**: Periodic task scheduler (Cron, Interval, one-time; the `solar` feature is currently
+  **broken** — see [TODO.md](TODO.md#known-gaps--the-roadmap-after-031))
 
 #### Developer Tools
 - **celers-macros**: Procedural macros (`#[task]`, `#[derive(Task)]`)
 - **celers-cli**: Command-line worker and queue management
 - **celers-metrics**: Prometheus metrics and observability
 
-### Pure Rust: one documented exception
+### Pure Rust: no exceptions
 
-Every crate above builds C/C++/Fortran-free with its default features, and the
-banned-crate policy is enforced mechanically by `cargo deny check bans` against
-the workspace's `deny.toml`.
+Every crate above builds C/C++/Fortran-free — with default features, with
+`--all-features`, and with the facade's `full` feature. The banned-crate policy
+is enforced mechanically by `cargo deny check bans` against the workspace's
+`deny.toml`, whose `[graph] exclude` list is **empty**: no crate is hidden from
+the check.
 
-There is exactly one exception, and it is opt-in:
+Verify it yourself:
 
-| Feature | Crate | Status |
+```bash
+cargo tree -e features -i aws-lc-sys --all-features   # "did not match any packages"
+cargo deny check bans
+```
+
+The three transports that need TLS each get there differently, and all three are
+Pure Rust as of 0.3.1:
+
+| Feature | Crate | How TLS works |
 |---|---|---|
-| `sqs` | `celers-broker-sqs` (and the `celers` facade's `sqs` / `full` features) | **Not Pure Rust.** The AWS SDK's `default-https-client` hard-selects `aws-smithy-http-client/rustls-aws-lc` → `aws-lc-rs` → `aws-lc-sys`, which is vendored C/C++/assembly built with `cmake` + `cc`. The SDK offers no Pure-Rust TLS provider; its only alternatives (`rustls-ring`, `rustls-aws-lc-fips`, `s2n-tls`) are also C/asm. Removing it requires a custom `HttpClient` built on `oxihttp-client`. |
-| `amqp` | `celers-broker-amqp` | Pure Rust as of 0.3.1. `lapin` is pinned to `default-features = false` + `rustls-webpki-roots-certs`, and `celers_broker_amqp::install_pure_tls_provider()` installs the `rustls-rustcrypto` provider, so AMQPS no longer pulls `aws-lc-rs`. Deployments behind a private CA should enable `celers-broker-amqp/tls-native-certs` (also Pure Rust) to add the OS trust store. |
+| `sqs` | `celers-broker-sqs` | The AWS SDK's `default-https-client` is **not** enabled: it hard-selects `aws-smithy-http-client/rustls-aws-lc` → `aws-lc-rs` → `aws-lc-sys` (vendored C/C++/assembly built with `cmake` + `cc`), and the SDK's only alternatives (`rustls-ring`, `rustls-aws-lc-fips`, `s2n-tls`) are also C/asm. Instead, `celers_broker_sqs::pure_http` implements the SDK's `HttpClient`/`HttpConnector` over `oxihttp-client` (hyper 1.x + `tokio-rustls` + OxiTLS' `rustls-rustcrypto` provider, webpki roots) and installs it at every `aws_config::defaults(..)`. On by default via the crate's `pure-http` feature. |
+| `amqp` | `celers-broker-amqp` | `lapin` is pinned to `default-features = false` + `rustls-webpki-roots-certs`, and `celers_broker_amqp::install_pure_tls_provider()` installs the `rustls-rustcrypto` provider. Deployments behind a private CA should enable `celers-broker-amqp/tls-native-certs` (also Pure Rust) to add the OS trust store. |
+| `rediss://` | `celers-broker-redis`, `celers-backend-redis` | The `redis` crate is built with `tokio-rustls-comp` + `tls-rustls-webpki-roots`, neither of which selects a crypto provider, and each crate's `install_pure_tls_provider()` supplies OxiTLS'. Custom CA and client certificates go through `RedisConfig::tls(TlsConfig::new().ca_cert(..).client_cert(.., ..))`, which routes to `redis::Client::build_with_tls`. |
 
-Note that `--all-features` and the facade's `full` feature both turn `sqs` on,
-so a build using either is not Pure Rust. Verify any given crate with
-`cargo tree -e features -i aws-lc-sys -p <crate>`.
+Because no rustls provider *feature* is enabled anywhere in the workspace, a
+bare `rustls::ClientConfig::builder()` has no provider to auto-select and would
+panic. Every client constructor in these crates therefore calls its
+`install_pure_tls_provider()` first. An application that builds rustls clients
+through *other* libraries before constructing a CeleRS broker should call one of
+them itself, first thing in `main`; whoever installs a default provider first
+wins.
 
 The gRPC result backend (`celers-backend-rpc`) ships without built-in TLS for
 the same reason: `tonic`'s `tls-ring` / `tls-aws-lc` features pull banned
@@ -158,33 +225,33 @@ crypto. Bring your own TLS-enabled `Channel` via
 
 ### Crate Status (v0.3.1)
 
-| Crate | Status | Tests |
-|-------|--------|-------|
-| celers-cli | [Alpha] | 757 |
-| celers-worker | [Stable] | 655 |
-| celers-protocol | [Stable] | 503 |
-| celers-broker-redis | [Stable] | 478 |
-| celers-core | [Stable] | 438 |
-| celers-beat | [Stable] | 427 |
-| celers-kombu | [Stable] | 343 |
-| celers-canvas | [Stable] | 320 |
-| celers-metrics | [Stable] | 319 |
-| celers-broker-sqs | [Stable] | 294 |
-| celers-broker-amqp | [Stable] | 265 |
-| celers-backend-redis | [Stable] | 226 |
-| celers-macros | [Stable] | 221 |
-| celers-broker-postgres | [Stable] | 175 |
-| celers (facade) | [Stable] | 154 |
-| celers-broker-sql | [Alpha] | 126 |
-| celers-backend-db | [Alpha] | 61 |
-| celers-backend-rpc | [Alpha] | 19 |
-| **Total** | **14 Stable, 4 Alpha** | **5781** |
+**Verified 2026-08-26 with `cargo nextest run --workspace --all-features`: 7,529 tests run, 7,529 passed, 0
+failed, 109 skipped**, plus **1,165 passing doctests** (`cargo test --doc --workspace --all-features`; 136
+more are ```` ```ignore ```` and never compile). A per-crate breakdown is intentionally not reproduced here:
+with 18 published crates under active, parallel development, a static table drifts out of date between
+releases faster than it gets corrected -- regenerate one locally with `cargo nextest list --workspace
+--all-features` if you want a current snapshot, or watch a single crate's count with `cargo nextest list -p
+<crate> --all-features`.
 
-Per-crate counts are defined test cases (`cargo nextest list --workspace --all-features`). The
-verified *executed* result is **5,676 passing / 0 failed with `--all-features`** (**5,495 passing /
-0 failed** with default features) — the ~105-test gap versus the table total is tests gated behind
-live external services (Redis/PostgreSQL/MySQL/RabbitMQ/SQS) marked `#[ignore]` by default (106
-such tests in the workspace), not a discrepancy.
+That 7,529 total is not the whole story on what it verifies. Three categories of test coexist inside it, and
+only the first two ran a real assertion:
+
+1. **Ordinary tests** -- ran, asserted, passed.
+2. **Env-gated live-service tests** (~63) -- ran and asserted for real *only if* the matching `CELERS_TEST_*`
+   (or, for two crates, the differently-named) variable was set to a reachable server; otherwise they print a
+   `skipping` line and return, **still counted as passing**. See
+   [tests/integration/README.md](tests/integration/README.md) for the full variable-to-service table and how
+   to tell which happened.
+3. **`#[ignore]`d tests** (109, the "skipped" figure above) -- not attempted at all unless the run adds
+   `--run-ignored all`.
+
+Category 2 means a green `--all-features` run with no service URLs exported -- the common case on a laptop --
+has not exercised live Redis/PostgreSQL/MySQL/RabbitMQ/SQS behavior in that subset, only the code paths that
+don't need one. `docker-compose.yml` now carries a service for every one of them (`--profile test` adds MySQL
+and LocalStack, `--profile python-compat` adds Celery), but **nothing in this repository runs the full
+matrix**: `.github/` holds only `dependabot.yml`, `FUNDING.yml` and a `workflows.disabled/` directory, so no
+workflow runs on push today. Running the matrix by hand -- services up, every gate variable exported,
+`--run-ignored all` -- is the only way to know all 7,529 assertions actually fired.
 
 ## 🚀 Quick Start
 
@@ -214,10 +281,29 @@ satisfied by the facade's re-export:
 
 ```toml
 [dependencies]
-celers = "0.3"
+celers = { version = "0.3", features = ["redis"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
+
+**If you use Canvas workflows through the facade, ask for them explicitly.** The primitives
+themselves are always re-exported, but the half that *finishes* a workflow — the chord barrier and
+the chain continuation — lives in the worker behind `celers-worker`'s own gates. Without the
+features below you can build and apply a `Chord`, watch its header run, and never see the callback:
+
+```toml
+[dependencies]
+# `workflows` implies `canvas` and `backend-redis` (the barrier is counted in a result backend).
+celers = { version = "0.3", features = ["redis", "workflows"] }
+```
+
+`celers/full` includes both. Feature flags for the rest: `postgres`, `mysql`, `amqp`, `sqs`,
+`backend-redis`, `backend-db`, `backend-rpc`, `beat` / `beat-cron` / `beat-solar`, `json`,
+`msgpack`, `metrics`, `tracing`, `dev-utils`. (`beat-solar` compiles, but solar schedules do not
+currently produce a next run — see [TODO.md](TODO.md#known-gaps--the-roadmap-after-031).)
+
+**MSRV**: 1.89 for everything except `sqs`, which needs 1.94.1 (its AWS SDK dependencies are not
+optional) — and therefore so do `celers/full` and any `--all-features` build.
 
 ### Define a Task
 
@@ -330,6 +416,50 @@ celers report weekly --format html --output weekly.html
 celers analyze profile task --queue default
 ```
 
+### Remote control and inspection
+
+`celers inspect` (read-only) and `celers control` (mutating) talk to running workers over a Redis pub/sub control
+channel every worker joins automatically -- there is no separate daemon to start. Both broadcast a request and
+print every reply that arrives before a timeout; "no worker answered" means nothing was listening, not that the
+command failed. This is a CeleRS-native protocol -- it does not interoperate with `celery -A app inspect` against
+a Python worker, or vice versa.
+
+```bash
+# Which workers are alive right now
+$ celers inspect ping --broker redis://localhost:6379
+✓ 1 worker(s) answered 'ping'
+  kitasan pong (clock 1787655038.426)
+
+# What task types a worker knows how to run
+$ celers inspect registered --broker redis://localhost:6379
+✓ 1 worker(s) answered 'inspect registered'
+  kitasan
+      demo.echo
+      demo.fail
+      demo.sleep
+
+# Tasks a worker is executing right now
+celers inspect active --broker redis://localhost:6379
+
+# Revoke a task by id (recorded durably, so it also blocks the task if it's
+# still queued or a worker for it hasn't started yet -- see --help)
+celers control revoke <task-id> --broker redis://localhost:6379
+
+# Ask every listening worker to drain and stop
+celers control shutdown --broker redis://localhost:6379
+```
+
+`celers inspect --help` / `celers control --help` list every subcommand (11 and 10 respectively as of 0.3.1):
+ping/active/scheduled/reserved/revoked/registered/stats/queues/report/conf/circuit-breakers on the read side,
+and ping/shutdown/revoke/revoke-pattern/rate-limit/time-limit/add-consumer/cancel-consumer/queue-length/
+reset-circuit-breaker on the mutating side.
+
+Two answers are deliberately shaped and worth knowing: `inspect scheduled` and `inspect reserved` always come
+back empty, and that is *accurate* rather than a stub — a CeleRS worker keeps no worker-local scheduled or
+reserved set (ETA tasks wait in the broker's delayed queue, and a batch dequeue dispatches rather than parks).
+`control queue purge/delete/bind/unbind/declare` answer with an error naming the reason: the `Broker` trait has
+no such operations, so a worker cannot perform them on your behalf — use `celers queue purge` and friends.
+
 ## 📊 Monitoring
 
 ### Prometheus Metrics
@@ -381,21 +511,36 @@ let info = checker.get_health();
 - ✅ **Phase 2**: Advanced Features (Priorities, DLQ, Cancellation)
 - ✅ **Phase 3**: Developer Experience (Macros, CLI, Metrics)
 - ✅ **Phase 4**: Performance & Scalability
-- ✅ **Phase 5**: Beat Scheduler (Cron, Interval, Solar)
-- ✅ **Phase 6**: Extended Brokers & Backends (AMQP, SQS, DB, gRPC)
-- ✅ **Phase 7**: Full Celery Protocol Compatibility (v2 wire format)
+- ✅ **Phase 5**: Beat Scheduler -- Cron, Interval, one-time and solar schedules all work (solar covers
+  sunrise/sunset, civil/nautical/astronomical twilight and golden hour, and handles polar day/night)
+- 🚧 **Phase 6**: Extended Brokers & Backends -- all three result backends are complete; AMQP and SQS are
+  `celers-kombu` transports without a `celers_core::Broker` adapter, so a `Worker` cannot consume from them
+- 🚧 **Phase 7**: Full Celery Protocol Compatibility -- the **protocol layer is interop-verified** against a
+  live Python Celery 5.6.3, both directions (`tests/python-compat/`). What remains is the broker and result
+  backend, which still carry CeleRS-shaped payloads, so the two runtimes cannot share a queue. Row-by-row
+  evidence in [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md)
 - ✅ **Phase 8**: v0.2.0 Enhancements (Compression, Distributed Locks, Events)
 - ✅ **Phase 9**: v0.2.0 Production Features (Event Persistence, Chunking, Heartbeat)
 
 ### Upcoming Milestones
 
-- **Next**: Full Python Celery interoperability (bidirectional task exchange, integration tests against real Python Celery workers)
-- **v1.0.0**: Stable API, Kafka/NATS brokers, web admin dashboard, security hardening
+- **Next**: route the broker and result backend through `celers-protocol` so a Python Celery worker and a
+  CeleRS worker can share a queue; a kombu pidbox codec so `celery -A app inspect` reaches a CeleRS worker;
+  a `celers_core::Broker` adapter over the AMQP and SQS transports. The full, evidence-backed list is
+  [TODO.md → Known gaps](TODO.md#known-gaps--the-roadmap-after-031)
+- **v1.0.0**: Stable API, Kafka/NATS brokers, web admin dashboard
 
 ## 📖 Documentation
 
+- [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md) - What interoperates with Python Celery, and
+  which test proves each row
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) - Docker, Kubernetes, and building a worker image
+- [tests/python-compat/README.md](tests/python-compat/README.md) - The live Celery interoperability suite
+- [tests/integration/README.md](tests/integration/README.md) - Gate variable → service → invocation for every
+  env-gated suite
 - [Architecture Decision Records](docs/adr/) - Key design decisions
-- [TODO.md](TODO.md) - Detailed task tracking
+- [CHANGELOG.md](CHANGELOG.md) - Release notes, including 0.3.1's breaking wire-format changes
+- [TODO.md](TODO.md) - Roadmap and the honest list of known gaps
 
 ## 🔬 Examples
 
@@ -417,26 +562,45 @@ The repository includes 15 working examples (in `crates/celers-examples/examples
 - `web_scraper` - Real-world web scraping workload
 - `image_processing` - Real-world image processing workload
 
-Run examples with:
+Run examples with (the repository root is a virtual workspace with no `[package]` of its own, so `-p
+celers-examples` is required -- a bare `cargo run --example <name>` fails to select a package):
 
 ```bash
-cargo run --example prometheus_metrics
+cargo run -p celers-examples --example basic_processing
+
+# prometheus_metrics additionally needs the `metrics` feature (it links
+# celers-metrics through celers-worker/celers-broker-redis):
+cargo run -p celers-examples --example prometheus_metrics --features metrics
 ```
 
 ## 🧪 Testing
 
-Verified workspace-wide with `cargo nextest run --workspace`: **5,676 tests passing, 0 failed**
-with `--all-features` (**5,495 passing, 0 failed** with default features).
+Verified workspace-wide with `cargo nextest run --workspace --all-features`: **7,529 tests passing, 0
+failed, 109 skipped**, plus **1,165 passing doctests**. See [Crate Status](#crate-status-v031) above for what
+those figures do and do not establish about the env-gated live-service suites, and
+[tests/integration/README.md](tests/integration/README.md) to run them against real services.
 
 ```bash
-# Run all tests
+# Run all tests (default features)
 cargo test
 
-# Run with coverage
-cargo test --all-features
+# Run the full suite, including every broker/backend
+cargo nextest run --workspace --all-features
 
-# Run benchmarks
-cargo bench
+# Doctests (nextest does not run these)
+cargo test --doc --workspace --all-features
+
+# Bring up the services the gated suites need, then run them for real
+docker-compose up -d
+docker-compose --profile test up -d          # MySQL + LocalStack
+CELERS_TEST_REDIS_URL=redis://127.0.0.1:6379 \
+  cargo nextest run --workspace --all-features --run-ignored all
+
+# Live Python Celery interoperability (creates its own venv under $TMPDIR)
+CELERS_TEST_REDIS_URL=redis://127.0.0.1:6379 tests/python-compat/run.sh
+
+# Run benchmarks -- see "Benchmarks available via" below; `-p` is required
+cargo bench -p celers-examples --bench serialization
 
 # Check for warnings
 cargo clippy --workspace --all-features --all-targets -- -D warnings
@@ -444,23 +608,40 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 
 ## 🏆 Performance
 
-CeleRS is designed for high throughput:
+CeleRS is designed for high throughput. The figures below are **design targets, not measurements** — this
+repository publishes no benchmark results, and none of these numbers has been verified against a run here.
+Measure your own workload with the criterion suites below before planning capacity around them.
 
-- **Target**: 10,000 tasks/sec per worker
-- **Latency**: P95 < 10ms for enqueue/dequeue
-- **Memory**: < 50MB baseline per worker
-- **Reliability**: 99.99% task delivery guarantee
+- **Target throughput**: 10,000 tasks/sec per worker
+- **Target latency**: P95 < 10 ms for enqueue/dequeue
+- **Target memory**: < 50 MB baseline per worker
+- **Delivery**: at-least-once, via visibility timeouts and an unacked set that a reaper redelivers from. Not
+  exactly-once, and not a numeric guarantee — design your tasks to be idempotent
 
-Benchmarks available via:
+Benchmarks available via (note: `celers-cli` and `celers-examples` both declare a `serialization` bench, so a bare
+`--bench serialization` with no `-p` runs it in *both* crates; add `-p` to run just one):
 
 ```bash
-cargo bench --bench serialization
-cargo bench --bench queue_operations
+cargo bench -p celers-examples --bench serialization
+cargo bench -p celers-examples --bench queue_operations
+cargo bench -p celers-examples --bench batch_operations
+cargo bench -p celers-cli --bench serialization
 ```
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+We welcome contributions. There is no `CONTRIBUTING.md` yet (writing one is tracked in
+[TODO.md](TODO.md)); until there is, the rules are the ones enforced mechanically — see
+[Code Standards](#code-standards) below and run the same gates CI would:
+
+```bash
+cargo build --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo nextest run --workspace --all-features
+cargo test --doc --workspace --all-features
+cargo fmt --all --check
+cargo deny check bans
+```
 
 ### Development Setup
 
@@ -511,6 +692,10 @@ Licensed under Apache-2.0
 
 ---
 
-**Status**: Active Development | **Version**: 0.3.1 | **Rust**: 1.70+ (MSRV)
+**Status**: Active Development | **Version**: 0.3.1 | **MSRV**: 1.89, declared as `rust-version` in the
+workspace manifest (`oxisql`/`oxitls` set that floor) -- except `celers-broker-sqs`, which declares 1.94.1
+because its AWS SDK dependencies are not optional, and therefore so do `celers/sqs`, `celers/full` and any
+`--all-features` build. Re-derive with `cargo metadata --format-version 1 --all-features` and take the highest
+`rust_version` in the resolved graph.
 
 Built with ❤️ for the Rust community

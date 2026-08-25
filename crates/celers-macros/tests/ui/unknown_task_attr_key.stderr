@@ -1,0 +1,5 @@
+error: unknown attribute 'bogus'. Valid attributes are: name, timeout, priority, max_retries
+ --> tests/ui/unknown_task_attr_key.rs:6:8
+  |
+6 | #[task(bogus = "value")]
+  |        ^^^^^

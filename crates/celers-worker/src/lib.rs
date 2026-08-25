@@ -74,6 +74,9 @@ pub mod poison_pill;
 pub mod prefetch;
 pub mod queue_monitor;
 pub mod rate_limit;
+/// Pure-Rust TLS provider installation for this crate's `rediss://` clients.
+#[cfg(feature = "redis")]
+pub mod redis_tls;
 pub mod resource_tracker;
 pub mod restart_manager;
 pub mod retry;

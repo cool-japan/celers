@@ -364,7 +364,7 @@ impl CronScheduler {
     /// over the same set of jobs must use the same `namespace` and register
     /// the same job ids with equivalent cron expressions.
     pub fn new(redis_url: &str, namespace: impl Into<String>) -> Result<Self> {
-        let client = redis::Client::open(redis_url)
+        let client = crate::connection::open_client(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
         Ok(Self {

@@ -1,7 +1,25 @@
 # ADR-005: SQS Broker Celery Compatibility
 
 ## Status
-Proposed
+**Proposed — not implemented.** Every box in the Implementation Plan below is still unchecked as of
+0.3.1. Read this as a design proposal, not as a description of shipped behaviour.
+
+## Amendment (0.3.1, 2026-08-26)
+
+Two facts that post-date this proposal and change how to read it:
+
+1. **`SqsBroker` is not a `celers_core::Broker`.** It implements `celers_kombu`'s
+   `Producer`/`Consumer`/`Transport`/`Broker` traits — a message-transport abstraction — so a
+   `celers_worker::Worker` cannot consume from SQS at all today, whatever the wire format. A
+   `celers_core::Broker` adapter over the kombu transports is a prerequisite for anything in the
+   Implementation Plan, and is tracked in [TODO.md](../../TODO.md#known-gaps--the-roadmap-after-031).
+2. **The Pure-Rust exception this crate used to carry is closed.** `celers_broker_sqs::pure_http`
+   replaces the AWS SDK's `default-https-client` (→ `aws-lc-sys`) with an `HttpClient` over
+   `oxihttp-client`, and `deny.toml`'s `[graph] exclude` is now empty. Anything you read elsewhere
+   describing SQS as a banned-crate exception is stale.
+
+The current, evidence-backed compatibility picture is
+[docs/CELERY_COMPATIBILITY.md](../CELERY_COMPATIBILITY.md).
 
 ## Context
 

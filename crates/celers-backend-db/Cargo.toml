@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Database (PostgreSQL/MySQL) result backend for CeleRS"
 readme = "README.md"
 keywords = ["celery", "database", "backend", "postgresql", "mysql"]
@@ -42,6 +43,10 @@ oxitls = { workspace = true }
 rustls = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
+# Encodes the compressed-result envelope's bytes as base64 text so
+# `result_data` -- a native JSON/JSONB column -- never holds anything but
+# valid JSON. See `result_compression.rs`.
+base64 = { workspace = true }
 
 # Core protocol
 celers-core = { workspace = true }

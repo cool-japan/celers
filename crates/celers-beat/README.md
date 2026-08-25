@@ -1,6 +1,6 @@
 # celers-beat
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 504 (`--all-features`, excluding `#[ignore]`d) + 80 doctests | Updated: 2026-08-26**
 
 Periodic task scheduler for CeleRS, equivalent to Celery Beat. Schedule tasks to run at regular intervals or specific times using interval or crontab expressions.
 
@@ -11,13 +11,18 @@ Production-ready task scheduler with comprehensive features:
 **Core Scheduling:**
 - ✅ **Interval Schedules**: Execute every N seconds
 - ✅ **Crontab Schedules**: Unix cron-style scheduling with timezone support
-- ✅ **Solar Schedules**: Sunrise/sunset/twilight/golden hour events
+- ✅ **Solar Schedules**: Sunrise/sunset/twilight/golden hour events — see
+  [Solar Schedule](#solar-schedule-optional) below
 - ✅ **One-Time Schedules**: Run once at specific time (auto-cleanup)
 - ✅ **Custom Schedules**: User-defined scheduling logic via closures
 - ✅ **Composite Schedules**: Combine schedules with AND/OR logic
 
 **Task Management:**
-- ✅ **Persistent State**: Track execution history across restarts
+- ✅ **Persistent State**: Track execution history across restarts, through the pluggable
+  `ScheduleStore` seam (`load`/`save`/`remove`). `FileScheduleStore` is the default local-file
+  behaviour; `RedisScheduleStore` (feature `redis-store`, off by default) gives several beat
+  instances a shared, durable schedule catalog. Note that `save` is last-write-wins — run a single
+  active writer, and keep `dispatch_lock` wired up for per-fire duplicate prevention
 - ✅ **Schedule Versioning**: Track and rollback schedule modifications
 - ✅ **Task Dependencies**: Define execution order with dependency chains
 - ✅ **Groups & Tags**: Organize tasks with hierarchical groups and tags
@@ -149,7 +154,11 @@ let schedule = Schedule::crontab("0", "9", "1-5", "*", "*");
 
 ### Solar Schedule (Optional)
 
-Execute tasks at sunrise/sunset:
+> **Fixed in 0.3.1.** Through earlier 0.3.x, `Schedule::Solar::next_run` returned
+> `Err(ScheduleError::Invalid)` for *every* input, so a solar entry never fired: `sunrise::sunrise_sunset`
+> returns Unix *seconds*, and the `Schedule::Solar` branch divided them as if they were
+> minutes-since-midnight. The branch now uses `sunrise`'s `SolarDay::event_time`, which returns an absolute
+> `DateTime<Utc>` and needs no unit conversion at all.
 
 ```toml
 [dependencies]
@@ -170,12 +179,22 @@ let schedule = Schedule::solar("sunrise", 51.5074, -0.1278);
 ```
 
 **Supported events:**
-- `"sunrise"` - Task runs at sunrise
-- `"sunset"` - Task runs at sunset
+- `"sunrise"` / `"sunset"` - the sun crosses the horizon
+- `"dawn"` / `"dusk"` (aliases of `"civil_twilight_begin"` / `"civil_twilight_end"`) - sun 6° below the horizon
+- `"nautical_twilight_begin"` / `"nautical_twilight_end"` - sun 12° below the horizon
+- `"astronomical_twilight_begin"` / `"astronomical_twilight_end"` - sun 18° below the horizon
+- `"golden_hour_begin"` / `"golden_hour_end"` - approximated relative to sunrise/sunset
 
 **Notes:**
-- Latitude/longitude must be in decimal degrees
-- Times are calculated in UTC
+- Latitude/longitude are decimal degrees, and out-of-range values return
+  `ScheduleError::Invalid` rather than panicking
+- Times are computed in UTC. The instant for a given *local* date often falls on a different UTC
+  date — Tokyo's sunrise for 22 June 2026 is `2026-06-21T19:25:59Z` — so the search starts a day
+  early and selects on the absolute instant
+- Twilight events are true elevation solves, not fixed offsets from sunrise
+- Polar day and polar night are handled: dates where the event does not occur are skipped rather
+  than reported as errors, so a Svalbard sunrise schedule resolves to the first sunrise after the
+  midnight sun ends
 - Next occurrence is searched up to 365 days ahead
 
 ## Scheduled Tasks
@@ -1028,13 +1047,15 @@ impl celers_core::Task for GenerateReportTask {
 - **Precision:** 1-second granularity
 - **Latency:** <10ms schedule evaluation
 
+> These are design targets, not measurements: no benchmark in this repository produces them.
+
 ## Comparison with Celery Beat
 
 | Feature | Celery Beat | CeleRS Beat |
 |---------|-------------|-------------|
 | Interval schedules | ✅ | ✅ |
 | Crontab schedules | ✅ | ✅ (with timezone support) |
-| Solar schedules | ✅ | ✅ (with twilight & golden hour) |
+| Solar schedules | ✅ | 🟥 implemented but **broken** in 0.3.1 (see above) |
 | One-time schedules | ❌ | ✅ |
 | Custom schedules | ❌ | ✅ |
 | Schedule versioning | ❌ | ✅ |

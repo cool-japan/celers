@@ -1,0 +1,5 @@
+error: unknown validation parameter 'bogus'. Valid parameters: min, max, min_length, max_length, pattern, message, email, url, phone, not_empty, positive, negative, alphabetic, alphanumeric, numeric, uuid, ipv4, hexadecimal, ipv6, slug, mac_address, json, base64, color_hex, semver, domain, ascii, lowercase, uppercase, time_24h, date_iso8601, credit_card, latitude, longitude, iso_country, iso_language, us_zip, ca_postal, iban, bitcoin_address, ethereum_address, isbn, password_strength, custom
+ --> tests/ui/unknown_validate_param.rs:8:29
+  |
+8 | async fn my_task(#[validate(bogus)] value: i32) -> celers_core::Result<i32> {
+  |                             ^^^^^

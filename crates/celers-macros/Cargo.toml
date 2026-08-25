@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Procedural macros for CeleRS task definitions (#[task], #[derive(Task)])"
 readme = "README.md"
 keywords = ["celery", "macros", "procedural", "task", "derive"]
@@ -24,6 +25,18 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# `celers-core` is a dev-dependency only (not a normal `[dependencies]`
+# entry), so this does not create a build-graph cycle -- Cargo permits a
+# dev-dependency cycle since dev-deps are only compiled for this crate's own
+# tests/examples, never as part of building `celers-core` itself. Used by
+# `tests/integration_test.rs` and the examples so the generated macro code
+# is checked against the real `Task`/`CelersError` types instead of a
+# hand-rolled mirror that can drift out of sync with them.
+celers-core = { workspace = true }
+# Compile-fail UI harness for asserting on the exact diagnostics bad
+# `#[task(...)]` / `#[derive(Task)]` usage produces (`tests/ui_compile_fail.rs`).
+# Pure Rust, no C/C++ dependencies.
+trybuild = { workspace = true }
 
 # Examples dependencies
 [[example]]

@@ -50,6 +50,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod compression;
 pub mod config;
 pub mod metrics;
 pub mod result_store;
@@ -58,6 +59,7 @@ pub mod server;
 mod codec;
 mod task_meta_extra;
 
+pub use compression::CompressionConfig;
 pub use config::GrpcConfig;
 pub use metrics::{OperationStats, RpcMetrics, RpcMetricsSnapshot, RpcOperation};
 pub use server::RpcBackendServer;
@@ -89,6 +91,7 @@ pub struct GrpcResultBackend {
     client: ResultBackendServiceClient<Channel>,
     metrics: Arc<RpcMetrics>,
     config: GrpcConfig,
+    compression: CompressionConfig,
 }
 
 impl GrpcResultBackend {
@@ -141,12 +144,29 @@ impl GrpcResultBackend {
             client,
             metrics: Arc::new(RpcMetrics::new()),
             config,
+            compression: CompressionConfig::disabled(),
         }
     }
 
     /// The configuration this client was constructed with.
     pub fn config(&self) -> &GrpcConfig {
         &self.config
+    }
+
+    /// Configure compression for `result_data` on the wire.
+    ///
+    /// Disabled by default — see [`CompressionConfig::disabled`]. Decoding
+    /// a compressed *response* is unconditional regardless of this
+    /// setting, so turning compression off here never breaks reading a
+    /// result some other, compression-enabled client stored.
+    pub fn with_compression(mut self, config: CompressionConfig) -> Self {
+        self.compression = config;
+        self
+    }
+
+    /// Get the compression configuration.
+    pub fn compression_config(&self) -> &CompressionConfig {
+        &self.compression
     }
 
     /// Return a point-in-time snapshot of all RPC metrics.
@@ -238,7 +258,7 @@ async fn wait_before_retry(
 #[async_trait]
 impl ResultBackend for GrpcResultBackend {
     async fn store_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<()> {
-        let proto_meta = codec::to_proto_meta(meta)?;
+        let proto_meta = codec::to_proto_meta_with_compression(meta, &self.compression)?;
         let message = StoreResultRequest {
             task_id: task_id.to_string(),
             meta: Some(proto_meta),
@@ -540,6 +560,7 @@ mod tests {
             memory_bytes: None,
             retries: None,
             queue: None,
+            ignored_error: None,
         }
     }
 

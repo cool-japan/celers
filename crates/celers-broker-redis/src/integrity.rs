@@ -212,7 +212,7 @@ impl IntegrityValidator {
         redis_url: &str,
         key_prefix: &str,
     ) -> Result<Self> {
-        let client = Client::open(redis_url)
+        let client = crate::connection::open_client(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
         let mut validator = Self::new(algorithm);
         validator.redis = Some(RedisSequenceBackend {

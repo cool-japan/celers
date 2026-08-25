@@ -218,7 +218,11 @@ impl PostgresBroker {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use std::sync::Arc;
+    /// # use std::time::Duration;
+    /// # fn example(broker: Arc<PostgresBroker>) {
     /// // Run maintenance every hour (ANALYZE only)
     /// let handle = broker.start_maintenance_scheduler(
     ///     Duration::from_secs(3600),
@@ -228,6 +232,7 @@ impl PostgresBroker {
     ///
     /// // Stop the maintenance task later
     /// handle.abort();
+    /// # }
     /// ```
     pub fn start_maintenance_scheduler(
         self: Arc<Self>,

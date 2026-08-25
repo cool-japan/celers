@@ -146,10 +146,22 @@ fn test_task_result_status_serialization() {
 /// default wherever a database is available, instead of needing
 /// `-- --ignored` — which is why the delivery-identity bug went unnoticed for
 /// so long.
+///
+/// Prints a visible, greppable `SKIPPED:` line naming the call site (via
+/// `#[track_caller]`) when unconfigured, matching the convention used by
+/// `tests_pg.rs`'s `broker_or_skip!` — a bare `None` here previously let a
+/// skipped run and a real run both report `ok` with nothing in the log to
+/// tell them apart, and each of this function's three call sites had to
+/// remember to print its own (easily-stale-on-rename) skip message by hand.
+#[track_caller]
 fn integration_db_url() -> Option<String> {
     match std::env::var("CELERS_TEST_POSTGRES_URL") {
         Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => None,
+        _ => {
+            let location = std::panic::Location::caller();
+            eprintln!("SKIPPED: {location} (set CELERS_TEST_POSTGRES_URL to run)");
+            None
+        }
     }
 }
 
@@ -161,7 +173,6 @@ fn integration_queue() -> String {
 #[tokio::test]
 async fn test_postgres_broker_lifecycle() {
     let Some(database_url) = integration_db_url() else {
-        eprintln!("skipping test_postgres_broker_lifecycle: CELERS_TEST_POSTGRES_URL is not set");
         return;
     };
 
@@ -206,9 +217,6 @@ async fn test_postgres_broker_lifecycle() {
 #[tokio::test]
 async fn test_skip_locked_concurrent_dequeue() {
     let Some(database_url) = integration_db_url() else {
-        eprintln!(
-            "skipping test_skip_locked_concurrent_dequeue: CELERS_TEST_POSTGRES_URL is not set"
-        );
         return;
     };
 
@@ -325,7 +333,6 @@ fn test_retry_strategy_default() {
 #[tokio::test]
 async fn test_pool_metrics() {
     let Some(database_url) = integration_db_url() else {
-        eprintln!("skipping test_pool_metrics: CELERS_TEST_POSTGRES_URL is not set");
         return;
     };
 

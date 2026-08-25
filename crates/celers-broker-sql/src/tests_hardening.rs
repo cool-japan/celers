@@ -52,6 +52,10 @@ const APPLIED_MIGRATIONS: &[(&str, &str)] = &[
         "010_task_results.sql",
         include_str!("../migrations/010_task_results.sql"),
     ),
+    (
+        "011_revocation.sql",
+        include_str!("../migrations/011_revocation.sql"),
+    ),
 ];
 
 /// Source files containing a `celers_tasks` INSERT.
@@ -175,6 +179,25 @@ fn queue_name_migration_adds_an_indexed_backfilled_column() {
     );
 }
 
+#[test]
+fn revocation_migration_creates_a_microsecond_precision_queue_scoped_table() {
+    let sql = include_str!("../migrations/011_revocation.sql");
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS celers_revoked_tasks"));
+    assert!(
+        sql.contains("PRIMARY KEY (queue_name, task_id)"),
+        "revocation is queue-scoped, not global"
+    );
+    assert!(
+        sql.contains("revoked_at DATETIME(6)") && sql.contains("expires_at DATETIME(6)"),
+        "the poller's cursor needs sub-second precision, or same-second \
+         revocations tie far more often than necessary"
+    );
+    assert!(
+        sql.contains("idx_revoked_tasks_poll") && sql.contains("(queue_name, revoked_at)"),
+        "the poller's `queue_name = ? AND revoked_at > ?` query needs a covering index"
+    );
+}
+
 /// Index names must be unique across the whole migration chain.
 ///
 /// MySQL has no `CREATE INDEX IF NOT EXISTS`, so a name reused by a later
@@ -292,10 +315,35 @@ mod integration {
     use std::sync::Arc;
     use uuid::Uuid;
 
+    /// The connection string to test against, printing a visible, greppable
+    /// skip line when it is not configured.
+    ///
+    /// A bare early-return with no message here is exactly the defect this
+    /// suite exists to avoid: a skipped run and a real run both report `ok`,
+    /// so without this line the test count cannot tell them apart (see this
+    /// module's own doc comment). `#[track_caller]` would name the exact test
+    /// call site rather than this function's own call to it, but is a no-op
+    /// on an `async fn` caller on stable Rust (rust-lang/rust#110011) — both
+    /// of this helper's callers below are async, so the location this prints
+    /// is this function's own, not the individual test's; every skip is
+    /// still visible, just not disambiguated between two skip sites in the
+    /// same test (e.g. `queues_are_isolated_from_each_other`, which opens two
+    /// brokers).
+    fn test_mysql_url() -> Option<String> {
+        match std::env::var(TEST_URL_ENV) {
+            Ok(url) if !url.trim().is_empty() => Some(url),
+            _ => {
+                let location = std::panic::Location::caller();
+                eprintln!("SKIPPED: {location} (set {TEST_URL_ENV} to run)");
+                None
+            }
+        }
+    }
+
     /// Build a broker on an isolated logical queue, or `None` when no test
     /// server is configured.
     async fn broker_on_fresh_queue() -> Option<(MysqlBroker, String)> {
-        let url = std::env::var(TEST_URL_ENV).ok()?;
+        let url = test_mysql_url()?;
         let queue = format!("test_{}", Uuid::new_v4().simple());
         let broker = MysqlBroker::with_queue(&url, &queue)
             .await
@@ -305,7 +353,7 @@ mod integration {
     }
 
     async fn broker_on_queue(queue: &str) -> Option<MysqlBroker> {
-        let url = std::env::var(TEST_URL_ENV).ok()?;
+        let url = test_mysql_url()?;
         Some(
             MysqlBroker::with_queue(&url, queue)
                 .await
@@ -839,6 +887,136 @@ mod integration {
             broker.queue_size().await.expect("queue_size"),
             1,
             "the second call must not have inserted a duplicate row"
+        );
+    }
+
+    // ========== Revocation (idx 1: durable revoked-task set, polled) ==========
+
+    #[tokio::test]
+    async fn revoke_removes_a_pending_task_and_is_revoked_reflects_it() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        let task = SerializedTask::new("revoke_pending".to_string(), vec![]);
+        let task_id = broker.enqueue(task).await.expect("enqueue");
+
+        assert!(
+            !broker.is_revoked(&task_id).await.expect("is_revoked"),
+            "a freshly enqueued task must not already be revoked"
+        );
+
+        let recorded = broker.revoke(&task_id, false).await.expect("revoke");
+        assert!(recorded, "revoke() must report the revocation as recorded");
+
+        assert!(
+            broker.is_revoked(&task_id).await.expect("is_revoked"),
+            "revoke() must be durably visible through is_revoked()"
+        );
+
+        assert!(
+            broker.dequeue().await.expect("dequeue").is_none(),
+            "a revoked pending task must not be claimable"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_is_observed_by_the_poller_within_one_interval() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+        // A one-second poll interval keeps the test's wait bounded without
+        // being so short it turns into a busy loop against the server.
+        let broker = broker.with_revocation_poll_interval(1);
+
+        let mut stream = broker
+            .subscribe_revocations()
+            .await
+            .expect("subscribe_revocations")
+            .expect("MysqlBroker must publish a revocation stream");
+
+        let task = SerializedTask::new("revoke_notice".to_string(), vec![]);
+        let task_id = broker.enqueue(task).await.expect("enqueue");
+
+        broker
+            .revoke(&task_id, true)
+            .await
+            .expect("revoke with terminate=true");
+
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv())
+            .await
+            .expect("a notice must arrive within a few poll intervals")
+            .expect("recv must not error")
+            .expect("recv must not report the stream as ended");
+
+        assert_eq!(notice.task_id, task_id);
+        assert!(
+            notice.terminate,
+            "terminate=true must survive the round trip through TINYINT(1)"
+        );
+    }
+
+    /// Regression test for a real bug caught in review: an earlier draft of
+    /// `POLL_REVOCATIONS` used a `revoked_at >= ?` cursor, which — once the
+    /// watermark reached a row's own timestamp — matched that same row on
+    /// every subsequent poll forever (the watermark can only advance past a
+    /// *different*, newer row), redelivering the same notice indefinitely
+    /// whenever nothing newer ever arrives. This is the common case, not a
+    /// rare one: it fires for every revocation that happens to be the most
+    /// recent one so far, which is most revocations most of the time.
+    #[tokio::test]
+    async fn a_single_revocation_is_delivered_exactly_once_not_forever() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+        let broker = broker.with_revocation_poll_interval(1);
+
+        let mut stream = broker
+            .subscribe_revocations()
+            .await
+            .expect("subscribe_revocations")
+            .expect("MysqlBroker must publish a revocation stream");
+
+        let task = SerializedTask::new("revoke_once".to_string(), vec![]);
+        let task_id = broker.enqueue(task).await.expect("enqueue");
+        broker.revoke(&task_id, false).await.expect("revoke");
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv())
+            .await
+            .expect("a notice must arrive within a few poll intervals")
+            .expect("recv must not error")
+            .expect("recv must not report the stream as ended");
+        assert_eq!(first.task_id, task_id);
+
+        // No second revocation is ever issued. Across several more poll
+        // intervals, `recv()` must not produce another notice for the same
+        // (never re-revoked) task — that would be the infinite-redelivery
+        // bug the `>` cursor exists to prevent.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv()).await;
+        assert!(
+            second.is_err(),
+            "a single revocation must be delivered exactly once, not redelivered every poll \
+             (got a second notice: {second:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_lapses_once_its_ttl_elapses() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+        let broker = broker.with_revocation_ttl(1);
+
+        let task = SerializedTask::new("revoke_ttl".to_string(), vec![]);
+        let task_id = broker.enqueue(task).await.expect("enqueue");
+        broker.revoke(&task_id, false).await.expect("revoke");
+        assert!(broker.is_revoked(&task_id).await.expect("is_revoked"));
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        assert!(
+            !broker.is_revoked(&task_id).await.expect("is_revoked"),
+            "a revocation older than its TTL must lapse"
         );
     }
 }

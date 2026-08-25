@@ -102,6 +102,11 @@ fn build_task(request: &Value) -> BridgeResult<Value> {
     if let Some(id) = request.get("id").and_then(Value::as_str) {
         builder = builder.id(id.parse::<Uuid>()?);
     }
+    // Naming the queue is what makes `properties.delivery_info.routing_key`
+    // truthful, and a worker routes a task's own retries with it.
+    if let Some(queue) = request.get("queue").and_then(Value::as_str) {
+        builder = builder.queue(queue);
+    }
     if let Some(kwargs) = request.get("kwargs").and_then(Value::as_object) {
         let map: HashMap<String, Value> = kwargs
             .iter()
@@ -186,6 +191,9 @@ fn decode_task(envelope: &Value) -> BridgeResult<Value> {
         "delivery_mode": message.properties.delivery_mode,
         "priority": message.properties.priority,
         "correlation_id": message.properties.correlation_id,
+        "delivery_tag": message.properties.delivery_tag,
+        "exchange": message.properties.delivery_info.exchange,
+        "routing_key": message.properties.routing_key(),
         "has_workflow": body.embed.has_workflow(),
         "chain": body.embed.chain.iter().map(|c| c.task.clone()).collect::<Vec<_>>(),
         // The links themselves, not just their names: continuing a chain needs
@@ -246,6 +254,12 @@ fn execute(envelope: &Value) -> BridgeResult<Value> {
 }
 
 /// Read a Celery result record back into the typed model.
+///
+/// `exc_message` is reported as the list it is on the wire (Python's
+/// `exc.args`, splatted back into the exception constructor), with the joined
+/// human-readable rendering alongside it as `exc_message_text`. `children`
+/// reports the parsed result trees, since a retried or chained task's record
+/// carries whole `AsyncResult.as_tuple()` nodes rather than bare ids.
 fn decode_result(meta: &Value) -> BridgeResult<Value> {
     let result = ResultMessage::from_json(serde_json::to_string(meta)?.as_bytes())?;
     Ok(json!({
@@ -257,8 +271,31 @@ fn decode_result(meta: &Value) -> BridgeResult<Value> {
         "traceback": result.traceback,
         "exc_type": result.exception.as_ref().map(|e| e.exc_type.clone()),
         "exc_message": result.exception.as_ref().map(|e| e.exc_message.clone()),
+        "exc_message_text": result.exception.as_ref().map(ExceptionInfo::message),
         "exc_module": result.exception.as_ref().and_then(|e| e.exc_module.clone()),
+        "children": result.children.iter().map(child_detail).collect::<Vec<_>>(),
+        // What CeleRS would write back out, so a caller can compare it with
+        // what Celery put in.
+        "children_wire": serde_json::to_value(&result.children)?,
     }))
+}
+
+/// Flatten one parsed result child into the parts a test asserts on.
+fn child_detail(child: &celers_protocol::result::ResultChild) -> Value {
+    json!({
+        "task_id": child.task_id.to_string(),
+        "parent": child.parent.as_ref().map(|parent| child_detail(parent)),
+        "is_group": child.is_group(),
+        "children": child
+            .children
+            .as_ref()
+            .map(|members| members.iter().map(child_detail).collect::<Vec<_>>()),
+        "descendant_ids": child
+            .descendant_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    })
 }
 
 // =============================================================================

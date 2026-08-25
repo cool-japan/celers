@@ -485,7 +485,7 @@ impl ReplayScheduler {
     /// is a Redis sorted set and replay must `ZADD` into it rather than
     /// `LPUSH`.
     pub async fn with_mode(redis_url: &str, queue_name: &str, mode: QueueMode) -> Result<Self> {
-        let client = Client::open(redis_url)
+        let client = crate::connection::open_client(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
         Ok(Self {

@@ -2,7 +2,32 @@
 
 Production-ready AWS SQS broker implementation for CeleRS with batch operations, FIFO queues, CloudWatch integration, and comprehensive cost optimization.
 
-**Version: 0.3.1 | Status: [Stable] | Tests: 294 | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-08-26**
+
+> **Two traits are in play, and `SqsBroker` implements the lower one.** `SqsBroker` is a
+> `celers_kombu` `Producer` / `Consumer` / `Transport` / `Broker` — the message-transport
+> abstraction. `celers_worker::Worker` consumes the *task-queue* abstraction `celers_core::Broker`
+> (`enqueue` / `dequeue` / `ack` / `reject` / `defer` / `cancel`).
+>
+> **`SqsBroker::into_core_broker(queue)` bridges them**, yielding an `SqsCoreBroker` that a worker
+> can run against. Behind the `core-broker` feature, which is **on by default**. The adapter uses
+> SQS's native operations wherever the task-queue model has a matching one — `ReceiveMessage`
+> (`MaxNumberOfMessages` up to 10) for batch dequeue, `SendMessageBatch` / `DeleteMessageBatch` for
+> the other batch paths, `ChangeMessageVisibility` for `defer`, `DelaySeconds` for `enqueue_after` —
+> so batch dequeue is one billed request per batch rather than one per message. See
+> [`src/core_broker.rs`](src/core_broker.rs) for the full mapping and its limits.
+>
+> This makes SQS *worker-usable*, not *Celery-interoperable*: the body is a JSON-serialized
+> `celers_protocol::Message`, not a Celery v2 task message. Everything below describes the
+> transport, which is complete and tested.
+
+> **Minimum Supported Rust Version: 1.94.1** — higher than the rest of the
+> CeleRS workspace, which builds on **1.89**. The `aws-config`, `aws-sdk-sqs`
+> and `aws-sdk-cloudwatch` dependencies are not optional here and the whole
+> `aws-*` / `aws-smithy-*` chain requires 1.94.1, so there is no feature
+> combination of this crate that builds on an older toolchain. The same floor
+> therefore applies to `celers` with the `sqs` (or `full`) feature, and to any
+> `--all-features` build of the workspace.
 
 ## Overview
 
@@ -446,7 +471,7 @@ The broker uses AWS SDK's credential chain:
 
 **Recommendation**: Use IAM roles in production for enhanced security.
 
-**Dependency note**: This crate depends on the AWS SDK (`aws-config`/`aws-sdk-sqs`/`aws-sdk-cloudwatch`), which still pulls in `ring`/`aws-lc-sys`. This is an accepted, tracked, upstream-blocked limitation (no drop-in Pure-Rust AWS SDK exists yet in the COOLJAPAN ecosystem) rather than a functional defect.
+**Dependency note**: This crate depends on the AWS SDK (`aws-config`/`aws-sdk-sqs`/`aws-sdk-cloudwatch`), but **not** on its TLS stack — see [Pure Rust](#pure-rust) below. HTTPS is provided by `celers_broker_sqs::pure_http`, an `oxihttp-client`-backed transport, so `aws-lc-sys` and `ring` are absent from the graph.
 
 ## Production Features
 
@@ -814,22 +839,22 @@ See the `examples/` directory for comprehensive examples:
 Run examples:
 ```bash
 # Core features
-cargo run --example sqs_basic_usage
-cargo run --example sqs_advanced_features
-cargo run --example sqs_cost_optimization
-cargo run --example monitoring_alarms
+cargo run -p celers-broker-sqs --example sqs_basic_usage
+cargo run -p celers-broker-sqs --example sqs_advanced_features
+cargo run -p celers-broker-sqs --example sqs_cost_optimization
+cargo run -p celers-broker-sqs --example monitoring_alarms
 
 # Production features
-cargo run --example sqs_monitoring_utilities
-cargo run --example sqs_advanced_utilities
-cargo run --example production_optimization
-cargo run --example production_suite
-cargo run --example quota_management
-cargo run --example routing_patterns
-cargo run --example sqs_distributed_tracing
-cargo run --example advanced_production_features  # NEW
-cargo run --example lambda_sqs_handler  # NEW
-cargo run --example replay_and_sla  # NEW
+cargo run -p celers-broker-sqs --example sqs_monitoring_utilities
+cargo run -p celers-broker-sqs --example sqs_advanced_utilities
+cargo run -p celers-broker-sqs --example production_optimization
+cargo run -p celers-broker-sqs --example production_suite
+cargo run -p celers-broker-sqs --example quota_management
+cargo run -p celers-broker-sqs --example routing_patterns
+cargo run -p celers-broker-sqs --example sqs_distributed_tracing
+cargo run -p celers-broker-sqs --example advanced_production_features  # NEW
+cargo run -p celers-broker-sqs --example lambda_sqs_handler  # NEW
+cargo run -p celers-broker-sqs --example replay_and_sla  # NEW
 ```
 
 ## Benchmarks
@@ -891,25 +916,50 @@ including messages taken from a DLQ.
   lowest-priority queue uses the full long poll, so a priority scan costs one
   long poll rather than one per level.
 
-## Pure Rust policy exception
+## Pure Rust
 
-⚠️ **This crate is not Pure Rust.** `aws-smithy-runtime`'s
-`default-https-client` feature unconditionally selects
-`aws-smithy-http-client/rustls-aws-lc`, which pulls in `aws-lc-rs` ->
-`aws-lc-sys` (vendored C/C++/assembly, built with `cmake` + `cc`).
-`aws-smithy-http-client` offers no pure-Rust TLS provider: every option it has
+This crate is Pure Rust. It was the workspace's last policy exception, and the
+exception is gone.
+
+**The problem.** `aws-smithy-runtime`'s `default-https-client` feature
+unconditionally selects `aws-smithy-http-client/rustls-aws-lc`, which pulls in
+`aws-lc-rs` -> `aws-lc-sys` (vendored C/C++/assembly, built with `cmake` + `cc`).
+`aws-smithy-http-client` offers no Pure-Rust TLS provider: every option it has
 (`rustls-aws-lc`, `rustls-aws-lc-fips`, `rustls-ring`, `legacy-rustls-ring`,
 `s2n-tls`) is C or assembly.
 
-Blast radius is contained to this crate and `celers-broker-amqp`: no other
-workspace member pulls `aws-lc-sys`, and the `celers` facade only becomes
-impure through its `sqs` / `amqp` / `full` features (or `--all-features`).
+**The fix.** `aws-config`, `aws-sdk-sqs` and `aws-sdk-cloudwatch` are declared
+without `default-https-client`, which removes `aws-smithy-http-client` from the
+graph entirely — and with it `aws-lc-rs`, `aws-lc-sys`, and the ~12-second
+`rustls_native_certs::load_native_certs()` walk it performed at client
+construction time on macOS. The transport is replaced by
+[`celers_broker_sqs::pure_http`](src/pure_http.rs): an
+`aws_smithy_runtime_api::client::http::HttpClient` / `HttpConnector` implemented
+over `oxihttp-client` (hyper 1.x + `tokio-rustls` + OxiTLS' `rustls-rustcrypto`
+provider, Mozilla `webpki-roots` trust store), installed with
+`aws_config::defaults(..).http_client(..)` at every client construction.
 
-Removing the exception requires implementing an
-`aws_smithy_runtime_api::client::http::HttpClient` backed by `oxihttp-client`
-and installing it with `aws_config::defaults(..).http_client(..)` while building
-the SDK with `default-features = false`. That needs `aws-smithy-runtime-api` and
-`aws-smithy-types` as workspace dependencies; see the workspace TODO.
+It honours `HttpConnectorSettings` the way the stock connector does — connect
+timeout on the TCP connect, read timeout on the wait for response headers — and
+caches one connector (one hyper connection pool) per distinct settings pair, so
+connections are reused rather than re-handshaked per request. Transport faults
+are classified as `ConnectorError::io` / `timeout` so the SDK's retry policy
+still treats them as transient.
+
+Verify:
+
+```bash
+cargo tree -e features -i aws-lc-sys --all-features   # "did not match any packages"
+cargo deny check bans                                  # deny.toml's [graph] exclude is empty
+```
+
+**Opting out.** The transport is behind the default-on `pure-http` feature.
+Build with `default-features = false` if you need the stock SDK client (FIPS, a
+corporate proxy, the OS trust store); your application then owns HTTP client
+selection and must enable `aws-config/default-https-client` in its own manifest,
+or pass an `HttpClient` to the SDK itself. There is deliberately no in-workspace
+feature for that fallback: `deny.toml` checks with `[graph] all-features = true`,
+so any such feature would drag `aws-lc-sys` back into the checked graph.
 
 ## Testing
 

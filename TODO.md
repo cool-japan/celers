@@ -10,12 +10,53 @@
 - **Phase 4**: Performance & Scalability ✅ **COMPLETE**
 - **Phase 5**: Beat Scheduler ✅ **COMPLETE**
 - **Phase 6**: Extended Brokers & Backends ✅ **COMPLETE**
+- **Phase 7**: Full Celery Protocol Compatibility 🚧 **IN PROGRESS** — the *protocol layer* is
+  interop-verified against Celery 5.6.3; the broker and result backend are not on the Celery wire
+  yet, so a Python worker and a CeleRS worker still cannot share a queue. See
+  [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md) and
+  [Known gaps](#known-gaps--the-roadmap-after-031)
 - **Phase 8**: v0.2.0 Enhancements ✅ **COMPLETE**
 - **Phase 9**: v0.2.0 Production Features ✅ **COMPLETE**
 
-**🎉 100% PROJECT COMPLETION - ALL 18/18 CRATES IMPLEMENTED! 🎉**
+All 18 publishable crates are implemented and shipping. That is a statement about breadth, not
+about completeness against Python Celery — Phase 7 above is the honest measure of that, and
+[Known gaps](#known-gaps--the-roadmap-after-031) is the list of what is still missing.
 
-### v0.3.0 Hardening (in progress — 2026-06-13)
+### v0.3.1 Hardening campaign ✅ COMPLETE (2026-08-26)
+
+A workspace-wide correctness, security and honesty campaign on branch `0.3.1`: 475 files changed
+against 0.3.0. Verified green at the close of the campaign —
+`cargo build --workspace --all-features`, `cargo clippy --workspace --all-targets --all-features --
+-D warnings`, `cargo fmt --check`, `cargo deny check bans`, and
+**7,529/7,529 tests passing** (`cargo nextest run --workspace --all-features`, 109 `#[ignore]`d)
+plus **1,165 passing doctests** (`cargo test --doc --workspace --all-features`, 136 `ignore`d).
+
+What landed (full detail in [CHANGELOG.md](CHANGELOG.md)'s 0.3.1 section):
+
+- **Remote worker control**: `celers_core::control` / `control_transport`, `celers_worker::control`,
+  `celers_broker_redis::RedisControlTransport`, and the `celers inspect` (11) / `celers control`
+  (10) CLI commands in front of them. CeleRS-native — no kombu pidbox codec yet.
+- **Broker-fed revocation**: `Broker::revoke` / `is_revoked` / `subscribe_revocations`, durable
+  revoked-id storage in Redis / PostgreSQL / MySQL, and dequeue-time refusal via
+  `Worker::with_broker_revocation`.
+- **Celery-compatible event wire**: the `celeryev` channels now carry the shape a Celery monitor
+  parses, with the Lamport clock; **breaking for 0.3.0 consumers**.
+- **Task security wired into the worker**: signature verification before dispatch, worker-side
+  re-signing of retries and workflow continuations, redacted `inspect active` previews — all
+  off by default.
+- **Soft/hard time limits**, settable at runtime over the control channel.
+- **Workflows that run**: chord aggregation, saga compensation, conditional Branch/Switch, and the
+  Pipeline/FanIn/FanOut/ScatterGather lowerings, all covered end to end by `workflow_semantics` and
+  `patterns_e2e`.
+- **Pure Rust, no exceptions**: `deny.toml`'s `[graph] exclude` is empty. The last holdout,
+  `celers-broker-sqs`, now goes through `pure_http`, an AWS SDK `HttpClient` over `oxihttp-client`.
+- **Celery interop proved, not asserted**: `tests/python-compat/` runs a real Celery client and a
+  real `celery` worker against a real Redis, and `crates/celers-protocol/tests/fixtures/` holds
+  verbatim Celery 5.6.3 captures.
+- **MSRV declared**: 1.89 workspace-wide, 1.94.1 for `celers-broker-sqs` (and therefore `celers/sqs`,
+  `celers/full`, `--all-features`).
+
+### v0.3.0 Hardening (2026-06-13)
 
 Ongoing stub-elimination / correctness round (branch `0.3.0`). Latest sweep:
 
@@ -178,17 +219,128 @@ clean: `cargo build --workspace --all-features` and
 
 ## Quick Stats
 
-- **Crates**: 18/18 (100% COMPLETE) - core, worker, protocol, kombu, canvas, beat, macros, CLI, metrics, 5 brokers, 3 backends
-- **Brokers**: Redis, PostgreSQL, MySQL, RabbitMQ (AMQP), AWS SQS
+- **Crates**: 18 published + 2 unpublished workspace members (`celers-examples`, `celers-facade-test`)
+- **Brokers a `celers_worker::Worker` can consume from** (`celers_core::Broker`): Redis, PostgreSQL,
+  MySQL, plus the in-process `InMemoryBroker`
+- **Brokers available as `celers-kombu` transports only** (publish/consume over
+  `celers_protocol::Message`; **no `celers_core::Broker` adapter yet**): RabbitMQ (AMQP), AWS SQS
 - **Backends**: Redis, PostgreSQL/MySQL (Database), gRPC - ALL with ResultStore adapters
 - **Examples**: 15 working examples (including Canvas workflows, web scraper, image processing, AsyncResult API)
 - **Benchmarks**: 3 comprehensive benchmark suites
-- **Unit Tests**: 5676 tests passing with `--all-features` / 5495 with default features, 0 failures
-  (v0.3.0 hardening + feature expansion + release-prep pass, verified 2026-07-13)
-- **Build Status**: ✅ 0 errors, 0 warnings, 0 clippy warnings, 0 doc warnings
+- **Tests**: 7,529 passing with `--all-features` (0 failures, 109 `#[ignore]`d), plus 1,165 passing
+  doctests (136 `ignore`d) — verified 2026-08-26 at the close of the 0.3.1 campaign. Note that the
+  env-gated live-service suites inside that count print a skip line and pass without asserting when
+  their `CELERS_TEST_*` variable is unset; see
+  [tests/integration/README.md](tests/integration/README.md)
+- **Build Status**: ✅ 0 errors, 0 warnings, 0 clippy warnings, 0 doc warnings, `cargo deny check bans` clean
 - **Documentation**: 1500+ lines of guides + 18 TODO.md files
 - **Monitoring**: Full Prometheus + Grafana + OpenTelemetry support
 - **Features**: Task queues, priorities, DLQ, cancellation, retries, timeouts, health checks, Canvas workflows (chunks, xmap, xstarmap, group.skew, group.jitter, conditional: Branch/Maybe/Switch), batch operations, memory optimization, chord synchronization, AsyncResult API with ALL backend ResultStore adapters, Protocol v2 compatibility tests, Real-time events (task & worker lifecycle), Event emission from worker, Worker control commands (inspect, ping, shutdown, revoke), Per-task rate limiting (token bucket, sliding window), Task routing by name patterns (glob, regex), Time limits (soft/hard), Enhanced task revocation (bulk, pattern, persistent), Queue control commands
+
+## Known gaps — the roadmap after 0.3.1
+
+Everything below was *verified against the code at the close of the 0.3.1 campaign*, not inherited
+from an older list. Each entry names where the evidence lives. This is the honest roadmap; the
+per-phase checklists further down are history.
+
+### Blocking full Celery interoperability
+
+1. **The broker and result backend are not on the Celery wire.** `celers-broker-redis` (and the
+   PostgreSQL / MySQL brokers) enqueue a `SerializedTask` JSON document, not a Celery envelope, and
+   both Redis result backends store a CeleRS-shaped record (`{task_id, task_name, result,
+   created_at, …}`) under Celery's `celery-task-meta-<uuid>` key rather than Celery's
+   `{status, result, traceback, children, date_done, task_id}`. **A Python Celery worker and a
+   CeleRS worker cannot share a queue.** Closing this means routing both through `celers-protocol`;
+   `tests/python-compat/` is built to prove it when it lands.
+   *Evidence:* [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md) → "What is not
+   interoperable".
+2. **No kombu pidbox codec.** `celers inspect` / `celers control` are shaped like a pidbox
+   (broadcast channel + per-request reply channel) but speak a CeleRS-native encoding, so
+   `celery -A app inspect` cannot reach a CeleRS worker and vice versa. A pidbox codec plus a golden
+   fixture for the control-command wire is the missing piece.
+   *Evidence:* `crates/celers-core/src/control_transport.rs`.
+3. ~~**`MessageBuilder` envelopes are not deliverable as-is.**~~ **FIXED.** `MessageProperties` now
+   serializes `delivery_tag` (fresh per message, as kombu's producer mints it) and `delivery_info`
+   (`{exchange, routing_key}`, the routing key naming the queue `.queue(...)` / `.routing_key(...)`
+   chose), so the ordinary producer path no longer kills a Celery worker's consumer loop with the
+   `KeyError` that `kombu.transport.virtual.base.Message.__init__` raises on either missing key.
+   `build()` also stamps `argsrepr` / `kwargsrepr`, which a monitor displays.
+   *Evidence:* `tests/python-compat/test_celers_to_python.py::test_message_builder_envelope_is_deliverable_as_is`
+   publishes the builder's envelope **unpatched** and a real worker executes it; the requirement
+   itself stays pinned by `::test_kombu_requires_delivery_tag_and_delivery_info`.
+4. ~~**`ResultMessage::children` is `Vec<Uuid>`.**~~ **FIXED.** `children` is a tree of
+   `ResultChild` nodes modelling `AsyncResult.as_tuple()` (`[[id, parent], group_results]`), so a
+   retried, chained or grouped task's record parses and is written back in Celery's own shape; the
+   legacy id-list form, Celery's short `[id, nodes]` form and a `children: null` record (what
+   `Backend.current_task_children` writes outside a task context) are all accepted.
+   *Evidence:* `tests/python-compat/test_celers_to_python.py::test_celers_parses_a_celery_record_that_has_children`,
+   whose children come from Celery's own `as_tuple()` and go back through `result_from_tuple`.
+5. **The Celery-shaped event stream has not been pointed at a real monitor.** CeleRS emits the
+   Celery event shape as of 0.3.1 and pins the bytes with a golden test, but no test has yet run
+   `celery events` or Flower against a CeleRS worker. Doing so is the cheapest remaining interop
+   win.
+
+### Known defects
+
+6. ~~**Solar schedules never fire.**~~ **FIXED.** The `Schedule::Solar` branch of
+   `crates/celers-beat/src/schedule.rs` now resolves events through `sunrise`'s
+   `SolarDay::event_time`, which returns an absolute `DateTime<Utc>` and needs no unit conversion;
+   the old code divided that crate's Unix-*seconds* return as minutes-since-midnight and errored on
+   the first iteration. `test_solar_schedule_{sunrise,sunset}` are un-`#[ignore]`d and now assert
+   real almanac instants, joined by tests for negative longitudes, twilight ordering, polar day and
+   out-of-range coordinates. Remaining nit: `golden_hour_begin`/`_end` are still offsets from
+   sunrise/sunset rather than a true `SolarEvent::Elevation` solve.
+7. **`AmqpEventEmitter` publishes every event with one configured routing key** (default empty, so
+   fanout). Celery uses a topic exchange keyed by event type (`task.started`, `worker.heartbeat`,
+   …), so a Celery-style monitor cannot subscribe selectively.
+   *Evidence:* `crates/celers-broker-amqp/src/event_transport.rs`.
+
+### Missing adapters and features
+
+8. **No `celers_core::Broker` adapter over the `celers-kombu` transports.** `AmqpBroker` and
+   `SqsBroker` implement `celers_kombu`'s `Producer`/`Consumer`/`Transport`/`Broker` — a
+   message-transport abstraction — not the task-queue abstraction a `celers_worker::Worker` consumes
+   from. Until an adapter exists, **a worker cannot run against RabbitMQ or SQS**, and neither can
+   carry revocation (there is no `revoke`/`is_revoked`/`subscribe_revocations` override point to
+   implement on them). An AMQP-native revocation channel is straightforward once the adapter exists:
+   a fanout exchange plus a durable table, mirroring `celers-broker-postgres`.
+   *Evidence:* the "Revocation does not apply to this crate" section in
+   `crates/celers-broker-amqp/src/lib.rs`.
+9. **`celers worker` builds an empty `TaskRegistry`.** This is inherent — CeleRS tasks are Rust
+   types registered at build time — and 0.3.1 makes it loud (an explicit warning plus
+   `--demo-tasks`), but the only way to run application tasks remains linking `celers-worker` into
+   your own binary. A configuration-driven registry would need a plugin ABI CeleRS does not have.
+10. **`ReplayGuard` is per-process by construction.** A deployment needing global single-use-nonce
+    semantics must back it with shared storage (the module documents how). Relatedly,
+    `SignatureVerification::with_freshness` and `with_replay_guard` are at odds with at-least-once
+    redelivery: several paths hand the same signed bytes to a worker more than once by design.
+11. **`PayloadHygiene::redact_payload` has no result-backend caller.** The worker uses it for the
+    `inspect active` argument preview, but no result-backend surface currently persists task
+    args/kwargs, so there is nothing to redact there. The call becomes necessary the moment one
+    does.
+12. **`celers-cli` `[dev-dependencies]` still lacks `async-trait`**, so `tests/control_redis.rs`
+    implements `celers_core::Task` in the desugared `Pin<Box<dyn Future>>` form. `async-trait` is
+    already in `[workspace.dependencies]`; adding it lets that impl collapse back to
+    `async fn execute`.
+
+### Test and tooling debt
+
+13. **Env-gated suites still pass without asserting.** ~63 tests early-return when their
+    `CELERS_TEST_*` variable is unset, and 109 more are `#[ignore]`d. `docker-compose.yml` now has a
+    service for every one of them (`--profile test` for MySQL and LocalStack, `--profile
+    python-compat` for Celery) and [tests/integration/README.md](tests/integration/README.md) maps
+    variable → service → invocation, but nothing in the repository *runs* the full matrix:
+    `.github/` holds only `dependabot.yml`, `FUNDING.yml` and a `workflows.disabled/` directory. A
+    `scripts/test-integration.sh` that brings the stack up, exports all eight variables and runs
+    `--run-ignored all` is the missing piece.
+14. **Three files remain at or over the 2000-line policy limit** (down from seven):
+    `celers-backend-db/src/lib.rs` (2334), `celers-worker/src/worker_core/tests.rs` (2308),
+    `celers-worker/src/sandbox.rs` (2049). `splitrs` is the project's tool for this.
+15. **The seccomp filter is type-checked but never executed here.** `sandbox.rs`'s `seccomp_impl` is
+    gated on `all(target_os = "linux", feature = "seccomp")`; its BPF jump encoding has a unit test,
+    but no test in this repository installs the filter under a Linux kernel.
+
+---
 
 ---
 
@@ -294,17 +446,30 @@ Simple tasks can be enqueued to Redis, and Rust workers can pick them up and exe
 ## Documentation 🚧 IN PROGRESS
 
 ### Core Documentation
-- [ ] Write comprehensive API documentation (in progress via rustdoc)
-- [x] Create user guide with examples (10+ working examples)
-- [x] Write deployment guide (Docker, Kubernetes) ✅ (DEPLOYMENT.md created)
-- [x] Create performance tuning guide (PERFORMANCE.md created)
-- [ ] Add architecture decision records (ADRs) (future)
+- [x] API documentation via rustdoc — 1,165 passing doctests, `RUSTDOCFLAGS="-D warnings" cargo doc`
+      clean
+- [x] User guide with examples (15 working examples in `crates/celers-examples/examples/`)
+- [x] Deployment guide ([docs/DEPLOYMENT.md](docs/DEPLOYMENT.md))
+- [x] Architecture decision records — five, in [docs/adr/](docs/adr/)
+- [x] Celery compatibility guide, rewritten in 0.3.1 with a per-row evidence column
+      ([docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md))
+- [x] Integration-test guide: gate variable → service → invocation
+      ([tests/integration/README.md](tests/integration/README.md))
+- [x] Python interop guide ([tests/python-compat/README.md](tests/python-compat/README.md))
+- [ ] `CONTRIBUTING.md` — **README links to it and it does not exist**; either write it or drop the
+      link
+- [ ] 136 doctests are still ```ignore``d and therefore never compile
 
 ### Specialized Guides
-- [x] Grafana dashboard documentation (GRAFANA.md)
-- [x] OpenTelemetry integration guide (OPENTELEMETRY.md)
-- [x] CLI usage documentation (celers-cli/README.md)
-- [x] Performance optimization guide (PERFORMANCE.md)
+- [x] CLI usage documentation (`crates/celers-cli/README.md`)
+- [x] Per-crate READMEs for all 18 published crates
+- [x] Grafana dashboard + Prometheus scrape config, as **files that exist** and that
+      `docker-compose.yml` mounts (`docs/grafana/`, `docs/prometheus.yml`) — the previously claimed
+      `GRAFANA.md` and `OPENTELEMETRY.md` never existed and the entries are removed rather than
+      re-promised
+- [x] Result-backend performance notes (`crates/celers-backend-redis/PERFORMANCE.md`)
+- [ ] Workspace-level performance tuning guide (a `PERFORMANCE.md` at the repository root was
+      claimed before and never existed)
 - [ ] Migration guide from other task queues (future)
 
 ### Examples & Tutorials
@@ -320,21 +485,35 @@ Simple tasks can be enqueued to Redis, and Rust workers can pick them up and exe
 
 ## Testing
 
-- [ ] Add unit tests for all core types
-- [ ] Add integration tests with real Redis
-- [ ] Add integration tests with PostgreSQL
-- [ ] Add stress tests and benchmarks
-- [ ] Add chaos testing scenarios
-- [ ] Achieve >80% code coverage
+- [x] Unit tests for all core types — 7,529 passing with `--all-features`
+- [x] Integration tests against a real Redis (env-gated on `CELERS_TEST_REDIS_URL`)
+- [x] Integration tests against a real PostgreSQL / MySQL / RabbitMQ / LocalStack SQS (env-gated;
+      services in `docker-compose.yml`, one `--profile test` away)
+- [x] Live Python Celery interoperability suite (`tests/python-compat/`)
+- [x] Property-based round-trip tests (`celers-protocol`) and a `trybuild` compile-fail UI harness
+      (`celers-macros`)
+- [x] Benchmarks — 3 criterion suites in `celers-examples`, 1 in `celers-cli`
+- [ ] **Something in the repository that actually runs the gated matrix** — see Known gaps #13; the
+      suites exist and the services exist, but no script or workflow ties them together, so a green
+      local run proves nothing about them
+- [ ] Stress / chaos testing scenarios
+- [ ] Measure code coverage (no coverage run has ever been recorded here; the ">80%" target was
+      never backed by a number)
 
 ## Release Preparation
 
-- [x] Set up CI/CD pipeline (GitHub Actions) ✅
-- [x] Add automated testing on multiple Rust versions ✅
-- [x] Configure cargo-release for versioning (via GitHub Actions) ✅
-- [x] Prepare crates.io publication ✅ (All 18 crates have complete metadata)
-- [ ] Write migration guide from other task queues
-- [x] Create example applications (web scraper, image processing) ✅
+- [ ] **CI/CD pipeline** — `.github/` holds only `dependabot.yml`, `FUNDING.yml` and a
+      `workflows.disabled/` directory: **no workflow runs on push today**. The previous ✅ on this
+      line was wrong. Project policy allows only `pypi-publish.yml` / `npm-publish.yml` under
+      `.github/workflows`, so build/test automation has to live elsewhere (a `scripts/` entry point
+      run locally or by an external runner)
+- [ ] Automated testing on multiple Rust versions — the MSRV is now *declared* (1.89; 1.94.1 with
+      `sqs`), but nothing verifies a build at that floor
+- [x] crates.io metadata complete for all 18 published crates (`readme`, `keywords`, `categories`,
+      `rust-version`)
+- [x] `cargo deny check bans` green with an empty `[graph] exclude`
+- [x] Example applications (web scraper, image processing)
+- [ ] Migration guide from other task queues
 
 ## Subcrate TODO Files
 
@@ -392,39 +571,50 @@ Each crate has its own detailed TODO.md with implementation status and future en
 
 ## Phase 7: Full Celery Protocol Compatibility 🚧 IN PROGRESS
 
-**Goal**: Achieve 100% compatibility with Python Celery for seamless interoperability
+**Goal**: interoperate with Python Celery well enough that the two can share a queue.
+
+**Status after 0.3.1**: the *protocol layer* is done and interop-verified against Celery 5.6.3; the
+*broker and result backend* are not, so the queue is not shared yet. The row-by-row evidence table
+lives in [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md); what remains is items 1–5 of
+[Known gaps](#known-gaps--the-roadmap-after-031).
 
 ### Critical: Python Celery Interoperability
-- [x] **Full Protocol v2 Wire Compatibility** ✅
-  - [x] Verify Celery v2 message format (headers, properties, body)
-  - [x] Test serialization/deserialization with Python Celery messages
-  - [x] Handle all Celery v2 message types (task, result, event)
-  - [x] Support task arguments (args, kwargs, embed) formats
-  - [x] Support all content types (JSON) - msgpack, pickle, YAML pending
-  - [x] Handle task ETA/countdown correctly
-  - [x] Support task expires timestamps
-  - [ ] Test with Python Celery 4.x workers (integration tests pending)
-
-- [ ] **Full Protocol v5 Wire Compatibility**
-  - [x] Implement Celery v5 message format changes
-  - [ ] Test with Python Celery 5.x workers
-  - [x] Support protocol version negotiation
-  - [x] Handle backward compatibility with v2
-
-- [ ] **Bidirectional Task Exchange**
-  - [ ] Rust worker can execute tasks sent from Python Celery
-  - [ ] Python Celery worker can execute tasks sent from Rust
-  - [ ] Shared task registry between Python and Rust
-  - [ ] Result retrieval across languages
-  - [ ] Error handling compatibility
-
-- [ ] **Integration Testing Suite**
-  - [ ] Create Python Celery + CeleRS integration tests
-  - [ ] Test task submission Python → Rust
-  - [ ] Test task submission Rust → Python
-  - [ ] Test result retrieval across languages
-  - [ ] Test Canvas workflows (Chain, Chord, Group) interop
-  - [ ] Test Beat scheduler task submission
+- [x] **Protocol v2 wire compatibility** ✅ interop-verified
+  - [x] Celery v2 envelope (headers, properties, base64 body) parsed and produced
+  - [x] Checked against **verbatim Celery 5.6.3 captures** (`crates/celers-protocol/tests/fixtures/`,
+        `tests/celery_golden.rs`) — recorded from a real Celery, not generated by CeleRS
+  - [x] args / kwargs / embed, including tuple-vs-list `argsrepr`
+  - [x] ETA, countdown→eta resolution, expires (UTC RFC 3339)
+  - [x] `argsrepr` / `kwargsrepr` rendered as `celery.utils.saferepr` renders them
+  - [x] Celery 5.6-only headers (`shadow`, `stamps`, `replaced_task_nesting`, …) tolerated on parse
+  - [x] **Tested against a live Python Celery 5.6.3 worker** (`tests/python-compat/`)
+  - [ ] Tested against Celery 4.x (only 5.6.3 is pinned today)
+- [x] **Result records** ✅ interop-verified
+  - [x] Read a real worker's SUCCESS and FAILURE records (`exc_type`/`exc_module`/`exc_message`
+        + `traceback`)
+  - [x] Write a record a real `AsyncResult.get()` reads, including the pub/sub publish that wakes it
+  - [ ] `children` as Celery's nested result tuples (Known gaps #4)
+- [ ] **"Protocol v5"** — note that this is a **CeleRS-internal** version label, not a Celery wire
+      protocol: nothing in the interop suite or the recorded captures exercises it (both pin
+      `task_protocol = 2`). Version negotiation and the v2↔v5 migration are implemented and
+      Rust-tested; there is nothing on the Celery side to test them against.
+- [ ] **Bidirectional task exchange over a shared queue** (Known gaps #1)
+  - [x] Bidirectional exchange at the **protocol** layer, via `celery_bridge` + a real Celery worker
+  - [ ] `celers-broker-*` puts a Celery envelope on the queue instead of a `SerializedTask`
+  - [ ] `celers-backend-redis` stores Celery's `{status, result, traceback, children, date_done,
+        task_id}` record
+  - [ ] A CeleRS worker and a `celery` worker consuming the same queue
+  - [ ] `MessageBuilder` emits `delivery_tag` / `delivery_info` (Known gaps #3)
+- [x] **Integration testing suite** ✅ `tests/python-compat/`
+  - [x] Real Celery client + real `celery` worker + real Redis, no mocks
+  - [x] Python → CeleRS and CeleRS → Python, both directions
+  - [x] Result retrieval across languages, failures and retries included
+  - [x] Chain link and group headers at the protocol level
+  - [x] Reachable from cargo (`cargo test -p celers-protocol --test python_interop`) and skips
+        visibly without Redis / Python
+  - [ ] Canvas workflows executed across the two runtimes (needs the shared queue above)
+  - [ ] Beat scheduler task submission into a Celery worker
+  - [ ] `celery events` / Flower pointed at a CeleRS worker (Known gaps #5)
   - [ ] Performance comparison benchmarks
 
 ### Task Routing & Dispatching
@@ -501,6 +691,17 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [x] Worker lifecycle events (online, offline)
   - [x] Redis event transport (pub/sub) - RedisEventEmitter, RedisEventReceiver
   - [x] AMQP event transport (fanout)
+  - [x] task-soft-time-limit-exceeded event type (0.3.1, CeleRS extension)
+  - [x] **Celery-compatible wire shape** on `celeryev` channels (0.3.1) — `uuid`, `name`, float
+        `timestamp`, `hostname`, `pid`, `clock`, `utcoffset`; byte-stability pinned by
+        `celers_core::event::wire`'s `wire_json_is_byte_for_byte_stable`. **Breaking for 0.3.0
+        consumers**
+  - [x] Celery Lamport clock (`forward_event_clock` / `adjust_event_clock`) (0.3.1)
+  - [x] Parses events published by a real Python Celery worker, filling its two sparser fields with
+        documented defaults (0.3.1)
+  - [ ] Verified against a real monitor (`celery events`, Flower) — Known gaps #5
+  - [ ] AMQP emitter uses a topic exchange keyed by event type instead of one routing key
+        (Known gaps #7)
 
 - [x] **Event Consumers**
   - [x] Event receiver/dispatcher
@@ -511,7 +712,24 @@ Each crate has its own detailed TODO.md with implementation status and future en
   - [x] Event-based alerting
 
 ### Remote Control & Inspection
-- [x] **Worker Control Commands** ✅ (Protocol defined in celers-core/src/control.rs)
+
+**0.3.1 closed the transport half of this.** The command vocabulary lived in
+`celers-core/src/control.rs` from earlier phases with nothing carrying it; there is now a wire
+(`celers_core::control_transport`), a Redis implementation
+(`celers_broker_redis::RedisControlTransport`), a worker-side handler (`celers_worker::control`)
+and the `celers inspect` / `celers control` CLI in front of it. Three caveats survive:
+
+- [ ] **No kombu pidbox codec** — the channel, framing and command names are CeleRS-native, so
+      `celery -A app inspect/control` cannot reach a CeleRS worker (Known gaps #2)
+- [x] `Inspect(Scheduled)` / `Inspect(Reserved)` answer empty **accurately**: a CeleRS worker keeps
+      no worker-local scheduled or reserved set (ETA tasks live in the broker's delayed queue; a
+      batch dequeue dispatches rather than parks)
+- [ ] `Queue(Purge/Delete/Bind/Unbind/Declare)` answer with an error naming the reason: the `Broker`
+      trait has no such operations, so a worker cannot perform them. Use `celers queue purge` and
+      the other broker-specific commands
+
+- [x] **Worker Control Commands** ✅ (vocabulary in celers-core/src/control.rs; dispatched by
+      celers-worker/src/control.rs since 0.3.1)
   - [x] `worker.control.inspect.active()` - List active tasks
   - [x] `worker.control.inspect.scheduled()` - List scheduled tasks
   - [x] `worker.control.inspect.reserved()` - List reserved tasks
@@ -639,17 +857,34 @@ Each crate has its own detailed TODO.md with implementation status and future en
 
 ### Security & Authentication
 - [ ] **Broker Security**
-  - [ ] TLS/SSL for Redis ✅ (supported by redis crate)
-  - [ ] TLS/SSL for PostgreSQL ✅ (supported by sqlx)
-  - [ ] TLS/SSL for RabbitMQ ✅ (supported by amqp crate)
+  - [x] TLS for Redis (`rediss://`) — 0.3.1: `tokio-rustls-comp` + `tls-rustls-webpki-roots` with
+        OxiTLS' Pure-Rust provider installed by each crate's `install_pure_tls_provider()`; custom
+        CA and client certs via `RedisConfig::tls(...)`
+  - [x] TLS for RabbitMQ — `lapin` pinned to `rustls-webpki-roots-certs` + the same Pure-Rust
+        provider; `celers-broker-amqp/tls-native-certs` adds the OS trust store
+  - [x] TLS for AWS SQS — 0.3.1: `celers_broker_sqs::pure_http`, an SDK `HttpClient` over
+        `oxihttp-client`
+  - [ ] TLS for PostgreSQL/MySQL — inherited from `oxisql-*`; not exercised by a test here
+  - [ ] TLS for the gRPC result backend — deliberately not built in (`tonic`'s `tls-ring` /
+        `tls-aws-lc` pull banned crypto); bring your own `Channel` via
+        `GrpcResultBackend::from_channel_with_config`
   - [ ] Authentication tokens
   - [ ] IP whitelisting
 
-- [ ] **Task Security**
-  - [x] Task signature verification
+- [x] **Task Security** ✅ (wired into the worker in 0.3.1; all of it off by default)
+  - [x] Task signature verification (HMAC-SHA256), enforced **before dispatch** — before revocation,
+        poison-pill or routing decisions — with DLQ recording, a `task-rejected` event and a
+        `WorkerStats::signature_rejected` counter
+  - [x] Worker re-signs the messages it produces (retries, workflow continuations)
+  - [x] Migration mode: admit unsigned, still reject forged
   - [x] Message encryption (at rest and in transit)
-  - [x] Task argument sanitization
-  - [ ] Secure pickle (prevent arbitrary code execution)
+  - [x] Task argument sanitization + payload redaction in `inspect active`
+  - [x] `celers-cli loadtest --signing-key`, falling back to `CELERS_TASK_SIGNING_KEY`, so a
+        verifying fleet does not dead-letter every synthetic task
+  - [ ] `ReplayGuard` backed by shared storage for global single-use-nonce semantics
+        (Known gaps #10)
+  - [x] Secure pickle — resolved by **not implementing pickle**: it is an arbitrary-code-execution
+        risk and is deliberately absent
 
 ### Developer Experience
 - [ ] **Migration Tools**

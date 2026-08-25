@@ -113,6 +113,33 @@ impl FreshnessWindow {
 ///
 /// Entries are pruned lazily: a nonce older than the freshness window can be
 /// dropped because such a message is rejected by the freshness check anyway.
+///
+/// # Backing it with shared storage
+///
+/// There is deliberately no pluggable nonce-store trait here yet, because the
+/// only correct implementation needs a dependency celers-core does not have.
+/// The design a backend crate should follow, so the two halves agree:
+///
+/// 1. Verify the MAC and the freshness window **first** — exactly as
+///    [`ReplayGuard::verify_at`] does — so a forged or stale message can never
+///    reach the shared store and burn a nonce the genuine message needs.
+/// 2. Claim the nonce atomically. In Redis that is one round trip:
+///    `SET celers:nonce:{nonce} 1 NX PX {retain_ms}` — `NX` makes the claim
+///    atomic across every worker, and a reply of `nil` (the key existed) is
+///    [`SignatureError::Replayed`]. In SQL it is an `INSERT` against a unique
+///    index on the nonce, with a unique-violation mapping to the same error.
+/// 3. Set `retain_ms` to `max_age + max_clock_skew` (see
+///    [`FreshnessWindow`]) and let the store expire entries itself. A nonce
+///    older than that window is already refused by step 1, so remembering it
+///    longer buys nothing and grows without bound.
+/// 4. Fail **closed**: if the shared store is unreachable, reject the message
+///    rather than falling back to a local check. Falling back silently returns
+///    the deployment to per-process semantics at exactly the moment an attacker
+///    would want it to.
+///
+/// Until that exists, a fleet configured with this guard gets "each worker
+/// process accepts a given replay at most once" — strictly better than no
+/// guard, and strictly weaker than single-use.
 #[derive(Debug)]
 pub struct ReplayGuard {
     window: FreshnessWindow,

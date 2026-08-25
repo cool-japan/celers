@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Command-line interface for CeleRS worker and queue management"
 readme = "README.md"
 keywords = ["celery", "cli", "worker", "queue", "management"]
@@ -62,6 +63,16 @@ async-trait = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which is what
+# lets `commands::worker_demo_tasks`'s `demo_sleep_task_caps_an_excessive_duration`
+# assert the 60s sleep cap without an actual 60-second wait. Dev-only: it does
+# not affect the published binary. Matches the same declaration (and rationale)
+# in celers-worker's and celers-core's own `[dev-dependencies]` -- without it,
+# `cargo test -p celers-cli`/`cargo nextest run -p celers-cli` run in isolation
+# (rather than as part of a `--workspace` build that unifies the feature in via
+# those other crates' dev-dependencies) fail with `tokio::time::advance` and
+# `start_paused` not found.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "serialization"

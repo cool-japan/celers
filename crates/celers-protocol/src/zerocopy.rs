@@ -87,6 +87,12 @@ fn default_lang_cow() -> Cow<'static, str> {
 /// [`MessageRef::body`] -- like [`crate::Message::body`] -- always
 /// base64-encodes its body. Without it, a kombu consumer hands the base64
 /// *text* to the content-type deserializer instead of decoding it first.
+///
+/// The same applies to `delivery_tag` and `delivery_info`, which
+/// `kombu.transport.virtual.base.Message.__init__` indexes without a default:
+/// a message published through [`MessageRef`] that omitted them would raise
+/// `KeyError` inside the consumer callback and take the worker's event loop
+/// down with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagePropertiesRef<'a> {
     /// Correlation ID
@@ -114,6 +120,18 @@ pub struct MessagePropertiesRef<'a> {
     /// consumer never base64-decodes.
     #[serde(borrow, default = "default_body_encoding")]
     pub body_encoding: Cow<'a, str>,
+
+    /// kombu's per-delivery handle; see [`crate::MessageProperties::delivery_tag`].
+    ///
+    /// Defaults to the nil UUID when a payload carries none, so parsing stays
+    /// deterministic; a freshly constructed [`MessageRef`] gets a unique tag
+    /// from [`MessagePropertiesRef::default`].
+    #[serde(borrow, default = "absent_delivery_tag")]
+    pub delivery_tag: Cow<'a, str>,
+
+    /// Where the message was published; see [`crate::DeliveryInfo`].
+    #[serde(default)]
+    pub delivery_info: crate::DeliveryInfo,
 }
 
 fn default_delivery_mode() -> u8 {
@@ -124,6 +142,10 @@ fn default_body_encoding() -> Cow<'static, str> {
     Cow::Borrowed(crate::BODY_ENCODING_BASE64)
 }
 
+fn absent_delivery_tag() -> Cow<'static, str> {
+    Cow::Owned(Uuid::nil().to_string())
+}
+
 impl Default for MessagePropertiesRef<'_> {
     fn default() -> Self {
         Self {
@@ -132,6 +154,10 @@ impl Default for MessagePropertiesRef<'_> {
             delivery_mode: default_delivery_mode(),
             priority: None,
             body_encoding: default_body_encoding(),
+            // A fresh tag per constructed message, exactly as
+            // `MessageProperties::default` mints one.
+            delivery_tag: Cow::Owned(Uuid::new_v4().to_string()),
+            delivery_info: crate::DeliveryInfo::default(),
         }
     }
 }
@@ -301,6 +327,8 @@ impl<'a> MessageRef<'a> {
                 reply_to: self.properties.reply_to.map(|s| s.into_owned()),
                 delivery_mode: self.properties.delivery_mode,
                 priority: self.properties.priority,
+                delivery_tag: self.properties.delivery_tag.into_owned(),
+                delivery_info: self.properties.delivery_info,
             },
             body: self.body.into_owned(),
             content_type: self.content_type.into_owned(),

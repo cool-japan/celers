@@ -61,6 +61,36 @@ edition = "2021"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/celers"
+# MINIMUM SUPPORTED RUST VERSION
+#
+# Not a wish: it is the maximum `rust-version` over everything this workspace
+# actually compiles, and it is re-derivable read-only:
+#
+#   cargo metadata --format-version 1 --all-features
+#
+# then take `max(rust_version)` over the packages reachable from the workspace
+# members through normal/build dependency edges. As of this release that is
+# 1.89, set by the oxisql 0.4.1 chain (oxisql-core / -postgres / -mysql /
+# -parse) and the oxitls 0.3.0 chain; lapin 4.10.0 and amq-protocol 10.6.3 sit
+# just below at 1.88.
+#
+# TWO KNOWN EXCEPTIONS, both deliberate:
+#
+#   * `celers-broker-sqs` declares its own `rust-version = "1.94.1"`. Its
+#     `aws-config` / `aws-sdk-sqs` / `aws-sdk-cloudwatch` dependencies are NOT
+#     optional, so that whole crate — and therefore the `sqs` feature of the
+#     `celers` facade, `--all-features`, and `celers/full` — requires 1.94.1
+#     unconditionally. Inheriting 1.89 there would be a claim cargo contradicts
+#     on the first build.
+#
+#   * Running the *test* suite of `celers-metrics` additionally needs 1.93.1,
+#     from its `serial_test` 4.0.1 dev-dependency. Dev-dependencies do not
+#     affect what a downstream user needs to build the crate, so this does not
+#     move the published floor — but a contributor on exactly 1.89 will meet it.
+#
+# Re-derive this number whenever dependencies are bumped; it belongs on the
+# release checklist next to `cargo deny check bans`.
+rust-version = "1.89"
 
 [workspace.dependencies]
 # Core dependencies
@@ -75,7 +105,42 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 # Broker implementations
-redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
+#
+# REDIS TLS (`rediss://`). `tokio-rustls-comp` turns on the async rustls
+# transport; `tls-rustls-webpki-roots` picks the trust store.
+#
+#   * `tls-rustls` (pulled in by `tokio-rustls-comp`) selects NO rustls crypto
+#     provider feature — it is `["dep:rustls", "rustls/std",
+#     "dep:rustls-native-certs"]`. That is what makes it composable with this
+#     workspace's Pure-Rust `rustls-rustcrypto` stack, unlike lapin's default.
+#
+#   * ORDERING CONSTRAINT, identical to the lapin one documented below:
+#     `redis`'s `create_rustls_config` calls the bare
+#     `rustls::ClientConfig::builder()`, which panics unless a process-default
+#     `CryptoProvider` is already installed. Both
+#     `celers_broker_redis::install_pure_tls_provider()` and
+#     `celers_backend_redis::install_pure_tls_provider()` install OxiTLS'
+#     provider (via `std::sync::Once`), and every `redis::Client` this
+#     workspace opens goes through an `open_client`/`build_client` helper that
+#     calls one of them first. An application that builds rustls clients
+#     through other libraries earlier in startup should call one itself, first
+#     thing in `main`; whoever installs first wins.
+#
+#   * TRUST STORE: `tls-rustls-webpki-roots` makes `create_rustls_config` seed
+#     its root store from the Mozilla bundle and — see the `cfg(all(...,
+#     not(feature = "tls-rustls-webpki-roots")))` guard on its
+#     `load_native_certs()` call — never touch the OS trust store. That keeps
+#     `rediss://` off the ~12 s macOS Security-framework walk. A private Redis
+#     CA is supplied per-connection instead, through
+#     `RedisConfig::tls(TlsConfig::new().ca_cert(...))`, which routes to
+#     `redis::Client::build_with_tls`.
+#
+#   * `rustls-native-certs` is still COMPILED (`tls-rustls` names it with
+#     `dep:`, so there is no way to opt out) but is dead code at runtime under
+#     `tls-rustls-webpki-roots`. It is Pure Rust plus the `security-framework`
+#     bindings to the macOS system framework, and is not on `deny.toml`'s ban
+#     list. Nothing in this workspace can drop it short of forking `redis`.
+redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager", "aio", "cluster-async", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 # NOTE: neither oxisql-postgres nor oxisql-mysql 0.3.2 exposes a `chrono`
 # Cargo feature (confirmed against their published Cargo.toml manifests) —
 # the `chrono`-gated `FromValue` impls (e.g. `DateTime<Utc>`) live in
@@ -103,17 +168,22 @@ oxitls = { version = "0.3.0", default-features = false, features = ["pure", "web
 # `rustls/ring` turns it on for everybody. The Pure-Rust surface is therefore
 # a property of the *feature set being built*, not of this line:
 #
-#   * Pure Rust today: every workspace member except `celers-broker-sqs`.
+#   * Pure Rust today: EVERY workspace member, `celers-broker-sqs` included.
 #     (`celers-broker-amqp` joined that set once `lapin` was pinned to
-#     `default-features = false` + `rustls-webpki-roots-certs`, below.)
-#   * NOT Pure Rust: `celers-broker-sqs`, and therefore the `celers` facade's
-#     opt-in `sqs` feature and `full`/`--all-features` builds. The AWS SDK's
-#     `default-https-client` hard-selects `aws-smithy-http-client/rustls-aws-lc`
-#     -> `aws-lc-rs` -> `aws-lc-sys` (vendored C/C++/asm built with cmake+cc).
-#     `sqs` is off by default in every crate that offers it.
+#     `default-features = false` + `rustls-webpki-roots-certs`, below;
+#     `celers-broker-sqs` joined it once `default-https-client` came off the
+#     three AWS SDK declarations and `celers_broker_sqs::pure_http` took over
+#     the transport.)
+#   * CONSEQUENCE — no rustls provider feature is enabled anywhere in this
+#     workspace any more. `rustls::ClientConfig::builder()` auto-selects a
+#     provider only when EXACTLY ONE provider feature is on; with none, it
+#     panics unless a process default was installed first. Every bare-builder
+#     path in the graph is therefore covered by an
+#     `install_pure_tls_provider()` call — see the lapin and redis notes.
 #
-# Verify with `cargo tree -e features -i aws-lc-sys -p <crate>`; enforced
-# mechanically by `deny.toml` (`[graph] exclude` names the one exception).
+# Verify with `cargo tree -e features -i aws-lc-sys --all-features` (must
+# report "did not match any packages"); enforced mechanically by `deny.toml`,
+# whose `[graph] exclude` is now empty.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 # `default-features = false` is load-bearing and MUST live here, at the
 # workspace level: a member-level `default-features = false` on an inherited
@@ -150,7 +220,15 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 # which adds `lapin/rustls-native-certs` (Pure Rust) on top.
 lapin = { version = "4.10.0", default-features = false, features = ["default-runtime", "rustls-webpki-roots-certs"] }
 oxihttp-client = { version = "0.2.1", features = ["tls"] }
+# `oxihttp_core::Body` / `Bytes` — the request-body type `Client::execute_body`
+# takes. `oxihttp-client` does not re-export it, and it is already in the graph
+# (oxihttp-client depends on exactly this version), so naming it adds no crate.
+oxihttp-core = "0.2.1"
 http = "1.5.0"
+# `BodyExt::collect`, used by `celers_broker_sqs::pure_http` to drain an
+# `SdkBody` request body into memory before handing it to oxihttp. Already in
+# the graph via oxihttp-client / tonic / the AWS SDK.
+http-body-util = "0.1.5"
 
 # AWS SDK
 #
@@ -162,35 +240,52 @@ http = "1.5.0"
 # hyper-rustls 0.24 / `ring` in the whole lockfile — i.e. four open RUSTSEC
 # advisories (RUSTSEC-2026-0258, -0104, -0098, -0099) and seven duplicate
 # version pairs — for a hyper-0.14 connector that `celers-broker-sqs` never
-# constructs. Working HTTPS comes from `default-https-client` (rustls 0.23),
-# which is kept. `behavior-version-latest` is deliberately NOT enabled:
+# constructs.
+#
+# `default-https-client` is NOT enabled either, and that is the whole
+# Pure-Rust SQS story. It resolves to
+# `aws-smithy-runtime/default-https-client` ->
+# `aws-smithy-http-client/rustls-aws-lc` -> `aws-lc-rs` -> `aws-lc-sys`
+# (vendored C/C++/asm built with cmake+cc). `aws-smithy-http-client`'s only
+# other TLS options are `rustls-ring`, `rustls-aws-lc-fips` and `s2n-tls`, all
+# C/asm, so there is no feature combination of the stock client that satisfies
+# the Pure-Rust policy. With the feature off, `aws-smithy-http-client` is
+# unreachable and leaves the graph entirely.
+#
+# HTTPS then comes from `celers_broker_sqs::pure_http`: an
+# `aws_smithy_runtime_api` `HttpClient`/`HttpConnector` implemented over
+# `oxihttp-client` (hyper 1.x + tokio-rustls + OxiTLS' `rustls-rustcrypto`
+# provider), installed with `aws_config::defaults(..).http_client(..)` at
+# `broker_core.rs`'s `get_client` / `get_cloudwatch_client`. It is behind
+# `celers-broker-sqs`'s default-on `pure-http` feature; turning that off leaves
+# HTTP client selection to the application, which must then supply one (e.g. by
+# enabling `aws-config/default-https-client` in ITS OWN manifest — a workspace
+# feature cannot offer that, because `deny.toml` checks with
+# `[graph] all-features = true` and would see the FFI stack come back).
+#
+# `behavior-version-latest` is deliberately NOT enabled:
 # `crates/celers-broker-sqs/src/broker_core.rs` passes
 # `BehaviorVersion::latest()` explicitly at every `aws_config::defaults` call.
-aws-config = { version = "1.11.0", default-features = false, features = ["rt-tokio", "credentials-process", "sso", "default-https-client"] }
-aws-sdk-sqs = { version = "1.107.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
-aws-sdk-cloudwatch = { version = "1.126.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
-# TEST-ONLY (a `[dev-dependencies]` entry of `celers-broker-sqs`, nothing else).
+aws-config = { version = "1.11.0", default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
+aws-sdk-sqs = { version = "1.107.0", default-features = false, features = ["rt-tokio"] }
+aws-sdk-cloudwatch = { version = "1.126.0", default-features = false, features = ["rt-tokio"] }
+# The `HttpClient` / `HttpConnector` / `HttpConnectorSettings` /
+# `SharedHttpConnector` traits and types `celers_broker_sqs::pure_http`
+# implements, and that `src/test_support.rs` uses for its offline unit-test
+# client. `aws-sdk-sqs::config` re-exports `HttpClient` and `SharedHttpClient`
+# but not `HttpConnectorSettings` or `SharedHttpConnector`, so neither can be
+# written against the SDK's own re-exports alone.
 #
 # Already in the graph transitively — `aws-sdk-sqs` depends on exactly this
-# version — so naming it here adds no crate to the build, it only makes the
-# `HttpClient`/`HttpConnector` traits *nameable*. `aws-sdk-sqs::config`
-# re-exports `HttpClient` and `SharedHttpClient` but not `HttpConnectorSettings`
-# or `SharedHttpConnector`, so a stub HTTP client cannot be written against the
-# SDK's own re-exports alone.
-#
-# Why a stub is needed at all: `Client::from_conf` runs
-# `HttpClient::validate_base_client_config` on whichever HTTP client the base
-# config selects, and `aws-smithy-http-client` deliberately builds its TCP
-# connector there ("so that native certs load at client initialization time
-# instead of upon first request"). That calls
-# `rustls_native_certs::load_native_certs()`, which costs ~12s per process on
-# macOS and returns *nothing* when several processes hit the Security framework
-# at once — tripping the `debug_assert!(valid > 0)` in
-# `aws-smithy-http-client`'s rustls provider. Unit tests that only need a
-# `Client` *value* therefore hand it an offline HTTP client instead, which
-# de-selects the default one so its `validate_base_client_config` never runs.
-# See `crates/celers-broker-sqs/src/test_support.rs`.
-aws-smithy-runtime-api = "1.15.0"
+# version — so naming it here adds no crate to the build. `client` gates the
+# whole `aws_smithy_runtime_api::client` module tree; `http-1x` gates
+# `Request::try_into_http1x` and `TryFrom<http_1x::Response<B>>`, the two
+# conversions the connector is built on. Both were previously turned on
+# transitively by `aws-smithy-http-client/default-client`, which is gone.
+aws-smithy-runtime-api = { version = "1.15.0", features = ["client", "http-1x"] }
+# `SdkBody`, the body type on both sides of `HttpConnector::call`. Same
+# reasoning: already in the graph at exactly this version via the SDK.
+aws-smithy-types = "1.6.2"
 
 # CLI and utilities
 clap = { version = "4.6.6", features = ["derive"] }
@@ -309,6 +404,7 @@ tokio-test = "0.4.5"
 tempfile = "3.27.0"
 serial_test = "4.0.1"
 futures = "0.3.34"
+trybuild = "1.0.120"
 
 # Macro dependencies
 quote = "1.0.47"

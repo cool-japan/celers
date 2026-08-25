@@ -745,10 +745,10 @@ The result: **10-50x better performance** with **strong type safety** and **mode
 
 ## Additional Resources
 
-- [CeleRS Documentation](../README.md)
+- [CeleRS Documentation](../../README.md)
 - [Performance Tuning Guide](PERFORMANCE.md)
 - [Celery Documentation](https://docs.celeryproject.org/)
-- [Example Migration Project](../examples/)
+- [Runnable examples](../celers-examples/examples/) (`cargo run -p celers-examples --example <name>`)
 
 ## Support
 

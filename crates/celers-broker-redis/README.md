@@ -2,7 +2,7 @@
 
 High-performance Redis broker implementation for CeleRS with batch operations, priority queues, and comprehensive monitoring.
 
-**Version: 0.3.1 | Status: [Stable] | Tests: 478 (+ 68 doc tests) | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 581 (`--all-features`, excluding `#[ignore]`d) + 68 doctests | Updated: 2026-08-26**
 
 ## Overview
 
@@ -263,6 +263,49 @@ let broker = RedisBroker::with_mode(
 "redis://localhost:6379/2"         // Database 2
 ```
 
+### TLS (`rediss://`)
+
+TLS is Pure Rust: the `redis` crate is built with `tokio-rustls-comp` +
+`tls-rustls-webpki-roots` (neither of which selects a crypto provider), and this
+crate installs OxiTLS' `rustls-rustcrypto` provider as the process default from
+every client constructor. A `rediss://` URL needs no extra configuration.
+
+The default trust store is the Mozilla `webpki-roots` bundle — the OS trust
+store is never walked, which also keeps startup off the ~12-second macOS
+Security-framework path. For a private Redis CA, or for mutual TLS, configure
+the certificates and they are passed to `redis::Client::build_with_tls`:
+
+```rust
+use celers_broker_redis::{RedisBroker, RedisConfig, TlsConfig};
+use celers_kombu::QueueMode;
+
+let config = RedisConfig::from_url("rediss://redis.internal:6379")
+    .tls(
+        TlsConfig::new()
+            .ca_cert("/etc/celers/redis-ca.pem")
+            .client_cert("/etc/celers/client.pem", "/etc/celers/client.key"),
+    );
+
+let broker = RedisBroker::from_config(&config, "celery", QueueMode::Fifo)?;
+```
+
+Notes:
+
+- A configured CA **replaces** the webpki bundle rather than adding to it, which
+  is `redis`'s own semantics and usually what a private CA wants.
+- A client certificate without its key (or the reverse) is rejected at build
+  time rather than silently falling back to server-only authentication.
+- Certificates configured on a plaintext (`redis://`, no `TlsConfig::enabled`)
+  connection are also rejected: dropping them silently would connect in the
+  clear while the operator believed the connection was encrypted.
+- `cipher_suites` / `min_tls_version` / `max_tls_version` are **not** expressible
+  through the `redis` API, so setting them is an error rather than a no-op. Pin
+  them on the Redis server instead.
+- An application that builds rustls clients through other libraries before
+  constructing a broker should call
+  `celers_broker_redis::install_pure_tls_provider()` first thing in `main`;
+  whoever installs a default provider first wins.
+
 ## Performance Tuning
 
 ### Batch Size Selection
@@ -459,7 +502,7 @@ let (conn_timeout, op_timeout) = calculate_redis_timeout_values(
 ## Examples
 
 See `examples/` directory (verified against `crates/celers-broker-redis/examples/` on 2026-07-13 —
-run with `cargo run --example <name>`, using the filename without `.rs` as `<name>`):
+run with `cargo run -p celers-broker-redis --example <name>`, using the filename without `.rs` as `<name>`):
 - `redis_basic_usage.rs` - Basic usage (creating a broker, enqueuing/dequeuing tasks)
 - `redis_advanced_features.rs` - DLQ handling, task replay from DLQ, delayed task execution
 - `resilience_features.rs` - Resilience patterns: circuit breaker, rate limiting, deduplication, bulkhead

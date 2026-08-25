@@ -69,7 +69,33 @@ pub struct MysqlBroker {
     pub(crate) enqueue_window_start_ms: AtomicI64,
     pub(crate) circuit_breaker: Arc<RwLock<CircuitBreakerStateInternal>>,
     pub(crate) hooks: Arc<tokio::sync::RwLock<TaskHooks>>,
+    /// How long a durable revocation record survives, in seconds — see
+    /// `revocation.rs`. Mirrors `celers-broker-redis`'s
+    /// `DEFAULT_REVOCATION_TTL_SECS`/`with_revocation_ttl`.
+    pub(crate) revocation_ttl_secs: u64,
+    /// How often [`crate::revocation::MysqlRevocationStream`] polls
+    /// `celers_revoked_tasks` for new rows. MySQL has no LISTEN/NOTIFY
+    /// equivalent, so this is the notification-latency knob — see
+    /// `revocation.rs`.
+    pub(crate) revocation_poll_interval_secs: u64,
 }
+
+/// Default lifetime of a durable revocation record: 24 hours, matching
+/// `celers-broker-redis::DEFAULT_REVOCATION_TTL_SECS` and
+/// `celers-broker-postgres::DEFAULT_REVOCATION_TTL_SECS`.
+pub const DEFAULT_REVOCATION_TTL_SECS: u64 = 86_400;
+
+/// Default poll interval for [`crate::revocation::MysqlRevocationStream`].
+///
+/// Every already-running task a `revoke(terminate = true)` call needs to
+/// reach waits up to this long to learn about it (a *queued* task is refused
+/// immediately, at dispatch, via `is_revoked()` against the same durable
+/// row — this latency is specific to the fire-and-forget "abort a task that
+/// is already executing" path). Two seconds is a deliberate compromise: short
+/// enough that "revoke --terminate" feels responsive, long enough that an
+/// idle worker fleet is not issuing a `SELECT` against this table five times
+/// a second per worker.
+pub const DEFAULT_REVOCATION_POLL_INTERVAL_SECS: u64 = 2;
 
 /// Remove whole-line `--` comments from one `;`-delimited migration chunk.
 ///
@@ -132,6 +158,8 @@ impl MysqlBroker {
                 CircuitBreakerConfig::default(),
             ))),
             hooks: Arc::new(tokio::sync::RwLock::new(TaskHooks::new())),
+            revocation_ttl_secs: DEFAULT_REVOCATION_TTL_SECS,
+            revocation_poll_interval_secs: DEFAULT_REVOCATION_POLL_INTERVAL_SECS,
         })
     }
 
@@ -155,6 +183,8 @@ impl MysqlBroker {
                 circuit_breaker_config,
             ))),
             hooks: Arc::new(tokio::sync::RwLock::new(TaskHooks::new())),
+            revocation_ttl_secs: DEFAULT_REVOCATION_TTL_SECS,
+            revocation_poll_interval_secs: DEFAULT_REVOCATION_POLL_INTERVAL_SECS,
         })
     }
 
@@ -264,6 +294,13 @@ impl MysqlBroker {
             "010",
             "task_results_table",
             include_str!("../migrations/010_task_results.sql"),
+        )
+        .await?;
+
+        self.run_migration_tracked(
+            "011",
+            "revocation",
+            include_str!("../migrations/011_revocation.sql"),
         )
         .await?;
 
@@ -414,6 +451,35 @@ impl MysqlBroker {
     /// concurrency caveat.
     pub fn connection(&self) -> &MyConnection {
         &self.conn
+    }
+
+    /// Override how long a durable revocation record survives.
+    ///
+    /// The default is [`DEFAULT_REVOCATION_TTL_SECS`]. Shorten it to exercise
+    /// expiry in a test without waiting a day for a record to lapse.
+    pub fn with_revocation_ttl(mut self, ttl_secs: u64) -> Self {
+        self.revocation_ttl_secs = ttl_secs;
+        self
+    }
+
+    /// The currently configured revocation TTL, in seconds.
+    pub fn revocation_ttl(&self) -> u64 {
+        self.revocation_ttl_secs
+    }
+
+    /// Override how often [`crate::revocation::MysqlRevocationStream`] polls
+    /// for new revocations.
+    ///
+    /// The default is [`DEFAULT_REVOCATION_POLL_INTERVAL_SECS`]. Shorten it to
+    /// keep a test's wait bounded.
+    pub fn with_revocation_poll_interval(mut self, poll_interval_secs: u64) -> Self {
+        self.revocation_poll_interval_secs = poll_interval_secs;
+        self
+    }
+
+    /// The currently configured revocation poll interval, in seconds.
+    pub fn revocation_poll_interval(&self) -> u64 {
+        self.revocation_poll_interval_secs
     }
 
     /// The logical queue this broker enqueues into and claims from.

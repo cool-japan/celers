@@ -30,11 +30,12 @@
 //!
 //! # Basic Example
 //!
-//! ```ignore
+//! ```
 //! use celers_beat::{Schedule, ScheduledTask};
 //!
 //! let schedule = Schedule::interval(60);  // Every 60 seconds
 //! let task = ScheduledTask::new("send_report".to_string(), schedule);
+//! assert_eq!(task.name, "send_report");
 //! ```
 
 use std::sync::Arc;
@@ -52,6 +53,7 @@ pub mod lock;
 pub mod registry;
 pub mod schedule;
 pub mod schedule_ext;
+pub mod schedule_store;
 pub mod scheduler;
 pub mod scheduler_catchup;
 pub mod scheduler_ext;
@@ -87,6 +89,9 @@ pub use lock::*;
 pub use registry::{AddOutcome, ScheduleRegistry};
 pub use schedule::*;
 pub use schedule_ext::*;
+#[cfg(feature = "redis-store")]
+pub use schedule_store::RedisScheduleStore;
+pub use schedule_store::{FileScheduleStore, ScheduleStore};
 pub use scheduler::*;
 pub use scheduler_ext::*;
 pub use task::*;

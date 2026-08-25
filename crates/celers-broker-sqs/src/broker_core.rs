@@ -35,6 +35,31 @@ use crate::visibility::VisibilityHeartbeat;
 /// neither acknowledges nor rejects from growing the map without limit.
 const MAX_TRACKED_RECEIPTS: usize = 10_000;
 
+/// Load the AWS configuration every client in this crate is built from.
+///
+/// One place, so the SQS client, the CloudWatch client and the credential
+/// providers underneath them all get the same behaviour version and the same
+/// HTTP transport.
+///
+/// With the default `pure-http` feature the transport is
+/// [`crate::pure_http::pure_http_client`] — a Pure-Rust `HttpClient` over
+/// `oxihttp-client`. It has to be installed explicitly because the workspace
+/// does not enable `aws-config/default-https-client`: that feature hard-selects
+/// `aws-smithy-http-client/rustls-aws-lc`, i.e. the FFI `aws-lc-sys` stack that
+/// `deny.toml` bans. Without `pure-http`, HTTP client selection is left to the
+/// application (see the feature's documentation in `Cargo.toml`).
+///
+/// `BehaviorVersion::latest()` is passed explicitly rather than through the
+/// `behavior-version-latest` Cargo feature, so the choice is visible in source.
+pub(crate) async fn load_aws_config() -> aws_config::SdkConfig {
+    let loader = aws_config::defaults(BehaviorVersion::latest());
+
+    #[cfg(feature = "pure-http")]
+    let loader = loader.http_client(crate::pure_http::pure_http_client());
+
+    loader.load().await
+}
+
 /// AWS SQS broker implementation
 pub struct SqsBroker {
     pub(crate) client: Option<Client>,
@@ -493,7 +518,7 @@ impl SqsBroker {
     /// Get or create SQS client (cloned for borrow checker compatibility)
     pub(crate) async fn get_client(&mut self) -> Result<Client> {
         if self.client.is_none() {
-            let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+            let config = load_aws_config().await;
             self.client = Some(Client::new(&config));
         }
 
@@ -609,7 +634,7 @@ impl SqsBroker {
     /// Get or create CloudWatch client
     pub(crate) async fn get_cloudwatch_client(&mut self) -> Result<CloudWatchClient> {
         if self.cloudwatch_client.is_none() {
-            let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+            let config = load_aws_config().await;
             self.cloudwatch_client = Some(CloudWatchClient::new(&config));
         }
 

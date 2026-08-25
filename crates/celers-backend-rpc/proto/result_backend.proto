@@ -65,12 +65,27 @@ message TaskMeta {
   uint32 completed_at_nanos = 13;
   // JSON-encoded tail carrying the extended TaskMeta fields that have no
   // dedicated proto field of their own: progress, version, tags, metadata,
-  // worker_hostname, runtime_ms, memory_bytes, retries, queue. Kept as one
-  // opaque blob (mirroring celers-backend-db's `extra` column) so future
-  // extended fields don't each need a new proto field and a version bump
-  // here. Optional so messages from writers that predate this field still
-  // decode to an all-default extended-fields set instead of failing.
+  // worker_hostname, runtime_ms, memory_bytes, retries, queue, ignored_error.
+  // Kept as one opaque blob (mirroring celers-backend-db's `extra` column)
+  // so future extended fields don't each need a new proto field and a
+  // version bump here. Optional so messages from writers that predate this
+  // field still decode to an all-default extended-fields set instead of
+  // failing.
   optional string extra_json = 14;
+  // Compressed form of `result_data`, present only when the writer had
+  // compression enabled and the payload was large enough to be worth it.
+  // When set, this is the authoritative result payload and `result_data`
+  // is left unset; a reader must check this field first. `bytes` (not a
+  // base64 string): unlike a JSON/JSONB column, a protobuf field can hold
+  // arbitrary binary directly. Absent on every message written with
+  // compression disabled, below threshold, or by a writer that predates
+  // this field -- all three decode via the plain `result_data` string
+  // exactly as before, with no version flag needed.
+  optional bytes result_data_compressed = 15;
+  // Algorithm that produced `result_data_compressed` (e.g. "zstd", "gzip",
+  // "zlib" -- see `celers_core::result::compression`'s table). Always
+  // present when `result_data_compressed` is set; meaningless otherwise.
+  optional string result_compression_algorithm = 16;
 }
 
 // Chord state

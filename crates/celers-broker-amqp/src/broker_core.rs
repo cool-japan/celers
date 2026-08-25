@@ -909,8 +909,23 @@ impl Transport for AmqpBroker {
 
 #[async_trait]
 impl Producer for AmqpBroker {
+    /// Publish to the configured default exchange, with `queue` as the routing
+    /// key.
+    ///
+    /// The exchange is [`AmqpConfig::default_exchange`] — the one
+    /// `setup_topology` declares and binds the queue to. It used to be the
+    /// literal `"celery"`, which is the *default value* of that setting and so
+    /// agreed with it only by coincidence: a broker configured with
+    /// [`with_exchange`](AmqpConfig::with_exchange) declared and
+    /// bound one exchange and then published to another, which RabbitMQ answers
+    /// with a 404 that closes the channel. Every other publishing path in this
+    /// crate (`publish_batch`, `publish_to_dlx`, the queue-ops helpers) already
+    /// read the configured value, so `publish` was the odd one out — and the
+    /// disagreement was visible from the task-queue adapter as `enqueue` failing
+    /// while `enqueue_batch` succeeded.
     async fn publish(&mut self, queue: &str, message: Message) -> Result<()> {
-        self.publish_with_routing("celery", queue, message).await
+        let exchange = self.config.default_exchange.clone();
+        self.publish_with_routing(&exchange, queue, message).await
     }
 
     async fn publish_with_routing(

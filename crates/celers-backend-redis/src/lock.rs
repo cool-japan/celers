@@ -44,7 +44,7 @@ impl RedisLockBackend {
     /// # Errors
     /// Returns an error if the Redis URL is invalid.
     pub fn new(redis_url: &str) -> celers_core::error::Result<Self> {
-        let client = redis::Client::open(redis_url)
+        let client = crate::tls::open_client(redis_url)
             .map_err(|e| CelersError::Configuration(format!("Invalid Redis URL: {}", e)))?;
         Ok(Self {
             client,
@@ -58,7 +58,7 @@ impl RedisLockBackend {
     /// * `redis_url` - Redis connection URL
     /// * `prefix` - Custom key prefix for lock keys
     pub fn with_prefix(redis_url: &str, prefix: String) -> celers_core::error::Result<Self> {
-        let client = redis::Client::open(redis_url)
+        let client = crate::tls::open_client(redis_url)
             .map_err(|e| CelersError::Configuration(format!("Invalid Redis URL: {}", e)))?;
         Ok(Self { client, prefix })
     }

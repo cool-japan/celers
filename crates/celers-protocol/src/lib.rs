@@ -12,7 +12,9 @@
 //!
 //! Messages consist of:
 //! - **Headers**: Task metadata (task name, ID, parent/root IDs, etc.)
-//! - **Properties**: AMQP properties (`correlation_id`, `reply_to`, `delivery_mode`)
+//! - **Properties**: AMQP properties (`correlation_id`, `reply_to`, `delivery_mode`,
+//!   `priority`) plus the two kombu ones a consumer indexes without a default,
+//!   `delivery_tag` and `delivery_info` (see [`MessageProperties`])
 //! - **Body**: Serialized task arguments
 //! - **Content-Type**: Serialization format ("application/json", "application/x-msgpack")
 //! - **Content-Encoding**: Encoding format ("utf-8", "binary")

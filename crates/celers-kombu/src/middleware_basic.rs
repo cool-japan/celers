@@ -148,19 +148,19 @@ impl LoggingMiddleware {
 impl MessageMiddleware for LoggingMiddleware {
     async fn before_publish(&self, message: &mut Message) -> Result<()> {
         if self.log_body {
-            eprintln!(
-                "[{}] Publishing: task={}, id={}, body_size={}",
-                self.prefix,
-                message.task_name(),
-                message.task_id(),
-                message.body.len()
+            tracing::debug!(
+                prefix = %self.prefix,
+                task = %message.task_name(),
+                id = %message.task_id(),
+                body_size = message.body.len(),
+                "Publishing"
             );
         } else {
-            eprintln!(
-                "[{}] Publishing: task={}, id={}",
-                self.prefix,
-                message.task_name(),
-                message.task_id()
+            tracing::debug!(
+                prefix = %self.prefix,
+                task = %message.task_name(),
+                id = %message.task_id(),
+                "Publishing"
             );
         }
         Ok(())
@@ -168,19 +168,19 @@ impl MessageMiddleware for LoggingMiddleware {
 
     async fn after_consume(&self, message: &mut Message) -> Result<()> {
         if self.log_body {
-            eprintln!(
-                "[{}] Consumed: task={}, id={}, body_size={}",
-                self.prefix,
-                message.task_name(),
-                message.task_id(),
-                message.body.len()
+            tracing::debug!(
+                prefix = %self.prefix,
+                task = %message.task_name(),
+                id = %message.task_id(),
+                body_size = message.body.len(),
+                "Consumed"
             );
         } else {
-            eprintln!(
-                "[{}] Consumed: task={}, id={}",
-                self.prefix,
-                message.task_name(),
-                message.task_id()
+            tracing::debug!(
+                prefix = %self.prefix,
+                task = %message.task_name(),
+                id = %message.task_id(),
+                "Consumed"
             );
         }
         Ok(())

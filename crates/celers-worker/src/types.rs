@@ -141,6 +141,15 @@ pub struct WorkerConfig {
     ///
     /// Without it a task no worker can currently serve produces a
     /// dequeue -> requeue -> dequeue spin at 100% CPU.
+    ///
+    /// This is *this worker's* back-off, not a hold on the message: an
+    /// admission miss is returned to the broker with no delay at all, so a
+    /// worker that **can** serve the task takes it immediately. The one
+    /// exception is a denial from the cluster-wide rate limiter
+    /// ([`Worker::with_rate_limit_coordinator`](crate::Worker::with_rate_limit_coordinator)),
+    /// whose `retry_after` binds every worker: there the clamped value is
+    /// handed to [`Broker::defer`](celers_core::Broker::defer) as well, so a
+    /// broker with a delayed queue holds the message for the same period.
     pub defer_delay_ms: u64,
 
     /// Upper bound for deferral delays, in milliseconds.

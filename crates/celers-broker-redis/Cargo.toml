@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Redis broker implementation for CeleRS with Lua scripts and priority queues"
 readme = "README.md"
 keywords = ["celery", "redis", "broker", "queue", "async"]
@@ -20,6 +21,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 redis = { workspace = true, features = ["cluster-async"] }
+# Supplies the Pure-Rust rustls crypto provider that
+# `install_pure_tls_provider()` installs as the process default. Mandatory, not
+# optional: no rustls provider *feature* is enabled anywhere in this workspace,
+# so `redis`'s bare `rustls::ClientConfig::builder()` panics without it.
+oxitls = { workspace = true }
 tracing = { workspace = true }
 oxiarc-deflate = { workspace = true }
 oxiarc-zstd = { workspace = true, optional = true }

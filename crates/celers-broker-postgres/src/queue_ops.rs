@@ -151,12 +151,17 @@ impl PostgresBroker {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use serde_json::json;
+    /// # async fn example(broker: PostgresBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// // Find tasks where metadata.user_id = 123
-    /// let tasks = broker.find_tasks_by_metadata("user_id", &json!(123), 10, 0).await?;
+    /// let _by_user_id = broker.find_tasks_by_metadata("user_id", &json!(123), 10, 0).await?;
     ///
     /// // Find tasks where metadata.priority = "high"
-    /// let tasks = broker.find_tasks_by_metadata("priority", &json!("high"), 10, 0).await?;
+    /// let _by_priority = broker.find_tasks_by_metadata("priority", &json!("high"), 10, 0).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn find_tasks_by_metadata(
         &self,
@@ -194,9 +199,15 @@ impl PostgresBroker {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use celers_broker_postgres::PostgresBroker;
+    /// # use serde_json::json;
+    /// # async fn example(broker: PostgresBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// // Count tasks where metadata.user_id = 123
     /// let count = broker.count_tasks_by_metadata("user_id", &json!(123)).await?;
+    /// # let _ = count;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn count_tasks_by_metadata(
         &self,

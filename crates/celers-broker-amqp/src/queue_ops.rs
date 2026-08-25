@@ -81,8 +81,9 @@ impl AmqpBroker {
     /// Declare an exchange with full configuration including alternative exchange
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// use celers_broker_amqp::{AmqpBroker, ExchangeConfig, AmqpExchangeType};
+    /// use celers_kombu::Transport;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
@@ -134,8 +135,9 @@ impl AmqpBroker {
     /// multiple exchanges before reaching queues.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// use celers_broker_amqp::{AmqpBroker, AmqpExchangeType};
+    /// use celers_kombu::Transport;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
@@ -211,8 +213,9 @@ impl AmqpBroker {
     /// Returns Ok if queue exists, or an error if it doesn't.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// use celers_broker_amqp::AmqpBroker;
+    /// use celers_kombu::Transport;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
@@ -247,8 +250,9 @@ impl AmqpBroker {
     /// Passive exchange declaration - check if exchange exists without creating it
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// use celers_broker_amqp::AmqpBroker;
+    /// use celers_kombu::Transport;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut broker = AmqpBroker::new("amqp://localhost:5672", "test").await?;
@@ -552,15 +556,20 @@ impl AmqpBroker {
     /// * `consumer_tag` - A unique identifier for this consumer (empty string for auto-generated)
     ///
     /// # Example
-    /// ```ignore
-    /// use futures_lite::StreamExt;
+    /// ```no_run
+    /// use celers_broker_amqp::AmqpBroker;
+    /// use futures::StreamExt;
+    /// use lapin::options::BasicAckOptions;
     ///
+    /// # async fn example(mut broker: AmqpBroker) -> Result<(), Box<dyn std::error::Error>> {
     /// let mut consumer = broker.start_consumer("my_queue", "").await?;
     /// while let Some(delivery) = consumer.next().await {
     ///     let delivery = delivery?;
     ///     // Process message...
     ///     delivery.ack(BasicAckOptions::default()).await?;
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn start_consumer(
         &mut self,
@@ -596,8 +605,9 @@ impl AmqpBroker {
     /// when multiple consumers are active. Higher priority consumers receive messages first.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```no_run
     /// use celers_broker_amqp::{AmqpBroker, ConsumerConfig};
+    /// use celers_kombu::Transport;
     /// use futures::StreamExt;
     /// use lapin::options::BasicAckOptions;
     ///

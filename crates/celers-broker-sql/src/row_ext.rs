@@ -75,12 +75,16 @@ impl RowExt for Row {
 ///
 /// Usage mirrors the shape of the target struct:
 ///
-/// ```ignore
+/// ```text
 /// let infos: Vec<TaskInfo> = rows
 ///     .iter()
 ///     .map(row_to!(TaskInfo { task_name: "task_name" }))
 ///     .collect::<Result<_, _>>()?;
 /// ```
+///
+/// (Illustrative only: `row_ext` is a private module — see this crate's
+/// `lib.rs` — so this cannot be a doctest against the public API, and
+/// exercising it for real needs a live `Row` besides.)
 ///
 /// This crate's own call sites map multi-field structs (`TaskMeta`,
 /// `ChordState`, ...) by hand across several fields with mixed typed helpers
@@ -137,10 +141,13 @@ pub(crate) use row_to;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let id = Uuid::new_v4();
 /// conn.execute("INSERT INTO t (id) VALUES ($1)", &[&uuid_param(&id)]).await?;
 /// ```
+///
+/// (Illustrative only: `row_ext` is a private module, so this is not
+/// reachable as a doctest against the public API.)
 #[allow(dead_code)]
 pub fn uuid_param(u: &uuid::Uuid) -> oxisql_core::Value {
     oxisql_core::Value::Uuid(u.as_u128())
@@ -174,10 +181,13 @@ pub fn opt_uuid_from_row(row: &Row, col: &str) -> Result<Option<uuid::Uuid>, Oxi
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let payload = serde_json::json!({ "k": "v" });
 /// conn.execute("INSERT INTO t (data) VALUES ($1)", &[&json_param(&payload)]).await?;
 /// ```
+///
+/// (Illustrative only: `row_ext` is a private module, so this is not
+/// reachable as a doctest against the public API.)
 #[allow(dead_code)]
 pub fn json_param(v: &serde_json::Value) -> String {
     v.to_string()

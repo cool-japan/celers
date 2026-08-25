@@ -54,6 +54,41 @@
 //! # }
 //! ```
 //!
+//! # Running a worker against SQS
+//!
+//! [`SqsBroker`] implements the `celers-kombu` *transport* traits
+//! (`publish`/`consume`/`purge`/...) over [`celers_protocol::Message`]. A
+//! `celers_worker::Worker` consumes the *task-queue* trait
+//! [`celers_core::Broker`] (`enqueue`/`dequeue`/`ack`/`reject`/`defer`/...), so
+//! the two do not meet on their own.
+//!
+//! [`SqsBroker::into_core_broker`] bridges them, yielding an
+//! [`SqsCoreBroker`]:
+//!
+//! ```no_run
+//! use celers_broker_sqs::SqsBroker;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let broker = SqsBroker::new("celers-tasks")
+//!     .await?
+//!     .with_max_messages(10) // the ceiling on one `ReceiveMessage`
+//!     .into_core_broker("celers-tasks");
+//! // ... hand `broker` to `celers_worker::Worker::new`.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The adapter uses SQS's native operations where the task-queue model has a
+//! matching one — `ReceiveMessage`/`SendMessageBatch`/`DeleteMessageBatch` for
+//! the batch paths, `ChangeMessageVisibility` for `defer`, `DelaySeconds` for
+//! `enqueue_after` — so batch dequeue really is one request per batch rather
+//! than one per message. See the [`core_broker`] module for the full mapping
+//! and its limits. It is behind the `core-broker` feature, which is **on by
+//! default**.
+//!
+//! This does not make the queue readable by a Python Celery worker; see
+//! `docs/CELERY_COMPATIBILITY.md`.
+//!
 //! # FIFO Queue Example
 //!
 //! ```ignore
@@ -227,6 +262,18 @@ pub mod broker_core;
 pub mod broker_ops;
 pub mod types;
 
+/// `celers_core::Broker` over this crate's transport, so a worker can consume
+/// from SQS.
+///
+/// Requires the `core-broker` feature (on by default).
+#[cfg(feature = "core-broker")]
+pub mod core_broker;
+
+/// Pure-Rust HTTPS transport for the AWS SDK — see the module docs for why the
+/// stock `aws-smithy-http-client` cannot be used here.
+#[cfg(feature = "pure-http")]
+pub mod pure_http;
+
 /// Offline `aws_sdk_sqs::Client` construction for unit tests — see the module
 /// docs for why building one the ordinary way is both slow and flaky.
 #[cfg(test)]
@@ -239,6 +286,8 @@ mod tests;
 // Re-exports
 pub use batch_ops::{BatchEntryFailure, BatchOutcome, RETRY_BUDGET_EXHAUSTED_CODE};
 pub use broker_core::SqsBroker;
+#[cfg(feature = "core-broker")]
+pub use core_broker::{SqsCoreBroker, MAX_DELAY_SECONDS, MAX_VISIBILITY_DELAY_SECONDS};
 pub use delivery::ReceiptMetadata;
 pub use types::*;
 pub use visibility::VisibilityHeartbeat;

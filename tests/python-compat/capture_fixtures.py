@@ -209,7 +209,13 @@ REPR_ARGS = [
     [True, False, None],
     [1.5, 2.0, -0.25, 0.1],
     [1e16, 1e-5, 1e20, 1e-7, 123456789012345.0],
+    # The exact points where Python's repr switches to exponent notation, from
+    # both sides, plus negative zero. Off-by-one here is silent and invisible.
+    [-0.0, 1e-4, 1e-5, 9.999e-5, 1e15, 1e16],
     ["it's", 'a"b', "plain", "back\\slash"],
+    # saferepr passes control characters through literally rather than
+    # escaping them the way the builtin repr would.
+    ["line\nbreak", "tab\there", "cr\rhere"],
     [[1, 2], {"k": "v"}],
     [{"nested": {"deep": [1, None, True]}}],
     [{"a": {"b": {"c": {"d": 1}}}}],
@@ -225,6 +231,10 @@ REPR_KWARGS = [
     {"quote": "it's"},
     {"nested": {"k": [1, 2]}},
     {"a": {"b": {"c": [1]}}},
+    # A key needing the same quote escaping as a value.
+    {"it's": 1, "plain": 2},
+    # Control characters in a key, and an empty key.
+    {"line\nbreak": 1, "": 2},
 ]
 
 

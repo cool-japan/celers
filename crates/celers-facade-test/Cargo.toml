@@ -39,6 +39,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Compile-time proof of the minimum dependency set for #[celers::task]"
 publish = false
 

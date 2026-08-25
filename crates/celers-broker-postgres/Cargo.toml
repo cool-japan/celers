@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "PostgreSQL broker implementation for CeleRS with FOR UPDATE SKIP LOCKED"
 readme = "README.md"
 keywords = ["celery", "postgresql", "broker", "queue", "sql"]

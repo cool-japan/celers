@@ -3,11 +3,11 @@
 # Note: this image packages the `celers` CLI binary only -- inspect, control,
 # queue, dlq, schedule, backup/restore, doctor, and friends. CeleRS tasks are
 # compiled-in Rust impls (unlike Python Celery, which imports task modules at
-# runtime), so `celers worker start` from this image runs with an EMPTY task
+# runtime), so `celers worker` from this image runs with an EMPTY task
 # registry and cannot execute any user task. To run tasks, link
 # `celers-worker` into your own binary, register your tasks, and build your
 # own image FROM this builder stage (or an equivalent one). See
-# docs/DEPLOYMENT.md's "Building a worker image" section for a worked
+# docs/DEPLOYMENT.md's "Building a Worker Image" section for a worked
 # example.
 
 # Build stage
@@ -29,13 +29,22 @@ FROM debian:bookworm-slim
 
 ARG CELERS_VERSION=0.3.1
 
-# ca-certificates only: rustls with webpki-roots does not read the system
-# trust store, but keeping the system CA bundle costs nothing and helps any
-# future tooling added to the image. No OpenSSL packages are installed here
-# -- see deny.toml's ban on openssl / openssl-sys.
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Deliberately NOT installing ca-certificates here. `celers-cli`'s default
+# build resolves TLS entirely through oxitls' `webpki-roots` feature
+# (Mozilla's compiled-in root bundle via the `webpki-roots` crate --
+# confirm with `cargo tree -p celers-cli | grep webpki-roots`), so it never
+# reads /etc/ssl/certs and the system CA bundle buys nothing. It is worse
+# than useless: on Debian bookworm, `ca-certificates` carries a hard
+# `Depends: openssl` (verified with `apt-cache depends ca-certificates`,
+# and empirically -- `apt-get install ca-certificates` here pulls in both
+# `openssl` and `libssl3` even with --no-install-recommends). Installing it
+# would silently defeat the Pure-Rust story deny.toml's ban on openssl /
+# openssl-sys enforces at the Cargo level, by putting OpenSSL in the image
+# through the OS package manager instead. If a future feature needs the
+# system trust store (celers-broker-amqp's `tls-native-certs`, or a
+# downstream worker image with different TLS needs), install
+# `ca-certificates` there deliberately and accept the OpenSSL package that
+# comes with it -- do not add it here "just in case".
 
 # Create non-root user
 RUN useradd -m -u 1000 celers && \

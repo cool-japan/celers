@@ -207,9 +207,10 @@ pub use rate_limit_distributed::{
     RateLimitParams,
 };
 pub use result::{
-    builtin_codecs, AsyncResult, AsyncResultConfig, CompressionCodec, ExtendedResultStore,
-    IdentityCodec, ResultChunk, ResultChunker, ResultCompressor, ResultMetadata, ResultStore,
-    ResultTombstone, TaskResultValue,
+    builtin_codecs, AsyncResult, AsyncResultConfig, CompressionCodec, CompressionConfig,
+    ExtendedResultStore, IdentityCodec, ResultChunk, ResultChunker, ResultCompressionPolicy,
+    ResultCompressor, ResultMetadata, ResultStore, ResultTombstone, TaskResultValue,
+    DEFAULT_COMPRESSION_MIN_SIZE, NO_COMPRESSION,
 };
 // The concrete result-compression codecs, each gated on the feature that pulls
 // in its (Pure Rust) implementation. See `result::compression` for the

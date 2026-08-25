@@ -302,7 +302,7 @@ impl BackupManager {
         let snapshot = self.create_snapshot().await?;
 
         // Connect to target instance
-        let target_client = Client::open(target_url)
+        let target_client = crate::connection::open_client(target_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to target: {}", e)))?;
 
         let target_name = target_queue_name.unwrap_or(&self.queue_name);

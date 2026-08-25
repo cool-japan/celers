@@ -46,7 +46,9 @@ impl RedisResultBackend {
         };
 
         let archive_key = self.archive_key(task_id);
-        self.write_meta_to_key(&archive_key, &meta, Some(archive_ttl), None)
+        // Not the live key: an archived copy is a cold backup, and nothing
+        // ever subscribes to its channel.
+        self.write_meta_to_key(&archive_key, &meta, Some(archive_ttl), None, false)
             .await?;
 
         Ok(())

@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Task execution runtime for CeleRS with concurrency control and health checks"
 readme = "README.md"
 keywords = ["celery", "worker", "runtime", "executor", "async"]
@@ -56,7 +57,13 @@ default = []
 metrics = ["celers-metrics"]
 canvas = ["celers-canvas"]
 workflows = ["canvas", "celers-backend-redis"]
-redis = ["dep:redis"]
+# `oxitls` supplies the Pure-Rust rustls crypto provider that
+# `redis_tls::install_pure_tls_provider()` installs as the process default.
+# Mandatory alongside `redis`, not optional: no rustls provider *feature* is
+# enabled anywhere in this workspace, so the bare
+# `rustls::ClientConfig::builder()` the `redis` crate uses for `rediss://`
+# panics without it.
+redis = ["dep:redis", "dep:oxitls"]
 postgres = ["dep:oxisql-core", "dep:oxisql-postgres", "dep:oxitls", "dep:rustls", "dep:url", "dep:anyhow"]
 # Opt-in, off by default: lets `Sandbox::enforce_process_limits` apply real
 # `setrlimit` limits on Unix. Without it the sandbox reports the control as
@@ -101,3 +108,10 @@ seccomp = ["dep:libc"]
 # lets the timeout, shutdown-grace and TTL-sweep tests assert real behaviour
 # without sleeping. Test-only: it is inert unless a test pauses the clock.
 tokio = { workspace = true, features = ["test-util"] }
+# A real `Broker` whose `reject(requeue = true)` rewrites retry state, used
+# by the shutdown-drain test that proves `drain_in_flight` does not spend a
+# retry on a broker where that would matter (gated on `CELERS_TEST_REDIS_URL`
+# behind a live server; celers-broker-redis does not depend back on this
+# crate, so this is not a cycle). Dev-only: never part of this crate's own
+# dependency graph as published.
+celers-broker-redis = { workspace = true }

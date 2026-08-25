@@ -46,6 +46,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::warn;
 
 /// SQS event record from Lambda
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -194,7 +195,12 @@ pub struct LambdaEventProcessor {
     /// Maximum number of retries for transient errors
     pub max_retries: usize,
 
-    /// Enable detailed error logging
+    /// Emit a `tracing` warning for every failed processing attempt.
+    ///
+    /// The events go through `tracing`, so a Lambda that installs a subscriber
+    /// gets them structured (`message_id`, `attempt`, `error`) and one that
+    /// installs none gets nothing — which is the point: a library must not
+    /// write to stderr behind its host's back.
     pub detailed_logging: bool,
 }
 
@@ -272,11 +278,16 @@ impl LambdaEventProcessor {
                 Err(e) => {
                     last_error = Some(e.clone());
                     if self.detailed_logging {
-                        eprintln!(
-                            "Error processing message {} (attempt {}): {}",
-                            record.message_id,
-                            attempts + 1,
-                            e
+                        // `tracing`, not `eprintln!`: in Lambda every line on
+                        // stderr becomes a separate CloudWatch entry with no
+                        // level, no target and no span, so a structured event
+                        // is the difference between a filterable log and a wall
+                        // of text. The rest of this crate logs this way too.
+                        warn!(
+                            message_id = %record.message_id,
+                            attempt = attempts + 1,
+                            error = %e,
+                            "Error processing SQS record"
                         );
                     }
                     attempts += 1;

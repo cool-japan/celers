@@ -414,30 +414,78 @@ fn test_message_headers_equality() {
 
 #[test]
 fn test_message_properties_equality() {
-    let props1 = MessageProperties::default();
-    let props2 = MessageProperties::default();
+    // `delivery_tag` is minted per instance (kombu's producer does the same),
+    // so pin it the way `created_at` is pinned on headers and let the
+    // comparison exercise the rest of the properties.
+    let tag = "1a2b3c4d-0000-4000-8000-000000000000";
+    let props1 = MessageProperties::default().with_delivery_tag(tag);
+    let props2 = MessageProperties::default().with_delivery_tag(tag);
     let props3 = MessageProperties {
         priority: Some(5),
-        ..Default::default()
+        ..MessageProperties::default().with_delivery_tag(tag)
     };
 
     assert_eq!(props1, props2);
     assert_ne!(props1, props3);
 }
 
+/// The delivery tag is a *per-message* identity, not a constant: a kombu
+/// consumer keys its unacknowledged-message table by it, so two in-flight
+/// messages sharing one make an ack drop the wrong message.
+#[test]
+fn test_each_message_gets_its_own_delivery_tag() {
+    let first = MessageProperties::default();
+    let second = MessageProperties::default();
+
+    assert_ne!(first.delivery_tag, second.delivery_tag);
+    assert!(
+        Uuid::parse_str(&first.delivery_tag).is_ok(),
+        "the tag kombu mints is a uuid string, got {:?}",
+        first.delivery_tag
+    );
+
+    let id = Uuid::new_v4();
+    let body = vec![1, 2, 3];
+    let msg1 = Message::new("tasks.add".to_string(), id, body.clone());
+    let msg2 = Message::new("tasks.add".to_string(), id, body);
+    assert_ne!(msg1.properties.delivery_tag, msg2.properties.delivery_tag);
+}
+
+/// A message with no queue of its own still names the queue it is on, so a
+/// worker's retry and `link` re-publishes come back to the same place.
+#[test]
+fn test_default_delivery_info_names_the_default_queue() {
+    let properties = MessageProperties::default();
+
+    assert_eq!(properties.delivery_info.exchange, "");
+    assert_eq!(properties.routing_key(), DEFAULT_CELERY_QUEUE);
+    assert_eq!(
+        MessageProperties::default()
+            .with_routing_key("payments")
+            .routing_key(),
+        "payments"
+    );
+}
+
 #[test]
 fn test_message_equality() {
     let id = Uuid::new_v4();
     let body = vec![1, 2, 3];
-    // `created_at` is captured per-instance at construction time; pin it so the
-    // comparison exercises the rest of the message content.
+    // `created_at` and `properties.delivery_tag` are captured per-instance at
+    // construction time; pin both so the comparison exercises the rest of the
+    // message content.
     let ts = chrono::Utc::now();
+    let tag = Uuid::new_v4().to_string();
+    let pin = |msg: &mut Message| {
+        msg.headers.created_at = Some(ts);
+        msg.properties.delivery_tag = tag.clone();
+    };
     let mut msg1 = Message::new("tasks.add".to_string(), id, body.clone());
-    msg1.headers.created_at = Some(ts);
+    pin(&mut msg1);
     let mut msg2 = Message::new("tasks.add".to_string(), id, body.clone());
-    msg2.headers.created_at = Some(ts);
+    pin(&mut msg2);
     let mut msg3 = Message::new("tasks.add".to_string(), id, vec![4, 5, 6]);
-    msg3.headers.created_at = Some(ts);
+    pin(&mut msg3);
 
     assert_eq!(msg1, msg2);
     assert_ne!(msg1, msg3);
@@ -449,21 +497,27 @@ fn test_message_equality_with_options() {
     let parent_id = Uuid::new_v4();
     let body = vec![1, 2, 3];
 
-    // `created_at` is captured per-instance at construction time; pin it so the
-    // comparison exercises priority/parent and the rest of the content.
+    // `created_at` and `properties.delivery_tag` are captured per-instance at
+    // construction time; pin both so the comparison exercises priority/parent
+    // and the rest of the content.
     let ts = chrono::Utc::now();
+    let tag = Uuid::new_v4().to_string();
+    let pin = |msg: &mut Message| {
+        msg.headers.created_at = Some(ts);
+        msg.properties.delivery_tag = tag.clone();
+    };
     let mut msg1 = Message::new("tasks.add".to_string(), id, body.clone())
         .with_priority(5)
         .with_parent(parent_id);
-    msg1.headers.created_at = Some(ts);
+    pin(&mut msg1);
     let mut msg2 = Message::new("tasks.add".to_string(), id, body.clone())
         .with_priority(5)
         .with_parent(parent_id);
-    msg2.headers.created_at = Some(ts);
+    pin(&mut msg2);
     let mut msg3 = Message::new("tasks.add".to_string(), id, body.clone())
         .with_priority(3)
         .with_parent(parent_id);
-    msg3.headers.created_at = Some(ts);
+    pin(&mut msg3);
 
     assert_eq!(msg1, msg2);
     assert_ne!(msg1, msg3);

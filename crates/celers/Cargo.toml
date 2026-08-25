@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Celery-compatible distributed task queue for Rust (Facade crate)"
 readme = "README.md"
 keywords = ["celery", "task-queue", "distributed", "async", "worker"]
@@ -80,6 +81,26 @@ backend-redis = ["celers-backend-redis", "celers-canvas/backend-redis"]
 backend-db = ["celers-backend-db"]
 backend-rpc = ["celers-backend-rpc"]
 
+# Canvas workflows
+#
+# Same bug class as `backend-redis` above, on the *consumer* side. The canvas
+# primitives themselves are always re-exported (celers-canvas is a hard
+# dependency), so a facade user can build a `Chord` or a `Chain` with no
+# feature at all — but the half that *finishes* them lives in the worker,
+# behind celers-worker's own `canvas` / `workflows` gates: the chord barrier
+# and the chain continuation in `celers_worker::worker_core`. Without this
+# forwarding a facade user could construct and apply a chord, watch the header
+# run, and never see the callback, because the worker they built has the
+# barrier compiled out.
+#
+# `workflows` pulls `backend-redis` too, and must: the barrier is counted in a
+# result backend, and `celers-worker/workflows` enables its own
+# `celers-backend-redis` regardless — forwarding it here keeps the facade's
+# re-exports (`ChordState`, `ResultBackend`) in step with what the worker can
+# actually do, instead of enabling a backend the facade cannot name.
+canvas = ["celers-worker/canvas"]
+workflows = ["canvas", "backend-redis", "celers-worker/workflows"]
+
 # Scheduler
 beat = ["celers-beat"]
 beat-cron = ["beat", "celers-beat/cron"]
@@ -97,7 +118,7 @@ tracing = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-openteleme
 dev-utils = []
 
 # Full feature set
-full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-db", "backend-rpc", "beat", "beat-cron", "beat-solar", "json", "msgpack", "metrics", "tracing", "dev-utils"]
+full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-db", "backend-rpc", "canvas", "workflows", "beat", "beat-cron", "beat-solar", "json", "msgpack", "metrics", "tracing", "dev-utils"]
 
 [dev-dependencies]
 anyhow = { workspace = true }

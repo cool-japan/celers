@@ -431,7 +431,7 @@ impl GeoReplicationManager {
 
     /// Add a region to the replication group
     pub async fn add_region(&mut self, region: Region) -> Result<()> {
-        let client = Client::open(region.redis_url.as_str()).map_err(|e| {
+        let client = crate::connection::open_client(region.redis_url.as_str()).map_err(|e| {
             CelersError::Broker(format!("Failed to connect to region {}: {}", region.id, e))
         })?;
 

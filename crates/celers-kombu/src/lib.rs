@@ -15,6 +15,16 @@
 //! - **HealthCheck**: Health monitoring interface
 //! - **Metrics**: Metrics collection interface
 //! - **Admin**: Broker administration interface
+//!
+//! # Running a worker against one of these transports
+//!
+//! The traits above move [`celers_protocol::Message`]s; a `celers_worker::Worker`
+//! consumes [`celers_core::Broker`], which moves *tasks*. The
+//! [`core_adapter`] module bridges the two: [`core_adapter::KombuBrokerAdapter`]
+//! implements `celers_core::Broker` over any transport here, which is what makes
+//! `celers_broker_amqp::AmqpBroker` and `celers_broker_sqs::SqsBroker`
+//! worker-usable. It lives behind the `core-adapter` feature (enabled for you by
+//! those two crates).
 
 mod backpressure;
 mod circuit_breaker;
@@ -35,6 +45,12 @@ mod quota;
 mod retry;
 mod scheduler;
 mod types;
+
+/// `celers_core::Broker` adapter over the transports in this crate.
+///
+/// Requires the `core-adapter` feature.
+#[cfg(feature = "core-adapter")]
+pub mod core_adapter;
 
 pub mod utils;
 

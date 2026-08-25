@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "SQL database broker implementation for CeleRS (MySQL)"
 readme = "README.md"
 keywords = ["celery", "mysql", "broker", "queue", "sql"]

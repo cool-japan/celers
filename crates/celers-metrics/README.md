@@ -1,6 +1,6 @@
 # celers-metrics
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13**
+**Version: 0.3.1 | Status: [Stable] | Tests: 354 (`--all-features`) + 50 doctests | Updated: 2026-08-26**
 
 Prometheus metrics integration for CeleRS distributed task queue monitoring. Comprehensive instrumentation with 25+ metrics for production observability.
 

@@ -101,6 +101,8 @@ pub mod profiler;
 pub mod result_store;
 pub mod retry;
 pub mod telemetry;
+/// Pure-Rust TLS provider installation for `rediss://` connections.
+pub mod tls;
 pub mod utilities;
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -116,6 +118,10 @@ mod tests_ops;
 #[path = "tests_event_wire.rs"]
 mod tests_event_wire;
 
+#[cfg(test)]
+#[path = "tests_publish.rs"]
+mod tests_publish;
+
 // ── Re-exports: preserve public API ──────────────────────────────────
 
 // types
@@ -128,6 +134,9 @@ pub use result_backend_trait::{LazyTaskResult, ResultBackend, ResultStream};
 
 // backend struct
 pub use backend::{RedisResultBackend, VersioningConfig};
+
+// TLS provider guard
+pub use tls::{install_pure_tls_provider, open_client};
 
 // query
 pub use query::TaskQuery;

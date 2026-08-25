@@ -491,6 +491,8 @@ mod execution_loop_integration {
         acked: Mutex<HashMap<TaskId, usize>>,
         requeued: Mutex<HashMap<TaskId, usize>>,
         rejected: Mutex<HashMap<TaskId, usize>>,
+        /// Every `defer` call, with the delay the worker asked for.
+        deferred: Mutex<HashMap<TaskId, Vec<Duration>>>,
     }
 
     impl ControlledBroker {
@@ -500,7 +502,18 @@ mod execution_loop_integration {
                 acked: Mutex::new(HashMap::new()),
                 requeued: Mutex::new(HashMap::new()),
                 rejected: Mutex::new(HashMap::new()),
+                deferred: Mutex::new(HashMap::new()),
             })
+        }
+
+        /// The delays this broker was asked to defer `id` for, in order.
+        fn defer_delays(&self, id: &TaskId) -> Vec<Duration> {
+            self.deferred
+                .lock()
+                .expect("lock")
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
         }
 
         fn ack_count(&self, id: &TaskId) -> usize {
@@ -564,6 +577,25 @@ mod execution_loop_integration {
             };
             *map.lock().expect("lock").entry(*task_id).or_insert(0) += 1;
             Ok(())
+        }
+
+        /// Records the deferral and then does exactly what the trait default
+        /// documents — return the message via `reject(requeue = true)` — so the
+        /// existing requeue-count assertions keep measuring what they did while
+        /// the delay the worker requested becomes observable.
+        async fn defer(
+            &self,
+            task_id: &TaskId,
+            receipt_handle: Option<&str>,
+            delay: Duration,
+        ) -> Result<()> {
+            self.deferred
+                .lock()
+                .expect("lock")
+                .entry(*task_id)
+                .or_default()
+                .push(delay);
+            self.reject(task_id, receipt_handle, true).await
         }
 
         async fn queue_size(&self) -> Result<usize> {
@@ -827,6 +859,79 @@ mod execution_loop_integration {
             stats.rate_limited() >= 1,
             "should record a rate-limited task"
         );
+
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    /// A *cluster-wide* rate limit is the one deferral that hands the broker a
+    /// real delay.
+    ///
+    /// The budget is shared, so the limiter's `retry_after` says something about
+    /// every worker, not just this one: returning the message immediately would
+    /// only move the denial to the next consumer. A broker with a delayed queue
+    /// holds it until due, which is what this asserts the worker asks for —
+    /// clamped into the configured band, so an unbounded hint from a zero-rate
+    /// limiter cannot strand the message.
+    #[tokio::test]
+    async fn test_distributed_rate_limit_defers_with_the_clamped_retry_hint() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let registry = TaskRegistry::new();
+        registry
+            .register(QuickTask {
+                runs: Arc::clone(&runs),
+            })
+            .await;
+
+        let task = serialized("quick_task");
+        let id = task.metadata.id;
+        let broker = ControlledBroker::new(vec![BrokerMessage::new(task)]);
+
+        // A zero-rate limiter with its single burst token already spent: every
+        // acquisition is denied, with an effectively unbounded retry hint.
+        let backend = Arc::new(InMemoryDistributedBackend::new());
+        let coordinator = WorkerRateLimitCoordinator::new(
+            backend as Arc<dyn celers_core::rate_limit_distributed::DistributedRateLimitBackend>,
+            RateLimitConfig::new(0.0).with_burst(1),
+        );
+        assert!(coordinator
+            .acquire("quick_task", "default")
+            .await
+            .expect("acquire")
+            .is_allowed());
+
+        let config = WorkerConfig {
+            poll_interval_ms: 10,
+            defer_delay_ms: 10,
+            defer_max_delay_ms: 40,
+            ..Default::default()
+        };
+        let worker: Worker<ControlledBroker, NoOpEventEmitter> =
+            Worker::new_from_arc(Arc::clone(&broker), registry, config)
+                .with_rate_limit_coordinator(coordinator);
+        let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+        let mut delays = Vec::new();
+        for _ in 0..300 {
+            delays = broker.defer_delays(&id);
+            if !delays.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            !delays.is_empty(),
+            "a cluster-wide denial must defer the message"
+        );
+        assert!(
+            delays
+                .iter()
+                .all(|delay| *delay >= Duration::from_millis(10)
+                    && *delay <= Duration::from_millis(40)),
+            "the limiter's retry hint must reach the broker clamped (and \
+             jittered) into [defer_delay_ms, defer_max_delay_ms], got {delays:?}"
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 0, "task must not execute");
 
         handle.shutdown().await.expect("shutdown");
     }
@@ -1154,6 +1259,79 @@ mod execution_loop_integration {
         // It must never have executed nor been acked.
         assert_eq!(runs.load(Ordering::Relaxed), 0, "task must not execute");
         assert_eq!(broker.ack_count(&id), 0, "deferred task must not be acked");
+
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    /// An admission miss must go through `Broker::defer`, not
+    /// `reject(requeue = true)`.
+    ///
+    /// The distinction is invisible on a broker that keeps no retry state (this
+    /// mock, the in-memory broker), and decisive on one that does: the Redis
+    /// broker rewrites a requeued payload to `Retrying(n + 1)`, so routing an
+    /// affinity mismatch through `reject` would dead-letter a task that merely
+    /// visited the wrong worker `max_retries` times without ever running it.
+    /// What is asserted here is the call the worker makes — and the delay it
+    /// asks for, which a broker with a delayed queue honours.
+    #[tokio::test]
+    async fn test_admission_miss_defers_instead_of_spending_a_retry() {
+        use crate::affinity::{AffinityRegistry, TaskAffinity};
+        use crate::WorkerLabels;
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let registry = TaskRegistry::new();
+        registry
+            .register(QuickTask {
+                runs: Arc::clone(&runs),
+            })
+            .await;
+
+        let task = serialized("quick_task");
+        let id = task.metadata.id;
+        let broker = ControlledBroker::new(vec![BrokerMessage::new(task)]);
+
+        let config = WorkerConfig {
+            poll_interval_ms: 10,
+            defer_delay_ms: 750,
+            defer_max_delay_ms: 750,
+            worker_labels: WorkerLabels::from_iter(["cpu"]),
+            ..Default::default()
+        };
+        let affinity =
+            AffinityRegistry::new().with_task("quick_task", TaskAffinity::new().require("gpu"));
+
+        let worker: Worker<ControlledBroker, NoOpEventEmitter> =
+            Worker::new_from_arc(Arc::clone(&broker), registry, config).with_affinity(affinity);
+        let handle = worker.run_with_shutdown().await.expect("worker starts");
+
+        let mut delays = Vec::new();
+        for _ in 0..200 {
+            delays = broker.defer_delays(&id);
+            if !delays.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            !delays.is_empty(),
+            "an unservable task must be deferred through Broker::defer"
+        );
+        assert!(
+            delays.iter().all(Duration::is_zero),
+            "an admission miss belongs to this worker, not to the task: the \
+             message must go back with no broker-side hold so a worker that \
+             *can* serve it takes it at once (got {delays:?}). \
+             `defer_delay_ms` is this worker's poll back-off, and is \
+             deliberately not forwarded here."
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 0, "task must not execute");
+        assert_eq!(broker.ack_count(&id), 0, "deferred task must not be acked");
+        assert_eq!(
+            broker.reject_count(&id),
+            0,
+            "a deferral is not a dead-letter rejection"
+        );
 
         handle.shutdown().await.expect("shutdown");
     }

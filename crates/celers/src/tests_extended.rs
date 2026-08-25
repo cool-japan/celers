@@ -1189,17 +1189,36 @@ fn test_performance_profiling_slowest_operations() {
 
     let profiler = PerformanceProfiler::new();
 
-    // Use larger time gaps to avoid flakiness under system load
+    // `PerformanceProfiler::end_span` always measures a real
+    // `Instant::elapsed()` -- there is no API to inject a recorded/fabricated
+    // duration -- so this test's ordering assertions below are inescapably
+    // real wall-clock measurements. `thread::sleep` only ever overshoots its
+    // requested duration (a delayed wakeup), never returns early, so a narrow
+    // gap between two operations' nominal durations is a one-sided bet: only
+    // the smaller operation's sleep overshooting can invert the ranking, never
+    // the larger one's finishing early. The previous 10ms/50ms/150ms durations
+    // (40ms and 100ms gaps) left that bet open -- reported by the full-suite
+    // run as flaking under real contention (hundreds of test binaries on one
+    // shared machine), though this file's own load test could not reproduce
+    // it locally, consistent with that being a rarer, heavier-contention event
+    // than a single machine easily recreates on demand.
+    //
+    // Widened to gaps of 280ms (fast -> medium) and 900ms (medium -> slow):
+    // margins an order of magnitude past typical scheduler jitter, even under
+    // heavy contention, while still exercising exactly what this test is
+    // for -- `get_slowest_operations` ranking multiple recorded operations by
+    // measured total duration, including that insertion order ("fast_op",
+    // then "slow_op", then "medium_op") is not what determines the ranking.
     profiler.start_span("fast_op");
-    thread::sleep(Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(20));
     profiler.end_span();
 
     profiler.start_span("slow_op");
-    thread::sleep(Duration::from_millis(150));
+    thread::sleep(Duration::from_millis(1200));
     profiler.end_span();
 
     profiler.start_span("medium_op");
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(300));
     profiler.end_span();
 
     let slowest = profiler.get_slowest_operations(2);

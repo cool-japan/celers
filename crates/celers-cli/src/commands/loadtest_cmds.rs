@@ -1601,7 +1601,26 @@ mod tests {
         let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
         let signer = celers_core::TaskSigner::new(key);
         let mut verified = 0;
-        while let Ok(Some(msg)) = broker.try_dequeue().await {
+        // `dequeue()`, not `try_dequeue()`: `Broker::try_dequeue`'s default
+        // implementation (which `RedisBroker` inherits -- it overrides
+        // `dequeue`/`dequeue_batch` but not `try_dequeue` itself) polls the
+        // `dequeue()` future exactly once and treats `Pending` as "nothing
+        // available" (see its doc comment's own "brokers whose dequeue waits
+        // for a message... should override this"). `RedisBroker::dequeue`
+        // performs real network I/O (pool checkout, then a maintenance and a
+        // pop EVAL against Redis), which essentially never resolves on a
+        // single poll, so `try_dequeue()` against a live Redis broker
+        // essentially always returns `Ok(None)` -- even with messages
+        // present (confirmed empirically: both signing tests here returned 0
+        // messages found, every run, before this fix). Calling the real,
+        // properly-awaited `dequeue()` exactly `cfg.total` times (the known
+        // count just enqueued) sidesteps that trap entirely.
+        for _ in 0..cfg.total {
+            let msg = broker
+                .dequeue()
+                .await
+                .expect("dequeue must not error")
+                .expect("exactly cfg.total tasks were enqueued and must all be dequeuable");
             let envelope = msg
                 .task
                 .metadata
@@ -1636,7 +1655,16 @@ mod tests {
 
         let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
         let mut seen = 0;
-        while let Ok(Some(msg)) = broker.try_dequeue().await {
+        // `dequeue()`, not `try_dequeue()` -- see the matching comment in
+        // `run_loadtest_signs_every_task_when_a_signing_key_is_given` for why
+        // `try_dequeue()` against a live `RedisBroker` cannot see a message
+        // that is genuinely present.
+        for _ in 0..cfg.total {
+            let msg = broker
+                .dequeue()
+                .await
+                .expect("dequeue must not error")
+                .expect("exactly cfg.total tasks were enqueued and must all be dequeuable");
             assert!(
                 msg.task.metadata.signature.is_none(),
                 "without a signing key, no task must carry a signature"

@@ -232,7 +232,7 @@ impl Default for AdaptivePoolStats {
 impl AdaptiveConnectionPool {
     /// Create a new adaptive connection pool
     pub async fn new(redis_url: &str, config: AdaptivePoolConfig) -> Result<Self> {
-        let client = Client::open(redis_url)
+        let client = crate::connection::open_client(redis_url)
             .map_err(|e| CelersError::Broker(format!("Failed to connect to Redis: {}", e)))?;
 
         let pool = Self {

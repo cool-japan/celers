@@ -1176,16 +1176,25 @@ fn test_wfq_serialization() {
 
 #[tokio::test]
 async fn test_tick_without_heartbeat() {
-    // Single instance mode - tick returns due tasks
+    // Single instance mode - tick returns due tasks.
+    //
+    // `Schedule::interval(1).next_run` is anchored to
+    // `ScheduledTask::schedule_base()` (`created_at` for a task that has
+    // never run -- see that method's doc), which is real `chrono::Utc::now()`
+    // wall-clock time inside `BeatScheduler::tick()`, not a `tokio` timer --
+    // `tokio::time::pause`/`advance` cannot substitute for waiting here.
+    // Backdating `created_at` gets the identical "already past its first
+    // occurrence" state deterministically instead of actually waiting for it,
+    // matching the established local idiom (see
+    // `test_tick_with_locks_dedupes_across_instances` below, which backdates
+    // `last_run_at` the same way for the same reason).
     let mut scheduler = BeatScheduler::new();
     scheduler
-        .add_task(ScheduledTask::new(
-            "test_task".to_string(),
-            Schedule::interval(1),
-        ))
+        .add_task(
+            ScheduledTask::new("test_task".to_string(), Schedule::interval(1))
+                .with_created_at(Utc::now() - Duration::seconds(2)),
+        )
         .expect("failed to add task");
-    // Wait for task to become due
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let due = scheduler.tick().await.expect("tick failed");
     assert!(
         !due.is_empty(),
@@ -1214,13 +1223,16 @@ async fn test_tick_as_leader() {
 
     let mut scheduler = BeatScheduler::new();
     scheduler.with_heartbeat(hb);
+    // Backdated `created_at` deterministically puts the task past its first
+    // occurrence instead of sleeping for real elapsed time; see
+    // `test_tick_without_heartbeat` above for why a `tokio` timer cannot
+    // substitute for that wait.
     scheduler
-        .add_task(ScheduledTask::new(
-            "test_task".to_string(),
-            Schedule::interval(1),
-        ))
+        .add_task(
+            ScheduledTask::new("test_task".to_string(), Schedule::interval(1))
+                .with_created_at(Utc::now() - Duration::seconds(2)),
+        )
         .expect("failed to add task");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let due = scheduler.tick().await.expect("tick failed");
     assert!(!due.is_empty(), "leader tick should return due tasks");
@@ -1259,13 +1271,14 @@ async fn test_tick_as_standby_returns_empty() {
 
     let mut scheduler = BeatScheduler::new();
     scheduler.with_heartbeat(hb2);
+    // Backdated `created_at`, not a real wait; see
+    // `test_tick_without_heartbeat` above.
     scheduler
-        .add_task(ScheduledTask::new(
-            "test_task".to_string(),
-            Schedule::interval(1),
-        ))
+        .add_task(
+            ScheduledTask::new("test_task".to_string(), Schedule::interval(1))
+                .with_created_at(Utc::now() - Duration::seconds(2)),
+        )
         .expect("failed to add task");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let due = scheduler.tick().await.expect("tick failed");
     assert!(due.is_empty(), "standby tick should not return tasks");
@@ -1340,13 +1353,14 @@ async fn test_heartbeat_tick_as_leader() {
 #[tokio::test]
 async fn test_get_leader_due_tasks_single_instance() {
     let mut scheduler = BeatScheduler::new();
+    // Backdated `created_at`, not a real wait; see
+    // `test_tick_without_heartbeat` above.
     scheduler
-        .add_task(ScheduledTask::new(
-            "task1".to_string(),
-            Schedule::interval(1),
-        ))
+        .add_task(
+            ScheduledTask::new("task1".to_string(), Schedule::interval(1))
+                .with_created_at(Utc::now() - Duration::seconds(2)),
+        )
         .expect("failed to add task");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let due = scheduler.get_leader_due_tasks().await;
     assert!(!due.is_empty(), "single-instance should return due tasks");
@@ -1383,13 +1397,14 @@ async fn test_get_leader_due_tasks_standby() {
 
     let mut scheduler = BeatScheduler::new();
     scheduler.with_heartbeat(hb2);
+    // Backdated `created_at`, not a real wait; see
+    // `test_tick_without_heartbeat` above.
     scheduler
-        .add_task(ScheduledTask::new(
-            "task1".to_string(),
-            Schedule::interval(1),
-        ))
+        .add_task(
+            ScheduledTask::new("task1".to_string(), Schedule::interval(1))
+                .with_created_at(Utc::now() - Duration::seconds(2)),
+        )
         .expect("failed to add task");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let due = scheduler.get_leader_due_tasks().await;
     assert!(due.is_empty(), "standby should not return due tasks");
@@ -1760,14 +1775,14 @@ async fn test_tick_with_locks_single_instance_dispatches() {
     // Without a shared backend a single instance dispatches its due entry.
     let mut scheduler = BeatScheduler::new();
     scheduler.with_lock_backend(Arc::new(InMemoryLockBackend::new()));
+    // Backdated `created_at`, not a real wait; see
+    // `test_tick_without_heartbeat` above.
     scheduler
-        .add_task(ScheduledTask::new(
-            "solo".to_string(),
-            Schedule::interval(1),
-        ))
+        .add_task(
+            ScheduledTask::new("solo".to_string(), Schedule::interval(1))
+                .with_created_at(Utc::now() - Duration::seconds(2)),
+        )
         .expect("add task");
-
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let dispatched = scheduler
         .tick_with_locks(DEFAULT_DISPATCH_LOCK_TTL_SECS)
@@ -1847,13 +1862,14 @@ async fn test_tick_with_locks_standby_dispatches_nothing() {
     let mut standby = BeatScheduler::new();
     standby.with_heartbeat(hb2);
     standby.with_lock_backend(lock_backend);
+    // Backdated `created_at`, not a real wait; see
+    // `test_tick_without_heartbeat` above.
     standby
-        .add_task(ScheduledTask::new(
-            "should_not_run".to_string(),
-            Schedule::interval(1),
-        ))
+        .add_task(
+            ScheduledTask::new("should_not_run".to_string(), Schedule::interval(1))
+                .with_created_at(Utc::now() - Duration::seconds(2)),
+        )
         .expect("add task");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let dispatched = standby
         .tick_with_locks(DEFAULT_DISPATCH_LOCK_TTL_SECS)

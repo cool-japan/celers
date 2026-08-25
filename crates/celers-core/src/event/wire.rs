@@ -27,12 +27,18 @@
 //! `loadavg`, `freq`) already uses Celery's own field names and travels
 //! through unchanged.
 //!
-//! This module is the single bridge between the two: [`Event::to_wire_value`]
-//! and friends render the wire shape, [`Event::from_wire_value`] and friends
-//! parse it back. The conversion is lossless for every event produced by the
-//! builders in this crate, whose timestamps carry the microsecond resolution a
-//! float Unix timestamp can represent exactly (see
-//! [`event_timestamp_now`]).
+//! This module renders and parses that shape: [`Event::to_wire_value`] and
+//! friends produce it, [`Event::from_wire_value`] and friends read it back.
+//! The field mapping itself is not done here — it is the typed
+//! `Event <-> EventMessage` conversion in [`super::message`], which this module
+//! wraps with the envelope and the JSON encoding. The conversion is lossless
+//! for every event produced by the builders in this crate, whose timestamps
+//! carry the microsecond resolution a float Unix timestamp can represent
+//! exactly (see [`event_timestamp_now`]).
+//!
+//! The exact bytes are pinned by `wire_json_is_byte_for_byte_stable` in this
+//! module's tests: they are a published interface that a Python Celery monitor
+//! parses, so changing them is a breaking change.
 //!
 //! # Reading a Python Celery worker's events
 //!
@@ -553,113 +559,113 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{TaskEvent, TaskEventBuilder, WorkerEvent, WorkerEventBuilder};
+    use crate::event::test_events::{at, every_event};
+    use crate::event::{TaskEvent, TaskEventBuilder, WorkerEventBuilder};
     use uuid::Uuid;
 
-    fn at(rfc3339: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(rfc3339)
-            .expect("valid RFC3339 fixture")
-            .with_timezone(&Utc)
-    }
+    /// The exact bytes CeleRS puts on the `celeryev` channel, for every event
+    /// it can publish.
+    ///
+    /// Captured from the JSON-mediated implementation this bridge replaced, so
+    /// it is evidence that the switch to a typed
+    /// [`EventMessage`](celers_protocol::event::EventMessage) conversion did
+    /// not move a single byte. It stays useful afterwards for its own sake:
+    /// these bytes are a published interface that a Python Celery monitor
+    /// parses, and changing them silently is the failure this pins down.
+    ///
+    /// If this test fails, the wire format changed. That is a breaking change
+    /// for every existing consumer — update the fixture only together with a
+    /// CHANGELOG entry saying so.
+    #[test]
+    fn wire_json_is_byte_for_byte_stable() {
+        // A fully specified envelope: fixed clock and pid so the rendering is
+        // deterministic, plus a fallback hostname that must appear on exactly
+        // the events carrying no hostname of their own.
+        let envelope = EventEnvelope::default()
+            .with_clock(11)
+            .with_utcoffset(0)
+            .with_pid(4242)
+            .with_hostname("celery@publisher");
 
-    /// Every event a worker can publish, with fixed microsecond timestamps so
-    /// the round trip can be asserted for exact equality.
-    fn every_event() -> Vec<Event> {
-        let task_id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
-        let timestamp = at("2026-03-04T05:06:07.123456Z");
-        vec![
-            Event::Task(TaskEvent::Sent {
-                task_id,
-                task_name: "tasks.add".to_string(),
-                queue: "celery".to_string(),
-                timestamp,
-                args: Some("[1, 2]".to_string()),
-                kwargs: Some("{}".to_string()),
-                eta: Some(at("2026-03-04T05:10:00Z")),
-                expires: Some(at("2026-03-04T06:00:00Z")),
-                retries: Some(1),
-            }),
-            Event::Task(TaskEvent::Received {
-                task_id,
-                task_name: "tasks.add".to_string(),
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                pid: 4242,
-            }),
-            Event::Task(TaskEvent::Started {
-                task_id,
-                task_name: "tasks.add".to_string(),
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                pid: 4242,
-            }),
-            Event::Task(TaskEvent::Succeeded {
-                task_id,
-                task_name: "tasks.add".to_string(),
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                runtime: 1.5,
-                result: Some("3".to_string()),
-            }),
-            Event::Task(TaskEvent::Failed {
-                task_id,
-                task_name: "tasks.add".to_string(),
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                exception: "ValueError('bad')".to_string(),
-                traceback: Some("Traceback...".to_string()),
-            }),
-            Event::Task(TaskEvent::Retried {
-                task_id,
-                task_name: "tasks.add".to_string(),
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                exception: "Timeout".to_string(),
-                retries: 2,
-            }),
-            Event::Task(TaskEvent::Revoked {
-                task_id,
-                task_name: Some("tasks.add".to_string()),
-                timestamp,
-                terminated: true,
-                signum: Some(9),
-                expired: false,
-            }),
-            Event::Task(TaskEvent::Rejected {
-                task_id,
-                task_name: Some("tasks.add".to_string()),
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                reason: "queue full".to_string(),
-            }),
-            Event::Task(TaskEvent::SoftTimeLimitExceeded {
-                task_id,
-                task_name: "tasks.add".to_string(),
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                elapsed_secs: 30.25,
-                limit_secs: 30.0,
-            }),
-            Event::Worker(WorkerEvent::Online {
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                sw_ident: "celers".to_string(),
-                sw_ver: "0.3.1".to_string(),
-                sw_sys: "linux".to_string(),
-            }),
-            Event::Worker(WorkerEvent::Offline {
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-            }),
-            Event::Worker(WorkerEvent::Heartbeat {
-                hostname: "celery@worker-1".to_string(),
-                timestamp,
-                active: 3,
-                processed: 100,
-                loadavg: Some([1.0, 0.8, 0.5]),
-                freq: 2.0,
-            }),
-        ]
+        let expected: [(&str, &str); 12] = [
+            (
+                "task-sent",
+                r#"{"args":"[1, 2]","clock":11,"eta":"2026-03-04T05:10:00Z","expires":"2026-03-04T06:00:00Z","hostname":"celery@publisher","kwargs":"{}","name":"tasks.add","pid":4242,"queue":"celery","retries":1,"timestamp":1772600767.123456,"type":"task-sent","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "task-received",
+                r#"{"clock":11,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"timestamp":1772600767.123456,"type":"task-received","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "task-started",
+                r#"{"clock":11,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"timestamp":1772600767.123456,"type":"task-started","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "task-succeeded",
+                r#"{"clock":11,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"result":"3","runtime":1.5,"timestamp":1772600767.123456,"type":"task-succeeded","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "task-failed",
+                r#"{"clock":11,"exception":"ValueError('bad')","hostname":"celery@worker-1","name":"tasks.add","pid":4242,"timestamp":1772600767.123456,"traceback":"Traceback...","type":"task-failed","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "task-retried",
+                r#"{"clock":11,"exception":"Timeout","hostname":"celery@worker-1","name":"tasks.add","pid":4242,"retries":2,"timestamp":1772600767.123456,"type":"task-retried","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "task-revoked",
+                r#"{"clock":11,"expired":false,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"signum":9,"terminated":true,"timestamp":1772600767.123456,"type":"task-revoked","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "task-rejected",
+                r#"{"clock":11,"hostname":"celery@worker-1","name":"tasks.add","pid":4242,"reason":"queue full","timestamp":1772600767.123456,"type":"task-rejected","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "task-soft-time-limit-exceeded",
+                r#"{"clock":11,"elapsed_secs":30.25,"hostname":"celery@worker-1","limit_secs":30.0,"name":"tasks.add","pid":4242,"timestamp":1772600767.123456,"type":"task-soft-time-limit-exceeded","utcoffset":0,"uuid":"12345678-9abc-def0-1234-56789abcdef0"}"#,
+            ),
+            (
+                "worker-online",
+                r#"{"clock":11,"hostname":"celery@worker-1","pid":4242,"sw_ident":"celers","sw_sys":"linux","sw_ver":"0.3.1","timestamp":1772600767.123456,"type":"worker-online","utcoffset":0}"#,
+            ),
+            (
+                "worker-offline",
+                r#"{"clock":11,"hostname":"celery@worker-1","pid":4242,"timestamp":1772600767.123456,"type":"worker-offline","utcoffset":0}"#,
+            ),
+            (
+                "worker-heartbeat",
+                r#"{"active":3,"clock":11,"freq":2.0,"hostname":"celery@worker-1","loadavg":[1.0,0.8,0.5],"pid":4242,"processed":100,"timestamp":1772600767.123456,"type":"worker-heartbeat","utcoffset":0}"#,
+            ),
+        ];
+
+        let events = every_event();
+        assert_eq!(
+            events.len(),
+            expected.len(),
+            "every event must have a fixture; add the new variant's bytes here"
+        );
+
+        for (event, (event_type, wire_json)) in events.iter().zip(expected) {
+            assert_eq!(
+                event.event_type(),
+                event_type,
+                "fixture order does not match every_event()"
+            );
+            assert_eq!(
+                event
+                    .to_wire_json_with(&envelope)
+                    .unwrap_or_else(|e| panic!("{event_type} should render: {e}")),
+                wire_json,
+                "the wire bytes for {event_type} changed"
+            );
+
+            // ...and those exact bytes still parse back into the same event.
+            assert_eq!(
+                &Event::from_wire_str(wire_json)
+                    .unwrap_or_else(|e| panic!("{event_type} fixture should parse: {e}")),
+                event
+            );
+        }
     }
 
     #[test]
@@ -839,7 +845,7 @@ mod tests {
     /// mixed cluster these arrive whether or not anyone planned for it.
     #[test]
     fn python_celery_events_parse_into_the_typed_model() {
-        let cases: [(&str, &str); 7] = [
+        let cases: [(&str, &str); 8] = [
             (
                 "task-sent",
                 r#"{"type":"task-sent","uuid":"7b1a0d1e-0000-4000-8000-000000000001","name":"tasks.add","args":"(1, 2)","kwargs":"{}","retries":0,"eta":null,"expires":null,"queue":"celery","exchange":"","routing_key":"celery","root_id":null,"parent_id":null,"hostname":"gen12345@client","timestamp":1774000000.123456,"pid":12345,"clock":1,"utcoffset":0}"#,
@@ -865,6 +871,13 @@ mod tests {
                 // Celery's task-retried carries no retry count.
                 "task-retried",
                 r#"{"type":"task-retried","uuid":"7b1a0d1e-0000-4000-8000-000000000002","exception":"Timeout()","traceback":"Traceback (most recent call last):\n","hostname":"celery@worker-1","timestamp":1774000001.123456,"pid":42,"clock":6,"utcoffset":0}"#,
+            ),
+            (
+                // Celery's `Request.revoked()` goes through the event
+                // dispatcher like every other worker event, so `hostname`
+                // names the worker that dropped the task.
+                "task-revoked",
+                r#"{"type":"task-revoked","uuid":"7b1a0d1e-0000-4000-8000-000000000002","terminated":true,"signum":9,"expired":false,"hostname":"celery@worker-1","timestamp":1774000001.223456,"pid":42,"clock":7,"utcoffset":0}"#,
             ),
             (
                 "worker-heartbeat",
@@ -893,6 +906,46 @@ mod tests {
             panic!("task-retried maps onto TaskEvent::Retried");
         };
         assert_eq!(retries, 0, "Celery's task-retried carries no retry count");
+
+        let revoked = Event::from_wire_str(cases[6].1).expect("task-revoked");
+        let Event::Task(TaskEvent::Revoked { ref hostname, .. }) = revoked else {
+            panic!("task-revoked maps onto TaskEvent::Revoked");
+        };
+        assert_eq!(
+            hostname, "celery@worker-1",
+            "a monitor must be able to tell which worker revoked the task"
+        );
+        assert_eq!(revoked.hostname(), Some("celery@worker-1"));
+    }
+
+    /// A `task-revoked` written before the variant carried a hostname must
+    /// still parse.
+    ///
+    /// CeleRS 0.3.0 rendered the event with no `hostname` of its own, so
+    /// during a rolling upgrade a 0.3.1 monitor reads both shapes. Losing the
+    /// whole revocation over a missing field would be strictly worse than
+    /// reading it with an empty hostname, which is what
+    /// `Reader::hostname_or_default` trades for.
+    #[test]
+    fn a_task_revoked_without_a_hostname_still_parses() {
+        let json = r#"{"type":"task-revoked","uuid":"7b1a0d1e-0000-4000-8000-000000000002","terminated":false,"expired":true,"timestamp":1774000001.223456,"clock":7,"utcoffset":0}"#;
+
+        let event = Event::from_wire_str(json).expect("a hostname-less revocation still parses");
+        let Event::Task(TaskEvent::Revoked {
+            ref hostname,
+            expired,
+            terminated,
+            ..
+        }) = event
+        else {
+            panic!("task-revoked maps onto TaskEvent::Revoked");
+        };
+        assert_eq!(
+            hostname, "",
+            "the missing field reads as empty, not as an error"
+        );
+        assert!(expired);
+        assert!(!terminated);
     }
 
     #[test]

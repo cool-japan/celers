@@ -16,10 +16,21 @@ use lapin::Confirmation;
 use std::time::Duration;
 
 /// AMQP URL of a live broker to run integration tests against, if any.
+///
+/// Prints a visible, greppable skip line naming the call site (via
+/// `#[track_caller]`) when unconfigured — a bare `None` here previously let a
+/// skipped run and a real run both report `ok` with nothing in the log to
+/// tell them apart.
+#[track_caller]
 fn integration_url() -> Option<String> {
-    std::env::var("CELERS_TEST_AMQP_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
+    match std::env::var("CELERS_TEST_AMQP_URL") {
+        Ok(url) if !url.is_empty() => Some(url),
+        _ => {
+            let location = std::panic::Location::caller();
+            eprintln!("SKIPPED: {location} (set CELERS_TEST_AMQP_URL to run)");
+            None
+        }
+    }
 }
 
 fn test_message(task: &str) -> celers_protocol::Message {
@@ -350,6 +361,53 @@ async fn peek_queue_returns_distinct_messages_against_a_live_broker() {
 
     // The messages must still be in the queue afterwards.
     assert_eq!(broker.queue_size(&queue).await.unwrap_or(0), 3);
+
+    let _ = broker.delete_queue(&queue).await;
+}
+
+/// `publish` must target the exchange the topology actually declared.
+///
+/// Regression: `Producer::publish` hardcoded the exchange `"celery"` while
+/// `setup_topology`, `publish_batch` and every other publishing path used
+/// [`AmqpConfig::default_exchange`]. The two agreed only for the default value,
+/// so a broker configured with `with_exchange` declared and bound one
+/// exchange and published to another — RabbitMQ answers that with a 404 that
+/// closes the channel, so `publish` failed while `publish_batch` on the same
+/// broker worked.
+///
+/// Needs a live broker: the divergence is only observable as a routing outcome.
+#[tokio::test]
+async fn publish_uses_the_configured_default_exchange() {
+    let Some(url) = integration_url() else {
+        return;
+    };
+
+    let queue = format!("celers_test_exchange_{}", uuid::Uuid::new_v4().simple());
+    let exchange = format!("celers_test_exchange_x_{}", uuid::Uuid::new_v4().simple());
+    let config = AmqpConfig::default().with_exchange(exchange.clone());
+
+    let mut broker = AmqpBroker::with_config(&url, &queue, config)
+        .await
+        .expect("broker construction");
+    broker
+        .connect()
+        .await
+        .expect("connect declares and binds the configured exchange");
+
+    // Before the fix this failed with a 404 on the never-declared "celery"
+    // exchange rather than routing anywhere.
+    broker
+        .publish(&queue, test_message("tasks.exchange"))
+        .await
+        .expect("publish must reach the declared exchange");
+
+    let envelope = broker
+        .consume(&queue, Duration::from_secs(3))
+        .await
+        .expect("consume")
+        .expect("the message must have been routed to the bound queue");
+    assert_eq!(envelope.message.headers.task, "tasks.exchange");
+    broker.ack(&envelope.delivery_tag).await.expect("ack");
 
     let _ = broker.delete_queue(&queue).await;
 }

@@ -117,6 +117,9 @@ pub use broker_batch::*;
 // Diagnostics, profiling, and statistics
 mod broker_diagnostics;
 
+mod revocation;
+pub use revocation::MysqlRevocationStream;
+
 // Monitoring utilities
 pub mod monitoring;
 pub mod utilities;

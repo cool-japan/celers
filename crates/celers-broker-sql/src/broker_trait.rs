@@ -297,6 +297,46 @@ impl Broker for MysqlBroker {
         Ok(affected > 0)
     }
 
+    /// Revoke a task, optionally aborting a copy that is already running.
+    ///
+    /// The revocation is **durable**: the id is recorded in
+    /// `celers_revoked_tasks` (scored by `expires_at`, pruned on every call)
+    /// and [`is_revoked`](Self::is_revoked) refuses it for as long as that
+    /// row lives — so a task that is still `pending` really is cancelled, and
+    /// one enqueued again under the same id before the record lapses is
+    /// refused too. See `revocation.rs` for the full design, including why
+    /// there is no LISTEN/NOTIFY-style push here (MySQL has none) and why
+    /// the claim query itself is not filtered against this table.
+    ///
+    /// A [`RevocationNotice`](celers_core::revocation_channel::RevocationNotice)
+    /// becomes visible to
+    /// [`subscribe_revocations`](Self::subscribe_revocations)'s poller within
+    /// one poll interval — this is the one place this broker's revocation
+    /// support is slower than Redis's or Postgres's, and it is documented as
+    /// such rather than hidden.
+    ///
+    /// Returns `true` once the revocation is recorded.
+    async fn revoke(&self, task_id: &TaskId, terminate: bool) -> Result<bool> {
+        self.record_revocation(task_id, terminate).await
+    }
+
+    /// Whether `task_id` is listed in the durable `celers_revoked_tasks` set
+    /// for this broker's queue, with a still-live `expires_at`.
+    async fn is_revoked(&self, task_id: &TaskId) -> Result<bool> {
+        self.read_revocation(task_id).await
+    }
+
+    /// Subscribe to this broker's revocations.
+    ///
+    /// Backed by [`crate::MysqlRevocationStream`], which polls
+    /// `celers_revoked_tasks` — see `revocation.rs` for why (MySQL has no
+    /// LISTEN/NOTIFY) and the latency that implies.
+    async fn subscribe_revocations(
+        &self,
+    ) -> Result<Option<Box<dyn celers_core::revocation_channel::RevocationStream>>> {
+        Ok(Some(Box::new(self.open_revocation_poller())))
+    }
+
     /// Schedule a task for execution at a specific Unix timestamp (seconds)
     async fn enqueue_at(&self, task: SerializedTask, execute_at: i64) -> Result<TaskId> {
         let task_id = task.metadata.id;

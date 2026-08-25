@@ -44,7 +44,7 @@ async fn broker_on_new_queue(test_name: &str) -> Option<(PostgresBroker, String)
     let url = match test_pg_url() {
         Some(url) => url,
         None => {
-            eprintln!("skipping {test_name}: CELERS_TEST_POSTGRES_URL is not set");
+            eprintln!("SKIPPED: {test_name} (set CELERS_TEST_POSTGRES_URL to run)");
             return None;
         }
     };
@@ -573,7 +573,10 @@ async fn pool_reports_real_occupancy_and_survives_concurrent_work() {
     let url = match test_pg_url() {
         Some(url) => url,
         None => {
-            eprintln!("skipping pool_reports_real_occupancy: CELERS_TEST_POSTGRES_URL is not set");
+            eprintln!(
+                "SKIPPED: pool_reports_real_occupancy_and_survives_concurrent_work \
+                 (set CELERS_TEST_POSTGRES_URL to run)"
+            );
             return;
         }
     };
@@ -1258,4 +1261,103 @@ async fn get_cancellation_reasons_groups_and_counts_reasons() {
         .find(|(reason, _)| reason.as_deref() == Some("Cancelled: operator request"))
         .map(|(_, count)| *count);
     assert_eq!(operator_count, Some(1));
+}
+
+// ========== Revocation (idx 1: durable revoked-task set) ==========
+
+#[tokio::test]
+async fn revoke_removes_a_pending_task_and_is_revoked_reflects_it() {
+    let (broker, _queue) =
+        broker_or_skip!("revoke_removes_a_pending_task_and_is_revoked_reflects_it");
+
+    let task = SerializedTask::new("revoke_pending".to_string(), vec![]);
+    let task_id = broker.enqueue(task).await.expect("enqueue");
+
+    assert!(
+        !broker.is_revoked(&task_id).await.expect("is_revoked"),
+        "a freshly enqueued task must not already be revoked"
+    );
+
+    let recorded = broker.revoke(&task_id, false).await.expect("revoke");
+    assert!(recorded, "revoke() must report the revocation as recorded");
+
+    assert!(
+        broker.is_revoked(&task_id).await.expect("is_revoked"),
+        "revoke() must be durably visible through is_revoked()"
+    );
+
+    // The pending copy is cancelled outright — dequeue must not hand it out.
+    assert!(
+        broker.dequeue().await.expect("dequeue").is_none(),
+        "a revoked pending task must not be claimable"
+    );
+
+    let info = broker
+        .get_task(&task_id)
+        .await
+        .expect("get_task")
+        .expect("the revoked row must still exist for audit purposes");
+    assert_eq!(info.state.to_string(), "cancelled");
+}
+
+#[tokio::test]
+async fn is_revoked_is_false_for_a_task_that_was_never_revoked() {
+    let (broker, _queue) = broker_or_skip!("is_revoked_is_false_for_a_task_that_was_never_revoked");
+
+    let unknown_id = Uuid::new_v4();
+    assert!(!broker.is_revoked(&unknown_id).await.expect("is_revoked"));
+}
+
+#[tokio::test]
+async fn revoke_publishes_a_notice_a_subscriber_can_observe() {
+    let (broker, _queue) = broker_or_skip!("revoke_publishes_a_notice_a_subscriber_can_observe");
+
+    let mut stream = broker
+        .subscribe_revocations()
+        .await
+        .expect("subscribe_revocations")
+        .expect("PostgresBroker must publish a revocation stream");
+
+    let task = SerializedTask::new("revoke_notice".to_string(), vec![]);
+    let task_id = broker.enqueue(task).await.expect("enqueue");
+
+    broker
+        .revoke(&task_id, true)
+        .await
+        .expect("revoke with terminate=true");
+
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv())
+        .await
+        .expect("a notice must arrive well within the listener's poll timeout")
+        .expect("recv must not error")
+        .expect("recv must not report the stream as ended");
+
+    assert_eq!(notice.task_id, task_id);
+    assert!(
+        notice.terminate,
+        "terminate=true must survive onto the wire"
+    );
+}
+
+#[tokio::test]
+async fn revocation_lapses_once_its_ttl_elapses() {
+    let (broker, queue) = broker_or_skip!("revocation_lapses_once_its_ttl_elapses");
+    // A fresh, very short-lived broker on the SAME queue: `with_revocation_ttl`
+    // is a per-instance setting, not a per-row one, so the row this broker
+    // writes must be read back through an equally-short-TTL'd broker (or, as
+    // here, the same one) — a one-second TTL is generous enough not to be
+    // flaky against real network latency while still finishing quickly.
+    let broker = broker.with_revocation_ttl(1);
+
+    let task = SerializedTask::new("revoke_ttl".to_string(), vec![]);
+    let task_id = broker.enqueue(task).await.expect("enqueue");
+    broker.revoke(&task_id, false).await.expect("revoke");
+    assert!(broker.is_revoked(&task_id).await.expect("is_revoked"));
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    assert!(
+        !broker.is_revoked(&task_id).await.expect("is_revoked"),
+        "a revocation older than its TTL must lapse in queue {queue}"
+    );
 }

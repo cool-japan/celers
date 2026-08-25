@@ -479,19 +479,38 @@ impl ObservabilityMiddleware {
         &self.service_name
     }
 
+    /// Emit one observability event at the configured [`Self::with_log_level`].
+    ///
+    /// `tracing`'s level-specific macros (`trace!`/`debug!`/.../`error!`)
+    /// each need a compile-time level, so a runtime-configured level string
+    /// is dispatched with a match rather than embedded in the message text —
+    /// the previous `eprintln!` baked `level=` into the formatted string,
+    /// which bypassed every level filter (`RUST_LOG` included) instead of
+    /// honouring one.
     fn log(&self, event: &str, message: &Message) {
         if !self.enable_logging {
             return;
         }
-        eprintln!(
-            "[{}] level={} event={} task={} id={} body_size={}",
-            self.service_name,
-            self.log_level,
-            event,
-            message.task_name(),
-            message.task_id(),
-            message.body.len()
-        );
+        let service = self.service_name.as_str();
+        let task = message.task_name();
+        let id = message.task_id();
+        let body_size = message.body.len();
+        match self.log_level.as_str() {
+            "trace" => {
+                tracing::trace!(service, event, task, %id, body_size, "Observability event")
+            }
+            "debug" => {
+                tracing::debug!(service, event, task, %id, body_size, "Observability event")
+            }
+            "warn" => tracing::warn!(service, event, task, %id, body_size, "Observability event"),
+            "error" => {
+                tracing::error!(service, event, task, %id, body_size, "Observability event")
+            }
+            // Unrecognised levels fall back to "info", matching the
+            // constructor's own default (`ObservabilityMiddleware::new` sets
+            // `log_level: "info".to_string()`).
+            _ => tracing::info!(service, event, task, %id, body_size, "Observability event"),
+        }
     }
 }
 

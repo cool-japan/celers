@@ -1,21 +1,32 @@
 # celers
 
-Production-ready, Celery-compatible distributed task queue library for Rust. Binary-level protocol compatibility with Python Celery while delivering superior performance, type safety, and reliability.
+Celery-protocol-compatible distributed task queue library for Rust: a type-safe, Pure-Rust task runtime that speaks Python Celery's message format.
 
-**Status: [Stable] — v0.3.1 (2026-07-13) — 145 tests**
+**Status: [Stable] — v0.3.1 (2026-08-26) — 172 tests + 20 doctests**
 
 ## Overview
 
 **CeleRS** provides:
 
-- ✅ **Celery Compatibility**: Binary protocol compatible with Python Celery 4.x/5.x
+- ✅ **Celery protocol compatibility**: the v2 wire format, **interop-verified against a live Python
+  Celery 5.6.3** in both directions. Note the boundary: the *broker* and *result backend* do not yet
+  speak that format, so a Python worker and a CeleRS worker cannot share a queue —
+  see [docs/CELERY_COMPATIBILITY.md](../../docs/CELERY_COMPATIBILITY.md)
 - ✅ **Type Safety**: Compile-time guarantees for task signatures
-- ✅ **High Performance**: 10-100x throughput vs Python Celery
-- ✅ **Multiple Brokers**: Redis, PostgreSQL, RabbitMQ, AWS SQS
-- ✅ **Workflow Primitives**: Chain, Group, Chord, Map, Starmap
-- ✅ **Observability**: Prometheus metrics, structured logging
-- ✅ **Production Ready**: Graceful shutdown, retries, dead letter queues
-- ✅ **Memory Safe**: No garbage collection, predictable performance
+- ✅ **Performance**: a compiled `tokio` runtime with no GIL and no per-task fork. No benchmark
+  comparison against Python Celery is published here, so no multiplier is claimed
+- ✅ **Brokers a worker can consume from**: Redis, PostgreSQL, MySQL, in-memory. RabbitMQ and SQS
+  ship as `celers-kombu` transports without a `celers_core::Broker` adapter yet, so a `Worker`
+  cannot run against them
+- ✅ **Workflow Primitives**: Chain, Group, Chord, Map, Starmap, Saga, Branch/Switch — see the
+  `workflows` feature below, without which a chord's callback never runs
+- ✅ **Remote control**: `celers inspect` / `celers control` reach running workers over a pub/sub
+  channel (CeleRS-native; not Celery's pidbox)
+- ✅ **Security**: opt-in HMAC-SHA256 message authentication verified before dispatch
+- ✅ **Observability**: Prometheus metrics, structured logging, a Celery-compatible event stream
+- ✅ **Production Ready**: Graceful shutdown, retries, dead letter queues, soft/hard time limits,
+  durable revocation
+- ✅ **Pure Rust**: no C, C++, Fortran or vendored assembly, enforced by `cargo deny check bans`
 
 ## Quick Start
 
@@ -27,6 +38,10 @@ celers = { version = "0.3", features = ["redis"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
+
+**Minimum Supported Rust Version: 1.89.** Enabling the `sqs` feature (or `full`)
+raises it to **1.94.1**: the AWS SDK crates `celers-broker-sqs` depends on
+declare that floor and are not optional there.
 
 ### Basic Example
 
@@ -111,7 +126,7 @@ celers = { version = "0.3", features = [
     "postgres",        # PostgreSQL broker support
     "backend-redis",   # Redis result backend
     "metrics",         # Prometheus metrics
-    "workflows",       # Canvas workflow primitives
+    "workflows",       # Chord barrier + chain continuation in the worker
     "beat",            # Periodic task scheduler
 ] }
 ```
@@ -120,13 +135,43 @@ celers = { version = "0.3", features = [
 |---------|-------------|---------|
 | `redis` | Redis broker | `celers-broker-redis` |
 | `postgres` | PostgreSQL broker | `celers-broker-postgres` |
+| `mysql` | MySQL broker | `celers-broker-sql` |
 | `amqp` | RabbitMQ broker | `celers-broker-amqp` |
 | `sqs` | AWS SQS broker | `celers-broker-sqs` |
-| `backend-redis` | Redis result backend | `celers-backend-redis` |
+| `backend-redis` | Redis result backend (and the real `Chord::apply`) | `celers-backend-redis`, `celers-canvas/backend-redis` |
 | `backend-db` | Database result backend | `celers-backend-db` |
+| `backend-rpc` | gRPC result backend | `celers-backend-rpc` |
+| `canvas` | Worker-side canvas support (chain continuation) | `celers-worker/canvas` |
+| `workflows` | Worker-side chord barrier + chain continuation | `canvas`, `backend-redis`, `celers-worker/workflows` |
 | `metrics` | Prometheus metrics | `celers-metrics` |
-| `workflows` | Canvas workflows | `celers-canvas` |
+| `tracing` | OpenTelemetry tracing | `opentelemetry`, `tracing-subscriber` |
 | `beat` | Periodic tasks | `celers-beat` |
+| `beat-cron` | Cron schedules for beat | `celers-beat/cron` |
+| `beat-solar` | Solar schedules for beat | `celers-beat/solar` |
+| `json` | JSON serialization (default) | — |
+| `msgpack` | MessagePack serialization | `celers-protocol/msgpack` |
+| `dev-utils` | Development helpers | — |
+| `full` | Everything above | — |
+
+### Workflows need a feature, not just a type
+
+The canvas primitives (`Chain`, `Group`, `Chord`, `Map`, `Starmap`) are always
+re-exported, so they build under the default feature set. What they need at
+*runtime* is gated:
+
+- **`Chord::apply(&broker, &mut backend)`** — the barrier-synchronised, two
+  argument form — exists only with `backend-redis`. Without it the crate
+  compiles a one-argument `Chord::apply(&broker)` that always returns an error
+  rather than silently degrading a chord into a group with a dropped callback.
+  Use `Chord::apply_header_only` if dispatching only the header really is what
+  you want.
+- **The worker half** — counting the barrier and enqueuing the callback, and
+  continuing a chain past its head — is compiled into `celers-worker` only with
+  `workflows`. A worker built without it runs the header tasks and then stops.
+
+So a chord end to end needs `features = ["workflows"]` (which turns on
+`canvas` and `backend-redis` for you) on **both** the producer and the worker
+binary.
 
 ## Architecture
 
@@ -530,7 +575,8 @@ See `examples/` directory:
 
 ## Contributing
 
-See [CONTRIBUTING.md](../../CONTRIBUTING.md) for contribution guidelines.
+There is no `CONTRIBUTING.md` yet. Until there is, the rules are the ones enforced mechanically — see
+the root [README.md](../../README.md#-contributing) for the exact gates to run before opening a PR.
 
 ## Community
 

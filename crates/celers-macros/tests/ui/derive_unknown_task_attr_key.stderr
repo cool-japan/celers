@@ -1,0 +1,5 @@
+error: unknown #[task(...)] attribute 'bogus'. Valid attributes are: name, input, output
+  --> tests/ui/derive_unknown_task_attr_key.rs:12:8
+   |
+12 | #[task(bogus = "value")]
+   |        ^^^^^

@@ -269,7 +269,7 @@ impl RedisDlqStorage {
     /// * `redis_url` - Redis connection URL (e.g., "redis://127.0.0.1:6379")
     /// * `key_prefix` - Prefix for Redis keys (default: "celery:dlq")
     pub fn new(redis_url: &str, key_prefix: Option<String>) -> Result<Self> {
-        let client = redis::Client::open(redis_url).map_err(|e| {
+        let client = crate::redis_tls::open_client(redis_url).map_err(|e| {
             celers_core::CelersError::Other(format!("Redis connection error: {}", e))
         })?;
 

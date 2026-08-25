@@ -24,10 +24,20 @@ Example applications and benchmarks for the CeleRS distributed task queue. Demon
 
 ## Running an Example
 
+The repository root is a **virtual workspace** with no `[package]` of its own, so `-p celers-examples`
+is required — a bare `cargo run --example <name>` fails to select a package:
+
 ```bash
-cargo run --example basic_processing
-cargo run --example prometheus_metrics --features metrics
-cargo run --example canvas_workflows --features workflows
+cargo run -p celers-examples --example basic_processing
+cargo run -p celers-examples --example prometheus_metrics --features metrics
+cargo run -p celers-examples --example canvas_workflows --features workflows
+```
+
+Benchmarks need `-p` for a second reason: `celers-cli` and `celers-examples` both declare a
+`serialization` bench, so a bare `--bench serialization` runs it in *both* crates.
+
+```bash
+cargo bench -p celers-examples --bench serialization
 ```
 
 ## Benchmarks

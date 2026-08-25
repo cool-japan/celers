@@ -50,6 +50,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::compat::{python_args_repr, python_kwargs_repr};
 use crate::embed::{EmbedOptions, EmbeddedBody};
 use crate::migration::PROTOCOL_VERSION_HEADER;
 use crate::{
@@ -381,7 +382,23 @@ pub fn build_v5_message(spec: &V5MessageSpec) -> Result<V5Message, V5BuildError>
         .map_err(|e| V5BuildError::BodyEncoding(e.to_string()))?;
 
     // Build the headers, carrying the inline (native) workflow stamping.
-    let mut headers = MessageHeaders::new(spec.task.clone(), spec.id).with_lang(spec.lang.clone());
+    //
+    // `argsrepr` / `kwargsrepr` render the same args and kwargs that went into
+    // the body, as Python literals (see `compat::python_args_repr`). Flower,
+    // `celery events` and `celery inspect` read those headers instead of
+    // deserializing the body, so a producer that omits them shows a blank
+    // argument list for every task. Stamped here, before `spec.extra_headers`
+    // is merged, so an explicit extra header still wins -- matching
+    // `MessageBuilder::build`, the other message-construction path.
+    let mut headers = MessageHeaders::new(spec.task.clone(), spec.id)
+        .with_lang(spec.lang.clone())
+        .with_argsrepr(python_args_repr(&spec.args))
+        .with_kwargsrepr(python_kwargs_repr(&Value::Object(
+            spec.kwargs
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )));
     headers.root_id = spec.root_id;
     headers.parent_id = spec.parent_id;
     headers.group = spec.group;
@@ -565,6 +582,38 @@ mod tests {
         assert!(arr[0].is_array());
         assert!(arr[1].is_object());
         assert!(arr[2].is_object());
+    }
+
+    /// Regression: the v5 builder never stamped `argsrepr` / `kwargsrepr`, so
+    /// every task published through it showed a blank argument list in Flower,
+    /// `celery events` and `celery inspect` -- all of which read those headers
+    /// instead of deserializing the body. `MessageBuilder::build` had the same
+    /// gap; both paths now render the same Python literals.
+    #[test]
+    fn test_v5_message_carries_python_arg_reprs() {
+        let msg = V5MessageSpec::new("tasks.greet", Uuid::new_v4())
+            .with_args(vec![json!("Ada")])
+            .with_kwarg("loud", json!(true))
+            .build()
+            .expect("v5 build must succeed");
+
+        assert_eq!(msg.headers.argsrepr(), Some("('Ada',)"));
+        assert_eq!(msg.headers.kwargsrepr(), Some("{'loud': True}"));
+
+        // The reprs describe the body that was actually encoded.
+        let decoded = EmbeddedBody::decode(&msg.body).expect("body must decode");
+        assert_eq!(
+            msg.headers.argsrepr(),
+            Some(crate::compat::python_args_repr(&decoded.args).as_str())
+        );
+
+        // An explicit extra header still wins: extras are merged afterwards.
+        let overridden = V5MessageSpec::new("tasks.greet", Uuid::new_v4())
+            .with_args(vec![json!("Ada")])
+            .with_header("argsrepr", json!("(redacted)"))
+            .build()
+            .expect("v5 build must succeed");
+        assert_eq!(overridden.headers.argsrepr(), Some("(redacted)"));
     }
 
     #[test]

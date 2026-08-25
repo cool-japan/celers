@@ -3,6 +3,7 @@
 mod broker_revocation;
 mod control_wiring;
 mod execution;
+mod runtime;
 pub(crate) mod support;
 
 #[cfg(test)]
@@ -12,7 +13,6 @@ mod tests;
 
 use crate::adaptive_poll::{AdaptivePoll, PollOutcome};
 use crate::affinity::{AffinityDecision, AffinityRegistry};
-use crate::batching::{self, CoalesceStrategy};
 use crate::cancellation::CancellationToken;
 use crate::checkpoint::CheckpointManager;
 use crate::circuit_breaker::CircuitBreaker;
@@ -28,9 +28,7 @@ use crate::routing::RoutingStrategy;
 use crate::types::{DynamicConfig, WorkerConfig, WorkerHandle, WorkerMode, WorkerStats};
 
 use execution::{DeadLetterRequest, ExecutionLimits, TaskDispatch, UnverifiedMessage};
-use support::{
-    clamp_defer_delay, effective_max_retries, ActiveTaskGuard, EventSink, InFlightRegistry,
-};
+use support::{effective_max_retries, ActiveTaskGuard, EventSink, InFlightRegistry};
 
 use celers_core::control_transport::ControlTransport;
 use celers_core::revocation::WorkerRevocationManager;
@@ -42,8 +40,7 @@ use celers_core::{
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration as StdDuration;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -83,32 +80,28 @@ impl StopReason {
     }
 }
 
-/// Whether `B`'s blocking [`Broker::dequeue`] is known to be cancel-safe, so
-/// the dequeue loop may race it against the shutdown signal.
+/// Whether `broker`'s blocking [`Broker::dequeue`] is cancel-safe, so the
+/// dequeue loop may race it against the shutdown signal.
 ///
-/// [`Broker`] makes no cancel-safety promise, and it cannot: an implementation
-/// is free to remove a message from its queue at one `.await` point and hand it
-/// back at a later one, so dropping the future mid-flight would lose the
-/// message outright. The default is therefore `false` for every broker, and the
-/// worker keeps the documented behaviour — a parked `dequeue` observes shutdown
-/// when it next returns.
+/// This used to be a `TypeId` allowlist naming the one implementation whose
+/// `dequeue` had been read and verified. [`Broker`] now carries the answer
+/// itself as [`Broker::dequeue_is_cancel_safe`], so this is the one-line
+/// delegation that comment predicted — with two things the allowlist could not
+/// do: a broker outside this workspace can opt in, and a *decorator* (a wrapper
+/// that records delays, injects faults, ...) can forward its inner broker's
+/// answer instead of being silently excluded by its own type.
 ///
-/// This is a deliberately narrow **allowlist**, not a general mechanism: it
-/// names implementations whose `dequeue` has been read and verified to hold no
-/// message across an `.await`. Today that is
-/// [`celers_core::InMemoryBroker`], whose `dequeue` mutates its queue only
-/// after its lock await has resolved and then runs synchronously to the return,
-/// and whose waiting is a `tokio::sync::Semaphore::acquire` (which consumes no
-/// permit if the future is dropped). The in-memory broker also has no block
-/// timeout, so an idle in-process worker would otherwise learn about
-/// `control shutdown` only when the next message happened to arrive.
+/// The trait's default is `false`, which keeps the conservative behaviour for
+/// every broker that has not made the promise: a parked `dequeue` observes
+/// shutdown when it next returns. [`celers_core::InMemoryBroker`] overrides it
+/// to `true` — it has no block timeout at all, so an idle in-process worker
+/// would otherwise learn about `control shutdown` only when the next message
+/// happened to arrive.
 ///
-/// Anything else opts in explicitly and knowingly through
-/// [`Worker::with_cancel_safe_dequeue`]. When [`Broker`] eventually grows a
-/// `dequeue_is_cancel_safe()` capability method of its own, this function
-/// becomes a one-line delegation to it.
-fn broker_dequeue_is_cancel_safe<B: 'static>() -> bool {
-    std::any::TypeId::of::<B>() == std::any::TypeId::of::<celers_core::InMemoryBroker>()
+/// Whoever builds the worker can still override the answer in either direction
+/// with [`Worker::with_cancel_safe_dequeue`].
+fn broker_dequeue_is_cancel_safe<B: Broker + ?Sized>(broker: &B) -> bool {
+    broker.dequeue_is_cancel_safe()
 }
 
 /// Worker runtime for consuming and executing tasks
@@ -297,6 +290,9 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
 
         let shutdown_timeout_secs = Arc::new(AtomicU64::new(config.shutdown_timeout_secs));
 
+        // Read before `broker` is moved into the struct below.
+        let cancel_safe_dequeue = broker_dequeue_is_cancel_safe(broker.as_ref());
+
         Self {
             broker,
             registry: Arc::new(registry),
@@ -324,7 +320,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             broker_url: None,
             result_backend_url: None,
             result_store: None,
-            cancel_safe_dequeue: broker_dequeue_is_cancel_safe::<B>(),
+            cancel_safe_dequeue,
             #[cfg(feature = "workflows")]
             chord_backend: None,
         }
@@ -437,8 +433,8 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// bounded and small. [`celers_core::InMemoryBroker`] has no timeout at
     /// all: it waits indefinitely on an empty queue, so an idle in-process
     /// worker would act on `control shutdown` only when the next message
-    /// happened to arrive. It is recognised automatically and needs no call to
-    /// this method.
+    /// happened to arrive. It declares itself cancel-safe through
+    /// [`Broker::dequeue_is_cancel_safe`] and needs no call to this method.
     ///
     /// # Safety of the race
     ///
@@ -446,16 +442,17 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// That is only sound if the implementation never holds a message across an
     /// `.await` — otherwise the dropped future takes an already-dequeued
     /// message with it, and the message is lost rather than redelivered.
-    /// [`Broker`] promises nothing here, so the default is `false` for every
+    /// [`Broker::dequeue_is_cancel_safe`] defaults to `false` for every
     /// broker but the verified in-memory one. Pass `true` only for a broker
     /// whose `dequeue` you have checked.
     ///
     /// Passing `false` is always safe: it restores the "observe shutdown at the
     /// next dequeue return" behaviour, including for the in-memory broker.
     ///
-    /// Batch dequeue is unaffected either way:
-    /// [`Broker::dequeue_batch`] is expected to be non-blocking, so there is
-    /// nothing to race.
+    /// Batch dequeue is unaffected either way: the loop never races
+    /// [`Broker::dequeue_batch`], because dropping it would abandon a whole
+    /// batch rather than one message. A worker configured for batch dequeue
+    /// therefore still observes shutdown when the batch call returns.
     ///
     /// # Example
     ///
@@ -1145,112 +1142,6 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         result
     }
 
-    /// Heartbeat loop that periodically emits worker-heartbeat events
-    async fn heartbeat_loop<EE: EventEmitter>(
-        hostname: String,
-        interval: Duration,
-        event_emitter: Arc<EE>,
-        stats: Arc<WorkerStats>,
-        freq: f64,
-    ) {
-        loop {
-            sleep(interval).await;
-
-            let active = stats.active() as u32;
-            let processed = stats.processed();
-
-            // Get system load average (on Unix systems)
-            let loadavg = Self::get_load_average();
-
-            let event =
-                WorkerEventBuilder::new(&hostname).heartbeat(active, processed, loadavg, freq);
-
-            if let Err(e) = event_emitter.emit(event).await {
-                // A heartbeat nobody receives is how a monitor decides this
-                // worker is dead, so a failure here is operationally visible.
-                warn!("Failed to emit worker-heartbeat event: {}", e);
-            }
-        }
-    }
-
-    /// Get system load average (returns [0.0, 0.0, 0.0] where unsupported)
-    ///
-    /// Delegates to [`crate::sysinfo::read_load_average`], which reads
-    /// `/proc/loadavg` on Linux and `getloadavg(3)` on the BSDs/macOS — the
-    /// latter has no `/proc`, where the previous inline implementation silently
-    /// reported a flat zero load in every heartbeat.
-    fn get_load_average() -> [f64; 3] {
-        crate::sysinfo::read_load_average().unwrap_or([0.0, 0.0, 0.0])
-    }
-
-    /// Current poll interval from the (runtime updatable) dynamic config.
-    fn poll_interval(&self) -> Duration {
-        let ms = self
-            .dynamic_config
-            .read()
-            .map(|c| c.poll_interval_ms)
-            .unwrap_or(1000);
-        Duration::from_millis(ms)
-    }
-
-    /// Sleep for `duration`, returning early with `true` if a shutdown signal
-    /// arrives first (so shutdown latency never inherits a poll or backoff
-    /// interval).
-    async fn sleep_or_shutdown(
-        shutdown_rx: &mut Option<&mut mpsc::Receiver<()>>,
-        duration: Duration,
-    ) -> bool {
-        match shutdown_rx.as_mut() {
-            Some(rx) => {
-                tokio::select! {
-                    biased;
-                    _ = rx.recv() => true,
-                    () = sleep(duration) => false,
-                }
-            }
-            None => {
-                sleep(duration).await;
-                false
-            }
-        }
-    }
-
-    /// Acquire up to `wanted` concurrency permits, waiting at most
-    /// [`PERMIT_WAIT`] for the first one.
-    ///
-    /// Returning `None` means the worker is saturated: the caller loops back to
-    /// re-check the worker mode and shutdown channel instead of dequeuing more
-    /// work it cannot run.
-    async fn acquire_permits(
-        permits: &Arc<Semaphore>,
-        wanted: usize,
-    ) -> Option<Vec<OwnedSemaphorePermit>> {
-        let first = match timeout(PERMIT_WAIT, Arc::clone(permits).acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_closed)) => return None,
-            Err(_elapsed) => return None,
-        };
-
-        let mut held = Vec::with_capacity(wanted.max(1));
-        held.push(first);
-        while held.len() < wanted {
-            match Arc::clone(permits).try_acquire_owned() {
-                Ok(permit) => held.push(permit),
-                Err(_) => break,
-            }
-        }
-        Some(held)
-    }
-
-    /// Defer a message: return it to the queue for a later attempt without
-    /// treating it as a failed execution.
-    async fn defer_message(&self, task_id: &TaskId, receipt_handle: Option<&str>, reason: &str) {
-        self.stats.task_deferred();
-        if let Err(e) = self.broker.reject(task_id, receipt_handle, true).await {
-            error!("Failed to defer task {} ({}): {}", task_id, reason, e);
-        }
-    }
-
     /// Inner worker loop (separated to ensure offline event is always emitted)
     async fn run_loop_inner(
         &self,
@@ -1423,9 +1314,14 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             messages.len()
                         );
                         for msg in messages {
+                            // No broker-side delay: it is *this* worker that
+                            // stopped consuming, not the task that must wait.
+                            // Holding the message back would delay the healthy
+                            // worker that should take it.
                             self.defer_message(
                                 &msg.task.metadata.id,
                                 msg.receipt_handle.as_deref(),
+                                Duration::ZERO,
                                 "worker not accepting tasks",
                             )
                             .await;
@@ -1534,6 +1430,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             events.emit(Event::Task(TaskEvent::Revoked {
                                 task_id,
                                 task_name: Some(task_name.clone()),
+                                hostname: hostname.to_string(),
                                 timestamp: chrono::Utc::now(),
                                 terminated: false,
                                 signum: None,
@@ -1619,9 +1516,23 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                 reason: "Worker routing mismatch".to_string(),
                             }));
 
-                            // Defer with requeue (another worker might handle it)
-                            self.defer_message(&task_id, msg.receipt_handle.as_deref(), "routing")
-                                .await;
+                            // Defer (another worker might handle it).
+                            //
+                            // The message is held back for no time at all: the
+                            // mismatch is this worker's, and a worker that
+                            // *can* route the task must be able to take it at
+                            // once. `defer_delay` below is a different thing —
+                            // the poll back-off that keeps *this* worker from
+                            // spinning on work it cannot serve, which is what
+                            // `WorkerConfig::defer_delay_ms` documents itself
+                            // as.
+                            self.defer_message(
+                                &task_id,
+                                msg.receipt_handle.as_deref(),
+                                Duration::ZERO,
+                                "routing",
+                            )
+                            .await;
                             defer_delay = Some(
                                 self.admission_defer_delay()
                                     .max(defer_delay.unwrap_or(Duration::ZERO)),
@@ -1650,10 +1561,16 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                 reason: "Worker affinity mismatch".to_string(),
                             }));
 
-                            // Defer (requeue) so a worker with matching labels can
-                            // pick the task up.
-                            self.defer_message(&task_id, msg.receipt_handle.as_deref(), "affinity")
-                                .await;
+                            // Defer so a worker with matching labels can pick
+                            // the task up — immediately, hence no broker-side
+                            // delay; see the routing branch above.
+                            self.defer_message(
+                                &task_id,
+                                msg.receipt_handle.as_deref(),
+                                Duration::ZERO,
+                                "affinity",
+                            )
+                            .await;
                             defer_delay = Some(
                                 self.admission_defer_delay()
                                     .max(defer_delay.unwrap_or(Duration::ZERO)),
@@ -1680,6 +1597,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             self.defer_message(
                                 &task_id,
                                 msg.receipt_handle.as_deref(),
+                                Duration::ZERO,
                                 "feature flags",
                             )
                             .await;
@@ -1719,6 +1637,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                     self.defer_message(
                                         &task_id,
                                         msg.receipt_handle.as_deref(),
+                                        Duration::ZERO,
                                         "circuit breaker half-open",
                                     )
                                     .await;
@@ -1792,9 +1711,14 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                 cb.release_probe(&task_name).await;
                             }
 
+                            // This limiter is per worker, so another worker
+                            // may well have budget: the message goes back with
+                            // no broker-side hold, and only *this* worker waits
+                            // out `retry_after`.
                             self.defer_message(
                                 &task_id,
                                 msg.receipt_handle.as_deref(),
+                                Duration::ZERO,
                                 "worker rate limit",
                             )
                             .await;
@@ -1837,20 +1761,28 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                         cb.release_probe(&task_name).await;
                                     }
 
-                                    // Defer (requeue) so the task is retried later.
+                                    // The one deferral that hands the broker a
+                                    // real delay. This budget is shared by the
+                                    // whole cluster, so the limiter's
+                                    // `retry_after` is a statement about *every*
+                                    // worker: handing the message straight back
+                                    // would only move the denial to the next
+                                    // consumer. A broker with a delayed queue
+                                    // holds it until due; one without falls back
+                                    // to an immediate requeue, which is the old
+                                    // behaviour. The same clamped value is this
+                                    // worker's poll back-off, so the two wait in
+                                    // step.
+                                    let delay = self.clamped_defer_delay(retry_after);
                                     self.defer_message(
                                         &task_id,
                                         msg.receipt_handle.as_deref(),
+                                        delay,
                                         "rate limit",
                                     )
                                     .await;
-                                    // Honour the limiter's own retry hint (clamped
-                                    // into the configured band) instead of
-                                    // discarding it and spinning.
-                                    defer_delay = Some(
-                                        self.clamped_defer_delay(retry_after)
-                                            .max(defer_delay.unwrap_or(Duration::ZERO)),
-                                    );
+                                    defer_delay =
+                                        Some(delay.max(defer_delay.unwrap_or(Duration::ZERO)));
                                     continue;
                                 }
                                 Err(e) => {
@@ -2033,184 +1965,5 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
         info!("Worker stopped ({})", stop_reason.as_str());
 
         Ok(())
-    }
-
-    /// Wait for every dispatched task to finish, then hand anything still
-    /// undisposed back to the broker.
-    ///
-    /// The concurrency semaphore doubles as the drain barrier: holding all
-    /// `concurrency` permits means no task is running. On deadline (or when
-    /// [`WorkerConfig::graceful_shutdown`](crate::WorkerConfig::graceful_shutdown)
-    /// is off) the messages that were dequeued but never disposed of are
-    /// requeued, so they are redelivered instead of being stranded in the
-    /// broker's processing list with no reaper to recover them.
-    async fn drain_in_flight(
-        &self,
-        permits: &Arc<Semaphore>,
-        in_flight: &InFlightRegistry,
-        concurrency: usize,
-    ) {
-        // Read the runtime value, not the static one: `ControlCommand::Shutdown
-        // { timeout }` replaces the drain deadline, and reading the config here
-        // would make that parameter decorative.
-        let deadline = Duration::from_secs(self.shutdown_timeout_secs.load(Ordering::SeqCst));
-        let drain_permits = u32::try_from(concurrency).unwrap_or(u32::MAX);
-
-        if self.config.graceful_shutdown && !deadline.is_zero() {
-            let outstanding = in_flight.len();
-            if outstanding > 0 {
-                info!(
-                    "Waiting up to {:?} for {} in-flight task(s) to finish",
-                    deadline, outstanding
-                );
-            }
-            match timeout(deadline, permits.acquire_many(drain_permits)).await {
-                Ok(Ok(_all_permits)) => {
-                    info!("All in-flight tasks completed");
-                }
-                Ok(Err(e)) => {
-                    warn!("Concurrency semaphore closed while draining: {}", e);
-                }
-                Err(_elapsed) => {
-                    warn!(
-                        "Graceful shutdown deadline of {:?} exceeded with {} task(s) still \
-                         running; requeueing their messages",
-                        deadline,
-                        in_flight.len()
-                    );
-                }
-            }
-        } else if !in_flight.is_empty() {
-            warn!(
-                "Graceful shutdown disabled; requeueing {} in-flight message(s)",
-                in_flight.len()
-            );
-        }
-
-        // Whatever is left was never disposed of by its task: give it back to
-        // the broker rather than losing it.
-        for (task_id, receipt_handle) in in_flight.take_all() {
-            warn!("Requeueing undisposed task {} at shutdown", task_id);
-            if let Err(e) = self
-                .broker
-                .reject(&task_id, receipt_handle.as_deref(), true)
-                .await
-            {
-                error!(
-                    "Failed to requeue in-flight task {} at shutdown: {}",
-                    task_id, e
-                );
-            }
-        }
-    }
-
-    /// Deferral delay for admission decisions (routing / affinity / features).
-    fn admission_defer_delay(&self) -> Duration {
-        clamp_defer_delay(
-            Duration::from_millis(self.config.defer_delay_ms),
-            self.config.defer_delay_ms,
-            self.config.defer_max_delay_ms,
-        )
-    }
-
-    /// Clamp an externally supplied delay (e.g. a rate limiter's `retry_after`)
-    /// into the configured deferral band.
-    fn clamped_defer_delay(&self, requested: Duration) -> Duration {
-        clamp_defer_delay(
-            requested,
-            self.config.defer_delay_ms,
-            self.config.defer_max_delay_ms,
-        )
-    }
-
-    /// Coalesce duplicate messages within a dequeued batch, acknowledging the
-    /// dropped duplicates so an at-least-once broker removes them.
-    ///
-    /// Returns `(survivors, dropped)`. Survivors are deduplicated by
-    /// [`batching::broker_message_coalesce_key`] preserving first-seen order;
-    /// the chosen representative follows `strategy`. Duplicates are best-effort
-    /// acked (a failed ack is logged but does not abort processing).
-    ///
-    /// # Result loss
-    ///
-    /// The default coalescing key is `(task name, payload hash)`, which does
-    /// **not** include the task id: two independent submissions with identical
-    /// arguments coalesce into one, and the dropped one never runs and never
-    /// produces a result. Set
-    /// [`WorkerConfig::coalesce_require_same_task_id`](crate::WorkerConfig::coalesce_require_same_task_id)
-    /// to restrict coalescing to true redelivery duplicates (same task id),
-    /// which is lossless.
-    async fn coalesce_and_ack_duplicates(
-        &self,
-        messages: Vec<celers_core::BrokerMessage>,
-        strategy: CoalesceStrategy,
-    ) -> (
-        Vec<celers_core::BrokerMessage>,
-        Vec<celers_core::BrokerMessage>,
-    ) {
-        use std::collections::HashMap;
-
-        let require_same_id = self.config.coalesce_require_same_task_id;
-
-        let mut survivors: Vec<celers_core::BrokerMessage> = Vec::with_capacity(messages.len());
-        let mut dropped: Vec<celers_core::BrokerMessage> = Vec::new();
-        let mut index: HashMap<(Option<TaskId>, String, u64), usize> =
-            HashMap::with_capacity(messages.len());
-
-        for msg in messages {
-            let (name, payload_hash) = batching::broker_message_coalesce_key(&msg);
-            let key = if require_same_id {
-                (Some(msg.task.metadata.id), name, payload_hash)
-            } else {
-                (None, name, payload_hash)
-            };
-
-            if let Some(&existing_idx) = index.get(&key) {
-                match strategy {
-                    CoalesceStrategy::KeepFirst => {
-                        // Drop the newcomer.
-                        dropped.push(msg);
-                    }
-                    CoalesceStrategy::KeepLast => {
-                        // The newcomer wins its slot; the prior survivor is dropped.
-                        let prev = std::mem::replace(&mut survivors[existing_idx], msg);
-                        dropped.push(prev);
-                    }
-                }
-            } else {
-                index.insert(key, survivors.len());
-                survivors.push(msg);
-            }
-        }
-
-        // Acknowledge dropped duplicates so they are not redelivered.
-        for msg in &dropped {
-            let task_id = msg.task.metadata.id;
-            if let Err(e) = self
-                .broker
-                .ack(&task_id, msg.receipt_handle.as_deref())
-                .await
-            {
-                warn!(
-                    "Failed to acknowledge coalesced duplicate task {}: {}",
-                    task_id, e
-                );
-            }
-        }
-
-        (survivors, dropped)
-    }
-
-    /// Calculate the backoff delay applied before retry attempt `retry_count`.
-    ///
-    /// Delegates to the effective [`RetryConfig`](crate::RetryConfig) (the
-    /// explicit `retry_config` when set, otherwise the legacy
-    /// `retry_base_delay_ms` / `retry_max_delay_ms` pair) — the same value the
-    /// execution loop schedules a retry with. The computation is done in
-    /// floating point and capped, where the previous
-    /// `base * 2u64.pow(retry_count)` overflowed and panicked for large retry
-    /// counts.
-    pub fn calculate_backoff_delay(&self, retry_count: u32) -> StdDuration {
-        support::backoff_delay(&self.config.get_retry_config(), retry_count)
     }
 }

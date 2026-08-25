@@ -13,10 +13,16 @@
 //! the **negative** case — the failure handler must *not* run when the task
 //! succeeds, and the compensations must *not* run when the saga completes.
 //!
-//! Branch/switch evaluation and chord barriers are covered in
-//! `celers-worker`'s own `workflow_semantics` integration test instead: both
-//! need worker features (`canvas`, `workflows`) that this facade's manifest
-//! does not turn on.
+//! Branch/switch evaluation and the *worker-side* half of a chord barrier —
+//! counting completions and enqueuing the callback — are covered in
+//! `celers-worker`'s own `workflow_semantics` integration test instead: they
+//! are compiled into the worker behind its `canvas` / `workflows` gates, which
+//! this facade now forwards (`celers = { features = ["workflows"] }`) but which
+//! this file does not need in order to pin the producer side.
+//!
+//! What is pinned here is the half the facade owns: the barrier a chord
+//! *registers* before anything runs (see `aggregate_registration` below, gated
+//! on `backend-redis`).
 
 use celers::advanced_patterns::{
     create_conditional_workflow, create_parallel_chains, create_saga_workflow,
@@ -1199,6 +1205,60 @@ mod aggregate_registration {
 
         async fn chord_get_state(&mut self, _chord_id: Uuid) -> BackendResult<Option<ChordState>> {
             Ok(self.state.clone())
+        }
+    }
+
+    /// The two-argument `Chord::apply` is reachable from the facade's own
+    /// feature set, and it is a chord — not a group with a stray extra task.
+    ///
+    /// `celers-canvas` compiles a one-argument `Chord::apply(&broker)` that
+    /// always fails unless `backend-redis` is on, and the facade forwards
+    /// `celers-canvas/backend-redis` from its own `backend-redis` feature. That
+    /// forwarding is the only thing standing between `celers::chord(..)` and an
+    /// unconditional error, so it is asserted here rather than assumed: this
+    /// test does not compile if the forwarding is dropped.
+    #[tokio::test]
+    async fn a_chord_applied_through_the_facade_registers_a_barrier_and_holds_the_callback() {
+        use celers::{Chord, Group};
+
+        let broker = CapturingBroker::default();
+        let mut backend = CapturingBackend::default();
+
+        let header = Group::new().add("resize", vec![]).add("optimize", vec![]);
+        let chord = Chord::new(header, Signature::new("finalize".to_string()));
+
+        let chord_id = chord
+            .apply(&broker, &mut backend)
+            .await
+            .expect("the two-argument apply is the real, barrier-synchronised one");
+
+        let state = backend.state.clone().expect("a barrier must be registered");
+        assert_eq!(state.chord_id, chord_id);
+        assert_eq!(state.total, 2, "the barrier counts the header tasks");
+        assert_eq!(state.callback.as_deref(), Some("finalize"));
+
+        // Only the header is enqueued. The callback is the worker's job once
+        // the barrier completes — enqueuing it here would make the chord a
+        // group with an extra task that runs immediately.
+        let enqueued = broker.tasks();
+        let names: Vec<&str> = enqueued
+            .iter()
+            .map(|task| task.metadata.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["resize", "optimize"]);
+        assert!(
+            !names.contains(&"finalize"),
+            "the callback must wait for the barrier, not ride along with the header"
+        );
+
+        // The barrier is registered against the ids the header was dispatched
+        // with, so a completion can actually be counted against it.
+        for task in &enqueued {
+            assert!(
+                state.task_ids.contains(&task.metadata.id),
+                "every header task must be a member of the barrier"
+            );
+            assert_eq!(task.metadata.chord_id, Some(chord_id));
         }
     }
 

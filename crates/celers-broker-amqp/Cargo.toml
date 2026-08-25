@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "RabbitMQ/AMQP broker implementation for CeleRS"
 readme = "README.md"
 keywords = ["celery", "rabbitmq", "amqp", "broker", "messaging"]
@@ -40,6 +41,12 @@ celers-kombu = { workspace = true }
 celers-core = { workspace = true, optional = true }
 
 [features]
+# On by default: without it `AmqpBroker` is a message transport and nothing
+# more, and a `celers_worker::Worker` cannot consume from RabbitMQ at all. See
+# `core_broker`.
+default = ["core-broker"]
+# `celers_core::Broker` over this crate's transport (`AmqpCoreBroker`).
+core-broker = ["dep:celers-core", "celers-kombu/core-adapter"]
 amqp-events = ["dep:celers-core"]
 # Opt-in, off by default: adds the OS trust store to the webpki roots the
 # workspace-level `lapin` declaration selects. Needed when RabbitMQ presents a

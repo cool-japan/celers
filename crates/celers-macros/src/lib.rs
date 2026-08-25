@@ -16,9 +16,9 @@
 //!
 //! ## Basic Task
 //!
-//! ```ignore
+//! ```
+//! use celers_core::{Result, Task};
 //! use celers_macros::task;
-//! use celers_core::Result;
 //!
 //! #[task]
 //! async fn add_numbers(a: i32, b: i32) -> Result<i32> {
@@ -30,16 +30,22 @@
 //! // - AddNumbersTaskInput { a: i32, b: i32 }
 //! // - AddNumbersTaskOutput = i32
 //!
+//! # #[tokio::main]
+//! # async fn main() {
 //! // Usage:
 //! let task = AddNumbersTask;
 //! let input = AddNumbersTaskInput { a: 5, b: 3 };
-//! let result = task.execute(input).await?;
+//! let result = task.execute(input).await.unwrap();
 //! assert_eq!(result, 8);
+//! # }
 //! ```
 //!
 //! ## Task with Configuration
 //!
-//! ```ignore
+//! ```
+//! use celers_core::{Result, Task};
+//! use celers_macros::task;
+//!
 //! #[task(
 //!     name = "tasks.process_data",
 //!     timeout = 60,
@@ -61,7 +67,10 @@
 //!
 //! ## Task with Optional Parameters
 //!
-//! ```ignore
+//! ```
+//! use celers_core::Result;
+//! use celers_macros::task;
+//!
 //! #[task]
 //! async fn send_notification(
 //!     user_id: u64,
@@ -85,11 +94,19 @@
 //!
 //! ## Task with Generic Parameters
 //!
-//! ```ignore
+//! ```
+//! use celers_core::Result;
+//! use celers_macros::task;
+//! use serde::{de::DeserializeOwned, Serialize};
+//!
 //! #[task]
 //! async fn process_items<T>(items: Vec<T>) -> Result<usize>
 //! where
-//!     T: Send + Clone,
+//!     // `Task::Input` requires `Serialize + for<'de> Deserialize<'de>` (see
+//!     // `celers_core::Task`), so any type parameter the generated
+//!     // `Input` struct is built over needs those bounds too -- `Send +
+//!     // Clone` alone is not enough.
+//!     T: Send + Clone + Serialize + DeserializeOwned,
 //! {
 //!     Ok(items.len())
 //! }
@@ -105,7 +122,10 @@
 //!
 //! ## Task with Parameter Validation
 //!
-//! ```ignore
+//! ```
+//! use celers_core::{CelersError, Result, Task};
+//! use celers_macros::task;
+//!
 //! #[task]
 //! async fn register_user(
 //!     #[validate(min = 18, max = 120)]
@@ -119,13 +139,18 @@
 //!     Ok(format!("User {} registered with email {}", username, email))
 //! }
 //!
+//! # #[tokio::main]
+//! # async fn main() {
+//! let task = RegisterUserTask;
+//!
 //! // Valid input succeeds:
 //! let input = RegisterUserTaskInput {
 //!     age: 25,
 //!     username: "alice".to_string(),
 //!     email: "alice@example.com".to_string(),
 //! };
-//! let result = task.execute(input).await?; // Ok
+//! let result = task.execute(input).await.unwrap();
+//! assert_eq!(result, "User alice registered with email alice@example.com");
 //!
 //! // Invalid input returns error:
 //! let input = RegisterUserTaskInput {
@@ -133,12 +158,21 @@
 //!     username: "alice".to_string(),
 //!     email: "alice@example.com".to_string(),
 //! };
-//! let result = task.execute(input).await; // Err: "Field 'age' value 15 is below minimum 18"
+//! match task.execute(input).await.unwrap_err() {
+//!     CelersError::TaskExecution(msg) => {
+//!         assert_eq!(msg, "Field 'age' value 15 is below minimum 18");
+//!     }
+//!     other => panic!("unexpected error variant: {other:?}"),
+//! }
+//! # }
 //! ```
 //!
 //! ## Task with Custom Validation Messages
 //!
-//! ```ignore
+//! ```
+//! use celers_core::{CelersError, Result, Task};
+//! use celers_macros::task;
+//!
 //! #[task]
 //! async fn create_account(
 //!     #[validate(min = 18, message = "You must be at least 18 years old to create an account")]
@@ -151,18 +185,32 @@
 //!     Ok(format!("Account created for {}", username))
 //! }
 //!
-//! // Invalid input returns custom error message:
+//! # #[tokio::main]
+//! # async fn main() {
+//! let task = CreateAccountTask;
+//!
+//! // Invalid input returns the custom error message instead of the
+//! // auto-generated one:
 //! let input = CreateAccountTaskInput {
 //!     age: 15,
 //!     username: "alice".to_string(),
 //!     email: "alice@example.com".to_string(),
 //! };
-//! let result = task.execute(input).await; // Err: "You must be at least 18 years old to create an account"
+//! match task.execute(input).await.unwrap_err() {
+//!     CelersError::TaskExecution(msg) => {
+//!         assert_eq!(msg, "You must be at least 18 years old to create an account");
+//!     }
+//!     other => panic!("unexpected error variant: {other:?}"),
+//! }
+//! # }
 //! ```
 //!
 //! ## Task with Predefined Validators
 //!
-//! ```ignore
+//! ```
+//! use celers_core::Result;
+//! use celers_macros::task;
+//!
 //! #[task]
 //! async fn register_user(
 //!     #[validate(email, message = "Please enter a valid email")]
@@ -193,7 +241,7 @@
 //!
 //! For a function named `my_task`, the macro generates:
 //!
-//! ```ignore
+//! ```text
 //! // Input struct with serde support
 //! #[derive(Serialize, Deserialize, Debug, Clone)]
 //! pub struct MyTaskTaskInput {
