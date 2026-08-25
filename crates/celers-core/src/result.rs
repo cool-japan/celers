@@ -49,6 +49,14 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod compression;
+
+pub use compression::{builtin_codecs, CompressionCodec, IdentityCodec, ResultCompressor};
+#[cfg(feature = "compression-deflate")]
+pub use compression::{GzipCodec, ZlibCodec, DEFAULT_DEFLATE_LEVEL};
+#[cfg(feature = "compression-zstd")]
+pub use compression::{ZstdCodec, DEFAULT_ZSTD_LEVEL};
+
 /// Result store trait for `AsyncResult` API
 ///
 /// This trait provides the storage interface needed by `AsyncResult` for querying
@@ -285,6 +293,26 @@ pub enum TaskResultValue {
 
     /// Task was rejected (e.g., validation failed)
     Rejected { reason: String },
+
+    /// The task failed, but the failure was **deliberately suppressed**.
+    ///
+    /// Recorded when a task dispatched with
+    /// [`ignore_errors`](crate::TaskMetadata) — canvas's
+    /// `TaskOptions::ignore_errors`, carried in the dispatch payload — returns
+    /// an error. The worker neither retries nor dead-letters such a task, and
+    /// the surrounding workflow continues as if it had produced `null`.
+    ///
+    /// It is deliberately **terminal but not a failure**: a caller awaiting the
+    /// result gets a resolved answer instead of hanging
+    /// ([`is_terminal`](Self::is_terminal) is `true`), and error-driven
+    /// machinery — [`is_failed`](Self::is_failed), error links, dead-lettering —
+    /// stays out of the way, which is exactly what "ignore this task's errors"
+    /// has to mean. The original error text is preserved so the suppression is
+    /// observable rather than silent.
+    Ignored {
+        /// The suppressed error.
+        error: String,
+    },
 }
 
 impl TaskResultValue {
@@ -298,6 +326,7 @@ impl TaskResultValue {
                 | TaskResultValue::Failure { .. }
                 | TaskResultValue::Revoked
                 | TaskResultValue::Rejected { .. }
+                | TaskResultValue::Ignored { .. }
         )
     }
 
@@ -316,6 +345,18 @@ impl TaskResultValue {
     }
 
     /// Check if the task succeeded
+    ///
+    /// # `Ignored` is neither successful nor failed
+    ///
+    /// A terminal result has **three** dispositions, not two: succeeded, failed,
+    /// and [`Ignored`](Self::Ignored) — a failure the producer asked to have
+    /// suppressed. This returns `false` for `Ignored` because the task did not
+    /// succeed; [`is_failed`](Self::is_failed) returns `false` for the same
+    /// value because suppression is precisely a request not to treat it as a
+    /// failure. Code that branches on the two must therefore have a third arm
+    /// (test it with [`is_ignored`](Self::is_ignored)) rather than assume
+    /// `!is_failed()` means success — and must not read "neither" as "not
+    /// finished yet": [`is_terminal`](Self::is_terminal) is `true`.
     #[inline]
     #[must_use]
     pub const fn is_successful(&self) -> bool {
@@ -323,6 +364,9 @@ impl TaskResultValue {
     }
 
     /// Check if the task failed
+    ///
+    /// `false` for [`Ignored`](Self::Ignored): see
+    /// [`is_successful`](Self::is_successful) for the three-way split.
     #[inline]
     #[must_use]
     pub const fn is_failed(&self) -> bool {
@@ -349,8 +393,16 @@ impl TaskResultValue {
         match self {
             TaskResultValue::Failure { error, .. } => Some(error),
             TaskResultValue::Rejected { reason } => Some(reason),
+            TaskResultValue::Ignored { error } => Some(error),
             _ => None,
         }
+    }
+
+    /// Whether this result records a deliberately suppressed failure.
+    #[inline]
+    #[must_use]
+    pub const fn is_ignored(&self) -> bool {
+        matches!(self, TaskResultValue::Ignored { .. })
     }
 
     /// Get the traceback if available
@@ -588,6 +640,15 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
     }
 
     /// Check if the task completed successfully
+    ///
+    /// Both this and [`failed`](Self::failed) are `false` for a task whose
+    /// failure was deliberately suppressed
+    /// ([`TaskResultValue::Ignored`](TaskResultValue::Ignored)) — see
+    /// [`TaskResultValue::is_successful`] for why that is a third disposition
+    /// rather than a missing one. Distinguish it with
+    /// [`info`](Self::info)`().is_ignored()`, and note that
+    /// [`ready`](Self::ready) is already `true` for it, so "neither" never means
+    /// "still running".
     pub async fn successful(&self) -> crate::Result<bool> {
         match self.store.get_result(self.task_id).await? {
             Some(result) => Ok(result.is_successful()),
@@ -596,6 +657,9 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
     }
 
     /// Check if the task failed
+    ///
+    /// `false` for a deliberately suppressed failure; see
+    /// [`successful`](Self::successful).
     pub async fn failed(&self) -> crate::Result<bool> {
         match self.store.get_result(self.task_id).await? {
             Some(result) => Ok(result.is_failed()),
@@ -673,6 +737,11 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
                             "Task rejected: {reason}"
                         )));
                     }
+                    // A deliberately suppressed failure is terminal and *not*
+                    // an error for the caller — that is the whole point of
+                    // dispatching with `ignore_errors`. It resolves as "no
+                    // result", the same value the workflow hands the next step.
+                    TaskResultValue::Ignored { .. } => return Ok(None),
                     // Task not ready yet, continue polling
                     _ => {}
                 }
@@ -1135,146 +1204,6 @@ pub trait ExtendedResultStore: ResultStore {
 
     /// Query results by tags
     async fn query_by_tags(&self, tags: &[String]) -> crate::Result<Vec<TaskId>>;
-}
-
-/// A pluggable compression codec.
-///
-/// Implementations live wherever the codec's dependency lives: a backend crate
-/// can register a deflate or zstd codec and every `ResultCompressor` built with
-/// it then works, instead of the compressor being a type whose only two methods
-/// always fail.
-pub trait CompressionCodec: Send + Sync + std::fmt::Debug {
-    /// Name this codec answers to (e.g. `"zstd"`, `"deflate"`).
-    fn name(&self) -> &str;
-
-    /// Compress `data`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the codec cannot process the input.
-    fn compress(&self, data: &[u8]) -> crate::Result<Vec<u8>>;
-
-    /// Decompress `data`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the input is not valid for this codec.
-    fn decompress(&self, data: &[u8]) -> crate::Result<Vec<u8>>;
-}
-
-/// The identity codec: stores payloads verbatim under the name `"none"`.
-///
-/// Always available, so a `ResultCompressor` is never a type whose operations
-/// unconditionally fail. It is what `compression_algorithm: "none"` means on
-/// the wire.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct IdentityCodec;
-
-impl CompressionCodec for IdentityCodec {
-    fn name(&self) -> &str {
-        "none"
-    }
-
-    fn compress(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
-        Ok(data.to_vec())
-    }
-
-    fn decompress(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
-        Ok(data.to_vec())
-    }
-}
-
-/// Compression helper for result values
-///
-/// Holds a registry of [`CompressionCodec`]s keyed by algorithm name. The
-/// identity codec (`"none"`) is always registered; backends add real codecs with
-/// [`ResultCompressor::with_codec`].
-#[derive(Debug, Clone)]
-pub struct ResultCompressor {
-    threshold_bytes: usize,
-    codecs: std::collections::HashMap<String, std::sync::Arc<dyn CompressionCodec>>,
-}
-
-impl ResultCompressor {
-    /// Create a new compressor with threshold
-    #[must_use]
-    pub fn new(threshold_bytes: usize) -> Self {
-        let mut codecs: std::collections::HashMap<String, std::sync::Arc<dyn CompressionCodec>> =
-            std::collections::HashMap::new();
-        codecs.insert("none".to_string(), std::sync::Arc::new(IdentityCodec));
-        Self {
-            threshold_bytes,
-            codecs,
-        }
-    }
-
-    /// Register a codec, replacing any codec already registered under its name.
-    #[must_use]
-    pub fn with_codec(mut self, codec: std::sync::Arc<dyn CompressionCodec>) -> Self {
-        self.codecs.insert(codec.name().to_string(), codec);
-        self
-    }
-
-    /// Register a codec on an existing compressor.
-    pub fn register_codec(&mut self, codec: std::sync::Arc<dyn CompressionCodec>) {
-        self.codecs.insert(codec.name().to_string(), codec);
-    }
-
-    /// Names of the registered algorithms, sorted.
-    #[must_use]
-    pub fn algorithms(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.codecs.keys().cloned().collect();
-        names.sort();
-        names
-    }
-
-    /// Whether an algorithm is available.
-    #[must_use]
-    pub fn supports(&self, algorithm: &str) -> bool {
-        self.codecs.contains_key(algorithm)
-    }
-
-    /// Check if value should be compressed
-    #[must_use]
-    pub const fn should_compress(&self, data: &[u8]) -> bool {
-        data.len() >= self.threshold_bytes
-    }
-
-    /// Look up a codec by name.
-    fn codec(&self, algorithm: &str) -> crate::Result<&std::sync::Arc<dyn CompressionCodec>> {
-        self.codecs.get(algorithm).ok_or_else(|| {
-            crate::CelersError::Configuration(format!(
-                "unsupported compression algorithm '{algorithm}'; registered: {}",
-                self.algorithms().join(", ")
-            ))
-        })
-    }
-
-    /// Compress data with the named algorithm.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::CelersError::Configuration`] if no codec is registered
-    /// under `algorithm`, or the codec's own error if compression fails.
-    pub fn compress(&self, data: &[u8], algorithm: &str) -> crate::Result<Vec<u8>> {
-        self.codec(algorithm)?.compress(data)
-    }
-
-    /// Decompress data with the named algorithm.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::CelersError::Configuration`] if no codec is registered
-    /// under `algorithm`, or the codec's own error if decompression fails.
-    pub fn decompress(&self, data: &[u8], algorithm: &str) -> crate::Result<Vec<u8>> {
-        self.codec(algorithm)?.decompress(data)
-    }
-}
-
-impl Default for ResultCompressor {
-    fn default() -> Self {
-        Self::new(1024 * 1024) // 1MB threshold
-    }
 }
 
 /// Chunker for large results
@@ -1798,6 +1727,61 @@ mod tests {
         assert!(err.to_string().contains("no value"), "unexpected: {err}");
     }
 
+    /// A terminal result has three dispositions, not two. Pinning the whole
+    /// matrix here is what keeps a later `_ =>` arm from quietly folding
+    /// `Ignored` into "still pending" — the exact hang this variant exists to
+    /// remove.
+    #[test]
+    fn test_ignored_is_a_third_terminal_disposition() {
+        let ignored = TaskResultValue::Ignored {
+            error: "sink unreachable".to_string(),
+        };
+
+        assert!(ignored.is_terminal());
+        assert!(ignored.is_ready());
+        assert!(!ignored.is_pending());
+        assert!(ignored.is_ignored());
+
+        // Neither predicate claims it: it did not succeed, and suppression is
+        // precisely a request not to treat it as a failure.
+        assert!(!ignored.is_successful());
+        assert!(!ignored.is_failed());
+
+        // The suppressed error stays readable; there is no value to hand back.
+        assert_eq!(ignored.error_message(), Some("sink unreachable"));
+        assert_eq!(ignored.success_value(), None);
+        assert!(ignored.traceback().is_none());
+    }
+
+    /// Without a terminal record a suppressed failure would leave `get`
+    /// polling a backend nobody is going to write to.
+    #[tokio::test]
+    async fn test_get_resolves_for_an_ignored_result() {
+        let backend = MockBackend::new();
+        let task_id = Uuid::new_v4();
+        backend.set_result(
+            task_id,
+            TaskResultValue::Ignored {
+                error: "sink unreachable".to_string(),
+            },
+            TaskState::Succeeded(b"null".to_vec()),
+        );
+
+        let result = AsyncResult::new(task_id, backend);
+
+        // Resolves as "no value" — the same thing the workflow hands the
+        // successor — rather than as an error or a timeout.
+        assert_eq!(result.get(None).await.expect("get must resolve"), None);
+        assert!(result.ready().await.expect("ready"));
+        assert!(!result.successful().await.expect("successful"));
+        assert!(!result.failed().await.expect("failed"));
+        assert!(result
+            .info()
+            .await
+            .expect("info")
+            .is_some_and(|value| value.is_ignored()));
+    }
+
     #[test]
     fn test_async_result_config_backoff() {
         let config = AsyncResultConfig::default();
@@ -1883,63 +1867,5 @@ mod tests {
         let huge = ResultMetadata::new().with_ttl(Duration::from_secs(u64::MAX / 2));
         assert!(huge.expires_at.is_some());
         assert!(!huge.is_expired());
-    }
-
-    /// Regression: `ResultCompressor` was a public, constructible type whose
-    /// only two operations always failed.
-    #[test]
-    fn test_result_compressor_dispatches_to_registered_codecs() {
-        #[derive(Debug)]
-        struct XorCodec;
-
-        impl CompressionCodec for XorCodec {
-            fn name(&self) -> &str {
-                "xor"
-            }
-            fn compress(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
-                Ok(data.iter().map(|b| b ^ 0x5a).collect())
-            }
-            fn decompress(&self, data: &[u8]) -> crate::Result<Vec<u8>> {
-                Ok(data.iter().map(|b| b ^ 0x5a).collect())
-            }
-        }
-
-        let compressor = ResultCompressor::new(4).with_codec(Arc::new(XorCodec));
-        assert_eq!(compressor.algorithms(), vec!["none", "xor"]);
-        assert!(compressor.supports("none"));
-        assert!(compressor.supports("xor"));
-        assert!(!compressor.supports("zstd"));
-
-        assert!(compressor.should_compress(b"12345"));
-        assert!(!compressor.should_compress(b"123"));
-
-        // The always-present identity codec round-trips verbatim.
-        let identity = compressor.compress(b"payload", "none").expect("compress");
-        assert_eq!(identity, b"payload");
-        assert_eq!(
-            compressor
-                .decompress(&identity, "none")
-                .expect("decompress"),
-            b"payload"
-        );
-
-        // The registered codec is actually used.
-        let squeezed = compressor.compress(b"payload", "xor").expect("compress");
-        assert_ne!(squeezed, b"payload");
-        assert_eq!(
-            compressor.decompress(&squeezed, "xor").expect("decompress"),
-            b"payload"
-        );
-
-        // An unregistered algorithm is a named configuration error, not a
-        // blanket "compression not available".
-        let err = compressor
-            .compress(b"payload", "zstd")
-            .expect_err("unknown algorithm must be rejected");
-        assert!(
-            err.to_string()
-                .contains("unsupported compression algorithm"),
-            "unexpected: {err}"
-        );
     }
 }

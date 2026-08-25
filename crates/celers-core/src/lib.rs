@@ -207,9 +207,17 @@ pub use rate_limit_distributed::{
     RateLimitParams,
 };
 pub use result::{
-    AsyncResult, AsyncResultConfig, ExtendedResultStore, ResultChunk, ResultChunker,
-    ResultCompressor, ResultMetadata, ResultStore, ResultTombstone, TaskResultValue,
+    builtin_codecs, AsyncResult, AsyncResultConfig, CompressionCodec, ExtendedResultStore,
+    IdentityCodec, ResultChunk, ResultChunker, ResultCompressor, ResultMetadata, ResultStore,
+    ResultTombstone, TaskResultValue,
 };
+// The concrete result-compression codecs, each gated on the feature that pulls
+// in its (Pure Rust) implementation. See `result::compression` for the
+// algorithm-name table these are registered under.
+#[cfg(feature = "compression-deflate")]
+pub use result::{GzipCodec, ZlibCodec, DEFAULT_DEFLATE_LEVEL};
+#[cfg(feature = "compression-zstd")]
+pub use result::{ZstdCodec, DEFAULT_ZSTD_LEVEL};
 pub use result_groups::{GroupChild, GroupStatus, ResultGroup};
 pub use result_tombstone::{ResultExistence, TombstoneExt, TombstoneRegistry};
 pub use result_ttl::{ResolvedResultTtl, ResultTtlConfig};

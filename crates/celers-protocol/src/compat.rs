@@ -50,6 +50,218 @@ pub const CELERY_V2_HEADERS: &[&str] = &[
 /// Header keys without which a Celery worker cannot dispatch the task.
 pub const REQUIRED_V2_HEADERS: &[&str] = &["task", "id", "lang"];
 
+/// The queue Celery uses when a task names none (`task_default_queue`).
+pub const DEFAULT_CELERY_QUEUE: &str = "celery";
+
+/// How deep `celery.utils.saferepr` descends before eliding a container.
+///
+/// Celery renders `argsrepr` / `kwargsrepr` with `saferepr(..., maxlevels=3)`,
+/// which replaces the *contents* of any container opened at nesting level 3 or
+/// deeper with `...` while keeping its brackets: `{'a': {'b': {'c': [...]}}}`.
+pub const SAFEREPR_MAXLEVELS: usize = 3;
+
+/// Above this magnitude (and below `1e-4`) Python's `repr` switches a float to
+/// exponent notation. `repr(1e16)` is `'1e+16'`; `repr(1e15)` is
+/// `'1000000000000000.0'`.
+const FLOAT_EXPONENT_THRESHOLD: i32 = 16;
+
+/// Below this exponent Python's `repr` switches a float to exponent notation.
+/// `repr(1e-4)` is `'0.0001'`; `repr(1e-5)` is `'1e-05'`.
+const FLOAT_EXPONENT_FLOOR: i32 = -4;
+
+/// Render a JSON value the way `celery.utils.saferepr` renders its Python
+/// equivalent.
+///
+/// This is what the `argsrepr` / `kwargsrepr` observability headers carry, and
+/// it is what Flower, `celery events` and `celery inspect` print. It is *not*
+/// `repr` from the standard library: Celery's `saferepr` always delimits a
+/// string with single quotes, escaping an embedded `'` as `\'`, where the
+/// builtin would switch to double quotes. It also leaves backslashes,
+/// newlines, tabs and control characters unescaped, and passes non-ASCII
+/// through verbatim.
+///
+/// The mapping:
+///
+/// | JSON        | Python              |
+/// |-------------|---------------------|
+/// | `null`      | `None`              |
+/// | `true`      | `True`              |
+/// | `false`     | `False`             |
+/// | `4`         | `4`                 |
+/// | `2.0`       | `2.0`               |
+/// | `"it's"`    | `'it\'s'`           |
+/// | `[1, 2]`    | `[1, 2]`            |
+/// | `{"a": 1}`  | `{'a': 1}`          |
+///
+/// # Ordering
+///
+/// A JSON object has no insertion order once parsed -- [`serde_json::Map`] is
+/// a `BTreeMap` here -- so a dict is rendered with its keys **sorted**. Python
+/// reprs a dict in insertion order, so a caller who built `kwargs` as
+/// `{'z': 1, 'a': 2}` sees `{'z': 1, 'a': 2}` from Celery and
+/// `{'a': 2, 'z': 1}` from this function. The difference is confined to a
+/// display header; no dispatch decision reads it.
+pub fn python_repr(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_python_repr(&mut out, value, 0);
+    out
+}
+
+/// Render a positional-argument list as the Python **tuple** literal Celery's
+/// `argsrepr` carries: `()`, `(1,)`, `(4, 5)`.
+///
+/// The tuple form is deliberate. `task.delay(4, 5)` -- the canonical Celery
+/// call -- passes `args` as a tuple, so `repr(args)` is `'(4, 5)'`. Calling
+/// `apply_async(args=[4, 5])` with a *list* instead yields `'[4, 5]'`; both
+/// are real Celery output, and CeleRS follows `.delay()`. Do not "fix" this to
+/// the list form.
+pub fn python_args_repr(args: &[serde_json::Value]) -> String {
+    let mut out = String::from("(");
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        write_python_repr(&mut out, arg, 1);
+    }
+    // Python disambiguates a one-element tuple from a parenthesised value.
+    if args.len() == 1 {
+        out.push(',');
+    }
+    out.push(')');
+    out
+}
+
+/// Render keyword arguments as the Python dict literal Celery's `kwargsrepr`
+/// carries: `{}`, `{'loud': True}`.
+///
+/// A non-object `kwargs` cannot occur in a well-formed protocol v2 body, but
+/// rather than panic on one this falls back to [`python_repr`], which renders
+/// whatever it was given.
+pub fn python_kwargs_repr(kwargs: &serde_json::Value) -> String {
+    match kwargs {
+        serde_json::Value::Object(_) => python_repr(kwargs),
+        other => python_repr(other),
+    }
+}
+
+/// Render `value` into `out`, where `level` counts the containers already open.
+fn write_python_repr(out: &mut String, value: &serde_json::Value, level: usize) {
+    use serde_json::Value;
+    match value {
+        Value::Null => out.push_str("None"),
+        Value::Bool(true) => out.push_str("True"),
+        Value::Bool(false) => out.push_str("False"),
+        Value::Number(number) => out.push_str(&python_number_repr(number)),
+        Value::String(text) => write_python_str(out, text),
+        Value::Array(items) => {
+            if level >= SAFEREPR_MAXLEVELS {
+                out.push_str("[...]");
+                return;
+            }
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_python_repr(out, item, level + 1);
+            }
+            out.push(']');
+        }
+        Value::Object(entries) => {
+            if level >= SAFEREPR_MAXLEVELS {
+                out.push_str("{...}");
+                return;
+            }
+            out.push('{');
+            for (index, (key, item)) in entries.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_python_str(out, key);
+                out.push_str(": ");
+                write_python_repr(out, item, level + 1);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Write a Python string literal: single quotes, `'` escaped as `\'`.
+///
+/// Everything else -- backslashes, newlines, tabs, control and non-ASCII
+/// characters -- is passed through verbatim, because that is what
+/// `celery.utils.saferepr` does. Reproducing the builtin `repr`'s escaping
+/// here would *diverge* from the header Celery actually writes.
+fn write_python_str(out: &mut String, text: &str) {
+    out.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('\'');
+}
+
+/// Render a JSON number as Python's `repr` of the corresponding int or float.
+///
+/// Integers print as-is. Floats follow Python: a `.0` suffix keeps an integral
+/// float distinguishable from an int, and magnitudes outside
+/// `[1e-4, 1e16)` switch to exponent notation with a signed, zero-padded
+/// two-digit exponent (`1e+20`, `1e-07`).
+fn python_number_repr(number: &serde_json::Number) -> String {
+    if number.is_i64() || number.is_u64() {
+        return number.to_string();
+    }
+    let Some(value) = number.as_f64() else {
+        // Unreachable for a `serde_json::Number`, which is always one of the
+        // three arms; falling back to the JSON text beats panicking.
+        return number.to_string();
+    };
+    python_float_repr(value)
+}
+
+/// Python's `repr` for a finite `f64`.
+fn python_float_repr(value: f64) -> String {
+    if !value.is_finite() {
+        // JSON cannot carry these, but a hand-built `Number` could not either,
+        // so this arm exists only so the function is total.
+        return match (value.is_nan(), value.is_sign_negative()) {
+            (true, _) => "nan".to_string(),
+            (false, true) => "-inf".to_string(),
+            (false, false) => "inf".to_string(),
+        };
+    }
+
+    // Rust's `LowerExp` is shortest-round-trip, the same guarantee Python's
+    // `repr` gives, so the mantissa needs no reformatting -- only the exponent
+    // spelling differs (`1e20` vs `1e+20`).
+    let exponential = format!("{:e}", value);
+    let (mantissa, exponent_text) = match exponential.split_once('e') {
+        Some(parts) => parts,
+        // `LowerExp` always emits an `e`; if that ever changed, the decimal
+        // rendering below is still correct.
+        None => return with_float_point(&format!("{}", value)),
+    };
+    let exponent: i32 = exponent_text.parse().unwrap_or(0);
+
+    if exponent >= FLOAT_EXPONENT_THRESHOLD || exponent < FLOAT_EXPONENT_FLOOR {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{}e{}{:02}", mantissa, sign, exponent.abs());
+    }
+
+    with_float_point(&format!("{}", value))
+}
+
+/// Give a decimal float rendering the `.0` Python uses to mark it as a float.
+fn with_float_point(text: &str) -> String {
+    if text.contains('.') || text.contains('e') || text.contains("inf") || text.contains("nan") {
+        text.to_string()
+    } else {
+        format!("{}.0", text)
+    }
+}
+
 /// Verify that a CeleRS message serializes to Celery-compatible JSON
 ///
 /// Checks, in order:
@@ -172,7 +384,18 @@ pub fn verify_message_format(msg: &Message) -> Result<(), String> {
 /// * `properties.body_encoding`, which tells kombu to base64-decode the body;
 /// * the embed dict with all four workflow keys present
 ///   (`{'callbacks': None, 'errbacks': None, 'chain': None, 'chord': None}`),
-///   which is what Python emits even when no workflow is attached.
+///   which is what Python emits even when no workflow is attached;
+/// * `argsrepr` / `kwargsrepr` as *Python* literals -- see
+///   [`python_args_repr`] and [`python_kwargs_repr`]. These are what Flower
+///   and `celery events` display, so a Rust `Debug` rendering there
+///   (`[Number(4), Number(5)]`) is visible to every operator watching the
+///   cluster.
+///
+/// The envelope is a strict subset of Celery 5.6's headers: that release also
+/// writes `group_index`, `replaced_task_nesting`, `stamped_headers` and
+/// `stamps`. A real worker reads headers with `.get()`, and the interop suite
+/// under `tests/python-compat` proves an envelope built here executes on an
+/// unmodified Celery worker.
 ///
 /// # Errors
 ///
@@ -187,6 +410,34 @@ pub fn create_python_celery_message(
     task_id: Uuid,
     args: Vec<serde_json::Value>,
     kwargs: serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Error> {
+    create_python_celery_message_on_queue(task_name, task_id, args, kwargs, DEFAULT_CELERY_QUEUE)
+}
+
+/// Build the canonical envelope for a task that lives on `queue`.
+///
+/// Identical to [`create_python_celery_message`] except that
+/// `properties.delivery_info.routing_key` names `queue` instead of the default.
+///
+/// # Why the routing key matters
+///
+/// It is not decoration. A Celery worker re-publishes with
+/// `self.request.delivery_info` when a task calls `task.retry()`, and uses the
+/// same information to route `link` callbacks. A message that sits on
+/// `payments` while claiming `routing_key: "celery"` therefore sends its own
+/// retries to the *default* queue -- where, if nothing consumes it, the retry
+/// is never executed and the task stays `RETRY` forever. The interop suite
+/// reproduces exactly that (`tests/python-compat/test_celers_to_python.py`).
+///
+/// # Errors
+///
+/// As [`create_python_celery_message`].
+pub fn create_python_celery_message_on_queue(
+    task_name: &str,
+    task_id: Uuid,
+    args: Vec<serde_json::Value>,
+    kwargs: serde_json::Value,
+    queue: &str,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let embed = json!({
         "callbacks": null,
@@ -209,8 +460,8 @@ pub fn create_python_celery_message(
             "eta": null,
             "expires": null,
             "timelimit": [null, null],
-            "argsrepr": format!("{:?}", args),
-            "kwargsrepr": kwargs.to_string(),
+            "argsrepr": python_args_repr(&args),
+            "kwargsrepr": python_kwargs_repr(&kwargs),
             "origin": "1234@celers-test",
             "shadow": null,
             "ignore_result": false
@@ -222,7 +473,9 @@ pub fn create_python_celery_message(
             "priority": 0,
             "body_encoding": BODY_ENCODING_BASE64,
             "delivery_tag": Uuid::nil().to_string(),
-            "delivery_info": {"exchange": "", "routing_key": "celery"}
+            // The empty exchange is kombu's direct-to-queue routing; the
+            // routing key names the queue the message is being put on.
+            "delivery_info": {"exchange": "", "routing_key": queue}
         },
         "content-type": "application/json",
         "content-encoding": "utf-8",
@@ -321,58 +574,65 @@ mod tests {
         verify_message_format(&msg).expect("a v5 message is a valid v2 envelope");
     }
 
+    /// A protocol v2 envelope captured verbatim from Python Celery 5.6.3.
+    ///
+    /// Recorded by `tests/python-compat/capture_fixtures.py`, which published
+    /// `tasks.add.apply_async(args=(4, 5))` through a real Celery to a real
+    /// Redis and wrote back the bytes kombu put on the queue. See
+    /// `tests/fixtures/README.md` for the versions and the exact command.
+    ///
+    /// Regression: the tests below used to build their "canonical Celery
+    /// envelope" by calling [`create_python_celery_message`] -- the function in
+    /// this very module -- and then assert over its output. Such a test cannot
+    /// detect divergence from Celery; it can only fail if the function
+    /// contradicts itself.
+    const CELERY_CAPTURE: &str =
+        include_str!("../tests/fixtures/celery_task_v2_positional_tuple.json");
+
+    /// The envelope [`create_python_celery_message`] produces, recorded only
+    /// after an unmodified Celery worker executed it and returned `SUCCESS`.
+    const CELERS_ACCEPTED: &str =
+        include_str!("../tests/fixtures/celers_envelope_accepted_by_celery.json");
+
     #[test]
     fn test_parse_python_celery_message() {
-        let task_id = Uuid::new_v4();
-        let python_msg = create_python_celery_message(
-            "tasks.multiply",
-            task_id,
-            vec![json!(4), json!(5)],
-            json!({}),
-        )
-        .expect("fixture serialization should not fail");
+        let python_msg: serde_json::Value =
+            serde_json::from_str(CELERY_CAPTURE).expect("the capture is valid JSON");
 
-        // Should parse without errors
-        let msg = parse_python_message(python_msg).expect("Should parse Python message");
+        let msg = parse_python_message(python_msg).expect("a real Celery message must parse");
 
-        assert_eq!(msg.headers.task, "tasks.multiply");
-        assert_eq!(msg.headers.id, task_id);
+        assert_eq!(msg.headers.task, "tasks.add");
+        assert_eq!(
+            msg.headers.id.to_string(),
+            "7b1a0d1e-0000-4000-8000-000000000002"
+        );
         assert_eq!(msg.headers.lang, "py");
         assert_eq!(msg.content_type, "application/json");
+
+        let decoded = EmbeddedBody::decode(&msg.body).expect("body must decode");
+        assert_eq!(decoded.args, vec![json!(4), json!(5)]);
     }
 
-    /// The fixture must carry the parts a real Celery producer emits and CeleRS
-    /// previously ignored: the null-valued embed keys, `body_encoding`, and the
-    /// full v2 header set. Regression: the fixture claimed to be "the exact
-    /// format Python Celery uses" while emitting an empty embed dict `{}` and
-    /// omitting every one of those keys.
+    /// What Python actually emits, asserted against Python's own bytes: every
+    /// v2 header present (null when unused), `timelimit` as the `[soft, hard]`
+    /// pair, `body_encoding` so kombu decodes the body, and an embed dict with
+    /// all four workflow keys spelled out.
     #[test]
-    fn test_python_fixture_is_the_canonical_celery_envelope() {
-        let task_id = Uuid::new_v4();
-        let python_msg = create_python_celery_message(
-            "tasks.multiply",
-            task_id,
-            vec![json!(4), json!(5)],
-            json!({}),
-        )
-        .expect("fixture serialization should not fail");
+    fn test_the_capture_is_the_canonical_celery_envelope() {
+        let python_msg: serde_json::Value =
+            serde_json::from_str(CELERY_CAPTURE).expect("the capture is valid JSON");
 
-        // Every protocol v2 header key is present (null when unused).
         for header in CELERY_V2_HEADERS {
             assert!(
                 python_msg["headers"].get(header).is_some(),
-                "fixture is missing the Celery v2 header '{}'",
+                "Celery's own message is missing the v2 header '{}'",
                 header
             );
         }
         assert_eq!(python_msg["headers"]["timelimit"], json!([null, null]));
-
-        // kombu's body codec selector.
         assert_eq!(python_msg["properties"]["body_encoding"], json!("base64"));
         assert!(python_msg["properties"]["delivery_info"].is_object());
 
-        // The embed dict carries all four workflow keys with explicit nulls,
-        // which is what `as_task_v2` writes.
         let body = base64::engine::general_purpose::STANDARD
             .decode(python_msg["body"].as_str().expect("body is a string"))
             .expect("body is base64");
@@ -381,17 +641,73 @@ mod tests {
             assert_eq!(
                 tuple[2][key],
                 json!(null),
-                "embed dict is missing the '{}' key",
+                "Celery's embed dict is missing the '{}' key",
                 key
             );
         }
 
-        // And the whole thing round-trips into a `Message` whose body decodes.
-        let msg = parse_python_message(python_msg).expect("fixture must parse");
+        let msg = parse_python_message(python_msg).expect("the capture must parse");
         let decoded = EmbeddedBody::decode(&msg.body).expect("body must decode");
         assert_eq!(decoded.args, vec![json!(4), json!(5)]);
         assert!(!decoded.embed.has_workflow());
-        verify_message_format(&msg).expect("the fixture is a valid v2 envelope");
+        verify_message_format(&msg).expect("the capture is a valid v2 envelope");
+    }
+
+    /// A task published to a named queue must say so in its routing key, or a
+    /// Celery worker sends the task's own retries to the default queue -- where
+    /// nothing is listening, so the task stays `RETRY` forever.
+    #[test]
+    fn test_routing_key_names_the_queue_the_message_is_on() {
+        let task_id = Uuid::nil();
+        let default = create_python_celery_message("tasks.add", task_id, vec![json!(1)], json!({}))
+            .expect("serialize");
+        assert_eq!(
+            default["properties"]["delivery_info"]["routing_key"],
+            json!(DEFAULT_CELERY_QUEUE),
+            "the default must stay `celery`; the accepted golden fixture pins it"
+        );
+
+        let routed = create_python_celery_message_on_queue(
+            "tasks.add",
+            task_id,
+            vec![json!(1)],
+            json!({}),
+            "payments",
+        )
+        .expect("serialize");
+        assert_eq!(
+            routed["properties"]["delivery_info"]["routing_key"],
+            json!("payments")
+        );
+        assert_eq!(
+            routed["properties"]["delivery_info"]["exchange"],
+            json!(""),
+            "kombu routes direct-to-queue through the empty exchange"
+        );
+
+        // The queue must not leak anywhere else in the envelope.
+        assert_eq!(routed["headers"], default["headers"]);
+        assert_eq!(routed["body"], default["body"]);
+    }
+
+    /// The other half: what CeleRS emits must equal what Celery was proven to
+    /// accept. Together with the test above, drift in *either* direction fails.
+    #[test]
+    fn test_created_envelope_equals_the_one_celery_accepted() {
+        let task_id: Uuid = "7b1a0d1e-0000-4000-8000-000000000012"
+            .parse()
+            .expect("fixture task id");
+        let produced =
+            create_python_celery_message("tasks.add", task_id, vec![json!(4), json!(5)], json!({}))
+                .expect("the canonical envelope must serialize");
+        let accepted: serde_json::Value =
+            serde_json::from_str(CELERS_ACCEPTED).expect("the capture is valid JSON");
+
+        assert_eq!(
+            produced, accepted,
+            "create_python_celery_message drifted from the envelope a real \
+             Celery worker executed"
+        );
     }
 
     #[test]

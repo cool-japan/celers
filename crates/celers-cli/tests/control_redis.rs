@@ -54,29 +54,14 @@ struct CountingTask {
     name: &'static str,
 }
 
-// Written in the desugared `#[async_trait]` form on purpose: `celers-cli` does
-// not depend on the `async-trait` crate, and this test may not add one (see the
-// crate's manifest follow-ups). The shape is exactly what the attribute would
-// expand to on `async fn execute(&self, input) -> Result<Output>`.
+#[async_trait::async_trait]
 impl Task for CountingTask {
     type Input = Empty;
     type Output = Empty;
 
-    fn execute<'life0, 'async_trait>(
-        &'life0 self,
-        _input: Self::Input,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Output>> + Send + 'async_trait>,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        let runs = Arc::clone(&self.runs);
-        Box::pin(async move {
-            runs.fetch_add(1, Ordering::SeqCst);
-            Ok(Empty {})
-        })
+    async fn execute(&self, _input: Self::Input) -> Result<Self::Output> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(Empty {})
     }
 
     fn name(&self) -> &str {

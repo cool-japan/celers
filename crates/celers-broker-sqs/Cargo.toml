@@ -38,4 +38,15 @@ celers-protocol = { workspace = true }
 celers-kombu = { workspace = true }
 
 [dev-dependencies]
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which is what
+# lets interval-driven background loops be tested deterministically instead
+# of by sleeping. Test-only: it is inert unless a test pauses the clock.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+# Lets `src/test_support.rs` name `HttpClient`/`HttpConnector` so unit tests can
+# build an `aws_sdk_sqs::Client` whose transport is a stub. Without it every
+# such test pays `rustls_native_certs::load_native_certs()` (~12s per process on
+# macOS, and empty — which trips a `debug_assert!` inside the SDK — when several
+# test processes hit the keychain concurrently). Already in the graph via
+# `aws-sdk-sqs`; see the note in the workspace manifest.
+aws-smithy-runtime-api = { workspace = true }

@@ -205,9 +205,14 @@ pub use crate::result_helpers::{
 
 // Advanced workflow patterns
 pub use crate::advanced_patterns::{
-    create_conditional_workflow, create_dynamic_workflow, create_parallel_chains,
-    create_saga_workflow,
+    create_conditional_workflow, create_conditional_workflow_with, create_dynamic_workflow,
+    create_parallel_chains, create_saga_workflow, ParallelChains,
 };
+
+// The canvas types those patterns are built from: a conditional workflow is a
+// `NestedChain` holding a `Branch`, and a caller needs `Condition` to express
+// anything beyond a plain truthiness test.
+pub use crate::{Branch, CanvasElement, CanvasError, Condition, NestedChain, NestedGroup, Switch};
 
 // Monitoring and observability helpers
 pub use crate::monitoring_helpers::TaskMonitor;

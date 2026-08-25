@@ -16,11 +16,27 @@ target/
 *~
 
 # Documentation
+# NOTE on the pattern below: unlike .gitignore, a bare .dockerignore pattern
+# with no `/` and no `**` is anchored to the CONTEXT ROOT ONLY -- it does not
+# match at every depth (see docs.docker.com/build/building/context/, the
+# `**/*.go` example; verified 2026-08-25 against the live docs and against
+# github.com/moby/moby#27144). So `*.md` here excludes only README.md /
+# CHANGELOG.md / TODO.md etc. at the repo root; it does NOT reach
+# crates/*/README.md, which every publishable crate manifest needs present
+# via its `readme = "README.md"` key (Cargo metadata tooling such as
+# `cargo package`/`cargo publish --dry-run` run inside the build context
+# would fail without it). Do not "fix" this to `**/*.md` -- that would
+# actually strip every crate README from the build context.
 *.md
 docs/
 LICENSE*
 
 # Tests and benchmarks
+# Same root-anchoring rule as above: these three patterns exclude only
+# ./benches, ./tests and ./examples at the repo root. crates/*/tests,
+# crates/*/benches and crates/*/examples are a separate, unrelated
+# directory tree and are NOT covered -- they stay in the build context
+# (harmlessly; nothing in the image build reads them).
 benches/
 tests/
 examples/

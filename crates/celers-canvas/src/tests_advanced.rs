@@ -222,7 +222,6 @@ fn test_time_travel_debugger() {
 /// Integration tests for broker, backend, chord barriers, and performance
 mod integration {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -405,115 +404,207 @@ mod integration {
         assert_eq!(chord.header.tasks.len(), 2);
     }
 
-    // ===== Chord Barrier Race Condition Tests =====
+    // ===== Chord Barrier Tests =====
+    //
+    // These drive the real barrier: the completion counter a `ResultBackend`
+    // keeps for the chord `Chord::apply` registered, which is what the worker
+    // compares against `ChordState::total` before enqueuing the callback. They
+    // replace three tests that spawned tokio tasks around an `AtomicUsize` and
+    // asserted on it — properties of `fetch_add` and of the tests' own
+    // `if`-statements, with no CeleRS type in sight.
+    //
+    // A barrier is only observable through a result backend, hence the feature
+    // gate. The worker half — the callback firing exactly once, with the
+    // members' results as its argument — is covered end to end in
+    // `celers-worker/src/workflows/patterns_e2e.rs`.
+    #[cfg(feature = "backend-redis")]
+    mod chord_barrier {
+        use super::*;
+        use crate::tests_backend::MockResultBackend;
+        use celers_backend_redis::{ResultBackend, TaskMeta, TaskResult};
 
-    #[tokio::test]
-    async fn test_chord_concurrent_completion() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(tokio::sync::Barrier::new(10));
+        /// Dispatch a chord with `members` header tasks and return the backend
+        /// holding its barrier, plus the chord id.
+        async fn apply_chord(members: usize) -> (MockResultBackend, Uuid) {
+            let broker = MockBroker::new();
+            let mut backend = MockResultBackend::new();
 
-        let mut handles = vec![];
+            let mut header = Group::new();
+            for index in 0..members {
+                header = header.add("member", vec![serde_json::json!(index)]);
+            }
 
-        // Simulate 10 tasks completing concurrently
-        for _ in 0..10 {
-            let counter = counter.clone();
-            let barrier = barrier.clone();
+            let chord_id = Chord::new(header, Signature::new("aggregate".to_string()))
+                .apply(&broker, &mut backend)
+                .await
+                .expect("chord dispatches");
 
-            let handle = tokio::spawn(async move {
-                // Wait for all tasks to be ready
-                barrier.wait().await;
+            assert_eq!(
+                broker.task_count(),
+                members,
+                "only the header is enqueued; the callback waits for the barrier"
+            );
 
-                // Simulate task completion and counter increment (like Redis INCR)
-                let old = counter.fetch_add(1, Ordering::SeqCst);
-                old + 1
-            });
-
-            handles.push(handle);
+            (backend, chord_id)
         }
 
-        // Wait for all tasks
-        let mut results = vec![];
-        for handle in handles {
-            results.push(handle.await.unwrap());
+        /// The property the whole barrier rests on: when N members complete at
+        /// once, each completion is handed a distinct count and exactly one of
+        /// them sees the count reach `total`. That single observation is what
+        /// the worker turns into a callback, so a duplicate here would run the
+        /// callback twice and a skipped one would never run it at all.
+        #[tokio::test]
+        async fn concurrent_completions_hand_out_every_count_exactly_once() {
+            const MEMBERS: usize = 10;
+
+            let (backend, chord_id) = apply_chord(MEMBERS).await;
+            let total = backend.only_state().total;
+            assert_eq!(total, MEMBERS);
+
+            let backend = Arc::new(tokio::sync::Mutex::new(backend));
+            // Nobody increments until every task is ready to, so the calls
+            // really do contend rather than running one after another.
+            let gate = Arc::new(tokio::sync::Barrier::new(MEMBERS));
+
+            let mut handles = Vec::with_capacity(MEMBERS);
+            for _ in 0..MEMBERS {
+                let backend = Arc::clone(&backend);
+                let gate = Arc::clone(&gate);
+
+                handles.push(tokio::spawn(async move {
+                    gate.wait().await;
+                    backend
+                        .lock()
+                        .await
+                        .chord_complete_task(chord_id)
+                        .await
+                        .expect("the completion counter is always available")
+                }));
+            }
+
+            let mut counts = Vec::with_capacity(MEMBERS);
+            for handle in handles {
+                counts.push(handle.await.expect("completion task must not panic"));
+            }
+
+            counts.sort_unstable();
+            assert_eq!(
+                counts,
+                (1..=MEMBERS).collect::<Vec<_>>(),
+                "every completion must get its own count: no duplicates, none skipped"
+            );
+
+            let openings = counts.iter().filter(|count| **count >= total).count();
+            assert_eq!(
+                openings, 1,
+                "exactly one completion may observe the barrier opening"
+            );
+
+            let state = backend
+                .lock()
+                .await
+                .chord_get_state(chord_id)
+                .await
+                .expect("state lookup")
+                .expect("the barrier outlives its members");
+            assert!(state.is_complete(), "all {} members completed", MEMBERS);
+            assert_eq!(state.remaining(), 0);
         }
 
-        // Verify no duplicates (each increment should be unique)
-        results.sort();
-        assert_eq!(results, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        assert_eq!(counter.load(Ordering::SeqCst), 10);
-    }
+        /// The barrier stays shut while any member is outstanding. This is the
+        /// `count >= total` decision the worker makes on every completion, read
+        /// back from the barrier itself.
+        #[tokio::test]
+        async fn the_barrier_opens_only_after_the_last_member_completes() {
+            const MEMBERS: usize = 3;
 
-    #[tokio::test]
-    async fn test_chord_barrier_idempotency() {
-        // Test that callback is triggered exactly once even with race conditions
-        let callback_count = Arc::new(AtomicUsize::new(0));
-        let completed_count = Arc::new(AtomicUsize::new(0));
-        let total_tasks = 5;
+            let (mut backend, chord_id) = apply_chord(MEMBERS).await;
 
-        let mut handles = vec![];
+            for expected in 1..=MEMBERS {
+                let count = backend
+                    .chord_complete_task(chord_id)
+                    .await
+                    .expect("counter increments");
+                assert_eq!(count, expected, "completions are counted one by one");
 
-        for _ in 0..total_tasks {
-            let callback_count = callback_count.clone();
-            let completed_count = completed_count.clone();
+                let state = backend
+                    .chord_get_state(chord_id)
+                    .await
+                    .expect("state lookup")
+                    .expect("the barrier exists until the chord is reclaimed");
 
-            let handle = tokio::spawn(async move {
-                // Simulate task completion
-                let count = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
-
-                // Only the last task should trigger callback
-                if count == total_tasks {
-                    callback_count.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-
-            handles.push(handle);
+                assert_eq!(
+                    state.completed, expected,
+                    "the count must be visible on the state the worker reads"
+                );
+                assert_eq!(state.remaining(), MEMBERS - expected);
+                assert_eq!(
+                    state.is_complete(),
+                    expected == MEMBERS,
+                    "the barrier may only report complete once every member has finished \
+                     ({}/{} completed)",
+                    expected,
+                    MEMBERS
+                );
+            }
         }
 
-        for handle in handles {
-            handle.await.unwrap();
+        /// Partial failure: a member that failed, and one that never reported at
+        /// all, both come back as JSON `null` in the aggregate — in the chord's
+        /// declaration order — while the successful member's value is preserved.
+        /// This is exactly the mapping the worker applies before handing the
+        /// list to the callback, so a single dead member cannot strand a chord.
+        #[tokio::test]
+        async fn partial_results_substitute_null_for_members_without_a_success_value() {
+            let (mut backend, chord_id) = apply_chord(3).await;
+            let ids = backend.only_state().task_ids;
+            assert_eq!(ids.len(), 3);
+
+            let mut succeeded = TaskMeta::new(ids[0], "member".to_string());
+            succeeded.result = TaskResult::Success(serde_json::json!({"rows": 12}));
+            backend
+                .store_result(ids[0], &succeeded)
+                .await
+                .expect("store the successful member's result");
+
+            // ids[1] never reported at all: the member died before writing back.
+
+            let mut failed = TaskMeta::new(ids[2], "member".to_string());
+            failed.result = TaskResult::Failure("shard unreachable".to_string());
+            backend
+                .store_result(ids[2], &failed)
+                .await
+                .expect("store the failed member's result");
+
+            let partial = backend
+                .chord_get_partial_results(chord_id)
+                .await
+                .expect("partial results");
+
+            assert_eq!(
+                partial.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                ids,
+                "results come back in the chord's declaration order"
+            );
+
+            let values: Vec<serde_json::Value> = partial
+                .into_iter()
+                .map(|(_, meta)| {
+                    meta.and_then(|meta| meta.result.success_value().cloned())
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect();
+
+            assert_eq!(
+                values,
+                vec![
+                    serde_json::json!({"rows": 12}),
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                ],
+                "a missing result and a failed one are both nulls; the success is untouched"
+            );
         }
-
-        // Verify callback was triggered exactly once
-        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
-        assert_eq!(completed_count.load(Ordering::SeqCst), total_tasks);
-    }
-
-    #[tokio::test]
-    async fn test_chord_partial_failure_handling() {
-        // Test chord behavior when some tasks fail
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let failure_count = Arc::new(AtomicUsize::new(0));
-
-        let mut handles = vec![];
-
-        for i in 0..10 {
-            let success_count = success_count.clone();
-            let failure_count = failure_count.clone();
-
-            let handle = tokio::spawn(async move {
-                if i % 3 == 0 {
-                    // Simulate failure
-                    failure_count.fetch_add(1, Ordering::SeqCst);
-                    Err::<(), &str>("Task failed")
-                } else {
-                    // Simulate success
-                    success_count.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            let _ = handle.await.unwrap();
-        }
-
-        let success = success_count.load(Ordering::SeqCst);
-        let failure = failure_count.load(Ordering::SeqCst);
-
-        assert_eq!(success + failure, 10);
-        assert!(failure > 0, "Should have some failures");
     }
 
     // ===== Performance Tests =====

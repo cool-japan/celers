@@ -802,6 +802,10 @@ impl InMemoryResultBackend {
             TaskResultValue::Revoked => TaskState::Revoked,
             TaskResultValue::Retry { attempt, .. } => TaskState::Retrying(*attempt),
             TaskResultValue::Rejected { .. } => TaskState::Rejected,
+            // Terminal and non-failing by contract (see
+            // `TaskResultValue::Ignored`): the workflow carries a JSON `null`
+            // forward, so the state matches a task that returned nothing.
+            TaskResultValue::Ignored { .. } => TaskState::Succeeded(b"null".to_vec()),
         }
     }
 }
@@ -1319,6 +1323,45 @@ mod tests {
             }
             other => panic!("expected Succeeded, got {other:?}"),
         }
+    }
+
+    /// A deliberately suppressed failure has to map to a **terminal** state:
+    /// anything else (a `Custom` state, or no mapping at all) leaves every
+    /// `AsyncResult` waiter polling forever, which is the failure this variant
+    /// exists to remove. `null` is the value the workflow carries forward in
+    /// its place.
+    #[tokio::test]
+    async fn backend_get_state_maps_an_ignored_failure_to_a_terminal_state() {
+        let backend = InMemoryResultBackend::new();
+        let id = Uuid::new_v4();
+
+        backend
+            .store_result(
+                id,
+                TaskResultValue::Ignored {
+                    error: "sink unreachable".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let state = backend.get_state(id).await.unwrap();
+        assert!(state.is_terminal(), "a waiter must resolve, got {state:?}");
+        match state {
+            TaskState::Succeeded(bytes) => {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                    serde_json::Value::Null
+                );
+            }
+            other => panic!("expected Succeeded(null), got {other:?}"),
+        }
+
+        // The suppressed error itself is preserved in the stored result, so the
+        // suppression stays observable rather than silent.
+        let stored = backend.get_result(id).await.unwrap().unwrap();
+        assert!(stored.is_ignored());
+        assert_eq!(stored.error_message(), Some("sink unreachable"));
     }
 
     #[tokio::test]

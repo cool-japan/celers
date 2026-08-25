@@ -16,7 +16,7 @@
 use celers_core::control::{ControlCommand, ControlResponse, InspectCommand, InspectResponse};
 use celers_core::control_transport::{ControlClient, ControlTransport, InMemoryControlTransport};
 use celers_core::task_security::{sign_task, PayloadHygiene, SigningOptions};
-use celers_core::task_signature::TaskSigner;
+use celers_core::task_signature::{FreshnessWindow, ReplayGuard, TaskSigner};
 use celers_core::{Broker, InMemoryBroker, SerializedTask, Task, TaskRegistry};
 use celers_worker::{DlqConfig, SignatureVerification, Worker, WorkerConfig, WorkerHandle};
 
@@ -316,10 +316,15 @@ async fn verification_is_off_by_default() {
         .await;
 
     let broker = Arc::new(InMemoryBroker::new());
-    // No `signature_verification`: exactly `WorkerConfig::default()`'s posture.
+    // The claim the whole feature rests on: a *default* worker behaves exactly
+    // as it did before either control existed. Asserted against
+    // `WorkerConfig::default()` itself, not the test helper, so flipping either
+    // default to `Some(..)` fails here.
+    let defaults = WorkerConfig::default();
+    assert!(defaults.signature_verification.is_none());
+    assert!(defaults.payload_hygiene.is_none());
+
     let running = start(&broker, registry, fast_config("default-worker")).await;
-    assert!(fast_config("x").signature_verification.is_none());
-    assert!(fast_config("x").payload_hygiene.is_none());
 
     broker
         .enqueue(SerializedTask::new(
@@ -414,4 +419,146 @@ async fn inspect_active_reports_a_redacted_payload() {
 
     release.notify_waiters();
     let _ = handle.shutdown().await;
+}
+
+/// A task that fails its first attempt and succeeds on the retry, so the retry
+/// path is exercised end to end.
+struct FlakyTask {
+    attempts: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Task for FlakyTask {
+    type Input = serde_json::Value;
+    type Output = serde_json::Value;
+
+    async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(celers_core::CelersError::TaskExecution(
+                "first attempt always fails".to_string(),
+            ));
+        }
+        Ok(input)
+    }
+
+    fn name(&self) -> &str {
+        "flaky_task"
+    }
+}
+
+#[tokio::test]
+async fn the_worker_re_signs_its_own_retry_attempts() {
+    // A retry is a message the worker constructs and enqueues. It inherits the
+    // original MAC (neither `state` nor `updated_at` is signed), but it also
+    // inherits the original nonce — so under a replay guard the worker would
+    // reject its own retry as a replay unless it re-signs it with a fresh one.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(FlakyTask {
+            attempts: Arc::clone(&attempts),
+        })
+        .await;
+
+    let broker = Arc::new(InMemoryBroker::new());
+    let config = WorkerConfig {
+        max_retries: 3,
+        retry_base_delay_ms: 1,
+        retry_max_delay_ms: 5,
+        signature_verification: Some(
+            SignatureVerification::new(TaskSigner::new(KEY)).with_replay_guard(Arc::new(
+                ReplayGuard::new(FreshnessWindow::new(Duration::from_secs(300))),
+            )),
+        ),
+        ..fast_config("retry-signing-worker")
+    };
+    let running = start(&broker, registry, config).await;
+
+    let mut task = SerializedTask::new("flaky_task".to_string(), br#"{"n":1}"#.to_vec());
+    sign_task(&TaskSigner::new(KEY), &mut task, SigningOptions::default());
+    broker.enqueue(task).await.expect("enqueue");
+
+    let ran = Arc::clone(&attempts);
+    wait_until("the retry to run", || ran.load(Ordering::SeqCst) == 2).await;
+    assert_eq!(
+        running.stats.signature_rejected(),
+        0,
+        "the worker rejected its own retry"
+    );
+
+    running.shutdown().await;
+}
+
+/// A task whose completion carries an `on_success_link`, so the worker enqueues
+/// a continuation of its own.
+struct LinkedTask {
+    name: &'static str,
+    ran: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Task for LinkedTask {
+    type Input = serde_json::Value;
+    type Output = serde_json::Value;
+
+    async fn execute(&self, input: Self::Input) -> celers_core::Result<Self::Output> {
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        Ok(input)
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
+#[tokio::test]
+async fn a_workflow_continuation_is_signed_by_the_worker() {
+    // The continuation is built by the worker, not by the producer: without
+    // signing it, enabling verification would end every chain at its first hop.
+    let first_ran = Arc::new(AtomicUsize::new(0));
+    let second_ran = Arc::new(AtomicUsize::new(0));
+    let registry = TaskRegistry::new();
+    registry
+        .register(LinkedTask {
+            name: "chain_head",
+            ran: Arc::clone(&first_ran),
+        })
+        .await;
+    registry
+        .register(LinkedTask {
+            name: "chain_tail",
+            ran: Arc::clone(&second_ran),
+        })
+        .await;
+
+    let broker = Arc::new(InMemoryBroker::new());
+    let config = WorkerConfig {
+        signature_verification: Some(SignatureVerification::new(TaskSigner::new(KEY))),
+        ..fast_config("workflow-signing-worker")
+    };
+    let running = start(&broker, registry, config).await;
+
+    let mut head = SerializedTask::new("chain_head".to_string(), br#"{"n":1}"#.to_vec());
+    head.metadata.on_success_link = Some("chain_tail".to_string());
+    sign_task(&TaskSigner::new(KEY), &mut head, SigningOptions::default());
+    broker.enqueue(head).await.expect("enqueue");
+
+    let head_ran = Arc::clone(&first_ran);
+    wait_until("the chain head to run", || {
+        head_ran.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    let tail_ran = Arc::clone(&second_ran);
+    wait_until("the chain tail to run", || {
+        tail_ran.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        running.stats.signature_rejected(),
+        0,
+        "the worker rejected its own continuation"
+    );
+
+    running.shutdown().await;
 }

@@ -1,7 +1,23 @@
-version: '3.8'
-
+# Local development and integration-test services for CeleRS.
+#
+# `docker-compose up -d` (no profile) starts the core stack: redis,
+# postgres, rabbitmq, prometheus, grafana, and a demo `worker` container.
+# Two broker/backend suites need services that aren't part of that default
+# set -- mysql and localstack -- plus an optional python-celery container
+# for wire-protocol interop testing. Those are behind the `test` (and
+# `python-compat`) Compose profiles so they don't start by default; bring
+# them up with:
+#
+#   docker-compose --profile test up -d
+#
+# See tests/integration/README.md for the full table mapping each
+# env-gated test suite to the service and environment variable it needs.
 services:
-  # Redis broker
+  # Redis broker/backend. Gates:
+  #   celers-broker-redis, celers-backend-redis, celers-cli's
+  #   control_redis.rs/revocation_redis.rs, and
+  #   celers-worker's distributed_rate_limit.rs -- all read
+  #   CELERS_TEST_REDIS_URL.
   redis:
     image: redis:7-alpine
     container_name: celers-redis
@@ -18,7 +34,11 @@ services:
     networks:
       - celers-network
 
-  # PostgreSQL broker/backend
+  # PostgreSQL broker/backend. Gates:
+  #   celers-broker-postgres reads CELERS_TEST_POSTGRES_URL;
+  #   celers-backend-db reads the bare DATABASE_URL instead (an existing
+  #   inconsistency in the source, not a typo here -- see
+  #   tests/integration/README.md). Both can point at this same server.
   postgres:
     image: postgres:16-alpine
     container_name: celers-postgres
@@ -39,7 +59,8 @@ services:
     networks:
       - celers-network
 
-  # RabbitMQ broker
+  # RabbitMQ broker. Gate: celers-broker-amqp's tests_hardening.rs reads
+  # CELERS_TEST_AMQP_URL.
   rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: celers-rabbitmq
@@ -59,7 +80,75 @@ services:
     networks:
       - celers-network
 
-  # Prometheus (monitoring)
+  # MySQL broker/backend (profile: test). Gates:
+  #   celers-broker-sql's tests_hardening.rs reads CELERS_TEST_MYSQL_URL;
+  #   celers-broker-sql's (older) tests.rs and celers-backend-db both read
+  #   the bare MYSQL_URL instead -- again an existing inconsistency in the
+  #   source, not a typo here. Both can point at this same server.
+  mysql:
+    image: mysql:8.0
+    container_name: celers-mysql
+    profiles: ["test"]
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_DATABASE: celers_test
+      MYSQL_USER: celers
+      MYSQL_PASSWORD: celers_password
+      MYSQL_ROOT_PASSWORD: celers_root_password
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pcelers_root_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - celers-network
+
+  # AWS SQS emulator (profile: test). Gate: celers-broker-sqs's tests.rs
+  # and tests/localstack.rs read CELERS_TEST_SQS_URL.
+  localstack:
+    image: localstack/localstack:3
+    container_name: celers-localstack
+    profiles: ["test"]
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs
+      DEFAULT_REGION: us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - celers-network
+
+  # Python Celery worker for wire-protocol interop testing (profile:
+  # python-compat). Builds from tests/python-compat, which is developed
+  # separately from this file -- until that directory has its own
+  # Dockerfile, `docker-compose --profile python-compat up` fails on this
+  # service alone with a clear "build path not found" error; it is not
+  # part of the default `up -d` set, so that does not affect the rest of
+  # the stack. See tests/python-compat/README.md.
+  python-celery:
+    build:
+      context: ./tests/python-compat
+    container_name: celers-python-celery
+    profiles: ["python-compat"]
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - celers-network
+
+  # Prometheus (monitoring). Config: docs/prometheus.yml. Real, minimal,
+  # and safe to scrape out of the box (see that file's own comments for
+  # what it does and does not cover today).
   prometheus:
     image: prom/prometheus:latest
     container_name: celers-prometheus
@@ -75,7 +164,10 @@ services:
     networks:
       - celers-network
 
-  # Grafana (visualization)
+  # Grafana (visualization). Provisioning: docs/grafana/ -- a Prometheus
+  # datasource plus one real dashboard (CeleRS Overview) built from the
+  # metric names celers-metrics actually registers. See
+  # docs/grafana/dashboards/json/celers-overview.json.
   grafana:
     image: grafana/grafana:latest
     container_name: celers-grafana
@@ -93,7 +185,16 @@ services:
     networks:
       - celers-network
 
-  # CeleRS Worker (example)
+  # CeleRS worker -- CONNECTIVITY DEMO ONLY. This builds the shipped
+  # `celers` CLI image, which constructs an EMPTY task registry (see
+  # crates/celers-cli/src/commands/worker.rs and docs/DEPLOYMENT.md's
+  # "Building a worker image" section). It connects to Redis, joins the
+  # remote-control channel so `celers inspect`/`celers control` have
+  # something to talk to, and logs -- but it can never execute a task,
+  # because CeleRS tasks are compiled-in Rust code, not something a
+  # generic binary can load at runtime. To run real tasks, build your own
+  # image from a binary that links `celers-worker` and registers your
+  # tasks, per docs/DEPLOYMENT.md.
   worker:
     build:
       context: .
@@ -101,21 +202,21 @@ services:
     container_name: celers-worker
     environment:
       RUST_LOG: info
-      REDIS_URL: redis://redis:6379
-      POSTGRES_URL: postgres://celers:celers_password@postgres:5432/celers
     depends_on:
       redis:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
     networks:
       - celers-network
-    command: worker start --concurrency 4
+    # `celers worker` builds a RedisBroker unconditionally regardless of the
+    # URL scheme passed to --broker (crates/celers-cli/src/commands/worker.rs),
+    # so this service only ever needs -- and only ever waits on -- Redis.
+    command: worker --broker redis://redis:6379 --concurrency 4
 
 volumes:
   redis-data:
   postgres-data:
   rabbitmq-data:
+  mysql-data:
   prometheus-data:
   grafana-data:
 

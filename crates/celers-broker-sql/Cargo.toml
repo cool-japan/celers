@@ -44,6 +44,10 @@ default = []
 metrics = ["celers-metrics"]
 
 [dev-dependencies]
+# `test-util` provides tokio's mock clock (`pause`/`advance`), which is what
+# lets interval-driven background loops be tested deterministically instead
+# of by sleeping. Test-only: it is inert unless a test pauses the clock.
+tokio = { workspace = true, features = ["test-util"] }
 futures = { workspace = true }
 criterion = { workspace = true }
 tracing-subscriber = { workspace = true }

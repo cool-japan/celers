@@ -33,6 +33,7 @@
 //! straight from [`SerializedTask::with_on_success_link`]) still take the
 //! original path: the named task is enqueued with the raw result bytes.
 
+use crate::security::SignatureVerification;
 use celers_core::{Broker, SerializedTask};
 // `warn!` is fully qualified at its call sites: every one of them lives behind a
 // feature gate, and importing it would make the import itself unused in some
@@ -45,6 +46,12 @@ use celers_backend_redis::ResultBackend;
 #[cfg(not(feature = "workflows"))]
 pub trait ResultBackend {}
 
+/// End-to-end execution of the advanced canvas patterns (saga rollback,
+/// pipeline, fan-out, fan-in, scatter-gather), driven through a real broker by
+/// this module and [`crate::error_links`].
+#[cfg(all(test, feature = "workflows"))]
+mod patterns_e2e;
+
 /// JSON key under which `celers-canvas` embeds the remaining chain tail.
 ///
 /// Mirrors `celers_canvas::CHAIN_TAIL_KEY`; the two constants are the contract
@@ -53,11 +60,65 @@ pub trait ResultBackend {}
 /// dependency is not enabled.
 pub const CHAIN_TAIL_KEY: &str = "chain";
 
-/// Handle task completion for workflow primitives
+/// Handle task completion for workflow primitives.
+///
+/// Equivalent to [`handle_workflow_completion_signed`] with no signer: use it
+/// when the worker does not authenticate messages. If it does, the continuations
+/// this enqueues would be unsigned and rejected on their own delivery.
+#[cfg(feature = "workflows")]
+pub async fn handle_workflow_completion<B: Broker>(
+    task: &SerializedTask,
+    result: &[u8],
+    broker: &B,
+    backend: Option<&mut (dyn ResultBackend + 'static)>,
+) -> Result<(), WorkflowError> {
+    handle_workflow_completion_signed(task, result, broker, backend, None).await
+}
+
+/// Handle task completion for workflow primitives.
+///
+/// Equivalent to [`handle_workflow_completion_signed`] with no signer: use it
+/// when the worker does not authenticate messages. If it does, the continuations
+/// this enqueues would be unsigned and rejected on their own delivery.
+#[cfg(not(feature = "workflows"))]
+pub async fn handle_workflow_completion<B: Broker>(
+    task: &SerializedTask,
+    result: &[u8],
+    broker: &B,
+) -> Result<(), WorkflowError> {
+    handle_workflow_completion_signed(task, result, broker, None).await
+}
+
+/// Sign a continuation this worker is about to enqueue.
+///
+/// A chain successor, an `on_success_link` target and a chord callback are all
+/// *newly constructed* messages: they carry no producer signature. A worker
+/// that verifies signatures would enqueue one and then reject its own delivery
+/// of it, ending every workflow at its first hop. Signing here — with the same
+/// key the worker verifies against, and a fresh `signed_at`/nonce — is what
+/// makes workflows and message authentication compose.
+///
+/// A no-op (a single `Option` check) when the worker does not verify.
+pub(crate) fn sign_continuation(
+    task: &mut SerializedTask,
+    signature: Option<&SignatureVerification>,
+) {
+    if let Some(verification) = signature {
+        verification.sign(task);
+    }
+}
+
+/// Handle task completion for workflow primitives, signing every continuation.
 ///
 /// This function should be called after a task completes successfully.
 /// It checks for workflow metadata (chain links, chord membership) and
 /// triggers appropriate workflow actions.
+///
+/// `signature` is the worker's
+/// [`SignatureVerification`](crate::SignatureVerification) when it authenticates
+/// messages, and `None` otherwise. See [`sign_continuation`] for why it has to
+/// be threaded through here rather than left to the producer.
+/// [`handle_workflow_completion`] is the `None` case.
 ///
 /// # Chain Callback Execution
 ///
@@ -68,11 +129,12 @@ pub const CHAIN_TAIL_KEY: &str = "chain";
 ///
 /// If the task has a `chord_id` in its metadata, increment the completion
 /// counter in the result backend. When all tasks complete, trigger the callback.
-pub async fn handle_workflow_completion<B: Broker>(
+pub async fn handle_workflow_completion_signed<B: Broker>(
     task: &SerializedTask,
     _result: &[u8],
     broker: &B,
-    #[cfg(feature = "workflows")] backend: Option<&mut dyn ResultBackend>,
+    #[cfg(feature = "workflows")] backend: Option<&mut (dyn ResultBackend + 'static)>,
+    signature: Option<&SignatureVerification>,
 ) -> Result<(), WorkflowError> {
     let task_id = task.metadata.id;
 
@@ -82,6 +144,25 @@ pub async fn handle_workflow_completion<B: Broker>(
         debug!("Task {} is part of chord {}", task_id, chord_id);
 
         if let Some(backend) = backend {
+            // Record this member's result *before* counting it. The callback is
+            // enqueued the moment the counter reaches `total`, and it is handed
+            // `chord_get_partial_results`; a result written after the increment
+            // would race the callback and arrive as a `null` in the aggregate.
+            // Nothing else writes into the barrier store, so without this every
+            // chord callback received a list of nulls.
+            let mut meta = celers_backend_redis::TaskMeta::new(task_id, task.metadata.name.clone());
+            meta.result = celers_backend_redis::TaskResult::Success(result_to_json(_result));
+            meta.completed_at = Some(chrono::Utc::now());
+            if let Err(e) = backend.store_result(task_id, &meta).await {
+                tracing::warn!(
+                    "Failed to record chord member {}'s result for chord {}: {}; \
+                     the callback will see a null in its place",
+                    task_id,
+                    chord_id,
+                    e
+                );
+            }
+
             // Atomically increment the completion counter
             let count = backend.chord_complete_task(chord_id).await.map_err(|e| {
                 WorkflowError::Backend(format!("Failed to increment chord counter: {}", e))
@@ -153,8 +234,9 @@ pub async fn handle_workflow_completion<B: Broker>(
                         let args_bytes = serde_json::to_vec(&callback_args)
                             .map_err(|e| WorkflowError::Serialization(e.to_string()))?;
 
-                        let callback_task =
+                        let mut callback_task =
                             celers_core::SerializedTask::new(callback_name, args_bytes);
+                        sign_continuation(&mut callback_task, signature);
 
                         broker
                             .enqueue(callback_task)
@@ -194,7 +276,9 @@ pub async fn handle_workflow_completion<B: Broker>(
             );
 
             // Build the next task; its payload is this task's result bytes
-            let next_task = celers_core::SerializedTask::new(link_name.clone(), _result.to_vec());
+            let mut next_task =
+                celers_core::SerializedTask::new(link_name.clone(), _result.to_vec());
+            sign_continuation(&mut next_task, signature);
 
             broker.enqueue(next_task).await.map_err(|e| {
                 WorkflowError::Broker(format!(
@@ -222,7 +306,8 @@ pub async fn handle_workflow_completion<B: Broker>(
         return Ok(());
     };
 
-    let (next_task, schedule) = build_next_task(&resolved, remaining, &result_value)?;
+    let (mut next_task, schedule) = build_next_task(&resolved, remaining, &result_value)?;
+    sign_continuation(&mut next_task, signature);
     let next_name = next_task.metadata.name.clone();
 
     dispatch_next(broker, next_task, schedule).await?;
@@ -239,7 +324,7 @@ pub async fn handle_workflow_completion<B: Broker>(
 
 /// When the continuation task should be handed to the broker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Schedule {
+pub(crate) enum Schedule {
     /// Enqueue right away.
     #[default]
     Immediate,
@@ -253,7 +338,7 @@ enum Schedule {
 ///
 /// Returns an empty vector for payloads that are not JSON, are not an object,
 /// or carry no `chain` key — i.e. everything that is not a canvas chain step.
-fn parse_chain_tail(payload: &[u8]) -> Vec<serde_json::Value> {
+pub(crate) fn parse_chain_tail(payload: &[u8]) -> Vec<serde_json::Value> {
     let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(payload) else {
         return Vec::new();
     };
@@ -274,7 +359,7 @@ fn parse_chain_tail(payload: &[u8]) -> Vec<serde_json::Value> {
 /// are used as-is; anything else degrades gracefully (UTF-8 text becomes a JSON
 /// string, arbitrary bytes become an array of byte values) rather than aborting
 /// the chain.
-fn result_to_json(result: &[u8]) -> serde_json::Value {
+pub(crate) fn result_to_json(result: &[u8]) -> serde_json::Value {
     if result.is_empty() {
         return serde_json::Value::Null;
     }
@@ -294,12 +379,12 @@ fn result_to_json(result: &[u8]) -> serde_json::Value {
 }
 
 /// A chain step resolved against the predecessor's result.
-struct ResolvedStep {
+pub(crate) struct ResolvedStep {
     /// The signature to run, as JSON.
-    signature: serde_json::Value,
+    pub(crate) signature: serde_json::Value,
     /// Whether the predecessor's result has already been folded into the
     /// signature's arguments (conditional steps do this while evaluating).
-    result_applied: bool,
+    pub(crate) result_applied: bool,
 }
 
 /// Resolve one chain-tail entry into the signature to run next.
@@ -307,7 +392,7 @@ struct ResolvedStep {
 /// Plain `task` steps resolve to themselves. `branch`/`switch` steps are
 /// evaluated against `result`; they resolve to the selected arm, or to `None`
 /// when no arm matches and no default is configured (which ends the chain).
-fn resolve_next_step(
+pub(crate) fn resolve_next_step(
     step: &serde_json::Value,
     result: &serde_json::Value,
 ) -> Result<Option<ResolvedStep>, WorkflowError> {
@@ -393,7 +478,7 @@ fn evaluate_conditional_step(
 
 /// Build the continuation task from a resolved signature plus the remaining
 /// chain tail, folding in the predecessor's result.
-fn build_next_task(
+pub(crate) fn build_next_task(
     resolved: &ResolvedStep,
     remaining: &[serde_json::Value],
     result: &serde_json::Value,
@@ -431,7 +516,7 @@ fn build_next_task(
         apply_result_to_args(options, result, &mut args, &mut kwargs);
     }
 
-    let mut envelope = serde_json::Map::with_capacity(3);
+    let mut envelope = serde_json::Map::with_capacity(6);
     envelope.insert("args".to_string(), serde_json::Value::Array(args));
     envelope.insert("kwargs".to_string(), serde_json::Value::Object(kwargs));
     if !remaining.is_empty() {
@@ -440,6 +525,13 @@ fn build_next_task(
             serde_json::Value::Array(remaining.to_vec()),
         );
     }
+
+    // The producer put the *whole* signature — including its failure route,
+    // its suppression flag and its own retry policy — into the chain tail. If
+    // this rebuild dropped them, only the head of a chain would ever have an
+    // error link: a saga's second and third steps would fail with nothing to
+    // roll back, which is precisely where a saga needs rollback.
+    crate::error_links::carry_failure_options(options, &mut envelope);
 
     let payload = serde_json::to_vec(&serde_json::Value::Object(envelope))
         .map_err(|e| WorkflowError::Serialization(e.to_string()))?;
@@ -482,6 +574,25 @@ fn build_next_task(
             .and_then(serde_json::Value::as_u64)
         {
             next.metadata.max_retries = u32::try_from(max_retries).unwrap_or(u32::MAX);
+        }
+        // A pre-assigned id lets a barrier registered before dispatch recognise
+        // this very message; a chord id makes this step the one that completes
+        // a chord member. Only a *chain's final step* normally carries either,
+        // which is what lets a chord member be a whole chain and still count
+        // exactly once.
+        if let Some(task_id) = options
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        {
+            next.metadata.id = task_id;
+        }
+        if let Some(chord_id) = options
+            .get("chord_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        {
+            next.metadata.chord_id = Some(chord_id);
         }
     }
 
@@ -535,7 +646,7 @@ fn schedule_from_options(options: Option<&serde_json::Value>) -> Schedule {
 }
 
 /// Enqueue the continuation task using the scheduling variant it asks for.
-async fn dispatch_next<B: Broker>(
+pub(crate) async fn dispatch_next<B: Broker>(
     broker: &B,
     task: SerializedTask,
     schedule: Schedule,
@@ -1353,9 +1464,7 @@ mod tests {
     mod chord_barrier {
         use super::*;
         use async_trait::async_trait;
-        use celers_backend_redis::{
-            ChordState, Result as BackendResult, ResultBackend, TaskMeta, TaskResult,
-        };
+        use celers_backend_redis::{ChordState, Result as BackendResult, ResultBackend, TaskMeta};
         use celers_core::Broker;
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
@@ -1515,12 +1624,13 @@ mod tests {
             ];
 
             for (index, (task_id, value)) in completions.into_iter().enumerate() {
-                let mut meta = TaskMeta::new(task_id, "header".to_string());
-                meta.result = TaskResult::Success(value);
-                backend.store_result(task_id, &meta).await.expect("store");
+                // The worker is what records a chord member's result: nothing
+                // else writes into the barrier store, so a callback would
+                // otherwise aggregate a list of nulls.
+                let result = serde_json::to_vec(&value).expect("result serializes");
 
                 let task = completing_task(task_id, chord_id);
-                handle_workflow_completion(&task, b"{}", &broker, Some(&mut backend))
+                handle_workflow_completion(&task, &result, &broker, Some(&mut backend))
                     .await
                     .expect("chord completion handling");
 

@@ -1,0 +1,173 @@
+{
+  "celery": "5.6.3",
+  "kombu": "5.6.2",
+  "note": "argsrepr renders args as a Python tuple; kwargsrepr renders a dict with keys sorted, because serde_json::Map is ordered.",
+  "args": [
+    {
+      "value": [],
+      "repr": "()"
+    },
+    {
+      "value": [
+        4,
+        5
+      ],
+      "repr": "(4, 5)"
+    },
+    {
+      "value": [
+        "Ada"
+      ],
+      "repr": "('Ada',)"
+    },
+    {
+      "value": [
+        1
+      ],
+      "repr": "(1,)"
+    },
+    {
+      "value": [
+        true,
+        false,
+        null
+      ],
+      "repr": "(True, False, None)"
+    },
+    {
+      "value": [
+        1.5,
+        2.0,
+        -0.25,
+        0.1
+      ],
+      "repr": "(1.5, 2.0, -0.25, 0.1)"
+    },
+    {
+      "value": [
+        1e+16,
+        1e-05,
+        1e+20,
+        1e-07,
+        123456789012345.0
+      ],
+      "repr": "(1e+16, 1e-05, 1e+20, 1e-07, 123456789012345.0)"
+    },
+    {
+      "value": [
+        "it's",
+        "a\"b",
+        "plain",
+        "back\\slash"
+      ],
+      "repr": "('it\\'s', 'a\"b', 'plain', 'back\\slash')"
+    },
+    {
+      "value": [
+        [
+          1,
+          2
+        ],
+        {
+          "k": "v"
+        }
+      ],
+      "repr": "([1, 2], {'k': 'v'})"
+    },
+    {
+      "value": [
+        {
+          "nested": {
+            "deep": [
+              1,
+              null,
+              true
+            ]
+          }
+        }
+      ],
+      "repr": "({'nested': {'deep': [...]}},)"
+    },
+    {
+      "value": [
+        {
+          "a": {
+            "b": {
+              "c": {
+                "d": 1
+              }
+            }
+          }
+        }
+      ],
+      "repr": "({'a': {'b': {...}}},)"
+    },
+    {
+      "value": [
+        "unicode: é and 日本"
+      ],
+      "repr": "('unicode: é and 日本',)"
+    }
+  ],
+  "kwargs": [
+    {
+      "value": {},
+      "repr": "{}"
+    },
+    {
+      "value": {
+        "loud": true
+      },
+      "repr": "{'loud': True}"
+    },
+    {
+      "value": {
+        "punct": "?"
+      },
+      "repr": "{'punct': '?'}"
+    },
+    {
+      "value": {
+        "a": null,
+        "b": false
+      },
+      "repr": "{'a': None, 'b': False}"
+    },
+    {
+      "value": {
+        "n": 1.0,
+        "m": 2.5
+      },
+      "repr": "{'m': 2.5, 'n': 1.0}"
+    },
+    {
+      "value": {
+        "quote": "it's"
+      },
+      "repr": "{'quote': 'it\\'s'}"
+    },
+    {
+      "value": {
+        "nested": {
+          "k": [
+            1,
+            2
+          ]
+        }
+      },
+      "repr": "{'nested': {'k': [1, 2]}}"
+    },
+    {
+      "value": {
+        "a": {
+          "b": {
+            "c": [
+              1
+            ]
+          }
+        }
+      },
+      "repr": "{'a': {'b': {'c': [...]}}}"
+    }
+  ]
+}

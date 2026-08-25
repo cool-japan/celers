@@ -20,6 +20,15 @@ fn to_task_result(value: &TaskResultValue) -> TaskResult {
         TaskResultValue::Revoked => TaskResult::Revoked,
         TaskResultValue::Retry { attempt, .. } => TaskResult::Retry(*attempt),
         TaskResultValue::Rejected { reason } => TaskResult::Failure(reason.clone()),
+        // `TaskResult` has no "ignored" case, and inventing one here would
+        // change this backend's on-the-wire result format. A deliberately
+        // suppressed failure is terminal and non-failing, and the value the
+        // workflow carries forward is JSON `null`, so it projects onto exactly
+        // that. The suppressed error text does not survive the round trip
+        // through this backend (`celers_core::InMemoryResultBackend` keeps it);
+        // mapping it to `Failure` instead would resurrect the very error the
+        // caller asked to ignore, which is the worse loss.
+        TaskResultValue::Ignored { .. } => TaskResult::Success(serde_json::Value::Null),
     }
 }
 

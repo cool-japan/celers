@@ -945,19 +945,32 @@ fn jitter_does_not_drift_the_interval_grid() {
     let scheduler = BeatScheduler::new();
     let base = Utc::now() - Duration::seconds(600);
 
+    // The window has to be *strictly* narrower than half the interval, and the
+    // sampling instant has to match it. With the ±30 s window this used to
+    // pair with a 60 s interval, occurrence k's latest dispatch (k*60+30) is
+    // exactly occurrence k+1's earliest (k+1)*60-30 — so at `now = base+60k+30`
+    // the *next* occurrence could also be eligible, `fires.last()` returned it,
+    // and the walk skipped a step and desynchronised (observed as an
+    // intermittent "no fire at step N"). At ±20 s the windows are disjoint:
+    // occurrence k is always eligible at base+60k+20, and occurrence k+1 never
+    // is (its earliest dispatch is base+60k+40). The property under test — a
+    // fire records the grid occurrence, never the jittered instant — is
+    // unchanged.
     let mut task = ScheduledTask::new("smeared".to_string(), Schedule::interval(60))
-        .with_jitter(Jitter::symmetric(30));
+        .with_jitter(Jitter::symmetric(20));
     task.last_run_at = Some(base);
     task.invalidate_next_run_cache();
 
-    // Walk ten fires, always recording what `planned_fires` hands back. `now`
-    // clears the widest positive offset so each occurrence is definitely
-    // eligible by the time we look.
+    // Walk ten fires, always recording what `planned_fires` hands back.
     let mut recorded = Vec::new();
     for step in 1..=10 {
-        let now = base + Duration::seconds(60 * step + 30);
+        let now = base + Duration::seconds(60 * step + 20);
         let fires = scheduler.planned_fires(&task, now).expect("fires");
-        assert!(!fires.is_empty(), "no fire at step {step}");
+        assert_eq!(
+            fires.len(),
+            1,
+            "exactly one occurrence is eligible per step; got {fires:?} at step {step}"
+        );
         let occurrence = *fires.last().expect("at least one fire");
         task.mark_run_at(occurrence);
         recorded.push(occurrence);

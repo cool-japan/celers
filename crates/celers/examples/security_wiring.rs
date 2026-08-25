@@ -26,6 +26,13 @@
 //! The signing key is read from `CELERS_TASK_SIGNING_KEY` when set, so the
 //! example also shows where a real deployment's key comes from; it falls back
 //! to a fixed demo key so the example runs unattended.
+//!
+//! One thing to carry over to a real deployment: with verification on, every
+//! place your code enqueues a **new** task has to sign it, or that task is
+//! dead-lettered on arrival. The worker signs its own enqueues (retries and
+//! workflow continuations) for you, and `celers-cli`'s retry/replay commands
+//! move existing bytes so they stay signed. See `celers_worker::security` for
+//! the full rules, including how a replay guard interacts with redelivery.
 
 use celers::prelude::*;
 use celers::{AsyncResult, Broker, InMemoryBroker, SerializedTask, TaskRegistry, TaskResultValue};

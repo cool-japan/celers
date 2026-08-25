@@ -1,0 +1,170 @@
+# deny.toml — COOLJAPAN policy gate for the CeleRS workspace.
+#
+# Run (all four checks):  cargo deny check
+# Individually:           cargo deny check bans | advisories | licenses | sources
+#
+# VERIFIED GREEN as of 2026-08-25 against the Cargo.lock at this commit:
+#   cargo deny check  ->  advisories ok, bans ok, licenses ok, sources ok
+#
+# The single `[graph] exclude` entry below is the only thing keeping it green;
+# deleting it is the acceptance test for the remaining Pure-Rust SQS work.
+
+[graph]
+all-features = true
+no-default-features = false
+# celers-broker-amqp is NO LONGER excluded: the workspace-level
+# `lapin = { default-features = false, features = ["default-runtime",
+# "rustls-webpki-roots-certs"] }` declaration removed `rustls--aws_lc_rs` from
+# the AMQP chain, and `celers_broker_amqp::install_pure_tls_provider()`
+# supplies the Pure-Rust `rustls-rustcrypto` provider at runtime.
+#
+# celers-broker-sqs remains excluded. `aws-smithy-runtime`'s
+# `default-https-client` feature hard-selects
+# `aws-smithy-http-client/rustls-aws-lc` (its only other TLS options are
+# `rustls-ring`, `rustls-aws-lc-fips` and `s2n-tls`, all C/asm), and dropping
+# the feature entirely leaves the SDK with no HTTPS at all. Eliminating
+# aws-lc-sys therefore requires implementing a custom `HttpClient` on top of
+# `oxihttp-client` (aws-smithy-runtime-api `HttpConnector`/
+# `SharedHttpConnector`, http::Request<SdkBody> mapping, HttpConnectorSettings
+# timeouts) and installing it via `aws_config::defaults(..).http_client(..)`.
+# That is tracked as a followup; until it lands, the `sqs` feature of the
+# `celers` facade is documented as a Pure-Rust policy exception (it is
+# off by default, as is `celers-broker-sqs` itself).
+exclude = ["celers-broker-sqs"]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+deny = [
+    # --- C / C++ / assembly crypto & TLS (Pure-Rust policy) ---
+    { crate = "aws-lc-sys",     reason = "C/C++/asm crypto (also drags in cmake+cc); use rustls-rustcrypto via oxitls" },
+    { crate = "aws-lc-rs",      reason = "wraps aws-lc-sys (C/C++/asm)" },
+    { crate = "ring",           reason = "C/asm crypto; use rustls-rustcrypto via oxitls" },
+    { crate = "openssl-sys",    reason = "FFI to OpenSSL" },
+    { crate = "openssl",        reason = "FFI to OpenSSL" },
+    { crate = "native-tls",     reason = "platform TLS via FFI; use oxitls" },
+    { crate = "s2n-tls-sys",    reason = "C TLS stack" },
+
+    # --- COOLJAPAN mandated replacements ---
+    { crate = "bincode",        use-instead = "oxicode" },
+    { crate = "rustfft",        use-instead = "oxifft" },
+    # flate2/miniz_oxide are Pure Rust here (rust_backend, verified via
+    # `cargo tree -e features -i flate2`), but banned as a DIRECT dependency.
+    # `wrappers` allows only the transitive parents that exist today.
+    { crate = "flate2", use-instead = "oxiarc-deflate", wrappers = ["mysql_async", "mysql_common"] },
+    { crate = "libz-sys",       reason = "C zlib backend for flate2" },
+    { crate = "libz-ng-sys",    reason = "C zlib-ng backend for flate2" },
+    { crate = "zstd",           use-instead = "oxiarc-zstd" },
+    { crate = "zstd-sys",       use-instead = "oxiarc-zstd" },
+    { crate = "zip",            use-instead = "oxiarc-archive" },
+    { crate = "tar",            use-instead = "oxiarc-archive" },
+    { crate = "bzip2",          use-instead = "oxiarc-bzip2" },
+    { crate = "bzip2-sys",      use-instead = "oxiarc-bzip2" },
+    { crate = "lz4",            use-instead = "oxiarc-lz4" },
+    { crate = "lz4-sys",        use-instead = "oxiarc-lz4" },
+    { crate = "snap",           use-instead = "oxiarc" },
+    { crate = "brotli",         use-instead = "oxiarc" },
+    { crate = "rusqlite",       use-instead = "oxisql-sqlite-compat" },
+    { crate = "libsqlite3-sys", use-instead = "oxisql-sqlite-compat" },
+    { crate = "openblas-src",   use-instead = "oxiblas" },
+    { crate = "blas-src",       use-instead = "oxiblas" },
+    { crate = "sqlx",           reason = "replaced by oxisql-postgres / oxisql-mysql" },
+    { crate = "reqwest",        use-instead = "oxihttp-client" },
+
+    # --- unmaintained parsers on untrusted-input paths ---
+    # serde_yaml is archived upstream (newest release is `0.9.34+deprecated`)
+    # and parses user-supplied config files in celers-cli.
+    { crate = "serde_yaml",     use-instead = "serde_yaml_ng" },
+]
+skip = [
+    # RustCrypto generation split lives entirely inside oxitls' own dependency
+    # set (oxitls-adapter-rustls-rustcrypto pulls p256 0.14 / aes-gcm 0.11 while
+    # oxitls-rustcrypto-provider still pulls p256 0.13 / aes-gcm 0.10).
+    # Upstream oxitls item, not fixable from this workspace.
+    { crate = "aead" }, { crate = "aes" }, { crate = "aes-gcm" },
+    { crate = "chacha20" }, { crate = "chacha20poly1305" }, { crate = "cipher" },
+    { crate = "ctr" }, { crate = "ghash" }, { crate = "poly1305" },
+    { crate = "polyval" }, { crate = "universal-hash" }, { crate = "inout" },
+    { crate = "elliptic-curve" }, { crate = "p256" }, { crate = "p384" },
+    { crate = "primeorder" }, { crate = "ecdsa" }, { crate = "rfc6979" },
+    { crate = "ff" }, { crate = "group" }, { crate = "crypto-bigint" },
+    { crate = "base16ct" }, { crate = "sec1" }, { crate = "spki" },
+    { crate = "der" }, { crate = "const-oid" }, { crate = "pkcs8" },
+    { crate = "digest" }, { crate = "block-buffer" }, { crate = "crypto-common" },
+    { crate = "hmac" }, { crate = "sha2" }, { crate = "signature" },
+    { crate = "hkdf" }, { crate = "num-bigint" }, { crate = "cpufeatures" },
+    { crate = "getrandom" }, { crate = "rand" }, { crate = "rand_core" },
+    { crate = "rand_chacha" },
+    # protobuf 3.7 (via prometheus 0.14) is still on thiserror 1.x.
+    { crate = "thiserror" }, { crate = "thiserror-impl" },
+    # syn 2 vs 3. celers-macros itself is on syn 3 now; syn 2 survives only
+    # through third-party derive crates that have not migrated yet
+    # (serde_derive, thiserror-impl, asn1-rs-derive, prost-derive, ...).
+    { crate = "syn" },
+    # nom 7 (x509-parser 0.18, via the oxitls OCSP/cert parsing chain) vs
+    # nom 8 (amq-protocol 10.6, via lapin). Both are the newest releases of
+    # their respective parents; nothing in this workspace can converge them.
+    { crate = "nom" },
+    # misc single-parent splits with no upgrade path today
+    { crate = "phf" },
+    { crate = "phf_shared" }, { crate = "foldhash" }, { crate = "hashbrown" },
+    { crate = "winnow" },
+    # base64 0.22 comes only from bson 3.1.0 (the newest bson); this workspace
+    # declares 0.23 for its own crates.
+    { crate = "base64" },
+    { crate = "fiat-crypto" }, { crate = "r-efi" }, { crate = "wasi" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # rsa 0.9.x "Marvin" timing sidechannel — NO fixed release exists.
+    # Reached only via oxitls-rustcrypto-provider/src/sign/rsa.rs, i.e. only
+    # when a TLS *client certificate* with an RSA key is configured. CeleRS
+    # never configures RSA client certs; server-certificate verification uses
+    # public-key operations only, which carry no secret-dependent timing.
+    # Re-evaluate when rsa 0.10 ships.
+    { id = "RUSTSEC-2023-0071", reason = "no fix available; RSA private-key ops unreachable in CeleRS TLS configuration" },
+    # `paste` unmaintained (no CVE); transitive via oxitls-rustcrypto-provider.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro, transitive via oxitls; no vulnerability" },
+    # `rustls-pemfile` unmaintained (no CVE); transitive via oxitls / oxisql-postgres.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained, transitive via oxitls; no vulnerability" },
+    # `proc-macro-error2` unmaintained; only from tabled_derive 0.11 <- tabled 0.21.0,
+    # which IS the newest published tabled (verified against the crates.io index),
+    # so no upgrade removes it. Build-time proc-macro only; no runtime exposure.
+    { id = "RUSTSEC-2026-0173", reason = "build-time proc-macro via tabled 0.21 (latest release); no upgrade available" },
+]
+# Deliberately NOT ignored, and no longer reachable: these four came in with
+# the AWS SDK's default `rustls` feature (legacy hyper-0.14 + rustls 0.21 +
+# ring) and disappeared from the lockfile when the workspace switched
+# aws-config / aws-sdk-sqs / aws-sdk-cloudwatch to
+# `default-features = false` + `default-https-client`. They are listed here so
+# a future re-enable of that feature is recognised for what it costs:
+#   RUSTSEC-2026-0258  h2 0.3.27              unbounded empty DATA frames
+#   RUSTSEC-2026-0104  rustls-webpki 0.101.7  reachable panic in CRL parsing
+#   RUSTSEC-2026-0098  rustls-webpki 0.101.7  URI name-constraint bypass
+#   RUSTSEC-2026-0099  rustls-webpki 0.101.7  wildcard name-constraint bypass
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    # clipboard-win / error-code (via rustyline), xxhash-rust (via redis)
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

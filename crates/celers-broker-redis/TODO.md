@@ -183,13 +183,12 @@ Full-featured Redis broker with FIFO/priority queues, DLQ, task cancellation, he
     module from `partitioning.rs`'s `HashAlgorithm::XxHash`, which genuinely was fixed in v0.3.0 to
     use real xxHash64 via `twox-hash` (see Security/Data Integrity fixes below) — do not conflate the
     two. Verified by direct source read on 2026-07-13; not fabricated, not fixed by this release.
-  - [ ] SHA256 (cryptographically secure) — **not real**: `ChecksumAlgorithm::Sha256::compute()` in
-    `src/integrity.rs` is also a `DefaultHasher` placeholder (`// Use a simple hash for now (could use
-    sha2 crate)`), zero-padded to look like a 64-hex-char SHA256 digest. Despite the doc comment
-    ("cryptographically secure, slower"), this provides no cryptographic guarantee at all. Verified by
-    direct source read on 2026-07-13; not fabricated, not fixed by this release. The `sha2` crate is
-    already a workspace dependency (used correctly elsewhere, e.g. HMAC signing) — wiring it in here is
-    a real, scoped follow-up.
+  - [x] SHA256 (cryptographically secure) — **fixed in 0.3.1**: `ChecksumAlgorithm::Sha256::compute()`
+    in `src/integrity.rs` now computes a real SHA-256 digest via the `sha2` crate (added to this
+    crate's `Cargo.toml`) and renders it as 64 lowercase hex characters through `hex::encode`. It was
+    previously a `DefaultHasher` placeholder zero-padded to look like a SHA-256 digest, and then an
+    honest `Err`. Pinned by FIPS 180-4 known-answer vectors plus a wrap/validate tamper-detection
+    round trip in `integrity::tests`.
 - [x] `IntegrityWrappedTask` - Tasks with integrity metadata
 - [x] Checksum computation and validation
 - [x] Sequence number tracking for ordered delivery

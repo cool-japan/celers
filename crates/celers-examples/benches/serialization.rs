@@ -2,7 +2,8 @@
 
 use celers_core::SerializedTask;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use std::hint::black_box;use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
+use std::hint::black_box;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SmallPayload {

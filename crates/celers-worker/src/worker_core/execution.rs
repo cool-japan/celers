@@ -3,6 +3,14 @@
 //! Split out of [`worker_core`](crate::worker_core) so the dequeue loop stays
 //! readable. Everything here runs inside the task's own spawned future.
 
+/// Unit tests for the disposition decisions taken here.
+///
+/// In a sibling file (rather than at the bottom of this one) so neither grows
+/// past the workspace's file-size cap; it is a child module, so the private
+/// helpers on this path are reachable from it.
+#[cfg(test)]
+mod tests;
+
 use crate::checkpoint::CheckpointManager;
 use crate::circuit_breaker::CircuitBreaker;
 use crate::dlq::{self, DlqHandler};
@@ -12,6 +20,7 @@ use crate::memory::{self, MemoryTracker};
 use crate::middleware;
 use crate::poison_pill::PoisonPillDetector;
 use crate::retry::RetryConfig;
+use crate::security::SignatureVerification;
 use crate::types::WorkerStats;
 
 use super::support::{
@@ -21,8 +30,8 @@ use super::support::{
 
 use celers_core::time_limit::{TimeLimitConfig, TimeLimitExceeded};
 use celers_core::{
-    Broker, CelersError, Event, Result, SerializedTask, TaskEvent, TaskEventBuilder, TaskId,
-    TaskRegistry, TaskState,
+    Broker, CelersError, Event, Result, ResultStore, SerializedTask, TaskEvent, TaskEventBuilder,
+    TaskId, TaskRegistry, TaskState,
 };
 
 use std::sync::Arc;
@@ -184,7 +193,38 @@ pub(crate) struct TaskDispatch<B: Broker> {
     pub(crate) retry_config: RetryConfig,
     /// Maximum accepted result size in bytes (0 = unlimited).
     pub(crate) max_result_size_bytes: usize,
+    /// Message authentication, when the worker verifies signatures.
+    ///
+    /// Carried into execution because the worker is also a *producer* here: a
+    /// retry attempt is a message it constructs and enqueues, and it has to
+    /// sign it or it would reject its own delivery of it.
+    pub(crate) signature: Option<SignatureVerification>,
+    /// Result store terminal dispositions are written to, when the worker was
+    /// given one ([`Worker::with_result_store`](crate::Worker::with_result_store)).
+    ///
+    /// Without it a permanently-failed or deliberately-ignored task leaves no
+    /// record at all, so [`AsyncResult::get`](celers_core::AsyncResult::get)
+    /// polls for a result that will never be written.
+    pub(crate) result_store: Option<Arc<dyn ResultStore>>,
+    /// Chord barrier store, when the worker was given one
+    /// ([`Worker::with_chord_backend`](crate::Worker::with_chord_backend)).
+    ///
+    /// A separate handle from `result_store` because a chord barrier is a
+    /// different trait: counting completions, reading the registered header
+    /// ids and collecting their results live on
+    /// [`celers_backend_redis::ResultBackend`], not on
+    /// [`ResultStore`]. Without it a chord's callback never fires.
+    #[cfg(feature = "workflows")]
+    pub(crate) chord_backend: Option<Arc<tokio::sync::Mutex<dyn ChordBackend>>>,
 }
+
+/// The result-backend operations a chord barrier needs.
+///
+/// An alias for [`celers_backend_redis::ResultBackend`] kept behind one name so
+/// the worker's own signatures do not have to spell out an optional
+/// dependency's trait everywhere.
+#[cfg(feature = "workflows")]
+pub(crate) use celers_backend_redis::ResultBackend as ChordBackend;
 
 /// Outcome of driving the task future, accounting for timeout *and*
 /// cooperative cancellation *and* handler panics.
@@ -217,6 +257,22 @@ pub(crate) struct DeadLetterRequest<'a> {
     pub(crate) extra_metadata: Vec<(&'a str, String)>,
     /// Whether this worker still owns the broker-side disposition.
     pub(crate) dispose: bool,
+    /// Whether the task's declared error route (its `link_error` handlers,
+    /// carried in the payload) should run for this failure.
+    ///
+    /// `true` for every genuine execution failure. `false` for a message that
+    /// never earned the right to make this worker enqueue anything — one that
+    /// failed signature verification — since its error route is
+    /// attacker-controlled and running it would turn a forged message into a
+    /// task-dispatch primitive.
+    pub(crate) error_links: bool,
+    /// Message authentication, when the worker verifies signatures: an error
+    /// handler is a message *this* worker produces and would otherwise reject
+    /// on its own delivery.
+    pub(crate) signature: Option<&'a SignatureVerification>,
+    /// Result store the terminal failure is recorded in, when the worker has
+    /// one. Without it a caller awaiting the task's result waits forever.
+    pub(crate) result_store: Option<&'a Arc<dyn ResultStore>>,
 }
 
 /// A dequeued message that did not pass signature verification.
@@ -285,6 +341,14 @@ pub(crate) async fn reject_unverified<B: Broker>(
                 ("signature_error", error.to_string()),
             ],
             dispose: true,
+            // An unauthenticated message must not be able to make this worker
+            // enqueue tasks of the sender's choosing, which is exactly what
+            // honouring its payload's error route would be.
+            error_links: false,
+            signature: None,
+            // Nor should a forged message be able to write a result under an
+            // id it chose.
+            result_store: None,
         },
     )
     .await;
@@ -295,6 +359,12 @@ pub(crate) async fn reject_unverified<B: Broker>(
 /// Shared by the execution-error, timeout, oversized-result and open-circuit
 /// paths so every one of them produces the same observable terminal state
 /// (event + DLQ entry + metrics), instead of silently dropping the task.
+///
+/// Because it is the single funnel every terminal failure passes through, it is
+/// also where a task's **error route** runs: the `link_error` handlers the
+/// producer attached (a fallback task, a dead-letter handler, a saga's chain of
+/// compensations) are enqueued here, and only here, so no failure class can
+/// quietly skip them. See [`crate::error_links`] for the wire format.
 pub(crate) async fn dead_letter<B: Broker>(
     broker: &Arc<B>,
     dlq_handler: Option<&Arc<DlqHandler>>,
@@ -311,6 +381,42 @@ pub(crate) async fn dead_letter<B: Broker>(
             .pid(pid)
             .failed(req.error_msg),
     );
+
+    // Record the terminal failure so an `AsyncResult` waiter resolves with the
+    // error instead of polling forever. Done before the ack below: a crash in
+    // between redelivers the task, which is recoverable; a lost result is not.
+    if let Some(store) = req.result_store {
+        if let Err(e) = store
+            .store_result(
+                req.task_id,
+                celers_core::TaskResultValue::Failure {
+                    error: req.error_msg.to_string(),
+                    traceback: None,
+                },
+            )
+            .await
+        {
+            warn!(
+                "Failed to record the terminal failure of task {}: {}",
+                req.task_id, e
+            );
+        }
+    }
+
+    if req.error_links {
+        crate::error_links::run_error_route_logged(
+            req.task,
+            &crate::error_links::TaskFailure {
+                task_id: req.task_id,
+                task_name: &task_name,
+                error: req.error_msg,
+                failure_type: req.failure_type,
+            },
+            broker.as_ref(),
+            req.signature,
+        )
+        .await;
+    }
 
     if let Some(dlq) = dlq_handler {
         let mut entry = dlq::DlqEntry::new(
@@ -343,6 +449,194 @@ pub(crate) async fn dead_letter<B: Broker>(
     }
 }
 
+/// The delay before this task's next retry.
+///
+/// A task may carry its own backoff schedule in its dispatch payload (canvas's
+/// `Signature::with_retry_delay` / `with_retry_backoff` / `with_retry_backoff_max`
+/// / `with_retry_jitter`, see [`crate::error_links::TaskRetryPolicy`]). When it
+/// does, that schedule wins: it is the more specific statement of how *this*
+/// task should back off, and honouring it is what makes a per-task exponential
+/// backoff a real policy rather than a decorative field. Otherwise the worker's
+/// single configured [`RetryConfig`] applies, exactly as before.
+pub(crate) fn task_backoff_delay(
+    task: &SerializedTask,
+    config: &RetryConfig,
+    retry_count: u32,
+) -> Duration {
+    match crate::error_links::TaskRetryPolicy::from_payload(&task.payload) {
+        Some(policy) => policy.delay(retry_count),
+        None => backoff_delay(config, retry_count),
+    }
+}
+
+/// A failure a task asked to have suppressed.
+///
+/// See [`crate::error_links::ignores_errors`] and canvas's
+/// `TaskOptions::ignore_errors`: the task is a non-critical step whose failure
+/// must not stop the workflow around it.
+pub(crate) struct SuppressedFailure<'a, B: Broker> {
+    /// Broker the message came from.
+    pub(crate) broker: &'a Arc<B>,
+    /// The task that failed.
+    pub(crate) task: &'a SerializedTask,
+    /// Its id.
+    pub(crate) task_id: TaskId,
+    /// The delivery's receipt handle, if any.
+    pub(crate) receipt_handle: Option<&'a str>,
+    /// Whether this worker still owns the broker-side disposition.
+    pub(crate) claimed: bool,
+    /// The suppressed error.
+    pub(crate) error_msg: &'a str,
+    /// Lifecycle event sink.
+    pub(crate) events: &'a EventSink,
+    /// Worker hostname for event identification.
+    pub(crate) hostname: &'a str,
+    /// Worker process id for event identification.
+    pub(crate) pid: u32,
+    /// Result store the ignored outcome is recorded in, when there is one.
+    pub(crate) result_store: Option<&'a Arc<dyn ResultStore>>,
+    /// Chord barrier store, when there is one.
+    #[cfg(feature = "workflows")]
+    pub(crate) chord_backend: Option<&'a Arc<tokio::sync::Mutex<dyn ChordBackend>>>,
+    /// Message authentication for the continuations this enqueues.
+    pub(crate) signature: Option<&'a SignatureVerification>,
+}
+
+/// Dispose of a failure the task asked to have ignored.
+///
+/// Setting `max_retries = 0` — which is all `ignore_errors` used to do — is not
+/// error suppression: the task still failed, still went to the dead-letter
+/// queue, and still ended the chain it was part of. Suppression means all four
+/// of the following, which is what this does:
+///
+/// * **no retry** and **no dead-letter entry** — the failure is not an
+///   incident, so it does not become one;
+/// * an [`Ignored`](celers_core::TaskResultValue::Ignored) result, so a caller
+///   awaiting the task resolves (with no value) instead of waiting forever, and
+///   the suppressed error text stays observable;
+/// * the **workflow continues**: the successor runs with a `null` result,
+///   exactly as if the task had returned nothing. This is the point of the
+///   whole feature — a failed analytics ping must not strand the chain behind
+///   it;
+/// * the message is acknowledged, so it is not redelivered.
+///
+/// The task's own error route is deliberately **not** run: "ignore this task's
+/// errors" and "route this task's errors somewhere" are contradictory requests,
+/// and suppression is the more specific one.
+///
+/// # Which failures are suppressible
+///
+/// The boundary is *whether the worker ran the task*. Everything that is an
+/// outcome of an attempt at this task is suppressible:
+///
+/// * the handler returned an error,
+/// * the handler panicked,
+/// * the attempt hit its soft or hard time limit, and
+/// * the attempt produced an oversized result.
+///
+/// Refusals to run it at all are **not**, because there is no task outcome to
+/// suppress and the refusal protects something other than this caller:
+///
+/// * an **open circuit** — the worker is shedding load for the whole task type;
+/// * a **poison-pill quarantine** — the message is known-bad and is being kept
+///   away from every worker, not just this one;
+/// * a **failed signature verification** — an unauthenticated message must not
+///   be able to select its own disposition;
+/// * a **revocation** — a deliberate operator action, which suppression must
+///   not be able to override.
+///
+/// Those four take the ordinary terminal path (dead-letter entry, `Failure`
+/// result) whatever the task's `ignore_errors` flag says.
+async fn suppress_failure<B: Broker>(req: SuppressedFailure<'_, B>) {
+    let SuppressedFailure {
+        broker,
+        task,
+        task_id,
+        receipt_handle,
+        claimed,
+        error_msg,
+        events,
+        hostname,
+        pid,
+        result_store,
+        #[cfg(feature = "workflows")]
+        chord_backend,
+        signature,
+    } = req;
+
+    let task_name = task.metadata.name.clone();
+
+    warn!(
+        "Task {} ('{}') failed but was dispatched with ignore_errors; \
+         suppressing the failure and continuing the workflow: {}",
+        task_id, task_name, error_msg
+    );
+
+    // Still published: suppression changes what the *worker* does about the
+    // failure, not whether operators get to see that it happened.
+    events.emit(
+        TaskEventBuilder::new(task_id, &task_name)
+            .hostname(hostname)
+            .pid(pid)
+            .failed(format!("ignored: {error_msg}")),
+    );
+
+    if let Some(store) = result_store {
+        if let Err(e) = store
+            .store_result(
+                task_id,
+                celers_core::TaskResultValue::Ignored {
+                    error: error_msg.to_string(),
+                },
+            )
+            .await
+        {
+            warn!(
+                "Failed to record the ignored failure of task {}: {}",
+                task_id, e
+            );
+        }
+    }
+
+    if claimed {
+        // A JSON `null` is what a task that returned nothing produces, and it
+        // is what the successor receives.
+        {
+            // Only a chord member needs the barrier, and the guard is held
+            // across a broker enqueue — so taking it for every completion
+            // would serialize the whole worker behind one mutex.
+            #[cfg(feature = "workflows")]
+            let mut barrier = match chord_backend.filter(|_| task.metadata.chord_id.is_some()) {
+                Some(backend) => Some(backend.lock().await),
+                None => None,
+            };
+
+            let continued = crate::workflows::handle_workflow_completion_signed(
+                task,
+                b"null",
+                broker.as_ref(),
+                #[cfg(feature = "workflows")]
+                barrier.as_deref_mut(),
+                signature,
+            )
+            .await;
+            if let Err(e) = continued {
+                error!(
+                    "Failed to continue the workflow past ignored failure of task {}: {}",
+                    task_id, e
+                );
+            }
+        }
+
+        if let Err(e) = broker.ack(&task_id, receipt_handle).await {
+            error!(
+                "Failed to acknowledge task {} after suppressing its failure: {}",
+                task_id, e
+            );
+        }
+    }
+}
+
 /// Re-enqueue a task for another attempt with its retry state advanced.
 ///
 /// Retry accounting is the worker's job, not the broker's: the [`Broker`]
@@ -352,6 +646,11 @@ pub(crate) async fn dead_letter<B: Broker>(
 /// `Retrying(n + 1)` here (and re-enqueuing explicitly) terminates the retry
 /// loop on *every* broker and lets the backoff delay be honoured through the
 /// broker's delayed queue instead of a hot requeue.
+///
+/// The retry copy is re-signed when the worker verifies signatures: it is a
+/// message this worker is producing, and a fresh `signed_at`/nonce is what
+/// keeps a freshness window or a replay guard from rejecting the worker's own
+/// retry as a stale replay of the attempt it descends from.
 async fn requeue_for_retry<B: Broker>(
     broker: &Arc<B>,
     task: &SerializedTask,
@@ -359,10 +658,14 @@ async fn requeue_for_retry<B: Broker>(
     receipt_handle: Option<&str>,
     next_retry: u32,
     delay: Duration,
+    signature: Option<&SignatureVerification>,
 ) {
     let mut retry_task = task.clone();
     retry_task.metadata.state = TaskState::Retrying(next_retry);
     retry_task.metadata.updated_at = chrono::Utc::now();
+    if let Some(verification) = signature {
+        verification.sign(&mut retry_task);
+    }
 
     // Prefer broker-side scheduling (ETA / delayed queue) so the worker does
     // not hold the task — and its concurrency permit — while it waits.
@@ -450,6 +753,10 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
         max_retries,
         retry_config,
         max_result_size_bytes,
+        signature,
+        result_store,
+        #[cfg(feature = "workflows")]
+        chord_backend,
     } = dispatch;
 
     let start_time = Instant::now();
@@ -550,29 +857,57 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                     detector.record_failure(task_id, size_error.clone()).await;
                 }
 
-                // Retrying cannot shrink a deterministic result, so this is
-                // terminal regardless of the remaining retry budget.
-                dead_letter(
-                    &broker,
-                    dlq_handler.as_ref(),
-                    &events,
-                    &hostname,
-                    pid,
-                    DeadLetterRequest {
+                // An oversized result is an outcome of *running this task*, so
+                // it is inside the suppression boundary: a best-effort step
+                // that asked for `ignore_errors` must not strand the chain
+                // behind it just because the value it produced was too big to
+                // carry. The value is discarded either way, so suppression
+                // costs the worker nothing it was going to keep.
+                if crate::error_links::ignores_errors(&task.payload) {
+                    suppress_failure(SuppressedFailure {
+                        broker: &broker,
                         task: &task,
                         task_id,
                         receipt_handle: receipt_handle.as_deref(),
-                        retry_count: current_retry,
+                        claimed,
                         error_msg: &size_error,
-                        failure_type: "result_too_large",
-                        extra_metadata: vec![
-                            ("result_bytes", result.len().to_string()),
-                            ("max_result_bytes", max_result_size_bytes.to_string()),
-                        ],
-                        dispose: claimed,
-                    },
-                )
-                .await;
+                        events: &events,
+                        hostname: &hostname,
+                        pid,
+                        result_store: result_store.as_ref(),
+                        #[cfg(feature = "workflows")]
+                        chord_backend: chord_backend.as_ref(),
+                        signature: signature.as_ref(),
+                    })
+                    .await;
+                } else {
+                    // Retrying cannot shrink a deterministic result, so this is
+                    // terminal regardless of the remaining retry budget.
+                    dead_letter(
+                        &broker,
+                        dlq_handler.as_ref(),
+                        &events,
+                        &hostname,
+                        pid,
+                        DeadLetterRequest {
+                            task: &task,
+                            task_id,
+                            receipt_handle: receipt_handle.as_deref(),
+                            retry_count: current_retry,
+                            error_msg: &size_error,
+                            failure_type: "result_too_large",
+                            extra_metadata: vec![
+                                ("result_bytes", result.len().to_string()),
+                                ("max_result_bytes", max_result_size_bytes.to_string()),
+                            ],
+                            dispose: claimed,
+                            error_links: true,
+                            signature: signature.as_ref(),
+                            result_store: result_store.as_ref(),
+                        },
+                    )
+                    .await;
+                }
             } else {
                 info!("Task {} completed successfully in {:?}", task_id, duration);
                 debug!("Result size: {} bytes", result.len());
@@ -652,17 +987,35 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                     // steps instead of stopping after the first. Done *before*
                     // the ack so a crash in between redelivers the task rather
                     // than silently ending the workflow.
-                    #[cfg(feature = "canvas")]
                     {
-                        let continued = crate::workflows::handle_workflow_completion(
+                        // The chord barrier lives behind a `&mut` trait object,
+                        // so the guard has to be held across the call — which
+                        // spans a broker enqueue. Taking it for every
+                        // completion would put the worker's whole concurrency
+                        // behind one mutex, so it is taken only for a task that
+                        // is actually a chord member.
+                        #[cfg(feature = "workflows")]
+                        let mut barrier = match chord_backend
+                            .as_ref()
+                            .filter(|_| task.metadata.chord_id.is_some())
+                        {
+                            Some(backend) => Some(backend.lock().await),
+                            None => None,
+                        };
+
+                        let continued = crate::workflows::handle_workflow_completion_signed(
                             &task,
                             &result,
                             broker.as_ref(),
-                            // The worker holds no result-backend handle yet, so
-                            // chord barrier counting is skipped (chain
-                            // continuation and branch/switch evaluation are not).
+                            // Chord barriers only count when the worker holds a
+                            // barrier store; chain continuation and
+                            // branch/switch evaluation never needed one.
                             #[cfg(feature = "workflows")]
-                            None,
+                            barrier.as_deref_mut(),
+                            // Continuations are messages this worker produces:
+                            // unsigned, they would be rejected by this very
+                            // worker on their own delivery.
+                            signature.as_ref(),
                         )
                         .await;
                         if let Err(e) = continued {
@@ -670,6 +1023,18 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                                 "Failed to continue the workflow after task {} succeeded: {}",
                                 task_id, e
                             );
+                        }
+                    }
+
+                    // Record the success so an `AsyncResult` waiter resolves.
+                    if let Some(ref store) = result_store {
+                        let value =
+                            serde_json::from_slice(&result).unwrap_or(serde_json::Value::Null);
+                        if let Err(e) = store
+                            .store_result(task_id, celers_core::TaskResultValue::Success(value))
+                            .await
+                        {
+                            warn!("Failed to record the result of task {}: {}", task_id, e);
                         }
                     }
 
@@ -703,7 +1068,24 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                 detector.record_failure(task_id, error_msg.clone()).await;
             }
 
-            if current_retry < max_retries {
+            if crate::error_links::ignores_errors(&task.payload) {
+                suppress_failure(SuppressedFailure {
+                    broker: &broker,
+                    task: &task,
+                    task_id,
+                    receipt_handle: receipt_handle.as_deref(),
+                    claimed,
+                    error_msg: &error_msg,
+                    events: &events,
+                    hostname: &hostname,
+                    pid,
+                    result_store: result_store.as_ref(),
+                    #[cfg(feature = "workflows")]
+                    chord_backend: chord_backend.as_ref(),
+                    signature: signature.as_ref(),
+                })
+                .await;
+            } else if current_retry < max_retries {
                 warn!(
                     "Requeuing task {} for retry {}/{}",
                     task_id,
@@ -738,7 +1120,13 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                         task_id,
                         receipt_handle.as_deref(),
                         current_retry + 1,
-                        backoff_delay(&retry_config, current_retry),
+                        // A task that declared its own backoff schedule gets
+                        // it; otherwise the worker's configured strategy
+                        // applies. Without this, `Signature::with_retry_delay`
+                        // / `with_retry_backoff` were decorative and every
+                        // task in the fleet retried on the same curve.
+                        task_backoff_delay(&task, &retry_config, current_retry),
+                        signature.as_ref(),
                     )
                     .await;
                 }
@@ -769,6 +1157,9 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                         failure_type: "execution_error",
                         extra_metadata: Vec::new(),
                         dispose: claimed,
+                        error_links: true,
+                        signature: signature.as_ref(),
+                        result_store: result_store.as_ref(),
                     },
                 )
                 .await;
@@ -789,7 +1180,24 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                 detector.record_failure(task_id, error_msg.clone()).await;
             }
 
-            if current_retry < max_retries {
+            if crate::error_links::ignores_errors(&task.payload) {
+                suppress_failure(SuppressedFailure {
+                    broker: &broker,
+                    task: &task,
+                    task_id,
+                    receipt_handle: receipt_handle.as_deref(),
+                    claimed,
+                    error_msg: &error_msg,
+                    events: &events,
+                    hostname: &hostname,
+                    pid,
+                    result_store: result_store.as_ref(),
+                    #[cfg(feature = "workflows")]
+                    chord_backend: chord_backend.as_ref(),
+                    signature: signature.as_ref(),
+                })
+                .await;
+            } else if current_retry < max_retries {
                 if let Some(ref mw) = middleware {
                     if let Err(e) = mw.on_retry(&ctx, current_retry + 1).await {
                         warn!("Middleware on_retry error: {}", e);
@@ -817,7 +1225,13 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                         task_id,
                         receipt_handle.as_deref(),
                         current_retry + 1,
-                        backoff_delay(&retry_config, current_retry),
+                        // A task that declared its own backoff schedule gets
+                        // it; otherwise the worker's configured strategy
+                        // applies. Without this, `Signature::with_retry_delay`
+                        // / `with_retry_backoff` were decorative and every
+                        // task in the fleet retried on the same curve.
+                        task_backoff_delay(&task, &retry_config, current_retry),
+                        signature.as_ref(),
                     )
                     .await;
                 }
@@ -843,6 +1257,9 @@ pub(crate) async fn run_dispatched_task<B: Broker + 'static>(
                         failure_type: failure.failure_type,
                         extra_metadata: failure.metadata,
                         dispose: claimed,
+                        error_links: true,
+                        signature: signature.as_ref(),
+                        result_store: result_store.as_ref(),
                     },
                 )
                 .await;

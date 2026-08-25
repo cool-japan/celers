@@ -702,6 +702,14 @@ fn print_plan(plan: &LoadPlan, dry_run: bool) {
 /// * `queue` - Target queue name; synthetic tasks are enqueued here.
 /// * `config` - The load-test configuration (see [`LoadTestConfig`]).
 /// * `dry_run` - When `true`, print the plan without enqueuing anything.
+/// * `signing_key` - When `Some`, every synthetic task is signed (HMAC-SHA256,
+///   [`celers_core::sign_task`] with [`celers_core::SigningOptions::default`])
+///   with this shared secret before being enqueued. Without this, a worker
+///   configured with signature verification (`CELERS_TASK_SIGNING_KEY`, see
+///   `celers_worker::security`) dead-letters every load-test task, since an
+///   unsigned message never satisfies a verifying worker's
+///   [`celers_core::SignaturePolicy`]. `None` enqueues unsigned tasks, matching
+///   the previous, always-unsigned behavior.
 ///
 /// # Returns
 ///
@@ -726,7 +734,7 @@ fn print_plan(plan: &LoadPlan, dry_run: bool) {
 ///     jitter_fraction: 0.5,
 /// };
 /// // Preview without touching the broker.
-/// run_loadtest("redis://localhost:6379", "bench", &config, true).await?;
+/// run_loadtest("redis://localhost:6379", "bench", &config, true, None).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -735,6 +743,7 @@ pub async fn run_loadtest(
     queue: &str,
     config: &LoadTestConfig,
     dry_run: bool,
+    signing_key: Option<&[u8]>,
 ) -> anyhow::Result<()> {
     if !(config.rate_per_sec.is_finite() && config.rate_per_sec > 0.0) {
         anyhow::bail!(
@@ -750,12 +759,25 @@ pub async fn run_loadtest(
         return Ok(());
     }
 
+    // Built once, reused for every task in the run: signing is cheap
+    // (HMAC-SHA256 over a small canonical byte string) but there is no
+    // reason to re-derive the signer per task. `None` enqueues unsigned
+    // tasks, matching the previous, always-unsigned behavior -- see the
+    // signing_key argument doc above for why a verifying fleet needs this.
+    let signer = signing_key.map(celers_core::TaskSigner::new);
+
     // Establish the broker connection up front; a single broker handles all
     // enqueues for the run.
     let broker = RedisBroker::new(broker_url, queue)?;
 
     println!();
     println!("{}", format!("Enqueuing {} task(s)...", plan.len()).cyan());
+    if signer.is_some() {
+        println!(
+            "{}",
+            "  (signing every task with the configured key before enqueueing)".dimmed()
+        );
+    }
 
     // Single monotonic start instant; every offset is measured from here so the
     // realised arrival times track the plan as closely as the runtime allows.
@@ -773,7 +795,10 @@ pub async fn run_loadtest(
             tokio::time::sleep(target - now).await;
         }
 
-        let task = entry.task.to_serialized();
+        let mut task = entry.task.to_serialized();
+        if let Some(ref signer) = signer {
+            celers_core::sign_task(signer, &mut task, celers_core::SigningOptions::default());
+        }
         match broker.enqueue(task).await {
             Ok(_) => {
                 enqueued += 1;
@@ -1515,7 +1540,7 @@ mod tests {
         cfg.rate_per_sec = 1000.0; // negligible inter-arrival sleep
         cfg.jitter_fraction = 0.0;
 
-        let result = run_loadtest(TEST_BROKER_URL, &queue_name, &cfg, false).await;
+        let result = run_loadtest(TEST_BROKER_URL, &queue_name, &cfg, false, None).await;
         assert!(
             result.is_err(),
             "run_loadtest must fail (nonzero exit) when every enqueue fails"
@@ -1540,7 +1565,7 @@ mod tests {
         cfg.rate_per_sec = 1000.0;
         cfg.jitter_fraction = 0.0;
 
-        let result = run_loadtest(TEST_BROKER_URL, &queue_name, &cfg, false).await;
+        let result = run_loadtest(TEST_BROKER_URL, &queue_name, &cfg, false, None).await;
         assert!(result.is_ok(), "healthy run must not fail: {result:?}");
 
         let client = redis::Client::open(TEST_BROKER_URL).expect("client");
@@ -1553,5 +1578,71 @@ mod tests {
             .query_async(&mut conn)
             .await
             .unwrap_or(0);
+    }
+
+    /// Regression test for the security followup: `loadtest` used to mint
+    /// unsigned `SerializedTask`s unconditionally, so a verifying worker
+    /// dead-lettered every load-test task. With `signing_key: Some(...)`,
+    /// every enqueued task must carry a signature that verifies against
+    /// that same key.
+    #[tokio::test]
+    async fn run_loadtest_signs_every_task_when_a_signing_key_is_given() {
+        let queue_name = format!("test-loadtest-signed-{}", uuid::Uuid::new_v4());
+        let key = b"loadtest-unit-test-signing-key!";
+
+        let mut cfg = base_config();
+        cfg.total = 3;
+        cfg.rate_per_sec = 1000.0;
+        cfg.jitter_fraction = 0.0;
+
+        let result = run_loadtest(TEST_BROKER_URL, &queue_name, &cfg, false, Some(key)).await;
+        assert!(result.is_ok(), "a signed run must not fail: {result:?}");
+
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+        let signer = celers_core::TaskSigner::new(key);
+        let mut verified = 0;
+        while let Ok(Some(msg)) = broker.try_dequeue().await {
+            let envelope = msg
+                .task
+                .metadata
+                .signature
+                .clone()
+                .expect("every enqueued task must carry a signature envelope");
+            let fields = celers_core::signed_fields(&msg.task);
+            signer
+                .verify(&fields, &envelope.signature)
+                .expect("the signature must verify against the same key it was signed with");
+            verified += 1;
+        }
+        assert_eq!(
+            verified, cfg.total,
+            "every task in the run must have been signed and enqueued"
+        );
+    }
+
+    /// Without a signing key, tasks must stay unsigned -- matching the
+    /// previous, always-unsigned behavior for anyone not opting in.
+    #[tokio::test]
+    async fn run_loadtest_leaves_tasks_unsigned_without_a_signing_key() {
+        let queue_name = format!("test-loadtest-unsigned-{}", uuid::Uuid::new_v4());
+
+        let mut cfg = base_config();
+        cfg.total = 2;
+        cfg.rate_per_sec = 1000.0;
+        cfg.jitter_fraction = 0.0;
+
+        let result = run_loadtest(TEST_BROKER_URL, &queue_name, &cfg, false, None).await;
+        assert!(result.is_ok(), "an unsigned run must not fail: {result:?}");
+
+        let broker = RedisBroker::new(TEST_BROKER_URL, &queue_name).expect("broker");
+        let mut seen = 0;
+        while let Ok(Some(msg)) = broker.try_dequeue().await {
+            assert!(
+                msg.task.metadata.signature.is_none(),
+                "without a signing key, no task must carry a signature"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, cfg.total);
     }
 }

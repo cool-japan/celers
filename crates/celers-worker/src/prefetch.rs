@@ -16,6 +16,35 @@
 //!   still-buffered messages instead of silently discarding them
 //! - **Batch integration**: Works seamlessly with batch dequeue
 //!
+//! # Status: a building block, not part of the worker's dequeue loop
+//!
+//! This is a **standalone component for callers building their own consume
+//! loop**. [`Worker`](crate::Worker) does not use it, and that is a decision
+//! rather than an omission — the two designs solve the same problem in
+//! incompatible ways:
+//!
+//! * The worker's loop acquires its concurrency permits **before** it dequeues
+//!   (see `worker_core`'s `run_loop_inner`), so a saturated worker stops
+//!   pulling messages out of the broker instead of accumulating them in RAM.
+//!   That is the loop's entire backpressure story, and it is what keeps a
+//!   crashed worker from stranding work it had reserved but never started.
+//! * A prefetch buffer exists precisely to hold messages the worker has *no
+//!   capacity to run yet*. Inserting one between the broker and dispatch would
+//!   move the reservation boundary past the permits and undo that guarantee:
+//!   messages would sit in this process, invisible to the broker's redelivery,
+//!   for as long as the buffer is deep.
+//!
+//! What the worker ships instead is
+//! [`WorkerConfig::enable_batch_dequeue`](crate::WorkerConfig), which fetches
+//! up to `batch_size` messages per round trip — but only ever as many as it
+//! holds permits for. That recovers the round-trip amortisation prefetching is
+//! usually reached for, without the buffered-reservation trade. It is also what
+//! the remote-control protocol reports as Celery's `prefetch_multiplier`.
+//!
+//! Use [`PrefetchBuffer`] when you are driving a broker yourself and want a
+//! deeper reserve than in-flight capacity, and you accept that buffered
+//! messages are reserved by this process. Do not expect `Worker` to consult it.
+//!
 //! # Example
 //!
 //! ```

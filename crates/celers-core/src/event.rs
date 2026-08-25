@@ -75,6 +75,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod message;
 pub mod wire;
 
 pub use wire::{

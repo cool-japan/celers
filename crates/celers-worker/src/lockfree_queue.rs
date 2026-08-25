@@ -1,12 +1,20 @@
 //! Lock-free task queue implementation
 //!
-//! This module provides a high-performance lock-free queue for task scheduling
-//! using work-stealing techniques to maximize throughput and reduce contention.
+//! This module provides a high-performance lock-free queue for task scheduling,
+//! built on [`crossbeam_deque::Injector`] — the global-queue half of crossbeam's
+//! work-stealing machinery — to maximize throughput and reduce contention.
+//!
+//! It is a **single shared queue**, not a work-stealing scheduler: there are no
+//! per-worker deques and nothing is taken from another worker. Consumers pop
+//! with `Injector::steal`, which is how crossbeam spells "take from the global
+//! queue". [`LockFreeQueue::injector`] hands out the injector so a caller that
+//! wants real per-worker stealing can pair it with its own
+//! `crossbeam_deque::Worker`/`Stealer` pairs.
 //!
 //! # Features
 //!
 //! - Lock-free operations for better performance under contention
-//! - Work-stealing support for load balancing
+//! - Usable as the global queue of a work-stealing scheduler built on top
 //! - Thread-safe producer and consumer handles
 //! - Batch dequeue operations
 //! - Zero-copy task passing when possible

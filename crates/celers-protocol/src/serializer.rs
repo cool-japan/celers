@@ -149,13 +149,13 @@ impl Serializer for YamlSerializer {
     }
 
     fn serialize<T: Serialize>(&self, value: &T) -> SerializerResult<Vec<u8>> {
-        serde_yaml::to_string(value)
+        serde_yaml_ng::to_string(value)
             .map(|s| s.into_bytes())
             .map_err(|e| SerializerError::Serialize(e.to_string()))
     }
 
     fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> SerializerResult<T> {
-        serde_yaml::from_slice(bytes).map_err(|e| SerializerError::Deserialize(e.to_string()))
+        serde_yaml_ng::from_slice(bytes).map_err(|e| SerializerError::Deserialize(e.to_string()))
     }
 
     #[inline]

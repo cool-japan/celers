@@ -65,9 +65,11 @@ impl RowExt for Row {
 /// Build a closure `FnMut(&Row) -> Result<Ty, OxiSqlError>` that maps a row's
 /// named columns onto the fields of `Ty`.
 ///
-/// Usage mirrors the shape of the target struct:
+/// Usage mirrors the shape of the target struct (sketch: `TaskInfo` and `rows`
+/// stand in for the caller's own type and query result, so this is written as
+/// prose rather than as a doctest):
 ///
-/// ```ignore
+/// ```text
 /// let infos: Vec<TaskInfo> = rows
 ///     .iter()
 ///     .map(row_to!(TaskInfo { task_name: "task_name" }))
@@ -127,9 +129,15 @@ pub(crate) use row_to;
 ///
 /// # Example
 ///
-/// ```ignore
-/// let id = Uuid::new_v4();
-/// conn.execute("INSERT INTO t (id) VALUES ($1)", &[&uuid_param(&id)]).await?;
+/// ```
+/// use celers_worker::row_ext::uuid_param;
+///
+/// let id = uuid::Uuid::new_v4();
+/// let bound = uuid_param(&id);
+/// assert!(matches!(bound, oxisql_core::Value::Uuid(raw) if raw == id.as_u128()));
+///
+/// // At a call site the value is bound like any other parameter:
+/// // conn.execute("INSERT INTO t (id) VALUES ($1)", &[&bound]).await?;
 /// ```
 #[allow(dead_code)]
 pub fn uuid_param(u: &uuid::Uuid) -> oxisql_core::Value {
@@ -163,9 +171,14 @@ pub fn opt_uuid_from_row(row: &Row, col: &str) -> Result<Option<uuid::Uuid>, Oxi
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use celers_worker::row_ext::json_param;
+///
 /// let payload = serde_json::json!({ "k": "v" });
-/// conn.execute("INSERT INTO t (data) VALUES ($1)", &[&json_param(&payload)]).await?;
+/// assert_eq!(json_param(&payload), r#"{"k":"v"}"#);
+///
+/// // At a call site the string is bound like any other text parameter:
+/// // conn.execute("INSERT INTO t (data) VALUES ($1)", &[&json_param(&payload)]).await?;
 /// ```
 #[allow(dead_code)]
 pub fn json_param(v: &serde_json::Value) -> String {
@@ -223,7 +236,7 @@ pub fn json_from_row(row: &Row, col: &str) -> Result<serde_json::Value, OxiSqlEr
 // `::timestamptz` cast then converts the value server-side, exactly as if a
 // `TIMESTAMPTZ`-typed literal had been used.
 //
-// ```ignore
+// ```text
 // let now: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
 // conn.execute(
 //     "UPDATE t SET seen_at = $1::text::timestamptz WHERE id = $2",

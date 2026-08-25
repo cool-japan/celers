@@ -302,7 +302,7 @@ fn load_profile_overlay(
 /// which keys are present).
 ///
 /// TOML and YAML are each parsed with their own `Deserialize` impl
-/// (`toml::Value` / `serde_yaml::Value`) and then re-serialized through
+/// (`toml::Value` / `serde_yaml_ng::Value`) and then re-serialized through
 /// `serde_json::to_value`, giving [`merge_overlay`] one uniform
 /// presence-checking representation regardless of the overlay file's
 /// on-disk format.
@@ -315,7 +315,7 @@ fn parse_raw_overlay_value(path: &Path) -> anyhow::Result<serde_json::Value> {
             serde_json::to_value(v)?
         }
         ConfigFormat::Yaml => {
-            let v: serde_yaml::Value = serde_yaml::from_str(&expanded)?;
+            let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&expanded)?;
             serde_json::to_value(v)?
         }
     };

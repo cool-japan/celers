@@ -616,6 +616,13 @@ fn state_for_cached(value: Option<&TaskResultValue>) -> TaskState {
         Some(TaskResultValue::Revoked) => TaskState::Revoked,
         Some(TaskResultValue::Retry { attempt, .. }) => TaskState::Retrying(*attempt),
         Some(TaskResultValue::Rejected { .. }) => TaskState::Rejected,
+        // A suppressed failure is terminal and non-failing by contract, and its
+        // value is the JSON `null` the workflow carries forward — so it maps to
+        // the same state a task returning nothing would report. Mapping it to
+        // `Failed` would resurrect the error the caller asked to ignore;
+        // mapping it to a `Custom` state would make it non-terminal and hang
+        // every waiter.
+        Some(TaskResultValue::Ignored { .. }) => TaskState::Succeeded(b"null".to_vec()),
     }
 }
 

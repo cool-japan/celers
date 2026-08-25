@@ -1,0 +1,18 @@
+# Grafana dashboard-provider provisioning for the local development stack
+# in ../../docker-compose.yml. Mounted read-only at
+# /etc/grafana/provisioning/dashboards/dashboards.yml. Points Grafana at
+# ./json (which the same compose mount lands at
+# /etc/grafana/provisioning/dashboards/json) for the actual dashboard JSON.
+apiVersion: 1
+
+providers:
+  - name: CeleRS
+    orgId: 1
+    folder: CeleRS
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+      foldersFromFilesStructure: false

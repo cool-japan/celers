@@ -227,6 +227,11 @@ pub mod broker_core;
 pub mod broker_ops;
 pub mod types;
 
+/// Offline `aws_sdk_sqs::Client` construction for unit tests — see the module
+/// docs for why building one the ordinary way is both slow and flaky.
+#[cfg(test)]
+mod test_support;
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

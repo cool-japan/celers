@@ -1154,20 +1154,25 @@ pub trait Task: Send + Sync {
 /// copying data during serialization and deserialization. For high-performance
 /// scenarios, consider these alternatives:
 ///
+/// These are field-declaration sketches, not runnable code, so they are fenced
+/// as `text` rather than as `ignore`d Rust: an `ignore` block is never
+/// compiled, which makes it indistinguishable from a snippet that has silently
+/// rotted.
+///
 /// 1. **`Bytes` from `bytes` crate**: Provides cheap cloning via reference counting
-///    ```ignore
+///    ```text
 ///    use bytes::Bytes;
 ///    pub payload: Bytes,
 ///    ```
 ///
 /// 2. **`Arc<[u8]>`**: Reference-counted slice for shared ownership
-///    ```ignore
+///    ```text
 ///    use std::sync::Arc;
 ///    pub payload: Arc<[u8]>,
 ///    ```
 ///
 /// 3. **Borrowed payloads with lifetimes**: For truly zero-copy deserialization
-///    ```ignore
+///    ```text
 ///    #[derive(Deserialize)]
 ///    pub struct SerializedTask<'a> {
 ///        #[serde(borrow)]

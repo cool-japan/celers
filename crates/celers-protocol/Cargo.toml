@@ -20,7 +20,7 @@ hex = { workspace = true, optional = true }
 
 # Optional serialization formats
 rmp-serde = { workspace = true, optional = true }  # MessagePack
-serde_yaml = { workspace = true, optional = true }  # YAML
+serde_yaml_ng = { workspace = true, optional = true }  # YAML (maintained serde_yaml fork)
 
 # Optional compression
 oxiarc-deflate = { workspace = true, optional = true }  # gzip/deflate
@@ -40,7 +40,7 @@ default = ["json"]
 json = []
 msgpack = ["rmp-serde"]
 binary = []
-yaml = ["serde_yaml"]
+yaml = ["dep:serde_yaml_ng"]
 protobuf = ["prost"]
 bson-format = ["bson"]
 gzip = ["oxiarc-deflate"]

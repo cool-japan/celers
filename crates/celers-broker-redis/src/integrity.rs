@@ -32,12 +32,11 @@ pub enum ChecksumAlgorithm {
     /// `XXH3-64` (very fast, good distribution, spec-stable across
     /// toolchains — implemented via the `twox-hash` crate)
     XxHash,
-    /// SHA256 (cryptographically secure, slower)
+    /// SHA-256 (cryptographically secure, slower)
     ///
-    /// Not currently implemented: `celers-broker-redis` does not depend on
-    /// the `sha2` crate, so [`ChecksumAlgorithm::compute`] returns
-    /// [`Err`] for this variant rather than silently computing a different,
-    /// non-cryptographic hash under the "sha256" label.
+    /// Computed with the `sha2` crate and rendered as 64 lowercase hex
+    /// characters. Pick this when the checksum has to resist deliberate
+    /// tampering rather than only accidental corruption.
     Sha256,
 }
 
@@ -53,11 +52,14 @@ impl ChecksumAlgorithm {
 
     /// Compute checksum for data.
     ///
-    /// Returns `Err` for [`ChecksumAlgorithm::Sha256`] — see the variant's
-    /// documentation. Callers relying on a checksum purely for accidental
-    /// corruption detection (not cryptographic tamper-resistance) should use
-    /// [`ChecksumAlgorithm::Crc32`] or [`ChecksumAlgorithm::XxHash`], both of
-    /// which are fully implemented.
+    /// Every variant is implemented, so this currently never returns `Err`;
+    /// the `Result` is kept because the return type is part of the public API
+    /// and a future algorithm may need to fail.
+    ///
+    /// The output is lowercase hex in all cases: 8 characters for
+    /// [`Crc32`](ChecksumAlgorithm::Crc32), 16 for
+    /// [`XxHash`](ChecksumAlgorithm::XxHash) and 64 for
+    /// [`Sha256`](ChecksumAlgorithm::Sha256).
     pub fn compute(&self, data: &[u8]) -> Result<String> {
         match self {
             ChecksumAlgorithm::Crc32 => {
@@ -72,16 +74,15 @@ impl ChecksumAlgorithm {
                 let hash = twox_hash::XxHash3_64::oneshot(data);
                 Ok(format!("{:016x}", hash))
             }
-            ChecksumAlgorithm::Sha256 => Err(CelersError::Broker(
-                "ChecksumAlgorithm::Sha256 is not implemented: celers-broker-redis does not \
-                 depend on the `sha2` crate, so no real SHA-256 digest can be computed here. \
-                 Silently substituting a non-cryptographic hash under the \"sha256\" label would \
-                 defeat integrity verification without telling anyone, so this errors instead. \
-                 Use ChecksumAlgorithm::Crc32 or ChecksumAlgorithm::XxHash, or add \
-                 `sha2 = { workspace = true }` to celers-broker-redis's Cargo.toml and implement \
-                 this arm for real."
-                    .to_string(),
-            )),
+            ChecksumAlgorithm::Sha256 => {
+                // A real SHA-256 digest via the `sha2` crate. Rendering it as
+                // lowercase hex keeps the checksum field a plain ASCII string,
+                // matching the other two algorithms.
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(data);
+                Ok(hex::encode(hasher.finalize()))
+            }
         }
     }
 }
@@ -469,23 +470,52 @@ mod tests {
         let data = b"test data";
         let crc32 = ChecksumAlgorithm::Crc32.compute(data).unwrap();
         let xxhash = ChecksumAlgorithm::XxHash.compute(data).unwrap();
+        let sha256 = ChecksumAlgorithm::Sha256.compute(data).unwrap();
 
         assert!(!crc32.is_empty());
         assert!(!xxhash.is_empty());
+        assert!(!sha256.is_empty());
 
         // Same data should produce same checksum
         assert_eq!(crc32, ChecksumAlgorithm::Crc32.compute(data).unwrap());
         assert_eq!(xxhash, ChecksumAlgorithm::XxHash.compute(data).unwrap());
+        assert_eq!(sha256, ChecksumAlgorithm::Sha256.compute(data).unwrap());
     }
 
     #[test]
-    fn test_sha256_is_honestly_unsupported_not_faked() {
-        // No `sha2` dependency is available in this crate: computing a
-        // checksum labeled "sha256" must fail loudly rather than silently
-        // return a different (non-cryptographic) hash under that name.
-        let err = ChecksumAlgorithm::Sha256.compute(b"abc").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("sha2") || msg.contains("SHA-256") || msg.contains("Sha256"));
+    fn test_sha256_matches_known_nist_vectors() {
+        // FIPS 180-4 reference digests. These pin that the "sha256" label
+        // really denotes SHA-256 and not some other hash rendered under that
+        // name — the whole point of offering a cryptographic option.
+        assert_eq!(
+            ChecksumAlgorithm::Sha256.compute(b"").unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            ChecksumAlgorithm::Sha256.compute(b"abc").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            ChecksumAlgorithm::Sha256
+                .compute(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+                .unwrap(),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn test_sha256_output_shape_and_determinism() {
+        let a = ChecksumAlgorithm::Sha256.compute(b"test data").unwrap();
+        let b = ChecksumAlgorithm::Sha256.compute(b"test data").unwrap();
+        assert_eq!(a, b, "the same input must produce the same digest");
+        assert_eq!(a.len(), 64, "SHA-256 renders as 64 lowercase hex chars");
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert_ne!(a, ChecksumAlgorithm::Sha256.compute(b"test datb").unwrap());
+        // And it must not collide with the other algorithms' labels/outputs.
+        assert_ne!(a, ChecksumAlgorithm::Crc32.compute(b"test data").unwrap());
+        assert_ne!(a, ChecksumAlgorithm::XxHash.compute(b"test data").unwrap());
     }
 
     #[test]
@@ -521,11 +551,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wrap_task_with_sha256_fails_instead_of_faking_checksum() {
+    async fn test_wrap_and_validate_round_trip_with_sha256() {
         let validator = IntegrityValidator::new(ChecksumAlgorithm::Sha256);
         let task = create_test_task();
 
-        assert!(validator.wrap(task).await.is_err());
+        let wrapped = validator.wrap(task.clone()).await.unwrap();
+        assert_eq!(wrapped.task.metadata.id, task.metadata.id);
+        assert_eq!(wrapped.algorithm, "sha256");
+        assert_eq!(wrapped.checksum.len(), 64);
+        assert!(validator.validate(&wrapped).await.unwrap());
+
+        // Tampering with the payload must be detected by the digest.
+        let mut tampered = wrapped;
+        tampered.task.payload.push(0xff);
+        assert!(!validator.validate(&tampered).await.unwrap());
     }
 
     #[tokio::test]

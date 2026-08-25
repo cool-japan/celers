@@ -97,8 +97,10 @@
 
 use super::Event;
 use crate::error::{CelersError, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use celers_protocol::event::EventMessage;
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Wire name of the event type field.
@@ -298,13 +300,114 @@ pub fn event_timestamp_now() -> DateTime<Utc> {
     truncate_to_wire_precision(Utc::now())
 }
 
-/// Move `map[from]` to `map[to]`, leaving an already-present `to` untouched.
-fn rename_key(map: &mut Map<String, Value>, from: &str, to: &str) {
-    if map.contains_key(to) {
-        return;
+/// Normalise a received JSON object into an [`EventMessage`].
+///
+/// Accepts both shapes CeleRS has ever put on a wire:
+///
+/// * the canonical Celery shape — `uuid`, `name`, a float `timestamp`;
+/// * the internal shape an older CeleRS wrote — `task_id`, `task_name`, an
+///   RFC3339 string `timestamp` — so a consumer can read both during a rollout.
+///
+/// `clock` and `utcoffset` are dropped: they describe the transmission, not the
+/// event. `pid` and `hostname` are lifted onto the envelope fields of
+/// [`EventMessage`], where the typed conversion expects them.
+fn message_from_object(source: &Map<String, Value>) -> Result<EventMessage> {
+    let event_type = source
+        .get(WIRE_TYPE)
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>")
+        .to_string();
+
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    let mut hostname = None;
+    let mut pid = None;
+    let mut timestamp = None;
+
+    // Celery's names win when a payload somehow carries both spellings, which
+    // is what the previous rename layer did too.
+    for (wire, internal) in [
+        (WIRE_UUID, INTERNAL_TASK_ID),
+        (WIRE_NAME, INTERNAL_TASK_NAME),
+    ] {
+        if let Some(value) = source.get(wire).or_else(|| source.get(internal)) {
+            fields.insert(wire.to_string(), value.clone());
+        }
     }
-    if let Some(value) = map.remove(from) {
-        map.insert(to.to_string(), value);
+
+    for (key, value) in source {
+        match key.as_str() {
+            // Handled above or below, or transmission-only metadata.
+            WIRE_TYPE | WIRE_UUID | WIRE_NAME | INTERNAL_TASK_ID | INTERNAL_TASK_NAME
+            | WIRE_CLOCK | WIRE_UTCOFFSET => {}
+            WIRE_HOSTNAME => {
+                hostname = match value {
+                    Value::Null => None,
+                    Value::String(text) => Some(text.clone()),
+                    _ => {
+                        return Err(CelersError::Deserialization(format!(
+                            "wire event '{event_type}': 'hostname' is not a string"
+                        )))
+                    }
+                };
+            }
+            WIRE_PID => {
+                pid = match value {
+                    Value::Null => None,
+                    _ => Some(
+                        value
+                            .as_u64()
+                            .and_then(|raw| u32::try_from(raw).ok())
+                            .ok_or_else(|| {
+                                CelersError::Deserialization(format!(
+                                    "wire event '{event_type}': 'pid' is not a process id"
+                                ))
+                            })?,
+                    ),
+                };
+            }
+            WIRE_TIMESTAMP => timestamp = Some(parse_wire_timestamp(value, &event_type)?),
+            _ => {
+                fields.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    let Some(timestamp) = timestamp else {
+        return Err(CelersError::Deserialization(format!(
+            "wire event '{event_type}': missing 'timestamp'"
+        )));
+    };
+
+    Ok(EventMessage {
+        event_type,
+        timestamp,
+        hostname,
+        utcoffset: None,
+        pid,
+        clock: None,
+        fields,
+    })
+}
+
+/// Read a `timestamp` in either spelling: Celery's float Unix seconds, or the
+/// RFC3339 string an older CeleRS wrote.
+fn parse_wire_timestamp(value: &Value, event_type: &str) -> Result<f64> {
+    match value {
+        Value::Number(number) => number.as_f64().ok_or_else(|| {
+            CelersError::Deserialization(format!(
+                "wire event '{event_type}': timestamp {number} is not a number"
+            ))
+        }),
+        Value::String(text) => DateTime::parse_from_rfc3339(text)
+            .map(|at| to_wire_timestamp(at.with_timezone(&Utc)))
+            .map_err(|e| {
+                CelersError::Deserialization(format!(
+                    "wire event '{event_type}': timestamp '{text}' is not RFC3339: {e}"
+                ))
+            }),
+        _ => Err(CelersError::Deserialization(format!(
+            "wire event '{event_type}': timestamp is neither a number nor a string"
+        ))),
     }
 }
 
@@ -335,36 +438,35 @@ impl Event {
     /// Returns [`CelersError::Serialization`] if the event cannot be rendered
     /// as JSON.
     pub fn to_wire_value_with(&self, envelope: &EventEnvelope) -> Result<Value> {
-        let value = serde_json::to_value(self)
-            .map_err(|e| CelersError::Serialization(format!("event to JSON: {e}")))?;
-        let Value::Object(mut map) = value else {
+        // Typed all the way: `EventMessage` is celers-protocol's model of the
+        // Celery wire shape, so the field mapping is checked by the compiler
+        // rather than by renaming keys in a JSON map. See [`super::message`].
+        let mut message = EventMessage::from(self);
+
+        // Celery timestamps are float Unix seconds. Every `DateTime<Utc>` maps
+        // onto a finite double, so this guard is unreachable in practice — but
+        // serde_json turns a non-finite float into `null` rather than failing,
+        // and a `null` timestamp is worse than an error.
+        if !message.timestamp.is_finite() {
             return Err(CelersError::Serialization(
-                "event did not serialize into a JSON object".to_string(),
+                "event timestamp is not representable as a JSON number".to_string(),
             ));
-        };
-
-        rename_key(&mut map, INTERNAL_TASK_ID, WIRE_UUID);
-        rename_key(&mut map, INTERNAL_TASK_NAME, WIRE_NAME);
-
-        // Celery timestamps are float Unix seconds, never RFC3339 strings.
-        let timestamp = serde_json::Number::from_f64(to_wire_timestamp(self.timestamp()))
-            .ok_or_else(|| {
-                CelersError::Serialization(
-                    "event timestamp is not representable as a JSON number".to_string(),
-                )
-            })?;
-        map.insert(WIRE_TIMESTAMP.to_string(), Value::Number(timestamp));
-
-        map.insert(WIRE_CLOCK.to_string(), Value::from(envelope.clock));
-        map.insert(WIRE_UTCOFFSET.to_string(), Value::from(envelope.utcoffset));
-        map.entry(WIRE_PID.to_string())
-            .or_insert_with(|| Value::from(envelope.pid));
-        if let Some(ref hostname) = envelope.hostname {
-            map.entry(WIRE_HOSTNAME.to_string())
-                .or_insert_with(|| Value::from(hostname.clone()));
         }
 
-        Ok(Value::Object(map))
+        // The envelope supplies what an event does not know about itself:
+        // always the logical clock and UTC offset, and the publishing
+        // process/host only where the event carries none of its own.
+        message.clock = Some(envelope.clock);
+        message.utcoffset = Some(envelope.utcoffset);
+        if message.pid.is_none() {
+            message.pid = Some(envelope.pid);
+        }
+        if message.hostname.is_none() {
+            message.hostname.clone_from(&envelope.hostname);
+        }
+
+        serde_json::to_value(&message)
+            .map_err(|e| CelersError::Serialization(format!("event to JSON: {e}")))
     }
 
     /// Render this event as a Celery wire JSON string.
@@ -417,37 +519,10 @@ impl Event {
                 "wire event is not a JSON object".to_string(),
             ));
         };
-        let mut map = source.clone();
 
-        rename_key(&mut map, WIRE_UUID, INTERNAL_TASK_ID);
-        rename_key(&mut map, WIRE_NAME, INTERNAL_TASK_NAME);
-
-        if let Some(Value::Number(number)) = map.get(WIRE_TIMESTAMP) {
-            let seconds = number.as_f64().ok_or_else(|| {
-                CelersError::Deserialization(format!(
-                    "wire event timestamp {number} is not a number"
-                ))
-            })?;
-            let timestamp = from_wire_timestamp(seconds)?;
-            map.insert(
-                WIRE_TIMESTAMP.to_string(),
-                Value::String(timestamp.to_rfc3339_opts(SecondsFormat::Micros, true)),
-            );
-        }
-
-        // Transmission metadata, not part of the typed model. `pid` is kept:
-        // the received/started events carry it as a real field.
-        map.remove(WIRE_CLOCK);
-        map.remove(WIRE_UTCOFFSET);
-
-        let event_type = source
-            .get(WIRE_TYPE)
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>")
-            .to_string();
-
-        serde_json::from_value(Value::Object(map))
-            .map_err(|e| CelersError::Deserialization(format!("wire event '{event_type}': {e}")))
+        // Both shapes normalise onto one `EventMessage`, and the typed
+        // conversion in [`super::message`] does the rest.
+        Self::try_from(&message_from_object(source)?)
     }
 
     /// Parse a Celery wire event from a JSON string.

@@ -6,6 +6,8 @@ mod execution;
 pub(crate) mod support;
 
 #[cfg(test)]
+mod loop_tests;
+#[cfg(test)]
 mod tests;
 
 use crate::adaptive_poll::{AdaptivePoll, PollOutcome};
@@ -81,6 +83,34 @@ impl StopReason {
     }
 }
 
+/// Whether `B`'s blocking [`Broker::dequeue`] is known to be cancel-safe, so
+/// the dequeue loop may race it against the shutdown signal.
+///
+/// [`Broker`] makes no cancel-safety promise, and it cannot: an implementation
+/// is free to remove a message from its queue at one `.await` point and hand it
+/// back at a later one, so dropping the future mid-flight would lose the
+/// message outright. The default is therefore `false` for every broker, and the
+/// worker keeps the documented behaviour — a parked `dequeue` observes shutdown
+/// when it next returns.
+///
+/// This is a deliberately narrow **allowlist**, not a general mechanism: it
+/// names implementations whose `dequeue` has been read and verified to hold no
+/// message across an `.await`. Today that is
+/// [`celers_core::InMemoryBroker`], whose `dequeue` mutates its queue only
+/// after its lock await has resolved and then runs synchronously to the return,
+/// and whose waiting is a `tokio::sync::Semaphore::acquire` (which consumes no
+/// permit if the future is dropped). The in-memory broker also has no block
+/// timeout, so an idle in-process worker would otherwise learn about
+/// `control shutdown` only when the next message happened to arrive.
+///
+/// Anything else opts in explicitly and knowingly through
+/// [`Worker::with_cancel_safe_dequeue`]. When [`Broker`] eventually grows a
+/// `dequeue_is_cancel_safe()` capability method of its own, this function
+/// becomes a one-line delegation to it.
+fn broker_dequeue_is_cancel_safe<B: 'static>() -> bool {
+    std::any::TypeId::of::<B>() == std::any::TypeId::of::<celers_core::InMemoryBroker>()
+}
+
 /// Worker runtime for consuming and executing tasks
 pub struct Worker<B: Broker, E: EventEmitter = NoOpEventEmitter> {
     pub(crate) broker: Arc<B>,
@@ -147,6 +177,33 @@ pub struct Worker<B: Broker, E: EventEmitter = NoOpEventEmitter> {
     pub(crate) broker_url: Option<String>,
     /// Result-backend URL reported by `inspect conf`, credentials stripped.
     pub(crate) result_backend_url: Option<String>,
+    /// Result store terminal task dispositions are written to (enabled via
+    /// [`Worker::with_result_store`]).
+    ///
+    /// `None` (the default) means the worker records nothing: a caller holding
+    /// an [`AsyncResult`](celers_core::AsyncResult) then polls for a result no
+    /// one will ever write. With a store, successes, terminal failures and
+    /// deliberately ignored failures all become observable.
+    pub(crate) result_store: Option<Arc<dyn celers_core::ResultStore>>,
+    /// Whether this worker may race a blocking [`Broker::dequeue`] against its
+    /// shutdown signal (see [`Worker::with_cancel_safe_dequeue`]).
+    ///
+    /// Seeded by [`broker_dequeue_is_cancel_safe`] and overridable by whoever
+    /// built the worker. `false` keeps the conservative behaviour: shutdown is
+    /// observed at the *next* trip round the loop.
+    pub(crate) cancel_safe_dequeue: bool,
+    /// Chord barrier store (enabled via [`Worker::with_chord_backend`]).
+    ///
+    /// Deliberately a second handle rather than a reuse of `result_store`: the
+    /// barrier primitives (`chord_complete_task`, `chord_get_state`,
+    /// `chord_get_partial_results`) live on
+    /// [`celers_backend_redis::ResultBackend`] and take `&mut self`, which
+    /// [`celers_core::ResultStore`] neither declares nor could. `None` (the
+    /// default) leaves chord callbacks un-triggered — a chord's header runs,
+    /// but nothing counts it.
+    #[cfg(feature = "workflows")]
+    pub(crate) chord_backend:
+        Option<Arc<tokio::sync::Mutex<dyn celers_backend_redis::ResultBackend>>>,
 }
 
 impl<B: Broker + 'static> Worker<B, NoOpEventEmitter> {
@@ -266,6 +323,10 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             control_transport: None,
             broker_url: None,
             result_backend_url: None,
+            result_store: None,
+            cancel_safe_dequeue: broker_dequeue_is_cancel_safe::<B>(),
+            #[cfg(feature = "workflows")]
+            chord_backend: None,
         }
     }
 
@@ -364,6 +425,63 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     pub fn with_revocation_watcher(mut self, watcher: RevocationWatcher) -> Self {
         self.revocation_watcher = Some(watcher);
         self
+    }
+
+    /// Declare whether this worker's broker has a **cancel-safe**
+    /// [`Broker::dequeue`], letting the dequeue loop race it against the
+    /// shutdown signal.
+    ///
+    /// A worker parked in a blocking `dequeue` otherwise observes a shutdown
+    /// only when that call returns. Brokers with a block timeout (Redis,
+    /// PostgreSQL/MySQL, SQS) return within one block period, so the delay is
+    /// bounded and small. [`celers_core::InMemoryBroker`] has no timeout at
+    /// all: it waits indefinitely on an empty queue, so an idle in-process
+    /// worker would act on `control shutdown` only when the next message
+    /// happened to arrive. It is recognised automatically and needs no call to
+    /// this method.
+    ///
+    /// # Safety of the race
+    ///
+    /// Racing means the `dequeue` future is **dropped** when shutdown wins.
+    /// That is only sound if the implementation never holds a message across an
+    /// `.await` — otherwise the dropped future takes an already-dequeued
+    /// message with it, and the message is lost rather than redelivered.
+    /// [`Broker`] promises nothing here, so the default is `false` for every
+    /// broker but the verified in-memory one. Pass `true` only for a broker
+    /// whose `dequeue` you have checked.
+    ///
+    /// Passing `false` is always safe: it restores the "observe shutdown at the
+    /// next dequeue return" behaviour, including for the in-memory broker.
+    ///
+    /// Batch dequeue is unaffected either way:
+    /// [`Broker::dequeue_batch`] is expected to be non-blocking, so there is
+    /// nothing to race.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use celers_worker::{Worker, WorkerConfig};
+    /// use celers_core::TaskRegistry;
+    /// # use celers_core::Broker;
+    /// # async fn example<B: Broker + 'static>(broker: B) {
+    /// let worker = Worker::new(broker, TaskRegistry::new(), WorkerConfig::default())
+    ///     // Only for a broker whose `dequeue` holds no message across an await.
+    ///     .with_cancel_safe_dequeue(true);
+    /// # let _ = worker;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_cancel_safe_dequeue(mut self, cancel_safe: bool) -> Self {
+        self.cancel_safe_dequeue = cancel_safe;
+        self
+    }
+
+    /// Whether the dequeue loop will race a blocking dequeue against the
+    /// shutdown signal for this worker's broker.
+    ///
+    /// See [`Worker::with_cancel_safe_dequeue`].
+    pub fn cancel_safe_dequeue(&self) -> bool {
+        self.cancel_safe_dequeue
     }
 
     /// Enable distributed (cluster-wide) rate-limit coordination.
@@ -665,6 +783,71 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// ```
     pub fn with_middleware(mut self, stack: middleware::MiddlewareStack) -> Self {
         self.middleware_stack = Some(Arc::new(stack));
+        self
+    }
+
+    /// Give the worker a result store, so task outcomes are actually recorded.
+    ///
+    /// Without one the worker executes tasks and writes nothing anywhere: a
+    /// caller holding an [`AsyncResult`](celers_core::AsyncResult) polls a
+    /// backend no one is writing to, and every terminal failure (retries
+    /// exhausted, hard time limit, oversized result, open circuit, poison-pill
+    /// quarantine) is visible only as a log line and a dead-letter entry.
+    ///
+    /// With one, the worker records:
+    ///
+    /// * [`Success`](celers_core::TaskResultValue::Success) with the task's
+    ///   return value,
+    /// * [`Failure`](celers_core::TaskResultValue::Failure) for every terminal
+    ///   failure, and
+    /// * [`Ignored`](celers_core::TaskResultValue::Ignored) for a failure the
+    ///   task asked to have suppressed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use celers_core::{InMemoryBroker, InMemoryResultBackend, TaskRegistry};
+    /// # use celers_worker::{Worker, WorkerConfig};
+    /// let store = Arc::new(InMemoryResultBackend::new());
+    /// let worker = Worker::new(
+    ///     InMemoryBroker::new(),
+    ///     TaskRegistry::new(),
+    ///     WorkerConfig::default(),
+    /// )
+    /// .with_result_store(store);
+    /// # let _ = worker;
+    /// ```
+    #[must_use]
+    pub fn with_result_store(mut self, store: Arc<dyn celers_core::ResultStore>) -> Self {
+        self.result_store = Some(store);
+        self
+    }
+
+    /// The result store this worker records outcomes in, if any.
+    pub fn result_store(&self) -> Option<&Arc<dyn celers_core::ResultStore>> {
+        self.result_store.as_ref()
+    }
+
+    /// Give the worker a chord barrier store, so chord callbacks actually fire.
+    ///
+    /// A chord is defined by its barrier: the callback runs once, after every
+    /// header task has completed, with their results. Counting those
+    /// completions needs shared state, which is what
+    /// [`celers_backend_redis::ResultBackend`] provides. Without this handle a
+    /// chord's header runs and its callback never does.
+    ///
+    /// It is a separate handle from [`with_result_store`](Self::with_result_store)
+    /// because the barrier primitives take `&mut self` and are not part of the
+    /// backend-agnostic [`celers_core::ResultStore`] trait; the `Mutex` is what
+    /// makes the `&mut` available from the worker's concurrent task futures.
+    #[cfg(feature = "workflows")]
+    #[must_use]
+    pub fn with_chord_backend(
+        mut self,
+        backend: Arc<tokio::sync::Mutex<dyn celers_backend_redis::ResultBackend>>,
+    ) -> Self {
+        self.chord_backend = Some(backend);
         self
     }
 
@@ -1155,11 +1338,47 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                 debug!("Batch dequeue enabled, fetching up to {} tasks", capacity);
                 self.broker.dequeue_batch(capacity).await
             } else {
-                // Single task dequeue (convert to Vec for uniform handling)
-                match self.broker.dequeue().await {
-                    Ok(Some(msg)) => Ok(vec![msg]),
-                    Ok(None) => Ok(vec![]),
-                    Err(e) => Err(e),
+                // Single task dequeue (convert to Vec for uniform handling).
+                //
+                // A blocking `dequeue` is the one place the loop can sit for an
+                // unbounded time, so a broker whose `dequeue` is cancel-safe
+                // races it against the shutdown signal: without that, an idle
+                // in-memory worker (no block timeout at all) acts on
+                // `control shutdown` only when the next message arrives. The
+                // race drops the losing `dequeue` future, which is exactly why
+                // it is gated on `cancel_safe_dequeue` — for a broker that
+                // holds a message across an await, dropping it would lose the
+                // message. See [`Worker::with_cancel_safe_dequeue`].
+                let raced: std::result::Result<
+                    Result<Option<celers_core::BrokerMessage>>,
+                    StopReason,
+                > = match shutdown_rx.as_mut().filter(|_| self.cancel_safe_dequeue) {
+                    Some(rx) => {
+                        tokio::select! {
+                            biased;
+                            // Shutdown first: a signal already waiting must
+                            // not lose to a message arriving in the same
+                            // poll.
+                            signal = rx.recv() => Err(match signal {
+                                Some(()) => StopReason::Shutdown,
+                                None => StopReason::Disconnected,
+                            }),
+                            dequeued = self.broker.dequeue() => Ok(dequeued),
+                        }
+                    }
+                    None => Ok(self.broker.dequeue().await),
+                };
+
+                match raced {
+                    // `held_permits` drops with the loop body, returning this
+                    // iteration's capacity before the drain waits for it.
+                    Err(reason) => {
+                        info!("Shutdown observed while waiting for a message");
+                        break reason;
+                    }
+                    Ok(Ok(Some(msg))) => Ok(vec![msg]),
+                    Ok(Ok(None)) => Ok(vec![]),
+                    Ok(Err(e)) => Err(e),
                 }
             };
 
@@ -1373,6 +1592,12 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                     failure_type: "poison_pill",
                                     extra_metadata: vec![("task_name", task_name.clone())],
                                     dispose: true,
+                                    // Terminal for the caller, so the task's
+                                    // own error handlers are exactly what
+                                    // should run.
+                                    error_links: true,
+                                    signature: self.config.signature_verification.as_ref(),
+                                    result_store: self.result_store.as_ref(),
                                 },
                             )
                             .await;
@@ -1536,6 +1761,9 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                                         failure_type: "circuit_breaker",
                                         extra_metadata: vec![("task_name", task_name.clone())],
                                         dispose: true,
+                                        error_links: true,
+                                        signature: self.config.signature_verification.as_ref(),
+                                        result_store: self.result_store.as_ref(),
                                     },
                                 )
                                 .await;
@@ -1741,6 +1969,10 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
                             ),
                             retry_config: retry_config.clone(),
                             max_result_size_bytes: self.config.max_result_size_bytes,
+                            signature: self.config.signature_verification.clone(),
+                            result_store: self.result_store.clone(),
+                            #[cfg(feature = "workflows")]
+                            chord_backend: self.chord_backend.clone(),
                         };
 
                         in_flight.register(task_id, receipt_handle, &dispatch.task);

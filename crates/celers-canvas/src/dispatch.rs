@@ -13,15 +13,21 @@
 //!
 //! ```json
 //! {
-//!   "args":   [ ... ],
-//!   "kwargs": { ... },
-//!   "chain":  [ <ChainStep>, <ChainStep>, ... ]
+//!   "args":    [ ... ],
+//!   "kwargs":  { ... },
+//!   "chain":   [ <ChainStep>, <ChainStep>, ... ],
+//!   "errback": [ <ChainStep>, <ChainStep>, ... ],
+//!   "ignore_errors": true,
+//!   "retry_policy": {"delay": 2, "backoff": 2.0, "max_delay": 3600}
 //! }
 //! ```
 //!
 //! `args`/`kwargs` are the task's own arguments. `chain` is present only when
 //! the task is a non-final step of a chain and carries the **entire remaining
-//! tail** as serialized [`ChainStep`]s.
+//! tail** as serialized [`ChainStep`]s. The last three keys are the failure
+//! half of the same contract — the task's error route, its failure-suppression
+//! flag and its own retry backoff — and are present only when declared; see
+//! [`ERROR_ROUTE_KEY`], [`IGNORE_ERRORS_KEY`] and [`RETRY_POLICY_KEY`].
 //!
 //! Carrying the whole tail is deliberate:
 //! [`TaskMetadata::on_success_link`](celers_core::TaskMetadata::on_success_link)
@@ -48,6 +54,39 @@ use uuid::Uuid;
 /// The worker (`celers-worker`'s `workflows` module) reads the same key; the
 /// two constants are the contract between producer and consumer.
 pub const CHAIN_TAIL_KEY: &str = "chain";
+
+/// JSON key under which a task's **failure** route travels in the payload.
+///
+/// The value has exactly the same shape as [`CHAIN_TAIL_KEY`] — a JSON array of
+/// [`ChainStep`] — and is consumed by the worker's terminal-failure path
+/// instead of its success path. The head runs when the task fails for good
+/// (retries exhausted, or no retry budget at all), receiving a JSON error
+/// descriptor as its argument, and the remaining entries ride along as *its*
+/// chain tail so a multi-step error route runs in order.
+///
+/// A name-only field on the metadata (the shape
+/// [`TaskMetadata::on_success_link`](celers_core::TaskMetadata::on_success_link)
+/// uses) is not enough here for the same reason it was not enough for the
+/// success path: a fallback handler needs its own arguments, and a saga's
+/// rollback is a *sequence* of compensations, not one task.
+pub const ERROR_ROUTE_KEY: &str = "errback";
+
+/// JSON key carrying [`TaskOptions::ignore_errors`] to the worker.
+pub const IGNORE_ERRORS_KEY: &str = "ignore_errors";
+
+/// JSON key carrying a task's own retry backoff policy to the worker.
+///
+/// Without it the worker can only apply *its* configured [`RetryConfig`]
+/// (`celers_worker::RetryConfig`) to every task alike, so a signature built
+/// with [`Signature::with_retry_delay`]/[`Signature::with_retry_backoff`] would
+/// have those values dropped on the floor. The value is an object:
+///
+/// ```json
+/// {"delay": 2, "backoff": 2.0, "max_delay": 3600, "jitter": true}
+/// ```
+///
+/// with `delay` in seconds; every field is optional.
+pub const RETRY_POLICY_KEY: &str = "retry_policy";
 
 /// Upper bound (in seconds) for a generated dispatch countdown: 30 days.
 ///
@@ -183,10 +222,69 @@ impl Schedule {
     }
 }
 
+/// The failure route declared by a signature, as chain steps.
+///
+/// [`TaskOptions::link_error`] (the single-callback field) comes first,
+/// followed by [`TaskOptions::link_errors`] in declaration order. In CeleRS the
+/// entries form a **sequential** error route rather than N independent
+/// callbacks: each one receives its predecessor's result, which is what makes a
+/// saga's rollback — compensate step 3, then 2, then 1 — expressible at all.
+#[must_use]
+pub fn error_route(sig: &Signature) -> Vec<ChainStep> {
+    sig.options
+        .all_link_errors()
+        .into_iter()
+        .cloned()
+        .map(ChainStep::Task)
+        .collect()
+}
+
+/// The per-task retry policy a signature declares, as a JSON object, or `None`
+/// when it declares none.
+fn retry_policy_value(options: &TaskOptions) -> Option<serde_json::Value> {
+    let TaskOptions {
+        retry_delay,
+        retry_backoff,
+        retry_backoff_max,
+        retry_jitter,
+        ..
+    } = options;
+
+    if retry_delay.is_none()
+        && retry_backoff.is_none()
+        && retry_backoff_max.is_none()
+        && retry_jitter.is_none()
+    {
+        return None;
+    }
+
+    let mut policy = serde_json::Map::with_capacity(4);
+    if let Some(delay) = retry_delay {
+        policy.insert("delay".to_string(), serde_json::Value::from(*delay));
+    }
+    if let Some(backoff) = retry_backoff {
+        policy.insert("backoff".to_string(), serde_json::Value::from(*backoff));
+    }
+    if let Some(max_delay) = retry_backoff_max {
+        policy.insert("max_delay".to_string(), serde_json::Value::from(*max_delay));
+    }
+    if let Some(jitter) = retry_jitter {
+        policy.insert("jitter".to_string(), serde_json::Value::from(*jitter));
+    }
+
+    Some(serde_json::Value::Object(policy))
+}
+
 /// Build the JSON payload envelope for `sig`, embedding `chain_tail` when the
 /// signature is a non-final chain step.
+///
+/// Besides `args`/`kwargs`/[`CHAIN_TAIL_KEY`] the envelope carries everything
+/// the worker needs that [`celers_core::TaskMetadata`] has no field for: the
+/// failure route ([`ERROR_ROUTE_KEY`]), the failure-suppression flag
+/// ([`IGNORE_ERRORS_KEY`]) and the task's own retry backoff policy
+/// ([`RETRY_POLICY_KEY`]).
 fn build_payload(sig: &Signature, chain_tail: &[ChainStep]) -> Result<Vec<u8>, CanvasError> {
-    let mut envelope = serde_json::Map::with_capacity(3);
+    let mut envelope = serde_json::Map::with_capacity(6);
     envelope.insert(
         "args".to_string(),
         serde_json::Value::Array(sig.args.clone()),
@@ -204,6 +302,23 @@ fn build_payload(sig: &Signature, chain_tail: &[ChainStep]) -> Result<Vec<u8>, C
         );
     }
 
+    let errbacks = error_route(sig);
+    if !errbacks.is_empty() {
+        envelope.insert(
+            ERROR_ROUTE_KEY.to_string(),
+            serde_json::to_value(&errbacks)
+                .map_err(|e| CanvasError::Serialization(e.to_string()))?,
+        );
+    }
+
+    if sig.options.ignore_errors {
+        envelope.insert(IGNORE_ERRORS_KEY.to_string(), serde_json::Value::Bool(true));
+    }
+
+    if let Some(policy) = retry_policy_value(&sig.options) {
+        envelope.insert(RETRY_POLICY_KEY.to_string(), policy);
+    }
+
     serde_json::to_vec(&serde_json::Value::Object(envelope))
         .map_err(|e| CanvasError::Serialization(e.to_string()))
 }
@@ -216,6 +331,10 @@ fn build_payload(sig: &Signature, chain_tail: &[ChainStep]) -> Result<Vec<u8>, C
 ///   is written into `metadata.on_success_link`.
 /// * `priority`, `time_limit`/`soft_time_limit` and `max_retries` are copied
 ///   onto the metadata.
+/// * an explicit [`TaskOptions::task_id`] becomes the message's id, so a caller
+///   that pre-assigned one (a chord barrier registering its members before they
+///   are dispatched) can actually correlate the result.
+/// * [`TaskOptions::chord_id`] becomes the message's `chord_id`.
 ///
 /// Scheduling (`countdown`/`eta`) is *not* applied here — it selects the
 /// enqueue variant and is handled by [`dispatch`] / [`dispatch_all`].
@@ -225,6 +344,18 @@ pub fn build_task(
 ) -> Result<SerializedTask, CanvasError> {
     let payload = build_payload(sig, chain_tail)?;
     let mut task = SerializedTask::new(sig.task.clone(), payload);
+
+    // A pre-assigned id is the only way a caller can know a task's identity
+    // *before* it is enqueued; a chord registers its barrier against exactly
+    // those ids. Ignoring `with_task_id` (as this used to) left the barrier
+    // watching ids that no message would ever carry.
+    if let Some(task_id) = sig.options.task_id {
+        task.metadata.id = task_id;
+    }
+
+    if let Some(chord_id) = sig.options.chord_id {
+        task.metadata.chord_id = Some(chord_id);
+    }
 
     if let Some(priority) = sig.options.priority {
         task = task.with_priority(priority.into());
@@ -401,7 +532,12 @@ pub fn build_fanout(
     for sig in signatures {
         let mut task = build_task(sig, &[])?;
         task.metadata.group_id = group_id;
-        task.metadata.chord_id = chord_id;
+        // `build_task` may already have stamped a chord id from the signature's
+        // own options; the fan-out's chord id wins when there is one, but a
+        // `None` here must not erase it.
+        if chord_id.is_some() {
+            task.metadata.chord_id = chord_id;
+        }
         built.push((task, Schedule::from_options(&sig.options)));
     }
 
@@ -780,6 +916,95 @@ mod tests {
         assert_eq!(
             ids, expected_ids,
             "returned ids must preserve the caller's original order across chunks"
+        );
+    }
+    #[test]
+    fn build_task_embeds_the_error_route_as_chain_steps() {
+        // A failure route is *not* a chain tail: it must travel in its own key,
+        // or a fallback handler becomes a following step and runs on success.
+        let sig = Signature::new("primary".to_string())
+            .with_link_error(Signature::new("fallback".to_string()))
+            .add_link_error(Signature::new("notify".to_string()));
+
+        let task = build_task(&sig, &[]).expect("build");
+        let payload = payload_json(&task);
+
+        assert!(
+            payload.get(CHAIN_TAIL_KEY).is_none(),
+            "an error handler must never appear in the success tail"
+        );
+        let route = payload[ERROR_ROUTE_KEY]
+            .as_array()
+            .expect("the error route is a JSON array");
+        assert_eq!(route.len(), 2);
+        assert_eq!(route[0]["step_type"], "task");
+        assert_eq!(route[0]["task"], "fallback");
+        assert_eq!(
+            route[1]["task"], "notify",
+            "`link_error` comes first, then `link_errors` in declaration order"
+        );
+        assert!(
+            task.metadata.on_success_link.is_none(),
+            "an error handler is not a success link"
+        );
+    }
+
+    #[test]
+    fn build_task_omits_the_failure_keys_when_nothing_is_declared() {
+        let task = build_task(&Signature::new("plain".to_string()), &[]).expect("build");
+        let payload = payload_json(&task);
+
+        assert!(payload.get(ERROR_ROUTE_KEY).is_none());
+        assert!(payload.get(IGNORE_ERRORS_KEY).is_none());
+        assert!(payload.get(RETRY_POLICY_KEY).is_none());
+    }
+
+    #[test]
+    fn build_task_carries_ignore_errors_and_the_retry_policy() {
+        let sig = Signature::new("flaky".to_string())
+            .ignoring_errors()
+            .with_retry_delay(2)
+            .with_retry_backoff(2.0)
+            .with_retry_backoff_max(60);
+
+        let payload = payload_json(&build_task(&sig, &[]).expect("build"));
+
+        assert_eq!(payload[IGNORE_ERRORS_KEY], serde_json::json!(true));
+        assert_eq!(payload[RETRY_POLICY_KEY]["delay"], serde_json::json!(2));
+        assert_eq!(payload[RETRY_POLICY_KEY]["backoff"], serde_json::json!(2.0));
+        assert_eq!(
+            payload[RETRY_POLICY_KEY]["max_delay"],
+            serde_json::json!(60)
+        );
+    }
+
+    #[test]
+    fn build_task_honours_a_pre_assigned_id_and_chord_id() {
+        // A barrier registered before dispatch can only recognise its members
+        // if the ids it recorded are the ones the messages carry.
+        let task_id = Uuid::new_v4();
+        let chord_id = Uuid::new_v4();
+        let sig = Signature::new("member".to_string())
+            .with_task_id(task_id)
+            .with_chord_id(chord_id);
+
+        let task = build_task(&sig, &[]).expect("build");
+
+        assert_eq!(task.metadata.id, task_id);
+        assert_eq!(task.metadata.chord_id, Some(chord_id));
+    }
+
+    #[test]
+    fn build_fanout_does_not_erase_a_signature_chord_id() {
+        let chord_id = Uuid::new_v4();
+        let signatures = vec![Signature::new("member".to_string()).with_chord_id(chord_id)];
+
+        let built = build_fanout(&signatures, Some(Uuid::new_v4()), None).expect("build");
+
+        assert_eq!(
+            built[0].0.metadata.chord_id,
+            Some(chord_id),
+            "a plain fan-out must not clear a chord id the signature set itself"
         );
     }
 }

@@ -41,6 +41,12 @@ celers-core = { workspace = true, optional = true }
 
 [features]
 amqp-events = ["dep:celers-core"]
+# Opt-in, off by default: adds the OS trust store to the webpki roots the
+# workspace-level `lapin` declaration selects. Needed when RabbitMQ presents a
+# certificate signed by a private/corporate CA. `rustls-native-certs` is Pure
+# Rust (it reads the platform's certificate files), so this does not
+# reintroduce an FFI crypto provider.
+tls-native-certs = ["lapin/rustls-native-certs"]
 
 [dev-dependencies]
 celers-core = { workspace = true }

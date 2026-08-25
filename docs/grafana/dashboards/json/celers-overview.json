@@ -1,0 +1,72 @@
+{
+  "id": null,
+  "uid": "celers-overview",
+  "title": "CeleRS Overview",
+  "description": "Minimal overview built from the metric names celers-metrics actually registers (see crates/celers-metrics/README.md and crates/celers-metrics/src/prometheus_metrics.rs). Only populates once a worker binary that starts a metrics exporter is scraped -- see docs/prometheus.yml.",
+  "tags": ["celers"],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "datasource": null,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Task throughput",
+      "description": "celers_tasks_{enqueued,completed,failed,retried,cancelled}_total",
+      "datasource": null,
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": null, "expr": "sum(rate(celers_tasks_enqueued_total[5m]))", "legendFormat": "enqueued" },
+        { "refId": "B", "datasource": null, "expr": "sum(rate(celers_tasks_completed_total[5m]))", "legendFormat": "completed" },
+        { "refId": "C", "datasource": null, "expr": "sum(rate(celers_tasks_failed_total[5m]))", "legendFormat": "failed" },
+        { "refId": "D", "datasource": null, "expr": "sum(rate(celers_tasks_retried_total[5m]))", "legendFormat": "retried" },
+        { "refId": "E", "datasource": null, "expr": "sum(rate(celers_tasks_cancelled_total[5m]))", "legendFormat": "cancelled" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Queue depth",
+      "description": "celers_queue_size, celers_processing_queue_size, celers_dlq_size",
+      "datasource": null,
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": null, "expr": "celers_queue_size", "legendFormat": "queue" },
+        { "refId": "B", "datasource": null, "expr": "celers_processing_queue_size", "legendFormat": "processing" },
+        { "refId": "C", "datasource": null, "expr": "celers_dlq_size", "legendFormat": "dlq" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Active workers",
+      "description": "celers_active_workers",
+      "datasource": null,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": null, "expr": "celers_active_workers", "legendFormat": "workers" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Task execution latency (p50 / p95 / p99)",
+      "description": "histogram_quantile over celers_task_execution_seconds_bucket",
+      "datasource": null,
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": null, "expr": "histogram_quantile(0.50, sum(rate(celers_task_execution_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": null, "expr": "histogram_quantile(0.95, sum(rate(celers_task_execution_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": null, "expr": "histogram_quantile(0.99, sum(rate(celers_task_execution_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH celers 1  "celers 0.3.0" 
+.TH celers 1  "celers 0.3.1" 
 .SH NAME
 celers \- CeleRS \- Distributed task queue management CLI
 .SH SYNOPSIS
@@ -85,6 +85,12 @@ Run system health diagnostics
 celers\-worker\-mgmt(1)
 Worker management operations
 .TP
+celers\-inspect(1)
+Inspect running workers over the remote control channel
+.TP
+celers\-control(1)
+Send control commands to running workers
+.TP
 celers\-doctor(1)
 Automatic problem detection and diagnostics
 .TP
@@ -136,4 +142,4 @@ Print configured capacity/TTL for the Redis connection pool and `queue`/`worker`
 celers\-help(1)
 Print this message or the help of the given subcommand(s)
 .SH VERSION
-v0.3.0
+v0.3.1

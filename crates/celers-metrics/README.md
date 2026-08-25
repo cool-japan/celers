@@ -35,9 +35,9 @@ Production-ready Prometheus metrics for monitoring:
 
 ```toml
 [dependencies]
-celers-metrics = "0.1"
-celers-worker = { version = "0.1", features = ["metrics"] }
-celers-broker-redis = { version = "0.1", features = ["metrics"] }
+celers-metrics = "0.3"
+celers-worker = { version = "0.3", features = ["metrics"] }
+celers-broker-redis = { version = "0.3", features = ["metrics"] }
 ```
 
 ### Expose HTTP Endpoint

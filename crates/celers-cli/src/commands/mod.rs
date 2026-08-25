@@ -21,6 +21,7 @@
 //!
 //! ```no_run
 //! use celers_cli::commands;
+//! use celers_cli::commands::WorkerStartupOptions;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -32,7 +33,7 @@
 //!         4,
 //!         3,
 //!         300,
-//!         None,
+//!         &WorkerStartupOptions::default(),
 //!     ).await?;
 //!     Ok(())
 //! }
@@ -59,6 +60,7 @@ pub(crate) mod task;
 pub(crate) mod utils;
 pub mod wizard;
 mod worker;
+mod worker_demo_tasks;
 
 // Re-export all public functions to preserve the flat API
 
@@ -68,7 +70,7 @@ pub use control::{ping_workers, revoke_tasks, run_control, run_inspect, ControlO
 // Worker management
 pub use worker::{
     drain_worker, list_workers, pause_worker, resume_worker, scale_workers, start_worker,
-    stop_worker, worker_stats,
+    stop_worker, worker_stats, WorkerStartupOptions,
 };
 
 // Queue operations

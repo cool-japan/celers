@@ -31,7 +31,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yaml_ng = { workspace = true }
 uuid = { workspace = true }
 redis = { workspace = true }
 chrono = { workspace = true }
@@ -52,6 +52,11 @@ oxiarc-archive = { workspace = true }
 dialoguer = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
+# Lets `commands::worker`'s built-in demo tasks (`--demo-tasks`) and the
+# integration tests write `#[async_trait] impl Task` as a plain `async fn`
+# instead of hand-desugaring the boxed-future signature. Promoted from
+# dev-dependencies (test-only) because the demo tasks are production code.
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -351,8 +351,19 @@ impl fmt::Display for AffinityConfig {
     }
 }
 
-/// Apply CPU affinity to the current thread
-#[cfg(target_os = "linux")]
+/// The single message both accessors report when real pinning is not
+/// compiled in, so callers can match on one string rather than two.
+pub const UNSUPPORTED: &str = "CPU affinity is not supported on this platform";
+
+/// Apply CPU affinity to the current thread.
+///
+/// Real pinning needs `sched_setaffinity(2)` through `libc`, so it is
+/// compiled only on Linux *and* only with this crate's off-by-default
+/// `cpu-affinity` feature. In every other configuration this returns
+/// `Err("CPU affinity is not supported on this platform")` — the same
+/// honest failure callers already get on macOS or Windows — rather than
+/// silently reporting success for a pin that never happened.
+#[cfg(all(target_os = "linux", feature = "cpu-affinity"))]
 pub fn set_thread_affinity(cores: &[usize]) -> Result<(), String> {
     use std::mem;
 
@@ -389,14 +400,18 @@ pub fn set_thread_affinity(cores: &[usize]) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// See the Linux implementation above for why this is a hard `Err`.
+#[cfg(not(all(target_os = "linux", feature = "cpu-affinity")))]
 pub fn set_thread_affinity(_cores: &[usize]) -> Result<(), String> {
-    // CPU affinity is not supported on this platform
-    Err("CPU affinity is not supported on this platform".to_string())
+    // Either the target has no sched_setaffinity, or the `cpu-affinity`
+    // feature that compiles the libc call in is off.
+    Err(UNSUPPORTED.to_string())
 }
 
-/// Get the current thread's CPU affinity
-#[cfg(target_os = "linux")]
+/// Get the current thread's CPU affinity.
+///
+/// Gated exactly like [`set_thread_affinity`]; see its documentation.
+#[cfg(all(target_os = "linux", feature = "cpu-affinity"))]
 pub fn get_thread_affinity() -> Result<Vec<usize>, String> {
     use std::mem;
 
@@ -427,9 +442,10 @@ pub fn get_thread_affinity() -> Result<Vec<usize>, String> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// See the Linux implementation above for why this is a hard `Err`.
+#[cfg(not(all(target_os = "linux", feature = "cpu-affinity")))]
 pub fn get_thread_affinity() -> Result<Vec<usize>, String> {
-    Err("CPU affinity is not supported on this platform".to_string())
+    Err(UNSUPPORTED.to_string())
 }
 
 #[cfg(test)]

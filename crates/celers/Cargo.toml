@@ -28,8 +28,8 @@ celers-broker-sqs = { workspace = true, optional = true }
 
 # Optional backend implementations
 celers-backend-redis = { workspace = true, optional = true }
-celers-backend-db = { path = "../celers-backend-db", version = "0.3.1", optional = true }
-celers-backend-rpc = { path = "../celers-backend-rpc", version = "0.3.1", optional = true }
+celers-backend-db = { workspace = true, optional = true }
+celers-backend-rpc = { workspace = true, optional = true }
 
 # Optional beat scheduler
 celers-beat = { workspace = true, optional = true }
@@ -70,7 +70,13 @@ amqp = ["celers-broker-amqp"]
 sqs = ["celers-broker-sqs"]
 
 # Backend features
-backend-redis = ["celers-backend-redis"]
+#
+# `celers-canvas/backend-redis` must be forwarded here: without it the canvas
+# crate compiles the always-`Err` 1-argument `Chord::apply(&broker)` stub, so
+# there would be no feature combination of this facade in which
+# `celers::chord(..)` can actually run. Enabling it swaps in the real
+# barrier-synchronised `Chord::apply(&broker, &mut backend)`.
+backend-redis = ["celers-backend-redis", "celers-canvas/backend-redis"]
 backend-db = ["celers-backend-db"]
 backend-rpc = ["celers-backend-rpc"]
 

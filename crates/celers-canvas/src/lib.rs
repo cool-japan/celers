@@ -117,4 +117,7 @@ mod tests_basic;
 mod tests_advanced;
 
 #[cfg(test)]
+mod tests_patterns;
+
+#[cfg(test)]
 mod tests_nested;

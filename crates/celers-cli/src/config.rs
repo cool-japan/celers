@@ -565,7 +565,7 @@ impl Config {
     pub fn from_str_with_format(content: &str, format: ConfigFormat) -> anyhow::Result<Self> {
         let config = match format {
             ConfigFormat::Toml => toml::from_str(content)?,
-            ConfigFormat::Yaml => serde_yaml::from_str(content)?,
+            ConfigFormat::Yaml => serde_yaml_ng::from_str(content)?,
         };
         Ok(config)
     }
@@ -574,7 +574,7 @@ impl Config {
     pub fn to_string_with_format(&self, format: ConfigFormat) -> anyhow::Result<String> {
         let content = match format {
             ConfigFormat::Toml => toml::to_string_pretty(self)?,
-            ConfigFormat::Yaml => serde_yaml::to_string(self)?,
+            ConfigFormat::Yaml => serde_yaml_ng::to_string(self)?,
         };
         Ok(content)
     }
@@ -706,9 +706,35 @@ impl Config {
         self
     }
 
-    /// Validate configuration settings
+    /// Validate configuration settings.
+    ///
+    /// # Errors
+    ///
+    /// Most problems this method finds are advisory and land in the returned
+    /// `Vec<String>` of warnings. `broker.url` is the exception (idx
+    /// prod-gaps-11): an empty URL or one with no `scheme://` separator is
+    /// not "a broker of an unexpected kind" -- it cannot be connected with at
+    /// all -- so it is a hard `Err` rather than a warning, and callers such
+    /// as `celers validate` propagate it as a failing exit code instead of
+    /// printing it alongside the advisory warnings. An unrecognized-but-well-
+    /// formed scheme, or one that disagrees with `broker.type`, still only
+    /// warns; see [`crate::config_validation`].
     pub fn validate(&self) -> anyhow::Result<Vec<String>> {
         let mut warnings = Vec::new();
+
+        // Broker URL (idx prod-gaps-11): hard-error on a URL that cannot
+        // possibly be connected with, then fold the softer checks in as
+        // warnings alongside everything else below.
+        crate::config_validation::require_well_formed(&self.broker.url)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(warning) = crate::config_validation::scheme_warning(&self.broker.url) {
+            warnings.push(warning);
+        }
+        for failover_url in &self.broker.failover_urls {
+            if let Some(warning) = crate::config_validation::scheme_warning(failover_url) {
+                warnings.push(format!("failover_urls: {warning}"));
+            }
+        }
 
         // Validate broker type
         let valid_broker_types = [
@@ -720,12 +746,23 @@ impl Config {
             "rabbitmq",
             "sqs",
         ];
-        if !valid_broker_types.contains(&self.broker.broker_type.to_lowercase().as_str()) {
+        let broker_type_known =
+            valid_broker_types.contains(&self.broker.broker_type.to_lowercase().as_str());
+        if !broker_type_known {
             warnings.push(format!(
                 "Unknown broker type '{}'. Supported types: {}",
                 self.broker.broker_type,
                 valid_broker_types.join(", ")
             ));
+        } else if let Some(warning) = crate::config_validation::scheme_broker_type_mismatch(
+            &self.broker.url,
+            &self.broker.broker_type,
+        ) {
+            // Only checked when broker_type is itself recognized -- an
+            // already-unknown broker_type gets its own warning above, and a
+            // second one about the scheme disagreeing with it would be
+            // redundant noise on top.
+            warnings.push(warning);
         }
 
         // Validate queue mode
@@ -1271,6 +1308,104 @@ default_timeout_secs = 600
 
         let warnings = config.validate().unwrap();
         assert_eq!(warnings.len(), 4);
+    }
+
+    /// Regression test for prod-gaps-11: an empty `broker.url` must hard-fail
+    /// `validate()` rather than passing clean or merely warning.
+    #[test]
+    fn test_config_validation_rejects_empty_broker_url() {
+        let mut config = Config::default_config();
+        config.broker.url = String::new();
+        let err = config
+            .validate()
+            .expect_err("an empty broker.url must be a hard error");
+        assert!(err.to_string().contains("invalid broker url"));
+    }
+
+    /// Regression test for prod-gaps-11: a `broker.url` with no `scheme://`
+    /// separator (e.g. a missing colon) must hard-fail, matching
+    /// `celers_cli::errors::classify_anyhow`'s `E_BAD_BROKER_URL` bucket.
+    #[test]
+    fn test_config_validation_rejects_malformed_broker_url() {
+        let mut config = Config::default_config();
+        config.broker.url = "redis//localhost:6379".to_string();
+        let err = config
+            .validate()
+            .expect_err("a url missing '://' must be a hard error");
+        let classified = crate::errors::classify_anyhow(&err);
+        assert_eq!(classified.code(), "E_BAD_BROKER_URL");
+    }
+
+    /// An unrecognized-but-well-formed scheme is a warning, not a hard
+    /// error: a broker backend this build was not compiled with is still a
+    /// syntactically valid URL.
+    #[test]
+    fn test_config_validation_warns_on_unknown_broker_url_scheme() {
+        let mut config = Config::default_config();
+        config.broker.url = "ftp://localhost:21".to_string();
+        let warnings = config
+            .validate()
+            .expect("an unrecognized scheme must not hard-fail");
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("unsupported broker scheme")));
+    }
+
+    /// Regression test for prod-gaps-11's cross-check: `broker.type` and
+    /// `broker.url`'s scheme disagreeing (a `redis` type pointed at a
+    /// `postgres://` URL) must warn.
+    #[test]
+    fn test_config_validation_warns_on_scheme_broker_type_mismatch() {
+        let mut config = Config::default_config();
+        config.broker.broker_type = "redis".to_string();
+        config.broker.url = "postgres://localhost:5432/db".to_string();
+        let warnings = config.validate().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("does not match broker.type")));
+    }
+
+    /// The scheme/broker_type cross-check must stay silent when
+    /// `broker_type` is itself unrecognized -- that case already produces
+    /// its own "Unknown broker type" warning, and a second one about the
+    /// scheme disagreeing with an unrecognized type would just be noise.
+    #[test]
+    fn test_config_validation_skips_scheme_mismatch_when_broker_type_already_unknown() {
+        let mut config = Config::default_config();
+        config.broker.broker_type = "totally-unknown".to_string();
+        config.broker.url = "postgres://localhost:5432/db".to_string();
+        let warnings = config.validate().unwrap();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one warning (Unknown broker type), no redundant scheme-mismatch warning: {warnings:?}"
+        );
+        assert!(warnings[0].contains("Unknown broker type"));
+    }
+
+    /// A `redis`/`rediss` pair (and other same-family scheme variants) must
+    /// not be flagged as a mismatch against their shared `broker_type`.
+    #[test]
+    fn test_config_validation_accepts_tls_scheme_variant() {
+        let mut config = Config::default_config();
+        config.broker.broker_type = "redis".to_string();
+        config.broker.url = "rediss://localhost:6379".to_string();
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings.is_empty(),
+            "rediss:// must be accepted for broker_type 'redis': {warnings:?}"
+        );
+    }
+
+    /// Regression test for prod-gaps-11's optional extension: an unknown
+    /// scheme in `failover_urls` should warn the same way the primary
+    /// `broker.url` does.
+    #[test]
+    fn test_config_validation_warns_on_bad_failover_url_scheme() {
+        let mut config = Config::default_config();
+        config.broker.failover_urls = vec!["not-a-real-scheme://backup:6379".to_string()];
+        let warnings = config.validate().unwrap();
+        assert!(warnings.iter().any(|w| w.contains("failover_urls")));
     }
 
     #[test]

@@ -8,9 +8,10 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use celers_worker::gc_tuning::{GcTuner, GcConfig};
 //!
+//! # async fn example() {
 //! let config = GcConfig::default();
 //! let tuner = GcTuner::new(config);
 //!
@@ -18,13 +19,14 @@
 //! tuner.record_allocation(1024);
 //!
 //! // Check if GC is recommended
-//! if tuner.should_gc() {
+//! if tuner.should_gc().await {
 //!     println!("High memory pressure detected, consider triggering GC");
 //! }
 //!
 //! // Get statistics
-//! let stats = tuner.get_stats();
+//! let stats = tuner.get_stats().await;
 //! println!("Total allocated: {} bytes", stats.total_allocated);
+//! # }
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};

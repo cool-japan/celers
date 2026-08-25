@@ -11,6 +11,11 @@ keywords = ["celery", "task-queue", "distributed", "async", "traits"]
 categories = ["asynchronous", "network-programming"]
 
 [dependencies]
+# The Celery wire model. celers-protocol depends on no celers crate (serde,
+# uuid, chrono, base64 and optional codecs only), so this is not a cycle — it
+# is what lets `event::Event <-> celers_protocol::event::EventMessage` be a
+# typed conversion instead of a JSON round trip through string keys.
+celers-protocol = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,6 +27,23 @@ tracing = { workspace = true }
 regex = { workspace = true }
 rand = { workspace = true }
 num_cpus = { workspace = true }
+
+# Result compression codecs (Pure Rust; see src/result/compression.rs).
+# Optional, but on by default: a `ResultCompressor` with nothing but the
+# identity codec registered is a type whose every real operation fails, which
+# is what these two dependencies exist to fix.
+oxiarc-deflate = { workspace = true, optional = true }  # gzip + zlib
+oxiarc-zstd = { workspace = true, optional = true }     # Zstandard
+
+[features]
+default = ["compression"]
+
+# All result-compression codecs this crate can register.
+compression = ["compression-deflate", "compression-zstd"]
+# gzip (RFC 1952) and zlib (RFC 1950), both DEFLATE-based.
+compression-deflate = ["dep:oxiarc-deflate"]
+# Zstandard (RFC 8878).
+compression-zstd = ["dep:oxiarc-zstd"]
 
 [dev-dependencies]
 criterion = { workspace = true }

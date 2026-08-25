@@ -125,6 +125,42 @@ impl Signature {
         self
     }
 
+    /// Suppress this task's failures instead of propagating them.
+    ///
+    /// See [`TaskOptions::ignore_errors`] for the exact runtime semantics: no
+    /// retry, no dead-letter, an *ignored* result, and the surrounding workflow
+    /// carries on.
+    ///
+    /// # Example
+    /// ```
+    /// use celers_canvas::Signature;
+    ///
+    /// let sig = Signature::new("log_analytics".to_string()).ignoring_errors();
+    /// assert!(sig.options.ignore_errors);
+    /// ```
+    #[must_use]
+    pub fn ignoring_errors(mut self) -> Self {
+        self.options.ignore_errors = true;
+        self
+    }
+
+    /// Set (or clear) the failure-suppression flag explicitly.
+    #[must_use]
+    pub fn with_ignore_errors(mut self, ignore: bool) -> Self {
+        self.options.ignore_errors = ignore;
+        self
+    }
+
+    /// Stamp this task with the chord barrier it completes.
+    ///
+    /// See [`TaskOptions::chord_id`]: used to make a chord member a whole
+    /// chain, by tagging only that chain's final step.
+    #[must_use]
+    pub fn with_chord_id(mut self, chord_id: Uuid) -> Self {
+        self.options.chord_id = Some(chord_id);
+        self
+    }
+
     pub fn immutable(mut self) -> Self {
         self.immutable = true;
         self
@@ -688,6 +724,46 @@ pub struct TaskOptions {
     /// Whether to add jitter to retry delays
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_jitter: Option<bool>,
+
+    /// Suppress this task's failures instead of propagating them.
+    ///
+    /// A task dispatched with this flag is never retried and never
+    /// dead-lettered when its handler returns an error: the worker records the
+    /// failure as an *ignored* result
+    /// ([`TaskResultValue::Ignored`](celers_core::TaskResultValue::Ignored)),
+    /// acknowledges the message and — crucially — **continues the workflow**,
+    /// handing the successor a `null` result. It exists for the non-critical
+    /// step (analytics, a best-effort notification) whose failure must not stop
+    /// the chain around it.
+    ///
+    /// The flag covers what happens when the worker *runs* the task — a handler
+    /// error, a panic, a time limit, an oversized result. It does not cover the
+    /// worker declining to run it (an open circuit, a poison-pill quarantine, a
+    /// failed signature check, a revocation): those record an ordinary
+    /// [`Failure`](celers_core::TaskResultValue::Failure), because they are
+    /// decisions about the fleet or about the message rather than about this
+    /// task's outcome.
+    ///
+    /// It travels in the dispatch payload under the `ignore_errors` key, so the
+    /// worker can honour it without a metadata field of its own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignore_errors: bool,
+
+    /// Chord barrier this task belongs to.
+    ///
+    /// Normally stamped by [`Chord`](crate::Chord)'s own dispatch, which knows
+    /// the barrier it just registered. Setting it on a *signature* is what lets
+    /// a chord's member be a whole [`Chain`](crate::Chain) rather than a single
+    /// task: only the chain's final step carries the chord id, so the barrier
+    /// counts once per member — when that member has actually finished — rather
+    /// than once per task in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chord_id: Option<Uuid>,
+}
+
+/// Helper for serde `skip_serializing_if` on plain `bool` fields.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl TaskOptions {

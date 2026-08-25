@@ -397,7 +397,7 @@ Verified against `Cargo.toml` 2026-07-13. Note: `ratatui`/`crossterm`/`reqwest` 
 - `anyhow`: Error handling
 - `thiserror`: Structured `CliError` codes (`errors.rs`)
 - `tracing` / `tracing-subscriber`: Structured logging (`logging.rs`)
-- `serde` / `serde_json` / `serde_yaml`: Config, task, and report (de)serialization
+- `serde` / `serde_json` / `serde_yaml_ng`: Config, task, and report (de)serialization
 - `uuid`: Task ID parsing
 - `redis`: Direct Redis operations for queue management
 - `chrono`: Timestamps

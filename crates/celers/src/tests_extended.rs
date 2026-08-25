@@ -266,16 +266,24 @@ fn test_error_recovery_with_fallback() {
     use crate::error_recovery::with_fallback;
     use serde_json::json;
 
-    let chain = with_fallback(
+    let task = with_fallback(
         "primary_task",
         vec![json!(1)],
         "fallback_task",
         vec![json!(2)],
     );
 
-    assert_eq!(chain.tasks.len(), 2);
-    assert_eq!(chain.tasks[0].task, "primary_task");
-    assert_eq!(chain.tasks[1].task, "fallback_task");
+    // The fallback is a *failure* callback, not a following step: chaining it
+    // with `.then()` (which is what this used to do) ran the backup API on
+    // every successful call.
+    assert_eq!(task.task, "primary_task");
+    assert_eq!(task.args, vec![json!(1)]);
+    let handlers = task.options.all_link_errors();
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].task, "fallback_task");
+    assert_eq!(handlers[0].args, vec![json!(2)]);
+    // Nothing runs after the primary on success.
+    assert!(!task.options.has_link());
 }
 
 #[test]
@@ -286,8 +294,10 @@ fn test_error_recovery_ignore_errors() {
     let sig = ignore_errors("non_critical_task", vec![json!(1)]);
 
     assert_eq!(sig.task, "non_critical_task");
+    // The flag the worker actually honours: no retry, no dead-letter, an
+    // `Ignored` result, and the workflow carries on.
+    assert!(sig.options.ignore_errors);
     assert_eq!(sig.options.max_retries, Some(0));
-    // Error suppression logic would be implemented in task handler
 }
 
 #[test]
@@ -299,7 +309,14 @@ fn test_error_recovery_exponential_backoff() {
 
     assert_eq!(sig.task, "flaky_task");
     assert_eq!(sig.options.max_retries, Some(5));
-    assert_eq!(sig.options.countdown, Some(2));
+    // A growing schedule, not one fixed countdown.
+    assert_eq!(sig.options.retry_delay, Some(2));
+    assert_eq!(sig.options.retry_backoff, Some(2.0));
+    assert_eq!(sig.options.countdown, None);
+    let schedule: Vec<u64> = (0..5)
+        .map(|n| sig.options.calculate_retry_delay(n))
+        .collect();
+    assert_eq!(schedule, vec![2, 4, 8, 16, 32]);
 }
 
 #[test]
@@ -307,11 +324,15 @@ fn test_error_recovery_with_dlq() {
     use crate::error_recovery::with_dlq;
     use serde_json::json;
 
-    let chain = with_dlq("risky_task", vec![json!(1)], "dlq_handler");
+    let task = with_dlq("risky_task", vec![json!(1)], "dlq_handler");
 
-    assert_eq!(chain.tasks.len(), 2);
-    assert_eq!(chain.tasks[0].task, "risky_task");
-    assert_eq!(chain.tasks[1].task, "dlq_handler");
+    // The DLQ handler runs on failure only; appending it to a chain fired it
+    // on every success.
+    assert_eq!(task.task, "risky_task");
+    let handlers = task.options.all_link_errors();
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].task, "dlq_handler");
+    assert!(!task.options.has_link());
 }
 
 // Tests for workflow validation
@@ -470,10 +491,24 @@ fn test_advanced_patterns_module_available() {
     // Verify advanced patterns module is accessible
     use crate::advanced_patterns::*;
 
-    // Test conditional workflow helper
+    // Test conditional workflow helper: a real branch, not a chain that runs
+    // the success task unconditionally and drops the failure task.
     let workflow =
         create_conditional_workflow("check", vec![], "success", vec![], "failure", vec![]);
-    assert!(!workflow.tasks.is_empty());
+    assert_eq!(workflow.len(), 2);
+    assert!(matches!(
+        workflow.elements[0],
+        crate::CanvasElement::Signature(ref sig) if sig.task == "check"
+    ));
+    let crate::CanvasElement::Branch(ref branch) = workflow.elements[1] else {
+        panic!("the second element must be a branch");
+    };
+    assert_eq!(branch.then_branch.task, "success");
+    assert_eq!(
+        branch.else_branch.as_ref().map(|sig| sig.task.as_str()),
+        Some("failure")
+    );
+    assert!(workflow.validate().is_ok());
 }
 
 #[test]
@@ -524,6 +559,17 @@ fn test_advanced_patterns_saga_workflow() {
 
     let workflow = create_saga_workflow(steps);
     assert_eq!(workflow.tasks.len(), 2);
+
+    // Nothing has completed when the first step fails, so it compensates
+    // nothing; the second step rolls back the first.
+    assert!(workflow.tasks[0].options.all_link_errors().is_empty());
+    let rollback: Vec<&str> = workflow.tasks[1]
+        .options
+        .all_link_errors()
+        .iter()
+        .map(|sig| sig.task.as_str())
+        .collect();
+    assert_eq!(rollback, vec!["compensate1"]);
 }
 
 #[test]

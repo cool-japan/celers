@@ -216,7 +216,7 @@ mod config_roundtrip {
     /// An arbitrary Unicode string, bounded in length to keep proptest cases
     /// fast while still exercising quoting/escaping edge cases. Hand-checked
     /// before writing this suite (see package plan P7 notes) to confirm
-    /// `toml` 1.1.2 and `serde_yaml` 0.9 both correctly quote/escape control
+    /// `toml` 1.1.2 and `serde_yaml_ng` 0.9 both correctly quote/escape control
     /// characters, quotes, `#`/`[`/`]`, emoji, embedded NULs, and
     /// YAML/TOML-ambiguous plain scalars ("null", "true", "123", "~",
     /// ".inf", dates, ...) placed in `String`-typed fields, so no character

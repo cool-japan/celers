@@ -1241,12 +1241,7 @@ async fn is_connected_tracks_observed_health() {
     broker
         .queue_url_cache
         .insert("tasks".to_string(), "http://localhost/tasks".to_string());
-    broker.client = Some(aws_sdk_sqs::Client::from_conf(
-        aws_sdk_sqs::Config::builder()
-            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
-            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
-            .build(),
-    ));
+    broker.client = Some(crate::test_support::offline_sqs_client());
     assert!(broker.is_connected());
 
     // A credential/transport failure observed by any operation flips it.
@@ -1271,12 +1266,7 @@ async fn heartbeats_are_tracked_and_released() {
     assert_eq!(broker.heartbeat_max_extension_secs, 600);
     assert_eq!(broker.active_heartbeat_count(), 0);
 
-    let client = aws_sdk_sqs::Client::from_conf(
-        aws_sdk_sqs::Config::builder()
-            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
-            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
-            .build(),
-    );
+    let client = crate::test_support::offline_sqs_client();
     let tag = encode_delivery_tag("tasks", "AQEB");
     broker.maybe_start_heartbeat(&client, "http://localhost/tasks", &tag, "AQEB");
     assert_eq!(broker.active_heartbeat_count(), 1);
@@ -1288,12 +1278,7 @@ async fn heartbeats_are_tracked_and_released() {
 #[tokio::test]
 async fn heartbeats_are_not_started_when_disabled() {
     let mut broker = SqsBroker::new("tasks").await.unwrap();
-    let client = aws_sdk_sqs::Client::from_conf(
-        aws_sdk_sqs::Config::builder()
-            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
-            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
-            .build(),
-    );
+    let client = crate::test_support::offline_sqs_client();
 
     broker.maybe_start_heartbeat(&client, "http://localhost/tasks", "tag", "AQEB");
     assert_eq!(broker.active_heartbeat_count(), 0);

@@ -37,13 +37,19 @@ url = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 
 # `libc` is referenced exclusively from Unix-gated code: `sysinfo.rs`
-# (getrusage/sysctlbyname/getloadavg), `cpu_affinity.rs`
-# (sched_setaffinity/sched_getaffinity) and the `rlimit` bridge in
-# `sandbox.rs`. Declaring it per-target keeps it out of Windows and wasm
-# builds entirely instead of compiling and linking an FFI crate that nothing
-# on those targets can call.
+# (getrusage/sysctlbyname/getloadavg/sysconf), `cpu_affinity.rs`
+# (sched_setaffinity/sched_getaffinity), and the `rlimit` and seccomp-bpf
+# bridges in `sandbox.rs`. Declaring it per-target keeps it out of Windows and
+# wasm builds entirely instead of compiling and linking an FFI crate that
+# nothing on those targets can call.
+#
+# It is also `optional`: per the COOLJAPAN Pure-Rust policy the default build
+# of this crate names no FFI crate at all. Every call site sits behind an
+# off-by-default feature (`native-sysinfo`, `cpu-affinity`, `rlimit`,
+# `seccomp`) with a documented fallback, so turning them all off degrades
+# behaviour honestly instead of breaking the build.
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+libc = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -55,7 +61,40 @@ postgres = ["dep:oxisql-core", "dep:oxisql-postgres", "dep:oxitls", "dep:rustls"
 # Opt-in, off by default: lets `Sandbox::enforce_process_limits` apply real
 # `setrlimit` limits on Unix. Without it the sandbox reports the control as
 # unavailable rather than silently ignoring it.
-rlimit = []
+rlimit = ["dep:libc"]
+
+# Opt-in, off by default: the `libc`-backed platform metrics in `sysinfo.rs`
+# — `sysconf(_SC_CLK_TCK)` on Linux, and `getrusage`/`sysctlbyname`/
+# `getloadavg` on macOS and the BSDs. With it off, the pure-Rust `/proc`
+# readers still work on Linux (USER_HZ falls back to its kernel-fixed 100)
+# and every other platform returns the module's documented "unavailable"
+# sentinel (`0` / `None`) instead of a fabricated number.
+native-sysinfo = ["dep:libc"]
+# Alias kept because the audit trail names this gate `linux-sysinfo`. The
+# feature is named for its primary target but the gate covers *every* libc
+# call in `sysinfo.rs`, macOS and BSD included — hence the honest name above.
+linux-sysinfo = ["native-sysinfo"]
+
+# Opt-in, off by default: real `sched_setaffinity`/`sched_getaffinity` pinning
+# in `cpu_affinity.rs`. Linux-only in effect; with it off (or on any non-Linux
+# target) `set_thread_affinity`/`get_thread_affinity` return
+# `Err("CPU affinity is not supported ...")`, which is exactly what they
+# already do off Linux — no caller sees a new failure mode.
+cpu-affinity = ["dep:libc"]
+
+# Opt-in, off by default, Linux-only: seccomp-bpf syscall filtering for
+# `SandboxConfig::with_seccomp(true)`. Without it (and on every non-Linux
+# target) `Sandbox::new` rejects the request with `SandboxError::Unsupported`
+# rather than pretending the filter was applied.
+#
+# NOTE: the filter is installed PROCESS-WIDE and is irreversible — seccomp has
+# no per-task granularity, and tasks here are in-process futures sharing the
+# runtime's threads. It is therefore a deny-list of syscalls a worker never
+# makes (module loading, ptrace, mount/namespace manipulation, bpf, keyring,
+# reboot, ...) answered with `SECCOMP_RET_ERRNO(EPERM)` rather than a SIGSYS
+# kill, so a wrong entry degrades to an errno instead of killing the worker.
+# Off by default all the same: it changes the whole process, not one task.
+seccomp = ["dep:libc"]
 
 [dev-dependencies]
 # `test-util` provides tokio's mock clock (`pause`/`advance`), which is what

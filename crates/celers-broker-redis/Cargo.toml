@@ -32,6 +32,10 @@ oxihttp-client = { workspace = true }
 aes-gcm = { workspace = true }
 chacha20poly1305 = { workspace = true }
 twox-hash = { workspace = true }
+# Real SHA-256 for `ChecksumAlgorithm::Sha256` (integrity.rs); `hex` renders
+# the digest in the same lowercase form the other algorithms use.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -1028,6 +1028,18 @@ pub use celers_canvas::{
     Chain, Chord, Chunks, Group, Map, Signature, Starmap, TaskOptions, XMap, XStarmap,
 };
 
+// Re-export the conditional and nested canvas types.
+//
+// `advanced_patterns::create_conditional_workflow` returns a `NestedChain`
+// containing a `Branch`, and `create_parallel_chains` a `NestedGroup` of
+// `Chain`s — none of which a caller could name, match on or extend without
+// these. `Condition` is needed to write anything but a plain truthiness test,
+// and `CanvasError` is what every `apply` returns.
+pub use celers_canvas::{
+    Branch, CallbackArgMode, CanvasElement, CanvasError, Condition, NestedChain, NestedGroup,
+    Switch,
+};
+
 // Re-export macros
 pub use celers_macros::{task, Task};
 
@@ -1042,9 +1054,25 @@ pub use celers_macros::{task, Task};
 //
 // Re-exporting the crates here means a downstream consumer that imports
 // this crate's items with a glob (`use celers::*;`) — or reaches them via
-// `celers::celers_core::...` explicitly — brings `celers_core` (and its
-// macro-required friends) into scope as bare names too, so the macro
-// expansion resolves without requiring an extra direct dependency.
+// `celers::celers_core::...` explicitly — brings `celers_core` and
+// `async_trait` into scope as bare names too, so those two halves of the
+// macro expansion resolve without an extra direct dependency.
+//
+// `serde` is re-exported for symmetry but does NOT achieve that: the macro
+// names it in *derive* position (`#[derive(serde::Serialize, ...)]`), and a
+// glob import does not satisfy a derive path. A downstream crate must
+// declare `serde` (with its `derive` feature) itself. Observed, not
+// theorised — `crates/celers-facade-test` is a two-dependency crate that
+// reproduces it on demand:
+//
+//     error[E0463]: can't find crate for `serde`
+//       --> src/lib.rs:NN:1
+//        | #[celers::task]
+//        = note: this error originates in the derive macro `serde::Serialize`
+//
+// So the minimum downstream dependency set for `#[celers::task]` is
+// `celers` + `serde`, and the README quickstart says so.
+//
 // `#[doc(hidden)]` keeps them out of the crate's rendered docs, since they
 // are implementation plumbing for the macros rather than part of the
 // facade's own documented surface.

@@ -30,6 +30,7 @@ pub mod command_utils;
 pub mod commands;
 pub mod config;
 pub mod config_layer;
+pub mod config_validation;
 pub mod errors;
 pub mod interactive;
 pub mod keys;

@@ -790,6 +790,38 @@ mod tests {
     }
 
     #[test]
+    fn a_signature_survives_the_json_wire_every_broker_uses() {
+        // Every broker in this workspace enqueues with
+        // `serde_json::to_string(&task)` and decodes the same way, so the
+        // envelope has to survive a plain serde round trip or verification
+        // fails for every real deployment while passing in-process tests.
+        let signer = signer();
+        let mut task = SerializedTask::new("tasks.add".to_string(), br#"{"args":[2,3]}"#.to_vec());
+        task.metadata.on_success_link = Some("tasks.notify".to_string());
+        task.metadata.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        sign_task(&signer, &mut task, SigningOptions::default());
+
+        let wire = serde_json::to_string(&task).expect("serializes");
+        let decoded: SerializedTask = serde_json::from_str(&wire).expect("deserializes");
+
+        assert_eq!(decoded.metadata.signature, task.metadata.signature);
+        assert!(verify_task(&signer, &decoded, &SignaturePolicy::default()).is_ok());
+    }
+
+    #[test]
+    fn an_unsigned_message_stays_absent_on_the_wire() {
+        // `skip_serializing_if` keeps the field off the wire entirely, so a
+        // producer that never signs emits exactly the bytes it always did and
+        // an older consumer still parses them.
+        let task = SerializedTask::new("tasks.add".to_string(), br#"[1]"#.to_vec());
+        let wire = serde_json::to_string(&task).expect("serializes");
+        assert!(!wire.contains("signature"), "unexpected field in {wire}");
+
+        let decoded: SerializedTask = serde_json::from_str(&wire).expect("deserializes");
+        assert!(decoded.metadata.signature.is_none());
+    }
+
+    #[test]
     fn tampered_payload_is_rejected() {
         let signer = signer();
         let mut task = SerializedTask::new("tasks.add".to_string(), br#"[2,3]"#.to_vec());

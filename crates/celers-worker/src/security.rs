@@ -26,6 +26,54 @@
 //! the projection in [`celers_core::task_security::signed_fields`], so what the
 //! producer signed is exactly what the worker checks.
 //!
+//! ## Everything that enqueues must hold the key
+//!
+//! Turning verification on makes the signing key a *deployment-wide*
+//! requirement: every component that builds a **new** message must sign it, or
+//! that message is dead-lettered on arrival.
+//!
+//! * **Your application code**, wherever it enqueues — call
+//!   [`sign_task`](celers_core::task_security::sign_task) on the task
+//!   immediately before handing it to the broker. This is the one that matters.
+//! * **`celers-beat`** does *not* enqueue: it is a schedule engine with no
+//!   broker handle at all, so whatever your integration enqueues when a
+//!   schedule fires is application code and follows the rule above.
+//! * **`celers-cli`** moves existing messages rather than minting new ones —
+//!   `task retry` and `dlq replay` re-enqueue the stored bytes, so a signed
+//!   message stays signed and stays valid (`state` and `updated_at` are not
+//!   covered by the MAC). The exception is `loadtest`, which mints synthetic
+//!   unsigned tasks: a verifying worker will reject them.
+//!
+//! The worker signs its **own** enqueues automatically — retry attempts and
+//! workflow continuations (chain successors, `on_success_link` targets, chord
+//! callbacks) are freshly constructed messages, and it re-signs each one with
+//! [`SignatureVerification::sign`]. Without that, switching verification on
+//! would kill every retry and every chain at the first hop.
+//!
+//! ## Freshness, replay and redelivery
+//!
+//! [`SignatureVerification::with_freshness`] and
+//! [`SignatureVerification::with_replay_guard`] both reason about a message
+//! being seen *once*. CeleRS is an at-least-once system, so several paths hand
+//! the **same bytes** — same `signed_at`, same nonce — back to the broker:
+//!
+//! * an admission deferral (routing, affinity, feature flags, rate limiting)
+//!   requeues the delivery;
+//! * a graceful-shutdown drain requeues whatever was still in flight;
+//! * the broker redelivers after a lost worker or an expired visibility
+//!   timeout.
+//!
+//! On the next delivery a replay guard reports
+//! [`SignatureError::Replayed`] and a narrow freshness window reports
+//! [`SignatureError::Stale`], and the message is dead-lettered rather than run.
+//! **Retries are not affected** — the worker re-signs those with a fresh nonce.
+//!
+//! So: enable a replay guard only where those paths do not occur (no admission
+//! deferrals configured, an ack-on-delivery broker), or accept that a deferred
+//! or redelivered message lands in the DLQ. For everything else, prefer
+//! [`with_freshness`](SignatureVerification::with_freshness) with a window
+//! comfortably longer than your longest deferral and shutdown drain.
+//!
 //! # Payload hygiene
 //!
 //! Set [`WorkerConfig::payload_hygiene`](crate::WorkerConfig::payload_hygiene)
@@ -59,7 +107,7 @@
 //! # let _ = config;
 //! ```
 
-use celers_core::task_security::{verify_task, SignaturePolicy};
+use celers_core::task_security::{sign_task, verify_task, SignaturePolicy, SigningOptions};
 use celers_core::task_signature::{FreshnessWindow, ReplayGuard, SignatureError, TaskSigner};
 use celers_core::SerializedTask;
 
@@ -148,6 +196,28 @@ impl SignatureVerification {
     #[must_use]
     pub const fn policy(&self) -> &SignaturePolicy {
         &self.policy
+    }
+
+    /// Sign a task **this worker is enqueueing itself**.
+    ///
+    /// A verifying worker is also a key holder, and it is a producer: it
+    /// enqueues retry attempts and workflow continuations (chain successors,
+    /// `on_success_link` targets, chord callbacks). Those are freshly
+    /// constructed messages — they carry no signature of their own — so without
+    /// this the worker would enqueue a message and then reject its own
+    /// delivery of it, silently killing every retry and every workflow the
+    /// moment verification was switched on.
+    ///
+    /// A fresh `signed_at` and nonce are stamped each time
+    /// ([`SigningOptions::default`](celers_core::task_security::SigningOptions)),
+    /// so a re-signed retry is a *new* message as far as a
+    /// [`FreshnessWindow`] or a [`ReplayGuard`] is concerned rather than a
+    /// replay of the attempt it descends from.
+    ///
+    /// The worker calls this for itself; you only need it when you enqueue
+    /// tasks from your own code.
+    pub fn sign(&self, task: &mut SerializedTask) {
+        sign_task(&self.signer, task, SigningOptions::default());
     }
 
     /// Verify one received message.

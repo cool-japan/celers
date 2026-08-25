@@ -21,16 +21,18 @@ use async_trait::async_trait;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use celers_core::lock::DistributedLockBackend;
 ///
-/// async fn schedule_task(backend: &dyn DistributedLockBackend) {
-///     let acquired = backend.try_acquire("my_task", "scheduler-1", 300).await.unwrap();
-///     if acquired {
+/// // `dyn`-safe on purpose: a scheduler holds whichever backend it was
+/// // configured with, without being generic over it.
+/// async fn schedule_task(backend: &dyn DistributedLockBackend) -> celers_core::Result<()> {
+///     if backend.try_acquire("my_task", "scheduler-1", 300).await? {
 ///         // Execute the task
 ///         // ...
-///         backend.release("my_task", "scheduler-1").await.unwrap();
+///         backend.release("my_task", "scheduler-1").await?;
 ///     }
+///     Ok(())
 /// }
 /// ```
 #[async_trait]

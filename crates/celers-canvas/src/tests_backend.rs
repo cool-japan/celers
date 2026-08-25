@@ -95,10 +95,20 @@ impl ResultBackend for MockResultBackend {
     }
 
     async fn chord_get_state(&mut self, chord_id: Uuid) -> BackendResult<Option<ChordState>> {
+        // The completion count is kept apart from the registered state — as it
+        // is in `RedisResultBackend`, where it lives in its own key so it can be
+        // incremented atomically — and merged back in here. Without the merge
+        // `is_complete()`/`remaining()` would answer from the count the barrier
+        // was *registered* with (always zero) rather than the one it has
+        // reached, which is the very decision the worker makes on it.
         Ok(self
             .chords
             .iter()
             .find(|state| state.chord_id == chord_id)
-            .cloned())
+            .cloned()
+            .map(|mut state| {
+                state.completed = self.completed.get(&chord_id).copied().unwrap_or(0);
+                state
+            }))
     }
 }

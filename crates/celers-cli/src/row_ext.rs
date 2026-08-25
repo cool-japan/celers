@@ -77,6 +77,13 @@ impl RowExt for Row {
 ///     .collect::<Result<_, _>>()?;
 /// ```
 ///
+/// This stays `ignore` rather than a runnable doctest: `row_to!` is
+/// `pub(crate)` (see the export below), and a doctest compiles against this
+/// crate's public API only, so it cannot reach a crate-private macro no
+/// matter how it is fenced (`no_run` still requires the snippet to compile).
+/// Making it reachable would mean exporting a macro this crate's own call
+/// sites deliberately do not use — see the paragraph below.
+///
 /// This crate's own call sites map single-column probe results by hand
 /// (see [`RowExt::col`] usage in `commands/database.rs` and `database.rs`)
 /// rather than through this macro, since none of them decode into a
@@ -109,9 +116,19 @@ pub(crate) use row_to;
 ///
 /// # Example
 ///
-/// ```ignore
+/// The real usage context is a query call this crate has no live connection
+/// to exercise inside a doctest (see `commands/database.rs`/`database.rs`
+/// for that), so this pins down the conversion itself instead:
+///
+/// ```
+/// use celers_cli::row_ext::uuid_param;
+/// use uuid::Uuid;
+///
 /// let id = Uuid::new_v4();
-/// conn.execute("INSERT INTO t (id) VALUES ($1)", &[&uuid_param(&id)]).await?;
+/// assert_eq!(uuid_param(&id), id.as_u128());
+///
+/// // What a caller actually does with the result:
+/// // conn.execute("INSERT INTO t (id) VALUES ($1)", &[&uuid_param(&id)]).await?;
 /// ```
 #[allow(dead_code)]
 pub fn uuid_param(u: &uuid::Uuid) -> u128 {
@@ -145,9 +162,20 @@ pub fn opt_uuid_from_row(row: &Row, col: &str) -> Result<Option<uuid::Uuid>, Oxi
 ///
 /// # Example
 ///
-/// ```ignore
+/// The real usage context is a query call this crate has no live connection
+/// to exercise inside a doctest (see `commands/database.rs`/`database.rs`
+/// for that), so this pins down the conversion itself instead. Kept to a
+/// single-key object: multi-key ordering depends on `serde_json`'s
+/// `preserve_order` feature, which this crate does not enable.
+///
+/// ```
+/// use celers_cli::row_ext::json_param;
+///
 /// let payload = serde_json::json!({ "k": "v" });
-/// conn.execute("INSERT INTO t (data) VALUES ($1)", &[&json_param(&payload)]).await?;
+/// assert_eq!(json_param(&payload), r#"{"k":"v"}"#);
+///
+/// // What a caller actually does with the result:
+/// // conn.execute("INSERT INTO t (data) VALUES ($1)", &[&json_param(&payload)]).await?;
 /// ```
 #[allow(dead_code)]
 pub fn json_param(v: &serde_json::Value) -> String {

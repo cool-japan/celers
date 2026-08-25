@@ -1,0 +1,33 @@
+# Minimal Prometheus configuration for the local development stack in
+# ../docker-compose.yml.
+#
+# What this scrapes today: Prometheus itself, which is always up. That is
+# enough to prove the container started and the config file parsed.
+#
+# What it does NOT scrape: the `worker` service in docker-compose.yml. The
+# shipped `celers` CLI image builds an EMPTY task registry (see
+# docs/DEPLOYMENT.md, "Building a worker image") and does not start an HTTP
+# metrics server on its own -- there is nothing listening on worker:9090
+# until you build your own worker binary that starts one (via
+# `celers-metrics`, following the pattern in
+# crates/celers-examples/examples/prometheus_metrics.rs). Once you have,
+# uncomment the `celers-worker` job below -- or add your own job for
+# whatever host/port your binary actually exposes -- and point it there.
+# The metric names it will expose (`celers_tasks_completed_total`,
+# `celers_queue_size`, `celers_task_execution_seconds`, ...) are documented
+# in the root README's "Monitoring" section and in
+# crates/celers-metrics/README.md.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # - job_name: 'celers-worker'
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ['worker:9090']

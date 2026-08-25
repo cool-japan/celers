@@ -1,14 +1,27 @@
 //! System information helpers for resource monitoring.
 //!
 //! - Linux: reads `/proc` and, for total memory, the process's cgroup
-//!   limit (v2 then v1) in preference to the host-wide total.
-//! - macOS: reads `sysctl`/`getrusage` via `libc`.
-//! - Everywhere else: returns conservative "unavailable" sentinels (`0` /
-//!   `None`) rather than fabricating a number.
+//!   limit (v2 then v1) in preference to the host-wide total. Pure Rust —
+//!   no FFI is involved.
+//! - macOS/BSD: reads `sysctl`/`getrusage`/`getloadavg` via `libc`, and so
+//!   requires this crate's off-by-default `native-sysinfo` feature (alias:
+//!   `linux-sysinfo`).
+//! - Everywhere else, and everywhere with `native-sysinfo` off: returns
+//!   conservative "unavailable" sentinels (`0` / `None`) rather than
+//!   fabricating a number.
 //!
 //! Every accessor is intentionally honest about unavailability: callers
 //! that feed these into ratio-based decisions (e.g. autoscaling) should
 //! treat `0`/`None` as "no signal available" rather than "zero load".
+//!
+//! # FFI policy
+//!
+//! Every `libc` call in this module is gated on `feature = "native-sysinfo"`,
+//! so the crate's default build declares no FFI dependency of its own (`libc`
+//! still reaches the binary transitively through `tokio`, which is outside
+//! this crate's control). The gate is drawn around the *calls*, not around
+//! the functions: the `/proc`-based Linux readers keep working with the
+//! feature off, because they never needed `libc` in the first place.
 
 use std::time::Duration;
 
@@ -19,6 +32,10 @@ use std::time::Duration;
 ///   size since process start). macOS/BSD report this field in *bytes*,
 ///   unlike Linux which reports the analogous `ru_maxrss` in KiB -- this
 ///   function normalizes both platforms' native readings to bytes.
+///
+/// The macOS path needs `libc`, so it is compiled only with the
+/// `native-sysinfo` feature; without it macOS behaves like an unsupported
+/// platform here.
 ///
 /// Returns 0 if unavailable or on an unsupported platform. A running
 /// process always has non-zero RSS, so `0` is an unambiguous
@@ -40,7 +57,7 @@ pub(crate) fn read_process_memory_bytes() -> usize {
             }
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
     {
         if let Some(usage) = macos_getrusage_self() {
             // macOS reports `ru_maxrss` in bytes (Linux reports KiB); this
@@ -61,7 +78,8 @@ pub(crate) fn read_process_memory_bytes() -> usize {
 ///   see the *node's* total memory as the denominator, so a
 ///   memory-percentage scaling trigger could never fire no matter how
 ///   close to its actual (much smaller) limit the process gets.
-/// - macOS: `hw.memsize` via `sysctlbyname`.
+/// - macOS: `hw.memsize` via `sysctlbyname` (needs the `native-sysinfo`
+///   feature; without it macOS behaves like an unsupported platform here).
 ///
 /// Returns 0 if unavailable or on an unsupported platform.
 #[allow(dead_code)]
@@ -85,7 +103,7 @@ pub(crate) fn read_total_memory_bytes() -> usize {
             }
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
     {
         if let Some(bytes) = macos_total_memory_bytes() {
             return bytes;
@@ -162,18 +180,26 @@ fn read_cgroup_memory_limit_bytes() -> Option<u64> {
 /// CPU time accounting short-circuits before this helper would ever be needed.
 #[cfg(target_os = "linux")]
 pub(crate) fn clock_ticks_per_sec() -> u64 {
-    // SAFETY: sysconf is always safe when called with a valid constant.
-    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks > 0 {
-        return ticks as u64;
+    #[cfg(feature = "native-sysinfo")]
+    {
+        // SAFETY: sysconf is always safe when called with a valid constant.
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks > 0 {
+            return ticks as u64;
+        }
     }
-    100 // sensible fallback
+    // Reached when `native-sysinfo` is off (no `sysconf` to ask) or when the
+    // call itself failed. 100 is not a guess in either case: the utime/stime
+    // fields of `/proc/self/stat` are reported in USER_HZ, which the Linux
+    // kernel fixes at 100 on every mainstream ABI regardless of CONFIG_HZ.
+    100
 }
 
 /// Read cumulative process CPU time (utime + stime).
 ///
 /// - Linux: parsed from `/proc/self/stat`.
-/// - macOS: `ru_utime + ru_stime` via `getrusage(RUSAGE_SELF)`.
+/// - macOS: `ru_utime + ru_stime` via `getrusage(RUSAGE_SELF)` (needs the
+///   `native-sysinfo` feature).
 ///
 /// Returns `None` if unavailable. The returned Duration is a process-lifetime
 /// cumulative value; subtract consecutive readings to get a per-interval delta.
@@ -198,14 +224,17 @@ pub(crate) fn read_process_cpu_time() -> Option<Duration> {
             total_ticks.saturating_mul(1_000_000_000) / hz,
         ))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
     {
         let usage = macos_getrusage_self()?;
         let utime_ns = timeval_to_nanos(usage.ru_utime);
         let stime_ns = timeval_to_nanos(usage.ru_stime);
         Some(Duration::from_nanos(utime_ns.saturating_add(stime_ns)))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        all(target_os = "macos", feature = "native-sysinfo")
+    )))]
     {
         None
     }
@@ -215,17 +244,17 @@ pub(crate) fn read_process_cpu_time() -> Option<Duration> {
 ///
 /// - Linux: parsed from `/proc/loadavg`.
 /// - macOS/BSD family (anywhere the POSIX-ish `getloadavg(3)` call is
-///   available through `libc`): via `getloadavg`.
+///   available through `libc`): via `getloadavg`, which needs the
+///   `native-sysinfo` feature.
 ///
 /// Returns `None` on an unsupported platform or if the read/call fails.
 /// This exists so that a caller reading `/proc/loadavg` directly under a
 /// bare `#[cfg(unix)]` guard -- which only exists on Linux and silently
-/// yields `[0.0, 0.0, 0.0]` everywhere else -- can switch to a primitive
-/// that is honest about unavailability instead. See the follow-up note in
-/// this crate's audit tracking: `worker_core::get_load_average` should be
-/// migrated to call this instead of reading `/proc/loadavg` under
-/// `#[cfg(unix)]`.
-#[allow(dead_code)] // intended for worker_core::get_load_average; not yet wired in
+/// yields `[0.0, 0.0, 0.0]` everywhere else -- has a primitive that is
+/// honest about unavailability instead. Every load-average reader in the
+/// crate now goes through it: `worker_core`'s heartbeat event,
+/// `worker_pool`'s load-based scaling signal, and `control`'s
+/// `inspect stats` reply.
 pub(crate) fn read_load_average() -> Option<[f64; 3]> {
     #[cfg(target_os = "linux")]
     {
@@ -236,16 +265,19 @@ pub(crate) fn read_load_average() -> Option<[f64; 3]> {
         let fifteen: f64 = fields.next()?.parse().ok()?;
         Some([one, five, fifteen])
     }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
+    #[cfg(all(
+        feature = "native-sysinfo",
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )
     ))]
     {
         let mut loads: [libc::c_double; 3] = [0.0; 3];
@@ -261,15 +293,20 @@ pub(crate) fn read_load_average() -> Option<[f64; 3]> {
     }
     #[cfg(not(any(
         target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
+        all(
+            feature = "native-sysinfo",
+            any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos",
+                target_os = "visionos",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "openbsd",
+                target_os = "netbsd"
+            )
+        )
     )))]
     {
         None
@@ -279,7 +316,7 @@ pub(crate) fn read_load_average() -> Option<[f64; 3]> {
 /// `timeval` (seconds + microseconds) as total nanoseconds, saturating
 /// rather than panicking/wrapping on a (never-expected-but-not-UB-to-guard)
 /// negative field.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
 fn timeval_to_nanos(tv: libc::timeval) -> u64 {
     (tv.tv_sec.max(0) as u64)
         .saturating_mul(1_000_000_000)
@@ -287,7 +324,7 @@ fn timeval_to_nanos(tv: libc::timeval) -> u64 {
 }
 
 /// `getrusage(RUSAGE_SELF)`, or `None` on failure.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
 fn macos_getrusage_self() -> Option<libc::rusage> {
     // SAFETY: `rusage` is a `#[repr(C)]` POD struct of integers/timevals;
     // a zeroed value is a valid (if meaningless) initial state, and
@@ -302,7 +339,7 @@ fn macos_getrusage_self() -> Option<libc::rusage> {
 }
 
 /// `sysctlbyname("hw.memsize")`, or `None` on failure.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
 fn macos_total_memory_bytes() -> Option<usize> {
     let mut size: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
@@ -330,29 +367,54 @@ fn macos_total_memory_bytes() -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// The platforms on which the accessors are expected to return a real
+    /// reading: Linux always (pure `/proc`), macOS only with the
+    /// `native-sysinfo` feature that compiles its `libc` calls in.
+    macro_rules! has_real_readings {
+        () => {
+            cfg!(any(
+                target_os = "linux",
+                all(target_os = "macos", feature = "native-sysinfo")
+            ))
+        };
+    }
+
     #[test]
     fn test_read_process_memory_bytes_returns_nonnegative() {
         let mem = read_process_memory_bytes();
-        // mem >= 0 is trivially true for usize, but we assert the function
-        // runs without panicking on every platform.
-        let _ = mem;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        assert!(
-            mem > 0,
-            "expected nonzero process RSS on Linux/macOS, got {mem}"
-        );
+        // mem >= 0 is trivially true for usize; the point is that the
+        // function runs without panicking on every platform and feature
+        // combination.
+        if has_real_readings!() {
+            assert!(
+                mem > 0,
+                "expected nonzero process RSS on a supported platform, got {mem}"
+            );
+        }
     }
 
     #[test]
     fn test_read_total_memory_bytes() {
         let total = read_total_memory_bytes();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        assert!(
-            total > 0,
-            "Expected total memory > 0 on Linux/macOS, got {}",
-            total
-        );
-        let _ = total;
+        if has_real_readings!() {
+            assert!(
+                total > 0,
+                "Expected total memory > 0 on a supported platform, got {total}"
+            );
+        }
+    }
+
+    /// With `native-sysinfo` off there is no `libc` to call, so the macOS
+    /// accessors must return the module's documented "unavailable" sentinel
+    /// rather than a fabricated number. This is the fallback half of the
+    /// FFI gate, and it is what the crate's *default* build compiles.
+    #[cfg(all(target_os = "macos", not(feature = "native-sysinfo")))]
+    #[test]
+    fn test_macos_accessors_report_unavailable_without_native_sysinfo() {
+        assert_eq!(read_process_memory_bytes(), 0);
+        assert_eq!(read_total_memory_bytes(), 0);
+        assert_eq!(read_process_cpu_time(), None);
+        assert_eq!(read_load_average(), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -364,18 +426,22 @@ mod tests {
 
     #[test]
     fn test_read_process_cpu_time() {
-        // Just check it doesn't panic; on Linux/macOS it should return Some.
+        // Just check it doesn't panic; where a real source exists it must
+        // return Some.
         let cpu = read_process_cpu_time();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        assert!(cpu.is_some(), "Expected Some on Linux/macOS");
-        let _ = cpu;
+        if has_real_readings!() {
+            assert!(cpu.is_some(), "Expected Some on a supported platform");
+        }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "macos", feature = "native-sysinfo")
+    ))]
     #[test]
     fn test_read_load_average_returns_plausible_values() {
-        let loads = read_load_average();
-        let loads = loads.expect("getloadavg/proc-loadavg should succeed on Linux/macOS");
+        let loads =
+            read_load_average().expect("getloadavg/proc-loadavg should succeed on this platform");
         for load in loads {
             assert!(
                 (0.0..1_000_000.0).contains(&load),
@@ -508,9 +574,12 @@ mod tests {
     //
     // These run for real on a macOS host (this workspace's own build
     // machine is macOS), directly verifying the sysctl/getrusage-backed
-    // implementations rather than only reasoning about them.
+    // implementations rather than only reasoning about them. They need the
+    // `native-sysinfo` feature, which is what compiles those `libc` calls in
+    // at all; the feature-off behaviour is covered by
+    // `test_macos_accessors_report_unavailable_without_native_sysinfo`.
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
     #[test]
     fn test_macos_total_memory_bytes_is_plausible() {
         let bytes = macos_total_memory_bytes().expect("sysctlbyname(hw.memsize) should succeed");
@@ -521,7 +590,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
     #[test]
     fn test_macos_getrusage_self_reports_nonzero_rss() {
         let usage = macos_getrusage_self().expect("getrusage(RUSAGE_SELF) should succeed");
@@ -531,7 +600,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "native-sysinfo"))]
     #[test]
     fn test_read_process_memory_bytes_matches_getrusage_on_macos() {
         // End-to-end: the public accessor must actually be wired to the

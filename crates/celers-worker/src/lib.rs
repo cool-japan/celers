@@ -108,8 +108,19 @@ mod metrics {
     // No-op stubs when metrics feature is disabled
 }
 
-#[cfg(feature = "canvas")]
+// `workflows` and `error_links` are the success and failure halves of the same
+// canvas wire format, and both are compiled unconditionally. Neither *needs*
+// the optional `celers-canvas` dependency: the tail, the error route and the
+// per-task options all travel as plain JSON in the task payload, and the one
+// place that genuinely needs canvas types — evaluating a `branch`/`switch`
+// condition — already has a `#[cfg(not(feature = "canvas"))]` counterpart that
+// ends the chain with a warning instead of guessing an arm. Gating the modules
+// themselves meant a worker built without `canvas` silently ran only the first
+// step of every chain and no error handler at all, even though it had
+// everything it needed for both.
 pub mod workflows;
+
+pub mod error_links;
 
 #[cfg(test)]
 mod broker_revocation_tests;

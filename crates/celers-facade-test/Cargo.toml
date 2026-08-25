@@ -1,0 +1,51 @@
+## The isolated proof of what a downstream crate actually needs in order to
+## use `#[celers::task]` (audit idx 319).
+##
+## The point is the dependency list below, and its exact size. `#[task]`
+## expands to code naming four things in the *caller's* module:
+##
+##   celers_core::Task            - resolved via the facade's `pub use celers_core;`
+##   async_trait::async_trait     - resolved via the facade's `pub use async_trait;`
+##   serde::Serialize             - NOT resolvable through the facade (see below)
+##   serde::Deserialize           - NOT resolvable through the facade (see below)
+##
+## The first two resolve through `use celers::*;` alone — verified, and this
+## crate is the workspace's only regression test for that, since every other
+## member depends on `celers-core` and `async-trait` directly and would keep
+## compiling if the facade dropped those re-exports.
+##
+## `serde` does NOT. Observed: remove the `serde` line below and this crate
+## fails to build with
+##
+##   error[E0463]: can't find crate for `serde`
+##     --> crates/celers-facade-test/src/lib.rs:NN:1
+##      | #[celers::task]
+##      = note: this error originates in the derive macro `serde::Serialize`
+##
+## even though the very same `use celers::*;` does satisfy `celers_core::Task`
+## and `#[async_trait::async_trait]` in the same expansion. The apparent reason
+## is that `serde` is named in *derive* position and a derive path's first
+## segment is not satisfied by a glob import — but treat the reproduction
+## above as the durable fact and that explanation as an inference.
+##
+## So the honest minimum for a downstream user of `#[celers::task]` is
+## `celers` + `serde` (with its `derive` feature) — not `celers` alone, as the
+## facade's re-export block claims. See the followup recorded for making the
+## macro emit a facade-relative derive path.
+[package]
+name = "celers-facade-test"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compile-time proof of the minimum dependency set for #[celers::task]"
+publish = false
+
+[dependencies]
+# EXACTLY THESE TWO. Do not add `celers-core` or `async-trait`: having them as
+# direct dependencies is what makes every *other* crate in this workspace
+# unable to detect a regression in the facade's re-export surface, and adding
+# them here would destroy the only test that can.
+celers = { workspace = true }
+serde = { workspace = true }

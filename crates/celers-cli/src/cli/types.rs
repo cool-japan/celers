@@ -254,10 +254,17 @@ pub(super) enum WorkerMgmtCommands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Pause task processing for a worker
+    /// Pause task processing for a worker (suspends consumption of one
+    /// queue over the live control channel; in-flight tasks keep running)
     Pause {
-        /// Worker ID
+        /// Worker ID (the hostname it reports, e.g. via `celers inspect
+        /// ping`)
         worker_id: String,
+        /// Queue the worker is consuming -- must be the queue it was
+        /// actually started on, or it answers with an error. Defaults to
+        /// the configured queue.
+        #[arg(short, long)]
+        queue: Option<String>,
         /// Broker URL
         #[arg(short, long)]
         broker: Option<String>,
@@ -265,11 +272,18 @@ pub(super) enum WorkerMgmtCommands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Resume task processing for a worker
+    /// Resume task processing for a worker (re-enables consumption of one
+    /// queue over the live control channel)
     Resume {
-        /// Worker ID
+        /// Worker ID (the hostname it reports, e.g. via `celers inspect
+        /// ping`)
         #[arg(short, long)]
         worker_id: String,
+        /// Queue the worker is consuming -- must be the queue it was
+        /// actually started on, or it answers with an error. Defaults to
+        /// the configured queue.
+        #[arg(short, long)]
+        queue: Option<String>,
         /// Broker URL
         #[arg(short, long)]
         broker: Option<String>,
@@ -288,10 +302,17 @@ pub(super) enum WorkerMgmtCommands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Drain worker (stop accepting new tasks)
+    /// Drain a worker: ask it to stop consuming, finish any in-flight
+    /// task(s), then EXIT. Unlike pause, this is one-way -- a drained
+    /// worker does not come back on its own.
     Drain {
-        /// Worker ID
+        /// Worker ID (the hostname it reports, e.g. via `celers inspect
+        /// ping`)
         worker_id: String,
+        /// Seconds to let in-flight tasks finish before the worker gives up
+        /// and exits anyway (the worker's own default applies when unset)
+        #[arg(long)]
+        grace: Option<u64>,
         /// Broker URL
         #[arg(short, long)]
         broker: Option<String>,
@@ -867,6 +888,24 @@ pub(super) enum Commands {
         /// falls back to a 30s default when neither is set.
         #[arg(long)]
         shutdown_timeout: Option<u64>,
+        /// Skip the startup broker/control-channel connectivity probe and
+        /// start immediately, on no evidence the broker is reachable. Use
+        /// when the probe itself is undesirable (e.g. a broker only
+        /// reachable after this process establishes a tunnel).
+        #[arg(long)]
+        no_connect_check: bool,
+        /// Total seconds to retry the startup connectivity probe before
+        /// giving up. Overrides `CELERS_BROKER_CONNECT_TIMEOUT_SECS`; falls
+        /// back to 30s when neither is set. Ignored with
+        /// --no-connect-check.
+        #[arg(long)]
+        broker_connect_timeout: Option<u64>,
+        /// Register a few harmless built-in demo tasks (demo.echo,
+        /// demo.sleep, demo.fail) instead of starting with a genuinely
+        /// empty registry, so this deployment can be smoke-tested before
+        /// any real task code exists.
+        #[arg(long)]
+        demo_tasks: bool,
         /// Configuration file path
         #[arg(long)]
         config: Option<PathBuf>,
@@ -969,6 +1008,15 @@ pub(super) enum Commands {
         /// Print the load plan without enqueuing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Sign every synthetic task with this shared secret before
+        /// enqueueing, so it passes a verifying worker's signature check
+        /// (`CELERS_TASK_SIGNING_KEY`) instead of being dead-lettered.
+        /// Falls back to `CELERS_TASK_SIGNING_KEY` when omitted, so the
+        /// same key configured on the worker side works here without
+        /// repeating it on the command line. Unsigned (the previous,
+        /// always-unsigned behavior) when neither is set.
+        #[arg(long)]
+        signing_key: Option<String>,
         /// Broker URL
         #[arg(short, long)]
         broker: Option<String>,

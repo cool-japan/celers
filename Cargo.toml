@@ -30,6 +30,28 @@ members = [
     "crates/celers-cli",
     "crates/celers-metrics",
 
+    # Examples & benchmarks (publish = false).
+    #
+    # This crate was split out of the workspace once to keep routine builds
+    # from compiling 15 examples and 3 benches. The cost of that was silent
+    # rot: nothing at the repo root ever built it, so it drifted out of sync
+    # with the APIs it demonstrates (it was found failing to compile, and
+    # unformatted, while every workspace member was green). It is back in
+    # `members` so `cargo build/clippy/fmt --workspace` covers it, and every
+    # dependency version now inherits from `[workspace.dependencies]` instead
+    # of being a copied literal that nothing keeps current.
+    #
+    # `cargo build --workspace` does not build example or bench targets, so
+    # the extra cost lands only on `--all-targets` runs — which is exactly
+    # where the drift needed to be caught.
+    "crates/celers-examples",
+
+    # A one-dependency crate (`celers` and nothing else) whose only job is to
+    # prove that `#[celers::task]` expands for a downstream user of the facade
+    # alone. Every other member depends on celers-core/async-trait/serde
+    # directly, so none of them can catch a regression in the facade's
+    # re-export surface. publish = false.
+    "crates/celers-facade-test",
 ]
 resolver = "2"
 
@@ -42,18 +64,18 @@ repository = "https://github.com/cool-japan/celers"
 
 [workspace.dependencies]
 # Core dependencies
-tokio = { version = "1.52.3", features = ["full"] }
-async-trait = "0.1.89"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+tokio = { version = "1.53.1", features = ["full"] }
+async-trait = "0.1.92"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 oxicode = { version = "0.2.6", features = ["serde", "derive"] }
-thiserror = "2.0.18"
-anyhow = "1.0.103"
+thiserror = "2.0.20"
+anyhow = "1.0.104"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 # Broker implementations
-redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
+redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager", "aio", "cluster-async"] }
 # NOTE: neither oxisql-postgres nor oxisql-mysql 0.3.2 exposes a `chrono`
 # Cargo feature (confirmed against their published Cargo.toml manifests) —
 # the `chrono`-gated `FromValue` impls (e.g. `DateTime<Utc>`) live in
@@ -64,7 +86,7 @@ redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager", "ai
 oxisql-core = { version = "0.4.1", features = ["chrono"] }
 oxisql-postgres = "0.4.1"
 oxisql-mysql = "0.4.1"
-# Pure-Rust TLS facade (rustls + rustls-rustcrypto, no ring/aws-lc/openssl).
+# Pure-Rust TLS facade (rustls + rustls-rustcrypto).
 # Depended on with the exact same feature set oxisql-postgres itself uses
 # internally (see its Cargo.toml), so the `Arc<rustls::ClientConfig>`
 # produced by `oxitls::client_config` is guaranteed compatible with
@@ -72,40 +94,141 @@ oxisql-mysql = "0.4.1"
 oxitls = { version = "0.3.0", default-features = false, features = ["pure", "webpki-roots"] }
 # Named directly (not just pulled in transitively via oxitls/oxisql-*) so
 # `celers-cli`'s `tls_mode.rs` can name `rustls::ClientConfig` in its public
-# API. Same version/feature pin as oxitls/oxisql's own Cargo.toml
-# (`default-features = false` keeps the default `ring`/`aws-lc-rs` crypto
-# backends out of the build; `rustls-rustcrypto`, pulled in transitively by
-# oxisql-postgres/oxisql-mysql/oxitls, supplies the actual Pure-Rust
-# `CryptoProvider`).
+# API. Same version/feature pin as oxitls/oxisql's own Cargo.toml.
+#
+# SCOPE OF THE `default-features = false` CLAIM — read before relying on it:
+# it keeps rustls' own default `aws-lc-rs` backend off for THIS declaration
+# only. Cargo unifies features per *package*, not per dependency declaration,
+# so any other crate in the same build that enables `rustls/aws_lc_rs` or
+# `rustls/ring` turns it on for everybody. The Pure-Rust surface is therefore
+# a property of the *feature set being built*, not of this line:
+#
+#   * Pure Rust today: every workspace member except `celers-broker-sqs`.
+#     (`celers-broker-amqp` joined that set once `lapin` was pinned to
+#     `default-features = false` + `rustls-webpki-roots-certs`, below.)
+#   * NOT Pure Rust: `celers-broker-sqs`, and therefore the `celers` facade's
+#     opt-in `sqs` feature and `full`/`--all-features` builds. The AWS SDK's
+#     `default-https-client` hard-selects `aws-smithy-http-client/rustls-aws-lc`
+#     -> `aws-lc-rs` -> `aws-lc-sys` (vendored C/C++/asm built with cmake+cc).
+#     `sqs` is off by default in every crate that offers it.
+#
+# Verify with `cargo tree -e features -i aws-lc-sys -p <crate>`; enforced
+# mechanically by `deny.toml` (`[graph] exclude` names the one exception).
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-lapin = "4.10.0"
+# `default-features = false` is load-bearing and MUST live here, at the
+# workspace level: a member-level `default-features = false` on an inherited
+# dependency is silently ignored by Cargo unless the workspace entry also
+# specifies it (verified against Cargo 1.95).
+#
+# lapin's default feature set is `["rustls", "default-runtime"]`, and
+# `rustls` resolves to `amq-protocol-tcp/rustls` =
+# `["rustls-platform-verifier", "rustls--aws_lc_rs"]` — i.e. it hard-selects
+# the FFI-backed `aws-lc-rs` provider (C/C++/asm via `aws-lc-sys`). Selecting
+# `rustls-webpki-roots-certs` instead keeps rustls/`rustls-connector` but with
+# NO built-in provider feature, which lets the Pure-Rust `rustls-rustcrypto`
+# provider that `celers_broker_amqp::install_pure_tls_provider()` installs as
+# the process default serve the AMQPS handshake.
+#
+# ORDERING CONSTRAINT: with no built-in provider, a bare
+# `rustls::ClientConfig::builder()` panics unless a default provider is
+# already installed. Audited: the only bare builder reachable in this
+# workspace's graph is `rustls-connector` (lapin's TLS layer), and both
+# `AmqpBroker::with_config` and `connect::open_connection` call
+# `install_pure_tls_provider()` (via `std::sync::Once`) before it can run.
+# `oxitls` and `oxihttp-client` are safe by construction — every one of their
+# rustls configs goes through `ClientConfig::builder_with_provider`, and
+# oxitls' own docs state it never calls `install_default()` (verified by
+# grepping both crates' sources for `ClientConfig::builder()`: no hits).
+#
+# An application that builds rustls clients through *other* libraries before
+# constructing an `AmqpBroker` should call
+# `celers_broker_amqp::install_pure_tls_provider()` itself, first thing in
+# `main`; whoever installs a default provider first wins.
+#
+# TRUST STORE: webpki roots replace the OS/corporate trust store. Deployments
+# with a private RabbitMQ CA should enable `celers-broker-amqp/tls-native-certs`,
+# which adds `lapin/rustls-native-certs` (Pure Rust) on top.
+lapin = { version = "4.10.0", default-features = false, features = ["default-runtime", "rustls-webpki-roots-certs"] }
 oxihttp-client = { version = "0.2.1", features = ["tls"] }
-http = "1.4.2"
+http = "1.5.0"
 
 # AWS SDK
-aws-config = "1.9"
-aws-sdk-sqs = "1.103"
-aws-sdk-cloudwatch = "1.120"
+#
+# `default-features = false` is load-bearing, not tidiness: the SDK crates'
+# default feature set contains `rustls`, which resolves to
+# `aws-smithy-runtime/tls-rustls` -> `aws-smithy-http-client/legacy-rustls-ring`
+# + `connector-hyper-0-14-x`. That single feature was the *only* source of
+# rustls 0.21 / rustls-webpki 0.101 / hyper 0.14 / h2 0.3 / tokio-rustls 0.24 /
+# hyper-rustls 0.24 / `ring` in the whole lockfile — i.e. four open RUSTSEC
+# advisories (RUSTSEC-2026-0258, -0104, -0098, -0099) and seven duplicate
+# version pairs — for a hyper-0.14 connector that `celers-broker-sqs` never
+# constructs. Working HTTPS comes from `default-https-client` (rustls 0.23),
+# which is kept. `behavior-version-latest` is deliberately NOT enabled:
+# `crates/celers-broker-sqs/src/broker_core.rs` passes
+# `BehaviorVersion::latest()` explicitly at every `aws_config::defaults` call.
+aws-config = { version = "1.11.0", default-features = false, features = ["rt-tokio", "credentials-process", "sso", "default-https-client"] }
+aws-sdk-sqs = { version = "1.107.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-cloudwatch = { version = "1.126.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
+# TEST-ONLY (a `[dev-dependencies]` entry of `celers-broker-sqs`, nothing else).
+#
+# Already in the graph transitively — `aws-sdk-sqs` depends on exactly this
+# version — so naming it here adds no crate to the build, it only makes the
+# `HttpClient`/`HttpConnector` traits *nameable*. `aws-sdk-sqs::config`
+# re-exports `HttpClient` and `SharedHttpClient` but not `HttpConnectorSettings`
+# or `SharedHttpConnector`, so a stub HTTP client cannot be written against the
+# SDK's own re-exports alone.
+#
+# Why a stub is needed at all: `Client::from_conf` runs
+# `HttpClient::validate_base_client_config` on whichever HTTP client the base
+# config selects, and `aws-smithy-http-client` deliberately builds its TCP
+# connector there ("so that native certs load at client initialization time
+# instead of upon first request"). That calls
+# `rustls_native_certs::load_native_certs()`, which costs ~12s per process on
+# macOS and returns *nothing* when several processes hit the Security framework
+# at once — tripping the `debug_assert!(valid > 0)` in
+# `aws-smithy-http-client`'s rustls provider. Unit tests that only need a
+# `Client` *value* therefore hand it an offline HTTP client instead, which
+# de-selects the default one so its `validate_base_client_config` never runs.
+# See `crates/celers-broker-sqs/src/test_support.rs`.
+aws-smithy-runtime-api = "1.15.0"
 
 # CLI and utilities
-clap = { version = "4.6.1", features = ["derive"] }
-clap_complete = "4.6.7"
-clap_mangen = "0.3.0"
-uuid = { version = "1.23.4", features = ["v4", "serde"] }
+clap = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.6.9"
+clap_mangen = "0.3.3"
+uuid = { version = "1.25.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
-chrono-tz = "0.10"
+chrono-tz = "0.10.4"
 hostname = "0.4.2"
-regex = "1.13"
+regex = "1.13.1"
 rand = "0.10.2"
 oxiarc-deflate = "0.4.1"
 oxiarc-zstd = "0.4.1"
-crossbeam-deque = "0.8"
-num_cpus = "1.17"
-libc = "0.2"
-base64 = "0.22"
-hex = "0.4"
+crossbeam-deque = "0.8.7"
+num_cpus = "1.17.0"
+libc = "0.2.189"
+base64 = "0.23.1"
+hex = "0.4.3"
 
 # gRPC dependencies
+#
+# TLS DECISION (celers-backend-rpc, audit idx 263) — recorded here because it
+# is a workspace-level choice, not a per-crate one:
+#
+# tonic's own `tls-ring` / `tls-aws-lc` features unconditionally pull `ring`
+# or `aws-lc-rs`, both banned by deny.toml, so neither is enabled and the
+# gRPC result backend ships **without built-in TLS**. The workspace
+# deliberately does NOT carve out a Pure-Rust policy exception for it.
+#
+# The supported path today is `GrpcResultBackend::from_channel_with_config`:
+# the caller builds its own `tonic::transport::Channel` and hands it in.
+#
+# The path to built-in TLS, when someone takes it, is
+# `Endpoint::connect_with_connector` over a `tokio-rustls` connector using the
+# workspace's existing `rustls` + `rustls-rustcrypto` (via `oxitls`) stack.
+# That needs `tokio-rustls`, `hyper-util` and `tower` added here plus a
+# connector implementation in celers-backend-rpc; it is not added
+# speculatively because an unused `[workspace.dependencies]` entry only rots.
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 prost = "0.14.4"
@@ -114,25 +237,33 @@ tonic-build = "0.14.6"
 tonic-prost-build = "0.14.6"
 
 # Serialization formats
-rmp-serde = "1.3"
-serde_yaml = "0.9"
+rmp-serde = "1.3.1"
+# `serde_yaml` 0.9 is archived upstream (its newest release is literally
+# `0.9.34+deprecated`) and it parses user-supplied config files in
+# `celers-cli`. `serde_yaml_ng` is the maintained fork with the same
+# `from_str`/`from_slice`/`to_string` surface. `serde_yaml` is banned by
+# name in deny.toml so it cannot come back.
+serde_yaml_ng = "0.10.0"
 bson = { version = "3.1.0", features = ["serde"] }
 
 # Crypto dependencies
-hmac = "0.13"
-sha2 = "0.11"
-aes-gcm = "0.11"
-chacha20poly1305 = "0.11"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+aes-gcm = "0.11.1"
+chacha20poly1305 = "0.11.0"
 
 # Hashing
-twox-hash = "2"
+twox-hash = "2.1.3"
 
 # Scheduling dependencies
 cron = "0.17.0"
 sunrise = "3.0.0"
 
 # Internal workspace crates
+celers = { path = "crates/celers", version = "0.3.1" }
+celers-backend-db = { path = "crates/celers-backend-db", version = "0.3.1" }
 celers-backend-redis = { path = "crates/celers-backend-redis", version = "0.3.1" }
+celers-backend-rpc = { path = "crates/celers-backend-rpc", version = "0.3.1" }
 celers-beat = { path = "crates/celers-beat", version = "0.3.1" }
 celers-broker-amqp = { path = "crates/celers-broker-amqp", version = "0.3.1" }
 celers-broker-postgres = { path = "crates/celers-broker-postgres", version = "0.3.1" }
@@ -148,19 +279,19 @@ celers-protocol = { path = "crates/celers-protocol", version = "0.3.1" }
 celers-worker = { path = "crates/celers-worker", version = "0.3.1" }
 
 # CLI tools
-toml = "1.1.2"
+toml = "1.1.4"
 tabled = "0.21.0"
 colored = "3.1.1"
 url = "2.5.8"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 rustyline = "18.0.1"
-csv = "1.4"
+csv = "1.4.0"
 oxiarc-archive = "0.4.1"
 dialoguer = "0.12.0"
 dirs = "6.0.0"
-urlencoding = "2.1"
-futures-util = "0.3.32"
+urlencoding = "2.1.3"
+futures-util = "0.3.34"
 
 # Metrics
 prometheus = "0.14.0"
@@ -173,20 +304,20 @@ tracing-opentelemetry = "0.33.0"
 
 # Testing
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
-proptest = "1.11"
-tokio-test = "0.4"
+proptest = "1.11.0"
+tokio-test = "0.4.5"
 tempfile = "3.27.0"
-serial_test = "3.5.0"
-futures = "0.3"
+serial_test = "4.0.1"
+futures = "0.3.34"
 
 # Macro dependencies
-quote = "1.0.46"
-syn = { version = "2.0.118", features = ["full"] }
-proc-macro2 = "1.0.106"
+quote = "1.0.47"
+syn = { version = "3.0.4", features = ["full"] }
+proc-macro2 = "1.0.107"
 
 # Other utilities
-crc32fast = "1.5"
-rust_decimal = "1.42"
+crc32fast = "1.5.1"
+rust_decimal = "1.42.1"
 
 [profile.release]
 # Enable link-time optimization for smaller binaries

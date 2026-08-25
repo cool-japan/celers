@@ -9,7 +9,7 @@ Production-ready worker runtime for consuming and executing CeleRS tasks with co
 High-performance worker runtime with:
 
 - ✅ **Concurrent Execution**: Configurable parallelism (default: 4 workers)
-- ✅ **Autoscaling Worker Pool**: Real work-stealing job execution (`WorkerPool::submit_task`) with queue-depth/CPU/memory-driven scaling policies
+- ✅ **Autoscaling Worker Pool**: Shared-queue job execution (`WorkerPool::submit_task`: one bounded MPSC queue, workers competing for the next task — no per-worker deques, nothing stolen) with queue-depth/CPU/memory-driven scaling policies
 - ✅ **Batch Dequeue**: Fetch multiple tasks per round-trip (10-100x faster)
 - ✅ **Memory Optimization**: Result size limits and tracking
 - ✅ **Retry Logic**: Exponential backoff with configurable limits

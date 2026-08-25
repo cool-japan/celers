@@ -375,12 +375,18 @@ fn test_ttl_duration_values() {
     assert_eq!(zero.as_secs(), 0);
 }
 
+/// `remaining`/`is_complete`/`percent_complete` read from the count the state
+/// carries.
+///
+/// This is a pure accessor test — it assigns `completed` directly and never
+/// touches Redis. The *increment* path, where a race could exist, is
+/// [`chord_complete_task_hands_out_every_count_exactly_once`] below; this test
+/// used to be named for that concurrency and exercised none of it.
 #[test]
-fn test_chord_barrier_completion_tracking() {
+fn chord_state_reports_remaining_from_the_count_it_carries() {
     let chord_id = Uuid::new_v4();
     let mut state = ChordState::new(chord_id, 5, vec![]);
 
-    // Simulate task completions
     for i in 1..=5 {
         state.completed = i;
         if i < 5 {
@@ -395,13 +401,20 @@ fn test_chord_barrier_completion_tracking() {
     assert_eq!(state.percent_complete(), 100.0);
 }
 
+/// The completion test is `completed >= total`, so a counter that overshot —
+/// which a redelivered member really can cause, since `INCR` has no way to know
+/// the member had already been counted — still reads as complete rather than
+/// wrapping around to "one short forever".
+///
+/// Single-threaded and backend-free by design: this pins the comparison, not
+/// the concurrency. See
+/// [`chord_complete_task_hands_out_every_count_exactly_once`] for the increment
+/// path under real contention.
 #[test]
-fn test_chord_barrier_race_condition_safety() {
-    // Test that chord state correctly handles the total vs completed
+fn chord_state_is_complete_at_and_past_the_total() {
     let chord_id = Uuid::new_v4();
     let mut state = ChordState::new(chord_id, 10, vec![]);
 
-    // Simulate concurrent completions by directly setting completed count
     state.completed = 9;
     assert!(!state.is_complete());
     assert_eq!(state.remaining(), 1);
@@ -414,6 +427,101 @@ fn test_chord_barrier_race_condition_safety() {
     state.completed = 11;
     assert!(state.is_complete());
     assert_eq!(state.remaining(), 0);
+}
+
+/// The real increment path under real contention: sixteen independent backends
+/// — each with its own connection, exactly as sixteen workers would have — call
+/// [`ResultBackend::chord_complete_task`] on one chord id at the same moment.
+///
+/// Every call must come back with a distinct count, and exactly one of them
+/// must be the call that reaches `total`. That single observation is what a
+/// worker turns into the chord callback: a duplicated count would run the
+/// callback twice, a skipped one would leave the chord hanging forever. Nothing
+/// short of the server-side `INCR` can decide that, which is why this test
+/// needs a live Redis instead of a mock.
+///
+/// Skipped, visibly, when `CELERS_TEST_REDIS_URL` is not set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chord_complete_task_hands_out_every_count_exactly_once() {
+    const MEMBERS: usize = 16;
+
+    let Ok(url) = std::env::var("CELERS_TEST_REDIS_URL") else {
+        eprintln!(
+            "SKIPPED: chord_complete_task_hands_out_every_count_exactly_once \
+             (set CELERS_TEST_REDIS_URL to run)"
+        );
+        return;
+    };
+
+    let chord_id = Uuid::new_v4();
+    let member_ids: Vec<Uuid> = (0..MEMBERS).map(|_| Uuid::new_v4()).collect();
+
+    // Chord keys are keyed by a fresh uuid, so this run cannot collide with any
+    // other, and the two keys are deleted again at the end.
+    let mut registrar = RedisResultBackend::new(&url).expect("redis client");
+    registrar
+        .chord_init(
+            ChordState::new(chord_id, MEMBERS, member_ids).with_callback("aggregate".to_string()),
+        )
+        .await
+        .expect("the barrier must be registered before anything counts against it");
+
+    // Nobody increments until every task is ready to.
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(MEMBERS));
+    let mut handles = Vec::with_capacity(MEMBERS);
+    for _ in 0..MEMBERS {
+        let url = url.clone();
+        let gate = std::sync::Arc::clone(&gate);
+
+        handles.push(tokio::spawn(async move {
+            let mut backend = RedisResultBackend::new(&url).expect("redis client");
+            gate.wait().await;
+            backend
+                .chord_complete_task(chord_id)
+                .await
+                .expect("INCR on the completion counter")
+        }));
+    }
+
+    let mut counts = Vec::with_capacity(MEMBERS);
+    for handle in handles {
+        counts.push(handle.await.expect("completion task must not panic"));
+    }
+
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        (1..=MEMBERS).collect::<Vec<_>>(),
+        "every concurrent completion must get its own count: no duplicates, none skipped"
+    );
+
+    let openings = counts.iter().filter(|count| **count >= MEMBERS).count();
+    assert_eq!(
+        openings, 1,
+        "exactly one completion may observe the barrier opening"
+    );
+
+    let state = registrar
+        .chord_get_state(chord_id)
+        .await
+        .expect("state lookup")
+        .expect("the barrier outlives its members");
+    assert_eq!(
+        state.completed, MEMBERS,
+        "the counter must be merged back into the state the worker reads"
+    );
+    assert!(state.is_complete());
+
+    // Clean up both keys this chord owns.
+    let client = redis::Client::open(url.as_str()).expect("redis client");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis connection");
+    let mut pipe = redis::pipe();
+    pipe.del(registrar.chord_key(chord_id));
+    pipe.del(registrar.chord_counter_key(chord_id));
+    let _: Vec<i64> = pipe.query_async(&mut conn).await.expect("cleanup");
 }
 
 #[test]

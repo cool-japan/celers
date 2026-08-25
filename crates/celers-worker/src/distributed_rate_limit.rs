@@ -26,10 +26,12 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! # #[cfg(feature = "redis")]
 //! # async fn example() -> celers_core::Result<()> {
-//! use celers_worker::distributed_rate_limit::{DistributedRateLimiter, DistributedRateLimitConfig};
+//! use celers_worker::distributed_rate_limit::{
+//!     DistributedRateLimitConfig, DistributedRateLimiter, DistributedRateLimiterTrait,
+//! };
 //!
 //! let config = DistributedRateLimitConfig {
 //!     redis_url: "redis://127.0.0.1:6379".to_string(),
@@ -894,10 +896,21 @@ mod tests {
     /// Exercises the Lua script against a real server when one is offered
     /// through `CELERS_TEST_REDIS_URL`; skipped otherwise so the suite stays
     /// hermetic.
+    ///
+    /// The gate is the environment variable and *only* the environment
+    /// variable. Once an operator has named a server, a connection failure is
+    /// a real failure: treating it as a second skip condition is how this test
+    /// used to report green against a Redis that was down, misconfigured or
+    /// too old for the script — while the atomicity of the token-bucket Lua is
+    /// the one thing it exists to prove.
     #[cfg(feature = "redis")]
     #[tokio::test]
     async fn test_redis_script_is_atomic_when_a_server_is_available() {
         let Ok(url) = std::env::var("CELERS_TEST_REDIS_URL") else {
+            eprintln!(
+                "SKIPPED: test_redis_script_is_atomic_when_a_server_is_available \
+                 (set CELERS_TEST_REDIS_URL to run)"
+            );
             return;
         };
 
@@ -907,9 +920,9 @@ mod tests {
             .with_refill_rate(1e-9)
             .with_key_prefix(prefix);
 
-        let Ok(limiter) = DistributedRateLimiter::new(config).await else {
-            return;
-        };
+        let limiter = DistributedRateLimiter::new(config)
+            .await
+            .expect("CELERS_TEST_REDIS_URL is set, so connecting to it must succeed");
         let limiter = Arc::new(limiter);
 
         let mut handles = Vec::new();

@@ -1,4 +1,4 @@
-use crate::{Condition, Signature};
+use crate::{Chain, Condition, Signature};
 use serde::{Deserialize, Serialize};
 
 pub struct NamedOutput {
@@ -182,6 +182,9 @@ impl std::fmt::Display for WorkflowErrorHandler {
 // ============================================================================
 
 /// Compensation workflow for rollback
+///
+/// The executable form is a [`Chain`]: see [`to_chain`](Self::to_chain), which
+/// is what turns the two parallel vectors below into something a worker runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompensationWorkflow {
     /// Forward actions
@@ -214,6 +217,103 @@ impl CompensationWorkflow {
     /// Get number of steps
     pub fn len(&self) -> usize {
         self.forward.len()
+    }
+
+    /// Lower the workflow into the [`Chain`] a worker actually executes.
+    ///
+    /// The forward actions become the chain, in declaration order. Step *k* is
+    /// given the compensations of steps *k-1 … 0* — newest first — as its
+    /// **sequential error route**
+    /// ([`TaskOptions::link_errors`](crate::TaskOptions::link_errors), which
+    /// [`crate::dispatch::error_route`] writes into the task payload): when
+    /// step *k* fails for good the worker enqueues `compensate(k-1)`, and only
+    /// once *that* has finished `compensate(k-2)`, down to `compensate(0)`.
+    /// Nothing runs when the chain succeeds.
+    ///
+    /// # Which compensations run
+    ///
+    /// Only those of steps that **completed successfully**. The step that
+    /// failed is not compensated: it never reported success, so undoing it is
+    /// the step's own responsibility. The first step therefore carries no error
+    /// route at all — if it fails, nothing has happened yet.
+    ///
+    /// # Routes the steps already declare are preserved
+    ///
+    /// A forward signature may carry its own
+    /// [`link_error`](crate::TaskOptions::link_error)/`link_errors` (an alert,
+    /// a dead-letter hop). Those are kept and appended **after** the rollback,
+    /// so the compensations run first and the step's own handler last. Both
+    /// fields are folded into `link_errors` so that order is exactly what
+    /// [`all_link_errors`](crate::TaskOptions::all_link_errors) reports.
+    ///
+    /// # A failing compensation truncates the rollback
+    ///
+    /// The rollback is itself a chain, so if `compensate(k-1)` fails for good
+    /// the compensations behind it do not run. Write compensations to be
+    /// idempotent and give them a retry budget.
+    ///
+    /// # Extra or missing compensations
+    ///
+    /// [`step`](Self::step) keeps the two vectors aligned, but they are public:
+    /// a forward step with no compensation at its index simply contributes
+    /// nothing to the rollback, and compensations past the end of `forward` are
+    /// unreachable and ignored.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use celers_canvas::{CompensationWorkflow, Signature};
+    ///
+    /// let saga = CompensationWorkflow::new()
+    ///     .step(
+    ///         Signature::new("reserve_inventory".to_string()),
+    ///         Signature::new("release_inventory".to_string()),
+    ///     )
+    ///     .step(
+    ///         Signature::new("charge_payment".to_string()),
+    ///         Signature::new("refund_payment".to_string()),
+    ///     );
+    ///
+    /// let chain = saga.to_chain();
+    /// assert_eq!(chain.len(), 2);
+    /// // Nothing to roll back if the very first step fails.
+    /// assert!(chain.tasks[0].options.all_link_errors().is_empty());
+    /// // A failed payment releases the inventory that was already reserved.
+    /// let rollback: Vec<&str> = chain.tasks[1]
+    ///     .options
+    ///     .all_link_errors()
+    ///     .iter()
+    ///     .map(|sig| sig.task.as_str())
+    ///     .collect();
+    /// assert_eq!(rollback, vec!["release_inventory"]);
+    /// ```
+    #[must_use]
+    pub fn to_chain(&self) -> Chain {
+        let mut chain = Chain::with_capacity(self.forward.len());
+        // Compensations of the steps already added, most recent first: exactly
+        // the rollback order a failure at the next step needs.
+        let mut rollback: Vec<Signature> = Vec::with_capacity(self.forward.len());
+
+        for (index, forward) in self.forward.iter().enumerate() {
+            let mut step = forward.clone();
+
+            let mut route = rollback.clone();
+            route.extend(step.options.all_link_errors().into_iter().cloned());
+            // Both declaration forms are folded into `link_errors` so the
+            // rollback keeps its position: `all_link_errors` always reports the
+            // single `link_error` first, which would otherwise jump ahead of
+            // the compensations.
+            step.options.link_error = None;
+            step.options.link_errors = route;
+
+            chain = chain.then_signature(step);
+
+            if let Some(compensation) = self.compensations.get(index) {
+                rollback.insert(0, compensation.clone());
+            }
+        }
+
+        chain
     }
 }
 

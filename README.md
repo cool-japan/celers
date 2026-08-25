@@ -98,7 +98,13 @@ CeleRS follows a **layered architecture** inspired by Python Celery's design:
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Workspace Crates (18 Total - 100% Complete)
+### Workspace Crates (18 published - 100% Complete)
+
+The workspace has two further members that are never published
+(`publish = false`): `celers-examples` (the runnable examples and benchmarks)
+and `celers-facade-test` (a two-dependency crate that pins the minimum
+dependency set `#[celers::task]` needs downstream). Both are in `members` so
+`cargo build/clippy/fmt --workspace` covers them.
 
 #### Core & Protocol Layer
 - **celers**: Facade crate with unified API
@@ -127,6 +133,28 @@ CeleRS follows a **layered architecture** inspired by Python Celery's design:
 - **celers-macros**: Procedural macros (`#[task]`, `#[derive(Task)]`)
 - **celers-cli**: Command-line worker and queue management
 - **celers-metrics**: Prometheus metrics and observability
+
+### Pure Rust: one documented exception
+
+Every crate above builds C/C++/Fortran-free with its default features, and the
+banned-crate policy is enforced mechanically by `cargo deny check bans` against
+the workspace's `deny.toml`.
+
+There is exactly one exception, and it is opt-in:
+
+| Feature | Crate | Status |
+|---|---|---|
+| `sqs` | `celers-broker-sqs` (and the `celers` facade's `sqs` / `full` features) | **Not Pure Rust.** The AWS SDK's `default-https-client` hard-selects `aws-smithy-http-client/rustls-aws-lc` → `aws-lc-rs` → `aws-lc-sys`, which is vendored C/C++/assembly built with `cmake` + `cc`. The SDK offers no Pure-Rust TLS provider; its only alternatives (`rustls-ring`, `rustls-aws-lc-fips`, `s2n-tls`) are also C/asm. Removing it requires a custom `HttpClient` built on `oxihttp-client`. |
+| `amqp` | `celers-broker-amqp` | Pure Rust as of 0.3.1. `lapin` is pinned to `default-features = false` + `rustls-webpki-roots-certs`, and `celers_broker_amqp::install_pure_tls_provider()` installs the `rustls-rustcrypto` provider, so AMQPS no longer pulls `aws-lc-rs`. Deployments behind a private CA should enable `celers-broker-amqp/tls-native-certs` (also Pure Rust) to add the OS trust store. |
+
+Note that `--all-features` and the facade's `full` feature both turn `sqs` on,
+so a build using either is not Pure Rust. Verify any given crate with
+`cargo tree -e features -i aws-lc-sys -p <crate>`.
+
+The gRPC result backend (`celers-backend-rpc`) ships without built-in TLS for
+the same reason: `tonic`'s `tls-ring` / `tls-aws-lc` features pull banned
+crypto. Bring your own TLS-enabled `Channel` via
+`GrpcResultBackend::from_channel_with_config`.
 
 ### Crate Status (v0.3.1)
 
@@ -171,6 +199,23 @@ celers-protocol = "0.3"
 celers-broker-redis = "0.3"
 celers-worker = "0.3"
 celers-macros = "0.3"
+tokio = { version = "1", features = ["full"] }
+
+# Required by the code `#[task]` generates, not just by your own code:
+# the macro expands to an `#[async_trait]` impl whose input struct derives
+# `serde::Serialize`/`Deserialize`, and those paths resolve in *your* crate.
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+```
+
+Or use the `celers` facade, which re-exports the whole API surface. Note that
+`serde` is still needed as a direct dependency even then — a derive path is not
+satisfied by the facade's re-export:
+
+```toml
+[dependencies]
+celers = "0.3"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

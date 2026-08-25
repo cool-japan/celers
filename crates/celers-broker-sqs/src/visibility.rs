@@ -207,12 +207,9 @@ mod tests {
     async fn heartbeat_can_be_stopped_before_its_first_tick() {
         // The task sleeps for a full interval before touching AWS, so
         // cancelling immediately guarantees no request is ever made and the
-        // test stays deterministic (no sleeps, no network).
-        let config = aws_sdk_sqs::Config::builder()
-            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
-            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
-            .build();
-        let client = Client::from_conf(config);
+        // test stays deterministic (no sleeps, no network). The client's
+        // transport is offline for the same reason — see `test_support`.
+        let client = crate::test_support::offline_sqs_client();
 
         let heartbeat = VisibilityHeartbeat::spawn(
             client,
@@ -229,11 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_heartbeat_cancels_it() {
-        let config = aws_sdk_sqs::Config::builder()
-            .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
-            .region(aws_sdk_sqs::config::Region::new("us-east-1"))
-            .build();
-        let client = Client::from_conf(config);
+        let client = crate::test_support::offline_sqs_client();
 
         let cancelled = {
             let heartbeat = VisibilityHeartbeat::spawn(

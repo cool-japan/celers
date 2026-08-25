@@ -875,7 +875,13 @@ mod tests {
     #[test]
     fn remove_tenant_falls_back_to_default() {
         let limiter = TenantRateLimiter::with_default(RateLimitConfig::new(1000.0).with_burst(5));
-        limiter.set_tenant_config("temp", RateLimitConfig::new(1000.0).with_burst(1));
+        // The override's rate has to be slow enough that the bucket cannot
+        // refill between the two acquires below. At 1000/s — which this used to
+        // use — a single millisecond of scheduling delay hands back a whole
+        // token, so "strict override active" failed intermittently under a
+        // loaded parallel test run. The sibling `reset_all_restores_all_tenants`
+        // uses the same near-zero rate for the same reason.
+        limiter.set_tenant_config("temp", RateLimitConfig::new(0.0001).with_burst(1));
         assert!(limiter.try_acquire("temp"));
         assert!(!limiter.try_acquire("temp")); // strict override active
 

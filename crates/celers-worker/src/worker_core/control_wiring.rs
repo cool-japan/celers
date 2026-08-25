@@ -117,8 +117,12 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
             time_limits: self.time_limits.clone(),
             circuit_breaker: self.circuit_breaker.clone(),
             concurrency: u32::try_from(self.config.concurrency).unwrap_or(u32::MAX),
-            // CeleRS has no prefetch reserve; a batch dequeue is the closest
-            // analogue of Celery's prefetch multiplier.
+            // The worker deliberately holds no prefetch reserve: it acquires
+            // its concurrency permits before dequeuing, so it never reserves a
+            // message it has no capacity to run (see `crate::prefetch`'s module
+            // doc for the full decision). A batch dequeue -- bounded by the
+            // permits actually held -- is therefore the closest analogue of
+            // Celery's prefetch multiplier this worker has.
             prefetch_multiplier: if self.config.enable_batch_dequeue {
                 u32::try_from(self.config.batch_size).unwrap_or(u32::MAX)
             } else {

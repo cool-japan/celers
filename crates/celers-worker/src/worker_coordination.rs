@@ -8,23 +8,41 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! Singleton work is held with a [`LeadershipGuard`], not with a cached
+//! `bool`: the guard renews leadership in the background and reports the loss
+//! through [`LeadershipGuard::is_current`], so a worker whose leader key
+//! expired stops doing the singleton work instead of continuing to believe it
+//! is the leader. [`Coordinator::try_become_leader`] on its own is a one-shot
+//! election with no renewal — see its own documentation for what that costs.
+//!
+//! ```no_run
 //! # #[cfg(feature = "redis")]
 //! # async fn example() -> celers_core::Result<()> {
-//! use celers_worker::worker_coordination::{WorkerCoordinator, CoordinatorConfig};
+//! use celers_worker::worker_coordination::{
+//!     CoordinatorConfig, LeadershipGuard, WorkerCoordinator,
+//! };
+//! use std::sync::Arc;
 //!
 //! let config = CoordinatorConfig {
 //!     redis_url: "redis://127.0.0.1:6379".to_string(),
 //!     worker_id: "worker-1".to_string(),
 //!     ..Default::default()
 //! };
+//! let leader_ttl_secs = config.leader_ttl_secs;
 //!
-//! let coordinator = WorkerCoordinator::new(config).await?;
+//! let coordinator: Arc<dyn celers_worker::worker_coordination::Coordinator> =
+//!     Arc::new(WorkerCoordinator::new(config).await?);
 //!
-//! // Try to become leader
-//! if coordinator.try_become_leader("my_singleton_task").await? {
-//!     println!("I am the leader!");
+//! // Try to become leader. `None` means another worker holds it.
+//! if let Some(guard) =
+//!     LeadershipGuard::try_acquire(coordinator, "my_singleton_task", leader_ttl_secs).await?
+//! {
+//!     while guard.is_current() {
+//!         // ... do one unit of the singleton work, then re-check ...
+//!         break;
+//!     }
 //! }
+//! // Dropping `guard` releases leadership; losing it flips `is_current()`.
 //! # Ok(())
 //! # }
 //! ```

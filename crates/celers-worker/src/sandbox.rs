@@ -16,7 +16,7 @@
 //! | Environment scrubbing | **Enforced** by [`Sandbox::sanitize_env`] for callers that build a task environment through it |
 //! | Address space / file descriptor / CPU-time limits | **Enforced process-wide** via `setrlimit` from [`Sandbox::enforce_process_limits`], and only when the crate's off-by-default `rlimit` feature is enabled on a Unix target |
 //! | `max_cpu_percent` | **Advisory only** — a scheduling share is not expressible as an rlimit; [`Sandbox::validate_resources`] records violations reported by the caller |
-//! | seccomp-bpf syscall filtering | **Not implemented** — requesting it is a hard error, never a silent no-op |
+//! | seccomp-bpf syscall filtering | **Enforced process-wide** as a deny-list of syscalls a worker never makes, installed by [`Sandbox::enforce_process_limits`] on Linux with the crate's off-by-default `seccomp` feature at [`IsolationLevel::Process`]. In any other configuration requesting it is a hard error — never a silent no-op |
 //! | [`IsolationLevel::Container`] / [`IsolationLevel::Full`] | **Not implemented** — requesting them is a hard error |
 //!
 //! Because unimplemented containment is worse than no containment, a
@@ -138,13 +138,28 @@ impl SandboxConfig {
         self
     }
 
-    /// Enable or disable seccomp filtering
+    /// Enable or disable seccomp-bpf syscall filtering.
     ///
-    /// # Warning
+    /// # Availability
     ///
-    /// seccomp-bpf syscall filtering is **not implemented** in this build.
-    /// Setting this to `true` makes [`Sandbox::new`] fail with
+    /// Filtering exists only on Linux, only when `celers-worker` is built
+    /// with its off-by-default `seccomp` feature, and only at
+    /// [`IsolationLevel::Process`] — the level at which
+    /// [`Sandbox::enforce_process_limits`] runs and installs it. In any other
+    /// configuration setting this to `true` makes [`Sandbox::new`] fail with
     /// [`SandboxError::Unsupported`] rather than silently ignore the request.
+    ///
+    /// # Warning: process-wide and irreversible
+    ///
+    /// The filter applies to the **whole worker process**, not to one task,
+    /// and can never be removed once installed — a seccomp filter has no
+    /// per-future or per-task granularity, because tasks here are in-process
+    /// async futures sharing the runtime's threads. It is therefore a
+    /// deny-list of syscalls the worker itself never makes (module loading,
+    /// `ptrace`, mount/namespace manipulation, `bpf`, keyring access, …),
+    /// answered with `EPERM` rather than a `SIGSYS` kill. It is installed by
+    /// [`Sandbox::enforce_process_limits`], which should be called once at
+    /// worker start-up.
     pub fn with_seccomp(mut self, enable: bool) -> Self {
         self.enable_seccomp = enable;
         self
@@ -581,12 +596,33 @@ impl Sandbox {
         }
 
         if config.enable_seccomp {
-            return Err(SandboxError::Unsupported {
-                control: "seccomp".to_string(),
-                reason: "seccomp-bpf syscall filtering is not implemented in this build; \
-                         disable it with SandboxConfig::with_seccomp(false)"
-                    .to_string(),
-            });
+            if !cfg!(all(target_os = "linux", feature = "seccomp")) {
+                return Err(SandboxError::Unsupported {
+                    control: "seccomp".to_string(),
+                    reason: "seccomp-bpf syscall filtering is not compiled into this build: it \
+                             requires a Linux target and the celers-worker `seccomp` feature, \
+                             which is off by default. Rebuild with `--features seccomp` on \
+                             Linux, or disable it with SandboxConfig::with_seccomp(false)"
+                        .to_string(),
+                });
+            }
+            // The filter is installed by `enforce_process_limits`, which only
+            // runs at `IsolationLevel::Process`. Accepting the configuration
+            // at any other level would hand back a sandbox that reports
+            // success while never installing the filter — exactly the
+            // silently-dropped control this module refuses to produce.
+            if config.isolation_level != IsolationLevel::Process {
+                return Err(SandboxError::Unsupported {
+                    control: "seccomp".to_string(),
+                    reason: format!(
+                        "seccomp filtering is installed by Sandbox::enforce_process_limits, \
+                         which requires IsolationLevel::Process (configured: {}). Set \
+                         .with_isolation_level(IsolationLevel::Process), or disable seccomp \
+                         with .with_seccomp(false)",
+                        config.isolation_level
+                    ),
+                });
+            }
         }
 
         match config.isolation_level {
@@ -623,7 +659,12 @@ impl Sandbox {
             network_gate: !self.config.allow_network,
             os_resource_limits: cfg!(all(unix, feature = "rlimit"))
                 && self.config.isolation_level == IsolationLevel::Process,
-            syscall_filter: false,
+            // Like `os_resource_limits`, this reports that the control is
+            // both requested and compilable in this build; it is actually
+            // installed by `enforce_process_limits`.
+            syscall_filter: cfg!(all(target_os = "linux", feature = "seccomp"))
+                && self.config.enable_seccomp
+                && self.config.isolation_level == IsolationLevel::Process,
         }
     }
 
@@ -825,19 +866,36 @@ impl Sandbox {
             });
         }
 
+        // Tracks whether this build could apply *anything*, so a build with
+        // every OS-level feature switched off still fails loudly instead of
+        // reporting success for controls it never installed.
+        #[allow(unused_mut, unused_assignments)]
+        let mut applied_any = false;
+
         #[cfg(all(unix, feature = "rlimit"))]
         {
-            rlimit_impl::apply(&self.config)
+            rlimit_impl::apply(&self.config)?;
+            applied_any = true;
         }
-        #[cfg(not(all(unix, feature = "rlimit")))]
-        {
-            Err(SandboxError::Unsupported {
+
+        // The seccomp filter is installed last, because it is irreversible:
+        // if an rlimit is going to be refused, fail before narrowing the
+        // process's syscall surface for the rest of its life.
+        #[cfg(all(target_os = "linux", feature = "seccomp"))]
+        if self.config.enable_seccomp {
+            seccomp_impl::install()?;
+            applied_any = true;
+        }
+
+        if !applied_any {
+            return Err(SandboxError::Unsupported {
                 control: "enforce_process_limits".to_string(),
                 reason: "this build cannot apply OS resource limits: the `rlimit` feature is \
                          disabled or the target is not Unix"
                     .to_string(),
-            })
+            });
         }
+        Ok(())
     }
 
     /// Validate resource usage reported by the caller.
@@ -1080,6 +1138,319 @@ mod rlimit_impl {
     }
 }
 
+/// seccomp-bpf bridge, compiled only for Linux with the crate's
+/// off-by-default `seccomp` feature enabled.
+///
+/// # What this filter is, and is not
+///
+/// It is a **process-wide hardening deny-list**, not a per-task jail. A
+/// seccomp filter applies to the thread that installs it (and, with
+/// `TSYNC`, its siblings) and can never be removed; tasks here are
+/// in-process async futures multiplexed across the runtime's worker threads,
+/// so there is no thread or process boundary that corresponds to "one task".
+/// Filtering per task is therefore impossible by construction, and a filter
+/// that blocked, say, `socket` would break the worker's own broker
+/// connection rather than the task's.
+///
+/// What *is* both safe and useful is denying the syscalls a task worker
+/// never legitimately makes — module loading, `ptrace`, mount/namespace
+/// manipulation, `bpf`, `perf_event_open`, keyring access, `reboot` and
+/// friends. Blocking them shrinks the kernel attack surface reachable from
+/// exploited task code without touching anything the worker itself does.
+///
+/// The action is `SECCOMP_RET_ERRNO(EPERM)`, deliberately **not**
+/// `SECCOMP_RET_KILL_*`: if this list is ever wrong, the caller sees
+/// `EPERM` instead of the whole worker dying on `SIGSYS`.
+///
+/// # Verification status
+///
+/// This module is type-checked against both `x86_64-unknown-linux-gnu` and
+/// `aarch64-unknown-linux-gnu`, and [`build_program`]'s jump encoding is
+/// covered by a unit test. Neither has been *executed* on a Linux host — the
+/// workspace's build machine is macOS, where the whole module is `cfg`'d out.
+/// Run `cargo test -p celers-worker --features seccomp` on Linux before
+/// relying on it in production.
+#[cfg(all(target_os = "linux", feature = "seccomp"))]
+mod seccomp_impl {
+    use super::SandboxError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Classic-BPF instruction, layout-compatible with `struct sock_filter`
+    /// from `<linux/filter.h>`. Declared here rather than taken from `libc`
+    /// so the exact ABI this code relies on is visible at the use site.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+
+    /// `struct sock_fprog` from `<linux/filter.h>`.
+    #[repr(C)]
+    struct SockFprog {
+        len: libc::c_ushort,
+        filter: *const SockFilter,
+    }
+
+    // --- BPF opcodes (<linux/bpf_common.h>) ---
+    /// `BPF_LD | BPF_W | BPF_ABS`
+    const LD_W_ABS: u16 = 0x00 | 0x00 | 0x20;
+    /// `BPF_JMP | BPF_JEQ | BPF_K`
+    const JEQ_K: u16 = 0x05 | 0x10 | 0x00;
+    /// `BPF_RET | BPF_K`
+    const RET_K: u16 = 0x06 | 0x00;
+
+    // --- seccomp constants (<linux/seccomp.h>, <linux/prctl.h>) ---
+    /// Byte offset of `seccomp_data.nr`.
+    const OFFSET_NR: u32 = 0;
+    /// Byte offset of `seccomp_data.arch`.
+    const OFFSET_ARCH: u32 = 4;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_MODE_FILTER: libc::c_int = 2;
+    const PR_SET_SECCOMP: libc::c_int = 22;
+    const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+
+    /// `AUDIT_ARCH_*` from `<linux/audit.h>`, for the arch check that stops
+    /// a 32-bit compat entry point from bypassing the syscall-number list.
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xc000_003e;
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 0xc000_00b7;
+
+    /// Installed at most once per process; a second call is a no-op success
+    /// because the filter is already in force and cannot be removed.
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// The syscalls a CeleRS worker never makes and that an exploited task
+    /// would want. Everything here is available on both Linux targets this
+    /// crate is type-checked against (`x86_64` and `aarch64`).
+    fn denied_syscalls() -> Vec<libc::c_long> {
+        // `mut` is used only on x86_64, which appends three arch-specific
+        // entries below; aarch64 has no equivalent syscalls.
+        #[allow(unused_mut)]
+        let mut denied: Vec<libc::c_long> = vec![
+            // Debugging / cross-process memory access
+            libc::SYS_ptrace,
+            libc::SYS_process_vm_readv,
+            libc::SYS_process_vm_writev,
+            // Kernel module and kernel image manipulation
+            libc::SYS_init_module,
+            libc::SYS_finit_module,
+            libc::SYS_delete_module,
+            libc::SYS_kexec_load,
+            libc::SYS_kexec_file_load,
+            // Mount / namespace manipulation
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_pivot_root,
+            libc::SYS_chroot,
+            libc::SYS_setns,
+            libc::SYS_unshare,
+            // Tracing / eBPF subsystems
+            libc::SYS_bpf,
+            libc::SYS_perf_event_open,
+            // Kernel keyring
+            libc::SYS_add_key,
+            libc::SYS_keyctl,
+            libc::SYS_request_key,
+            // Filesystem handles that bypass path resolution
+            libc::SYS_name_to_handle_at,
+            libc::SYS_open_by_handle_at,
+            // Whole-machine state
+            libc::SYS_swapon,
+            libc::SYS_swapoff,
+            libc::SYS_reboot,
+            libc::SYS_acct,
+            libc::SYS_quotactl,
+            // Misc privilege / memory-management escape hatches
+            libc::SYS_personality,
+            libc::SYS_userfaultfd,
+        ];
+        #[cfg(target_arch = "x86_64")]
+        {
+            // x86-only I/O port and LDT access.
+            denied.push(libc::SYS_iopl);
+            denied.push(libc::SYS_ioperm);
+            denied.push(libc::SYS_modify_ldt);
+        }
+        denied
+    }
+
+    /// Build the filter program.
+    ///
+    /// Layout (indices are instruction slots):
+    ///
+    /// ```text
+    ///   0            load seccomp_data.arch
+    ///   1            if arch != AUDIT_ARCH -> deny
+    ///   2            load seccomp_data.nr
+    ///   3 .. 3+n-1   if nr == denied[i]    -> deny
+    ///   3+n          return ALLOW
+    ///   4+n          deny: return ERRNO(EPERM)
+    /// ```
+    ///
+    /// Jump offsets are relative to the *following* instruction and are
+    /// single bytes, which caps the list at 253 entries — far above the ~30
+    /// used here, and asserted below so a future addition cannot silently
+    /// produce a mis-encoded program.
+    fn build_program(denied: &[libc::c_long]) -> Vec<SockFilter> {
+        let n = denied.len();
+        assert!(
+            n <= 253,
+            "seccomp deny-list must stay within the 8-bit BPF jump range"
+        );
+        let n_u8 = n as u8;
+
+        let mut prog = Vec::with_capacity(n + 5);
+        // 0: A = seccomp_data.arch
+        prog.push(SockFilter {
+            code: LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: OFFSET_ARCH,
+        });
+        // 1: if A == AUDIT_ARCH fall through, else jump to deny.
+        prog.push(SockFilter {
+            code: JEQ_K,
+            jt: 0,
+            jf: n_u8 + 2,
+            k: AUDIT_ARCH,
+        });
+        // 2: A = seccomp_data.nr
+        prog.push(SockFilter {
+            code: LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: OFFSET_NR,
+        });
+        // 3..: one equality test per denied syscall.
+        for (i, nr) in denied.iter().enumerate() {
+            prog.push(SockFilter {
+                code: JEQ_K,
+                jt: n_u8 - i as u8,
+                jf: 0,
+                k: *nr as u32,
+            });
+        }
+        // 3+n: nothing matched -> allow.
+        prog.push(SockFilter {
+            code: RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        });
+        // 4+n: deny -> EPERM (never KILL; see the module docs).
+        prog.push(SockFilter {
+            code: RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ERRNO | (libc::EPERM as u32 & 0x0000_ffff),
+        });
+        prog
+    }
+
+    /// Install the filter for this process.
+    ///
+    /// Idempotent: the second and later calls succeed without touching the
+    /// kernel, because a seccomp filter can never be uninstalled.
+    pub(super) fn install() -> Result<(), SandboxError> {
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // `PR_SET_NO_NEW_PRIVS` is mandatory for an unprivileged
+        // `PR_SET_SECCOMP`, and is what stops a set-uid binary from being
+        // used to shed the filter.
+        //
+        // The trailing arguments are cast to `c_ulong` rather than left as
+        // untyped integer literals: `prctl` is variadic and the C library
+        // reads arg2..arg5 as `unsigned long`, so passing 32-bit `int`s would
+        // leave the upper half of each 8-byte variadic slot undefined — and
+        // the kernel rejects `PR_SET_NO_NEW_PRIVS` with `EINVAL` unless
+        // arg3..arg5 are exactly zero.
+        //
+        // SAFETY: `prctl` with these constants takes no pointers.
+        let rc = unsafe {
+            libc::prctl(
+                PR_SET_NO_NEW_PRIVS,
+                1 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if rc != 0 {
+            INSTALLED.store(false, Ordering::SeqCst);
+            return Err(SandboxError::LimitFailed(format!(
+                "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let program = build_program(&denied_syscalls());
+        let fprog = SockFprog {
+            len: program.len() as libc::c_ushort,
+            filter: program.as_ptr(),
+        };
+        // SAFETY: `fprog` points at `program`, which outlives this call, and
+        // `len` is exactly its length. The kernel copies the program in.
+        // See the `c_ulong` note above for why the trailing zeros are typed.
+        let rc = unsafe {
+            libc::prctl(
+                PR_SET_SECCOMP,
+                SECCOMP_MODE_FILTER as libc::c_ulong,
+                &fprog as *const SockFprog,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if rc != 0 {
+            INSTALLED.store(false, Ordering::SeqCst);
+            return Err(SandboxError::LimitFailed(format!(
+                "prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn program_layout_is_wellformed() {
+            let denied = denied_syscalls();
+            let prog = build_program(&denied);
+            let n = denied.len();
+            assert_eq!(prog.len(), n + 5);
+
+            // The arch mismatch branch must land exactly on the deny slot.
+            let deny_index = n + 4;
+            assert_eq!(1 + 1 + prog[1].jf as usize, deny_index);
+            // Every syscall test must land exactly on the deny slot too.
+            for (i, insn) in prog[3..3 + n].iter().enumerate() {
+                assert_eq!(3 + i + 1 + insn.jt as usize, deny_index);
+                assert_eq!(insn.jf, 0);
+            }
+            assert_eq!(prog[n + 3].k, SECCOMP_RET_ALLOW);
+            assert_eq!(prog[deny_index].k, SECCOMP_RET_ERRNO | libc::EPERM as u32);
+        }
+
+        #[test]
+        fn deny_list_has_no_duplicates() {
+            let denied = denied_syscalls();
+            let mut sorted = denied.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), denied.len(), "duplicate syscall in deny-list");
+        }
+    }
+}
+
 /// Sandbox violation error
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxViolation {
@@ -1230,16 +1601,52 @@ mod tests {
         }
     }
 
+    /// Without a Linux target *and* the `seccomp` feature there is no filter
+    /// to install, so asking for one must be a hard error rather than a
+    /// silently-dropped control. This is what the default build compiles.
+    #[cfg(not(all(target_os = "linux", feature = "seccomp")))]
     #[test]
-    fn test_seccomp_request_is_rejected() {
+    fn test_seccomp_request_is_rejected_when_not_compiled_in() {
         let config = SandboxConfig::new().with_seccomp(true);
         match Sandbox::new(config) {
             Err(SandboxError::Unsupported { control, reason }) => {
                 assert_eq!(control, "seccomp");
-                assert!(reason.contains("not implemented"), "reason: {}", reason);
+                assert!(reason.contains("seccomp"), "reason: {}", reason);
+                assert!(reason.contains("feature"), "reason: {}", reason);
             }
             other => panic!("seccomp must be rejected, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// With the filter compiled in, a configuration that can actually receive
+    /// it must construct — and one that cannot must still be refused.
+    #[cfg(all(target_os = "linux", feature = "seccomp"))]
+    #[test]
+    fn test_seccomp_request_is_accepted_only_at_isolation_level_process() {
+        // Installed by `enforce_process_limits`, which requires
+        // IsolationLevel::Process — so a Basic-level sandbox asking for
+        // seccomp would silently never get it, and must be refused.
+        let basic = SandboxConfig::new().with_seccomp(true);
+        match Sandbox::new(basic) {
+            Err(SandboxError::Unsupported { control, reason }) => {
+                assert_eq!(control, "seccomp");
+                assert!(
+                    reason.contains("IsolationLevel::Process"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!(
+                "seccomp below IsolationLevel::Process must be rejected, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+
+        let process = SandboxConfig::new()
+            .with_seccomp(true)
+            .with_isolation_level(IsolationLevel::Process);
+        let sandbox = Sandbox::new(process).expect("seccomp is supported in this build");
+        assert!(sandbox.config().is_seccomp_enabled());
+        assert!(sandbox.enforcement().syscall_filter);
     }
 
     #[test]

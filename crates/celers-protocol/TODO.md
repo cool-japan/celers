@@ -409,7 +409,7 @@ Full Celery protocol compatibility with advanced utilities and performance optim
 - `base64` - Binary encoding
 - `hex` - Hex encoding for signatures (optional)
 - `rmp-serde` - MessagePack (optional)
-- `serde_yaml` - YAML (optional)
+- `serde_yaml_ng` - YAML (optional; maintained fork of the archived `serde_yaml`)
 - `bson` - BSON serialization (optional)
 - `prost` - Protobuf serialization (optional)
 - `oxiarc-deflate` - Gzip/deflate compression (optional, Pure Rust)

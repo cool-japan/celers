@@ -557,11 +557,9 @@ println!("Rejection rate: {:.1}%",
    ```rust
    use celers_worker::rate_limit::RateLimitConfig;
 
-   let rate_config = RateLimitConfig {
-       requests_per_second: 100.0,  // Increase limit
-       burst_size: 150,  // Allow bursts
-       ..Default::default()
-   };
+   // `new(max_tokens, refill_rate)`: a 150-token burst refilled at 100
+   // tokens per second.
+   let rate_config = RateLimitConfig::new(150.0, 100.0);
    ```
 
 2. **Use Lenient Preset:**
@@ -571,10 +569,17 @@ println!("Rejection rate: {:.1}%",
 
 3. **Enable Distributed Rate Limiting:**
    ```rust
-   use celers_worker::distributed_rate_limit::{DistributedRateLimiter, RedisRateLimiter};
+   use celers_worker::distributed_rate_limit::{
+       DistributedRateLimitConfig, DistributedRateLimiter, DistributedRateLimiterTrait,
+   };
 
-   // Share limits across workers
-   let limiter = RedisRateLimiter::new(redis_url, "task_type", rate_config).await?;
+   // Share limits across workers (needs the crate's `redis` feature).
+   let config = DistributedRateLimitConfig::new(redis_url)
+       .with_capacity(150)
+       .with_refill_rate(100.0);
+   let limiter = DistributedRateLimiter::new(config).await?;
+
+   let allowed = limiter.try_acquire("task_type", 1).await?;
    ```
 
 ---
@@ -590,58 +595,71 @@ println!("Rejection rate: {:.1}%",
 
 **Diagnosis:**
 ```rust
-use celers_worker::dlq::DlqHandler;
+use celers_worker::dlq::{DlqConfig, DlqHandler};
 
-let dlq = DlqHandler::new(config);
-let stats = dlq.get_statistics().await;
+let dlq = DlqHandler::new(DlqConfig::new(true));
+let stats = dlq.get_stats().await;
 
-println!("DLQ size: {}", stats.total_entries);
-println!("Oldest entry: {:?}", stats.oldest_entry_age);
+println!("DLQ size: {}", stats.total_messages);
+println!("Reprocess failures: {}", stats.reprocess_failures);
 
-// Get entries by task type
-let entries = dlq.get_entries_by_task_name("failing_task").await?;
+if let Some(oldest) = dlq.get_oldest_entry().await {
+    println!("Oldest entry: task {} at {}", oldest.task_id, oldest.dlq_timestamp);
+}
+
+// Entries by task type (returns a `Vec`, not a `Result`)
+let entries = dlq.get_entries_by_task_name("failing_task").await;
 println!("Failed 'failing_task' count: {}", entries.len());
 ```
 
 **Solutions:**
 
-1. **Enable TTL Cleanup:**
-   ```rust
-   use celers_worker::dlq::DlqConfig;
+1. **Bound the queue and sweep it:**
 
-   let dlq_config = DlqConfig {
-       enabled: true,
-       max_entries: 10000,
-       entry_ttl_secs: 86400 * 7,  // 7 days
-       auto_cleanup: true,
-       ..Default::default()
-   };
+   A TTL only says *when* an entry becomes stale — nothing expires on its
+   own. Pair the configuration with a sweeper (a `Worker` given a DLQ
+   config runs one for you; a standalone handler needs its own).
+
+   ```rust
+   use celers_worker::dlq::{DlqConfig, DlqHandler};
+   use std::sync::Arc;
+   use std::time::Duration;
+
+   let dlq_config = DlqConfig::new(true)
+       .with_max_size(10_000)
+       .with_ttl(86_400 * 7); // 7 days
+
+   let dlq = Arc::new(DlqHandler::new(dlq_config));
+   let _sweeper = Arc::clone(&dlq).spawn_cleanup_task(Duration::from_secs(3_600));
    ```
 
 2. **Enable Reprocessing:**
    ```rust
-   use celers_worker::dlq::{DlqReprocessor, DlqReprocessConfig};
+   use celers_worker::dlq::{DlqReprocessConfig, DlqReprocessor};
 
-   let reprocess_config = DlqReprocessConfig {
-       enabled: true,
-       max_retry_attempts: 3,
-       retry_delay_secs: 3600,  // 1 hour
-       ..Default::default()
-   };
+   let reprocess_config = DlqReprocessConfig::new(true)
+       .with_min_age(3_600)       // leave an entry alone for an hour first
+       .with_max_attempts(3)
+       .with_check_interval(300)  // scan every 5 minutes
+       .with_batch_size(10);
 
-   let reprocessor = DlqReprocessor::new(dlq.clone(), reprocess_config);
-   reprocessor.start_background_reprocessing().await;
+   // `new(config, handler, broker)` — the reprocessor re-enqueues through
+   // the broker, so it needs one.
+   let reprocessor =
+       DlqReprocessor::new(reprocess_config, Arc::clone(&dlq), Arc::clone(&broker));
+   reprocessor.start().await?;
    ```
 
 3. **Export and Archive:**
    ```rust
    // Export to JSON for analysis
-   let entries = dlq.export_to_json().await?;
+   let json = dlq.export_json().await?;
    let export_path = std::env::temp_dir().join("dlq_export.json");
-   std::fs::write(&export_path, entries)?;
+   std::fs::write(&export_path, json)?;
 
-   // Clear old entries after export
-   dlq.cleanup_old_entries(Duration::from_secs(86400 * 30)).await?;
+   // Drop everything past the configured TTL after the export.
+   let removed = dlq.cleanup_expired().await?;
+   println!("Removed {removed} expired DLQ entries");
    ```
 
 ---

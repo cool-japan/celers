@@ -2,15 +2,28 @@
 
 This guide covers deploying CeleRS in production environments using Docker, Kubernetes, and cloud platforms.
 
+**Read this first if you only read one section:** [Building a Worker Image](#building-a-worker-image). CeleRS tasks
+are compiled-in Rust code, not modules a generic binary loads at runtime the way Python Celery does. The `celers`
+CLI binary this repository ships (and the `Dockerfile` at the repo root builds) is an *operational* tool --
+`status`, `inspect`, `control`, `queue`, `dlq`, `schedule`, `backup`/`restore`, `doctor`, and friends -- not a task
+executor. Running `celers worker` from that image starts a real worker that connects to your broker and joins the
+remote-control channel, but it registers **zero tasks**, so it can never execute one
+(`crates/celers-cli/src/commands/worker.rs` builds the registry with `TaskRegistry::new()` and prints a warning
+about it). Every deployment below that shows `worker` running from the stock image is demonstrating broker
+connectivity, CLI operations, and worker lifecycle -- not task execution. To execute tasks you build your own
+binary that links `celers-worker` and registers your tasks, and deploy *that* image instead.
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Building a Worker Image](#building-a-worker-image)
 - [Docker Deployment](#docker-deployment)
 - [Kubernetes Deployment](#kubernetes-deployment)
 - [Cloud Platforms](#cloud-platforms)
 - [Monitoring & Observability](#monitoring--observability)
 - [Performance Tuning](#performance-tuning)
 - [Security Best Practices](#security-best-practices)
+- [Troubleshooting](#troubleshooting)
 
 ## Quick Start
 
@@ -23,46 +36,195 @@ This guide covers deploying CeleRS in production environments using Docker, Kube
 
 ### Local Development
 
-Use docker-compose for local development:
+`docker-compose.yml` at the repo root starts Redis, PostgreSQL, RabbitMQ, Prometheus, Grafana, and a demo
+`celers` worker container (connectivity only -- see the note above and
+[Building a Worker Image](#building-a-worker-image)):
 
 ```bash
-# Start all services
+# Start the core stack (redis, postgres, rabbitmq, prometheus, grafana, worker)
 docker-compose up -d
+
+# Also start MySQL and the SQS emulator (localstack), for the broker suites
+# that need them -- see tests/integration/README.md
+docker-compose --profile test up -d
 
 # View logs
 docker-compose logs -f worker
 
-# Scale workers
+# Scale the demo worker container (still an empty registry -- this proves
+# broker fan-out, not task throughput)
 docker-compose up -d --scale worker=4
 
 # Stop all services
 docker-compose down
 ```
 
-## Docker Deployment
+## Building a Worker Image
 
-### Single Worker Instance
+This is the part the shipped `celers` image cannot do for you. A minimal worker project:
+
+```
+my-worker/
+├── Cargo.toml
+├── Dockerfile
+└── src/
+    └── main.rs
+```
+
+`Cargo.toml`:
+
+```toml
+[package]
+name = "my-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+celers-macros = "0.3"
+celers-core = "0.3"
+celers-broker-redis = "0.3"
+celers-worker = "0.3"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing-subscriber = "0.3"
+
+# Required by the code `#[task]` generates -- see the root README's
+# "Installation" section for why these two are needed even though
+# celers-macros re-exports parts of their API.
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+```
+
+`src/main.rs` (adapted from `crates/celers-examples/examples/macro_tasks.rs` in this repository, trimmed to one
+task):
+
+```rust
+use celers_broker_redis::RedisBroker;
+use celers_core::TaskRegistry;
+use celers_macros::task;
+use celers_worker::{Worker, WorkerConfig};
+
+/// Define a task with the #[task] macro. This expands to an `AddTask` type
+/// implementing `celers_core::Task`, plus an `AddTaskInput { a: i64, b: i64 }`
+/// struct generated from the function signature.
+#[task]
+async fn add(a: i64, b: i64) -> celers_core::Result<i64> {
+    Ok(a + b)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let broker_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let broker = RedisBroker::new(&broker_url, "celery")?;
+
+    // This is the step the shipped `celers` CLI binary cannot take for
+    // you: register the tasks this binary actually knows how to run.
+    let registry = TaskRegistry::new();
+    registry.register(AddTask).await;
+
+    let config = WorkerConfig {
+        concurrency: 4,
+        max_retries: 3,
+        default_timeout_secs: 300,
+        ..Default::default()
+    };
+
+    let worker = Worker::new(broker, registry, config);
+    worker.run().await?;
+
+    Ok(())
+}
+```
+
+`Dockerfile` (same two-stage pattern as this repository's own `Dockerfile`, building your crate instead of
+`celers-cli`):
+
+```dockerfile
+FROM rust:1.95.0-slim-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 worker
+COPY --from=builder /app/target/release/my-worker /usr/local/bin/my-worker
+USER worker
+ENV RUST_LOG=info
+ENTRYPOINT ["/usr/local/bin/my-worker"]
+```
+
+Build and run it exactly like any other container:
 
 ```bash
-# Pull the latest image
-docker pull cooljapan/celers:latest
+docker build -t my-worker:latest .
 
-# Run worker
+# --network must be the Compose network the root docker-compose.yml's redis
+# service is on. Compose names it `<project>_celers-network`, where
+# <project> defaults to the checkout's directory name; confirm yours with
+# `docker compose config | grep -A1 '^networks:'`. For a checkout named
+# "celers" (the repository's own directory name) that is:
+docker run --rm -e REDIS_URL=redis://redis:6379 --network celers_celers-network my-worker:latest
+```
+
+This image, unlike the stock `celers` one, actually executes `add` tasks enqueued against the `celery` queue.
+Every `docker run`/Compose/Kubernetes/ECS/Cloud Run example later in this guide that shows a worker doing real
+work assumes an image built this way, not the stock `celers:latest`.
+
+If you also want this worker reachable from `celers inspect`/`celers control`, join the same remote-control
+channel the stock CLI uses -- see `RedisControlTransport` in `celers-broker-redis` and
+`crates/celers-cli/src/commands/worker.rs` for the reference wiring. If you want it to expose Prometheus metrics
+for the dashboard in [Monitoring & Observability](#monitoring--observability), see
+`crates/celers-examples/examples/prometheus_metrics.rs` for a minimal HTTP exporter built on `celers-metrics`.
+
+## Docker Deployment
+
+**No official CeleRS image is published to a public registry as of 0.3.1.** The only workflow that ever built and
+pushed one lives disabled at `.github/workflows.disabled/release.yml` (this project's release automation is
+manual; see the repository's contribution policy). Build locally instead:
+
+```bash
+# From the repository root: builds the operational `celers` CLI image
+# (status/inspect/control/queue/dlq/backup/doctor -- NOT a task executor;
+# see "Building a Worker Image" above for that)
+docker build -t celers:0.3.1 .
+
+# Run it
+docker run --rm -e RUST_LOG=info celers:0.3.1 status --broker redis://redis:6379
+```
+
+If you publish your own image under your own registry namespace, replace every `celers:0.3.1` below with that
+tag, and replace `worker` invocations with your own worker image where the example is meant to execute tasks.
+
+### Single Worker Instance (connectivity demo)
+
+```bash
+docker build -t celers:0.3.1 .
+
+# --broker must resolve from inside the container -- e.g. a Redis reachable
+# at that hostname on a shared Docker network (see the same --network note
+# under "Building a Worker Image"), or a real hostname/IP if Redis is
+# external. A bare `redis://redis:6379` only resolves if you also attach
+# this container to the network a host named "redis" is actually on.
 docker run -d \
   --name celers-worker \
+  --network celers_celers-network \
   -e RUST_LOG=info \
-  -e REDIS_URL=redis://redis:6379 \
-  cooljapan/celers:latest \
-  worker start --concurrency 8
+  celers:0.3.1 \
+  worker --broker redis://redis:6379 --concurrency 8
 ```
 
 ### Multi-Worker with Docker Compose
 
-Create `docker-compose.prod.yml`:
+Create `docker-compose.prod.yml` (swap `image: my-worker:latest` for your own worker image built per
+[Building a Worker Image](#building-a-worker-image) to actually execute tasks; using `celers:0.3.1` here, as
+below, reproduces the same empty-registry demo as the root `docker-compose.yml`):
 
 ```yaml
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
@@ -75,11 +237,11 @@ services:
           memory: 512M
 
   worker-high-priority:
-    image: cooljapan/celers:latest
+    image: my-worker:latest
     environment:
       RUST_LOG: info
       REDIS_URL: redis://redis:6379
-    command: worker start --concurrency 16 --queue high_priority
+    command: ["--concurrency", "16", "--queue", "high_priority"]
     deploy:
       replicas: 2
       resources:
@@ -88,11 +250,11 @@ services:
           cpus: '2'
 
   worker-normal:
-    image: cooljapan/celers:latest
+    image: my-worker:latest
     environment:
       RUST_LOG: info
       REDIS_URL: redis://redis:6379
-    command: worker start --concurrency 8 --queue celery
+    command: ["--concurrency", "8", "--queue", "celery"]
     deploy:
       replicas: 4
       resources:
@@ -171,7 +333,12 @@ spec:
 
 ### Worker Deployment
 
-Create `k8s/worker-deployment.yaml`:
+Create `k8s/worker-deployment.yaml`. `image` must be your own worker image (see
+[Building a Worker Image](#building-a-worker-image)) -- the stock `celers` image will start and pass its
+liveness/readiness probes (nothing here is broker-specific) but will never process a task. The probes below also
+assume *your* binary starts an HTTP server on 9090 exposing `/health` and `/ready`; `celers-worker::health`
+gives you `HealthChecker` to back those handlers, but your binary has to wire the listener itself -- `celers
+worker` does not start one:
 
 ```yaml
 apiVersion: apps/v1
@@ -196,12 +363,7 @@ spec:
     spec:
       containers:
         - name: worker
-          image: cooljapan/celers:latest
-          command: ["celers", "worker", "start"]
-          args:
-            - "--concurrency=8"
-            - "--max-retries=3"
-            - "--enable-metrics"
+          image: my-worker:latest
           env:
             - name: RUST_LOG
               value: "info"
@@ -277,6 +439,9 @@ spec:
           averageValue: "100"
 ```
 
+The `queue_size` custom metric requires a metrics adapter (e.g. `prometheus-adapter`) wired to your Prometheus
+instance -- this file only declares the HPA's intent, not that pipeline.
+
 Deploy to Kubernetes:
 
 ```bash
@@ -296,6 +461,10 @@ kubectl scale deployment celers-worker --replicas=10 -n celers
 
 ## Cloud Platforms
 
+The examples below all assume `image` points at your own worker image (see
+[Building a Worker Image](#building-a-worker-image)), pushed to whatever registry your platform reads from --
+substitute your actual registry/tag.
+
 ### AWS ECS
 
 Use AWS ECS with Fargate for serverless deployment:
@@ -310,8 +479,7 @@ Use AWS ECS with Fargate for serverless deployment:
   "containerDefinitions": [
     {
       "name": "worker",
-      "image": "cooljapan/celers:latest",
-      "command": ["celers", "worker", "start"],
+      "image": "<your-account>.dkr.ecr.<region>.amazonaws.com/my-worker:latest",
       "environment": [
         {"name": "RUST_LOG", "value": "info"},
         {"name": "REDIS_URL", "value": "redis://cache.xxxxx.0001.use1.cache.amazonaws.com:6379"}
@@ -331,11 +499,12 @@ Use AWS ECS with Fargate for serverless deployment:
 
 ### Google Cloud Run
 
-Deploy to Cloud Run (note: requires HTTP endpoint for health checks):
+Deploy to Cloud Run (note: requires HTTP endpoint for health checks -- see the Kubernetes section's note about
+your binary needing to start that server itself):
 
 ```bash
 gcloud run deploy celers-worker \
-  --image gcr.io/PROJECT_ID/celers:latest \
+  --image gcr.io/PROJECT_ID/my-worker:latest \
   --platform managed \
   --region us-central1 \
   --memory 2Gi \
@@ -351,7 +520,7 @@ gcloud run deploy celers-worker \
 az container create \
   --resource-group celers-rg \
   --name celers-worker \
-  --image cooljapan/celers:latest \
+  --image myregistry.azurecr.io/my-worker:latest \
   --cpu 2 \
   --memory 4 \
   --environment-variables \
@@ -364,7 +533,11 @@ az container create \
 
 ### Prometheus Integration
 
-Configure Prometheus scraping in `prometheus.yml`:
+The root `docker-compose.yml` already wires a real, minimal `docs/prometheus.yml` into the `prometheus` service.
+It scrapes Prometheus itself out of the box (always up, proves the stack came up); the commented-out job for a
+`celers-worker` target is there to uncomment once you build a worker binary that exports metrics -- see
+[Building a Worker Image](#building-a-worker-image) and `crates/celers-examples/examples/prometheus_metrics.rs`.
+For your own deployment, add a `scrape_configs` job pointing at wherever that binary's exporter listens, e.g.:
 
 ```yaml
 scrape_configs:
@@ -377,45 +550,61 @@ scrape_configs:
 
 ### Grafana Dashboards
 
-Import pre-built dashboards:
-- Queue metrics: `docs/grafana/queue-dashboard.json`
-- Worker metrics: `docs/grafana/worker-dashboard.json`
-- Performance metrics: `docs/grafana/performance-dashboard.json`
+`docker-compose.yml`'s `grafana` service provisions from `docs/grafana/`: a Prometheus datasource
+(`docs/grafana/datasources/datasource.yml`) and one real dashboard, **CeleRS Overview**
+(`docs/grafana/dashboards/json/celers-overview.json`), built from the metric names `celers-metrics` actually
+registers -- task throughput, queue depth, active workers, and p50/p95/p99 execution latency. It stays empty
+until something is being scraped; see the Prometheus note above.
 
 ### Logging
 
-Configure structured logging:
+Configure structured logging via the CLI's own flags (there is no `RUST_LOG_FORMAT` environment variable --
+`--log-format`/`--log-sink` are CLI flags, and take precedence over `RUST_LOG` for level only):
 
 ```bash
 # JSON logging for production
-RUST_LOG=info,celers=debug RUST_LOG_FORMAT=json celers worker start
+RUST_LOG=info,celers=debug celers worker --broker redis://localhost:6379 --log-format json
 
-# Send logs to CloudWatch/Stackdriver
-celers worker start 2>&1 | /opt/aws/cloudwatch/bin/cloudwatch-logs-agent
+# Send logs to a file or a TCP collector instead of stdout
+celers worker --broker redis://localhost:6379 --log-sink file:/var/log/celers/worker.log
+celers worker --broker redis://localhost:6379 --log-sink tcp:collector.internal:5170
 ```
+
+Your own worker binary (built per [Building a Worker Image](#building-a-worker-image)) is regular Rust code --
+wire `tracing-subscriber` however your logging pipeline expects; it is not tied to the CLI's `--log-*` flags.
 
 ## Performance Tuning
 
 ### Worker Configuration
 
-Optimize for throughput:
+`celers worker --help` is the source of truth for what the stock CLI accepts; as of 0.3.1 that is `--broker`,
+`--queue`, `--mode`, `--concurrency`, `--max-retries`, `--timeout`, `--shutdown-timeout`, and `--config`. There is
+no `--enable-batch-dequeue`, `--batch-size`, `--poll-interval`, `--enable-circuit-breaker`, or `--max-result-size`
+flag on this command.
 
 ```bash
-celers worker start \
-  --concurrency 16 \
-  --enable-batch-dequeue \
-  --batch-size 20 \
-  --poll-interval 100
+# Higher concurrency, longer per-task budget
+celers worker --broker redis://localhost:6379 --concurrency 16 --timeout 60
+
+# Tighter retry/timeout budget for latency-sensitive queues
+celers worker --broker redis://localhost:6379 --concurrency 8 --max-retries 5 --timeout 10
 ```
 
-Optimize for latency:
+`--config celers.toml` (see `celers init`) exposes one knob the CLI flags don't: `[worker] poll_interval_ms`, the
+delay between dequeue attempts when a queue is empty (default 1000ms). Lower it for latency, raise it to reduce
+idle broker load:
 
-```bash
-celers worker start \
-  --concurrency 8 \
-  --poll-interval 50 \
-  --max-retries 5
+```toml
+[worker]
+concurrency = 8
+poll_interval_ms = 100
+max_retries = 3
+default_timeout_secs = 60
 ```
+
+If you're building your own worker binary, `celers_worker::WorkerConfig` has more fields than either the CLI or
+the config file exposes today (retry backoff, defer-delay bounds, graceful-shutdown timing) -- see
+`crates/celers-worker/src/types.rs` and set them directly.
 
 ### Redis Tuning
 
@@ -465,6 +654,7 @@ requirepass your_strong_password
 
 # Worker configuration
 REDIS_URL=redis://:your_strong_password@redis:6379
+celers worker --broker "$REDIS_URL"
 ```
 
 ### Secrets Management
@@ -501,18 +691,22 @@ resources:
 ### Common Issues
 
 **Workers not processing tasks:**
+- Confirm you're running a worker binary that actually registers tasks -- the stock `celers` image never does; see
+  [Building a Worker Image](#building-a-worker-image)
 - Check Redis connectivity: `redis-cli ping`
-- Verify queue has tasks: `celers queue status`
+- Verify the queue has tasks: `celers status --broker redis://localhost:6379` or
+  `celers queue stats --broker redis://localhost:6379`
 - Check worker logs: `docker logs celers-worker`
 
 **High memory usage:**
-- Enable batch processing: `--enable-batch-dequeue`
 - Reduce concurrency: `--concurrency 4`
-- Set max result size: `--max-result-size 1048576`
+- Check for large task payloads/results piling up in the broker/backend (`celers queue stats`,
+  `celers db` for a SQL backend)
 
 **Slow task processing:**
 - Increase concurrency: `--concurrency 16`
-- Enable circuit breaker: `--enable-circuit-breaker`
-- Check broker latency in metrics
+- Lower `[worker] poll_interval_ms` in `celers.toml` if workers are idling between polls
+- Check broker latency: `celers status` and the Prometheus histogram in
+  [Monitoring & Observability](#monitoring--observability) once your worker exports it
 
-For more help, see the [Performance Guide](../PERFORMANCE.md) or [open an issue](https://github.com/cool-japan/celers/issues).
+For more help, [open an issue](https://github.com/cool-japan/celers/issues).

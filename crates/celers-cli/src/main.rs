@@ -61,6 +61,7 @@ mod command_utils;
 mod commands;
 mod config;
 mod config_layer;
+mod config_validation;
 mod errors;
 mod interactive;
 mod keys;

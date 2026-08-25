@@ -120,11 +120,20 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             max_retries,
             timeout,
             shutdown_timeout,
+            no_connect_check,
+            broker_connect_timeout,
+            demo_tasks,
             config,
         } => {
             let cfg = load_config(config)?;
             let broker_url = broker.unwrap_or(cfg.broker.url);
             let queue_name = queue.unwrap_or(cfg.broker.queue);
+            let options = crate::commands::WorkerStartupOptions {
+                shutdown_timeout_secs: shutdown_timeout,
+                no_connect_check,
+                connect_timeout_secs: broker_connect_timeout,
+                demo_tasks,
+            };
 
             crate::commands::start_worker(
                 &broker_url,
@@ -133,7 +142,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 concurrency,
                 max_retries,
                 timeout,
-                shutdown_timeout,
+                &options,
             )
             .await?;
         }
@@ -240,6 +249,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             seed,
             jitter,
             dry_run,
+            signing_key,
             broker,
             queue,
             config,
@@ -262,7 +272,25 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 jitter_fraction: jitter,
             };
 
-            crate::commands::run_loadtest(&broker_url, &queue_name, &load_config, dry_run).await?;
+            // --signing-key wins; CELERS_TASK_SIGNING_KEY (the same variable
+            // `celers_worker::security` documents for the verifying side) is
+            // the fallback, so one key configured once works on both ends.
+            // An empty value from either source counts as "not provided"
+            // rather than signing with an empty key.
+            let signing_key = signing_key.filter(|k| !k.is_empty()).or_else(|| {
+                std::env::var("CELERS_TASK_SIGNING_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+            });
+
+            crate::commands::run_loadtest(
+                &broker_url,
+                &queue_name,
+                &load_config,
+                dry_run,
+                signing_key.as_deref().map(str::as_bytes),
+            )
+            .await?;
         }
 
         Commands::Queue(queue_cmd) => match queue_cmd {
@@ -635,24 +663,28 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
             WorkerMgmtCommands::Pause {
                 worker_id,
+                queue,
                 broker,
                 config,
             } => {
                 let cfg = load_config(config)?;
                 let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
 
-                crate::commands::pause_worker(&broker_url, &worker_id).await?;
+                crate::commands::pause_worker(&broker_url, &worker_id, &queue_name).await?;
             }
 
             WorkerMgmtCommands::Resume {
                 worker_id,
+                queue,
                 broker,
                 config,
             } => {
                 let cfg = load_config(config)?;
                 let broker_url = broker.unwrap_or(cfg.broker.url);
+                let queue_name = queue.unwrap_or(cfg.broker.queue);
 
-                crate::commands::resume_worker(&broker_url, &worker_id).await?;
+                crate::commands::resume_worker(&broker_url, &worker_id, &queue_name).await?;
             }
 
             WorkerMgmtCommands::Scale {
@@ -668,13 +700,14 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
             WorkerMgmtCommands::Drain {
                 worker_id,
+                grace,
                 broker,
                 config,
             } => {
                 let cfg = load_config(config)?;
                 let broker_url = broker.unwrap_or(cfg.broker.url);
 
-                crate::commands::drain_worker(&broker_url, &worker_id).await?;
+                crate::commands::drain_worker(&broker_url, &worker_id, grace).await?;
             }
 
             WorkerMgmtCommands::Logs {

@@ -26,7 +26,10 @@ impl MockBroker {
 impl Broker for MockBroker {
     async fn enqueue(&self, task: SerializedTask) -> celers_core::Result<celers_core::TaskId> {
         let task_id = task.metadata.id;
-        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).push(task);
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(task);
         Ok(task_id)
     }
 
@@ -69,7 +72,10 @@ impl Broker for MockBroker {
         tasks: Vec<SerializedTask>,
     ) -> celers_core::Result<Vec<celers_core::TaskId>> {
         let task_ids: Vec<_> = tasks.iter().map(|t| t.metadata.id).collect();
-        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).extend(tasks);
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(tasks);
         Ok(task_ids)
     }
 

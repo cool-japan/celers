@@ -847,17 +847,28 @@ mod tests {
 
     /// Seed `count` raw DLQ entries directly (bypassing broker enqueue) so
     /// the DLQ starts out larger than [`DEFAULT_SCAN_LIMIT`].
+    ///
+    /// Pipelined into a single round trip rather than `count` sequential,
+    /// individually-awaited `RPUSH` calls: seeding is test setup, not the
+    /// thing under test, and for a large `count` (see
+    /// `replay_all_drains_beyond_one_scan_window`, which seeds
+    /// `DEFAULT_SCAN_LIMIT + 5` entries) the per-call round-trip latency
+    /// dominated this test's wall time. The dominant remaining cost is the
+    /// *drain* itself, inherent to
+    /// `celers_broker_redis::RedisBroker::replay_from_dlq`'s design (an
+    /// `LRANGE <dlq> 0 -1` -- an O(dlq size) full-list scan -- on every
+    /// single replay), which lives outside this crate and is not something
+    /// this test can route around while still genuinely exercising `--all`
+    /// at the real, production `DEFAULT_SCAN_LIMIT` threshold idx 333
+    /// regression-tests.
     async fn seed_dlq(conn: &mut redis::aio::MultiplexedConnection, queue: &str, count: usize) {
         let dlq_key = crate::keys::dlq(queue);
+        let mut pipe = redis::pipe();
         for i in 0..count {
             let task_json = raw_task(Uuid::new_v4(), &format!("seed-task-{i}"));
-            let _: i64 = redis::cmd("RPUSH")
-                .arg(&dlq_key)
-                .arg(&task_json)
-                .query_async(conn)
-                .await
-                .expect("seed dlq entry");
+            pipe.rpush(&dlq_key, task_json);
         }
+        let _: () = pipe.query_async(conn).await.expect("seed dlq entries");
     }
 
     /// Regression test for idx 333: `celers replay --all` used to read
