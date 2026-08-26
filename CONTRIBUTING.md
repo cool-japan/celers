@@ -108,6 +108,10 @@ merged regardless of what it fixes:
 - **No warnings.** `cargo clippy --workspace --all-targets --all-features -- -D warnings` must be
   clean. Fix the lint; do not `#[allow]` it away without a comment explaining why the lint is wrong
   for this call site.
+- **Documentation builds clean.** `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features
+  --no-deps --keep-going` must be clean — broken intra-doc links included. Always pass
+  `--keep-going`: without it, `cargo doc` stops scheduling new crates once enough failures
+  accumulate, so a run that "passes" can still be hiding errors in crates it never reached.
 - **No `unwrap()` / `expect()` outside test code.** Production code returns a typed error
   (`CelersError`) or documents, in a comment at the call site, exactly why the panic is genuinely
   unreachable — and prefers a safe fallback over a panic even then. `#[cfg(test)]` code and files
@@ -135,7 +139,7 @@ merged regardless of what it fixes:
   `[workspace.dependencies]` and reference it from member manifests as `dep = { workspace = true }`
   (or `dep.workspace = true`). Don't pin a version in an individual crate's `Cargo.toml`.
 
-Every one of the checks above (build, clippy, tests, doctests, fmt, deny) is what
+Every one of the checks above (build, clippy, tests, doctests, rustdoc, fmt, deny) is what
 [README.md → Contributing](README.md#-contributing) lists as the local equivalent of CI — run them
 before pushing, in this order, since an early failure makes the later ones moot:
 
@@ -144,6 +148,7 @@ cargo build --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features
 cargo test --doc --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --keep-going
 cargo fmt --all --check
 cargo deny check bans
 ```

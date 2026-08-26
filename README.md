@@ -686,7 +686,7 @@ cargo bench -p celers-cli --bench serialization
 
 We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full picture — dev setup, the
 env-gated live-service suites and how to run each against a real service, and the mechanically-enforced
-code standards. The short version is the same six gates CONTRIBUTING.md asks you to run before opening a
+code standards. The short version is the same seven gates CONTRIBUTING.md asks you to run before opening a
 PR, since there is currently no CI that runs them for you (`.github/` holds only `dependabot.yml`,
 `FUNDING.yml`, and an inactive `workflows.disabled/`):
 
@@ -695,6 +695,7 @@ cargo build --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features
 cargo test --doc --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --keep-going
 cargo fmt --all --check
 cargo deny check bans
 ```
@@ -711,6 +712,7 @@ cargo nextest run --all-features
 ### Code Standards
 
 - **No warnings policy**: `cargo clippy --workspace --all-targets --all-features -- -D warnings` must be clean
+- **Documentation builds clean**: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --keep-going` must be clean — always pass `--keep-going`, or `cargo doc` stops scheduling crates once failures accumulate
 - **No `unwrap()`/`expect()`** outside test code — a typed `CelersError`, or a documented, genuinely
   unreachable fallback
 - **Pure Rust by default**: no C/C++/Fortran/vendored assembly, enforced by `cargo deny check bans`
