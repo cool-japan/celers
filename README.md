@@ -4,7 +4,8 @@
 type-safe, Pure-Rust task runtime that speaks Python Celery's message format.
 
 **Status (v0.3.1)**: ✅ 0 errors | ✅ 0 warnings | ✅ `cargo deny check bans` clean, `[graph] exclude` empty
-| ✅ **7,529 tests + 1,165 doctests passing** (`--all-features`)
+| ✅ **7,722 tests + 1,175 doctests passing** (`--all-features`, verified 2026-08-26 — see
+[Crate Status](#crate-status-v031))
 
 ### What is and is not verified
 
@@ -65,13 +66,39 @@ A `celers_worker::Worker` consumes from a `celers_core::Broker`. These implement
 - ✅ **PostgreSQL**: ACID guarantees with `FOR UPDATE SKIP LOCKED`
 - ✅ **MySQL**: Full SQL support with batch operations
 - ✅ **In-memory**: `InMemoryBroker`, for local development and tests
+- ✅ **RabbitMQ (AMQP)**: exchanges, topic routing, publisher confirms, management API — plus, new in
+  0.3.1, `celers_core::Broker` via `AmqpBroker::into_core_broker(queue)`
+- ✅ **AWS SQS**: long polling, FIFO queues, batch operations, visibility extension — plus, new in
+  0.3.1, `celers_core::Broker` via `SqsBroker::into_core_broker(queue)`
 
-These ship as **`celers-kombu` transports** (publish/consume/purge over `celers_protocol::Message`) and do
-**not** yet implement `celers_core::Broker`, so a `Worker` cannot consume from them — an adapter is the
-missing piece, tracked in [TODO.md](TODO.md#known-gaps--the-roadmap-after-031):
+RabbitMQ and SQS reach `celers_core::Broker` through `celers_kombu::core_adapter::KombuBrokerAdapter`,
+which wraps either transport's existing `publish`/`consume`/`purge` traits (over
+`celers_protocol::Message`) rather than replacing them. Both crates enable it **by default** — the
+`core-broker` feature, pulling in `celers-kombu/core-adapter` — so no extra Cargo flag is needed:
 
-- 🟡 **RabbitMQ (AMQP)**: exchanges, topic routing, publisher confirms, management API
-- 🟡 **AWS SQS**: long polling, FIFO queues, batch operations, visibility extension
+```rust,ignore
+let broker = AmqpBroker::new("amqp://localhost:5672", "celery")
+    .await?
+    .into_core_broker("celery");   // now a celers_core::Broker; hand it to Worker::new
+```
+
+Two things worth knowing before you point a `Worker` at either one:
+
+- **One transport, one lock.** The adapter serializes every operation through a single
+  `tokio::sync::Mutex` around the transport. The worker's `dequeue` parks inside it for up to the
+  adapter's poll timeout (1s by default) while it waits for a message, during which an `ack` from an
+  already-dispatched task briefly waits too. Give each worker its own transport rather than sharing
+  one — a shared adapter serializes those workers against each other, not just against themselves.
+  SQS's native `dequeue_batch`/`enqueue_batch`/`ack_batch`/`defer` map onto real batch calls
+  (`ReceiveMessage`, `SendMessageBatch`, `DeleteMessageBatch`, `ChangeMessageVisibility`) rather than
+  one request per message.
+- **Still not Celery-wire-compatible.** Both transports carry a JSON-serialized
+  `celers_protocol::Message` as the body, not kombu's own AMQP/SQS wire framing, so a real Celery
+  worker cannot consume from either — see
+  [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md#brokers). Revocation is also not
+  wired here yet: `cancel()`/`revoke()` answer `false`/no-op rather than reaching a queued message,
+  because neither transport can address one by id before it is delivered — tracked in
+  [TODO.md](TODO.md#known-gaps--the-roadmap-after-031).
 
 ### Result Backends (3 Types)
 - ✅ **Redis Backend**: Fast in-memory storage with automatic TTL
@@ -163,12 +190,15 @@ dependency set `#[celers::task]` needs downstream). Both are in `members` so
   that nothing in the interop suite exercises — the suite and every capture pin `task_protocol = 2`)
 - **celers-kombu**: Kombu-style messaging abstraction (`Producer`/`Consumer`/`Transport`)
 
-#### Broker Layer (3 task-queue brokers, 2 transports)
+#### Broker Layer (5 task-queue brokers)
 - **celers-broker-redis**: Redis with Lua scripts and pipelining — implements `celers_core::Broker`
 - **celers-broker-postgres**: PostgreSQL with `FOR UPDATE SKIP LOCKED` — implements `celers_core::Broker`
 - **celers-broker-sql**: MySQL with batch operations — implements `celers_core::Broker`
-- **celers-broker-amqp**: RabbitMQ/AMQP with exchanges and routing — `celers-kombu` transport only
-- **celers-broker-sqs**: AWS SQS with long polling — `celers-kombu` transport only
+- **celers-broker-amqp**: RabbitMQ/AMQP with exchanges and routing — `celers-kombu` transport, plus
+  `celers_core::Broker` via `into_core_broker()` (default-on `core-broker` feature); still not
+  Celery-wire-compatible (JSON body, not kombu's AMQP framing)
+- **celers-broker-sqs**: AWS SQS with long polling — `celers-kombu` transport, plus
+  `celers_core::Broker` via `into_core_broker()` (default-on `core-broker` feature); same caveat
 
 #### Result Backend Layer (3 Implementations)
 - **celers-backend-redis**: Redis with TTL and chord synchronization
@@ -225,15 +255,15 @@ crypto. Bring your own TLS-enabled `Channel` via
 
 ### Crate Status (v0.3.1)
 
-**Verified 2026-08-26 with `cargo nextest run --workspace --all-features`: 7,529 tests run, 7,529 passed, 0
-failed, 109 skipped**, plus **1,165 passing doctests** (`cargo test --doc --workspace --all-features`; 136
-more are ```` ```ignore ```` and never compile). A per-crate breakdown is intentionally not reproduced here:
-with 18 published crates under active, parallel development, a static table drifts out of date between
-releases faster than it gets corrected -- regenerate one locally with `cargo nextest list --workspace
---all-features` if you want a current snapshot, or watch a single crate's count with `cargo nextest list -p
-<crate> --all-features`.
+**Verified 2026-08-26 with `cargo nextest run --workspace --all-features`: 7,722 tests run, 7,722 passed, 0
+failed, 112 skipped** (default features: 7,447 run, 7,447 passed, 0 failed, 98 skipped), plus **1,175 passing
+doctests** (`cargo test --doc --workspace --all-features`; 138 more are ```` ```ignore ```` and never
+compile). A per-crate breakdown is intentionally not reproduced here: with 18 published crates under
+active, parallel development, a static table drifts out of date between releases faster than it gets
+corrected -- regenerate one locally with `cargo nextest list --workspace --all-features` if you want a
+current snapshot, or watch a single crate's count with `cargo nextest list -p <crate> --all-features`.
 
-That 7,529 total is not the whole story on what it verifies. Three categories of test coexist inside it, and
+That 7,722 total is not the whole story on what it verifies. Three categories of test coexist inside it, and
 only the first two ran a real assertion:
 
 1. **Ordinary tests** -- ran, asserted, passed.
@@ -242,7 +272,7 @@ only the first two ran a real assertion:
    `skipping` line and return, **still counted as passing**. See
    [tests/integration/README.md](tests/integration/README.md) for the full variable-to-service table and how
    to tell which happened.
-3. **`#[ignore]`d tests** (109, the "skipped" figure above) -- not attempted at all unless the run adds
+3. **`#[ignore]`d tests** (112, the "skipped" figure above) -- not attempted at all unless the run adds
    `--run-ignored all`.
 
 Category 2 means a green `--all-features` run with no service URLs exported -- the common case on a laptop --
@@ -251,7 +281,11 @@ don't need one. `docker-compose.yml` now carries a service for every one of them
 and LocalStack, `--profile python-compat` adds Celery), but **nothing in this repository runs the full
 matrix**: `.github/` holds only `dependabot.yml`, `FUNDING.yml` and a `workflows.disabled/` directory, so no
 workflow runs on push today. Running the matrix by hand -- services up, every gate variable exported,
-`--run-ignored all` -- is the only way to know all 7,529 assertions actually fired.
+`--run-ignored all` -- is the only way to know all 7,722 assertions actually fired; this campaign's final wave
+did exactly that for `celers-broker-postgres`/`celers-broker-sql`/`celers-backend-db` and found (then fixed)
+real defects that every category-1/2 run above had been silently passing around -- see
+[CHANGELOG.md](CHANGELOG.md)'s 0.3.1 "Fixed" section and [TODO.md → Known gaps #16](TODO.md#known-gaps--the-roadmap-after-031)
+for the one such defect still open.
 
 ## 🚀 Quick Start
 
@@ -299,8 +333,7 @@ celers = { version = "0.3", features = ["redis", "workflows"] }
 
 `celers/full` includes both. Feature flags for the rest: `postgres`, `mysql`, `amqp`, `sqs`,
 `backend-redis`, `backend-db`, `backend-rpc`, `beat` / `beat-cron` / `beat-solar`, `json`,
-`msgpack`, `metrics`, `tracing`, `dev-utils`. (`beat-solar` compiles, but solar schedules do not
-currently produce a next run — see [TODO.md](TODO.md#known-gaps--the-roadmap-after-031).)
+`msgpack`, `metrics`, `tracing`, `dev-utils`.
 
 **MSRV**: 1.89 for everything except `sqs`, which needs 1.94.1 (its AWS SDK dependencies are not
 optional) — and therefore so do `celers/full` and any `--all-features` build.
@@ -513,20 +546,23 @@ let info = checker.get_health();
 - ✅ **Phase 4**: Performance & Scalability
 - ✅ **Phase 5**: Beat Scheduler -- Cron, Interval, one-time and solar schedules all work (solar covers
   sunrise/sunset, civil/nautical/astronomical twilight and golden hour, and handles polar day/night)
-- 🚧 **Phase 6**: Extended Brokers & Backends -- all three result backends are complete; AMQP and SQS are
-  `celers-kombu` transports without a `celers_core::Broker` adapter, so a `Worker` cannot consume from them
+- ✅ **Phase 6**: Extended Brokers & Backends -- all three result backends are complete; AMQP and SQS are
+  now also worker-usable `celers_core::Broker`s via `celers_kombu::core_adapter::KombuBrokerAdapter`
+  (see [Brokers](#brokers) above), on by default
 - 🚧 **Phase 7**: Full Celery Protocol Compatibility -- the **protocol layer is interop-verified** against a
-  live Python Celery 5.6.3, both directions (`tests/python-compat/`). What remains is the broker and result
-  backend, which still carry CeleRS-shaped payloads, so the two runtimes cannot share a queue. Row-by-row
-  evidence in [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md)
+  live Python Celery 5.6.3, both directions (`tests/python-compat/`). What remains is every broker and
+  result backend still carrying CeleRS-shaped payloads instead of Celery's own wire framing -- true for
+  Redis/PostgreSQL/MySQL, and, separately, for the now-worker-usable AMQP/SQS brokers too -- so no CeleRS
+  broker can yet share a queue with a Python Celery worker. Row-by-row evidence in
+  [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md)
 - ✅ **Phase 8**: v0.2.0 Enhancements (Compression, Distributed Locks, Events)
 - ✅ **Phase 9**: v0.2.0 Production Features (Event Persistence, Chunking, Heartbeat)
 
 ### Upcoming Milestones
 
-- **Next**: route the broker and result backend through `celers-protocol` so a Python Celery worker and a
-  CeleRS worker can share a queue; a kombu pidbox codec so `celery -A app inspect` reaches a CeleRS worker;
-  a `celers_core::Broker` adapter over the AMQP and SQS transports. The full, evidence-backed list is
+- **Next**: route every broker and result backend through `celers-protocol` so a Python Celery worker and a
+  CeleRS worker can share a queue; a kombu pidbox codec so `celery -A app inspect` reaches a CeleRS worker.
+  The full, evidence-backed list is
   [TODO.md → Known gaps](TODO.md#known-gaps--the-roadmap-after-031)
 - **v1.0.0**: Stable API, Kafka/NATS brokers, web admin dashboard
 
@@ -541,6 +577,7 @@ let info = checker.get_health();
 - [Architecture Decision Records](docs/adr/) - Key design decisions
 - [CHANGELOG.md](CHANGELOG.md) - Release notes, including 0.3.1's breaking wire-format changes
 - [TODO.md](TODO.md) - Roadmap and the honest list of known gaps
+- [CONTRIBUTING.md](CONTRIBUTING.md) - Dev setup, the gated live-service suites, and code standards
 
 ## 🔬 Examples
 
@@ -575,8 +612,8 @@ cargo run -p celers-examples --example prometheus_metrics --features metrics
 
 ## 🧪 Testing
 
-Verified workspace-wide with `cargo nextest run --workspace --all-features`: **7,529 tests passing, 0
-failed, 109 skipped**, plus **1,165 passing doctests**. See [Crate Status](#crate-status-v031) above for what
+Verified workspace-wide with `cargo nextest run --workspace --all-features`: **7,722 tests passing, 0
+failed, 112 skipped**, plus **1,175 passing doctests**. See [Crate Status](#crate-status-v031) above for what
 those figures do and do not establish about the env-gated live-service suites, and
 [tests/integration/README.md](tests/integration/README.md) to run them against real services.
 
@@ -630,9 +667,11 @@ cargo bench -p celers-cli --bench serialization
 
 ## 🤝 Contributing
 
-We welcome contributions. There is no `CONTRIBUTING.md` yet (writing one is tracked in
-[TODO.md](TODO.md)); until there is, the rules are the ones enforced mechanically — see
-[Code Standards](#code-standards) below and run the same gates CI would:
+We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full picture — dev setup, the
+env-gated live-service suites and how to run each against a real service, and the mechanically-enforced
+code standards. The short version is the same six gates CONTRIBUTING.md asks you to run before opening a
+PR, since there is currently no CI that runs them for you (`.github/` holds only `dependabot.yml`,
+`FUNDING.yml`, and an inactive `workflows.disabled/`):
 
 ```bash
 cargo build --workspace --all-features
@@ -649,15 +688,22 @@ cargo deny check bans
 git clone https://github.com/cool-japan/celers.git
 cd celers
 cargo build --all-features
-cargo test --all-features
+cargo nextest run --all-features
 ```
 
 ### Code Standards
 
-- **No warnings policy**: All code must compile without warnings
-- **Test coverage**: Aim for >80% coverage
+- **No warnings policy**: `cargo clippy --workspace --all-targets --all-features -- -D warnings` must be clean
+- **No `unwrap()`/`expect()`** outside test code — a typed `CelersError`, or a documented, genuinely
+  unreachable fallback
+- **Pure Rust by default**: no C/C++/Fortran/vendored assembly, enforced by `cargo deny check bans`
+  against [`deny.toml`](deny.toml)'s `[graph] exclude`, which is empty and must stay that way
+- **File size**: keep source files under 2000 lines; split into submodules before crossing it
 - **Documentation**: Public APIs must have rustdoc comments
-- **Formatting**: Use `cargo fmt` before committing
+- **Formatting**: `cargo fmt --all --check` must pass
+
+Full detail, including how to run the suites that need Redis/PostgreSQL/MySQL/RabbitMQ/SQS/Python-Celery,
+is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Sponsorship
 

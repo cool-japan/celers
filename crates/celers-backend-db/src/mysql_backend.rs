@@ -23,6 +23,108 @@ use crate::task_meta_extra::TaskMetaExtra;
 use crate::tls_mode;
 use crate::{decode_result_state, default_ttl_config};
 
+/// Is this `ERROR 1061 (42000): Duplicate key name` — an index that already
+/// exists?
+///
+/// Matched on the error *number*, which is stable across MySQL and MariaDB
+/// versions and locales, rather than on the message text, which is neither.
+fn is_duplicate_key_name(e: &oxisql_core::OxiSqlError) -> bool {
+    e.to_string().contains("1061")
+}
+
+/// Is this the server refusing a statement the prepared-statement protocol
+/// cannot carry (`ERROR 1295 (HY000)`)?
+///
+/// Matched on the error *number*, which is stable across MySQL and MariaDB
+/// versions and locales, rather than on the message text, which is neither.
+fn is_unsupported_in_prepared_protocol(e: &oxisql_core::OxiSqlError) -> bool {
+    e.to_string().contains("1295")
+}
+
+/// Drop leading `--` line comments and whitespace from a statement.
+///
+/// [`sql_split::split_sql_statements`] keeps the comment lines that precede a
+/// statement attached to it (`-- Indexes for performance\nCREATE INDEX ...`),
+/// so a parser that looks at the first word sees `--` and gives up. That is
+/// not cosmetic: it silently un-guarded the *first* index in the migration,
+/// which is exactly the one that then failed with `Duplicate key name` on the
+/// second `migrate()`.
+fn strip_leading_sql_comments(statement: &str) -> &str {
+    let mut rest = statement.trim_start();
+    while let Some(after) = rest.strip_prefix("--") {
+        match after.find('\n') {
+            Some(nl) => rest = after[nl + 1..].trim_start(),
+            // A statement that is nothing but a comment.
+            None => return "",
+        }
+    }
+    rest
+}
+
+/// A `CREATE INDEX <name> ON <table> (...)` statement, decomposed.
+#[derive(Debug, PartialEq, Eq)]
+struct CreateIndex<'a> {
+    name: &'a str,
+    table: &'a str,
+}
+
+/// Recognise `CREATE INDEX <name> ON <table>(...)` and pull out the two
+/// identifiers, so the caller can ask `information_schema` whether the index
+/// is already there.
+///
+/// Deliberately narrow: it matches the shape the bundled
+/// `001_init_mysql.sql` actually uses and returns `None` for anything else
+/// (including `CREATE UNIQUE INDEX`, which that file does not contain), so an
+/// unrecognised statement is executed unchanged rather than silently skipped.
+fn parse_create_index(statement: &str) -> Option<CreateIndex<'_>> {
+    let mut words = strip_leading_sql_comments(statement).split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("CREATE") {
+        return None;
+    }
+    if !words.next()?.eq_ignore_ascii_case("INDEX") {
+        return None;
+    }
+    let name = words.next()?.trim_matches('`');
+    if !words.next()?.eq_ignore_ascii_case("ON") {
+        return None;
+    }
+    // `ON celers_task_results(expires_at)` — the table name may run straight
+    // into the column list with no space.
+    let table = words
+        .next()?
+        .split('(')
+        .next()
+        .map(|t| t.trim_matches('`'))
+        .filter(|t| !t.is_empty())?;
+
+    if name.is_empty() {
+        return None;
+    }
+    Some(CreateIndex { name, table })
+}
+
+/// Recognise `CREATE PROCEDURE <name>(...)` and pull out the routine name.
+///
+/// Returns `None` for anything else, so an unrecognised body is executed
+/// unchanged rather than skipped.
+fn parse_create_procedure_name(statement: &str) -> Option<&str> {
+    let mut words = statement.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("CREATE") {
+        return None;
+    }
+    if !words.next()?.eq_ignore_ascii_case("PROCEDURE") {
+        return None;
+    }
+    // `cleanup_expired_results(OUT deleted_count INT)` — the parameter list
+    // may run straight into the name.
+    words
+        .next()?
+        .split('(')
+        .next()
+        .map(|n| n.trim_matches('`'))
+        .filter(|n| !n.is_empty())
+}
+
 /// MySQL result backend implementation
 #[derive(Clone)]
 pub struct MysqlResultBackend {
@@ -127,6 +229,49 @@ impl MysqlResultBackend {
         &mut self.ttl_config
     }
 
+    /// Does `index` already exist on `table` in the current database?
+    ///
+    /// `information_schema.statistics` is the portable place to ask — it
+    /// exists on MySQL 5.7, MySQL 8 and MariaDB alike, unlike
+    /// `CREATE INDEX IF NOT EXISTS`, which none of them accept.
+    async fn index_exists(&self, table: &str, index: &str) -> Result<bool> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM information_schema.statistics \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = ? \
+                   AND index_name = ? \
+                 LIMIT 1",
+                &[&table, &index],
+            )
+            .await
+            .map_err(|e| {
+                BackendError::Connection(format!(
+                    "Failed to check for index '{index}' on '{table}': {e}"
+                ))
+            })?;
+        Ok(!rows.is_empty())
+    }
+
+    /// Does stored routine `name` already exist in the current database?
+    async fn routine_exists(&self, name: &str) -> Result<bool> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM information_schema.routines \
+                 WHERE routine_schema = DATABASE() \
+                   AND routine_name = ? \
+                 LIMIT 1",
+                &[&name],
+            )
+            .await
+            .map_err(|e| {
+                BackendError::Connection(format!("Failed to check for routine '{name}': {e}"))
+            })?;
+        Ok(!rows.is_empty())
+    }
+
     /// Run database migrations
     pub async fn migrate(&self) -> Result<()> {
         let migration_sql = include_str!("../migrations/001_init_mysql.sql");
@@ -145,10 +290,42 @@ impl MysqlResultBackend {
         // fragment.
         if let Some(main_sql) = sections.first() {
             for statement in sql_split::split_sql_statements(main_sql) {
-                self.conn
-                    .execute(&statement, &[])
-                    .await
-                    .map_err(|e| BackendError::Connection(format!("Migration failed: {}", e)))?;
+                // MySQL has no `CREATE INDEX IF NOT EXISTS` in any released
+                // version, so a bare `CREATE INDEX` makes `migrate()` a
+                // one-shot: the second call — a worker restart, or simply a
+                // second worker starting against the same database — fails
+                // with `ERROR 1061 (42000): Duplicate key name`. Every other
+                // statement in this file is already idempotent
+                // (`CREATE TABLE IF NOT EXISTS`), and `migrate()` is
+                // documented and used as safe to call repeatedly, so the
+                // index statements are made idempotent the portable way:
+                // ask `information_schema` first, exactly as the `extra`
+                // column check below does.
+                let creating_index = parse_create_index(&statement);
+                if let Some(index) = &creating_index {
+                    if self.index_exists(index.table, index.name).await? {
+                        continue;
+                    }
+                }
+
+                match self.conn.execute(&statement, &[]).await {
+                    Ok(_) => {}
+                    // The `information_schema` check above is a
+                    // check-then-act, so two workers migrating at the same
+                    // moment can both see the index missing and both issue
+                    // the `CREATE`. MySQL has no `CREATE INDEX IF NOT
+                    // EXISTS` to make that atomic, and its advisory lock
+                    // (`GET_LOCK`) is session-scoped — useless here, because
+                    // every `execute` checks a fresh connection out of the
+                    // pool and would not be the session holding the lock.
+                    // So the loser of the race tolerates `ERROR 1061
+                    // (42000): Duplicate key name`: the post-condition it
+                    // wanted (the index exists) is satisfied either way.
+                    Err(e) if creating_index.is_some() && is_duplicate_key_name(&e) => {}
+                    Err(e) => {
+                        return Err(BackendError::Connection(format!("Migration failed: {}", e)))
+                    }
+                }
             }
         }
 
@@ -158,11 +335,78 @@ impl MysqlResultBackend {
         // statement separators at this level).
         for &proc_section in sections.iter().skip(1) {
             if let Some(proc_sql) = proc_section.split("DELIMITER ;").next() {
-                let trimmed = proc_sql.trim();
-                if !trimmed.is_empty() {
-                    self.conn.execute(trimmed, &[]).await.map_err(|e| {
-                        BackendError::Connection(format!("Stored procedure creation failed: {}", e))
-                    })?;
+                // `DELIMITER` is a *client* directive, so the server never
+                // sees it — but the `//` that terminates the body inside the
+                // block is likewise client-side syntax and is NOT valid SQL.
+                // Sending the body with it attached made every single
+                // migration fail with
+                // `ERROR 1064 ... near '//'`, which meant neither
+                // `cleanup_expired_results` nor `chord_increment_counter`
+                // was ever created on any MySQL database.
+                let trimmed = proc_sql.trim().trim_end_matches("//").trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // `CREATE PROCEDURE IF NOT EXISTS` needs MySQL 8.0.29+, and
+                // this schema targets 5.7+; `DROP PROCEDURE IF EXISTS` first
+                // would leave a window where a concurrently-starting worker
+                // finds the procedure missing. Check instead, same as the
+                // index and column cases.
+                let name = parse_create_procedure_name(trimmed);
+                if let Some(name) = name {
+                    // Already there — e.g. an operator ran the migration
+                    // through the `mysql` CLI, where `DELIMITER` works.
+                    if self.routine_exists(name).await? {
+                        continue;
+                    }
+                }
+
+                match self.conn.execute(trimmed, &[]).await {
+                    Ok(_) => {}
+                    Err(e) if is_unsupported_in_prepared_protocol(&e) => {
+                        // MySQL refuses `CREATE PROCEDURE` over the
+                        // prepared-statement protocol (`ERROR 1295 (HY000):
+                        // This command is not supported in the prepared
+                        // statement protocol yet`), and oxisql-mysql 0.4.1
+                        // routes both `execute` and `execute_batch` through
+                        // `mysql_async`'s `exec_iter`, which always prepares
+                        // — there is no text-protocol escape hatch to reach
+                        // for. Creating these routines from CeleRS is
+                        // therefore impossible until the driver grows one.
+                        //
+                        // This is downgraded to a warning rather than an
+                        // error *only* because nothing in CeleRS calls
+                        // either bundled routine: `cleanup_expired_results`
+                        // and `chord_increment_counter` are invoked on
+                        // PostgreSQL (where they are SQL functions created
+                        // by 001_init_postgres.sql), while the MySQL paths
+                        // do that work in inline SQL and
+                        // `MysqlResultBackend` has no `cleanup_expired` at
+                        // all. Failing here instead made `migrate()` return
+                        // an error on *every* MySQL database, which left the
+                        // whole MySQL result backend unusable — a far worse
+                        // outcome than a routine nothing calls being absent.
+                        //
+                        // If a MySQL code path ever needs one of these, it
+                        // must not rely on this migration creating it: give
+                        // MySQL the same treatment as PostgreSQL in inline
+                        // SQL, or wait for a driver that can send DDL over
+                        // the text protocol.
+                        tracing::warn!(
+                            routine = name.unwrap_or("<unparsed>"),
+                            error = %e,
+                            "skipping stored-routine creation: MySQL rejects CREATE PROCEDURE \
+                             over the prepared-statement protocol and the driver offers no \
+                             text-protocol path. No CeleRS MySQL code path calls this routine, \
+                             so the backend is fully functional without it."
+                        );
+                    }
+                    Err(e) => {
+                        return Err(BackendError::Connection(format!(
+                            "Stored procedure creation failed: {}",
+                            e
+                        )))
+                    }
                 }
             }
         }
@@ -366,9 +610,14 @@ impl ResultBackend for MysqlResultBackend {
                 let result_data_str: Option<String> = row
                     .col("result_data")
                     .map_err(|e| BackendError::Connection(format!("Failed to get result: {e}")))?;
-                let error_message: Option<String> = row
-                    .col("error_message")
-                    .map_err(|e| BackendError::Connection(format!("Failed to get result: {e}")))?;
+                // MySQL TEXT arrives as `Value::Blob` (TEXT and BLOB share a
+                // wire type), which `col::<Option<String>>` rejects — a
+                // failed task's non-NULL `error_message` is exactly that
+                // case. See `row_ext::opt_text_from_row`.
+                let error_message: Option<String> =
+                    crate::row_ext::opt_text_from_row(&row, "error_message").map_err(|e| {
+                        BackendError::Connection(format!("Failed to get result: {e}"))
+                    })?;
                 let retry_count: Option<i32> = row
                     .col("retry_count")
                     .map_err(|e| BackendError::Connection(format!("Failed to get result: {e}")))?;
@@ -637,10 +886,16 @@ impl ResultBackend for MysqlResultBackend {
                 let chord_id_str: String = row.col("chord_id").map_err(|e| {
                     BackendError::Connection(format!("Failed to get chord state: {e}"))
                 })?;
-                let task_ids_str: String = row.col("task_ids").map_err(|e| {
-                    BackendError::Connection(format!("Failed to get chord state: {e}"))
-                })?;
-                let task_ids: Vec<Uuid> = serde_json::from_str(&task_ids_str)
+                // Read through `json_from_row`, the crate's canonical JSON
+                // column read, rather than `col::<String>`: `FromValue for
+                // String` rejects `Value::Blob`, which is one of the shapes
+                // `oxisql-mysql` returns a `JSON` column as, and this read
+                // failed with `type mismatch: expected Text, got Blob`.
+                let task_ids_json =
+                    crate::row_ext::json_from_row(&row, "task_ids").map_err(|e| {
+                        BackendError::Connection(format!("Failed to get chord state: {e}"))
+                    })?;
+                let task_ids: Vec<Uuid> = serde_json::from_value(task_ids_json)
                     .map_err(|e| BackendError::Serialization(e.to_string()))?;
 
                 let total: i64 = row.col("total").map_err(|e| {
@@ -658,7 +913,11 @@ impl ResultBackend for MysqlResultBackend {
                         .map_err(|e| BackendError::Serialization(e.to_string()))?,
                     total: total as usize,
                     completed: completed as usize,
-                    callback: row.col("callback").map_err(|e| {
+                    // `callback` and `cancellation_reason` are MySQL TEXT,
+                    // which arrives as `Value::Blob` (TEXT and BLOB share a
+                    // wire type) and which `col::<Option<String>>` rejects.
+                    // See `row_ext::opt_text_from_row`.
+                    callback: crate::row_ext::opt_text_from_row(&row, "callback").map_err(|e| {
                         BackendError::Connection(format!("Failed to get chord state: {e}"))
                     })?,
                     // See the identical gap called out in
@@ -671,10 +930,18 @@ impl ResultBackend for MysqlResultBackend {
                         BackendError::Connection(format!("Failed to get chord state: {e}"))
                     })?,
                     timeout: timeout_secs.map(|s| std::time::Duration::from_secs(s as u64)),
-                    cancelled: row.col("cancelled").map_err(|e| {
-                        BackendError::Connection(format!("Failed to get chord state: {e}"))
-                    })?,
-                    cancellation_reason: row.col("cancellation_reason").map_err(|e| {
+                    // MySQL BOOLEAN is TINYINT(1) and arrives as an integer,
+                    // which `col::<bool>` rejects. The column is
+                    // `NOT NULL DEFAULT FALSE`, so `false` is the right
+                    // fallback. See `row_ext::bool_from_row`.
+                    cancelled: crate::row_ext::bool_from_row(&row, "cancelled", false).map_err(
+                        |e| BackendError::Connection(format!("Failed to get chord state: {e}")),
+                    )?,
+                    cancellation_reason: crate::row_ext::opt_text_from_row(
+                        &row,
+                        "cancellation_reason",
+                    )
+                    .map_err(|e| {
                         BackendError::Connection(format!("Failed to get chord state: {e}"))
                     })?,
                     retry_count: 0,
@@ -813,9 +1080,11 @@ impl ResultBackend for MysqlResultBackend {
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                 .map(|v| result_compression::maybe_decompress(v, &self.compression))
                 .transpose()?;
-            let error_message: Option<String> = row
-                .col("error_message")
-                .map_err(|e| BackendError::Connection(format!("Failed to get results: {e}")))?;
+            // MySQL TEXT arrives as `Value::Blob`; see
+            // `row_ext::opt_text_from_row`.
+            let error_message: Option<String> =
+                crate::row_ext::opt_text_from_row(&row, "error_message")
+                    .map_err(|e| BackendError::Connection(format!("Failed to get results: {e}")))?;
             let retry_count: Option<i32> = row
                 .col("retry_count")
                 .map_err(|e| BackendError::Connection(format!("Failed to get results: {e}")))?;
@@ -899,6 +1168,181 @@ impl ResultBackend for MysqlResultBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bundled migration's procedure bodies are terminated by the
+    /// client-side `//` delimiter, which is not SQL. Sending it to the server
+    /// made *every* `migrate()` call fail with `ERROR 1064 ... near '//'`, so
+    /// `cleanup_expired_results` and `chord_increment_counter` were never
+    /// created on any MySQL database — and because the live tests that would
+    /// have caught it are `#[ignore]`d, nothing noticed. This test needs no
+    /// server.
+    #[test]
+    fn procedure_bodies_drop_the_client_side_delimiter() {
+        let migration_sql = include_str!("../migrations/001_init_mysql.sql");
+        let sections: Vec<&str> = migration_sql.split("DELIMITER //").collect();
+        assert!(
+            sections.len() > 1,
+            "migration should contain at least one procedure"
+        );
+
+        let mut seen = Vec::new();
+        for section in sections.iter().skip(1) {
+            let body = section
+                .split("DELIMITER ;")
+                .next()
+                .expect("split always yields one element")
+                .trim()
+                .trim_end_matches("//")
+                .trim_end();
+            if body.is_empty() {
+                continue;
+            }
+            assert!(
+                !body.ends_with("//"),
+                "the `//` delimiter must be stripped before the body reaches \
+                 the server, got:\n{body}"
+            );
+            seen.push(parse_create_procedure_name(body).expect("procedure name"));
+        }
+
+        assert_eq!(
+            seen,
+            vec!["cleanup_expired_results", "chord_increment_counter"],
+            "both bundled procedures must be recognised, or migrate() will \
+             try to re-create one that already exists"
+        );
+    }
+
+    /// MySQL accepts `CREATE INDEX IF NOT EXISTS` in no released version, so
+    /// every index statement in the migration has to be guarded by an
+    /// `information_schema` lookup — which only happens for statements
+    /// `parse_create_index` recognises. If it stops recognising one, the
+    /// second `migrate()` call starts failing with `ERROR 1061 Duplicate key
+    /// name` again.
+    #[test]
+    fn every_bundled_create_index_is_recognised() {
+        let migration_sql = include_str!("../migrations/001_init_mysql.sql");
+        let main_sql = migration_sql
+            .split("DELIMITER //")
+            .next()
+            .expect("split always yields one element");
+
+        let mut indexes = Vec::new();
+        for statement in sql_split::split_sql_statements(main_sql) {
+            let upper = strip_leading_sql_comments(&statement).to_ascii_uppercase();
+            if upper.starts_with("CREATE INDEX") {
+                let parsed = parse_create_index(&statement)
+                    .unwrap_or_else(|| panic!("unrecognised CREATE INDEX:\n{statement}"));
+                indexes.push((parsed.name.to_string(), parsed.table.to_string()));
+            }
+        }
+
+        assert_eq!(
+            indexes,
+            vec![
+                (
+                    "idx_task_results_expires".to_string(),
+                    "celers_task_results".to_string()
+                ),
+                (
+                    "idx_task_results_state".to_string(),
+                    "celers_task_results".to_string()
+                ),
+                (
+                    "idx_task_results_created".to_string(),
+                    "celers_task_results".to_string()
+                ),
+                (
+                    "idx_chord_completed".to_string(),
+                    "celers_chord_state".to_string()
+                ),
+            ],
+            "the migration's indexes changed; keep them guarded"
+        );
+    }
+
+    #[test]
+    fn parse_create_index_sees_past_a_leading_comment() {
+        // `split_sql_statements` hands back the comment that precedes a
+        // statement as part of it. The first index in the migration is
+        // preceded by `-- Indexes for performance`, and missing it left that
+        // one index unguarded.
+        assert_eq!(
+            parse_create_index("-- Indexes for performance\nCREATE INDEX idx_a ON t(col)"),
+            Some(CreateIndex {
+                name: "idx_a",
+                table: "t"
+            })
+        );
+        assert_eq!(
+            parse_create_index("-- one\n-- two\n  CREATE INDEX idx_b ON t(col)"),
+            Some(CreateIndex {
+                name: "idx_b",
+                table: "t"
+            })
+        );
+    }
+
+    #[test]
+    fn strip_leading_sql_comments_handles_edge_cases() {
+        assert_eq!(strip_leading_sql_comments("-- only a comment"), "");
+        assert_eq!(strip_leading_sql_comments("SELECT 1"), "SELECT 1");
+        assert_eq!(strip_leading_sql_comments("  \n SELECT 1"), "SELECT 1");
+        // A `--` inside the statement body must survive.
+        assert_eq!(
+            strip_leading_sql_comments("SELECT 1 -- trailing"),
+            "SELECT 1 -- trailing"
+        );
+    }
+
+    #[test]
+    fn parse_create_index_handles_the_shapes_the_migration_uses() {
+        assert_eq!(
+            parse_create_index("CREATE INDEX idx_a ON t(col)"),
+            Some(CreateIndex {
+                name: "idx_a",
+                table: "t"
+            }),
+            "table name running into the column list"
+        );
+        assert_eq!(
+            parse_create_index("create index `idx_b` on `tbl` (a, b)"),
+            Some(CreateIndex {
+                name: "idx_b",
+                table: "tbl"
+            }),
+            "lowercase keywords and backtick-quoted identifiers"
+        );
+    }
+
+    #[test]
+    fn parse_create_index_rejects_anything_it_does_not_understand() {
+        // An unrecognised statement must return None so migrate() executes it
+        // unchanged rather than silently skipping schema.
+        for stmt in [
+            "CREATE TABLE t (a int)",
+            "CREATE UNIQUE INDEX idx ON t(a)",
+            "SELECT 1",
+            "CREATE INDEX",
+            "",
+        ] {
+            assert_eq!(parse_create_index(stmt), None, "should not match: {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn parse_create_procedure_name_handles_its_shapes() {
+        assert_eq!(
+            parse_create_procedure_name("CREATE PROCEDURE p(OUT x INT)\nBEGIN\nEND"),
+            Some("p")
+        );
+        assert_eq!(
+            parse_create_procedure_name("create procedure `q` ()\nBEGIN\nEND"),
+            Some("q")
+        );
+        assert_eq!(parse_create_procedure_name("CREATE TABLE t (a int)"), None);
+        assert_eq!(parse_create_procedure_name("SELECT 1"), None);
+    }
 
     #[tokio::test]
     #[ignore] // Requires MySQL running

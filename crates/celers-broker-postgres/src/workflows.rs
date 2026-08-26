@@ -132,7 +132,7 @@ impl PostgresBroker {
                 r#"
                 INSERT INTO celers_tasks
                     (id, task_name, payload, state, priority, max_retries, metadata, queue_name, created_at, scheduled_at)
-                VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), {})
+                VALUES ($1::text::uuid, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), {})
                 "#,
                 scheduled_at
             );
@@ -185,9 +185,9 @@ impl PostgresBroker {
             .conn
             .query(
                 r#"
-            SELECT metadata
+            SELECT metadata::text AS metadata
             FROM celers_tasks
-            WHERE id = $1
+            WHERE id = $1::text::uuid
             "#,
                 &[&task_id_param],
             )
@@ -235,7 +235,7 @@ impl PostgresBroker {
                                 r#"
                             UPDATE celers_tasks
                             SET scheduled_at = NOW()
-                            WHERE id = $1
+                            WHERE id = $1::text::uuid
                             "#,
                                 &[&next_task_id_param],
                             )
@@ -321,7 +321,7 @@ impl PostgresBroker {
                     r#"
                     INSERT INTO celers_tasks
                         (id, task_name, payload, state, priority, max_retries, metadata, queue_name, created_at, scheduled_at)
-                    VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), {})
+                    VALUES ($1::text::uuid, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), {})
                     "#,
                     scheduled_at
                 );
@@ -381,9 +381,9 @@ impl PostgresBroker {
             .conn
             .query(
                 r#"
-            SELECT metadata
+            SELECT metadata::text AS metadata
             FROM celers_tasks
-            WHERE id = $1
+            WHERE id = $1::text::uuid
             "#,
                 &[&task_id_param],
             )
@@ -504,7 +504,7 @@ impl PostgresBroker {
             .conn
             .query(
                 r#"
-            SELECT metadata->'stage_depends_on' as deps
+            SELECT (metadata->'stage_depends_on')::text AS deps
             FROM celers_tasks
             WHERE metadata->>'workflow_id' = $1
               AND metadata->>'stage_id' = $2
@@ -987,16 +987,16 @@ impl PostgresBroker {
         // `ToSqlValue`); `new_state` stays at `$1` (used both in the SET
         // clause and the CASE comparison), the `IN` list occupies
         // `$2..2+task_ids.len()`.
-        let placeholders: Vec<String> = (2..2 + task_ids.len()).map(|i| format!("${i}")).collect();
+        let placeholders = crate::sql::uuid_in_clause(2, task_ids.len());
         let query_str = format!(
             r#"
             UPDATE celers_tasks
-            SET state = $1,
-                completed_at = CASE WHEN $1 IN ('completed', 'failed', 'cancelled')
+            SET state = $1::text,
+                completed_at = CASE WHEN $1::text IN ('completed', 'failed', 'cancelled')
                                     THEN NOW() ELSE completed_at END
             WHERE id IN ({})
             "#,
-            placeholders.join(", ")
+            placeholders
         );
         let new_state_param = new_state.to_string();
         let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();

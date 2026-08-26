@@ -7,24 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1] - Unreleased
 
-0.3.1 is a hardening release, not a feature drop: 475 files changed against 0.3.0. The headline
+0.3.1 is a hardening release, not a feature drop: 557 files changed against 0.3.0. The headline
 additions are the ones that make a CeleRS deployment operable and defensible in production — a
 remote control protocol with `celers inspect` / `celers control` in front of it, revocations that
 survive a worker restart because the *broker* holds them, an event stream a Python Celery monitor
 can actually parse, opt-in message authentication on the worker receive path, soft/hard time
-limits, and workflow patterns (chord aggregation, saga compensation, conditional branches) that a
-worker really executes instead of only building. The whole workspace is now Pure Rust with an empty
-`deny.toml` `[graph] exclude`.
+limits, workflow patterns (chord aggregation, saga compensation, conditional branches) that a
+worker really executes instead of only building, and — new this release — RabbitMQ and SQS joining
+Redis/PostgreSQL/MySQL as brokers a `celers_worker::Worker` can actually run against, via
+`celers_kombu::core_adapter`. The whole workspace is now Pure Rust with an empty `deny.toml`
+`[graph] exclude`.
 
 Celery compatibility is now **proved rather than asserted — at the protocol layer**: a new
 `tests/python-compat/` suite exchanges tasks and results with a real Python Celery 5.6.3 in both
 directions, and `crates/celers-protocol/tests/fixtures/` holds verbatim Celery wire captures. The
-boundary is stated plainly in the rewritten `docs/CELERY_COMPATIBILITY.md`: the **broker and result
-backend still carry CeleRS-shaped payloads**, so a Python Celery worker and a CeleRS worker cannot
-share a queue yet.
+boundary is stated plainly in the rewritten `docs/CELERY_COMPATIBILITY.md`: **every broker and
+result backend still carries CeleRS-shaped payloads**, so a Python Celery worker and a CeleRS worker
+cannot share a queue yet — true of Redis/PostgreSQL/MySQL as before, and now, separately, of the
+newly worker-usable RabbitMQ/SQS brokers too (they gained `celers_core::Broker`, not Celery's own
+AMQP/SQS wire framing).
 
-**Read the breaking-changes section first if you consume CeleRS' event stream, subscribe to a Redis
-`<queue>:cancel` channel, `match` exhaustively on `TaskEvent`, or rely on task coalescing.**
+**Read the breaking-changes section first if you consume CeleRS' event stream (including over
+AMQP — the exchange type changed), subscribe to a Redis `<queue>:cancel` channel, `match`
+exhaustively on `TaskEvent`, pattern-match `celers_protocol::result::ExceptionInfo::exc_message` /
+`ResultMessage::children` or `celers_broker_redis::QueueRateLimiter::Distributed`, implement
+`celers_core::Broker` yourself, or rely on task coalescing.**
 
 ### ⚠️ Breaking changes
 
@@ -60,16 +67,52 @@ share a queue yet.
 - `celers_protocol::event::EventMessage::get_datetime()` now falls back to the Unix epoch for a
   non-finite or unrepresentable timestamp instead of `Utc::now()`. A corrupt timestamp used to read
   as "just now", which is indistinguishable from a healthy event; it now reads as obviously wrong
+- **The AMQP event exchange is now a topic exchange, not a fanout.** `AmqpEventConfig`'s
+  `exchange_type` default changed from `"fanout"` to `"topic"`, matching real Celery's
+  `celery.events.dispatcher.EventDispatcher`, and the default `EventRoutingMode::PerEventType`
+  publishes each event under a key derived from its own wire `type` (`task-started` →
+  `task.started`, `worker-heartbeat` → `worker.heartbeat`) instead of one fixed empty key. **This is
+  an operational break, not just a behavioural one**: if a `celeryev` exchange from a running 0.3.0
+  deployment already exists as `fanout` in RabbitMQ, this emitter's next `exchange_declare` fails
+  with a `406 PRECONDITION_FAILED` (exchange type mismatch) until an operator deletes and lets it be
+  redeclared. `AmqpEventReceiver` substitutes Celery's own catch-all binding pattern `"#"` for
+  itself when left at its default, so it keeps receiving everything without any config change; a
+  hand-rolled consumer bound on a specific key must rebind. The pre-fix behaviour is still available
+  as an explicit `EventRoutingMode::Fixed`
 
 #### Source compatibility
 
 - `TaskEvent` gained a `SoftTimeLimitExceeded` variant and **is not `#[non_exhaustive]`**: a
   downstream `match` over `TaskEvent` without a wildcard arm stops compiling until the arm is added
-- `celers_core::Broker` gained four methods — `revoke(&TaskId, terminate)`, `is_revoked(&TaskId)`,
-  `subscribe_revocations()` and `defer(task_id, receipt_handle, delay)`. All four have trait
-  defaults (`revoke` forwards to `cancel`, `is_revoked` answers `false`, `subscribe_revocations`
-  answers `None`, `defer` forwards to `reject(requeue = true)`), so an existing `impl Broker` keeps
-  compiling — it just gets the inert behaviour until it overrides them
+- `celers_core::Broker` gained five methods — `revoke(&TaskId, terminate)`, `is_revoked(&TaskId)`,
+  `subscribe_revocations()`, `defer(task_id, receipt_handle, delay)` and
+  `dequeue_is_cancel_safe()`. All five have trait defaults (`revoke` forwards to `cancel`,
+  `is_revoked` answers `false`, `subscribe_revocations` answers `None`, `defer` forwards to
+  `reject(requeue = true)`, `dequeue_is_cancel_safe` answers `false`), so an existing `impl Broker`
+  keeps compiling — it just gets the inert behaviour until it overrides them. See Defaults, below,
+  for why `dequeue_is_cancel_safe` exists and what changed alongside it
+- `celers_broker_redis::QueueRateLimiter::Distributed`'s payload is now
+  `Box<DistributedRateLimiter>` instead of `DistributedRateLimiter`: a `match` that binds the
+  variant's field by value, or constructs it directly, stops compiling. Boxed because
+  `DistributedRateLimiter` owns a `redis::Client`, whose `ConnectionAddr::TcpTls` variant now carries
+  the rustls trust store and client-certificate chain (the `rediss://` work above) — roughly 3× the
+  size of the `Local` variant, which an unboxed enum would charge to *every* `QueueRateLimiter`,
+  including purely local ones
+- `celers_protocol::result::ExceptionInfo::exc_message` is now `Vec<serde_json::Value>` instead of
+  `String`: it models Python's `exc.args` — the list `celery.backends.base.Backend
+  .exception_to_python` splats into the exception constructor as `*args` — rather than a
+  pre-joined display string. `ExceptionInfo::new(exc_type, message)` still takes one string (it
+  becomes the sole element); code that read `.exc_message` as a string should read
+  `ExceptionInfo::message()` instead, which renders the same `", "`-joined form for display.
+  `with_args(Vec<serde_json::Value>)` is the new builder for a multi-argument exception. See Fixed,
+  below, for why the old shape lost information on the wire
+- `celers_protocol::result::ResultMessage::children` is now `Vec<ResultChild>` instead of
+  `Vec<Uuid>`: it models the whole result tree `celery.result.AsyncResult.as_tuple()` writes
+  (`[[id, parent], group_results]`), not a flat list of ids, because Celery does not store child
+  *ids* on the wire. `ResultMessage::with_children(Vec<Uuid>)` still compiles and still builds a flat
+  list of parent-less, non-group children — the common case — but code that inspected `.children`
+  elements as bare `Uuid`s must switch to `ResultChild::task_id` (or `.child_ids()` for the old flat
+  view). `with_child_results(Vec<ResultChild>)` is the new builder for a whole tree. See Fixed, below
 
 #### Defaults
 
@@ -81,6 +124,29 @@ share a queue yet.
   never ran, never produced a result, and left its caller waiting forever on an `AsyncResult` that
   could never resolve. Turn it off only for idempotent, fire-and-forget work where nobody awaits the
   second submission
+- **`Broker::try_dequeue`'s default now refuses instead of lying.** It used to poll `dequeue()`
+  once and report a still-pending poll as `Ok(None)` ("nothing available") — wrong for any broker
+  that does real I/O, since the first poll of a network call is *always* pending, so the default
+  reported an empty queue no matter how much work was waiting. Worse, dropping that half-polled
+  future abandoned whatever it had already committed to server-side, stranding a message until its
+  redelivery window expired on a broker (SQS, most network brokers) that commits the pop before its
+  first `.await`. The default now returns `Err(CelersError::Broker(..))` — the same shape of named
+  refusal `enqueue_at`'s default already used — so a broker that has not overridden `try_dequeue`
+  fails loudly instead of silently under-reporting its queue. Nothing in this crate's own defaults
+  calls `try_dequeue` any more (see the next entry), so this only affects a caller that invokes it
+  directly against a broker that never overrode it
+- **`Broker::dequeue_batch`'s default no longer calls `try_dequeue`.** It now waits for the first
+  message with `dequeue()` and then drains further messages by probing `queue_size()` before each
+  further `dequeue()` call, stopping as soon as the probe reports zero — never dropping a `dequeue`
+  future early, and never parking on an empty queue past the first, documented wait. This is what
+  makes the `try_dequeue` change above safe for `dequeue_batch`: a broker that overrides neither
+  method keeps working, at the cost of one `queue_size` round trip per extra message in the batch
+  instead of one `try_dequeue`. `celers_kombu::core_adapter::KombuBrokerAdapter` (new this release)
+  overrides both with real transport primitives regardless
+- New `Broker::dequeue_is_cancel_safe()` (default `false`) lets a caller ask, before racing a
+  broker's `dequeue()` future against a timer or a shutdown signal, whether the loser's dropped
+  future can lose a message. Only `InMemoryBroker` currently overrides it to `true`; every network
+  broker keeps the safe default
 
 #### Manifests and features
 
@@ -100,6 +166,12 @@ share a queue yet.
   else leaves the SDK with no HTTP client at all — the deliberate escape hatch for a deployment that
   wants the stock (non-Pure-Rust) transport, which must then enable
   `aws-config/default-https-client` itself
+- `celers-broker-amqp` and `celers-broker-sqs`: new **default-on** `core-broker` feature (pulling
+  in `celers-core` and `celers-kombu/core-adapter`), which is what makes `into_core_broker(..)`
+  available — see Added, below. Building either crate with `default-features = false` drops the
+  dependency on `celers-core` and leaves only the `celers-kombu` transport traits, matching the
+  pre-0.3.1 surface; a build that already used `default-features = false` and named its features
+  explicitly is unaffected either way
 - `celers-beat`: new off-by-default `redis-store` feature (`RedisScheduleStore`)
 - `celers-worker`: the `redis` feature now also enables `oxitls`, mandatory rather than optional —
   no rustls provider *feature* is enabled anywhere in this workspace, so the bare
@@ -156,6 +228,58 @@ share a queue yet.
   therefore also blocks a task that is still queued, or one whose worker has not started yet
 - `RedisBroker::queue_names()` deliberately does not list `<queue>:revoked`, so `purge_all_queues()`
   leaves recorded revocations in place — purging messages must not un-revoke anything
+
+#### RabbitMQ and SQS become worker-usable
+
+- `celers_kombu::core_adapter::KombuBrokerAdapter<T>` implements `celers_core::Broker` over any
+  transport that implements the new `CoreBrokerTransport` seam, joining `celers-kombu`'s
+  message-transport traits (`publish`/`consume`/`purge`, which those crates already had) to the
+  task-queue abstraction `celers_worker::Worker` actually consumes. `AmqpBroker::into_core_broker(queue)`
+  and `SqsBroker::into_core_broker(queue)` build one; `queue` becomes both the adapter's queue and the
+  underlying transport's own queue name, connecting lazily (no I/O at construction). Both crates
+  enable the adapter **by default** — `core-broker`, forwarding to `celers-kombu/core-adapter` — so
+  existing `AmqpBroker`/`SqsBroker` users get `.into_core_broker(..)` with no manifest change
+- SQS's adapter additionally maps `dequeue_batch` / `enqueue_batch` / `ack_batch` / `defer` /
+  `enqueue_after` onto native `ReceiveMessage(MaxNumberOfMessages)` / `SendMessageBatch` /
+  `DeleteMessageBatch` / `ChangeMessageVisibility` / `SendMessage(DelaySeconds)` instead of the
+  trait's one-request-per-message defaults
+- **One transport, one lock.** `celers_core::Broker` takes `&self`; the transport traits take
+  `&mut self`, so the adapter owns its transport behind one `tokio::sync::Mutex` and serializes every
+  operation through it. The worker's main loop parks inside it while polling `dequeue`
+  (`DEFAULT_POLL_TIMEOUT`, 1 second), during which an `ack` from an already-dispatched task on the
+  same adapter briefly waits its turn. Sharing one adapter between several workers therefore
+  serializes them against each other rather than letting them consume in parallel — give each worker
+  its own transport
+- Neither transport can address an already-queued message by id, so `cancel()` always answers
+  `Ok(false)` and the revocation trait methods (`revoke`/`is_revoked`/`subscribe_revocations`) keep
+  their inert `Broker` defaults — broker-fed revocation (above) does not reach RabbitMQ or SQS yet. A
+  worker still refuses a *dequeued* revoked task through its own revocation registry
+- **Not Celery-wire-compatible**: the body each transport publishes is still a JSON-serialized
+  `celers_protocol::Message`, not kombu's own AMQP basic-properties framing or SQS message
+  attributes, so a real Celery worker cannot consume from either. This closes the *worker-usability*
+  gap, a separate, shallower claim than wire compatibility — see
+  [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md#brokers)
+- Fixed alongside: `AmqpBroker::publish` (the `Producer` impl `celers-kombu`'s `publish`/`consume`
+  traits use directly, and what the new adapter calls) published to the hardcoded exchange name
+  `"celery"` instead of the configured `AmqpConfig::default_exchange`. The two agreed only when a
+  caller never called `with_exchange(..)`; otherwise the queue-declare/bind used one exchange and
+  `publish` published to another, and RabbitMQ answered with a channel-closing 404 — visible from
+  `into_core_broker` as `enqueue` failing while `enqueue_batch` (which already read the configured
+  exchange) succeeded
+- The facade's URL-based factory, `celers::broker_helper::create_broker(broker_type, url, queue)`,
+  gained `"amqp"`/`"rabbitmq"` and `"sqs"` arms wired to the adapter above: it builds an
+  `AmqpBroker`/`SqsBroker` and hands back `.into_core_broker(queue)` as a `Box<dyn
+  celers_core::Broker>`, so code that only has a broker-type string and a URL (a `celers config`
+  style deployment) can now get a worker-usable RabbitMQ or SQS broker the same way it already could
+  for `redis`/`postgres`/`mysql`. Previously both arms fell through to the generic case and returned
+  `BrokerConfigError::UnsupportedBrokerType` unconditionally — even in a build with the `amqp`/`sqs`
+  feature compiled in. `SqsBroker` has no connection URL of its own (the AWS SDK reads its endpoint
+  from the environment), so the `sqs` arm's `url` parameter is intentionally unused. A build with the
+  feature *off* now reports `BrokerConfigError::FeatureNotEnabled` for these two types instead of the
+  same `UnsupportedBrokerType` used for a genuinely unrecognised string — accurate, since the type is
+  not unsupported, only not compiled into this build. Live-verified end to end against a real
+  RabbitMQ: `broker_helper::tests::live_amqp::create_broker_amqp_reaches_a_real_rabbitmq_end_to_end`
+  (gated on `CELERS_TEST_AMQP_URL`) enqueues, dequeues and acks a task through the URL-built broker
 
 #### Celery-compatible event wire
 
@@ -314,7 +438,16 @@ share a queue yet.
 - `celers-worker/src/worker_core.rs` was split (`execution.rs`, `control_wiring.rs`,
   `broker_revocation.rs`, `runtime.rs`, `support.rs`) to stay under the 2000-line-per-file
   convention; `celers-beat`'s `schedule_store` and `celers-broker-redis`'s `defer` are likewise
-  their own modules
+  their own modules. Also split this release: `celers-backend-db/src/lib.rs` (2334 → 239 lines, into
+  `mysql_backend.rs` / `postgres_backend.rs` / `result_compression.rs`);
+  `celers-worker/src/worker_core/tests.rs` (2308 lines, into a 16-file `worker_core/tests/`
+  directory, none over 600 lines); `celers-worker/src/sandbox.rs` (2049 → 600 lines, into
+  `sandbox/config.rs` / `error.rs` / `rlimit_impl.rs` / `seccomp_impl.rs` / `stats.rs` /
+  `tests.rs`). One file grew past the limit while this release's own tests were added:
+  `celers-beat/src/tests/tests_schedule.rs` is now 2004 lines
+- `celers-cli`'s `async-trait` dependency moved from `[dev-dependencies]` to `[dependencies]`: the
+  crate's built-in demo tasks (`commands::worker`'s `--demo-tasks`) are production code, not
+  test-only, and were the only reason the dependency existed at all
 - The Docker image no longer installs `ca-certificates`: on Debian bookworm it carries a hard
   `Depends: openssl`, which would put OpenSSL into a Pure-Rust image through the OS package manager.
   `celers-cli` resolves TLS through the compiled-in `webpki-roots` bundle and never reads
@@ -338,7 +471,52 @@ share a queue yet.
   date routinely falls on a neighbouring UTC date. `test_solar_schedule_{sunrise,sunset}` are
   un-`#[ignore]`d and assert real almanac instants (Tokyo's 2026 solstice sunrise is
   `2026-06-21T19:25:59Z` = 04:25 JST), alongside new tests for negative longitudes, twilight
-  ordering, polar day and invalid coordinates
+  ordering, polar day and invalid coordinates. `golden_hour_begin`/`_end`, initially left as a flat
+  offset from sunrise/sunset, is now also a true `SolarEvent::Elevation` solve (0° for the morning
+  boundary, -6° for the evening one) — there is no remaining approximation in the solar branch
+
+- **A `MessageBuilder` envelope killed a real Celery worker's event loop.** `MessageProperties`
+  never serialized `delivery_tag` or `delivery_info`, both of which
+  `kombu.transport.virtual.base.Message.__init__` indexes directly — no `.get()`, no default — so a
+  message built and published through the ordinary producer path raised `KeyError` *inside the
+  consumer callback*, which does not just fail one task: it kills the whole worker's event loop.
+  Both fields now serialize (`delivery_tag` fresh per message, the way kombu's own producer mints
+  one; `delivery_info` as `{exchange, routing_key}`, the routing key naming whichever queue
+  `.queue(..)`/`.routing_key(..)` selected), verified by publishing a `MessageBuilder` envelope
+  **unpatched** to a queue a real Celery worker consumes and executes
+  (`tests/python-compat/test_celers_to_python.py::test_message_builder_envelope_is_deliverable_as_is`)
+- **`ResultMessage::children` and `ExceptionInfo::exc_message` did not model what Celery actually
+  writes.** `children` was a flat `Vec<Uuid>`, but Celery's `AsyncResult.as_tuple()` writes whole
+  result trees (`[[id, parent], group_results]`) — any retried, chained or grouped task's record now
+  round-trips through the new `ResultChild` type instead of failing to parse or silently discarding
+  the parent chain. `exc_message` joined a multi-argument exception's `exc.args` into one string with
+  `", "`, so `raise ValueError("a", "b")` came back as one argument instead of two, and a non-string
+  argument (`OSError(2, "no such file")`) lost its type, rendered through `Display` instead of kept
+  as JSON. Both are now interop-verified against a real Celery worker: the `children` fix by feeding
+  Celery's own `as_tuple()` output back through `result_from_tuple`
+  (`test_celers_to_python.py::test_celers_parses_a_celery_record_that_has_children`), the
+  `exc_message` fix by letting Celery's `exception_to_python` rebuild a real `OSError(2, ..)` from a
+  CeleRS-written record (`::test_a_python_exception_rebuilt_from_a_celers_record_keeps_its_args`).
+  See Breaking changes → Source compatibility for the field-type changes this required
+- `celers_broker_redis::ResultBackend::store_task_result` now `PUBLISH`es the same bytes on a
+  channel named after the result key, in the same pipeline as the `SET`/`SETEX` — matching Celery's
+  own `celery.backends.redis.BaseKeyValueStoreBackend._set`. A writer that only `SET`s leaves every
+  client blocked in `AsyncResult.get()`'s Pub/Sub wait until its poll-interval fallback, rather than
+  waking immediately
+- `celers-backend-db`: a task stored as `TaskResultValue::Ignored { error }` now round-trips its
+  error text through `meta.ignored_error` instead of losing it, and — the more consequential half —
+  a *later* non-`Ignored` store for the same task now unconditionally clears the stale
+  `ignored_error` marker instead of leaving it behind, which previously made a task that was once
+  ignored and later completed with a real result keep reading back as `Ignored`
+- **The partitioning migration could not be applied.** Two functions in
+  `crates/celers-broker-postgres/migrations/003_partitioning.sql`
+  (`create_tasks_partitions_range`, `maintain_tasks_partitions`) declared a PL/pgSQL variable named
+  `current_date` — not merely shadowing the `CURRENT_DATE` SQL-standard constant, but colliding with
+  it as a reserved word, which PostgreSQL rejects at parse time: `CREATE OR REPLACE FUNCTION` itself
+  fails with `ERROR: syntax error at or near "current_date"` (confirmed against a real PostgreSQL 16
+  — the assignment `current_date := ...` is what the parser trips on). The whole migration file
+  would abort on this statement before either function was created, taking automatic partition
+  creation and maintenance out with it. Renamed to `v_current_date` throughout both functions
 
 - A task that reports its *own* cancellation — `Err(CelersError::Cancelled)`, which is what
   `check_cancelled()?` now produces — is disposed of as revoked (acked, no DLQ entry, `task-revoked`
@@ -353,12 +531,132 @@ share a queue yet.
   them — Python literals (`True`, `None`, tuple versus list parentheses) with the same third-level
   container elision — checked against a recorded `celery.utils.saferepr` table in both Rust
   (`celery_golden.rs`) and Python (`tests/python-compat/test_reprs.py`)
+- `MessageBuilder::build()` and `v5::build_v5_message` now **stamp** `argsrepr` / `kwargsrepr`
+  themselves, computed from the same args/kwargs the message carries; previously neither ever set
+  them, so every message built through the ordinary producer path showed a monitor no argument
+  preview at all (not merely a wrong one). An explicit `.header("argsrepr", ..)` still overrides the
+  computed value
 - The Docker image builds again: the builder stage was pinned to `rust:1.75`, far below the
   dependency MSRV, and its `COPY --from=builder` named `target/release/celers-cli` — a binary the
   build never produces, because `celers-cli`'s `[[bin]]` is named `celers`
 - The docker-compose monitoring stack no longer mounts nonexistent paths: `docs/prometheus.yml`,
   `docs/grafana/datasources/` and `docs/grafana/dashboards/` (with a real `celers-overview.json`)
   are committed, and `docs/DEPLOYMENT.md` points at what exists
+
+#### PostgreSQL and MySQL, verified against real servers for the first time
+
+The gated live-service suites for `celers-broker-postgres`, `celers-broker-sql` and
+`celers-backend-db` had never actually been run against a real server before this release — every
+integration test that needed one was `#[ignore]`d, so the workspace stayed green while these three
+crates were, in places, non-functional. Running them for the first time (see Testing and proof,
+above, and [tests/integration/README.md](tests/integration/README.md)) found the defects below, all
+now fixed and re-verified live.
+
+- **PostgreSQL rejected almost every UUID- or JSONB-bound statement — a release blocker.**
+  `oxisql-postgres` renders a `Value::Uuid`/JSON parameter as *text*, but `tokio-postgres` always
+  binds parameters in PostgreSQL's *binary* wire format, so a bare `$n` against a column PostgreSQL
+  infers as `uuid` or `jsonb` fails at bind time: `incorrect binary data format in bind parameter n`
+  for a UUID, `unsupported jsonb version number 123`/`91`/`110` (the first byte of `{`/`[`/a bare
+  number) for JSON text presented where binary `jsonb` belongs. Nothing in-process could ever catch
+  this — it only exists on the wire to a real server. `celers-broker-postgres` had 60 such bare-`$n`
+  sites (every `celers_tasks.id`/`celers_revoked_tasks.task_id` placeholder, including the generated
+  `IN (...)` lists), and it made the crate **non-functional against a live database**: 36 of its 210
+  gated tests failed the moment they were first run for real, including the plain enqueue path.
+  `celers-backend-db`'s PostgreSQL result backend had the identical defect on `result_data`/`extra`/
+  `task_ids` (`postgres_backend.rs`) and on `celers_events.payload` (`event_persistence.rs`) — so
+  **storing a task result with a payload, the crate's primary job, also failed outright** against a
+  live server. Fixed everywhere by pinning the placeholder's inferred type with an explicit
+  `::text::uuid` / `::text::jsonb` cast ahead of the server-side conversion —
+  `crate::row_ext::uuid_param`/`json_param`'s doc comments in both crates derive the fix in full, and
+  `celers-broker-postgres::sql::uuid_in_clause` centralises the generated `IN (...)` case so no call
+  site can omit the cast by hand. Reading a `JSONB` column back needed the mirror fix,
+  `SELECT payload::text AS payload` / `metadata::text AS metadata`, because `oxisql-postgres` decodes
+  JSON by asking `tokio-postgres` for a `String`, which does not accept a raw `jsonb` OID either. The
+  same "the server infers a stricter binary type than the driver can produce" hazard also reached
+  `celers-broker-postgres`'s analytics queries, on `EXTRACT(EPOCH FROM ...)` results (need
+  `::double precision`/`::BIGINT`) and interval-multiplication parameters (`$n::bigint`). Proven
+  live: `celers-broker-postgres` is **230/230 against a real PostgreSQL 16** (`tests_pg.rs` plus 18
+  new regression tests in `tests_pg_binds.rs`, gated on `CELERS_TEST_POSTGRES_URL`), and
+  `celers-backend-db`'s PostgreSQL half passes in full against the same server (`DATABASE_URL`)
+- **Concurrent auto-migration raced on both engines.** Every CeleRS component migrates its own
+  schema on start-up, and a normal deployment starts many workers at once, so `CREATE TABLE
+  IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS`'s existence-check-then-create is not atomic against a
+  second session doing the same thing — the loser failed startup with an opaque `db error`
+  (PostgreSQL: `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`).
+  `celers-backend-db` now serializes its three PostgreSQL migration call sites
+  (`PostgresResultBackend::migrate`, `DbEventPersister`'s migration, `DbLockBackend::ensure_table`)
+  on one transaction-scoped `pg_advisory_xact_lock` (new `crate::pg_ddl::advisory_locked_migration`
+  — the `_xact_` variant self-releases on commit *or* rollback, so it cannot leak across a pooled
+  connection's next use the way the session-scoped lock would). MySQL has no advisory lock, so
+  `celers-broker-sql`'s migration runner instead treats the specific errors a *concurrent* migrator
+  produces as success and retries the one that means "the other side is still mid-statement":
+  `1061 Duplicate key name` (another migrator's index already landed), `1060 Duplicate column name`
+  (another migrator's `ALTER TABLE` already landed) and `1213 Deadlock found` (retried through the
+  same `with_deadlock_retry` the application statements use, below). Its migrations-tracking insert
+  also switched to `ON DUPLICATE KEY UPDATE`, so two migrators applying the same file both succeed
+  instead of one hitting `Duplicate entry '...' for key celers_migrations.version`. Before this fix,
+  any one of these aborted `migrate()` part-way — including on `009_queue_name.sql`, whose column
+  the statistics queries below need, leaving the broker failing every one of them with
+  `Unknown column 'queue_name'`
+- **`celers-backend-db`'s MySQL `migrate()` failed outright, on every call, against every MySQL
+  database.** Its statement splitter fed `001_init_mysql.sql`'s `DELIMITER //`-terminated
+  `CREATE PROCEDURE` bodies to the server verbatim; `//` is a client-side directive, not SQL, so the
+  server rejected it with `ERROR 1064 ... near '//'` and aborted the whole migration —
+  `cleanup_expired_results` and `chord_increment_counter` were never created on **any** MySQL
+  database this crate ever migrated. A second defect in the same splitter dropped the leading
+  `-- comment` lines that precede a statement, which silently defeated the `information_schema`
+  existence guard on the first index of a re-run migration, failing a second `migrate()` call with
+  `1061 Duplicate key name`. Both are fixed by a (deliberately narrow — see the new parsing helpers'
+  own documentation) statement recogniser that finds `CREATE INDEX`/`CREATE PROCEDURE` regardless of
+  a leading comment and checks `information_schema.statistics`/`.routines` before creating either,
+  plus routing `1060`/`1061`/`1213` through the same idempotent-retry handling as the previous entry.
+  Both defects were invisible before this release because the live tests that would have caught them
+  are `#[ignore]`d and had never actually been run against a server
+- **`MysqlAnalytics::task_stats` crashed on an empty result set.** `SUM(...)` over zero matching
+  rows is SQL `NULL`, not `0`, and the query read each aggregate as a non-optional `i64` — so a
+  `task_stats` call over any time window with no matching tasks (an idle queue, a narrow window)
+  failed the whole query with `type mismatch: expected I64/F64/Decimal, got Null` instead of
+  reporting all-zero counts. Fixed by reading each `SUM` through the existing
+  `row_ext::opt_decimal_i64_from_row` and defaulting a `None` to `0`, which is exactly what "no rows
+  contributed" means
+- **`celers-broker-sql`'s `dequeue`/`ack`/`reject`/`cancel` surfaced MySQL's `1213 Deadlock found`
+  as a hard failure.** A claim, an ack and a revocation-driven cancel all take row locks on
+  `celers_tasks` that can legitimately cycle under concurrent load — a live parallel run of this
+  crate's own gated suite reproduced it — and InnoDB's documented remedy is to restart the losing
+  transaction. New `mysql_error::with_deadlock_retry`/`with_deadlock_retry_celers` (a bounded,
+  jittered restart loop) now wraps every one of those statements, including the multi-row batch
+  cancel; each is idempotent (a row already in its target state simply matches nothing on the
+  retry), so restarting cannot double-apply anything. `BeforeDequeue`'s documented behaviour — a
+  rejecting hook rolls the claim back rather than losing the message — is preserved across a
+  retried claim
+- **`celers-broker-sql`'s dead-letter move could not run.** `001_init.sql` defines `move_to_dlq` as
+  a stored procedure, but MySQL rejects `CREATE PROCEDURE` over the prepared-statement protocol
+  (`1295`) and `oxisql-mysql` has no text-protocol escape hatch to reach for — so the procedure
+  never existed on any migrated database, and `CALL move_to_dlq(?)` could only fail: a task that
+  exhausted its retries was never actually moved to the dead-letter queue. New `dlq_move.rs` issues
+  the procedure's own two statements directly (copy the row into `celers_dead_letter_queue`, then
+  delete it) inside the same transaction that gave the procedure its atomicity, for both the
+  single-task path (`Broker::reject`) and the batch path (`broker_chain.rs`'s batch DLQ move).
+  Live-verified: `tests_hardening::retry_exhaustion_moves_the_task_into_the_dead_letter_queue` and
+  `::reject_batch_moves_an_exhausted_task_into_the_dead_letter_queue`
+- **Several `celers-broker-sql` read/diagnostic methods reported database-wide numbers on a
+  queue-scoped broker.** `count_by_state_quick`, `get_task_age_distribution`,
+  `get_retry_statistics`, `list_active_workers`, `get_worker_statistics`/`get_all_worker_statistics`,
+  `get_queue_health`/`has_capacity` and `list_scheduled_tasks`/`count_scheduled_tasks` all queried
+  `celers_tasks` with no `queue_name` filter — the same class of bug `009_queue_name.sql` was
+  written to close for `queue_size`/`get_statistics`, left open in every read method added since.
+  Two brokers pointed at different queues in the same database saw each other's tasks in their own
+  stats, and a broker's own "pending" count could exceed everything its own `dequeue` would ever
+  hand out. Every one of them is now scoped to `WHERE queue_name = ?`, matching `queue_size`. This
+  is also what made this crate's own gated suite order-sensitive —
+  `queues_are_isolated_from_each_other` and a `test_concurrent_dequeue` count mismatch
+  (`left: 50, right: 20`) were two different symptoms of the same missing filter — and is why the
+  whole suite is now live-verified **217/217** against a real MySQL 8, both under `nextest`'s
+  default parallel execution and `--test-threads=1`
+- Corrected the SPDX license header in 29 `celers-broker-sqs`/`celers-kombu` source files from the
+  stale `MIT OR Apache-2.0` to `Apache-2.0`, matching the workspace's actual single-license
+  `license = "Apache-2.0"` (`Cargo.toml`, `LICENSE`) — the dual-license form was never accurate for
+  this project and is not present anywhere else in the workspace
 
 ### Security
 
@@ -383,6 +681,43 @@ share a queue yet.
   `tls-native-certs` feature
 - Verify both claims yourself with `cargo tree -e features -i aws-lc-sys --all-features` (must
   report "did not match any packages") and `cargo deny check bans`
+
+### Known Limitations
+
+- **`celers-backend-db` and `celers-broker-sql` collide on the MySQL table name
+  `celers_task_results`.** `celers-backend-db`'s `001_init_mysql.sql` and `celers-broker-sql`'s
+  `010_task_results.sql` each declare `CREATE TABLE IF NOT EXISTS celers_task_results` with
+  **incompatible schemas**. Whichever crate's migration reaches a shared database *second* finds the
+  table already present with the other crate's columns, and its own follow-up statement fails —
+  observed as `celers-backend-db`'s `CREATE INDEX ... (expires_at)` failing with
+  `ERROR 1072 (42000): Key column 'expires_at' doesn't exist in table` against a database
+  `celers-broker-sql` migrated first. This is not a stale-database artifact: it reproduces
+  deterministically on a freshly created database, in either migration order, and only when the two
+  crates are pointed at the *same* MySQL database — which is exactly what running both of
+  `tests/integration/README.md`'s MySQL rows against one `docker-compose` database does. Each crate
+  is otherwise fully correct against MySQL on its own — `celers-broker-sql`'s full suite passes
+  217/217, and `celers-backend-db`'s **150/150** (its full suite, not only its MySQL-specific tests)
+  passes with `MYSQL_URL` pointed at a database `celers-broker-sql` has never migrated — so use
+  separate MySQL databases for the broker and the result backend until this is fixed. See
+  [TODO.md → Known gaps #16](TODO.md#known-gaps--the-roadmap-after-031)
+
+Final verified state for 0.3.1 (this hardening campaign): workspace builds and
+`clippy --all-targets -- -D warnings` clean with both `--all-features` and default features,
+`cargo fmt --all --check` and `cargo deny check bans` clean (empty `[graph] exclude`).
+`cargo nextest run --workspace --all-features`: **7,722 tests run, 7,722 passed, 0 failed, 112
+`#[ignore]`d**; default features: **7,447 run, 7,447 passed, 0 failed, 98 `#[ignore]`d**.
+`cargo test --doc --workspace --all-features`: **1,175 passing doctests, 0 failed**, 138 more are
+```` ```ignore ```` and never compile. Live-service gated suites, brought up via the root
+`docker-compose.yml` (redis, postgres, rabbitmq, mysql, localstack): `celers-broker-redis` + `celers-backend-redis` +
+`celers-worker` + `celers-cli` together (**2,926/2,926**, one shared Redis), `celers-broker-amqp`
+(**313/313** against a real RabbitMQ) and `celers-broker-postgres` (**230/230** against a real
+PostgreSQL 16) all pass in full; `celers-broker-sql` passes in full against a real MySQL 8
+(**217/217**, verified under both `nextest`'s default parallel execution and `--test-threads=1`);
+`celers-backend-db` passes in full, **150/150**, with `DATABASE_URL` on the same PostgreSQL server
+and `MYSQL_URL` on a MySQL database `celers-broker-sql` has never migrated — see Known Limitations,
+above, for the one *shared*-database case it does not pass. `tests/python-compat` (a real Celery
+5.6.3 + kombu 5.6.2 client and worker):
+**38/38**. All counts measured 2026-08-26 against the tree this entry describes.
 
 ## [0.3.0] - 2026-07-12
 

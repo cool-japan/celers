@@ -1,6 +1,6 @@
 # celers-worker
 
-**Version: 0.3.1 | Status: [Stable] | Tests: 958 (`--all-features`, excluding `#[ignore]`d) + 68 doctests | Updated: 2026-08-26**
+**Version: 0.3.1 | Status: [Stable] | Tests: 961 (`--all-features`, excluding `#[ignore]`d) + 68 doctests | Updated: 2026-08-26**
 
 Production-ready worker runtime for consuming and executing CeleRS tasks with comprehensive monitoring, memory optimization, and workflow support.
 
@@ -635,8 +635,8 @@ let config = WorkerConfig {
 
 ## Testing
 
-**703 tests passing** (655 unit/integration via `cargo nextest` + 48 doc tests; 6 additional
-doc tests are `ignore`d because they require a live Postgres/Redis instance)
+**961 tests passing** (`cargo nextest run --all-features`) plus **68 doc tests passing** — none
+`ignore`d as of 0.3.1
 
 ## See Also
 

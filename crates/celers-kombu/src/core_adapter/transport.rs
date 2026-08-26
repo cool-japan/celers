@@ -1,5 +1,5 @@
 // Copyright (c) 2026 COOLJAPAN OU (Team KitaSan)
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! The seam between a transport and the task-queue adapter.
 

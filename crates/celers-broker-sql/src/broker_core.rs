@@ -4,6 +4,10 @@
 //! and core enqueue/dequeue/ack/reject operations.
 
 use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerStateInternal};
+use crate::mysql_error::{
+    is_duplicate_column_name, is_duplicate_key_name, is_unsupported_in_prepared_protocol,
+    with_deadlock_retry,
+};
 use crate::row_ext::RowExt;
 use crate::tls_mode;
 use crate::types::*;
@@ -43,6 +47,17 @@ pub struct MysqlBroker {
     /// `purge_terminal_tasks`. Two brokers pointed at the same database with
     /// different queue names therefore never see each other's tasks. It is
     /// NOT a table name — all queues share one set of tables.
+    ///
+    /// The read-only *diagnostics* family is scoped to the same column:
+    /// `count_by_state_quick`, `get_task_age_distribution`,
+    /// `get_retry_statistics`, `list_active_workers`,
+    /// `get_worker_statistics`/`get_all_worker_statistics`, `get_queue_health`
+    /// (and `has_capacity`, which is built on the first of them), plus
+    /// `list_scheduled_tasks`/`count_scheduled_tasks`. These used to report
+    /// database-wide numbers on a queue-scoped broker — the same class of bug
+    /// `009_queue_name.sql` was written to fix for `queue_size` and
+    /// `get_statistics`, and the reason a "pending" count could exceed what
+    /// the same broker's `dequeue` would ever hand out.
     ///
     /// `enqueue_deduplicated`/`enqueue_deduplicated_window`'s duplicate
     /// lookup used to search `$.dedup_key` with no queue predicate: two
@@ -110,6 +125,23 @@ pub(crate) fn strip_sql_line_comments(chunk: &str) -> String {
         .join("\n")
 }
 
+/// Is `statement` a `CREATE INDEX`?
+///
+/// Leading `--` comment lines are already removed by
+/// [`strip_sql_line_comments`] before the `;` split, so the keyword is the
+/// first token.
+pub(crate) fn is_create_index(statement: &str) -> bool {
+    let mut words = statement.split_whitespace();
+    matches!(words.next(), Some(w) if w.eq_ignore_ascii_case("CREATE"))
+        && matches!(words.next(), Some(w) if w.eq_ignore_ascii_case("INDEX"))
+}
+
+/// Is `statement` an `ALTER TABLE ... ADD COLUMN ...`?
+pub(crate) fn is_add_column(statement: &str) -> bool {
+    let upper = statement.to_ascii_uppercase();
+    upper.trim_start().starts_with("ALTER TABLE") && upper.contains("ADD COLUMN")
+}
+
 impl MysqlBroker {
     /// Create a new MySQL broker
     ///
@@ -139,7 +171,7 @@ impl MysqlBroker {
     ///
     /// Returns [`CelersError::Configuration`] when the connected server is
     /// older than **MySQL 8.0.1** / **MariaDB 10.6** — see
-    /// [`connect_checked`](Self::connect_checked).
+    /// `connect_checked`.
     pub async fn with_config(
         database_url: &str,
         queue_name: &str,
@@ -330,9 +362,18 @@ impl MysqlBroker {
 
     /// Mark a migration as applied
     async fn mark_migration_applied(&self, version: &str, name: &str) -> Result<()> {
+        // `ON DUPLICATE KEY UPDATE` rather than a bare `INSERT`: two brokers
+        // starting together both pass `is_migration_applied` (a
+        // check-then-act with nothing serialising it), both apply the — now
+        // idempotent — DDL, and both reach here. A bare INSERT made the
+        // loser fail with `Duplicate entry '001' for key
+        // celers_migrations.version`, turning a harmless duplicate effort
+        // into a failed `migrate()`. Re-asserting `name` is a no-op write
+        // that keeps the statement a single round trip.
         self.conn
             .execute(
-                "INSERT INTO celers_migrations (version, name) VALUES (?, ?)",
+                "INSERT INTO celers_migrations (version, name) VALUES (?, ?) \
+                 ON DUPLICATE KEY UPDATE name = VALUES(name)",
                 &[&version, &name],
             )
             .await
@@ -364,6 +405,58 @@ impl MysqlBroker {
         self.mark_migration_applied(version, name).await?;
 
         Ok(())
+    }
+
+    /// Execute one migration DDL statement, tolerating the ways a *concurrent*
+    /// migration of the same database can make it fail.
+    ///
+    /// `run_migration_tracked`'s "already applied?" lookup is a check-then-act
+    /// with nothing serialising it, and MySQL offers no usable lock to close
+    /// that window here: `CREATE INDEX IF NOT EXISTS` does not exist in any
+    /// released MySQL, `ADD COLUMN IF NOT EXISTS` needs 8.0.29+ (this schema
+    /// targets 5.7+), and `GET_LOCK` is session-scoped while every
+    /// `execute` checks a fresh connection out of `mysql_async`'s pool.
+    ///
+    /// So each statement is made *effectively* idempotent instead. Every case
+    /// below is one where the post-condition the migration wanted already
+    /// holds, or where MySQL itself says to retry:
+    ///
+    /// * `1061 Duplicate key name` — another migrator created the index.
+    /// * `1060 Duplicate column name` — another migrator added the column.
+    /// * `1213 Deadlock found ... try restarting transaction` — concurrent DDL
+    ///   on the same table. MySQL's own advice is to retry, which is what
+    ///   [`with_deadlock_retry`] does (shared with the application statements
+    ///   that can lose the same race, so there is one retry policy in the
+    ///   crate rather than a bespoke loop here).
+    ///
+    /// Anything else is a real migration failure and propagates. Before this,
+    /// any one of these aborted `migrate()` part-way, leaving later files —
+    /// including `009_queue_name.sql`, whose column the statistics query
+    /// needs — unapplied, so the broker then failed with
+    /// `Unknown column 'queue_name'`.
+    async fn execute_migration_statement(&self, statement: &str) -> Result<()> {
+        with_deadlock_retry("migration statement", || async {
+            match self.conn.execute(statement, &[]).await {
+                Ok(_) => Ok(()),
+                Err(e) if is_create_index(statement) && is_duplicate_key_name(&e) => {
+                    tracing::debug!(
+                        statement = %statement,
+                        "index already exists (concurrent migration); continuing"
+                    );
+                    Ok(())
+                }
+                Err(e) if is_add_column(statement) && is_duplicate_column_name(&e) => {
+                    tracing::debug!(
+                        statement = %statement,
+                        "column already exists (concurrent migration); continuing"
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Migration failed: {}", e)))
     }
 
     /// Run a migration without tracking (for the migrations table itself)
@@ -412,12 +505,10 @@ impl MysqlBroker {
         if let Some(main_sql) = sections.first() {
             for statement in strip_sql_line_comments(main_sql).split(';') {
                 let trimmed = statement.trim();
-                if !trimmed.is_empty() {
-                    self.conn
-                        .execute(trimmed, &[])
-                        .await
-                        .map_err(|e| CelersError::Other(format!("Migration failed: {}", e)))?;
+                if trimmed.is_empty() {
+                    continue;
                 }
+                self.execute_migration_statement(trimmed).await?;
             }
         }
 
@@ -431,9 +522,32 @@ impl MysqlBroker {
                 // COM_STMT_PREPARE is a syntax error.
                 let trimmed = stripped.trim().trim_end_matches("//").trim_end();
                 if !trimmed.is_empty() {
-                    self.conn.execute(trimmed, &[]).await.map_err(|e| {
-                        CelersError::Other(format!("Stored procedure creation failed: {}", e))
-                    })?;
+                    match self.conn.execute(trimmed, &[]).await {
+                        Ok(_) => {}
+                        // MySQL will not accept `CREATE PROCEDURE` over the
+                        // prepared-statement protocol, which is the only one
+                        // this driver speaks — see
+                        // the `dlq_move` module for the full explanation.
+                        // Failing here aborted `migrate()` on every MySQL
+                        // database, leaving the schema half-applied and the
+                        // broker unusable. Nothing depends on the routine any
+                        // more: the one caller (`move_to_dlq`) now issues the
+                        // procedure's two statements directly.
+                        Err(e) if is_unsupported_in_prepared_protocol(&e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "skipping stored-procedure creation: not sendable over the \
+                                 prepared-statement protocol. CeleRS does not call it — the \
+                                 DLQ move runs as plain SQL."
+                            );
+                        }
+                        Err(e) => {
+                            return Err(CelersError::Other(format!(
+                                "Stored procedure creation failed: {}",
+                                e
+                            )))
+                        }
+                    }
                 }
             }
         }
@@ -540,21 +654,6 @@ impl MysqlBroker {
                 task.metadata.id
             ))
         })
-    }
-
-    /// Move a task to the Dead Letter Queue, addressing the row by its
-    /// already-resolved primary key text.
-    ///
-    /// Takes the row id as text rather than a [`TaskId`] because `reject`
-    /// resolves the row id from the receipt handle first (see
-    /// [`crate::task_row::resolve_row_id`]).
-    pub(crate) async fn move_to_dlq_by_row_id(&self, row_id: &str) -> Result<()> {
-        self.conn
-            .execute("CALL move_to_dlq(?)", &[&row_id])
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to move task to DLQ: {}", e)))?;
-
-        Ok(())
     }
 
     // ========== Queue Control ==========
@@ -1287,6 +1386,8 @@ impl MysqlBroker {
     }
 
     /// List scheduled tasks (tasks with scheduled_at in the future)
+    ///
+    /// Scoped to this broker's queue, like `queue_size` and `get_statistics`.
     pub async fn list_scheduled_tasks(
         &self,
         limit: i64,
@@ -1299,12 +1400,13 @@ impl MysqlBroker {
                 SELECT id, task_name, priority, scheduled_at, created_at,
                        TIMESTAMPDIFF(SECOND, NOW(), scheduled_at) as delay_remaining_secs
                 FROM celers_tasks
-                WHERE state = 'pending'
+                WHERE queue_name = ?
+                  AND state = 'pending'
                   AND scheduled_at > NOW()
                 ORDER BY scheduled_at ASC
                 LIMIT ? OFFSET ?
                 "#,
-                &[&limit, &offset],
+                &[&self.queue_name, &limit, &offset],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to list scheduled tasks: {}", e)))?;
@@ -1339,15 +1441,17 @@ impl MysqlBroker {
     }
 
     /// Count scheduled tasks (tasks with scheduled_at in the future)
+    ///
+    /// Scoped to this broker's queue, like [`Self::list_scheduled_tasks`].
     pub async fn count_scheduled_tasks(&self) -> Result<i64> {
         let rows = self
             .conn
             .query(
                 r#"
                 SELECT COUNT(*) AS c FROM celers_tasks
-                WHERE state = 'pending' AND scheduled_at > NOW()
+                WHERE queue_name = ? AND state = 'pending' AND scheduled_at > NOW()
                 "#,
-                &[],
+                &[&self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to count scheduled tasks: {}", e)))?;
@@ -1619,7 +1723,7 @@ impl MysqlBroker {
     /// Useful for query optimization and performance tuning.
     ///
     /// Explains the *actual* statement `dequeue` runs (built by
-    /// [`crate::sql_text::dequeue_select_sql`]), not a hand-copied
+    /// `sql_text::dequeue_select_sql`), not a hand-copied
     /// approximation of it — the previous copy had already drifted away from
     /// the real query's clause order and predicates.
     pub async fn explain_dequeue(&self) -> Result<Vec<QueryPlan>> {

@@ -40,7 +40,7 @@ fn unique_queue() -> String {
 
 /// Connect a migrated broker on a private queue, or `None` when no test
 /// database is configured.
-async fn broker_on_new_queue(test_name: &str) -> Option<(PostgresBroker, String)> {
+pub(crate) async fn broker_on_new_queue(test_name: &str) -> Option<(PostgresBroker, String)> {
     let url = match test_pg_url() {
         Some(url) => url,
         None => {
@@ -83,7 +83,7 @@ async fn fail_task_into_dlq(broker: &PostgresBroker, task_name: &str, error_mess
     let conn = broker.connection().await.expect("pooled connection");
     let id_param = crate::row_ext::uuid_param(&task_id);
     conn.execute(
-        "UPDATE celers_tasks SET error_message = $1 WHERE id = $2",
+        "UPDATE celers_tasks SET error_message = $1 WHERE id = $2::text::uuid",
         &[&error_message, &id_param],
     )
     .await
@@ -416,7 +416,7 @@ async fn archiving_moves_completed_tasks_into_the_history_table() {
     let id_param = crate::row_ext::uuid_param(&task_id);
     let rows = conn
         .query(
-            "SELECT state FROM celers_task_history WHERE task_id = $1",
+            "SELECT state FROM celers_task_history WHERE task_id = $1::text::uuid",
             &[&id_param],
         )
         .await

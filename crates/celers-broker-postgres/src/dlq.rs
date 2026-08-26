@@ -71,9 +71,9 @@ impl PostgresBroker {
         let rows = tx
             .query(
                 r#"
-            SELECT task_id, task_name, payload, metadata
+            SELECT task_id, task_name, payload, metadata::text AS metadata
             FROM celers_dead_letter_queue
-            WHERE id = $1 AND queue_name = $2
+            WHERE id = $1::text::uuid AND queue_name = $2
             "#,
                 &[&dlq_id_param, &self.queue_name],
             )
@@ -114,7 +114,7 @@ impl PostgresBroker {
             r#"
             INSERT INTO celers_tasks
                 (id, task_name, payload, state, priority, retry_count, max_retries, metadata, queue_name, created_at, scheduled_at)
-            VALUES ($1, $2, $3, 'pending', 0, 0, 3, $4::text::jsonb, $5, NOW(), NOW())
+            VALUES ($1::text::uuid, $2, $3, 'pending', 0, 0, 3, $4::text::jsonb, $5, NOW(), NOW())
             "#,
             &[
                 &new_task_id_param,
@@ -129,7 +129,7 @@ impl PostgresBroker {
 
         // Delete from DLQ
         tx.execute(
-            "DELETE FROM celers_dead_letter_queue WHERE id = $1",
+            "DELETE FROM celers_dead_letter_queue WHERE id = $1::text::uuid",
             &[&dlq_id_param],
         )
         .await
@@ -150,7 +150,7 @@ impl PostgresBroker {
         let affected = self
             .conn
             .execute(
-                "DELETE FROM celers_dead_letter_queue WHERE id = $1 AND queue_name = $2",
+                "DELETE FROM celers_dead_letter_queue WHERE id = $1::text::uuid AND queue_name = $2",
                 &[&dlq_id_param, &self.queue_name],
             )
             .await

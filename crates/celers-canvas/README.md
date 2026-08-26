@@ -622,8 +622,8 @@ urgent.apply(&broker).await?;
 
 ## Testing
 
-**396 tests passing** (318 unit/integration via `cargo nextest --all-features` + 78 doc tests;
-2 further unit tests and 3 doc tests are `ignore`d)
+**388 tests passing** (`cargo nextest run --all-features`) plus **85 doc tests passing** — 2 further
+unit tests and 3 doc tests are `ignore`d
 
 ```rust
 #[cfg(test)]

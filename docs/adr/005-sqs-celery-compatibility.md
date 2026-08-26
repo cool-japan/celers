@@ -6,13 +6,19 @@
 
 ## Amendment (0.3.1, 2026-08-26)
 
-Two facts that post-date this proposal and change how to read it:
+Facts that post-date this proposal and change how to read it:
 
-1. **`SqsBroker` is not a `celers_core::Broker`.** It implements `celers_kombu`'s
-   `Producer`/`Consumer`/`Transport`/`Broker` traits — a message-transport abstraction — so a
-   `celers_worker::Worker` cannot consume from SQS at all today, whatever the wire format. A
-   `celers_core::Broker` adapter over the kombu transports is a prerequisite for anything in the
-   Implementation Plan, and is tracked in [TODO.md](../../TODO.md#known-gaps--the-roadmap-after-031).
+1. **`SqsBroker` is now worker-usable, but that is a different claim from this ADR's.**
+   `SqsBroker::into_core_broker(queue)` wraps it in
+   `celers_kombu::core_adapter::KombuBrokerAdapter`, which implements `celers_core::Broker`
+   (default-on `core-broker` feature) — so a `celers_worker::Worker` **can** consume from SQS as of
+   this release, closing the prerequisite this amendment used to name. That adapter reuses the
+   existing transport's `publish`/`consume` unchanged: the SQS message body is still a
+   JSON-serialized `celers_protocol::Message`, not the Celery/kombu SQS wire shape this ADR's
+   Implementation Plan describes. Every box below is still unchecked; worker-usability and
+   wire-compatibility are separate, and only the first is done. See
+   [TODO.md → Known gaps #8](../../TODO.md#known-gaps--the-roadmap-after-031) for the adapter, and
+   this document's own Implementation Plan for what remains.
 2. **The Pure-Rust exception this crate used to carry is closed.** `celers_broker_sqs::pure_http`
    replaces the AWS SDK's `default-https-client` (→ `aws-lc-sys`) with an `HttpClient` over
    `oxihttp-client`, and `deny.toml`'s `[graph] exclude` is now empty. Anything you read elsewhere

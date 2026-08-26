@@ -12,8 +12,10 @@
 - **Phase 6**: Extended Brokers & Backends ✅ **COMPLETE**
 - **Phase 7**: Full Celery Protocol Compatibility 🚧 **IN PROGRESS** — the *protocol layer* is
   interop-verified against Celery 5.6.3; the broker and result backend are not on the Celery wire
-  yet, so a Python worker and a CeleRS worker still cannot share a queue. See
-  [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md) and
+  yet, so a Python worker and a CeleRS worker still cannot share a queue — true for Redis/PostgreSQL/
+  MySQL and, separately, for RabbitMQ/SQS now that a `celers_worker::Worker` can run against them
+  (see Known gaps #8): they carry a JSON `celers_protocol::Message` body, not kombu's own AMQP/SQS
+  framing. See [docs/CELERY_COMPATIBILITY.md](docs/CELERY_COMPATIBILITY.md) and
   [Known gaps](#known-gaps--the-roadmap-after-031)
 - **Phase 8**: v0.2.0 Enhancements ✅ **COMPLETE**
 - **Phase 9**: v0.2.0 Production Features ✅ **COMPLETE**
@@ -24,12 +26,25 @@ about completeness against Python Celery — Phase 7 above is the honest measure
 
 ### v0.3.1 Hardening campaign ✅ COMPLETE (2026-08-26)
 
-A workspace-wide correctness, security and honesty campaign on branch `0.3.1`: 475 files changed
-against 0.3.0. Verified green at the close of the campaign —
-`cargo build --workspace --all-features`, `cargo clippy --workspace --all-targets --all-features --
--D warnings`, `cargo fmt --check`, `cargo deny check bans`, and
-**7,529/7,529 tests passing** (`cargo nextest run --workspace --all-features`, 109 `#[ignore]`d)
-plus **1,165 passing doctests** (`cargo test --doc --workspace --all-features`, 136 `ignore`d).
+A workspace-wide correctness, security and honesty campaign on branch `0.3.1`. Verified green at the
+close of the campaign — `cargo build --workspace --all-features`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` (and the same pair with default features),
+`cargo fmt --all --check`, `cargo deny check bans`, and **7,722/7,722 tests passing**
+(`cargo nextest run --workspace --all-features`, 112 `#[ignore]`d; 7,447/7,447 with default features,
+98 `#[ignore]`d) plus **1,175 passing doctests** (`cargo test --doc --workspace --all-features`, 138
+`ignore`d) — all reverified 2026-08-26 against the tree this entry describes.
+
+The final wave of the campaign ran the `celers-broker-postgres`, `celers-broker-sql` and
+`celers-backend-db` gated suites against real PostgreSQL/MySQL servers for the first time (see
+[CHANGELOG.md](CHANGELOG.md)'s "PostgreSQL and MySQL, verified against real servers for the first
+time") and closed what it found: `celers-broker-postgres` was non-functional against a live
+database (a bare-`$n` bind defect on every UUID placeholder) and is now **230/230** live; the same
+bind-cast defect, a concurrent-migration race, and a MySQL `migrate()` that failed outright on every
+call were fixed in `celers-backend-db`; `celers-broker-sql` gained MySQL deadlock retry, a working
+`move_to_dlq`, and a fix for a queue-scoping leak across its diagnostics methods — all
+live-re-verified the same way. One residual defect was found and is **not** fixed — a MySQL
+table-name collision between `celers-backend-db` and `celers-broker-sql` when both are pointed at
+the same database — see [Known gaps #16](#known-gaps--the-roadmap-after-031).
 
 What landed (full detail in [CHANGELOG.md](CHANGELOG.md)'s 0.3.1 section):
 
@@ -40,7 +55,8 @@ What landed (full detail in [CHANGELOG.md](CHANGELOG.md)'s 0.3.1 section):
   revoked-id storage in Redis / PostgreSQL / MySQL, and dequeue-time refusal via
   `Worker::with_broker_revocation`.
 - **Celery-compatible event wire**: the `celeryev` channels now carry the shape a Celery monitor
-  parses, with the Lamport clock; **breaking for 0.3.0 consumers**.
+  parses, with the Lamport clock, over a **topic** exchange on AMQP (was fanout) keyed by event type;
+  **breaking for 0.3.0 consumers**.
 - **Task security wired into the worker**: signature verification before dispatch, worker-side
   re-signing of retries and workflow continuations, redacted `inspect active` previews — all
   off by default.
@@ -48,6 +64,23 @@ What landed (full detail in [CHANGELOG.md](CHANGELOG.md)'s 0.3.1 section):
 - **Workflows that run**: chord aggregation, saga compensation, conditional Branch/Switch, and the
   Pipeline/FanIn/FanOut/ScatterGather lowerings, all covered end to end by `workflow_semantics` and
   `patterns_e2e`.
+- **RabbitMQ and SQS become worker-usable**: `celers_kombu::core_adapter::KombuBrokerAdapter`
+  implements `celers_core::Broker` over either transport; `AmqpBroker::into_core_broker` and
+  `SqsBroker::into_core_broker` build one, on by default. Still not Celery-wire-compatible at the
+  RabbitMQ/SQS level — see Known gaps #8. The facade's `celers::broker_helper::create_broker(type,
+  url, queue)` now also builds one directly for `"amqp"`/`"rabbitmq"`/`"sqs"`, live-verified against
+  a real RabbitMQ.
+- **PostgreSQL and MySQL, verified against a real server for the first time**: doing so found
+  `celers-broker-postgres` non-functional against a live database (fixed, now 230/230 live) plus
+  more PostgreSQL-bind, concurrent-migration and MySQL correctness defects across
+  `celers-backend-db`/`celers-broker-sql`, all fixed and live-re-verified. One residual MySQL
+  table-name collision between the two crates was found and is tracked, not fixed — see
+  [Known gaps #16](#known-gaps--the-roadmap-after-031).
+- **Protocol wire completeness**: `MessageProperties` now serializes `delivery_tag` / `delivery_info`
+  (their absence killed a real kombu consumer's event loop with a `KeyError`), `ResultMessage::children`
+  models Celery's actual result-tree shape instead of a bare id list, and `ExceptionInfo::exc_message`
+  is Python's `exc.args` list rather than a joined string — all three interop-verified against a real
+  Celery worker.
 - **Pure Rust, no exceptions**: `deny.toml`'s `[graph] exclude` is empty. The last holdout,
   `celers-broker-sqs`, now goes through `pure_http`, an AWS SDK `HttpClient` over `oxihttp-client`.
 - **Celery interop proved, not asserted**: `tests/python-compat/` runs a real Celery client and a
@@ -221,17 +254,20 @@ clean: `cargo build --workspace --all-features` and
 
 - **Crates**: 18 published + 2 unpublished workspace members (`celers-examples`, `celers-facade-test`)
 - **Brokers a `celers_worker::Worker` can consume from** (`celers_core::Broker`): Redis, PostgreSQL,
-  MySQL, plus the in-process `InMemoryBroker`
-- **Brokers available as `celers-kombu` transports only** (publish/consume over
-  `celers_protocol::Message`; **no `celers_core::Broker` adapter yet**): RabbitMQ (AMQP), AWS SQS
+  MySQL, the in-process `InMemoryBroker`, and — as of 0.3.1, via
+  `celers_kombu::core_adapter::KombuBrokerAdapter` — RabbitMQ (AMQP) and AWS SQS, each on by default
+  through the owning crate's `core-broker` feature. None of the three network transports is
+  Celery-wire-compatible; see [Known gaps](#known-gaps--the-roadmap-after-031)
 - **Backends**: Redis, PostgreSQL/MySQL (Database), gRPC - ALL with ResultStore adapters
 - **Examples**: 15 working examples (including Canvas workflows, web scraper, image processing, AsyncResult API)
 - **Benchmarks**: 3 comprehensive benchmark suites
-- **Tests**: 7,529 passing with `--all-features` (0 failures, 109 `#[ignore]`d), plus 1,165 passing
-  doctests (136 `ignore`d) — verified 2026-08-26 at the close of the 0.3.1 campaign. Note that the
-  env-gated live-service suites inside that count print a skip line and pass without asserting when
-  their `CELERS_TEST_*` variable is unset; see
-  [tests/integration/README.md](tests/integration/README.md)
+- **Tests**: 7,722 passing with `--all-features` (0 failures, 112 `#[ignore]`d; 7,447/7,447 with
+  default features, 98 `#[ignore]`d), plus 1,175 passing doctests (138 `ignore`d) — verified
+  2026-08-26 at the close of the 0.3.1 campaign. Note that the env-gated live-service suites inside
+  that count print a skip line and pass without asserting when their `CELERS_TEST_*` variable is
+  unset; see [tests/integration/README.md](tests/integration/README.md). The live-service suites
+  themselves — run for real against PostgreSQL/MySQL/RabbitMQ/Redis/LocalStack this campaign, not
+  merely present — are summarized in [CHANGELOG.md](CHANGELOG.md)'s 0.3.1 "Known Limitations"
 - **Build Status**: ✅ 0 errors, 0 warnings, 0 clippy warnings, 0 doc warnings, `cargo deny check bans` clean
 - **Documentation**: 1500+ lines of guides + 18 TODO.md files
 - **Monitoring**: Full Prometheus + Grafana + OpenTelemetry support
@@ -288,24 +324,42 @@ per-phase checklists further down are history.
    the old code divided that crate's Unix-*seconds* return as minutes-since-midnight and errored on
    the first iteration. `test_solar_schedule_{sunrise,sunset}` are un-`#[ignore]`d and now assert
    real almanac instants, joined by tests for negative longitudes, twilight ordering, polar day and
-   out-of-range coordinates. Remaining nit: `golden_hour_begin`/`_end` are still offsets from
-   sunrise/sunset rather than a true `SolarEvent::Elevation` solve.
-7. **`AmqpEventEmitter` publishes every event with one configured routing key** (default empty, so
-   fanout). Celery uses a topic exchange keyed by event type (`task.started`, `worker.heartbeat`,
-   …), so a Celery-style monitor cannot subscribe selectively.
+   out-of-range coordinates. `golden_hour_begin`/`_end`, the last remaining approximation, is now
+   also a true `SolarEvent::Elevation` solve (`elevation: 0.0` for the morning boundary,
+   `elevation: -6°` for the evening one) rather than a flat offset from sunrise/sunset — there is no
+   remaining approximation in the solar branch.
+7. ~~**`AmqpEventEmitter` publishes every event with one configured routing key** (default empty, so
+   fanout).~~ **FIXED.** The default exchange type is now `"topic"` (was `"fanout"`), and
+   `AmqpEventConfig::routing_mode` (default `EventRoutingMode::PerEventType`) derives each event's
+   routing key from its own wire `type` — `task-started` publishes as `task.started`,
+   `worker-heartbeat` as `worker.heartbeat` — matching real Celery's `EventDispatcher`. A consumer
+   can now bind `task.#`, `worker.#`, or `#` selectively; `AmqpEventReceiver` binds `#` by default.
+   The pre-fix behaviour survives as an explicit opt-in, `EventRoutingMode::Fixed`.
    *Evidence:* `crates/celers-broker-amqp/src/event_transport.rs`.
 
 ### Missing adapters and features
 
-8. **No `celers_core::Broker` adapter over the `celers-kombu` transports.** `AmqpBroker` and
-   `SqsBroker` implement `celers_kombu`'s `Producer`/`Consumer`/`Transport`/`Broker` — a
-   message-transport abstraction — not the task-queue abstraction a `celers_worker::Worker` consumes
-   from. Until an adapter exists, **a worker cannot run against RabbitMQ or SQS**, and neither can
-   carry revocation (there is no `revoke`/`is_revoked`/`subscribe_revocations` override point to
-   implement on them). An AMQP-native revocation channel is straightforward once the adapter exists:
-   a fanout exchange plus a durable table, mirroring `celers-broker-postgres`.
-   *Evidence:* the "Revocation does not apply to this crate" section in
-   `crates/celers-broker-amqp/src/lib.rs`.
+8. ~~**No `celers_core::Broker` adapter over the `celers-kombu` transports.**~~ **FIXED.**
+   `celers_kombu::core_adapter::KombuBrokerAdapter<T>` implements `celers_core::Broker` over any
+   `CoreBrokerTransport`; `AmqpBroker::into_core_broker(queue)` and `SqsBroker::into_core_broker(queue)`
+   build one, so **a `celers_worker::Worker` can now run against RabbitMQ and SQS**. Both crates
+   enable it by default (`core-broker` feature, pulling `celers-kombu/core-adapter`); SQS additionally
+   maps `dequeue_batch`/`enqueue_batch`/`ack_batch`/`defer`/`enqueue_after` onto native
+   `ReceiveMessage(MaxNumberOfMessages)`/`SendMessageBatch`/`DeleteMessageBatch`/
+   `ChangeMessageVisibility`/`SendMessage(DelaySeconds)` instead of the trait's one-at-a-time
+   defaults. One transport, one `tokio::sync::Mutex`: every operation is serialised through it, so
+   the worker's `dequeue` poll (parked for up to `DEFAULT_POLL_TIMEOUT`, 1s) briefly blocks `ack`
+   calls from tasks it already dispatched — give each worker its own transport rather than sharing
+   one. The revocation half of the original gap **remains open on purpose**: `cancel()` always
+   answers `Ok(false)` and `revoke`/`is_revoked`/`subscribe_revocations` are not overridden (they
+   keep the trait's inert defaults), because neither AMQP nor SQS can address an already-queued
+   message by id. A worker still refuses a revoked task it has *dequeued*, via its own
+   revocation registry.
+   *Evidence:* `crates/celers-kombu/src/core_adapter/adapter.rs`,
+   `crates/celers-broker-amqp/src/core_broker.rs`, `crates/celers-broker-sqs/src/core_broker.rs`.
+   The facade's `celers::broker_helper::create_broker("amqp"/"rabbitmq"/"sqs", url, queue)` now
+   builds one directly too, live-verified against a real RabbitMQ
+   (`broker_helper::tests::live_amqp::create_broker_amqp_reaches_a_real_rabbitmq_end_to_end`).
 9. **`celers worker` builds an empty `TaskRegistry`.** This is inherent — CeleRS tasks are Rust
    types registered at build time — and 0.3.1 makes it loud (an explicit warning plus
    `--demo-tasks`), but the only way to run application tasks remains linking `celers-worker` into
@@ -318,27 +372,58 @@ per-phase checklists further down are history.
     `inspect active` argument preview, but no result-backend surface currently persists task
     args/kwargs, so there is nothing to redact there. The call becomes necessary the moment one
     does.
-12. **`celers-cli` `[dev-dependencies]` still lacks `async-trait`**, so `tests/control_redis.rs`
-    implements `celers_core::Task` in the desugared `Pin<Box<dyn Future>>` form. `async-trait` is
-    already in `[workspace.dependencies]`; adding it lets that impl collapse back to
-    `async fn execute`.
+12. ~~**`celers-cli` `[dev-dependencies]` still lacks `async-trait`**~~ **FIXED.** `async-trait` is
+    now a `celers-cli` **`[dependencies]`** entry (not `[dev-dependencies]`) — promoted rather than
+    added there, because `commands::worker`'s built-in demo tasks (`--demo-tasks`) are production
+    code, not test-only. `tests/control_redis.rs` now writes `#[async_trait::async_trait] impl Task`
+    directly instead of the desugared `Pin<Box<dyn Future>>` form.
 
 ### Test and tooling debt
 
 13. **Env-gated suites still pass without asserting.** ~63 tests early-return when their
-    `CELERS_TEST_*` variable is unset, and 109 more are `#[ignore]`d. `docker-compose.yml` now has a
-    service for every one of them (`--profile test` for MySQL and LocalStack, `--profile
+    `CELERS_TEST_*` variable is unset, and 114 more are `#[ignore]`d (up from 109 — the new
+    `core_adapter`, `pure_http` and macro `trybuild` suites added their own). `docker-compose.yml`
+    now has a service for every one of them (`--profile test` for MySQL and LocalStack, `--profile
     python-compat` for Celery) and [tests/integration/README.md](tests/integration/README.md) maps
     variable → service → invocation, but nothing in the repository *runs* the full matrix:
     `.github/` holds only `dependabot.yml`, `FUNDING.yml` and a `workflows.disabled/` directory. A
-    `scripts/test-integration.sh` that brings the stack up, exports all eight variables and runs
-    `--run-ignored all` is the missing piece.
-14. **Three files remain at or over the 2000-line policy limit** (down from seven):
-    `celers-backend-db/src/lib.rs` (2334), `celers-worker/src/worker_core/tests.rs` (2308),
-    `celers-worker/src/sandbox.rs` (2049). `splitrs` is the project's tool for this.
+    `scripts/test-integration.sh` that brings the stack up, exports all seven variables and runs
+    `--run-ignored all` is the missing piece. Running the live PostgreSQL/MySQL suites this way for
+    the first time (this wave) is exactly what found the defects fixed in
+    [CHANGELOG.md](CHANGELOG.md)'s 0.3.1 "Fixed" section and the one tracked in Known gaps #16 below
+    — the risk this item describes is not hypothetical.
+14. ~~**Three files remain at or over the 2000-line policy limit**~~ **Down to one.**
+    `celers-backend-db/src/lib.rs` (was 2334) is now 239 lines, split into `mysql_backend.rs`,
+    `postgres_backend.rs` and `result_compression.rs`; `celers-worker/src/worker_core/tests.rs` (was
+    2308) is now a `worker_core/tests/` directory of 16 files, none over 600 lines;
+    `celers-worker/src/sandbox.rs` (was 2049) is now 600 lines, split into `sandbox/config.rs`,
+    `error.rs`, `rlimit_impl.rs`, `seccomp_impl.rs`, `stats.rs` and `tests.rs`. One file is over the
+    cap as of this release: `celers-beat/src/tests/tests_schedule.rs` at **2004 lines** (grew past it
+    with this wave's solar/golden-hour test additions). `splitrs` is the project's tool for this.
 15. **The seccomp filter is type-checked but never executed here.** `sandbox.rs`'s `seccomp_impl` is
     gated on `all(target_os = "linux", feature = "seccomp")`; its BPF jump encoding has a unit test,
     but no test in this repository installs the filter under a Linux kernel.
+16. **`celers-backend-db` and `celers-broker-sql` collide on the MySQL table name
+    `celers_task_results`.** `celers-backend-db`'s `migrations/001_init_mysql.sql` and
+    `celers-broker-sql`'s `migrations/010_task_results.sql` each declare
+    `CREATE TABLE IF NOT EXISTS celers_task_results` with incompatible column sets. Whichever
+    crate's `migrate()` reaches a shared database *second* finds the table already present with the
+    other crate's columns and its own follow-up DDL fails — reproduced live as
+    `celers-backend-db`'s `CREATE INDEX ... (expires_at)` failing with
+    `ERROR 1072 (42000): Key column 'expires_at' doesn't exist in table` against a database
+    `celers-broker-sql` had already migrated. This is order-independent (whichever side loses fails
+    on its own missing columns, not merely a warning) and reproduces on a freshly created database,
+    not only a long-lived one. It triggers exactly when a deployment points both the broker and the
+    result backend at one MySQL database/schema — a normal, documented topology
+    (`tests/integration/README.md`'s own MySQL rows do this by default). Confirmed to be purely this
+    collision, not a defect in either crate alone: `celers-backend-db`'s full suite passes
+    **150/150** with `MYSQL_URL` pointed at a database `celers-broker-sql` has never migrated
+    (running only its 31 MySQL-specific tests in isolation also passes), and `celers-broker-sql`'s
+    full suite passes 217/217. A fix
+    needs one crate to rename its table (or namespace both under a crate-specific prefix) — out of
+    scope for this documentation-only pass.
+    *Evidence:* `crates/celers-backend-db/migrations/001_init_mysql.sql`,
+    `crates/celers-broker-sql/migrations/010_task_results.sql`.
 
 ---
 
@@ -446,7 +531,7 @@ Simple tasks can be enqueued to Redis, and Rust workers can pick them up and exe
 ## Documentation 🚧 IN PROGRESS
 
 ### Core Documentation
-- [x] API documentation via rustdoc — 1,165 passing doctests, `RUSTDOCFLAGS="-D warnings" cargo doc`
+- [x] API documentation via rustdoc — 1,175 passing doctests, `RUSTDOCFLAGS="-D warnings" cargo doc`
       clean
 - [x] User guide with examples (15 working examples in `crates/celers-examples/examples/`)
 - [x] Deployment guide ([docs/DEPLOYMENT.md](docs/DEPLOYMENT.md))
@@ -456,9 +541,9 @@ Simple tasks can be enqueued to Redis, and Rust workers can pick them up and exe
 - [x] Integration-test guide: gate variable → service → invocation
       ([tests/integration/README.md](tests/integration/README.md))
 - [x] Python interop guide ([tests/python-compat/README.md](tests/python-compat/README.md))
-- [ ] `CONTRIBUTING.md` — **README links to it and it does not exist**; either write it or drop the
-      link
-- [ ] 136 doctests are still ```ignore``d and therefore never compile
+- [x] `CONTRIBUTING.md` — dev setup, gated live-service suites, code standards, the no-CI-on-push
+      reality, and how a release actually gets cut
+- [ ] 138 doctests are still ```ignore``d and therefore never compile
 
 ### Specialized Guides
 - [x] CLI usage documentation (`crates/celers-cli/README.md`)
@@ -485,10 +570,12 @@ Simple tasks can be enqueued to Redis, and Rust workers can pick them up and exe
 
 ## Testing
 
-- [x] Unit tests for all core types — 7,529 passing with `--all-features`
+- [x] Unit tests for all core types — 7,722 passing with `--all-features` (7,447 with default features)
 - [x] Integration tests against a real Redis (env-gated on `CELERS_TEST_REDIS_URL`)
 - [x] Integration tests against a real PostgreSQL / MySQL / RabbitMQ / LocalStack SQS (env-gated;
-      services in `docker-compose.yml`, one `--profile test` away)
+      services in `docker-compose.yml`, one `--profile test` away) — actually **run** against all
+      four this campaign for the first time (not merely present), which is what found and fixed the
+      defects in CHANGELOG.md's 0.3.1 "Fixed" section
 - [x] Live Python Celery interoperability suite (`tests/python-compat/`)
 - [x] Property-based round-trip tests (`celers-protocol`) and a `trybuild` compile-fail UI harness
       (`celers-macros`)

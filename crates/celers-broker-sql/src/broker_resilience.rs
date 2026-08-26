@@ -260,7 +260,7 @@ impl MysqlBroker {
     /// compare-and-swap that swaps the whole stored JSON document for the one
     /// carrying the advanced `next_run`, conditional on the document still
     /// being byte-identical to what this process read
-    /// ([`crate::sql_text::RECURRING_CLAIM_SQL`]). Exactly one process
+    /// (`sql_text::RECURRING_CLAIM_SQL`). Exactly one process
     /// observes `rows_affected == 1` and enqueues; the rest skip.
     ///
     /// This previously used a plain `SELECT` with no claim of any kind, so
@@ -310,8 +310,10 @@ impl MysqlBroker {
             let config_id: String = row
                 .col("task_id")
                 .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {e}")))?;
-            let config_json: String = row
-                .col("result")
+            // `celers_results.result` is a MEDIUMBLOB holding JSON text, and
+            // MySQL BLOB columns arrive as `Value::Blob`, which
+            // `col::<String>` rejects. See `row_ext::text_from_row`.
+            let config_json = crate::row_ext::text_from_row(&row, "result")
                 .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {e}")))?;
 
             let mut config: RecurringTaskConfig =
@@ -408,8 +410,10 @@ impl MysqlBroker {
             let config_id: String = row
                 .col("task_id")
                 .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {e}")))?;
-            let config_json: String = row
-                .col("result")
+            // `celers_results.result` is a MEDIUMBLOB holding JSON text, and
+            // MySQL BLOB columns arrive as `Value::Blob`, which
+            // `col::<String>` rejects. See `row_ext::text_from_row`.
+            let config_json = crate::row_ext::text_from_row(&row, "result")
                 .map_err(|e| CelersError::Other(format!("Failed to fetch recurring tasks: {e}")))?;
 
             if let Ok(config) = serde_json::from_str::<RecurringTaskConfig>(&config_json) {

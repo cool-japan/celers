@@ -366,8 +366,10 @@ impl ReplayManager {
     /// 1. each message is converted to a [`ReplayableMessage`] (its age and
     ///    failure count come from the SQS system attributes the broker
     ///    records on receive);
-    /// 2. messages rejected by `filter` are skipped and left in the DLQ — their
-    ///    visibility timeout returns them to it;
+    /// 2. messages rejected by `filter` are skipped and left in the DLQ — the
+    ///    run resets their visibility timeout to zero on the way out, so they
+    ///    are available again the moment it returns rather than after the
+    ///    queue's visibility timeout elapses;
     /// 3. matching messages are published to the main queue and only then
     ///    deleted **from the DLQ** (never from the main queue: an SQS receipt
     ///    handle is valid only against the queue it came from);
@@ -376,7 +378,12 @@ impl ReplayManager {
     /// 5. the configured rate limit is applied with an async sleep.
     ///
     /// With `dry_run` nothing is published and nothing is deleted: the messages
-    /// that *would* be replayed are counted and returned to the DLQ.
+    /// that *would* be replayed are counted and returned to the DLQ — really
+    /// returned, by resetting their visibility timeout once the run is over, so
+    /// that the real replay a dry run is usually followed by still finds them.
+    /// (Reading a message from SQS makes it invisible even when nothing is
+    /// deleted; without the reset, `dry_run = true` immediately followed by
+    /// `dry_run = false` moved nothing and reported success.)
     ///
     /// The loop stops when the DLQ returns an empty batch, when
     /// [`ReplayFilter::max_messages`] is reached, or at a hard round ceiling.
@@ -408,6 +415,26 @@ impl ReplayManager {
         let mut failed_message_ids: Vec<String> = Vec::new();
         let mut sent_since_start = 0usize;
 
+        // Delivery tags of the messages this run received from the DLQ but
+        // deliberately left there: everything a dry run inspected, and
+        // everything `filter` rejected.
+        //
+        // Reading a message from SQS starts its visibility timeout even when
+        // nothing is deleted, so "left in the DLQ" is only true again once
+        // that timeout expires — up to 12 hours, and 30 seconds by default.
+        // Until then the message is invisible, which made the obvious
+        // operator workflow silently do nothing:
+        //
+        //   let planned = replay_from_dlq(.., dry_run = true).await?;  // 1
+        //   let done    = replay_from_dlq(.., dry_run = false).await?; // 0 (!)
+        //
+        // The real run received an empty DLQ and reported success having moved
+        // nothing. Resetting the visibility timeout to zero puts each message
+        // back immediately instead — but only *after* the receive loop has
+        // finished, never inside it: releasing during the loop would make the
+        // very next round receive the same message again and count it twice.
+        let mut to_release: Vec<String> = Vec::new();
+
         for round in 0..MAX_REPLAY_ROUNDS {
             if limit > 0 && total >= limit {
                 break;
@@ -431,11 +458,13 @@ impl ReplayManager {
                 let replayable = replayable_from_envelope(broker, &envelope);
                 if !filter.matches(&replayable) {
                     skipped += 1;
+                    to_release.push(envelope.delivery_tag.clone());
                     continue;
                 }
 
                 if dry_run {
                     successful += 1;
+                    to_release.push(envelope.delivery_tag.clone());
                     continue;
                 }
 
@@ -461,6 +490,21 @@ impl ReplayManager {
             self.update_progress(total, total.max(limit), successful, failed);
             self.apply_rate_limit(sent_since_start, started.elapsed())
                 .await;
+        }
+
+        // Put back everything this run only looked at. A failure here is
+        // logged, not returned: the messages still become visible again when
+        // their visibility timeout expires, and a dry run that inspected the
+        // DLQ correctly must not be reported as a failed run because the
+        // release call did not land.
+        for delivery_tag in &to_release {
+            if let Err(error) = broker.extend_visibility(delivery_tag, 0).await {
+                warn!(
+                    "Failed to return an inspected message to DLQ {}: {} \
+                     (it becomes visible again when its visibility timeout expires)",
+                    dlq_name, error
+                );
+            }
         }
 
         let duration = started.elapsed();

@@ -46,8 +46,10 @@ against the real `Task` / `CelersError` types instead of a hand-rolled mirror th
 - ✅ **Performance Optimization**: LazyLock pattern caching for all regex-based validators
 
 ### Testing & Quality
-- ✅ 221 tests passing (21 unit + 200 integration), verified via `cargo nextest run -p celers-macros --all-features`
-- ℹ️ 23 additional doc examples exist but are marked `` ```ignore `` (illustrative only — see TODO for details)
+- ✅ 227 tests passing (21 unit + 206 integration across `integration_test`, `ui_compile_fail`
+  (a `trybuild` compile-fail harness), `validators_geo`, `validators_ids`, `validators_practical`),
+  verified via `cargo nextest run -p celers-macros --all-features`
+- ℹ️ 15 additional doc examples exist but are marked `` ```ignore `` (illustrative only — see TODO for details)
 - ✅ Zero compiler warnings, zero clippy warnings
 - ✅ Comprehensive validation examples
 - ✅ Runnable examples demonstrating all features

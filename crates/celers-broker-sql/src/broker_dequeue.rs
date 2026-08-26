@@ -9,6 +9,7 @@
 //! [`crate::task_row::row_to_broker_message`], plus the two helpers below.
 
 use crate::broker_core::MysqlBroker;
+use crate::mysql_error::with_deadlock_retry_celers;
 use crate::sql_text;
 use crate::task_row;
 use celers_core::{BrokerMessage, CelersError, Result, SerializedTask, TaskId};
@@ -99,6 +100,16 @@ impl MysqlBroker {
             return Ok(None);
         }
 
+        with_deadlock_retry_celers("dequeue_with_worker_id", || {
+            self.claim_one_with_worker_id(worker_id)
+        })
+        .await
+    }
+
+    /// One claim attempt for [`Self::dequeue_with_worker_id`] — see
+    /// `mysql_error::with_deadlock_retry_celers` for why the whole
+    /// transaction, and not an individual statement, is the retryable unit.
+    async fn claim_one_with_worker_id(&self, worker_id: &str) -> Result<Option<BrokerMessage>> {
         let mut tx = self
             .conn
             .transaction()
@@ -211,6 +222,11 @@ impl MysqlBroker {
             return Ok(Vec::new());
         }
 
+        with_deadlock_retry_celers("dequeue_batch", || self.claim_batch(limit)).await
+    }
+
+    /// One batch-claim attempt for [`Self::dequeue_batch_impl`].
+    async fn claim_batch(&self, limit: usize) -> Result<Vec<BrokerMessage>> {
         let mut tx = self
             .conn
             .transaction()

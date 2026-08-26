@@ -214,6 +214,42 @@ pub fn json_from_row(row: &Row, col: &str) -> Result<serde_json::Value, OxiSqlEr
         .unwrap_or(serde_json::Value::Null))
 }
 
+/// Read a column that holds text as a `String`, accepting the `Blob` variant
+/// MySQL `BLOB`/`TEXT` columns arrive as.
+///
+/// MySQL uses one wire type for `TEXT` and every `BLOB` size
+/// (`MYSQL_TYPE_BLOB` and friends), so `oxisql-mysql` maps them all to
+/// [`oxisql_core::Value::Blob`]. `FromValue for String` accepts
+/// `Text`/`Json`/`Decimal`/`Uuid` but **not** `Blob`, so
+/// `row.col::<String>("result")` over a `MEDIUMBLOB` that holds JSON text
+/// fails with `type mismatch: expected Text, got Blob` — which is what made
+/// every recurring-task read fail.
+///
+/// # Errors
+///
+/// [`OxiSqlError::Other`] if the bytes are not valid UTF-8 or the column is
+/// `NULL`, [`OxiSqlError::TypeMismatch`] for a non-text variant.
+#[allow(dead_code)]
+pub fn text_from_row(row: &Row, col: &str) -> Result<String, OxiSqlError> {
+    match row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?
+    {
+        oxisql_core::Value::Text(s) | oxisql_core::Value::Json(s) => Ok(s.clone()),
+        oxisql_core::Value::Blob(bytes) => std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|e| OxiSqlError::Other(format!("column '{col}' is not valid UTF-8: {e}"))),
+        oxisql_core::Value::Null => Err(OxiSqlError::TypeMismatch {
+            expected: "Text/Json/Blob",
+            got: "Null",
+        }),
+        other => Err(OxiSqlError::TypeMismatch {
+            expected: "Text/Json/Blob",
+            got: other.type_name(),
+        }),
+    }
+}
+
 // ── DateTime<Utc> parameter convention (PostgreSQL) ─────────────────────────
 //
 // oxisql-core provides `FromValue for chrono::DateTime<Utc>` (behind the

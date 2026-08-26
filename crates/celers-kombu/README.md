@@ -2,7 +2,7 @@
 
 Broker abstraction layer for CeleRS, inspired by Python's Kombu library. Provides unified traits for message broker implementations.
 
-**Status: [Stable] — v0.3.1 (2026-08-26) — 441 tests + 149 doctests**
+**Status: [Stable] — v0.3.1 (2026-08-26) — 468 tests + 154 doctests**
 
 ## Overview
 

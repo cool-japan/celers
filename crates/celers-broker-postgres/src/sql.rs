@@ -22,6 +22,21 @@
 //! * `TIMESTAMPTZ` parameters follow the same rule with
 //!   `$n::text::timestamptz` and `.to_rfc3339()`, as documented at length in
 //!   [`crate::row_ext`].
+//! * `UUID` parameters follow the same rule with `$n::text::uuid`.
+//!   [`crate::row_ext::uuid_param`] hands `oxisql-postgres` the 36-character
+//!   hyphenated text form, which it forwards as a `String` parameter — and a
+//!   `String`'s binary encoding is raw UTF-8, which PostgreSQL's binary
+//!   `uuid_recv` (16 bytes, exactly) rejects outright. A bare `$n` against a
+//!   `uuid` column therefore fails at bind time with
+//!   `incorrect binary data format in bind parameter n`; the `::text` cast
+//!   pins the parameter to `text` and the `::uuid` cast converts it
+//!   server-side. See [`crate::row_ext::uuid_param`] for the full derivation.
+//! * `JSONB` columns are likewise always **selected** through an explicit
+//!   `::text` cast (see [`CLAIM_RETURNING`]): `oxisql-postgres` decodes a
+//!   `jsonb` column by asking `tokio-postgres` for a `String`, and
+//!   `FromSql for String` does not accept `jsonb`, so an uncast `SELECT
+//!   metadata` fails inside the driver with
+//!   `error deserializing column N`.
 
 use crate::types::RetryStrategy;
 
@@ -65,21 +80,21 @@ pub(crate) fn validate_queue_name(name: &str) -> Result<(), String> {
 pub(crate) const INSERT_TASK_NOW: &str = r#"
 INSERT INTO celers_tasks
     (id, task_name, payload, state, priority, max_retries, metadata, queue_name, created_at, scheduled_at)
-VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), NOW())
+VALUES ($1::text::uuid, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), NOW())
 "#;
 
 /// As [`INSERT_TASK_NOW`], plus `$8` = an RFC3339 absolute schedule time.
 pub(crate) const INSERT_TASK_AT: &str = r#"
 INSERT INTO celers_tasks
     (id, task_name, payload, state, priority, max_retries, metadata, queue_name, created_at, scheduled_at)
-VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), $8::text::timestamptz)
+VALUES ($1::text::uuid, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), $8::text::timestamptz)
 "#;
 
 /// As [`INSERT_TASK_NOW`], plus `$8` = a delay in seconds.
 pub(crate) const INSERT_TASK_AFTER: &str = r#"
 INSERT INTO celers_tasks
     (id, task_name, payload, state, priority, max_retries, metadata, queue_name, created_at, scheduled_at)
-VALUES ($1, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), NOW() + ($8::bigint || ' seconds')::INTERVAL)
+VALUES ($1::text::uuid, $2, $3, 'pending', $4, $5, $6::text::jsonb, $7, NOW(), NOW() + ($8::bigint || ' seconds')::INTERVAL)
 "#;
 
 // ── Dequeue ────────────────────────────────────────────────────────────────
@@ -158,7 +173,7 @@ pub(crate) const ACK_TASK: &str = r#"
 UPDATE celers_tasks
    SET state = 'completed',
        completed_at = NOW()
- WHERE id = $1
+ WHERE id = $1::text::uuid
    AND queue_name = $2
    AND state = 'processing'
 RETURNING task_name, payload
@@ -167,12 +182,12 @@ RETURNING task_name, payload
 /// `$1` = task id, `$2` = queue_name. Used to explain an ack/reject that
 /// matched no row: absent task vs. task already in a terminal state.
 pub(crate) const PROBE_TASK_STATE: &str = r#"
-SELECT state FROM celers_tasks WHERE id = $1 AND queue_name = $2
+SELECT state FROM celers_tasks WHERE id = $1::text::uuid AND queue_name = $2
 "#;
 
 /// Fetch just enough of a task to run lifecycle hooks. `$1` id, `$2` queue.
 pub(crate) const SELECT_TASK_FOR_HOOKS: &str = r#"
-SELECT task_name, payload FROM celers_tasks WHERE id = $1 AND queue_name = $2
+SELECT task_name, payload FROM celers_tasks WHERE id = $1::text::uuid AND queue_name = $2
 "#;
 
 /// Permanently fail a task (`reject(requeue = false)`).
@@ -183,7 +198,7 @@ UPDATE celers_tasks
    SET state = 'failed',
        completed_at = NOW(),
        started_at = NULL
- WHERE id = $1
+ WHERE id = $1::text::uuid
    AND queue_name = $2
    AND state = 'processing'
 RETURNING task_name, payload
@@ -217,7 +232,7 @@ UPDATE celers_tasks
        completed_at = CASE WHEN retry_count + 1 > max_retries THEN NOW() ELSE NULL END,
        started_at = NULL,
        worker_id = NULL
- WHERE id = $1
+ WHERE id = $1::text::uuid
    AND queue_name = $2
    AND state = 'processing'
 RETURNING task_name, payload, retry_count, max_retries, state
@@ -230,7 +245,7 @@ pub(crate) const CANCEL_TASK: &str = r#"
 UPDATE celers_tasks
    SET state = 'cancelled',
        completed_at = NOW()
- WHERE id = $1
+ WHERE id = $1::text::uuid
    AND queue_name = $2
    AND state IN ('pending', 'processing')
 "#;
@@ -254,7 +269,7 @@ SELECT COUNT(*) as count
 /// the row rather than erroring, and refreshes `revoked_at` too.
 pub(crate) const UPSERT_REVOKED_TASK: &str = r#"
 INSERT INTO celers_revoked_tasks (task_id, queue_name, terminate, expires_at)
-VALUES ($1, $2, $3, $4::text::timestamptz)
+VALUES ($1::text::uuid, $2, $3, $4::text::timestamptz)
 ON CONFLICT (queue_name, task_id)
 DO UPDATE SET terminate = EXCLUDED.terminate,
               expires_at = EXCLUDED.expires_at,
@@ -273,25 +288,47 @@ DELETE FROM celers_revoked_tasks WHERE expires_at < NOW()
 /// `$1` = task id, `$2` = queue_name.
 pub(crate) const IS_REVOKED: &str = r#"
 SELECT 1 FROM celers_revoked_tasks
- WHERE task_id = $1
+ WHERE task_id = $1::text::uuid
    AND queue_name = $2
    AND expires_at > NOW()
 "#;
 
+/// The body of an `IN (...)` clause over `len` UUID parameters, numbered from
+/// the 1-based placeholder index `start_idx`:
+/// `"$3::text::uuid, $4::text::uuid, $5::text::uuid"`.
+///
+/// `oxisql-core` has no array/slice `ToSqlValue`, so `= ANY($n)` is expressed
+/// throughout this crate as a dynamically sized `IN` list with one placeholder
+/// per id, each bound individually through
+/// [`crate::row_ext::uuid_param`]. Only the *count* of placeholders is derived
+/// from the slice length — no value is ever spliced into SQL text, so this
+/// stays injection-safe.
+///
+/// This is the crate's single generator for such lists. Every one of them
+/// needs the `::text::uuid` cast (see this module's "Binding conventions"),
+/// and a hand-rolled `format!("${i}")` that quietly omits it produces SQL the
+/// server rejects only at run time, against a real database — so the cast
+/// lives here, once, behind a unit test, rather than at seven call sites.
+pub(crate) fn uuid_in_clause(start_idx: usize, len: usize) -> String {
+    (start_idx..start_idx + len)
+        .map(|i| format!("${i}::text::uuid"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Batch ack. `$1..$n` are task ids, `${n+1}` is the queue name.
 pub(crate) fn ack_batch_sql(id_count: usize) -> String {
-    let placeholders: Vec<String> = (1..=id_count).map(|i| format!("${i}")).collect();
+    let placeholders = uuid_in_clause(1, id_count);
     let queue_idx = id_count + 1;
     format!(
         r#"
 UPDATE celers_tasks
    SET state = 'completed',
        completed_at = NOW()
- WHERE id IN ({})
+ WHERE id IN ({placeholders})
    AND queue_name = ${queue_idx}
    AND state = 'processing'
-"#,
-        placeholders.join(", ")
+"#
     )
 }
 
@@ -450,9 +487,54 @@ mod tests {
                 sql.contains("$6::text::jsonb"),
                 "JSONB parameters must go through a ::text::jsonb cast"
             );
+            assert!(
+                sql.contains("VALUES ($1::text::uuid,"),
+                "the task id targets a UUID column and must go through a \
+                 ::text::uuid cast, or the bind is rejected by the server"
+            );
         }
         assert!(INSERT_TASK_AT.contains("$8::text::timestamptz"));
         assert!(INSERT_TASK_AFTER.contains("($8::bigint || ' seconds')::INTERVAL"));
+    }
+
+    /// Every `celers_tasks.id` / `celers_revoked_tasks.task_id` placeholder in
+    /// this module targets a PostgreSQL `UUID` column, and
+    /// [`crate::row_ext::uuid_param`] binds the *text* form — so a bare `$n`
+    /// there is rejected by the server with
+    /// `incorrect binary data format in bind parameter n`. This test is the
+    /// non-gated net for that: it fails the moment a cast is dropped, without
+    /// needing a live database.
+    #[test]
+    fn every_uuid_placeholder_carries_a_text_uuid_cast() {
+        let reject = reject_requeue_sql(RetryStrategy::default());
+        let batch = ack_batch_sql(3);
+        let claim_one = claim_one_sql();
+        let claim_batch = claim_batch_sql();
+
+        for (name, sql) in [
+            ("ACK_TASK", ACK_TASK),
+            ("FAIL_TASK", FAIL_TASK),
+            ("CANCEL_TASK", CANCEL_TASK),
+            ("PROBE_TASK_STATE", PROBE_TASK_STATE),
+            ("SELECT_TASK_FOR_HOOKS", SELECT_TASK_FOR_HOOKS),
+            ("reject_requeue_sql", reject.as_str()),
+        ] {
+            assert!(
+                sql.contains("id = $1::text::uuid"),
+                "{name} must cast its task-id parameter: {sql}"
+            );
+        }
+
+        assert!(UPSERT_REVOKED_TASK.contains("VALUES ($1::text::uuid,"));
+        assert!(IS_REVOKED.contains("task_id = $1::text::uuid"));
+        assert!(batch.contains("id IN ($1::text::uuid, $2::text::uuid, $3::text::uuid)"));
+
+        // No statement in this module may leave a UUID-column placeholder
+        // bare. The claim statements bind only the queue name (and a limit),
+        // so they must contain no `id = $n` at all.
+        for sql in [claim_one.as_str(), claim_batch.as_str()] {
+            assert!(!sql.contains("id = $"), "claim statements bind no task id");
+        }
     }
 
     #[test]
@@ -498,10 +580,48 @@ mod tests {
         assert!(!sql.contains("SELECT"));
     }
 
+    /// Every dynamically sized `IN (...)` list in the crate is generated here,
+    /// so this is the single place the cast can be lost. It is also the only
+    /// non-gated coverage those lists have — the alternative is discovering a
+    /// dropped cast as `incorrect binary data format in bind parameter n`
+    /// against a live server.
+    #[test]
+    fn uuid_in_clause_numbers_from_the_start_index_and_always_casts() {
+        assert_eq!(uuid_in_clause(1, 1), "$1::text::uuid");
+        assert_eq!(
+            uuid_in_clause(1, 3),
+            "$1::text::uuid, $2::text::uuid, $3::text::uuid"
+        );
+        // The offsets every call site in the crate uses: `$1` (results,
+        // ack-batch, batch-cancel), `$2` (bulk state/priority/reason updates,
+        // which reserve `$1` for the new value) and `$3` (task groups and
+        // tags, which reserve `$1`/`$2`).
+        assert_eq!(
+            uuid_in_clause(2, 2),
+            "$2::text::uuid, $3::text::uuid",
+            "a list starting after a reserved $1 must not renumber from 1"
+        );
+        assert_eq!(
+            uuid_in_clause(3, 2),
+            "$3::text::uuid, $4::text::uuid",
+            "a list starting after a reserved $1/$2 must not renumber from 1"
+        );
+        assert_eq!(uuid_in_clause(1, 0), "", "an empty list produces no text");
+
+        for (start, len) in [(1_usize, 5_usize), (2, 4), (3, 3)] {
+            let clause = uuid_in_clause(start, len);
+            assert_eq!(
+                clause.matches("::text::uuid").count(),
+                len,
+                "every placeholder needs the cast: {clause}"
+            );
+        }
+    }
+
     #[test]
     fn ack_batch_numbers_placeholders_correctly() {
         let sql = ack_batch_sql(3);
-        assert!(sql.contains("id IN ($1, $2, $3)"));
+        assert!(sql.contains("id IN ($1::text::uuid, $2::text::uuid, $3::text::uuid)"));
         assert!(sql.contains("queue_name = $4"));
         assert!(sql.contains("AND state = 'processing'"));
     }

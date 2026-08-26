@@ -189,40 +189,186 @@ pub fn opt_uuid_from_row(row: &Row, col: &str) -> Result<Option<uuid::Uuid>, Oxi
 
 /// Serialize a [`serde_json::Value`] to its `String` wire form for binding as
 /// a query parameter (oxisql-core has no `ToSqlValue` impl for `Value::Json`
-/// itself — a plain `&str`/`String` parameter is bound and the column's SQL
-/// type, e.g. Postgres `JSON`/`JSONB` or MySQL `JSON`, handles the cast on
-/// the server side).
+/// itself, so a plain `&str`/`String` parameter is bound instead).
+///
+/// # The `::text::jsonb` cast is mandatory on PostgreSQL
+///
+/// The returned `String` carries JSON *text*. On PostgreSQL's extended
+/// (prepared-statement) protocol the server infers each parameter's type
+/// from where it appears, so a bare `$n` written straight into a `JSONB`
+/// column is inferred as `jsonb` — and the client then encodes the string
+/// in the **binary** `jsonb` representation, whose first byte must be the
+/// format version `0x01`. JSON text starts with `{`, `[`, `"`, a digit or
+/// `n`, so the server rejects the value with
+/// `ERROR: unsupported jsonb version number 123` (`{`), `91` (`[`),
+/// `110` (`n`), etc., and the whole statement fails.
+///
+/// Binding through an explicit `$n::text::jsonb` pins the parameter's
+/// inferred type to `text` — which *is* transferred verbatim — and casts it
+/// to `jsonb` server-side, where the ordinary JSON text parser runs. This is
+/// the same idiom the timestamp and UUID parameters in this crate use
+/// (`$n::text::timestamptz`, `$n::text::uuid`) and the one
+/// `celers-broker-postgres`'s `sql.rs` asserts on in a unit test.
+///
+/// MySQL has no binary JSON parameter representation, so its `JSON` columns
+/// accept the bound string directly and need no cast.
 ///
 /// # Example
 ///
 /// ```ignore
 /// let payload = serde_json::json!({ "k": "v" });
-/// conn.execute("INSERT INTO t (data) VALUES ($1)", &[&json_param(&payload)]).await?;
+/// // Note the cast: `VALUES ($1)` alone corrupts the value on PostgreSQL.
+/// conn.execute(
+///     "INSERT INTO t (data) VALUES ($1::text::jsonb)",
+///     &[&json_param(&payload)],
+/// ).await?;
 /// ```
 #[allow(dead_code)]
 pub fn json_param(v: &serde_json::Value) -> String {
     v.to_string()
 }
 
+/// Read a nullable text column as `Option<String>`, accepting the `Blob`
+/// variant MySQL `TEXT` columns arrive as.
+///
+/// MySQL uses the *same* wire type for `TEXT` and `BLOB`
+/// (`MYSQL_TYPE_BLOB`) — they differ only by charset — so `oxisql-mysql`
+/// maps every `TEXT` column to [`oxisql_core::Value::Blob`].
+/// `FromValue for String` accepts `Text`/`Json`/`Decimal`/`Uuid` but **not**
+/// `Blob`, so a plain `row.col::<Option<String>>("callback")` over a MySQL
+/// `TEXT` column fails with `type mismatch: expected Text, got Blob`
+/// whenever the column is non-`NULL`. (A `NULL` slips through, which is why
+/// this only ever showed up on rows that actually had a value — for example
+/// a chord with a callback, or a failed task's `error_message`.)
+///
+/// Use this for every MySQL `TEXT` column. PostgreSQL `TEXT` arrives as
+/// `Value::Text` and is handled by the same match, so the helper is safe on
+/// both backends.
+///
+/// # Errors
+///
+/// [`OxiSqlError::Other`] if a `Blob` is not valid UTF-8, or
+/// [`OxiSqlError::TypeMismatch`] for a non-text variant.
+#[cfg_attr(not(feature = "mysql"), allow(dead_code))]
+pub fn opt_text_from_row(row: &Row, col: &str) -> Result<Option<String>, OxiSqlError> {
+    match row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?
+    {
+        oxisql_core::Value::Null => Ok(None),
+        oxisql_core::Value::Text(s) | oxisql_core::Value::Json(s) => Ok(Some(s.clone())),
+        oxisql_core::Value::Blob(bytes) => std::str::from_utf8(bytes)
+            .map(|s| Some(s.to_string()))
+            .map_err(|e| OxiSqlError::Other(format!("column '{col}' is not valid UTF-8: {e}"))),
+        other => Err(OxiSqlError::TypeMismatch {
+            expected: "Text/Json/Blob",
+            got: other.type_name(),
+        }),
+    }
+}
+
+/// Read a boolean column, accepting the integer MySQL actually returns.
+///
+/// MySQL has no real `BOOLEAN` type: `BOOLEAN` is a synonym for
+/// `TINYINT(1)`, and the value comes back over the wire as an integer, which
+/// `oxisql-mysql` maps to [`oxisql_core::Value::I64`]. `FromValue for bool`
+/// accepts only `Value::Bool`, so `row.col::<bool>("cancelled")` fails on
+/// MySQL with `type mismatch: expected Bool, got I64` — while working fine
+/// on PostgreSQL, whose `BOOLEAN` is a genuine boolean type.
+///
+/// Any non-zero integer is `true`, matching SQL's own truthiness rule.
+/// A `NULL` column reads as `default`, so callers of a `NOT NULL` column can
+/// pass `false` and get the schema's own semantics.
+///
+/// # Errors
+///
+/// [`OxiSqlError::TypeMismatch`] for a non-boolean, non-integer variant.
+#[cfg_attr(not(feature = "mysql"), allow(dead_code))]
+pub fn bool_from_row(row: &Row, col: &str, default: bool) -> Result<bool, OxiSqlError> {
+    match row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?
+    {
+        oxisql_core::Value::Null => Ok(default),
+        oxisql_core::Value::Bool(b) => Ok(*b),
+        oxisql_core::Value::I64(n) => Ok(*n != 0),
+        other => Err(OxiSqlError::TypeMismatch {
+            expected: "Bool/I64",
+            got: other.type_name(),
+        }),
+    }
+}
+
 /// Read a `JSON`/`JSONB` column as a [`serde_json::Value`].
 ///
-/// Reads the column as `Option<String>` (covers both a `NULL` SQL value and
-/// backends that surface JSON via `Value::Text` rather than `Value::Json`),
-/// then parses the text as JSON. A `NULL` column or an empty/missing string
-/// maps to [`serde_json::Value::Null`] rather than an error, matching the
-/// common "absent JSON column" convention.
+/// Inspects the raw [`oxisql_core::Value`] (via `Row::get`, bypassing
+/// `FromValue`) exactly like the numeric helpers below, and accepts
+/// `Value::Json` *and* `Value::Text`, so a query is correct whether the
+/// driver hands back a tagged JSON value or a plain string. A `NULL` column
+/// or an empty string maps to [`serde_json::Value::Null`] rather than an
+/// error, matching the common "absent JSON column" convention.
+///
+/// Accepting both variants matters because the two backends differ:
+/// `oxisql-postgres` maps `JSON`/`JSONB` to `Value::Json`, while a column
+/// that was cast in SQL (`SELECT payload::text`) arrives as `Value::Text`.
+/// The previous implementation read `Option<String>` through `FromValue`,
+/// which only accepts `Value::Text` — so any *uncast* PostgreSQL `JSONB`
+/// column failed with `TypeMismatch`. See the note on
+/// [`SELECT`-side casts](#postgresql-jsonb-columns-must-be-selected-as-text)
+/// below for why the queries in this crate cast anyway.
+///
+/// # PostgreSQL `JSONB` columns must be selected as `::text`
+///
+/// Handling `Value::Json` here is necessary but not sufficient on
+/// PostgreSQL: `oxisql-postgres` 0.4.1 builds that variant by asking
+/// `tokio-postgres` for a `String`, and `tokio-postgres` implements
+/// `FromSql for String` only for the *text-ish* types — `jsonb` needs
+/// `serde_json::Value` and the driver's `with-serde_json-1` feature. So a
+/// bare `SELECT payload` over a `JSONB` column fails inside the driver,
+/// before this function is ever reached, with
+/// `type conversion error: error deserializing column N`.
+///
+/// Every `SELECT` in this crate therefore casts JSONB columns in SQL —
+/// `SELECT payload::text` — which makes the column a plain `text` the driver
+/// does convert, and which this function then parses. That mirrors the
+/// `$n::text::jsonb` cast on the write side (see [`json_param`]).
 ///
 /// # Errors
 ///
 /// Returns [`OxiSqlError::Other`] wrapping the `serde_json` parse error if
-/// the column contains a non-empty string that is not valid JSON.
+/// the column contains a non-empty string that is not valid JSON, and
+/// [`OxiSqlError::TypeMismatch`] if it holds some other variant entirely.
 #[allow(dead_code)]
 pub fn json_from_row(row: &Row, col: &str) -> Result<serde_json::Value, OxiSqlError> {
-    let s: Option<String> = row.try_get(col)?;
-    Ok(s.map(|s| serde_json::from_str(&s))
-        .transpose()
-        .map_err(|e| OxiSqlError::Other(format!("invalid JSON in column '{col}': {e}")))?
-        .unwrap_or(serde_json::Value::Null))
+    let text: Option<&str> = match row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?
+    {
+        oxisql_core::Value::Null => None,
+        oxisql_core::Value::Json(s) | oxisql_core::Value::Text(s) => Some(s.as_str()),
+        // `oxisql-mysql` maps a `Bytes` payload to `Value::Blob` whenever it
+        // cannot see the column type (its type-less mapping path) or the
+        // server reports the column as one of the BLOB types — which is how
+        // MySQL `JSON` columns can arrive. The bytes are still JSON text, so
+        // decode rather than reject: `FromValue for String` does *not* accept
+        // `Blob`, which is what made `celers_chord_state.task_ids` fail with
+        // `type mismatch: expected Text, got Blob`.
+        oxisql_core::Value::Blob(bytes) => Some(std::str::from_utf8(bytes).map_err(|e| {
+            OxiSqlError::Other(format!("column '{col}' is not valid UTF-8 JSON: {e}"))
+        })?),
+        other => {
+            return Err(OxiSqlError::TypeMismatch {
+                expected: "Json/Text/Blob",
+                got: other.type_name(),
+            })
+        }
+    };
+
+    match text.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(serde_json::Value::Null),
+        Some(s) => serde_json::from_str(s)
+            .map_err(|e| OxiSqlError::Other(format!("invalid JSON in column '{col}': {e}"))),
+    }
 }
 
 // ── Numeric column convention (DECIMAL / NUMERIC) ───────────────────────────
@@ -291,13 +437,40 @@ pub fn opt_decimal_f64_from_row(row: &Row, col: &str) -> Result<Option<f64>, Oxi
     }
 }
 
+/// Read a nullable aggregate column as `Option<i64>`, accepting everything
+/// [`decimal_i64_from_row`] does plus `Value::Null` (-> `None`).
+///
+/// `SUM(...)` over **zero rows** is `NULL`, not `0`, in both MySQL and
+/// PostgreSQL. Reading such a column with the non-optional
+/// [`decimal_i64_from_row`] therefore fails with
+/// `type mismatch: expected I64/F64/Decimal, got Null` the moment the table
+/// (or the time window being aggregated) is empty — which is the normal
+/// state of a fresh deployment, not an edge case. Use this and treat `None`
+/// as the zero the caller means.
+///
+/// # Errors
+///
+/// As [`decimal_i64_from_row`], minus the `Null` case.
+#[cfg_attr(not(feature = "mysql"), allow(dead_code))]
+pub fn opt_decimal_i64_from_row(row: &Row, col: &str) -> Result<Option<i64>, OxiSqlError> {
+    if matches!(
+        row.get(col)
+            .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?,
+        oxisql_core::Value::Null
+    ) {
+        return Ok(None);
+    }
+    decimal_i64_from_row(row, col).map(Some)
+}
+
 /// Read a numeric column as `i64`, accepting `Value::I64`, `Value::F64`
 /// (truncating), or `Value::Decimal` (MySQL `DECIMAL`, Postgres `NUMERIC`).
 ///
 /// # Errors
 ///
 /// Returns [`OxiSqlError::TypeMismatch`] if the column holds any other
-/// variant (including `Null`), or [`OxiSqlError::Other`] if a `Decimal`
+/// variant (including `Null` — use [`opt_decimal_i64_from_row`] for an
+/// aggregate that can be `NULL`), or [`OxiSqlError::Other`] if a `Decimal`
 /// string fails to parse as `i64` (e.g. it has a fractional part).
 #[allow(dead_code)]
 pub fn decimal_i64_from_row(row: &Row, col: &str) -> Result<i64, OxiSqlError> {

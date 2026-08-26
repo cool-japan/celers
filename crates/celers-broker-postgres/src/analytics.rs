@@ -78,7 +78,7 @@ impl PostgresBroker {
             tx.execute(
                 r#"
                 INSERT INTO celers_task_results (task_id, status, result, error, traceback)
-                VALUES ($1, $2, $3, $4, $5)
+                VALUES ($1::text::uuid, $2, $3::text::jsonb, $4, $5)
                 ON CONFLICT (task_id) DO UPDATE
                 SET status = EXCLUDED.status,
                     result = EXCLUDED.result,
@@ -311,7 +311,7 @@ impl PostgresBroker {
             SELECT
                 worker_id,
                 COUNT(*) as processed,
-                AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) as avg_time_ms,
+                AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::double precision as avg_time_ms,
                 SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as success_rate
             FROM celers_tasks
             WHERE queue_name = $1
@@ -896,7 +896,7 @@ impl PostgresBroker {
             .query(
                 r#"
             SELECT
-                metadata->$2 as value,
+                (metadata->$2::text)::text as value,
                 COUNT(*) as count
             FROM celers_tasks
             WHERE queue_name = $1
@@ -913,10 +913,20 @@ impl PostgresBroker {
 
         let mut aggregated = Vec::with_capacity(rows.len());
         for row in &rows {
-            // `value` is a JSONB expression result (`metadata->$2`), read via
-            // `json_from_row` (row_ext.rs) and stringified/quote-trimmed
-            // exactly as the original `Option<serde_json::Value>` ->
+            // `value` is a JSONB expression result (`metadata->$2`) projected
+            // through an explicit `::text` cast, read via `json_from_row`
+            // (row_ext.rs) and stringified/quote-trimmed exactly as the
+            // original `Option<serde_json::Value>` ->
             // `.to_string().trim_matches('"')` did.
+            //
+            // The `::text` projection is mandatory, not cosmetic:
+            // `oxisql-postgres` decodes a `jsonb` column by asking
+            // `tokio-postgres` for a `String`, and `FromSql for String` does
+            // not accept `jsonb` — an uncast `metadata->$2` fails inside the
+            // driver with `error deserializing column N` before this code is
+            // reached. The inner `$2::text` likewise pins the JSON key's
+            // parameter type, so `->` never has to resolve between its
+            // `jsonb -> text` and `jsonb -> integer` overloads.
             let value = crate::row_ext::json_from_row(row, "value")
                 .map_err(|e| CelersError::Other(format!("Failed to read value: {}", e)))?;
             let value_str = if value.is_null() {
@@ -1025,7 +1035,7 @@ impl PostgresBroker {
             .conn
             .query(
                 r#"
-            SELECT metadata
+            SELECT metadata::text AS metadata
             FROM celers_tasks
             WHERE queue_name = $1
               AND task_name = '__baseline__'
@@ -1238,11 +1248,11 @@ impl PostgresBroker {
                     COALESCE(LAG(state) OVER (PARTITION BY id ORDER BY updated_at), 'created') as from_state,
                     state as to_state,
                     updated_at,
-                    EXTRACT(EPOCH FROM (updated_at - LAG(updated_at) OVER (PARTITION BY id ORDER BY updated_at))) * 1000 as duration_ms
+                    (EXTRACT(EPOCH FROM (updated_at - LAG(updated_at) OVER (PARTITION BY id ORDER BY updated_at))) * 1000)::double precision as duration_ms
                 FROM celers_tasks
                 WHERE queue_name = $1
-                  AND id = $2
-                  AND updated_at >= NOW() - INTERVAL '1 hour' * $3
+                  AND id = $2::text::uuid
+                  AND updated_at >= NOW() - INTERVAL '1 hour' * $3::bigint
                 ORDER BY updated_at DESC
                 LIMIT $4
                 "#,
@@ -1259,10 +1269,10 @@ impl PostgresBroker {
                     COALESCE(LAG(state) OVER (PARTITION BY id ORDER BY updated_at), 'created') as from_state,
                     state as to_state,
                     updated_at,
-                    EXTRACT(EPOCH FROM (updated_at - LAG(updated_at) OVER (PARTITION BY id ORDER BY updated_at))) * 1000 as duration_ms
+                    (EXTRACT(EPOCH FROM (updated_at - LAG(updated_at) OVER (PARTITION BY id ORDER BY updated_at))) * 1000)::double precision as duration_ms
                 FROM celers_tasks
                 WHERE queue_name = $1
-                  AND updated_at >= NOW() - INTERVAL '1 hour' * $2
+                  AND updated_at >= NOW() - INTERVAL '1 hour' * $2::bigint
                 ORDER BY updated_at DESC
                 LIMIT $3
                 "#,
@@ -1345,12 +1355,12 @@ impl PostgresBroker {
                 started_at,
                 completed_at,
                 retry_count,
-                EXTRACT(EPOCH FROM (COALESCE(completed_at, NOW()) - created_at)) as total_lifetime_secs,
-                EXTRACT(EPOCH FROM (COALESCE(started_at, completed_at, NOW()) - created_at)) as time_pending_secs,
-                EXTRACT(EPOCH FROM (COALESCE(completed_at, NOW()) - COALESCE(started_at, created_at))) as time_processing_secs,
+                EXTRACT(EPOCH FROM (COALESCE(completed_at, NOW()) - created_at))::BIGINT as total_lifetime_secs,
+                EXTRACT(EPOCH FROM (COALESCE(started_at, completed_at, NOW()) - created_at))::BIGINT as time_pending_secs,
+                EXTRACT(EPOCH FROM (COALESCE(completed_at, NOW()) - COALESCE(started_at, created_at)))::BIGINT as time_processing_secs,
                 error_message
             FROM celers_tasks
-            WHERE queue_name = $1 AND id = $2
+            WHERE queue_name = $1 AND id = $2::text::uuid
             "#,
                 &[&self.queue_name, &task_id_param],
             )
@@ -1436,7 +1446,7 @@ impl PostgresBroker {
                 FROM celers_tasks
                 WHERE queue_name = $1
                   AND state = 'processing'
-                  AND EXTRACT(EPOCH FROM (NOW() - COALESCE(started_at, updated_at))) > $2
+                  AND EXTRACT(EPOCH FROM (NOW() - COALESCE(started_at, updated_at))) > $2::bigint
                 ORDER BY duration_secs DESC
                 LIMIT $3
                 "#
@@ -1451,7 +1461,7 @@ impl PostgresBroker {
                 FROM celers_tasks
                 WHERE queue_name = $1
                   AND state = 'pending'
-                  AND EXTRACT(EPOCH FROM (NOW() - created_at)) > $2
+                  AND EXTRACT(EPOCH FROM (NOW() - created_at)) > $2::bigint
                 ORDER BY duration_secs DESC
                 LIMIT $3
                 "#
@@ -1522,11 +1532,11 @@ impl PostgresBroker {
                 SELECT *
                 FROM celers_tasks
                 WHERE queue_name = $1
-                  AND created_at >= NOW() - INTERVAL '1 hour' * $2
+                  AND created_at >= NOW() - INTERVAL '1 hour' * $2::bigint
             )
             SELECT
-                AVG(EXTRACT(EPOCH FROM (COALESCE(started_at, NOW()) - created_at))) as avg_time_pending_secs,
-                AVG(EXTRACT(EPOCH FROM (COALESCE(completed_at, NOW()) - COALESCE(started_at, created_at)))) as avg_time_processing_secs,
+                AVG(EXTRACT(EPOCH FROM (COALESCE(started_at, NOW()) - created_at)))::double precision as avg_time_pending_secs,
+                AVG(EXTRACT(EPOCH FROM (COALESCE(completed_at, NOW()) - COALESCE(started_at, created_at))))::double precision as avg_time_processing_secs,
                 COUNT(*) FILTER (WHERE state = 'completed' OR state = 'failed') as total_finished,
                 COUNT(*) FILTER (WHERE state = 'completed') as completed_count,
                 COUNT(*) FILTER (WHERE state = 'failed') as failed_count,
@@ -1629,7 +1639,7 @@ impl PostgresBroker {
             SET priority = priority + $3
             WHERE queue_name = $1
               AND state = 'pending'
-              AND EXTRACT(EPOCH FROM (NOW() - created_at)) > $2
+              AND EXTRACT(EPOCH FROM (NOW() - created_at)) > $2::bigint
             "#,
                 &[&self.queue_name, &age_threshold_secs, &priority_increment],
             )

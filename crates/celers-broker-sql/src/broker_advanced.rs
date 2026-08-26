@@ -158,7 +158,7 @@ impl MysqlBroker {
     ///
     /// Returns the number of rows deleted. Each statement deletes at most
     /// `batch_size` rows (chosen through the nested-derived-table `LIMIT` in
-    /// [`crate::sql_text::purge_terminal_tasks_sql`], which also works around
+    /// `sql_text::purge_terminal_tasks_sql`, which also works around
     /// MySQL's `ERROR 1093`/`ERROR 1235` restrictions on deleting from a
     /// table via a `LIMIT`-bearing subquery on itself) so no single sweep
     /// holds long-lived row locks, and the loop stops early once a batch

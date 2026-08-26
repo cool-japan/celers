@@ -309,10 +309,13 @@ fn no_source_file_uses_unchecked_pow_for_backoff() {
 
 mod integration {
     use super::TEST_URL_ENV;
+    use crate::row_ext::RowExt;
     use crate::MysqlBroker;
-    use celers_core::{Broker, SerializedTask};
+    use celers_core::{Broker, BrokerMessage, SerializedTask};
+    use oxisql_core::Connection;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use uuid::Uuid;
 
     /// The connection string to test against, printing a visible, greppable
@@ -352,6 +355,41 @@ mod integration {
         Some((broker, queue))
     }
 
+    /// How many times [`claim_from`] re-issues a claim that came back empty,
+    /// and how long it waits in between.
+    const CLAIM_ATTEMPTS: usize = 50;
+    const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+    /// Claim one task, retrying briefly while the claim comes back empty.
+    ///
+    /// A claim takes a next-key lock on the index record *after* the range it
+    /// scanned, and under parallel test execution that neighbour usually
+    /// belongs to another test's queue. Measured on this suite's MySQL 8.0
+    /// via `performance_schema.data_locks`: claiming from queue `zzprobe_a`
+    /// held `X` on the `idx_tasks_queue_dequeue` record of `zzprobe_b` *and*
+    /// `X,REC_NOT_GAP` on that row's primary key, so while such a claim is
+    /// open, `SKIP LOCKED` skips the other queue's own pending row and
+    /// `dequeue()` returns `Ok(None)`.
+    ///
+    /// That is a genuine limitation of the claim statement (reported
+    /// separately; the remedy is a READ COMMITTED claim transaction, or a
+    /// two-step claim that locks by primary key), not something a test can
+    /// fix. Tests whose subject is not claim concurrency claim through this
+    /// helper so a neighbouring queue cannot decide their outcome.
+    async fn claim_from(broker: &MysqlBroker) -> BrokerMessage {
+        for _ in 0..CLAIM_ATTEMPTS {
+            let claimed = broker.dequeue().await.expect("dequeue should succeed");
+            if let Some(message) = claimed {
+                return message;
+            }
+            tokio::time::sleep(CLAIM_RETRY_DELAY).await;
+        }
+        panic!(
+            "no task became claimable on queue {} within {CLAIM_ATTEMPTS} attempts",
+            broker.queue_name()
+        );
+    }
+
     async fn broker_on_queue(queue: &str) -> Option<MysqlBroker> {
         let url = test_mysql_url()?;
         Some(
@@ -375,11 +413,7 @@ mod integration {
             .with_timeout(45);
         let enqueued_id = broker.enqueue(task).await.expect("enqueue should succeed");
 
-        let message = broker
-            .dequeue()
-            .await
-            .expect("dequeue should succeed")
-            .expect("the task just enqueued must be claimable");
+        let message = claim_from(&broker).await;
 
         assert_eq!(
             message.task.metadata.id, enqueued_id,
@@ -431,11 +465,7 @@ mod integration {
             "a broker must never claim another logical queue's task"
         );
 
-        let claimed = alpha
-            .dequeue()
-            .await
-            .expect("dequeue should succeed")
-            .expect("the owning broker must claim its own task");
+        let claimed = claim_from(&alpha).await;
         assert_eq!(claimed.task.metadata.id, task_id);
     }
 
@@ -453,11 +483,8 @@ mod integration {
             return;
         };
         assert_eq!(reconnected.queue_size().await.expect("queue_size"), 1);
-        assert!(reconnected
-            .dequeue()
-            .await
-            .expect("dequeue should succeed")
-            .is_some());
+        let reclaimed = claim_from(&reconnected).await;
+        assert_eq!(reclaimed.task.metadata.name, "persisted_queue");
     }
 
     /// `max_retries` large enough to overflow the old `2_i64.pow` backoff.
@@ -471,11 +498,7 @@ mod integration {
             .with_max_retries(1000);
         broker.enqueue(task).await.expect("enqueue should succeed");
 
-        let message = broker
-            .dequeue()
-            .await
-            .expect("dequeue should succeed")
-            .expect("task must be claimable");
+        let message = claim_from(&broker).await;
 
         broker
             .reject(
@@ -542,11 +565,7 @@ mod integration {
 
         let task = SerializedTask::new("hooked".to_string(), b"x".to_vec());
         broker.enqueue(task).await.expect("enqueue should succeed");
-        let message = broker
-            .dequeue()
-            .await
-            .expect("dequeue should succeed")
-            .expect("task must be claimable");
+        let message = claim_from(&broker).await;
         broker
             .ack(&message.task.metadata.id, message.receipt_handle.as_deref())
             .await
@@ -573,8 +592,20 @@ mod integration {
             })))
             .await;
 
+        // Retried like every other claim in this module: a claim starved by
+        // a neighbouring queue's lock returns `Ok(None)` without ever
+        // reaching the hook, which would read here as "the hook did not
+        // veto". See `claim_from` for the measured mechanism.
+        let mut vetoed = false;
+        for _ in 0..CLAIM_ATTEMPTS {
+            if broker.dequeue().await.is_err() {
+                vetoed = true;
+                break;
+            }
+            tokio::time::sleep(CLAIM_RETRY_DELAY).await;
+        }
         assert!(
-            broker.dequeue().await.is_err(),
+            vetoed,
             "a vetoing BeforeDequeue hook must surface its error"
         );
 
@@ -666,8 +697,49 @@ mod integration {
         assert_ne!(info.priority, 55, "a failed callback must roll back");
     }
 
+    /// Count the tasks named `task_name` that are sitting in `celers_tasks`.
+    ///
+    /// `process_recurring_tasks` enqueues through `self.enqueue`, so the rows
+    /// it writes land in the calling broker's own queue — but the *name* is
+    /// what identifies them as this test's, and a uuid-suffixed name cannot
+    /// collide with anything another run left behind.
+    async fn tasks_named(broker: &MysqlBroker, task_name: &str) -> i64 {
+        let rows = broker
+            .connection()
+            .query(
+                "SELECT COUNT(*) AS c FROM celers_tasks WHERE task_name = ?",
+                &[&task_name],
+            )
+            .await
+            .expect("counting enqueued rows should succeed");
+        rows.first()
+            .map(|row| row.col::<i64>("c"))
+            .transpose()
+            .expect("the count column must decode")
+            .unwrap_or(0)
+    }
+
     /// Two concurrent schedulers must enqueue a due recurring task once, not
     /// twice.
+    ///
+    /// # Why this counts rows instead of return values
+    ///
+    /// `process_recurring_tasks` scans **every** `__recurring__%` row in the
+    /// database (`celers_task_results` is not queue-scoped) and returns how
+    /// many of them *it* claimed, so its return value counts every other
+    /// run's leftover configuration as well as this test's own. Registrations
+    /// are durable by design and nothing sweeps them, so on a database that
+    /// has served this suite more than once the old `first + second == 1`
+    /// assertion fails on arithmetic that has nothing to do with the property
+    /// under test: a live MySQL carrying 39 leftover due configurations
+    /// returned `20 + 19`, which is 39 configurations claimed exactly once
+    /// each — the correct behaviour — reported as a failure.
+    ///
+    /// The property is "*this* configuration is enqueued exactly once", so
+    /// this counts the rows carrying this test's uuid-suffixed task name.
+    /// That is strictly stronger than the sum: a double claim would show up
+    /// as 2 no matter how many neighbours are due, and no number of
+    /// neighbours can make it anything but 1 when the claim works.
     #[tokio::test]
     async fn recurring_tasks_are_claimed_exactly_once() {
         use crate::{RecurringSchedule, RecurringTaskConfig};
@@ -679,8 +751,9 @@ mod integration {
             return;
         };
 
+        let task_name = format!("recurring_{}", Uuid::new_v4().simple());
         let config = RecurringTaskConfig {
-            task_name: format!("recurring_{}", Uuid::new_v4().simple()),
+            task_name: task_name.clone(),
             schedule: RecurringSchedule::EverySeconds(3600),
             payload: b"x".to_vec(),
             priority: 0,
@@ -688,7 +761,7 @@ mod integration {
             last_run: None,
             next_run: chrono::Utc::now() - chrono::Duration::seconds(60),
         };
-        broker
+        let config_id = broker
             .register_recurring_task(config)
             .await
             .expect("registering a recurring task should succeed");
@@ -700,11 +773,29 @@ mod integration {
         let first = first.expect("process_recurring_tasks should succeed");
         let second = second.expect("process_recurring_tasks should succeed");
 
+        let enqueued = tasks_named(&broker, &task_name).await;
+
+        // Clean up before asserting, so a failure does not also leak this
+        // test's configuration into the next run the way the rows that
+        // exposed this defect were leaked.
+        broker
+            .delete_recurring_task(&config_id)
+            .await
+            .expect("deleting this test's recurring configuration should succeed");
+        broker
+            .connection()
+            .execute(
+                "DELETE FROM celers_tasks WHERE task_name = ?",
+                &[&task_name],
+            )
+            .await
+            .expect("deleting this test's enqueued rows should succeed");
+
         assert_eq!(
-            first + second,
-            1,
-            "a due recurring task must be claimed by exactly one scheduler, \
-             got {first} + {second}"
+            enqueued, 1,
+            "a due recurring task must be enqueued by exactly one scheduler, \
+             got {enqueued} rows named {task_name} (the two schedulers claimed \
+             {first} and {second} configurations in total, this test's included)"
         );
     }
 
@@ -723,11 +814,7 @@ mod integration {
             .enqueue(SerializedTask::new("done".to_string(), b"x".to_vec()))
             .await
             .expect("enqueue should succeed");
-        let msg = broker
-            .dequeue()
-            .await
-            .expect("dequeue should succeed")
-            .expect("the enqueued task must be claimable");
+        let msg = claim_from(&broker).await;
         broker
             .ack(&msg.task.metadata.id, msg.receipt_handle.as_deref())
             .await
@@ -780,11 +867,7 @@ mod integration {
 
         let task = SerializedTask::new("alpha_done".to_string(), b"x".to_vec());
         alpha.enqueue(task).await.expect("enqueue should succeed");
-        let msg = alpha
-            .dequeue()
-            .await
-            .expect("dequeue should succeed")
-            .expect("alpha's task must be claimable");
+        let msg = claim_from(&alpha).await;
         alpha
             .ack(&msg.task.metadata.id, msg.receipt_handle.as_deref())
             .await
@@ -997,6 +1080,260 @@ mod integration {
             second.is_err(),
             "a single revocation must be delivered exactly once, not redelivered every poll \
              (got a second notice: {second:?})"
+        );
+    }
+
+    // ---------- The dead-letter move ----------
+
+    /// Count the dead-letter rows carrying `task_id`.
+    ///
+    /// `celers_dead_letter_queue` has no `queue_name` column, so the DLQ is
+    /// database-wide: `get_statistics().dlq` and `list_dlq()` see every
+    /// queue's rows and every previous run's leftovers. A test can only
+    /// address its own row, and only by the task id it minted.
+    async fn dlq_rows_for(broker: &MysqlBroker, task_id: &Uuid) -> i64 {
+        let rows = broker
+            .connection()
+            .query(
+                "SELECT COUNT(*) AS c FROM celers_dead_letter_queue WHERE task_id = ?",
+                &[&task_id.to_string()],
+            )
+            .await
+            .expect("counting dead-letter rows should succeed");
+        rows.first()
+            .map(|row| row.col::<i64>("c"))
+            .transpose()
+            .expect("the count column must decode")
+            .unwrap_or(0)
+    }
+
+    /// Remove this test's dead-letter row, which queue-scoped cleanup cannot
+    /// reach.
+    async fn purge_dlq_rows_for(broker: &MysqlBroker, task_id: &Uuid) {
+        broker
+            .connection()
+            .execute(
+                "DELETE FROM celers_dead_letter_queue WHERE task_id = ?",
+                &[&task_id.to_string()],
+            )
+            .await
+            .expect("dead-letter cleanup should succeed");
+    }
+
+    /// The headline check for the stored-procedure replacement: a task that
+    /// exhausts its retry budget must actually land in the dead-letter queue,
+    /// and leave `celers_tasks`.
+    ///
+    /// `CALL move_to_dlq(?)` could never work — MySQL will not create the
+    /// procedure over the prepared-statement protocol — so this path was
+    /// rewritten as [`crate::dlq_move::DLQ_INSERT_SQL`] +
+    /// [`crate::dlq_move::DLQ_DELETE_SQL`] in one transaction. Nothing had
+    /// ever run that rewrite against a real server.
+    #[tokio::test]
+    async fn retry_exhaustion_moves_the_task_into_the_dead_letter_queue() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        // `max_retries = 1` and a claim that increments `retry_count` to 1
+        // make the very next reject the exhausting one: `reject` moves the
+        // task to the DLQ once `retry_count >= max_retries`.
+        let task = SerializedTask::new("exhausted".to_string(), b"dlq-payload".to_vec())
+            .with_max_retries(1);
+        let task_id = broker.enqueue(task).await.expect("enqueue should succeed");
+
+        let message = claim_from(&broker).await;
+        // The claim increments the persisted `retry_count` (the dequeued
+        // message still carries the pre-increment value it selected), which
+        // is what `reject` compares against `max_retries`.
+        let claimed = broker
+            .get_task(&task_id)
+            .await
+            .expect("get_task should succeed")
+            .expect("the claimed task must still exist");
+        assert_eq!(
+            claimed.retry_count, 1,
+            "the claim burns the single retry this task was given"
+        );
+
+        assert_eq!(
+            dlq_rows_for(&broker, &task_id).await,
+            0,
+            "nothing may be dead-lettered before the budget is spent"
+        );
+
+        broker
+            .reject(
+                &message.task.metadata.id,
+                message.receipt_handle.as_deref(),
+                true,
+            )
+            .await
+            .expect("reject should succeed");
+
+        assert_eq!(
+            dlq_rows_for(&broker, &task_id).await,
+            1,
+            "an exhausted task must be copied into the dead-letter queue"
+        );
+        assert!(
+            broker
+                .get_task(&task_id)
+                .await
+                .expect("get_task should succeed")
+                .is_none(),
+            "the source row must be deleted, not left behind as a duplicate"
+        );
+        assert_eq!(
+            broker.queue_size().await.expect("queue_size"),
+            0,
+            "a dead-lettered task must not still count against the queue"
+        );
+
+        purge_dlq_rows_for(&broker, &task_id).await;
+    }
+
+    /// The dead-lettered copy must carry the task's payload and retry count,
+    /// not an empty shell — `DLQ_INSERT_SQL` selects those columns from the
+    /// row it is about to delete, so a wrong column order would silently
+    /// scramble them.
+    #[tokio::test]
+    async fn the_dead_letter_copy_keeps_the_payload_and_retry_count() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        let task = SerializedTask::new("exhausted_body".to_string(), b"body-bytes".to_vec())
+            .with_max_retries(1);
+        let task_id = broker.enqueue(task).await.expect("enqueue should succeed");
+
+        let message = claim_from(&broker).await;
+        broker
+            .reject(
+                &message.task.metadata.id,
+                message.receipt_handle.as_deref(),
+                true,
+            )
+            .await
+            .expect("reject should succeed");
+
+        let rows = broker
+            .connection()
+            .query(
+                "SELECT task_name, payload, retry_count FROM celers_dead_letter_queue \
+                 WHERE task_id = ?",
+                &[&task_id.to_string()],
+            )
+            .await
+            .expect("reading the dead-letter row should succeed");
+        let row = rows.first().expect("the dead-letter row must exist");
+
+        let task_name: String = row.col("task_name").expect("task_name must decode");
+        let payload: Vec<u8> = row.col("payload").expect("payload must decode");
+        let retry_count: i32 = row.col("retry_count").expect("retry_count must decode");
+
+        assert_eq!(task_name, "exhausted_body");
+        assert_eq!(payload, b"body-bytes".to_vec());
+        assert_eq!(retry_count, 1);
+
+        purge_dlq_rows_for(&broker, &task_id).await;
+    }
+
+    /// `reject_batch` carries its own copy of the two dead-letter statements
+    /// (it runs them inside the batch's transaction rather than opening a
+    /// second one), so it needs its own live check.
+    #[tokio::test]
+    async fn reject_batch_moves_an_exhausted_task_into_the_dead_letter_queue() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        let exhausted =
+            SerializedTask::new("batch_exhausted".to_string(), b"x".to_vec()).with_max_retries(1);
+        let exhausted_id = broker
+            .enqueue(exhausted)
+            .await
+            .expect("enqueue should succeed");
+        let survivor =
+            SerializedTask::new("batch_survivor".to_string(), b"y".to_vec()).with_max_retries(9);
+        let survivor_id = broker
+            .enqueue(survivor)
+            .await
+            .expect("enqueue should succeed");
+
+        let first = claim_from(&broker).await;
+        let second = claim_from(&broker).await;
+
+        let rejected = broker
+            .reject_batch(&[
+                (first.task.metadata.id, first.receipt_handle.clone(), true),
+                (second.task.metadata.id, second.receipt_handle.clone(), true),
+            ])
+            .await
+            .expect("reject_batch should succeed");
+        assert_eq!(rejected, 2, "both tasks must be accounted for");
+
+        assert_eq!(
+            dlq_rows_for(&broker, &exhausted_id).await,
+            1,
+            "the task past its retry budget must be dead-lettered"
+        );
+        assert!(
+            broker
+                .get_task(&exhausted_id)
+                .await
+                .expect("get_task should succeed")
+                .is_none(),
+            "the dead-lettered task's source row must be gone"
+        );
+
+        assert_eq!(
+            dlq_rows_for(&broker, &survivor_id).await,
+            0,
+            "a task with retries left must not be dead-lettered"
+        );
+        let survivor_info = broker
+            .get_task(&survivor_id)
+            .await
+            .expect("get_task should succeed")
+            .expect("the requeued task must still exist");
+        assert_eq!(survivor_info.state.to_string(), "pending");
+
+        purge_dlq_rows_for(&broker, &exhausted_id).await;
+    }
+
+    // ---------- Server-error classification ----------
+
+    /// Pins the formatting `crate::mysql_error`'s predicates parse.
+    ///
+    /// Those predicates recover a MySQL error *number* from the formatted
+    /// message, because `oxisql-mysql` discards the numeric code when it maps
+    /// a server error to `OxiSqlError::Execution(String)`. That only works as
+    /// long as the driver keeps rendering server errors as
+    /// `ERROR <code> (<sqlstate>): <message>`. The hermetic tests in
+    /// `mysql_error.rs` assert the parsing; this one asserts the *format*, by
+    /// provoking a real server error (`1146`, unknown table) through the real
+    /// driver and matching it by number.
+    #[tokio::test]
+    async fn a_real_server_error_is_recognised_by_its_code() {
+        let Some((broker, _queue)) = broker_on_fresh_queue().await else {
+            return;
+        };
+
+        let error = broker
+            .connection()
+            .query("SELECT 1 FROM celers_no_such_table_exists", &[])
+            .await
+            .expect_err("querying a missing table must fail");
+
+        assert!(
+            crate::mysql_error::is_mysql_server_error(&error, 1146),
+            "a real ER_NO_SUCH_TABLE must be matched by number; \
+             the driver's formatting may have changed: {error}"
+        );
+        assert!(
+            !crate::mysql_error::is_deadlock(&error),
+            "an unrelated server error must not be mistaken for a deadlock"
         );
     }
 

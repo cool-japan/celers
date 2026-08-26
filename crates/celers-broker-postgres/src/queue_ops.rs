@@ -84,7 +84,7 @@ impl PostgresBroker {
             SELECT id, task_name, state, priority, retry_count, max_retries,
                    created_at, scheduled_at, started_at, completed_at, worker_id, error_message
             FROM celers_tasks
-            WHERE id = $1
+            WHERE id = $1::text::uuid
             "#,
                 &[&task_id_param],
             )
@@ -319,6 +319,29 @@ impl PostgresBroker {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Binding notes
+    ///
+    /// The JSONPath expression is bound through a `$n::text::jsonpath` cast,
+    /// not a bare `$n::jsonpath`. An explicit cast on a placeholder is what
+    /// *resolves* that placeholder's type, so `$2::jsonpath` makes PostgreSQL
+    /// infer `$2` as `jsonpath` — and `oxisql-postgres` then ships the string
+    /// in PostgreSQL's **binary** `jsonpath` format, whose leading version
+    /// header raw UTF-8 does not have. The inner `::text` pins the parameter
+    /// to `text` (whose text and binary encodings are identical) and the
+    /// outer cast converts it server-side, exactly as for
+    /// `$n::text::jsonb`/`$n::text::uuid` elsewhere in this crate.
+    ///
+    /// `value` is likewise compared as `jsonb` rather than as text. The
+    /// previous form matched `metadata #>> $n` — a `jsonb #>> text[]`
+    /// extraction — against `value.as_str().unwrap_or("")`, which was wrong
+    /// twice over: a dotted path string (`"user.department"`) is not a
+    /// `text[]` path literal, and a `text[]` parameter cannot be bound from a
+    /// `String` for the same binary-format reason as above; and any
+    /// non-string `value` (a number, a bool, an object) silently degraded to
+    /// an empty-string comparison that could never match. Comparing
+    /// `jsonb_path_query_first(...)` against `$3::text::jsonb` matches every
+    /// JSON type by value and needs no path rewriting at all.
     pub async fn search_tasks_by_jsonpath(
         &self,
         jsonpath: &str,
@@ -326,8 +349,7 @@ impl PostgresBroker {
         limit: i64,
     ) -> Result<Vec<TaskInfo>> {
         let jsonpath_expr = format!("$.{}", jsonpath.trim_start_matches("$."));
-        let jsonpath_field = jsonpath.trim_start_matches("$.").to_string();
-        let value_str = value.as_str().unwrap_or("").to_string();
+        let value_param = json_param(value);
         let rows = self
             .conn
             .query(
@@ -336,18 +358,12 @@ impl PostgresBroker {
                    created_at, scheduled_at, started_at, completed_at, worker_id, error_message
             FROM celers_tasks
             WHERE queue_name = $1
-              AND jsonb_path_exists(metadata, $2::jsonpath)
-              AND metadata #>> $3 = $4
+              AND jsonb_path_exists(metadata, $2::text::jsonpath)
+              AND jsonb_path_query_first(metadata, $2::text::jsonpath) = $3::text::jsonb
             ORDER BY created_at DESC
-            LIMIT $5
+            LIMIT $4
             "#,
-                &[
-                    &self.queue_name,
-                    &jsonpath_expr,
-                    &jsonpath_field,
-                    &value_str,
-                    &limit,
-                ],
+                &[&self.queue_name, &jsonpath_expr, &value_param, &limit],
             )
             .await
             .map_err(|e| {

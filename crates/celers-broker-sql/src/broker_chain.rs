@@ -113,9 +113,19 @@ impl MysqlBroker {
                         .map_err(|e| CelersError::Other(format!("Failed to fetch task: {e}")))?;
 
                     if retry_count >= max_retries {
-                        // Move to DLQ — plain `CALL move_to_dlq(?)` with a `?`
-                        // parameter, translated like any other MySQL statement.
-                        tx.execute("CALL move_to_dlq(?)", &[&task_id.to_string()])
+                        // Move to DLQ. The `move_to_dlq` stored procedure is
+                        // not used (CeleRS cannot create it — see the
+                        // `dlq_move` module); its two statements run here
+                        // directly, already inside this transaction, so this
+                        // batch's retry-exhausted tasks land in the DLQ
+                        // atomically with the rest of the batch's updates.
+                        let task_id_param = task_id.to_string();
+                        tx.execute(crate::dlq_move::DLQ_INSERT_SQL, &[&task_id_param])
+                            .await
+                            .map_err(|e| {
+                                CelersError::Other(format!("Failed to move task to DLQ: {}", e))
+                            })?;
+                        tx.execute(crate::dlq_move::DLQ_DELETE_SQL, &[&task_id_param])
                             .await
                             .map_err(|e| {
                                 CelersError::Other(format!("Failed to move task to DLQ: {}", e))

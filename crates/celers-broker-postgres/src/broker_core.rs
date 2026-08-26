@@ -18,6 +18,17 @@ use crate::types::{
 #[cfg(feature = "metrics")]
 use celers_metrics::{TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL};
 
+/// Advisory-lock key serialising [`PostgresBroker::migrate`] across every
+/// process pointed at one database.
+///
+/// PostgreSQL advisory locks live in a single flat `bigint` namespace shared
+/// by every application on the server, so the value is a fixed, deliberately
+/// unusual constant rather than a small integer that user code
+/// ([`PostgresBroker::advisory_lock`] takes a caller-supplied `i64`) might
+/// pick by accident: the ASCII bytes of `"celers"` followed by `0x0001`, the
+/// "schema migration" slot.
+pub const MIGRATION_ADVISORY_LOCK_ID: i64 = 0x6365_6c65_7273_0001;
+
 /// PostgreSQL-based broker implementation using SKIP LOCKED
 pub struct PostgresBroker {
     /// The connection pool backing every statement this crate runs.
@@ -375,9 +386,9 @@ impl PostgresBroker {
             .conn
             .query(
                 r#"
-            SELECT metadata
+            SELECT metadata::text AS metadata
             FROM celers_tasks
-            WHERE id = $1
+            WHERE id = $1::text::uuid
             "#,
                 &[&task_id_param],
             )
@@ -445,63 +456,238 @@ impl PostgresBroker {
     /// `sqlx::query(...).execute(...)` call relied on sqlx's own
     /// simple-query fallback for. Mirrors `celers-backend-db`'s migration
     /// runner, the proven pattern for this exact situation.
+    ///
+    /// # Concurrency, and why the DDL is not simply replayed
+    ///
+    /// Every statement in the migration set is idempotent
+    /// (`IF NOT EXISTS` / `OR REPLACE`), but idempotent is not the same as
+    /// concurrency-safe. Replaying the set on every call — which is what this
+    /// method used to do — breaks in three distinct ways once more than one
+    /// caller exists, and a fleet of workers all calling `migrate()` on
+    /// start-up (or a test suite whose cases each migrate a private queue) is
+    /// exactly that:
+    ///
+    /// * two sessions running the same `CREATE OR REPLACE FUNCTION` race on
+    ///   one `pg_proc` tuple — `ERROR: tuple concurrently updated`;
+    /// * `CREATE INDEX IF NOT EXISTS` takes a `ShareLock` on `celers_tasks`
+    ///   even when the index exists, against queue traffic already holding
+    ///   `RowExclusiveLock` on it — `ERROR: deadlock detected`;
+    /// * `007_queue_identity.sql` *replaces* `001_init.sql`'s `move_to_dlq()`
+    ///   with one that carries `queue_name` across, so a replay briefly
+    ///   reinstates the older definition and any task rejected inside that
+    ///   window is filed under the `default` queue and lost.
+    ///
+    /// Two mechanisms remove all three. A **session-level advisory lock**
+    /// ([`MIGRATION_ADVISORY_LOCK_ID`]), held on one pinned pooled
+    /// connection, serialises concurrent callers; a **migration ledger**
+    /// (`celers_schema_migrations`, see
+    /// `migrations/000_schema_migrations.sql`) records each file as it is
+    /// applied, inside the transaction that applies it, so every call after
+    /// the first runs no DDL at all. The lock is released on the same
+    /// connection whether the migrations succeeded or failed, and a process
+    /// that dies mid-migration releases it implicitly when its session ends.
+    ///
+    /// A database migrated by an older build has no ledger rows: the first
+    /// call after the upgrade replays the set once (harmlessly — every file
+    /// is idempotent) and records it, and subsequent calls skip it.
     pub async fn migrate(&self) -> Result<()> {
-        // Run initial schema migration
-        let init_sql = include_str!("../migrations/001_init.sql");
-        self.conn
-            .execute_batch(init_sql)
+        // One connection for the whole call: `pg_advisory_lock` is
+        // *session*-scoped, so taking it on a pooled connection and releasing
+        // it on whichever slot the pool hands out next would leak the lock
+        // forever. Holding the guard pins the slot until this returns.
+        let conn = self.connection().await?;
+
+        conn.execute(
+            "SELECT pg_advisory_lock($1)",
+            &[&MIGRATION_ADVISORY_LOCK_ID],
+        )
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to lock for migration: {}", e)))?;
+
+        let outcome = Self::run_migration_set(&conn).await;
+
+        // Release on the same connection, on both paths — a failed migration
+        // must not leave every other caller blocked for the life of the
+        // process.
+        if let Err(e) = conn
+            .execute(
+                "SELECT pg_advisory_unlock($1)",
+                &[&MIGRATION_ADVISORY_LOCK_ID],
+            )
             .await
-            .map_err(|e| CelersError::Other(format!("Migration 001_init failed: {}", e)))?;
+        {
+            tracing::warn!(error = %e, "failed to release the migration advisory lock (non-fatal: it is released when this session ends)");
+        }
 
-        // Run results table migration
-        let results_sql = include_str!("../migrations/002_results.sql");
-        self.conn
-            .execute_batch(results_sql)
-            .await
-            .map_err(|e| CelersError::Other(format!("Migration 002_results failed: {}", e)))?;
+        outcome
+    }
 
-        // Run deduplication table migration
-        let dedup_sql = include_str!("../migrations/004_deduplication.sql");
-        self.conn.execute_batch(dedup_sql).await.map_err(|e| {
-            CelersError::Other(format!("Migration 004_deduplication failed: {}", e))
-        })?;
+    /// The migration statements themselves, run in order on one connection.
+    ///
+    /// Split out of [`migrate`](Self::migrate) so the advisory lock there
+    /// wraps every path, including an early return from a failing migration.
+    async fn run_migration_set(conn: &crate::pool::PooledConnection) -> Result<()> {
+        let migrations: [(&str, &str); 7] = [
+            ("001_init", include_str!("../migrations/001_init.sql")),
+            ("002_results", include_str!("../migrations/002_results.sql")),
+            (
+                "004_deduplication",
+                include_str!("../migrations/004_deduplication.sql"),
+            ),
+            (
+                "005_snapshots",
+                include_str!("../migrations/005_snapshots.sql"),
+            ),
+            (
+                "006_deduplication_columns",
+                include_str!("../migrations/006_deduplication_columns.sql"),
+            ),
+            // Queue identity (real `queue_name` column), delivery accounting
+            // (`attempt_count`), idempotent DLQ promotion, and the periodic
+            // schedule / task group tables.
+            (
+                "007_queue_identity",
+                include_str!("../migrations/007_queue_identity.sql"),
+            ),
+            // Durable revoked-task set backing `Broker::revoke`/`is_revoked` —
+            // see `revocation.rs`.
+            (
+                "008_revocation",
+                include_str!("../migrations/008_revocation.sql"),
+            ),
+        ];
 
-        // Run snapshots table migration
-        let snapshots_sql = include_str!("../migrations/005_snapshots.sql");
-        self.conn
-            .execute_batch(snapshots_sql)
-            .await
-            .map_err(|e| CelersError::Other(format!("Migration 005_snapshots failed: {}", e)))?;
-
-        // Run deduplication schema reconciliation migration
-        let dedup_columns_sql = include_str!("../migrations/006_deduplication_columns.sql");
-        self.conn
-            .execute_batch(dedup_columns_sql)
+        // Bootstrap the ledger itself. This is the one statement that still
+        // runs on every call; a `CREATE TABLE IF NOT EXISTS` on a table that
+        // already exists touches no other relation, so it cannot deadlock
+        // against live queue traffic the way the rest of the DDL can.
+        conn.execute_batch(include_str!("../migrations/000_schema_migrations.sql"))
             .await
             .map_err(|e| {
-                CelersError::Other(format!("Migration 006_deduplication_columns failed: {}", e))
+                CelersError::Other(format!("Migration 000_schema_migrations failed: {e}"))
             })?;
 
-        // Queue identity (real `queue_name` column), delivery accounting
-        // (`attempt_count`), idempotent DLQ promotion, and the periodic
-        // schedule / task group tables.
-        let queue_identity_sql = include_str!("../migrations/007_queue_identity.sql");
-        self.conn
-            .execute_batch(queue_identity_sql)
-            .await
-            .map_err(|e| {
-                CelersError::Other(format!("Migration 007_queue_identity failed: {}", e))
-            })?;
+        let applied = Self::applied_migrations(conn).await?;
 
-        // Durable revoked-task set backing `Broker::revoke`/`is_revoked` —
-        // see `revocation.rs`.
-        let revocation_sql = include_str!("../migrations/008_revocation.sql");
-        self.conn
-            .execute_batch(revocation_sql)
-            .await
-            .map_err(|e| CelersError::Other(format!("Migration 008_revocation failed: {}", e)))?;
+        for (name, sql) in migrations {
+            if applied.iter().any(|a| a == name) {
+                tracing::debug!(migration = name, "migration already applied, skipping");
+                continue;
+            }
+            Self::apply_migration(conn, name, sql).await?;
+        }
 
         Ok(())
+    }
+
+    /// Names already recorded in `celers_schema_migrations`.
+    async fn applied_migrations(conn: &crate::pool::PooledConnection) -> Result<Vec<String>> {
+        let rows = conn
+            .query("SELECT name FROM celers_schema_migrations", &[])
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to read migration ledger: {e}")))?;
+
+        rows.iter()
+            .map(|row| {
+                crate::row_ext::RowExt::col::<String>(row, "name").map_err(|e| {
+                    CelersError::Other(format!("Failed to read migration ledger name: {e}"))
+                })
+            })
+            .collect()
+    }
+
+    /// Apply one migration file and record it, retrying a transient failure.
+    ///
+    /// The DDL in these files takes table-level locks (`CREATE INDEX` alone
+    /// needs a `ShareLock` on `celers_tasks`), so applying them while the
+    /// queue is serving traffic can lose a deadlock-detector coin toss —
+    /// `ERROR: deadlock detected` — through no fault of the migration. Every
+    /// file is idempotent, so simply trying again is both safe and the
+    /// correct response; only a failure that survives every attempt is real.
+    async fn apply_migration(
+        conn: &crate::pool::PooledConnection,
+        name: &str,
+        sql: &str,
+    ) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 3;
+
+        let mut last_error = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::apply_migration_once(conn, name, sql).await {
+                Ok(()) => {
+                    tracing::info!(migration = name, attempt, "applied migration");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        migration = name,
+                        attempt,
+                        error = %e,
+                        "migration attempt failed; retrying"
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            CelersError::Other(format!("Migration {name} failed for an unknown reason"))
+        }))
+    }
+
+    /// One attempt at applying `sql` and recording `name`, as a single
+    /// transaction.
+    ///
+    /// PostgreSQL DDL is transactional, and that is load-bearing here rather
+    /// than tidiness: `007_queue_identity.sql` replaces the `move_to_dlq()`
+    /// that `001_init.sql` creates, and the older definition does not carry
+    /// `queue_name` into the dead-letter queue. Applying the set inside one
+    /// transaction per file — and rolling back a failure — means no other
+    /// session ever observes a half-applied file.
+    async fn apply_migration_once(
+        conn: &crate::pool::PooledConnection,
+        name: &str,
+        sql: &str,
+    ) -> Result<()> {
+        conn.execute_batch("BEGIN")
+            .await
+            .map_err(|e| CelersError::Other(format!("Migration {name} failed to begin: {e}")))?;
+
+        let applied = async {
+            conn.execute_batch(sql)
+                .await
+                .map_err(|e| CelersError::Other(format!("Migration {name} failed: {e}")))?;
+            conn.execute(
+                "INSERT INTO celers_schema_migrations (name) VALUES ($1) \
+                 ON CONFLICT (name) DO NOTHING",
+                &[&name],
+            )
+            .await
+            .map_err(|e| {
+                CelersError::Other(format!("Migration {name} failed to record itself: {e}"))
+            })?;
+            Ok::<(), CelersError>(())
+        }
+        .await;
+
+        match applied {
+            Ok(()) => {
+                conn.execute_batch("COMMIT").await.map(|_| ()).map_err(|e| {
+                    CelersError::Other(format!("Migration {name} failed to commit: {e}"))
+                })
+            }
+            Err(e) => {
+                if let Err(rollback_error) = conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!(
+                        migration = name,
+                        error = %rollback_error,
+                        "failed to roll back a failed migration"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Check out one pooled connection.
@@ -677,12 +863,15 @@ impl PostgresBroker {
     /// Same trivial stored-function-call translation pattern as
     /// `celers-broker-sql`'s `MysqlBroker::move_to_dlq` (`CALL
     /// move_to_dlq(?)`): a plain `execute` with one bound `Uuid` parameter,
-    /// here calling the Postgres `SELECT move_to_dlq($1)` function form
-    /// (defined in `migrations/001_init.sql`) rather than MySQL's `CALL`.
+    /// here calling the Postgres `SELECT move_to_dlq($1::text::uuid)` function
+    /// form (defined in `migrations/001_init.sql`) rather than MySQL's `CALL`.
+    /// The function's parameter is declared `UUID`, so the argument needs the
+    /// crate-wide `$n::text::uuid` cast exactly like a UUID column would — see
+    /// [`crate::row_ext::uuid_param`].
     pub(crate) async fn move_to_dlq(&self, task_id: &TaskId) -> Result<()> {
         let task_id_param = uuid_param(task_id);
         self.conn
-            .execute("SELECT move_to_dlq($1)", &[&task_id_param])
+            .execute("SELECT move_to_dlq($1::text::uuid)", &[&task_id_param])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to move task to DLQ: {}", e)))?;
 

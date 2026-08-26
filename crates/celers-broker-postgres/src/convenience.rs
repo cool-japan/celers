@@ -54,9 +54,17 @@ fn row_to_task_info(row: &oxisql_core::Row) -> Result<TaskInfo> {
 }
 
 /// Extend a `Vec<&dyn ToSqlValue>` param list with a dynamically sized
-/// `IN ($n, $n+1, ..., $n+len-1)` placeholder clause bound to `uuid_params`
-/// (owned `oxisql_core::Value::Uuid` values via [`uuid_param`]), starting at
-/// 1-based placeholder index `start_idx`. Returns the generated clause text.
+/// `IN ($n::text::uuid, ..., $n+len-1::text::uuid)` placeholder clause bound
+/// to `uuid_params` (owned `oxisql_core::Value::Uuid` values via
+/// [`uuid_param`]), starting at 1-based placeholder index `start_idx`.
+/// Returns the generated clause text.
+///
+/// Every generated placeholder carries the crate-wide `$n::text::uuid` cast:
+/// `uuid_param` reaches the server as the 36-character *text* form, which a
+/// bare `$n` inferred as `uuid` rejects with
+/// `incorrect binary data format in bind parameter n`. See
+/// [`crate::row_ext::uuid_param`]. This helper is UUID-only by construction —
+/// a non-UUID `IN` list must not be built with it.
 ///
 /// Same "`= ANY($1)` has no array `ToSqlValue` in oxisql, rewrite to a
 /// data-length-sized `IN (...)` list, each element bound individually" rewrite
@@ -64,10 +72,7 @@ fn row_to_task_info(row: &oxisql_core::Row) -> Result<TaskInfo> {
 /// `broker_trait.rs` in this crate — only the placeholder *count* is derived
 /// from the slice length, no value is ever spliced into SQL text.
 fn in_clause_placeholders(start_idx: usize, len: usize) -> String {
-    (start_idx..start_idx + len)
-        .map(|i| format!("${i}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    crate::sql::uuid_in_clause(start_idx, len)
 }
 
 /// Convenience helper methods for common patterns
@@ -166,7 +171,8 @@ impl PostgresBroker {
                     let id_param = uuid_param(&id);
                     conn.execute(
                         "UPDATE celers_tasks SET state = 'completed', completed_at = NOW() \
-                         WHERE id = $1 AND queue_name = $2 AND state = 'processing'",
+                         WHERE id = $1::text::uuid AND queue_name = $2 \
+                         AND state = 'processing'",
                         &[&id_param, &queue],
                     )
                     .await
@@ -184,7 +190,7 @@ impl PostgresBroker {
                     let id_param = uuid_param(&id);
                     conn.execute(
                         "UPDATE celers_tasks SET retry_count = retry_count + 1 \
-                         WHERE id = $1 AND queue_name = $2",
+                         WHERE id = $1::text::uuid AND queue_name = $2",
                         &[&id_param, &queue],
                     )
                     .await
@@ -669,7 +675,8 @@ impl PostgresBroker {
         &self,
     ) -> Result<std::collections::HashMap<String, f64>> {
         let query_str = "SELECT task_name,
-                        AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) as avg_duration_ms
+                        AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::double precision \
+                            as avg_duration_ms
                  FROM celers_tasks
                  WHERE queue_name = $1
                    AND state = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
@@ -1492,7 +1499,7 @@ impl PostgresBroker {
             SET state = 'cancelled',
                 completed_at = NOW(),
                 error_message = $1
-            WHERE id = $2
+            WHERE id = $2::text::uuid
               AND queue_name = $3
               AND state IN ('pending', 'processing')
             "#,

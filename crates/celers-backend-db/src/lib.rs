@@ -36,6 +36,8 @@ pub mod lock;
 #[cfg(feature = "mysql")]
 mod mysql_backend;
 #[cfg(feature = "postgres")]
+pub mod pg_ddl;
+#[cfg(feature = "postgres")]
 mod pg_pool;
 #[cfg(feature = "postgres")]
 mod postgres_backend;

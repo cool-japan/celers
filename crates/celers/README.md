@@ -2,7 +2,7 @@
 
 Celery-protocol-compatible distributed task queue library for Rust: a type-safe, Pure-Rust task runtime that speaks Python Celery's message format.
 
-**Status: [Stable] — v0.3.1 (2026-08-26) — 172 tests + 20 doctests**
+**Status: [Stable] — v0.3.1 (2026-08-26) — 178 tests + 20 doctests**
 
 ## Overview
 

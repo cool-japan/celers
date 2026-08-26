@@ -2,7 +2,7 @@
 
 High-performance Redis broker implementation for CeleRS with batch operations, priority queues, and comprehensive monitoring.
 
-**Version: 0.3.1 | Status: [Stable] | Tests: 581 (`--all-features`, excluding `#[ignore]`d) + 68 doctests | Updated: 2026-08-26**
+**Version: 0.3.1 | Status: [Stable] | Tests: 583 (`--all-features`, excluding `#[ignore]`d) + 68 doctests | Updated: 2026-08-26**
 
 ## Overview
 

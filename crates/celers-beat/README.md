@@ -1,6 +1,6 @@
 # celers-beat
 
-**Version: 0.3.1 | Status: [Stable] | Tests: 504 (`--all-features`, excluding `#[ignore]`d) + 80 doctests | Updated: 2026-08-26**
+**Version: 0.3.1 | Status: [Stable] | Tests: 510 (`--all-features`, excluding `#[ignore]`d) + 80 doctests | Updated: 2026-08-26**
 
 Periodic task scheduler for CeleRS, equivalent to Celery Beat. Schedule tasks to run at regular intervals or specific times using interval or crontab expressions.
 
@@ -1077,8 +1077,9 @@ impl celers_core::Task for GenerateReportTask {
 
 ## Testing
 
-**501 tests passing** (425 unit/integration via `cargo nextest --all-features` + 76 doc tests;
-2 further unit tests and 2 doc tests are `ignore`d) across focused modules
+**510 tests passing** (`cargo nextest run --all-features`) plus **80 doc tests passing** — none
+`ignore`d as of 0.3.1, the solar-schedule tests that used to be are real assertions now — across
+focused modules
 
 ## License
 

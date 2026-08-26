@@ -61,6 +61,14 @@ mod task_row;
 // Overflow-safe retry backoff.
 mod backoff;
 
+// MySQL server-error classification and the bounded, jittered retry MySQL
+// prescribes for `ERROR 1213 (40001) Deadlock found`.
+mod mysql_error;
+
+// The dead-letter move, issued as plain SQL because the stored procedure the
+// schema declares cannot be created over the prepared-statement protocol.
+mod dlq_move;
+
 // Server capability gating for FOR UPDATE ... SKIP LOCKED.
 pub mod server_version;
 pub use server_version::{ServerFlavor, ServerVersion};

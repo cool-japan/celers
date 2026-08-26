@@ -561,6 +561,26 @@ impl PooledConnection {
         }
     }
 
+    /// Run a `;`-separated multi-statement batch on this specific connection
+    /// (simple-query protocol).
+    ///
+    /// The pool-wide [`PgPool::execute_batch`] picks whichever slot is free,
+    /// which is wrong whenever the batch must share a session with something
+    /// else — most importantly `PostgresBroker::migrate`, whose
+    /// `pg_advisory_lock` is session-scoped and would otherwise be taken on
+    /// one connection and released on another.
+    pub async fn execute_batch(&self, sql: &str) -> Result<u64, OxiSqlError> {
+        match self.conn()?.execute_batch(sql).await {
+            Ok(affected) => Ok(affected),
+            Err(e) => {
+                if is_connection_error(&e) {
+                    self.mark_broken();
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Begin a transaction on this connection.
     ///
     /// The returned handle borrows `self`, so the pool slot stays checked out

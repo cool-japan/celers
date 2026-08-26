@@ -598,14 +598,21 @@ impl MysqlAnalytics {
         let total: i64 = row
             .col("total_count")
             .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
-        let success = crate::row_ext::decimal_i64_from_row(&row, "success_count")
-            .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
-        let failure = crate::row_ext::decimal_i64_from_row(&row, "failure_count")
-            .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
-        let retry = crate::row_ext::decimal_i64_from_row(&row, "retry_count")
-            .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
-        let pending = crate::row_ext::decimal_i64_from_row(&row, "pending_count")
-            .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?;
+        //
+        // Each SUM is read as *optional*: `SUM(...)` over zero matching rows
+        // is `NULL`, not `0`, so on an empty table — or simply a time window
+        // with no tasks in it — the non-optional read failed the whole
+        // query with `type mismatch: expected I64/F64/Decimal, got Null`.
+        // `None` means "no rows contributed", which is exactly 0.
+        let count_of = |col: &str| -> Result<i64, BackendError> {
+            Ok(crate::row_ext::opt_decimal_i64_from_row(&row, col)
+                .map_err(|e| BackendError::Connection(format!("task_stats query failed: {e}")))?
+                .unwrap_or(0))
+        };
+        let success = count_of("success_count")?;
+        let failure = count_of("failure_count")?;
+        let retry = count_of("retry_count")?;
+        let pending = count_of("pending_count")?;
 
         Ok(TaskStats::from_counts(
             total as u64,
@@ -1082,6 +1089,13 @@ mod tests {
         let backend = crate::PostgresResultBackend::new(&url)
             .await
             .expect("connect to live PostgreSQL");
+        // `task_stats` reads `celers_task_results`, so the schema has to
+        // exist before the query — every sibling live test here migrates
+        // first. Without this the test only passed when some *other* test
+        // happened to migrate the database first, and failed outright
+        // against a fresh one with `relation "celers_task_results" does not
+        // exist`.
+        backend.migrate().await.expect("migrate");
         let analytics = backend.analytics();
         let stats = analytics
             .task_stats(Duration::from_secs(3600), None)

@@ -122,3 +122,16 @@ full = ["redis", "postgres", "mysql", "amqp", "sqs", "backend-redis", "backend-d
 
 [dev-dependencies]
 anyhow = { workspace = true }
+# `celers_kombu::core_adapter` (the `KombuBrokerAdapter`/`CoreBrokerTransport`
+# bridge that makes `AmqpBroker`/`SqsBroker` worker-usable) lives behind
+# celers-kombu's `core-adapter` feature. It is off by default and normally
+# turns on only as a side effect of enabling this facade's own `amqp`/`sqs`
+# features (which pull in `celers-broker-amqp`/`celers-broker-sqs`, whose own
+# default features enable it). The end-to-end kombu-bridge test
+# (`tests/kombu_bridge_e2e.rs`) needs the adapter over `celers_kombu`'s own
+# `MockBroker` — no amqp/sqs broker involved at all — so it requests the
+# feature here directly rather than riding on amqp/sqs's coattails. This does
+# not change what a downstream consumer of `celers` builds: dev-dependency
+# features never leak into a normal `cargo build` of this crate, only into
+# `cargo test`/`cargo nextest run`.
+celers-kombu = { workspace = true, features = ["core-adapter"] }

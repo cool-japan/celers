@@ -5,6 +5,7 @@
 use crate::backoff::retry_backoff_seconds;
 use crate::broker_core::MysqlBroker;
 use crate::broker_dequeue::{claim_pending_rows, mark_rows_processing};
+use crate::mysql_error::{with_deadlock_retry, with_deadlock_retry_celers};
 use crate::row_ext::RowExt;
 use crate::task_row::resolve_row_id;
 use async_trait::async_trait;
@@ -67,38 +68,14 @@ impl Broker for MysqlBroker {
             return Ok(None);
         }
 
-        let mut tx = self
-            .connection()
-            .transaction()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
-
-        let claimed = claim_pending_rows(&mut *tx, &self.queue_name, None).await?;
-
-        let Some((row_id, message)) = claimed.into_iter().next() else {
-            tx.rollback().await.map_err(|e| {
-                CelersError::Other(format!("Failed to rollback transaction: {}", e))
-            })?;
-            return Ok(None);
-        };
-
-        // `BeforeDequeue` runs while the row is still locked, so a hook that
-        // rejects the task rolls the claim back and leaves it pending for
-        // another worker rather than losing it.
-        if let Err(hook_error) = self.fire_before_dequeue(&message.task).await {
-            let _ = tx.rollback().await;
-            return Err(hook_error);
-        }
-
-        mark_rows_processing(&mut *tx, &[row_id.to_string()], None).await?;
-
-        tx.commit()
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
-
-        self.fire_after_dequeue(&message.task).await?;
-
-        Ok(Some(message))
+        // A claim is a transaction, and InnoDB resolves a lock cycle by
+        // rolling one transaction back with `ERROR 1213`. Without this the
+        // deadlock reaches the worker as a claim failure; a live parallel run
+        // of this crate's own suite produced exactly that. Restarting is the
+        // remedy MySQL documents — see
+        // `mysql_error::with_deadlock_retry_celers`, including what it means
+        // for `BeforeDequeue` hooks.
+        with_deadlock_retry_celers("dequeue", || self.claim_one()).await
     }
 
     async fn ack(&self, task_id: &TaskId, receipt_handle: Option<&str>) -> Result<()> {
@@ -109,19 +86,23 @@ impl Broker for MysqlBroker {
             self.fire_before_ack(task).await?;
         }
 
-        let affected = self
-            .connection()
-            .execute(
-                r#"
-                UPDATE celers_tasks
-                SET state = 'completed',
-                    completed_at = NOW()
-                WHERE id = ?
-                "#,
-                &[&row_id],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to ack task: {}", e)))?;
+        // Idempotent: a row already `completed` is simply written again, so a
+        // restarted statement cannot double-count anything.
+        let affected = with_deadlock_retry("ack", || async {
+            self.connection()
+                .execute(
+                    r#"
+                    UPDATE celers_tasks
+                    SET state = 'completed',
+                        completed_at = NOW()
+                    WHERE id = ?
+                    "#,
+                    &[&row_id],
+                )
+                .await
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to ack task: {}", e)))?;
 
         // A zero-row ack means the id never matched a row. That used to be
         // completely silent, which is how the "task acked but stayed
@@ -197,21 +178,26 @@ impl Broker for MysqlBroker {
                 // panicked outright for a large or negative `retry_count`.
                 let backoff_seconds = retry_backoff_seconds(retry_count);
 
-                let affected = self
-                    .connection()
-                    .execute(
-                        r#"
-                        UPDATE celers_tasks
-                        SET state = 'pending',
-                            scheduled_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
-                            started_at = NULL,
-                            worker_id = NULL
-                        WHERE id = ?
-                        "#,
-                        &[&backoff_seconds, &row_id],
-                    )
-                    .await
-                    .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
+                // Retried on `ERROR 1213`: this `UPDATE` contends with the
+                // claim path for the same row. It is idempotent — the row is
+                // written back to `pending` with the same computed delay.
+                let affected = with_deadlock_retry("reject(requeue)", || async {
+                    self.connection()
+                        .execute(
+                            r#"
+                            UPDATE celers_tasks
+                            SET state = 'pending',
+                                scheduled_at = DATE_ADD(NOW(), INTERVAL ? SECOND),
+                                started_at = NULL,
+                                worker_id = NULL
+                            WHERE id = ?
+                            "#,
+                            &[&backoff_seconds, &row_id],
+                        )
+                        .await
+                })
+                .await
+                .map_err(|e| CelersError::Other(format!("Failed to requeue task: {}", e)))?;
 
                 if affected == 0 {
                     tracing::warn!(
@@ -223,19 +209,23 @@ impl Broker for MysqlBroker {
             }
         } else {
             // Mark as failed permanently
-            let affected = self
-                .connection()
-                .execute(
-                    r#"
-                    UPDATE celers_tasks
-                    SET state = 'failed',
-                        completed_at = NOW()
-                    WHERE id = ?
-                    "#,
-                    &[&row_id],
-                )
-                .await
-                .map_err(|e| CelersError::Other(format!("Failed to mark task as failed: {}", e)))?;
+            // Idempotent, and retried on `ERROR 1213` for the same reason
+            // as the requeue branch above.
+            let affected = with_deadlock_retry("reject(fail)", || async {
+                self.connection()
+                    .execute(
+                        r#"
+                        UPDATE celers_tasks
+                        SET state = 'failed',
+                            completed_at = NOW()
+                        WHERE id = ?
+                        "#,
+                        &[&row_id],
+                    )
+                    .await
+            })
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to mark task as failed: {}", e)))?;
 
             if affected == 0 {
                 tracing::warn!(
@@ -279,20 +269,34 @@ impl Broker for MysqlBroker {
         Ok(count.max(0) as usize)
     }
 
+    /// Cancel a task that has not reached a terminal state yet.
+    ///
+    /// Issued through `mysql_error::with_deadlock_retry`: this `UPDATE`
+    /// competes for the same row locks as the claim path
+    /// (`SELECT ... FOR UPDATE SKIP LOCKED`
+    /// followed by an `UPDATE`) and as `revoke`'s own writes, and a live run
+    /// really did see it fail with `ERROR 1213 (40001) Deadlock found` from
+    /// the revocation path. InnoDB rolls the losing statement back entirely,
+    /// so re-running it is both safe and what MySQL documents as the remedy;
+    /// the statement is idempotent, since a row already `cancelled` no longer
+    /// matches `state IN ('pending', 'processing')`.
     async fn cancel(&self, task_id: &TaskId) -> Result<bool> {
-        let affected = self
-            .connection()
-            .execute(
-                r#"
-                UPDATE celers_tasks
-                SET state = 'cancelled',
-                    completed_at = NOW()
-                WHERE id = ? AND state IN ('pending', 'processing')
-                "#,
-                &[&task_id.to_string()],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to cancel task: {}", e)))?;
+        let task_id_param = task_id.to_string();
+        let affected = with_deadlock_retry("cancel", || async {
+            self.connection()
+                .execute(
+                    r#"
+                    UPDATE celers_tasks
+                    SET state = 'cancelled',
+                        completed_at = NOW()
+                    WHERE id = ? AND state IN ('pending', 'processing')
+                    "#,
+                    &[&task_id_param],
+                )
+                .await
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel task: {}", e)))?;
 
         Ok(affected > 0)
     }
@@ -476,5 +480,43 @@ impl Broker for MysqlBroker {
         }
 
         Ok(())
+    }
+}
+
+impl MysqlBroker {
+    /// One claim attempt for [`Broker::dequeue`].
+    async fn claim_one(&self) -> Result<Option<BrokerMessage>> {
+        let mut tx = self
+            .connection()
+            .transaction()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to begin transaction: {}", e)))?;
+
+        let claimed = claim_pending_rows(&mut *tx, &self.queue_name, None).await?;
+
+        let Some((row_id, message)) = claimed.into_iter().next() else {
+            tx.rollback().await.map_err(|e| {
+                CelersError::Other(format!("Failed to rollback transaction: {}", e))
+            })?;
+            return Ok(None);
+        };
+
+        // `BeforeDequeue` runs while the row is still locked, so a hook that
+        // rejects the task rolls the claim back and leaves it pending for
+        // another worker rather than losing it.
+        if let Err(hook_error) = self.fire_before_dequeue(&message.task).await {
+            let _ = tx.rollback().await;
+            return Err(hook_error);
+        }
+
+        mark_rows_processing(&mut *tx, &[row_id.to_string()], None).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to commit transaction: {}", e)))?;
+
+        self.fire_after_dequeue(&message.task).await?;
+
+        Ok(Some(message))
     }
 }

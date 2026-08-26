@@ -1,5 +1,5 @@
 // Copyright (c) 2026 COOLJAPAN OU (Team KitaSan)
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! A [`celers_core::Broker`] over this crate's transports.
 //!

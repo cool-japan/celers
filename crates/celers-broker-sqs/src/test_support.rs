@@ -1,5 +1,5 @@
 // Copyright (c) 2026 COOLJAPAN OU (Team KitaSan)
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Test-only construction of `aws_sdk_sqs::Client` values that own no TLS stack.
 //!

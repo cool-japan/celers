@@ -666,8 +666,10 @@ The safe default is a single active beat replica (a `Deployment` with `replicas:
 `strategy.type: Recreate`, or a `StatefulSet` with one pod), with `dispatch_lock` configured anyway so
 a rolling restart's overlap window cannot double-fire.
 
-**Do not use solar schedules in 0.3.1** — `Schedule::Solar::next_run` errors for every input; see
-[TODO.md](../TODO.md#known-gaps--the-roadmap-after-031).
+**Solar schedules work as of 0.3.1** — `Schedule::Solar::next_run` was fixed this release (it
+previously errored for every input; see [CHANGELOG.md](../CHANGELOG.md)'s Fixed section). Sunrise,
+sunset, civil/nautical/astronomical twilight and golden hour all resolve as true solar-elevation
+solves, and polar day/night are handled by skipping dates where the event does not occur.
 
 ## Security Best Practices
 

@@ -121,6 +121,19 @@ fn requeue_after_failed_flush(
     dropped
 }
 
+/// The event insert.
+///
+/// `payload` is a `JSONB` column, so `$5` must go through `::text::jsonb`: a
+/// bare `$5` makes PostgreSQL infer the parameter's type as `jsonb`, after
+/// which the client sends JSON text where the binary jsonb version byte
+/// belongs and the server rejects it with `unsupported jsonb version number`.
+/// Hoisted to a const so `tests::event_insert_casts_the_jsonb_payload_from_text`
+/// can hold that line without a live database. See `row_ext::json_param`.
+const SQL_INSERT_EVENT: &str = r#"
+            INSERT INTO celers_events (event_type, task_id, worker, timestamp, payload)
+            VALUES ($1, $2::text::uuid, $3, $4::text::timestamptz, $5::text::jsonb)
+            "#;
+
 /// Insert `events` in one transaction. Does not touch the in-memory buffer —
 /// callers are responsible for draining/re-queuing around this call.
 async fn try_flush_events(conn: &oxisql_postgres::PgConnection, events: &[Event]) -> Result<()> {
@@ -145,10 +158,7 @@ async fn try_flush_events(conn: &oxisql_postgres::PgConnection, events: &[Event]
         })?;
 
         tx.execute(
-            r#"
-            INSERT INTO celers_events (event_type, task_id, worker, timestamp, payload)
-            VALUES ($1, $2::text::uuid, $3, $4::text::timestamptz, $5)
-            "#,
+            SQL_INSERT_EVENT,
             &[
                 &event_type,
                 &task_id_param,
@@ -321,7 +331,12 @@ impl DbEventPersister {
         // `PostgresResultBackend::migrate` in lib.rs — this SQL text has
         // multiple `;`-separated statements, which the extended/prepared-
         // statement protocol `execute`/`query` use rejects.
-        self.conn.execute_batch(sql).await.map_err(|e| {
+        //
+        // Wrapped in the shared migration advisory lock for the same reason:
+        // concurrent auto-migration would otherwise race on the catalog. See
+        // `pg_ddl`.
+        let sql = crate::pg_ddl::advisory_locked_migration(sql);
+        self.conn.execute_batch(&sql).await.map_err(|e| {
             BackendError::Connection(format!("Failed to run event migrations: {}", e))
         })?;
 
@@ -485,7 +500,13 @@ impl EventPersister for DbEventPersister {
                 .query(
                     &format!(
                         r#"
-                        SELECT payload FROM celers_events
+                        -- `payload` is JSONB and is read by name, so it is
+                        -- selected as `::text AS payload`: oxisql-postgres
+                        -- reads JSON/JSONB by asking tokio-postgres for a
+                        -- String, which it only implements for text-ish
+                        -- types, so an uncast JSONB column fails in the
+                        -- driver. See row_ext::json_from_row.
+                        SELECT payload::text AS payload FROM celers_events
                         WHERE timestamp >= $1::text::timestamptz AND timestamp <= $2::text::timestamptz AND event_type = $3
                         ORDER BY timestamp ASC
                         LIMIT {limit}
@@ -499,7 +520,13 @@ impl EventPersister for DbEventPersister {
                 .query(
                     &format!(
                         r#"
-                        SELECT payload FROM celers_events
+                        -- `payload` is JSONB and is read by name, so it is
+                        -- selected as `::text AS payload`: oxisql-postgres
+                        -- reads JSON/JSONB by asking tokio-postgres for a
+                        -- String, which it only implements for text-ish
+                        -- types, so an uncast JSONB column fails in the
+                        -- driver. See row_ext::json_from_row.
+                        SELECT payload::text AS payload FROM celers_events
                         WHERE timestamp >= $1::text::timestamptz AND timestamp <= $2::text::timestamptz
                         ORDER BY timestamp ASC
                         LIMIT {limit}
@@ -605,6 +632,28 @@ mod tests {
         TaskEventBuilder::new(Uuid::new_v4(), "test_task")
             .hostname("host-1")
             .received()
+    }
+
+    /// `celers_events.payload` is a `JSONB` column, and `json_param` binds
+    /// JSON *text*. Without the `::text::jsonb` cast PostgreSQL infers the
+    /// parameter as `jsonb` and the client sends the text in the binary jsonb
+    /// encoding, so the server rejects every event insert with
+    /// `unsupported jsonb version number`. Event persistence would fail
+    /// wholesale — and only against a live server, which is why this guard
+    /// runs without one. Sibling of
+    /// `postgres_backend::tests::every_jsonb_parameter_is_cast_from_text`.
+    #[test]
+    fn event_insert_casts_the_jsonb_payload_from_text() {
+        assert!(
+            SQL_INSERT_EVENT.contains("$5::text::jsonb"),
+            "payload ($5) must be bound as `$5::text::jsonb`, not a bare `$5`. \
+             Statement:\n{SQL_INSERT_EVENT}"
+        );
+        assert!(
+            SQL_INSERT_EVENT.contains("timestamp, payload)"),
+            "payload must stay the 5th column, or $5 is no longer the JSONB \
+             parameter. Statement:\n{SQL_INSERT_EVENT}"
+        );
     }
 
     #[test]

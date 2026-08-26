@@ -453,7 +453,7 @@ impl PostgresBroker {
             .conn
             .query(
                 r#"
-            SELECT AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
+            SELECT AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::double precision
             FROM (
                 SELECT started_at, completed_at
                 FROM celers_tasks

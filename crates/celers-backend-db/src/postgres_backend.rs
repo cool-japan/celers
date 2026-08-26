@@ -113,8 +113,13 @@ impl PostgresResultBackend {
         // multi-statement text, matching the same constraint the
         // pre-migration `sqlx::query(...).execute(...)` call relied on
         // sqlx's own simple-query fallback for.
+        //
+        // The script is wrapped in the shared migration advisory lock so that
+        // several workers auto-migrating at once serialize rather than racing
+        // each other's `CREATE TABLE IF NOT EXISTS` — see `pg_ddl` for why
+        // `IF NOT EXISTS` alone is not safe against concurrent creation.
         self.conn
-            .execute_batch(migration_sql)
+            .execute_batch(&crate::pg_ddl::advisory_locked_migration(migration_sql))
             .await
             .map_err(|e| BackendError::Connection(format!("Migration failed: {}", e)))?;
 
@@ -233,6 +238,92 @@ impl PostgresResultBackend {
     }
 }
 
+// ── Statements that bind a JSONB parameter ─────────────────────────────────
+//
+// Hoisted out of the method bodies purely so `tests::every_jsonb_parameter_is
+// _cast_from_text` can assert on them without a live database, mirroring the
+// same guard `celers-broker-postgres`'s `sql.rs` keeps over its own
+// statements.
+//
+// Every parameter that lands in a `JSONB` column MUST be written
+// `$n::text::jsonb`. `json_param` hands over JSON *text*, and a bare `$n` in
+// a JSONB position makes PostgreSQL infer the parameter type as `jsonb`,
+// after which the client sends the string in the binary jsonb encoding whose
+// leading byte has to be the version `0x01`. JSON text begins with `{`, `[`,
+// `"`, a digit or `n`, so the server rejects the whole statement with
+// `unsupported jsonb version number 123 / 91 / 110`. See `crate::pg_ddl`'s
+// sibling note and `row_ext::json_param`'s documentation for the full
+// explanation.
+
+const SQL_STORE_RESULT: &str = r#"
+                INSERT INTO celers_task_results
+                    (task_id, task_name, result_state, result_data, error_message, retry_count,
+                     created_at, started_at, completed_at, worker, extra, expires_at)
+                VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5, $6,
+                        $7::text::timestamptz, $8::text::timestamptz, $9::text::timestamptz, $10,
+                        $11::text::jsonb,
+                        $12::text::timestamptz)
+                ON CONFLICT (task_id) DO UPDATE SET
+                    result_state = EXCLUDED.result_state,
+                    result_data = EXCLUDED.result_data,
+                    error_message = EXCLUDED.error_message,
+                    retry_count = EXCLUDED.retry_count,
+                    started_at = EXCLUDED.started_at,
+                    completed_at = EXCLUDED.completed_at,
+                    worker = EXCLUDED.worker,
+                    extra = EXCLUDED.extra,
+                    -- Only overwrite an existing expires_at when THIS store
+                    -- configured a TTL (EXCLUDED.expires_at IS NOT NULL);
+                    -- otherwise preserve whatever was already there. Matches
+                    -- the pre-fold behavior, where a separate set_expiration
+                    -- UPDATE ran (and unconditionally overwrote) only when a
+                    -- TTL was configured for this task_name.
+                    expires_at = COALESCE(EXCLUDED.expires_at, celers_task_results.expires_at)
+                "#;
+
+const SQL_STORE_RESULTS_BATCH: &str = r#"
+                INSERT INTO celers_task_results
+                    (task_id, task_name, result_state, result_data, error_message, retry_count,
+                     created_at, started_at, completed_at, worker, extra)
+                VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5, $6,
+                        $7::text::timestamptz, $8::text::timestamptz, $9::text::timestamptz, $10,
+                        $11::text::jsonb)
+                ON CONFLICT (task_id) DO UPDATE SET
+                    result_state = EXCLUDED.result_state,
+                    result_data = EXCLUDED.result_data,
+                    error_message = EXCLUDED.error_message,
+                    retry_count = EXCLUDED.retry_count,
+                    started_at = EXCLUDED.started_at,
+                    completed_at = EXCLUDED.completed_at,
+                    worker = EXCLUDED.worker,
+                    extra = EXCLUDED.extra
+                "#;
+
+const SQL_CHORD_INIT: &str = r#"
+                INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
+                VALUES ($1::text::uuid, $2, 0, $3, $4::text::jsonb, $5::text::timestamptz, $6, $7, $8)
+                ON CONFLICT (chord_id) DO UPDATE SET
+                    total = EXCLUDED.total,
+                    completed = 0,
+                    callback = EXCLUDED.callback,
+                    task_ids = EXCLUDED.task_ids,
+                    timeout_seconds = EXCLUDED.timeout_seconds,
+                    cancelled = EXCLUDED.cancelled,
+                    cancellation_reason = EXCLUDED.cancellation_reason
+                "#;
+
+const SQL_CHORD_UPDATE_STATE: &str = r#"
+                INSERT INTO celers_chord_state (chord_id, total, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
+                VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5::text::timestamptz, $6, $7, $8)
+                ON CONFLICT (chord_id) DO UPDATE SET
+                    total = EXCLUDED.total,
+                    callback = EXCLUDED.callback,
+                    task_ids = EXCLUDED.task_ids,
+                    timeout_seconds = EXCLUDED.timeout_seconds,
+                    cancelled = EXCLUDED.cancelled,
+                    cancellation_reason = EXCLUDED.cancellation_reason
+                "#;
+
 #[async_trait]
 impl ResultBackend for PostgresResultBackend {
     async fn store_result(&mut self, task_id: Uuid, meta: &TaskMeta) -> Result<()> {
@@ -259,30 +350,7 @@ impl ResultBackend for PostgresResultBackend {
 
         self.conn
             .execute(
-                r#"
-                INSERT INTO celers_task_results
-                    (task_id, task_name, result_state, result_data, error_message, retry_count,
-                     created_at, started_at, completed_at, worker, extra, expires_at)
-                VALUES ($1::text::uuid, $2, $3, $4, $5, $6,
-                        $7::text::timestamptz, $8::text::timestamptz, $9::text::timestamptz, $10, $11,
-                        $12::text::timestamptz)
-                ON CONFLICT (task_id) DO UPDATE SET
-                    result_state = EXCLUDED.result_state,
-                    result_data = EXCLUDED.result_data,
-                    error_message = EXCLUDED.error_message,
-                    retry_count = EXCLUDED.retry_count,
-                    started_at = EXCLUDED.started_at,
-                    completed_at = EXCLUDED.completed_at,
-                    worker = EXCLUDED.worker,
-                    extra = EXCLUDED.extra,
-                    -- Only overwrite an existing expires_at when THIS store
-                    -- configured a TTL (EXCLUDED.expires_at IS NOT NULL);
-                    -- otherwise preserve whatever was already there. Matches
-                    -- the pre-fold behavior, where a separate set_expiration
-                    -- UPDATE ran (and unconditionally overwrote) only when a
-                    -- TTL was configured for this task_name.
-                    expires_at = COALESCE(EXCLUDED.expires_at, celers_task_results.expires_at)
-                "#,
+                SQL_STORE_RESULT,
                 &[
                     &task_id.to_string(),
                     &meta.task_name,
@@ -309,8 +377,17 @@ impl ResultBackend for PostgresResultBackend {
             .conn
             .query(
                 r#"
-                SELECT task_id, task_name, result_state, result_data, error_message,
-                       retry_count, created_at, started_at, completed_at, worker, extra
+                -- `result_data` and `extra` are JSONB and MUST be selected as
+                -- `::text` (keeping the column name via AS, since they are
+                -- read by name): oxisql-postgres converts JSON/JSONB by
+                -- asking tokio-postgres for a String, which tokio-postgres
+                -- only implements for text-ish types, so an uncast JSONB
+                -- column fails in the driver with
+                -- `error deserializing column N`. See row_ext::json_from_row.
+                SELECT task_id, task_name, result_state,
+                       result_data::text AS result_data, error_message,
+                       retry_count, created_at, started_at, completed_at, worker,
+                       extra::text AS extra
                 FROM celers_task_results
                 WHERE task_id = $1::text::uuid
                 "#,
@@ -451,18 +528,7 @@ impl ResultBackend for PostgresResultBackend {
 
         self.conn
             .execute(
-                r#"
-                INSERT INTO celers_chord_state (chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
-                VALUES ($1::text::uuid, $2, 0, $3, $4, $5::text::timestamptz, $6, $7, $8)
-                ON CONFLICT (chord_id) DO UPDATE SET
-                    total = EXCLUDED.total,
-                    completed = 0,
-                    callback = EXCLUDED.callback,
-                    task_ids = EXCLUDED.task_ids,
-                    timeout_seconds = EXCLUDED.timeout_seconds,
-                    cancelled = EXCLUDED.cancelled,
-                    cancellation_reason = EXCLUDED.cancellation_reason
-                "#,
+                SQL_CHORD_INIT,
                 &[
                     &state.chord_id.to_string(),
                     &(state.total as i64),
@@ -500,17 +566,7 @@ impl ResultBackend for PostgresResultBackend {
 
         self.conn
             .execute(
-                r#"
-                INSERT INTO celers_chord_state (chord_id, total, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason)
-                VALUES ($1::text::uuid, $2, $3, $4, $5::text::timestamptz, $6, $7, $8)
-                ON CONFLICT (chord_id) DO UPDATE SET
-                    total = EXCLUDED.total,
-                    callback = EXCLUDED.callback,
-                    task_ids = EXCLUDED.task_ids,
-                    timeout_seconds = EXCLUDED.timeout_seconds,
-                    cancelled = EXCLUDED.cancelled,
-                    cancellation_reason = EXCLUDED.cancellation_reason
-                "#,
+                SQL_CHORD_UPDATE_STATE,
                 &[
                     &state.chord_id.to_string(),
                     &(state.total as i64),
@@ -556,7 +612,11 @@ impl ResultBackend for PostgresResultBackend {
             .conn
             .query(
                 r#"
-                SELECT chord_id, total, completed, callback, task_ids, created_at, timeout_seconds, cancelled, cancellation_reason
+                -- `task_ids` is JSONB: selected as `::text` for the reason
+                -- documented on the `get_result` query above.
+                SELECT chord_id, total, completed, callback,
+                       task_ids::text AS task_ids,
+                       created_at, timeout_seconds, cancelled, cancellation_reason
                 FROM celers_chord_state
                 WHERE chord_id = $1::text::uuid
                 "#,
@@ -661,22 +721,7 @@ impl ResultBackend for PostgresResultBackend {
             let extra_param = Self::extra_param(meta)?;
 
             tx.execute(
-                r#"
-                INSERT INTO celers_task_results
-                    (task_id, task_name, result_state, result_data, error_message, retry_count,
-                     created_at, started_at, completed_at, worker, extra)
-                VALUES ($1::text::uuid, $2, $3, $4, $5, $6,
-                        $7::text::timestamptz, $8::text::timestamptz, $9::text::timestamptz, $10, $11)
-                ON CONFLICT (task_id) DO UPDATE SET
-                    result_state = EXCLUDED.result_state,
-                    result_data = EXCLUDED.result_data,
-                    error_message = EXCLUDED.error_message,
-                    retry_count = EXCLUDED.retry_count,
-                    started_at = EXCLUDED.started_at,
-                    completed_at = EXCLUDED.completed_at,
-                    worker = EXCLUDED.worker,
-                    extra = EXCLUDED.extra
-                "#,
+                SQL_STORE_RESULTS_BATCH,
                 &[
                     &task_id.to_string(),
                     &meta.task_name,
@@ -724,8 +769,11 @@ impl ResultBackend for PostgresResultBackend {
             .join(", ");
         let sql = format!(
             r#"
-            SELECT task_id, task_name, result_state, result_data, error_message,
-                   retry_count, created_at, started_at, completed_at, worker, extra
+            -- JSONB columns selected as `::text`; see the `get_result` query.
+            SELECT task_id, task_name, result_state,
+                   result_data::text AS result_data, error_message,
+                   retry_count, created_at, started_at, completed_at, worker,
+                   extra::text AS extra
             FROM celers_task_results
             WHERE task_id IN ({placeholders})
             "#
@@ -847,6 +895,91 @@ impl ResultBackend for PostgresResultBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `$n` that lands in a `JSONB` column must be written
+    /// `$n::text::jsonb`.
+    ///
+    /// This is the always-on guard for a bug that shipped: `result_data`,
+    /// `extra` and `task_ids` were bound as bare `$n`, so PostgreSQL inferred
+    /// the parameter type as `jsonb`, the client encoded the JSON *text*
+    /// `json_param` produces as if it were binary jsonb, and the server
+    /// rejected every write with `unsupported jsonb version number 123` (`{`)
+    /// / `91` (`[`) / `110` (`n`). Storing any successful task result with a
+    /// payload — the crate's primary job — failed outright against a live
+    /// PostgreSQL.
+    ///
+    /// The live round-trip tests below *would* have caught it, but they are
+    /// `#[ignore]`d and had never been run against a real server. This test
+    /// needs no database, so it runs in every plain `cargo nextest run`.
+    /// `celers-broker-postgres`'s `sql.rs` keeps the same guard over its own
+    /// statements.
+    #[test]
+    fn every_jsonb_parameter_is_cast_from_text() {
+        // (statement, const name, the JSONB placeholders it binds)
+        let cases: &[(&str, &str, &[&str])] = &[
+            (SQL_STORE_RESULT, "SQL_STORE_RESULT", &["$4", "$11"]),
+            (
+                SQL_STORE_RESULTS_BATCH,
+                "SQL_STORE_RESULTS_BATCH",
+                &["$4", "$11"],
+            ),
+            (SQL_CHORD_INIT, "SQL_CHORD_INIT", &["$4"]),
+            (SQL_CHORD_UPDATE_STATE, "SQL_CHORD_UPDATE_STATE", &["$4"]),
+        ];
+
+        for (sql, name, jsonb_params) in cases {
+            for param in *jsonb_params {
+                let cast = format!("{param}::text::jsonb");
+                assert!(
+                    sql.contains(&cast),
+                    "{name}: JSONB parameter {param} must be bound as `{cast}`, \
+                     not as a bare `{param}` — a bare placeholder is sent in the \
+                     binary jsonb encoding and the server rejects it with \
+                     `unsupported jsonb version number`. Statement:\n{sql}"
+                );
+            }
+        }
+    }
+
+    /// The casts above are only correct if the placeholders they name are the
+    /// ones actually pointed at the JSONB columns, so pin the column order of
+    /// each `INSERT` too. Renumbering a parameter without moving its cast
+    /// would otherwise silently reintroduce the bug.
+    #[test]
+    fn jsonb_placeholders_match_the_insert_column_order() {
+        // celers_task_results: (task_id, task_name, result_state, result_data,
+        // error_message, retry_count, created_at, started_at, completed_at,
+        // worker, extra, ...) — result_data is 4th, extra is 11th.
+        for (sql, name) in [
+            (SQL_STORE_RESULT, "SQL_STORE_RESULT"),
+            (SQL_STORE_RESULTS_BATCH, "SQL_STORE_RESULTS_BATCH"),
+        ] {
+            assert!(
+                sql.contains("result_state, result_data, error_message"),
+                "{name}: result_data must stay the 4th column"
+            );
+            assert!(
+                sql.contains("worker, extra"),
+                "{name}: extra must stay the 11th column"
+            );
+        }
+
+        // celers_chord_state: task_ids is the 5th column in chord_init (which
+        // also writes `completed`) but the 4th VALUES placeholder, because
+        // `completed` is written as the literal 0 rather than bound.
+        assert!(
+            SQL_CHORD_INIT.contains("callback, task_ids, created_at"),
+            "SQL_CHORD_INIT: task_ids column position moved"
+        );
+        assert!(
+            SQL_CHORD_INIT.contains("$2, 0, $3, $4::text::jsonb"),
+            "SQL_CHORD_INIT: `completed` is the literal 0, so task_ids is $4"
+        );
+        assert!(
+            SQL_CHORD_UPDATE_STATE.contains("callback, task_ids, created_at"),
+            "SQL_CHORD_UPDATE_STATE: task_ids column position moved"
+        );
+    }
 
     #[tokio::test]
     #[ignore] // Requires PostgreSQL running
@@ -994,7 +1127,7 @@ mod tests {
         let raw_rows = backend
             .connection()
             .query(
-                "SELECT extra FROM celers_task_results WHERE task_id = $1::text::uuid",
+                "SELECT extra::text FROM celers_task_results WHERE task_id = $1::text::uuid",
                 &[&task_id.to_string()],
             )
             .await

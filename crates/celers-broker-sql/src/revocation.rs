@@ -43,6 +43,7 @@ use oxisql_core::Connection;
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use crate::mysql_error::with_deadlock_retry;
 use crate::row_ext::RowExt;
 use crate::MysqlBroker;
 
@@ -107,19 +108,29 @@ impl MysqlBroker {
         let expires_at = now + ChronoDuration::seconds(self.revocation_ttl_secs as i64);
         let task_id_str = task_id.to_string();
 
-        self.connection()
-            .execute(
-                UPSERT_REVOKED_TASK,
-                &[
-                    &task_id_str,
-                    &self.queue_name,
-                    &terminate,
-                    &format_datetime(now),
-                    &format_datetime(expires_at),
-                ],
-            )
-            .await
-            .map_err(|e| CelersError::Broker(format!("Failed to record revocation: {}", e)))?;
+        // `INSERT ... ON DUPLICATE KEY UPDATE` takes an insert-intention gap
+        // lock, which the concurrent prune below (an unbounded range `DELETE`)
+        // and other revokers contend with — a textbook `ERROR 1213` pairing.
+        // The upsert is idempotent (the same row is written with the same
+        // values), so restarting it is safe; see `mysql_error.rs`.
+        let revoked_at = format_datetime(now);
+        let expires_at_text = format_datetime(expires_at);
+        with_deadlock_retry("record_revocation", || async {
+            self.connection()
+                .execute(
+                    UPSERT_REVOKED_TASK,
+                    &[
+                        &task_id_str,
+                        &self.queue_name,
+                        &terminate,
+                        &revoked_at,
+                        &expires_at_text,
+                    ],
+                )
+                .await
+        })
+        .await
+        .map_err(|e| CelersError::Broker(format!("Failed to record revocation: {}", e)))?;
 
         if let Err(e) = self
             .connection()

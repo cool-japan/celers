@@ -154,14 +154,17 @@ impl PostgresBroker {
 
         // Insert deduplication entry. `expires_at` is a `DateTime<Utc>`
         // parameter -> `.to_rfc3339()` bound through a
-        // `$5::text::timestamptz` cast, per `row_ext.rs`'s convention.
+        // `$5::text::timestamptz` cast, and `task_id` targets a `UUID` column
+        // so it goes through the matching `$2::text::uuid` cast — both per
+        // `row_ext.rs`'s conventions. `idempotency_key`, `task_name` and
+        // `queue_name` are plain `VARCHAR` columns and need no cast.
         let expires_at = chrono::Utc::now() + chrono::Duration::seconds(config.window_secs);
         let expires_at_param = expires_at.to_rfc3339();
         tx.execute(
             r#"
             INSERT INTO celers_deduplication
                 (idempotency_key, task_id, task_name, queue_name, first_seen_at, last_seen_at, expires_at, duplicate_count)
-            VALUES ($1, $2, $3, $4, NOW(), NOW(), $5::text::timestamptz, 0)
+            VALUES ($1, $2::text::uuid, $3, $4, NOW(), NOW(), $5::text::timestamptz, 0)
             ON CONFLICT (idempotency_key, queue_name) DO NOTHING
             "#,
             &[

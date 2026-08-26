@@ -86,11 +86,20 @@ impl DbLockBackend {
         );
 
         // No parameter values here (only the table name, a static-fragment
-        // string owned by this struct, is spliced in) — `execute` with an
-        // empty param slice, matching the exact same "only static text
-        // splicing, never values" discipline `sqlx::AssertSqlSafe` was
-        // previously asserting.
-        self.conn.execute(&sql, &[]).await.map_err(|e| {
+        // string owned by this struct, is spliced in), matching the exact
+        // same "only static text splicing, never values" discipline
+        // `sqlx::AssertSqlSafe` was previously asserting.
+        //
+        // `execute_batch` rather than `execute` because the statement is
+        // wrapped in the shared migration advisory lock, which makes the
+        // script a multi-statement batch — and the extended/prepared-
+        // statement protocol `execute` uses rejects multi-statement text.
+        // Without the lock, two schedulers calling `ensure_table` at once
+        // race on the catalog and one fails with a duplicate-key error on
+        // `pg_type_typname_nsp_index` despite the `IF NOT EXISTS`; see
+        // `pg_ddl`.
+        let sql = crate::pg_ddl::advisory_locked_migration(&sql);
+        self.conn.execute_batch(&sql).await.map_err(|e| {
             CelersError::Other(format!(
                 "Failed to create lock table '{}': {}",
                 self.table_name, e

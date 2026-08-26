@@ -708,7 +708,7 @@ See the main CeleRS repository for contribution guidelines.
 
 ## Testing
 
-**757 tests passing** (unit tests across command parsing, configuration layering, backup/restore, connection pooling, TTL caching, structured logging, smart defaults, alias expansion, error classification, task-dependency graphs, and the interactive REPL)
+**1,107 tests passing** (`cargo nextest run --all-features`; unit and integration tests across command parsing, configuration layering, backup/restore, connection pooling, TTL caching, structured logging, smart defaults, alias expansion, error classification, task-dependency graphs, remote control/revocation against a real Redis (`tests/control_redis.rs`, `tests/revocation_redis.rs`, env-gated), and the interactive REPL) plus **37 doctests** (1 `ignore`d)
 
 ## License
 

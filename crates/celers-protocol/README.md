@@ -4,7 +4,7 @@ Celery protocol implementation for CeleRS: the v2 wire format Python Celery actu
 CeleRS-internal "v5" version label for CeleRS-to-CeleRS use. This is the crate whose compatibility is
 *proved* — see [Wire Format Compatibility](#wire-format-compatibility).
 
-**Status: [Stable] — v0.3.1 (2026-08-26) — 608 tests + 27 doctests**
+**Status: [Stable] — v0.3.1 (2026-08-26) — 629 tests + 27 doctests**
 
 ## Overview
 

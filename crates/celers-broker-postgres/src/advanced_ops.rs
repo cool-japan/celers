@@ -210,9 +210,9 @@ impl PostgresBroker {
                 WHERE queue_name = $1
             )
             SELECT
-                COALESCE(AVG(tasks_created), 0) as avg_arrival_rate,
-                COALESCE(AVG(tasks_completed), 0) as avg_completion_rate,
-                COALESCE(STDDEV(tasks_created), 0) as arrival_stddev,
+                COALESCE(AVG(tasks_created), 0)::double precision as avg_arrival_rate,
+                COALESCE(AVG(tasks_completed), 0)::double precision as avg_completion_rate,
+                COALESCE(STDDEV(tasks_created), 0)::double precision as arrival_stddev,
                 (SELECT pending FROM current_state) as current_pending,
                 (SELECT processing FROM current_state) as current_processing
             FROM hourly_stats
@@ -311,16 +311,16 @@ impl PostgresBroker {
                     COUNT(*) as total
                 FROM celers_tasks
                 WHERE queue_name = $1
-                  AND created_at >= NOW() - INTERVAL '1 hour' * $2
+                  AND created_at >= NOW() - INTERVAL '1 hour' * $2::bigint
                 GROUP BY EXTRACT(HOUR FROM created_at)
             ),
             aggregated AS (
                 SELECT
                     MAX(pending) as peak_pending,
-                    AVG(pending) as avg_pending,
-                    SUM(total) as total_tasks,
-                    SUM(completed) as total_completed,
-                    SUM(failed) as total_failed
+                    AVG(pending)::double precision as avg_pending,
+                    SUM(total)::BIGINT as total_tasks,
+                    SUM(completed)::BIGINT as total_completed,
+                    SUM(failed)::BIGINT as total_failed
                 FROM hourly_stats
             ),
             peak_hour_calc AS (
@@ -423,7 +423,7 @@ impl PostgresBroker {
                 r#"
             SELECT state, priority
             FROM celers_tasks
-            WHERE queue_name = $1 AND id = $2
+            WHERE queue_name = $1 AND id = $2::text::uuid
             "#,
                 &[&self.queue_name, &task_id_param],
             )
@@ -466,19 +466,19 @@ impl PostgresBroker {
             ),
             queue_stats AS (
                 SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending' AND priority >= $3) as tasks_ahead,
+                    COUNT(*) FILTER (WHERE state = 'pending' AND priority >= $2) as tasks_ahead,
                     COUNT(*) FILTER (WHERE state = 'processing') as currently_processing
                 FROM celers_tasks
                 WHERE queue_name = $1
             )
             SELECT
-                COALESCE(AVG(duration_secs), 60) as avg_task_duration_secs,
-                COALESCE(STDDEV(duration_secs), 30) as duration_stddev,
+                COALESCE(AVG(duration_secs), 60)::double precision as avg_task_duration_secs,
+                COALESCE(STDDEV(duration_secs), 30)::double precision as duration_stddev,
                 (SELECT tasks_ahead FROM queue_stats) as tasks_ahead,
                 (SELECT currently_processing FROM queue_stats) as currently_processing
             FROM recent_completions
             "#,
-                &[&self.queue_name, &task_id_param, &priority],
+                &[&self.queue_name, &priority],
             )
             .await
             .map_err(|e| {
@@ -1080,7 +1080,7 @@ impl PostgresBroker {
         self.conn
             .execute(
                 "INSERT INTO celers_task_groups (group_id, queue_name, group_name, description) \
-                 VALUES ($1, $2, $3, $4)",
+                 VALUES ($1::text::uuid, $2, $3, $4)",
                 &[
                     &group_id_param,
                     &self.queue_name,
@@ -1160,7 +1160,7 @@ impl PostgresBroker {
             .conn
             .query(
                 "SELECT group_name, description FROM celers_task_groups \
-                  WHERE group_id = $1 AND queue_name = $2",
+                  WHERE group_id = $1::text::uuid AND queue_name = $2",
                 &[&group_id_param, &self.queue_name],
             )
             .await
@@ -1199,15 +1199,17 @@ impl PostgresBroker {
     /// # }
     /// ```
     // ARRAY BINDING REWRITE: `id = ANY($3)` (binding `task_ids: &[Uuid]`) ->
-    // dynamic `id IN ($3, .., $n)`, one placeholder per task id (each bound
-    // via `uuid_param`, following $1=group_id, $2=queue_name).
+    // dynamic `id IN ($3::text::uuid, .., $n::text::uuid)`, one placeholder
+    // per task id (each bound via `uuid_param`, following $1=group_id,
+    // $2=queue_name). The `::text::uuid` cast is mandatory: `uuid_param`
+    // reaches the server as the 36-character text form, which a bare `$n`
+    // inferred as `uuid` rejects -- see `row_ext.rs`'s `uuid_param`.
     pub async fn add_tasks_to_group(&self, group_id: &str, task_ids: &[Uuid]) -> Result<i64> {
         if task_ids.is_empty() {
             return Ok(0);
         }
 
-        let placeholders: Vec<String> =
-            (0..task_ids.len()).map(|i| format!("${}", i + 3)).collect();
+        let placeholders = crate::sql::uuid_in_clause(3, task_ids.len());
         let query_str = format!(
             r#"
             UPDATE celers_tasks
@@ -1218,7 +1220,7 @@ impl PostgresBroker {
             )
             WHERE queue_name = $2 AND id IN ({})
             "#,
-            placeholders.join(", ")
+            placeholders
         );
         let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
         let mut param_refs: Vec<&dyn ToSqlValue> = vec![&group_id, &self.queue_name];
@@ -1469,8 +1471,9 @@ impl PostgresBroker {
     /// # Ok(())
     /// # }
     /// ```
-    // ARRAY BINDING REWRITE: `id = ANY($3)` -> dynamic `id IN ($3, .., $n)`,
-    // same pattern as `add_tasks_to_group` above.
+    // ARRAY BINDING REWRITE: `id = ANY($3)` -> dynamic
+    // `id IN ($3::text::uuid, .., $n::text::uuid)`, same pattern (and the
+    // same mandatory cast) as `add_tasks_to_group` above.
     pub async fn tag_tasks(&self, task_ids: &[Uuid], tags: &[&str]) -> Result<i64> {
         if task_ids.is_empty() || tags.is_empty() {
             return Ok(0);
@@ -1480,8 +1483,7 @@ impl PostgresBroker {
             .map_err(|e| CelersError::Other(format!("Failed to serialize tags: {}", e)))?;
         let tags_param = json_param(&tags_json);
 
-        let placeholders: Vec<String> =
-            (0..task_ids.len()).map(|i| format!("${}", i + 3)).collect();
+        let placeholders = crate::sql::uuid_in_clause(3, task_ids.len());
         let query_str = format!(
             r#"
             UPDATE celers_tasks
@@ -1492,7 +1494,7 @@ impl PostgresBroker {
             )
             WHERE queue_name = $2 AND id IN ({})
             "#,
-            placeholders.join(", ")
+            placeholders
         );
         let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
         let mut param_refs: Vec<&dyn ToSqlValue> = vec![&tags_param, &self.queue_name];

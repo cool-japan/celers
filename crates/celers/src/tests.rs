@@ -207,19 +207,52 @@ fn test_compile_time_validation() {
 mod redis_integration {
     use super::*;
 
+    /// Skipped, visibly, when `CELERS_TEST_REDIS_URL` is not set.
+    ///
+    /// This test used to hardcode `redis://localhost:6379` behind
+    /// `#[ignore]` instead of reading the documented env var, which meant
+    /// `cargo nextest run -- --run-ignored=all` (the shape a gated-suite pass
+    /// uses) would quietly hit whatever Redis happened to be listening on
+    /// localhost — including one nothing here intended to touch — and leave
+    /// its `test_queue` list behind with no cleanup. Reading
+    /// `CELERS_TEST_REDIS_URL` makes this run only when a gated pass actually
+    /// asks for it; the unique queue name and the drain below make sure that,
+    /// when it does, nothing outlives the test.
     #[tokio::test]
-    #[ignore = "requires Redis server"]
     async fn test_redis_broker_integration() {
         use crate::RedisBroker;
 
-        // This test requires a running Redis server
-        let broker_result = RedisBroker::new("redis://localhost:6379", "test_queue");
+        let Ok(url) = std::env::var("CELERS_TEST_REDIS_URL") else {
+            eprintln!("SKIPPED: test_redis_broker_integration (set CELERS_TEST_REDIS_URL to run)");
+            return;
+        };
 
-        if let Ok(broker) = broker_result {
-            let task = crate::dev_utils::create_test_task("redis.test");
-            let result = broker.enqueue(task).await;
-            assert!(result.is_ok());
+        // A fresh queue name per run: nothing else pointed at the same Redis
+        // can collide with it, and the drain below cannot mistake another
+        // run's leftover message for its own.
+        let queue_name = format!("celers-facade-test-{}", uuid::Uuid::new_v4());
+        let broker = RedisBroker::new(&url, &queue_name).expect("redis broker");
+
+        let task = crate::dev_utils::create_test_task("redis.test");
+        broker.enqueue(task).await.expect("enqueue");
+
+        // Leave Redis as we found it: drain the one message this test just
+        // wrote instead of leaking `queue_name` into the database
+        // `CELERS_TEST_REDIS_URL` points at.
+        if let Some(delivered) = broker.dequeue().await.expect("dequeue") {
+            broker
+                .ack(
+                    &delivered.task.metadata.id,
+                    delivered.receipt_handle.as_deref(),
+                )
+                .await
+                .expect("ack");
         }
+        assert_eq!(
+            broker.queue_size().await.expect("queue_size"),
+            0,
+            "the queue this test created must not outlive it"
+        );
     }
 }
 
@@ -227,20 +260,54 @@ mod redis_integration {
 mod postgres_integration {
     use super::*;
 
+    /// Skipped, visibly, when `CELERS_TEST_POSTGRES_URL` is not set.
+    ///
+    /// This used to hardcode `postgres://localhost/test` behind `#[ignore]`
+    /// and wrap the whole body in `if let Ok(broker) = ..`, so it had exactly
+    /// two outcomes: nothing listening -> the connection error was swallowed
+    /// and the test passed having asserted nothing, or something listening on
+    /// a database it was never pointed at deliberately. Reading the documented
+    /// variable (see `tests/integration/README.md`) makes it run only when a
+    /// gated pass asks for it, and the unique queue name plus the drain below
+    /// keep the live database as it was found.
     #[tokio::test]
-    #[ignore = "requires PostgreSQL server"]
     async fn test_postgres_broker_integration() {
         use crate::PostgresBroker;
 
-        // This test requires a running PostgreSQL server
-        let broker_result =
-            PostgresBroker::with_queue("postgres://localhost/test", "test_queue").await;
+        let Ok(url) = std::env::var("CELERS_TEST_POSTGRES_URL") else {
+            eprintln!(
+                "SKIPPED: test_postgres_broker_integration (set CELERS_TEST_POSTGRES_URL to run)"
+            );
+            return;
+        };
 
-        if let Ok(broker) = broker_result {
-            let task = crate::dev_utils::create_test_task("postgres.test");
-            let result = broker.enqueue(task).await;
-            assert!(result.is_ok());
-        }
+        let queue_name = format!("facade_pg_{}", uuid::Uuid::new_v4().simple());
+        let broker = PostgresBroker::with_queue(&url, &queue_name)
+            .await
+            .expect("connect to CELERS_TEST_POSTGRES_URL");
+        broker.migrate().await.expect("run migrations");
+
+        let task = crate::dev_utils::create_test_task("postgres.test");
+        broker.enqueue(task).await.expect("enqueue");
+
+        let delivered = broker
+            .dequeue()
+            .await
+            .expect("dequeue")
+            .expect("the task this test just enqueued");
+        broker
+            .ack(
+                &delivered.task.metadata.id,
+                delivered.receipt_handle.as_deref(),
+            )
+            .await
+            .expect("ack");
+
+        assert_eq!(
+            broker.queue_size().await.expect("queue_size"),
+            0,
+            "the queue this test created must not outlive it"
+        );
     }
 }
 
@@ -248,19 +315,49 @@ mod postgres_integration {
 mod mysql_integration {
     use super::*;
 
+    /// Skipped, visibly, when `CELERS_TEST_MYSQL_URL` is not set.
+    ///
+    /// Same fix, and the same reason, as
+    /// `postgres_integration::test_postgres_broker_integration`: the old body
+    /// hardcoded `mysql://localhost/test` and swallowed the connection error,
+    /// so it asserted nothing when no server was up and failed against one
+    /// that was (`assert!(result.is_ok())` on a database that does not exist).
     #[tokio::test]
-    #[ignore = "requires MySQL server"]
     async fn test_mysql_broker_integration() {
         use crate::MysqlBroker;
 
-        // This test requires a running MySQL server
-        let broker_result = MysqlBroker::with_queue("mysql://localhost/test", "test_queue").await;
+        let Ok(url) = std::env::var("CELERS_TEST_MYSQL_URL") else {
+            eprintln!("SKIPPED: test_mysql_broker_integration (set CELERS_TEST_MYSQL_URL to run)");
+            return;
+        };
 
-        if let Ok(broker) = broker_result {
-            let task = crate::dev_utils::create_test_task("mysql.test");
-            let result = broker.enqueue(task).await;
-            assert!(result.is_ok());
-        }
+        let queue_name = format!("facade_mysql_{}", uuid::Uuid::new_v4().simple());
+        let broker = MysqlBroker::with_queue(&url, &queue_name)
+            .await
+            .expect("connect to CELERS_TEST_MYSQL_URL");
+        broker.migrate().await.expect("run migrations");
+
+        let task = crate::dev_utils::create_test_task("mysql.test");
+        broker.enqueue(task).await.expect("enqueue");
+
+        let delivered = broker
+            .dequeue()
+            .await
+            .expect("dequeue")
+            .expect("the task this test just enqueued");
+        broker
+            .ack(
+                &delivered.task.metadata.id,
+                delivered.receipt_handle.as_deref(),
+            )
+            .await
+            .expect("ack");
+
+        assert_eq!(
+            broker.queue_size().await.expect("queue_size"),
+            0,
+            "the queue this test created must not outlive it"
+        );
     }
 }
 
@@ -269,16 +366,65 @@ mod amqp_integration {
     #[allow(unused_imports)]
     use super::*;
 
+    /// Skipped, visibly, when `CELERS_TEST_AMQP_URL` is not set.
+    ///
+    /// The old body asserted `AmqpBroker::new(..).is_ok()` against a
+    /// hardcoded `amqp://localhost:5672`. Construction is lazy — no socket is
+    /// opened — so that assertion held with no RabbitMQ anywhere on the
+    /// machine: it proved the constructor returns `Ok`, not that the facade's
+    /// re-exported type talks to a broker. This drives a real round trip
+    /// through `celers_core::Broker` (the shape `celers_worker::Worker` uses)
+    /// and deletes the queue it declared.
     #[tokio::test]
-    #[ignore = "requires RabbitMQ server"]
     async fn test_amqp_broker_integration() {
         use crate::AmqpBroker;
+        // `delete_queue` lives on kombu's `Broker`, `connect`/`disconnect` on
+        // its `Transport`; aliased because `Broker` in this module already
+        // means `celers_core::Broker`.
+        use celers_kombu::{Broker as KombuBroker, Transport};
 
-        // This test requires a running RabbitMQ server
-        let broker_result = AmqpBroker::new("amqp://localhost:5672", "test_queue").await;
+        let Ok(url) = std::env::var("CELERS_TEST_AMQP_URL") else {
+            eprintln!("SKIPPED: test_amqp_broker_integration (set CELERS_TEST_AMQP_URL to run)");
+            return;
+        };
 
-        // Just verify broker creation succeeds
-        assert!(broker_result.is_ok());
+        let queue_name = format!("celers-facade-amqp-{}", uuid::Uuid::new_v4().simple());
+        let broker = AmqpBroker::new(&url, &queue_name)
+            .await
+            .expect("amqp broker")
+            .into_core_broker(queue_name.clone());
+
+        let task = crate::dev_utils::create_test_task("amqp.test");
+        let task_id = broker.enqueue(task).await.expect("enqueue");
+
+        let delivered = broker
+            .dequeue()
+            .await
+            .expect("dequeue")
+            .expect("the task this test just enqueued");
+        assert_eq!(
+            delivered.task.metadata.id, task_id,
+            "the message read back must be the one this test published"
+        );
+        broker
+            .ack(
+                &delivered.task.metadata.id,
+                delivered.receipt_handle.as_deref(),
+            )
+            .await
+            .expect("ack");
+
+        // Leave the server as we found it: the queue was declared by this
+        // test's own connection and nothing else can be using it.
+        let mut transport = AmqpBroker::new(&url, &queue_name)
+            .await
+            .expect("cleanup transport");
+        transport.connect().await.expect("cleanup connect");
+        transport
+            .delete_queue(&queue_name)
+            .await
+            .expect("delete the queue this test declared");
+        let _ = transport.disconnect().await;
     }
 }
 
@@ -287,17 +433,67 @@ mod sqs_integration {
     #[allow(unused_imports)]
     use super::*;
 
+    /// Skipped, visibly, when `CELERS_TEST_SQS_URL` is not set.
+    ///
+    /// `SqsBroker::new` builds an AWS client without contacting anything, so
+    /// the old `assert!(broker_result.is_ok())` passed on a machine with no
+    /// AWS credentials and no endpoint — it asserted that a constructor
+    /// returns `Ok`. Gated on the same variable as
+    /// `celers-broker-sqs`'s own live suite (docker compose `localstack`,
+    /// profile `test`), this pushes one task through the facade's
+    /// re-exported type and deletes the queue afterwards.
     #[tokio::test]
-    #[ignore = "requires AWS SQS"]
     async fn test_sqs_broker_integration() {
         use crate::SqsBroker;
+        // See the AMQP test above for why kombu's `Broker` is aliased here.
+        use celers_kombu::{Broker as KombuBroker, Transport};
 
-        // This test requires AWS SQS access
-        // SqsBroker::new takes only queue_name; AWS config comes from environment
-        let broker_result = SqsBroker::new("test-queue").await;
+        let Ok(endpoint) = std::env::var("CELERS_TEST_SQS_URL") else {
+            eprintln!("SKIPPED: test_sqs_broker_integration (set CELERS_TEST_SQS_URL to run)");
+            return;
+        };
 
-        // Just verify broker creation succeeds
-        assert!(broker_result.is_ok());
+        // `aws_config` honours AWS_ENDPOINT_URL for every service; this is how
+        // `tests/localstack.rs` points the SDK at LocalStack, and the same
+        // reason applies here.
+        std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
+
+        let queue_name = format!("celers-facade-sqs-{}", uuid::Uuid::new_v4().simple());
+        let transport = SqsBroker::new(&queue_name)
+            .await
+            .expect("sqs broker")
+            .with_auto_create_queue(true)
+            .with_visibility_timeout(5)
+            .with_wait_time(2);
+        let broker = transport.into_core_broker(queue_name.clone());
+
+        let task = crate::dev_utils::create_test_task("sqs.test");
+        let task_id = broker.enqueue(task).await.expect("enqueue");
+
+        let delivered = broker
+            .dequeue()
+            .await
+            .expect("dequeue")
+            .expect("the task this test just enqueued");
+        assert_eq!(
+            delivered.task.metadata.id, task_id,
+            "the message read back must be the one this test published"
+        );
+        broker
+            .ack(
+                &delivered.task.metadata.id,
+                delivered.receipt_handle.as_deref(),
+            )
+            .await
+            .expect("ack");
+
+        // Leave the endpoint as we found it.
+        let mut cleanup = SqsBroker::new(&queue_name).await.expect("cleanup client");
+        cleanup.connect().await.expect("cleanup connect");
+        cleanup
+            .delete_queue(&queue_name)
+            .await
+            .expect("delete the queue this test created");
     }
 }
 
@@ -307,26 +503,43 @@ mod backend_redis_integration {
     #[allow(unused_imports)]
     use super::*;
 
+    /// Skipped, visibly, when `CELERS_TEST_REDIS_URL` is not set.
+    ///
+    /// Same fix as `redis_integration::test_redis_broker_integration`: this
+    /// used to hardcode `redis://localhost:6379` behind `#[ignore]`, and
+    /// `store_result` writes under the backend's default `celery-task-meta-`
+    /// prefix — one of the leaking key patterns a gated-suite pass observed
+    /// in the shared database. `forget` (the `ResultStore` trait's delete)
+    /// removes exactly that key again before the test ends.
     #[tokio::test]
-    #[ignore = "requires Redis server"]
     async fn test_redis_backend_integration() {
-        use crate::RedisResultBackend;
+        use crate::{RedisResultBackend, ResultStore};
         use celers_core::TaskResultValue;
+        use uuid::Uuid;
 
-        let backend_result = RedisResultBackend::new("redis://localhost:6379");
+        let Ok(url) = std::env::var("CELERS_TEST_REDIS_URL") else {
+            eprintln!("SKIPPED: test_redis_backend_integration (set CELERS_TEST_REDIS_URL to run)");
+            return;
+        };
 
-        if let Ok(backend) = backend_result {
-            use crate::ResultStore;
-            use uuid::Uuid;
-            let task_id = Uuid::new_v4();
-            let result = backend
-                .store_result(
-                    task_id,
-                    TaskResultValue::Success(serde_json::json!({"result": "success"})),
-                )
-                .await;
-            assert!(result.is_ok());
-        }
+        let backend = RedisResultBackend::new(&url).expect("redis result backend");
+        let task_id = Uuid::new_v4();
+        backend
+            .store_result(
+                task_id,
+                TaskResultValue::Success(serde_json::json!({"result": "success"})),
+            )
+            .await
+            .expect("store_result");
+
+        // Leave Redis as we found it: a fresh uuid per run means this key can
+        // never collide with another run's, but it otherwise lives under
+        // `CELERS_TEST_REDIS_URL` forever unless removed here.
+        backend.forget(task_id).await.expect("cleanup");
+        assert!(
+            !backend.has_result(task_id).await.expect("has_result"),
+            "the result this test stored must not outlive it"
+        );
     }
 }
 
@@ -335,48 +548,94 @@ mod backend_db_integration {
     #[allow(unused_imports)]
     use super::*;
 
+    /// Skipped, visibly, when `DATABASE_URL` is not set.
+    ///
+    /// `celers-backend-db` reads the bare `DATABASE_URL` / `MYSQL_URL` rather
+    /// than a `CELERS_TEST_*` name — see `tests/integration/README.md`, which
+    /// documents that inconsistency — so this test reads the same variable as
+    /// the crate it re-exports. The old body hardcoded
+    /// `postgres://localhost/test` and swallowed the connection error inside
+    /// `if let Ok(backend) = ..`, which is why its MySQL twin passed for years
+    /// and then failed the moment a real MySQL was listening on localhost.
     #[tokio::test]
-    #[ignore = "requires PostgreSQL server"]
     async fn test_postgres_backend_integration() {
-        use crate::PostgresResultBackend;
+        use crate::{PostgresResultBackend, ResultStore};
         use celers_core::TaskResultValue;
+        use uuid::Uuid;
 
-        let backend_result = PostgresResultBackend::new("postgres://localhost/test").await;
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIPPED: test_postgres_backend_integration (set DATABASE_URL to run)");
+            return;
+        };
 
-        if let Ok(backend) = backend_result {
-            use crate::ResultStore;
-            use uuid::Uuid;
-            let task_id = Uuid::new_v4();
-            let result = backend
-                .store_result(
-                    task_id,
-                    TaskResultValue::Success(serde_json::json!({"result": "success"})),
-                )
-                .await;
-            assert!(result.is_ok());
-        }
+        let backend = PostgresResultBackend::new(&url)
+            .await
+            .expect("connect to DATABASE_URL");
+        backend.migrate().await.expect("run migrations");
+
+        let task_id = Uuid::new_v4();
+        backend
+            .store_result(
+                task_id,
+                TaskResultValue::Success(serde_json::json!({"result": "success"})),
+            )
+            .await
+            .expect("store_result");
+        assert!(
+            backend.has_result(task_id).await.expect("has_result"),
+            "the result this test stored must be readable back"
+        );
+
+        // Leave the database as we found it.
+        backend.forget(task_id).await.expect("cleanup");
+        assert!(
+            !backend.has_result(task_id).await.expect("has_result"),
+            "the result this test stored must not outlive it"
+        );
     }
 
+    /// Skipped, visibly, when `MYSQL_URL` is not set.
+    ///
+    /// Point it at a database of its own, not at the one
+    /// `CELERS_TEST_MYSQL_URL` names: `celers-backend-db` and
+    /// `celers-broker-sql` both auto-migrate a `celers_task_results` table
+    /// with incompatible schemas (TODO.md Known gaps #16), so sharing one
+    /// database makes whichever migrates second fail.
     #[tokio::test]
-    #[ignore = "requires MySQL server"]
     async fn test_mysql_backend_integration() {
-        use crate::MysqlResultBackend;
+        use crate::{MysqlResultBackend, ResultStore};
         use celers_core::TaskResultValue;
+        use uuid::Uuid;
 
-        let backend_result = MysqlResultBackend::new("mysql://localhost/test").await;
+        let Ok(url) = std::env::var("MYSQL_URL") else {
+            eprintln!("SKIPPED: test_mysql_backend_integration (set MYSQL_URL to run)");
+            return;
+        };
 
-        if let Ok(backend) = backend_result {
-            use crate::ResultStore;
-            use uuid::Uuid;
-            let task_id = Uuid::new_v4();
-            let result = backend
-                .store_result(
-                    task_id,
-                    TaskResultValue::Success(serde_json::json!({"result": "success"})),
-                )
-                .await;
-            assert!(result.is_ok());
-        }
+        let backend = MysqlResultBackend::new(&url)
+            .await
+            .expect("connect to MYSQL_URL");
+        backend.migrate().await.expect("run migrations");
+
+        let task_id = Uuid::new_v4();
+        backend
+            .store_result(
+                task_id,
+                TaskResultValue::Success(serde_json::json!({"result": "success"})),
+            )
+            .await
+            .expect("store_result");
+        assert!(
+            backend.has_result(task_id).await.expect("has_result"),
+            "the result this test stored must be readable back"
+        );
+
+        // Leave the database as we found it.
+        backend.forget(task_id).await.expect("cleanup");
+        assert!(
+            !backend.has_result(task_id).await.expect("has_result"),
+            "the result this test stored must not outlive it"
+        );
     }
 }
 

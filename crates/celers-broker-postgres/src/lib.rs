@@ -149,7 +149,7 @@ pub mod monitoring;
 pub mod utilities;
 
 // Re-export all public types
-pub use broker_core::{PostgresBroker, DEFAULT_REVOCATION_TTL_SECS};
+pub use broker_core::{PostgresBroker, DEFAULT_REVOCATION_TTL_SECS, MIGRATION_ADVISORY_LOCK_ID};
 pub use notifications::TaskNotificationListener;
 pub use revocation::PgRevocationStream;
 pub use types::*;
@@ -160,3 +160,6 @@ mod tests;
 
 #[cfg(test)]
 mod tests_pg;
+
+#[cfg(test)]
+mod tests_pg_binds;

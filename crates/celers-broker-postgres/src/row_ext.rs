@@ -109,6 +109,56 @@ pub(crate) use row_to;
 /// Convert a [`uuid::Uuid`] into an [`oxisql_core::Value::Uuid`] for binding
 /// as a query parameter.
 ///
+/// # ⚠️ Only correct against a `$n::text::uuid` placeholder
+///
+/// **Never bind the returned value against a bare `$n` that PostgreSQL infers
+/// as `uuid`** (e.g. `WHERE id = $1` on a `id UUID` column). It fails against
+/// a live server every time, with
+/// `incorrect binary data format in bind parameter n`:
+///
+/// - `oxisql-postgres`'s `value_to_param` converts `Value::Uuid(u)` into
+///   `OwnedParam::Text(format!("{}", Value::Uuid(u)))` — the 36-character
+///   hyphenated text form, e.g. `"3fa85f64-5717-4562-b3fc-2c963f66afa6"`.
+/// - `OwnedParam::accepts()` unconditionally returns `true`, bypassing the
+///   `to_sql_checked!` guard that would otherwise reject a text payload for a
+///   `uuid`-typed placeholder before it reached the wire.
+/// - `postgres-types`' `impl ToSql for String` (which `OwnedParam::Text`
+///   delegates to) writes the raw UTF-8 bytes whatever the server-inferred
+///   parameter type is, and `tokio-postgres` always binds parameters in
+///   PostgreSQL **binary** format.
+/// - PostgreSQL's binary `uuid_recv` expects exactly 16 bytes, so a 36-byte
+///   text payload announced as a binary `uuid` is rejected outright.
+///
+/// This is the same hazard documented below for `DateTime<Utc>` parameters,
+/// and the fix has the same shape: pin the placeholder's inferred type to
+/// `text` — for which a `String`'s text and binary encodings are identical —
+/// with an inner `::text` cast, then convert server-side with an outer
+/// `::uuid` cast:
+///
+/// ```ignore
+/// let id: uuid::Uuid = ...;
+/// conn.execute(
+///     "DELETE FROM celers_tasks WHERE id = $1::text::uuid",
+///     &[&uuid_param(&id)],
+/// ).await?;
+/// ```
+///
+/// Every UUID-column placeholder in this crate carries that cast (see
+/// [`crate::sql`]'s "Binding conventions"), including the generated
+/// `IN ($1::text::uuid, ..)` lists. Adding a UUID parameter without one is a
+/// silent, server-rejected write, so the cast must be visible at the call
+/// site to stay auditable — which is why there is no wrapper hiding it.
+///
+/// Columns that merely *hold* a UUID as text (`celers_periodic_schedules
+/// .schedule_id` and `celers_queue_snapshots.snapshot_id` are both
+/// `VARCHAR(36)`) are the exact opposite case: PostgreSQL infers `varchar`
+/// there, the text payload is already right, and adding a `::uuid` cast would
+/// break the comparison. Bind those as plain `String`s, as this crate does.
+///
+/// The READ side ([`uuid_from_row`]/[`opt_uuid_from_row`]) decodes the
+/// server's native binary `uuid` column encoding — an entirely different code
+/// path, with no such hazard.
+///
 /// # Why `Value`, not a bare `u128`
 ///
 /// `oxisql-core` 0.3.2 has an asymmetry between its read and write paths for
@@ -140,7 +190,8 @@ pub(crate) use row_to;
 /// let id = Uuid::new_v4();
 /// let param = uuid_param(&id);
 /// assert_eq!(param, Value::Uuid(id.as_u128()));
-/// // Bind it: conn.execute("INSERT INTO t (id) VALUES ($1)", &[&param]).await?;
+/// // Bind it — note the mandatory cast:
+/// // conn.execute("INSERT INTO t (id) VALUES ($1::text::uuid)", &[&param]).await?;
 /// ```
 #[allow(dead_code)]
 pub fn uuid_param(u: &uuid::Uuid) -> oxisql_core::Value {
@@ -169,8 +220,25 @@ pub fn opt_uuid_from_row(row: &Row, col: &str) -> Result<Option<uuid::Uuid>, Oxi
 
 /// Serialize a [`serde_json::Value`] to its `String` wire form for binding as
 /// a query parameter (oxisql-core has no `ToSqlValue` impl for `Value::Json`
-/// itself — a plain `&str`/`String` parameter is bound and the column's SQL
-/// type, e.g. Postgres `JSON`/`JSONB`, handles the cast on the server side).
+/// itself, so a plain `&str`/`String` parameter is bound instead).
+///
+/// # The `::text::jsonb` cast is mandatory on PostgreSQL
+///
+/// The returned `String` carries JSON *text*. On PostgreSQL's extended
+/// (prepared-statement) protocol the server infers each parameter's type from
+/// where it appears, so a bare `$n` written straight into a `JSONB` column is
+/// inferred as `jsonb` — and the client then encodes the string in the
+/// **binary** `jsonb` representation, whose first byte must be the format
+/// version `0x01`. JSON text starts with `{`, `[`, `"`, a digit or `n`, so the
+/// server rejects the value with `ERROR: unsupported jsonb version number 123`
+/// (`{`), `91` (`[`), `110` (`n`), and the whole statement fails.
+///
+/// Binding through an explicit `$n::text::jsonb` pins the parameter's inferred
+/// type to `text` — which *is* transferred verbatim — and casts it to `jsonb`
+/// server-side, where the ordinary JSON text parser runs. It is the same idiom
+/// the UUID and timestamp parameters in this crate use
+/// (`$n::text::uuid`, `$n::text::timestamptz`); see [`crate::sql`]'s "Binding
+/// conventions", which its unit tests assert on.
 ///
 /// # Example
 ///
@@ -180,7 +248,8 @@ pub fn opt_uuid_from_row(row: &Row, col: &str) -> Result<Option<uuid::Uuid>, Oxi
 /// let payload = serde_json::json!({ "k": "v" });
 /// let param = json_param(&payload);
 /// assert_eq!(param, r#"{"k":"v"}"#);
-/// // Bind it: conn.execute("INSERT INTO t (data) VALUES ($1)", &[&param]).await?;
+/// // Bind it — note the mandatory cast; `VALUES ($1)` alone is rejected:
+/// // conn.execute("INSERT INTO t (data) VALUES ($1::text::jsonb)", &[&param]).await?;
 /// ```
 #[allow(dead_code)]
 pub fn json_param(v: &serde_json::Value) -> String {
@@ -248,9 +317,12 @@ pub fn json_from_row(row: &Row, col: &str) -> Result<serde_json::Value, OxiSqlEr
 //
 // ```ignore
 // let now: chrono::DateTime<chrono::Utc> = chrono::Utc::now();
+// // Both parameters are cast: the timestamp for the reason above, the id
+// // for the identical reason documented on `uuid_param`.
 // conn.execute(
-//     "UPDATE t SET seen_at = $1::text::timestamptz WHERE id = $2",
-//     &[&now.to_rfc3339(), &id],
+//     "UPDATE celers_tasks SET started_at = $1::text::timestamptz \
+//      WHERE id = $2::text::uuid",
+//     &[&now.to_rfc3339(), &uuid_param(&id)],
 // ).await?;
 // ```
 //

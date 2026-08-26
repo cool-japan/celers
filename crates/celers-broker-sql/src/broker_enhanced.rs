@@ -4,6 +4,7 @@
 //! queue statistics, worker management, and other extended operations.
 
 use crate::broker_core::MysqlBroker;
+use crate::mysql_error::with_deadlock_retry;
 use crate::row_ext::RowExt;
 use crate::types::*;
 use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
@@ -55,6 +56,14 @@ impl MysqlBroker {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// A multi-row `UPDATE ... WHERE id IN (...)` takes its row locks in
+    /// whatever order the optimizer chooses, so two overlapping batches (or a
+    /// batch overlapping a concurrent claim) can deadlock. The statement is
+    /// therefore issued through `mysql_error::with_deadlock_retry`, which
+    /// restarts it on `ERROR 1213`. The retry is safe because the
+    /// statement is idempotent: a row already `cancelled` no longer matches
+    /// the `state IN ('pending', 'processing')` predicate.
     pub async fn cancel_batch(&self, task_ids: &[TaskId]) -> Result<u64> {
         if task_ids.is_empty() {
             return Ok(0);
@@ -77,11 +86,11 @@ impl MysqlBroker {
             .map(|s| s as &dyn oxisql_core::ToSqlValue)
             .collect();
 
-        let cancelled = self
-            .connection()
-            .execute(&query, &param_refs)
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to cancel batch: {}", e)))?;
+        let cancelled = with_deadlock_retry("cancel_batch", || async {
+            self.connection().execute(&query, &param_refs).await
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to cancel batch: {}", e)))?;
 
         tracing::info!(count = cancelled, "Cancelled tasks in batch");
 
@@ -97,7 +106,9 @@ impl MysqlBroker {
     /// * `worker_id` - The worker ID to get statistics for
     ///
     /// # Returns
-    /// Worker statistics including task counts and average duration
+    /// Worker statistics including task counts and average duration,
+    /// counting only tasks in **this broker's queue** — a worker draining
+    /// several queues reports separate figures through a broker for each.
     ///
     /// # Example
     /// ```no_run
@@ -126,10 +137,10 @@ impl MysqlBroker {
                     MAX(started_at) as last_seen,
                     AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as avg_duration
                 FROM celers_tasks
-                WHERE worker_id = ?
+                WHERE worker_id = ? AND queue_name = ?
                 GROUP BY worker_id
                 "#,
-                &[&worker_id],
+                &[&worker_id, &self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get worker statistics: {}", e)))?;
@@ -184,7 +195,10 @@ impl MysqlBroker {
     /// * `state` - The task state to count
     ///
     /// # Returns
-    /// The number of tasks in the specified state
+    /// The number of tasks in the specified state, in **this broker's
+    /// queue** — the same scope as [`Self::queue_size`] and
+    /// `get_statistics`, so the count can never exceed what this broker
+    /// would actually hand out.
     ///
     /// # Example
     /// ```no_run
@@ -202,8 +216,8 @@ impl MysqlBroker {
         let rows = self
             .connection()
             .query(
-                "SELECT COUNT(*) AS c FROM celers_tasks WHERE state = ?",
-                &[&state.to_string()],
+                "SELECT COUNT(*) AS c FROM celers_tasks WHERE state = ? AND queue_name = ?",
+                &[&state.to_string(), &self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to count tasks by state: {}", e)))?;
@@ -230,7 +244,8 @@ impl MysqlBroker {
     /// - > 60 minutes
     ///
     /// # Returns
-    /// Vector of age distribution buckets with task counts and oldest task age
+    /// Vector of age distribution buckets with task counts and oldest task
+    /// age, over the pending tasks of **this broker's queue** only.
     ///
     /// # Example
     /// ```no_run
@@ -264,7 +279,7 @@ impl MysqlBroker {
                     COUNT(*) as task_count,
                     MAX(TIMESTAMPDIFF(SECOND, created_at, NOW())) as oldest_age
                 FROM celers_tasks
-                WHERE state = 'pending'
+                WHERE state = 'pending' AND queue_name = ?
                 GROUP BY bucket
                 ORDER BY
                     CASE bucket
@@ -275,7 +290,7 @@ impl MysqlBroker {
                         ELSE 5
                     END
                 "#,
-                &[],
+                &[&self.queue_name],
             )
             .await
             .map_err(|e| {
@@ -310,7 +325,8 @@ impl MysqlBroker {
     /// are failing most often and how many retries they typically require.
     ///
     /// # Returns
-    /// Vector of retry statistics per task type, sorted by total retries descending
+    /// Vector of retry statistics per task type, sorted by total retries
+    /// descending, over **this broker's queue** only.
     ///
     /// # Example
     /// ```no_run
@@ -342,11 +358,11 @@ impl MysqlBroker {
                     AVG(retry_count) as avg_retries,
                     MAX(retry_count) as max_retries
                 FROM celers_tasks
-                WHERE retry_count > 0
+                WHERE retry_count > 0 AND queue_name = ?
                 GROUP BY task_name
                 ORDER BY total_retries DESC
                 "#,
-                &[],
+                &[&self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get retry statistics: {}", e)))?;
@@ -389,7 +405,8 @@ impl MysqlBroker {
     /// in the 'processing' state.
     ///
     /// # Returns
-    /// Vector of worker IDs currently processing tasks
+    /// Vector of worker IDs currently processing tasks **in this broker's
+    /// queue**.
     ///
     /// # Example
     /// ```no_run
@@ -410,9 +427,10 @@ impl MysqlBroker {
                 SELECT DISTINCT worker_id
                 FROM celers_tasks
                 WHERE worker_id IS NOT NULL AND state = 'processing'
+                  AND queue_name = ?
                 ORDER BY worker_id
                 "#,
-                &[],
+                &[&self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to list active workers: {}", e)))?;
@@ -472,6 +490,7 @@ impl MysqlBroker {
     ///
     /// Combines multiple metrics to provide a comprehensive health assessment
     /// of the queue, including backlog, oldest task age, and active workers.
+    /// Every component is scoped to **this broker's queue**.
     ///
     /// Status determination:
     /// - "healthy": < 100 pending, oldest task < 5 min
@@ -506,11 +525,11 @@ impl MysqlBroker {
                 r#"
                 SELECT TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age
                 FROM celers_tasks
-                WHERE state = 'pending'
+                WHERE state = 'pending' AND queue_name = ?
                 ORDER BY created_at ASC
                 LIMIT 1
                 "#,
-                &[],
+                &[&self.queue_name],
             )
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get oldest task: {}", e)))?;

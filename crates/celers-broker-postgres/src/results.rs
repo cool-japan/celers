@@ -67,9 +67,14 @@ impl PostgresBroker {
         // `NULL`, exactly matching sqlx's `.bind(completed_at)` behavior for
         // `None`.
         //
-        // `result` (JSON, nullable) -> `json_param` wrapped in `Option` so a
+        // `result` (JSONB, nullable) -> `json_param` wrapped in `Option` so a
         // `None` result binds SQL `NULL` rather than the literal string
-        // `"null"`.
+        // `"null"`, bound through the statement's `$4::text::jsonb` cast
+        // (`NULL::text::jsonb` is still `NULL`).
+        //
+        // `task_id` targets a `UUID` column and therefore goes through the
+        // matching `$1::text::uuid` cast — see `row_ext.rs`'s `uuid_param`
+        // for why a bare `$1` there is rejected by the server.
         let task_id_param = uuid_param(task_id);
         let status_param = status.to_string();
         let result_param: Option<String> = result.as_ref().map(json_param);
@@ -79,7 +84,7 @@ impl PostgresBroker {
                 r#"
             INSERT INTO celers_task_results
                 (task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7::text::timestamptz, $8)
+            VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5, $6, NOW(), $7::text::timestamptz, $8)
             ON CONFLICT (task_id) DO UPDATE SET
                 status = EXCLUDED.status,
                 result = EXCLUDED.result,
@@ -112,10 +117,10 @@ impl PostgresBroker {
             .conn
             .query(
                 r#"
-            SELECT task_id, task_name, status, result, error, traceback,
+            SELECT task_id, task_name, status, result::text AS result, error, traceback,
                    created_at, completed_at, runtime_ms
             FROM celers_task_results
-            WHERE task_id = $1
+            WHERE task_id = $1::text::uuid
             "#,
                 &[&task_id_param],
             )
@@ -163,7 +168,7 @@ impl PostgresBroker {
         let rows_affected = self
             .conn
             .execute(
-                "DELETE FROM celers_task_results WHERE task_id = $1",
+                "DELETE FROM celers_task_results WHERE task_id = $1::text::uuid",
                 &[&task_id_param],
             )
             .await
@@ -237,16 +242,16 @@ impl PostgresBroker {
         // value is ever spliced into the SQL text, so this remains fully
         // injection-safe. This is the same rewrite pattern as
         // `broker_trait.rs`'s `dequeue_batch`/`ack_batch`.
-        let placeholders: Vec<String> = (1..=task_ids.len()).map(|i| format!("${i}")).collect();
+        let placeholders = crate::sql::uuid_in_clause(1, task_ids.len());
         let query_str = format!(
             r#"
-            SELECT task_id, task_name, status, result, error, traceback,
+            SELECT task_id, task_name, status, result::text AS result, error, traceback,
                    runtime_ms, created_at, completed_at
             FROM celers_task_results
             WHERE task_id IN ({})
             ORDER BY created_at DESC
             "#,
-            placeholders.join(", ")
+            placeholders
         );
         let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
         let param_refs: Vec<&dyn ToSqlValue> = task_id_params
@@ -327,13 +332,13 @@ impl PostgresBroker {
 
         // Same `ANY($1)` -> `IN ($1, .., $N)` rewrite as `get_results_batch`
         // above.
-        let placeholders: Vec<String> = (1..=task_ids.len()).map(|i| format!("${i}")).collect();
+        let placeholders = crate::sql::uuid_in_clause(1, task_ids.len());
         let query_str = format!(
             r#"
             DELETE FROM celers_task_results
             WHERE task_id IN ({})
             "#,
-            placeholders.join(", ")
+            placeholders
         );
         let task_id_params: Vec<oxisql_core::Value> = task_ids.iter().map(uuid_param).collect();
         let param_refs: Vec<&dyn ToSqlValue> = task_id_params
