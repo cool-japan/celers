@@ -49,6 +49,17 @@ metrics = ["celers-metrics"]
 # lets interval-driven background loops be tested deterministically instead
 # of by sleeping. Test-only: it is inert unless a test pauses the clock.
 tokio = { workspace = true, features = ["test-util"] }
+# Dev-only, and only for the live coexistence test: this crate's broker and
+# `celers-backend-db`'s `MysqlResultBackend` both auto-migrate into the same
+# MySQL database in a normal deployment, and used to collide on a shared
+# `celers_task_results` table (Known gaps #16). The regression test that
+# proves they now coexist has to drive *both* migrations against one
+# database, so it needs the other crate.
+#
+# This direction is the one that compiles: `celers-backend-db` does not
+# depend on `celers-broker-sql`, so there is no cycle. It is a
+# `dev-dependency`, so nothing reaches a published consumer's build.
+celers-backend-db = { workspace = true }
 futures = { workspace = true }
 criterion = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -467,7 +467,7 @@ impl MysqlBroker {
             "celers_tasks",
             "celers_dead_letter_queue",
             "celers_task_history",
-            "celers_task_results",
+            "celers_broker_results",
         ];
 
         let mut optimized = 0u64;
@@ -881,7 +881,7 @@ impl MysqlBroker {
         // Check for existing task within window.
         //
         // Scoped to `queue_name` (leading predicate, matching the
-        // `sql_text::dequeue_select_sql` convention) for the same reason as
+        // `sql_text::dequeue_candidate_sql` convention) for the same reason as
         // `MysqlBroker::enqueue_deduplicated`: without it, a `dedup_key`
         // collision across two logical queues silently drops the second
         // caller's task by handing back the first queue's id instead of

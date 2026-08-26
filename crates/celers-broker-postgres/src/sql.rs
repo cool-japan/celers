@@ -37,6 +37,24 @@
 //!   `FromSql for String` does not accept `jsonb`, so an uncast `SELECT
 //!   metadata` fails inside the driver with
 //!   `error deserializing column N`.
+//!
+//! # `updated_at` is maintained by hand, not by a trigger
+//!
+//! `celers_tasks.updated_at` (migration `010_task_updated_at.sql`) is what
+//! `analytics.rs`'s `get_state_transition_history` windows and filters on and
+//! what `detect_abnormal_state_duration("processing", ..)` falls back to when
+//! a claimed row has no `started_at`. It is deliberately **not** kept current
+//! by a `BEFORE UPDATE` trigger: a trigger would make every statement in this
+//! module write a column its own text does not mention, which is exactly the
+//! kind of invisible behaviour this module exists to avoid.
+//!
+//! Every `UPDATE celers_tasks` here therefore carries an explicit
+//! `updated_at = NOW()` clause, and
+//! [`tests::every_task_update_maintains_updated_at`] fails the build if one
+//! is ever added without it. The same convention applies to the
+//! `UPDATE celers_tasks` statements written inline elsewhere in the crate
+//! (`convenience.rs`, `advanced_ops.rs`, `workflows.rs`, `analytics.rs`,
+//! `dlq.rs`, `db_monitoring.rs`).
 
 use crate::types::RetryStrategy;
 
@@ -122,7 +140,8 @@ pub(crate) fn claim_one_sql() -> String {
 UPDATE celers_tasks
    SET state = 'processing',
        started_at = NOW(),
-       attempt_count = attempt_count + 1
+       attempt_count = attempt_count + 1,
+       updated_at = NOW()
  WHERE id = (
          SELECT id
            FROM celers_tasks
@@ -145,7 +164,8 @@ pub(crate) fn claim_batch_sql() -> String {
 UPDATE celers_tasks
    SET state = 'processing',
        started_at = NOW(),
-       attempt_count = attempt_count + 1
+       attempt_count = attempt_count + 1,
+       updated_at = NOW()
  WHERE id IN (
          SELECT id
            FROM celers_tasks
@@ -172,7 +192,8 @@ RETURNING {CLAIM_RETURNING}
 pub(crate) const ACK_TASK: &str = r#"
 UPDATE celers_tasks
    SET state = 'completed',
-       completed_at = NOW()
+       completed_at = NOW(),
+       updated_at = NOW()
  WHERE id = $1::text::uuid
    AND queue_name = $2
    AND state = 'processing'
@@ -197,7 +218,8 @@ pub(crate) const FAIL_TASK: &str = r#"
 UPDATE celers_tasks
    SET state = 'failed',
        completed_at = NOW(),
-       started_at = NULL
+       started_at = NULL,
+       updated_at = NOW()
  WHERE id = $1::text::uuid
    AND queue_name = $2
    AND state = 'processing'
@@ -231,7 +253,8 @@ UPDATE celers_tasks
                            ELSE NOW() + (({backoff}) || ' seconds')::INTERVAL END,
        completed_at = CASE WHEN retry_count + 1 > max_retries THEN NOW() ELSE NULL END,
        started_at = NULL,
-       worker_id = NULL
+       worker_id = NULL,
+       updated_at = NOW()
  WHERE id = $1::text::uuid
    AND queue_name = $2
    AND state = 'processing'
@@ -244,7 +267,8 @@ RETURNING task_name, payload, retry_count, max_retries, state
 pub(crate) const CANCEL_TASK: &str = r#"
 UPDATE celers_tasks
    SET state = 'cancelled',
-       completed_at = NOW()
+       completed_at = NOW(),
+       updated_at = NOW()
  WHERE id = $1::text::uuid
    AND queue_name = $2
    AND state IN ('pending', 'processing')
@@ -324,7 +348,8 @@ pub(crate) fn ack_batch_sql(id_count: usize) -> String {
         r#"
 UPDATE celers_tasks
    SET state = 'completed',
-       completed_at = NOW()
+       completed_at = NOW(),
+       updated_at = NOW()
  WHERE id IN ({placeholders})
    AND queue_name = ${queue_idx}
    AND state = 'processing'
@@ -534,6 +559,52 @@ mod tests {
         // so they must contain no `id = $n` at all.
         for sql in [claim_one.as_str(), claim_batch.as_str()] {
             assert!(!sql.contains("id = $"), "claim statements bind no task id");
+        }
+    }
+
+    /// `celers_tasks.updated_at` is maintained explicitly rather than by a
+    /// trigger (see this module's header), so every statement that mutates a
+    /// task row has to say so. Without this test the omission is invisible
+    /// until an analytics query silently reports a stale transition time or
+    /// misses a stuck task — neither of which fails loudly.
+    #[test]
+    fn every_task_update_maintains_updated_at() {
+        let claim_one = claim_one_sql();
+        let claim_batch = claim_batch_sql();
+        let reject = reject_requeue_sql(RetryStrategy::default());
+        let ack_batch = ack_batch_sql(2);
+
+        for (name, sql) in [
+            ("claim_one_sql", claim_one.as_str()),
+            ("claim_batch_sql", claim_batch.as_str()),
+            ("ACK_TASK", ACK_TASK),
+            ("FAIL_TASK", FAIL_TASK),
+            ("reject_requeue_sql", reject.as_str()),
+            ("CANCEL_TASK", CANCEL_TASK),
+            ("ack_batch_sql", ack_batch.as_str()),
+        ] {
+            assert!(
+                sql.contains("UPDATE celers_tasks"),
+                "{name} is listed here as a task mutation but does not update celers_tasks"
+            );
+            assert!(
+                sql.contains("updated_at = NOW()"),
+                "{name} mutates a task row without bumping updated_at: {sql}"
+            );
+        }
+
+        // The read-only statements in this module must NOT carry the clause —
+        // a copy-paste of it into a SELECT would be a syntax error against a
+        // live server, which no non-gated test would otherwise catch.
+        for (name, sql) in [
+            ("PROBE_TASK_STATE", PROBE_TASK_STATE),
+            ("SELECT_TASK_FOR_HOOKS", SELECT_TASK_FOR_HOOKS),
+            ("QUEUE_SIZE", QUEUE_SIZE),
+        ] {
+            assert!(
+                !sql.contains("updated_at"),
+                "{name} is a read and must not mention updated_at: {sql}"
+            );
         }
     }
 

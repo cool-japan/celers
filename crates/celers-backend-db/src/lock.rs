@@ -325,8 +325,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_db_lock_lifecycle() {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(database_url) = crate::test_env::postgres_url("test_db_lock_lifecycle") else {
+            return;
+        };
 
         let conn = oxisql_postgres::PgConnection::connect(
             &database_url,
@@ -392,8 +393,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_db_release_all() {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(database_url) = crate::test_env::postgres_url("test_db_release_all") else {
+            return;
+        };
 
         let conn = oxisql_postgres::PgConnection::connect(
             &database_url,

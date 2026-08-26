@@ -1178,10 +1178,20 @@ impl AmqpBroker {
     /// Peek at messages in a queue without consuming them.
     ///
     /// This method retrieves up to `max_messages` from the queue for inspection
-    /// and immediately requeues them. Useful for monitoring queue contents.
+    /// and immediately requeues them via `basic.nack(requeue = true)`. Useful
+    /// for monitoring queue contents.
     ///
     /// **Note:** This operation may affect message ordering and performance.
     /// Use sparingly and only for debugging/monitoring purposes.
+    ///
+    /// **Note:** `basic.nack` has no synchronous broker-side completion in
+    /// AMQP 0-9-1 -- this call returns once the requeue is *sent*, not once
+    /// the broker has applied it -- so a `queue_size`/`queue.declare(passive)`
+    /// check made immediately afterwards may transiently under-count the
+    /// just-requeued messages until the broker catches up (observed in
+    /// practice; see `tests_hardening::peek_queue_returns_distinct_messages_against_a_live_broker`'s
+    /// doc comment for measured frequency). A caller that needs an accurate
+    /// post-peek count should poll rather than trust a single read.
     ///
     /// # Arguments
     ///

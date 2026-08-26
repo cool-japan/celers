@@ -2,8 +2,8 @@
 //!
 //! Extracted from `broker_core.rs` (which exceeded the 2000-line limit) along
 //! the file's own `// ========== Task Result Storage ==========` section
-//! boundary. Reads and writes `celers_task_results` (created by migration
-//! `010_task_results.sql`).
+//! boundary. Reads and writes `celers_broker_results` (created by migration
+//! `010_broker_results.sql`).
 
 use crate::broker_core::MysqlBroker;
 use crate::row_ext::RowExt;
@@ -53,7 +53,7 @@ impl MysqlBroker {
         self.conn
             .execute(
                 r#"
-                INSERT INTO celers_task_results
+                INSERT INTO celers_broker_results
                     (task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms)
                 VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?)
                 ON DUPLICATE KEY UPDATE
@@ -89,7 +89,7 @@ impl MysqlBroker {
                 r#"
                 SELECT task_id, task_name, status, result, error, traceback,
                        created_at, completed_at, runtime_ms
-                FROM celers_task_results
+                FROM celers_broker_results
                 WHERE task_id = ?
                 "#,
                 &[&task_id.to_string()],
@@ -105,8 +105,13 @@ impl MysqlBroker {
                 let status_str: String = row
                     .col("status")
                     .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?;
-                let result_str: Option<String> = row
-                    .col("result")
+                // `result`, `error` and `traceback` are `LONGTEXT`/`TEXT`, and
+                // MySQL sends those over the same wire type as `BLOB`, so
+                // `oxisql-mysql` hands them back as `Value::Blob` — which
+                // `col::<Option<String>>` rejects with `type mismatch:
+                // expected Text, got Blob` on every row that is not `NULL`.
+                // See `row_ext::opt_text_from_row`.
+                let result_str = crate::row_ext::opt_text_from_row(&row, "result")
                     .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?;
                 Ok(Some(TaskResult {
                     task_id: Uuid::parse_str(&task_id_str)
@@ -116,11 +121,9 @@ impl MysqlBroker {
                         .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
                     status: status_str.parse()?,
                     result: result_str.and_then(|s| serde_json::from_str(&s).ok()),
-                    error: row
-                        .col("error")
+                    error: crate::row_ext::opt_text_from_row(&row, "error")
                         .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
-                    traceback: row
-                        .col("traceback")
+                    traceback: crate::row_ext::opt_text_from_row(&row, "traceback")
                         .map_err(|e| CelersError::Other(format!("Failed to get result: {e}")))?,
                     created_at: row
                         .col("created_at")
@@ -142,7 +145,7 @@ impl MysqlBroker {
         let affected = self
             .conn
             .execute(
-                "DELETE FROM celers_task_results WHERE task_id = ?",
+                "DELETE FROM celers_broker_results WHERE task_id = ?",
                 &[&task_id.to_string()],
             )
             .await
@@ -162,7 +165,7 @@ impl MysqlBroker {
             .conn
             .execute(
                 r#"
-                DELETE FROM celers_task_results
+                DELETE FROM celers_broker_results
                 WHERE completed_at < ?
                 "#,
                 &[&cutoff_str],

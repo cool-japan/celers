@@ -31,7 +31,9 @@ AMQP/SQS wire framing).
 AMQP — the exchange type changed), subscribe to a Redis `<queue>:cancel` channel, `match`
 exhaustively on `TaskEvent`, pattern-match `celers_protocol::result::ExceptionInfo::exc_message` /
 `ResultMessage::children` or `celers_broker_redis::QueueRateLimiter::Distributed`, implement
-`celers_core::Broker` yourself, or rely on task coalescing.**
+`celers_core::Broker` yourself, rely on task coalescing, call `PostgresBroker`'s advisory-lock
+trio, or read the MySQL broker's `celers_task_results` table directly — that table is renamed
+`celers_broker_results` and existing databases are upgraded in place on the next `migrate()`.**
 
 ### ⚠️ Breaking changes
 
@@ -80,8 +82,66 @@ exhaustively on `TaskEvent`, pattern-match `celers_protocol::result::ExceptionIn
   hand-rolled consumer bound on a specific key must rebind. The pre-fix behaviour is still available
   as an explicit `EventRoutingMode::Fixed`
 
+#### Database schema
+
+- **`celers-broker-sql`'s MySQL result table is renamed `celers_task_results` →
+  `celers_broker_results`, and existing databases are upgraded automatically on the next
+  `migrate()`.** This is the fix for what shipped as Known gaps #16: `celers-backend-db`'s
+  `MysqlResultBackend` auto-migrates a table *also* called `celers_task_results`, with an
+  incompatible schema (`result_state`/`result_data`/`extra` there, `status`/`result`/`traceback`
+  here), and a normal deployment points the broker and the result backend at one database. Whichever
+  migrated second lost: `CREATE TABLE IF NOT EXISTS` silently no-op'd against the other crate's
+  table and the follow-up DDL died — `ERROR 1072 (42000): Key column 'status' doesn't exist in
+  table` one way, `Key column 'expires_at' doesn't exist in table` the other. The **result
+  backend** keeps `celers_task_results`; this broker-internal store moved.
+
+  **What an operator has to do: nothing, but read this if you query the table directly.** The new
+  `MysqlBroker::rename_legacy_broker_results_table` step runs on every `migrate()`, is untracked (so
+  it also runs on a database whose ledger already records migration `010` under the old name — the
+  case that matters, since the tracked migration is skipped there), and issues a `RENAME TABLE`,
+  which preserves every row and carries the table's three indexes across under their existing names.
+  It is deliberately conservative and never destructive: it acts **only** when the legacy table
+  carries this crate's `traceback` signature column and the new name is free. A
+  `celers_task_results` carrying `celers-backend-db`'s `result_state` instead is recognised as the
+  result backend's live store and left strictly alone; one carrying *both* columns is ambiguous and
+  also left alone; with both table names already present the legacy one is left in place and a
+  warning names it, because rows in it would otherwise be silently unreachable. The legacy table is
+  never dropped and never written to under any branch — on a shared database it is another crate's
+  data. **Dashboards, reporting jobs and hand-written SQL that read `celers_task_results` expecting
+  the broker's columns must be repointed at `celers_broker_results`.**
+
+  `celers-broker-postgres` had the same collision latent — its `results.rs` addressed a result table
+  no migration had ever created — and its new `009_broker_results.sql` adopts the same name, so the
+  two backends now agree on both engines: the *broker's* result store is `celers_broker_results`
+  everywhere, the *result backend's* is `celers_task_results` everywhere. There is no rename step on
+  the PostgreSQL side and none is needed, because that crate never created a result table at all
+  (see Fixed).
+
+  Verified live rather than asserted: `celers-broker-sql`'s new
+  `tests_hardening::migration_upgrade` suite drives all four branches against a real MySQL 8 —
+  including a database seeded with the pre-rename schema, rows, indexes *and* a `celers_migrations`
+  row for version `010`, which is exactly what an older build leaves behind — and asserts the rows
+  and index names survive, that the result backend's table is untouched, and that a replay changes
+  nothing. It needs a database it may drop tables in, so it is gated on its own
+  `CELERS_TEST_MYSQL_UPGRADE_URL` (provisioned by `scripts/test-integration.sh`) and refuses to run
+  against the database `CELERS_TEST_MYSQL_URL` names. The collision itself is now covered from the
+  other side too: `celers-backend-db`'s full suite passes **151/151 against the very database
+  `celers-broker-sql` has just migrated**, the configuration that used to produce 7 failures
+
 #### Source compatibility
 
+- **`PostgresBroker::try_advisory_lock` / `advisory_lock` / `release_advisory_lock` are
+  `#[deprecated(since = "0.3.1")]`** — a downstream build with `-D warnings` stops compiling until
+  it moves to the guard API (see Added). They were not merely renamed, they were *broken*: each
+  issued its `pg_advisory_lock` / `pg_advisory_unlock` straight through the pool, which hands out a
+  different connection per statement, so an acquire and its release usually landed on different
+  backend sessions — the unlock returned `false` without releasing anything and the lock stayed held
+  on whichever pooled connection had taken it until the process exited. They keep their signatures
+  and now work correctly (the acquire parks the pinned connection in the broker's lock registry and
+  the release unlocks on that exact connection), but they stay deprecated because no implementation
+  can give them what the guard has: with no RAII, a caller that returns early or panics between the
+  two calls pins one of the broker's pool slots for the broker's whole lifetime with nothing to
+  notice it
 - `TaskEvent` gained a `SoftTimeLimitExceeded` variant and **is not `#[non_exhaustive]`**: a
   downstream `match` over `TaskEvent` without a wildcard arm stops compiling until the arm is added
 - `celers_core::Broker` gained five methods — `revoke(&TaskId, terminate)`, `is_revoked(&TaskId)`,
@@ -185,6 +245,45 @@ exhaustively on `TaskEvent`, pattern-match `celers_protocol::result::ExceptionIn
   crate is hidden from `cargo deny check bans` any more
 
 ### Added
+
+#### PostgreSQL advisory locks: an RAII guard API
+
+- **`AdvisoryLockGuard`, and three ways to take one.** `PostgresBroker::try_acquire_advisory_lock`
+  (non-blocking, `Ok(None)` when another session holds it), `acquire_advisory_lock` (blocks until
+  granted) and `acquire_advisory_lock_within(lock_id, deadline)` (bounded wait — a zero deadline
+  still makes exactly one attempt, so it degrades to the try form rather than to "never"). The guard
+  **owns the pooled connection the lock was taken on**, which is what makes it correct:
+  `pg_advisory_lock` is session-scoped, so an acquire and its release have to run on the same
+  backend session, and a pool that hands out a different connection per statement cannot promise
+  that. Dropping the guard releases the lock and returns the connection; `release()` does it
+  explicitly and reports whether the lock was actually held. `DEFAULT_MIGRATION_LOCK_TIMEOUT` (60s)
+  is the bound `migrate()` itself uses, so a migration that cannot get the lock now fails with a
+  clear timeout instead of hanging on start-up forever. Covered against a real PostgreSQL by the new
+  `tests_pg_locks.rs` (11 tests: mutual exclusion across two brokers, the blocking acquire waiting
+  for a holder and then succeeding, the bounded acquire failing fast, a dropped guard leaving the
+  pool usable, and `migrate()` both giving up when another session holds the migration lock and
+  releasing it when it finishes)
+
+#### One entry point for the live-service test matrix
+
+- **`scripts/test-integration.sh`.** Every gated suite in this workspace needs a service and an
+  environment variable, and until now the only record of which went with which was prose in
+  `tests/integration/README.md`. The script brings the `docker-compose.yml` services up, exports the
+  eight `CELERS_TEST_*`-family variables, runs each crate's gated suite the way that README
+  documents, and prints a PASS/FAIL/SKIP summary — `--only redis|postgres|mysql|rabbitmq|localstack`
+  to scope it, `--full` to add the Python-interop suite and a `docker build` smoke, `--keep-up`,
+  `--down-v`. It provisions the two databases that must not be shared (`celers_backend_db_test`,
+  `celers_upgrade_test`) with the root credentials, and only exports their variables if creation
+  succeeded, so a provisioning failure produces an honest skip rather than a misattributed test
+  failure.
+
+  It waits for **real** health through the host-forwarded port rather than for `nc -z` to report the
+  port open, and restarts a container that does not answer within ~60s before retrying. That is not
+  defensive padding: on a fresh `docker compose up -d` during this release's own verification, four
+  of the five services (PostgreSQL, MySQL, RabbitMQ, LocalStack) accepted TCP connections on the
+  forwarded port while never completing a protocol handshake, and every one of them was fixed by
+  exactly the restart the script performs. Without it the failure presents as a 30-second connect
+  timeout in every gated test — indistinguishable, from the test output alone, from a real defect
 
 #### Remote worker control (`celers inspect` / `celers control`)
 
@@ -455,6 +554,105 @@ exhaustively on `TaskEvent`, pattern-match `celers_protocol::result::ExceptionIn
 
 ### Fixed
 
+- **`celers-broker-postgres`'s entire result store addressed a table no migration created.**
+  `results.rs` (`store_result` / `get_result` / `delete_result` / `archive_results` /
+  `get_results_batch` / `delete_results_batch`), `analytics.rs`'s `store_results_batch` and
+  `db_monitoring.rs`'s `analyze_tables` / `vacuum_tables` all read and wrote a broker-side result
+  table, and **no migration in the crate had ever created it** — every one of those calls failed
+  against a live server with `ERROR: relation "..." does not exist`. It went unnoticed because none
+  of it was reachable from a test that touched a real database. New `009_broker_results.sql` creates
+  `celers_broker_results`, with the DDL derived from the binds rather than the other way round:
+  `task_id UUID PRIMARY KEY` because every write ends in `ON CONFLICT (task_id) DO UPDATE` and every
+  read casts through `$n::text::uuid`; `task_name NOT NULL DEFAULT ''` because `store_results_batch`
+  does not bind it while the read side deserialises it into a non-optional `String`; `result JSONB`
+  nullable, because the crate deliberately distinguishes a SQL `NULL` from the JSON literal `null`;
+  a `CHECK` transcribed from `TaskResultStatus`'s own `FromStr`. Its four indexes are named
+  `idx_broker_results_*` rather than `idx_task_results_*` because PostgreSQL index names are
+  database-wide and `celers-backend-db` already owns the latter — the table-name collision one level
+  down. Covered by the new `tests_pg_results.rs` (24 tests against a real PostgreSQL 16, including
+  the `NULL`-vs-`null` distinction, the upsert conflict branch, and batch/archive scoping)
+
+- **Two PostgreSQL analytics entry points read a `celers_tasks.updated_at` column that did not
+  exist.** `get_state_transition_history` projects it, windows over it
+  (`LAG(..) OVER (PARTITION BY id ORDER BY updated_at)`), filters and orders by it; and
+  `detect_abnormal_state_duration("processing", ..)` ages a claimed task through
+  `COALESCE(started_at, updated_at)`. Both failed against a live server with
+  `column "updated_at" does not exist`. New `010_task_updated_at.sql` adds it, and roughly thirty
+  `UPDATE celers_tasks` statements across `sql.rs`, `convenience.rs`, `advanced_ops.rs`,
+  `workflows.rs`, `analytics.rs`, `dlq.rs`, `db_monitoring.rs` and `scheduling.rs` now carry an
+  explicit `updated_at = NOW()`. Explicit rather than a `BEFORE UPDATE` trigger on purpose: a
+  trigger hides the write from `EXPLAIN`, from `pg_stat_statements` and from a plain reading of the
+  SQL, and puts the behaviour in the database rather than in the crate under review — and the
+  explicit form is what makes the column portable to the sibling brokers.
+
+  The migration adds the column **nullable**, backfills it from the row's real last-touch time
+  (`COALESCE(completed_at, started_at, created_at)`) and only then pins `DEFAULT NOW()` / `NOT
+  NULL`. Doing it in one `ADD COLUMN ... NOT NULL DEFAULT NOW()` would stamp every pre-existing row
+  with the migration's own timestamp, making every historical task look freshly touched and
+  under-reporting every genuinely stuck task for a whole threshold window. The `WHERE updated_at IS
+  NULL` guard is what makes the file replayable. Both properties were verified against a live
+  PostgreSQL on a database put into the pre-migration state by hand — three rows exercising all
+  three `COALESCE` branches each received their own true last-touch time rather than `NOW()`, and a
+  forced replay of the migration left those values untouched
+
+- **A MySQL claim on one queue starved every other queue.** `dequeue` was a single locking
+  `SELECT ... ORDER BY priority DESC, created_at ASC LIMIT n FOR UPDATE SKIP LOCKED`, and under
+  InnoDB's default `REPEATABLE READ` that shape locks far more than the rows it returns, in two
+  independent ways. *Across queues*: a locking range scan takes next-key locks, which cover the
+  index record **after** the scanned range — measured on this crate's own MySQL 8.0 via
+  `performance_schema.data_locks`, a claim on queue `zzprobe_a` held `X` on the
+  `idx_tasks_queue_dequeue` record belonging to queue `zzprobe_b`, so while that claim was open
+  queue B's own `dequeue()` skipped its only pending row and returned `Ok(None)`. `SKIP LOCKED`
+  skips a locked *record*, and a next-key lock locks the record. *Within a queue*:
+  `ORDER BY priority DESC, created_at ASC` cannot be served in order from the dequeue index once
+  `scheduled_at <= NOW()` makes it a range, so MySQL filesorts — and a filesort reads every
+  qualifying row before `LIMIT` applies, while a locking read locks every row it reads, so one
+  `dequeue()` locked the queue's entire due backlog for the life of its transaction.
+
+  Neither is fixable by rewriting the statement: `READ COMMITTED` cannot be reached through
+  `oxisql`'s `Connection::transaction()` (it hardcodes `TxOpts::default()`), and
+  `SET TRANSACTION ISOLATION LEVEL` inside an open transaction is `ERROR 1568`. The claim is
+  therefore split into a **non-locking** consistent read that picks candidate ids in priority order
+  (so its range scan cannot touch a neighbouring queue) followed by a locking read **by primary key
+  only** — `WHERE id IN (..)`, `FORCE INDEX (PRIMARY)`, no `ORDER BY`, no `LIMIT` — which takes
+  record-only (`REC_NOT_GAP`) locks and, with no filesort, locks nothing the caller does not claim.
+  `claim_pending_rows` walks the candidate list in chunks sized to what is still needed, so a row
+  another worker locked costs one extra round trip rather than a lost claim. Proved against a live
+  MySQL by `a_held_claim_on_one_queue_does_not_block_another_queue` and
+  `a_held_batch_claim_does_not_block_a_neighbouring_queue`, which assert the neighbour claims on its
+  **first** attempt with a claim held open, and by
+  `concurrent_claims_on_one_queue_partition_the_backlog`. The same rewrite removed two further
+  defects the three hand-written copies of this SQL had all drifted into: `FOR UPDATE SKIP LOCKED`
+  emitted *before* `LIMIT` (a parse error on MySQL, valid only on PostgreSQL, which is how the shape
+  reached a MySQL-only crate) and a missing `queue_name` predicate that let brokers on different
+  logical queues steal each other's tasks. All dequeue paths now build their statements through one
+  pair of builders in `sql_text.rs`
+
+- **MySQL bulk maintenance was not deadlock-retried.** The task-lifecycle statements
+  (`dequeue`/`ack`/`reject`/`cancel`) gained `with_deadlock_retry` earlier in this release, but the
+  bulk maintenance ones did not — and they are the statements *most* able to deadlock, because each
+  takes many row locks in one transaction while ordinary traffic keeps running. `archive_completed_tasks`,
+  `recover_stuck_tasks`, `purge_all`, `purge_by_state` and `purge_by_task_name` now go through the
+  same bounded, jittered retry loop. Each is idempotent — a row already in its target state matches
+  nothing on the retry — so restarting cannot double-apply anything
+
+- **An SQS DLQ dry run silently blinded the replay that followed it.**
+  `ReplayManager::replay_from_dlq(.., dry_run = true)` promised that inspected messages are
+  "returned to the DLQ", but its only mechanism for returning them was the visibility timeout:
+  `get_dlq_messages` issues a real `ReceiveMessage`, which makes every message it reads invisible
+  for the queue's visibility timeout (30 seconds by default, up to 12 hours) even though nothing is
+  deleted. The documented operator workflow — rehearse, read the count, then run for real — therefore
+  moved nothing and reported success, because the real run received an empty DLQ. Messages the
+  `ReplayFilter` rejected had the same problem: "skipped and left in the DLQ" meant "invisible for
+  the next 30 seconds". Both are now genuinely put back, with a `ChangeMessageVisibility` to zero
+  issued against the queue the delivery tag names once the receive loop is over — after the loop, so
+  a released message cannot be received and counted twice by the same run, and through `reject_on`
+  so an active visibility heartbeat is stopped rather than left to extend the timeout straight back
+  out. A release that fails is logged, not raised: the message still returns when its timeout
+  expires. Covered end-to-end against LocalStack by
+  `celers-broker-sqs`'s `tests/localstack.rs::dlq_redrive_moves_the_message_and_empties_the_dlq`,
+  which failed on exactly this before the fix
+
 - **Solar schedules now fire at all.** `Schedule::Solar::next_run` previously returned
   `Err(ScheduleError::Invalid)` for *every* input, so a solar beat entry never ran: the branch
   called the deprecated `sunrise::sunrise_sunset`, whose `(i64, i64)` return is a pair of Unix
@@ -575,8 +773,10 @@ now fixed and re-verified live.
   same "the server infers a stricter binary type than the driver can produce" hazard also reached
   `celers-broker-postgres`'s analytics queries, on `EXTRACT(EPOCH FROM ...)` results (need
   `::double precision`/`::BIGINT`) and interval-multiplication parameters (`$n::bigint`). Proven
-  live: `celers-broker-postgres` is **230/230 against a real PostgreSQL 16** (`tests_pg.rs` plus 18
-  new regression tests in `tests_pg_binds.rs`, gated on `CELERS_TEST_POSTGRES_URL`), and
+  live: `celers-broker-postgres` was **230/230 against a real PostgreSQL 16** when this landed
+  (`tests_pg.rs` plus 18 new regression tests in `tests_pg_binds.rs`, gated on
+  `CELERS_TEST_POSTGRES_URL`; **271/271** by release, once the result-store and advisory-lock suites
+  below were added), and
   `celers-backend-db`'s PostgreSQL half passes in full against the same server (`DATABASE_URL`)
 - **Concurrent auto-migration raced on both engines.** Every CeleRS component migrates its own
   schema on start-up, and a normal deployment starts many workers at once, so `CREATE TABLE
@@ -651,8 +851,8 @@ now fixed and re-verified live.
   is also what made this crate's own gated suite order-sensitive —
   `queues_are_isolated_from_each_other` and a `test_concurrent_dequeue` count mismatch
   (`left: 50, right: 20`) were two different symptoms of the same missing filter — and is why the
-  whole suite is now live-verified **217/217** against a real MySQL 8, both under `nextest`'s
-  default parallel execution and `--test-threads=1`
+  whole suite is live-verified against a real MySQL 8 — **217/217** when this landed, **236/236** by
+  release — both under `nextest`'s default parallel execution and `--test-threads=1`
 - Corrected the SPDX license header in 29 `celers-broker-sqs`/`celers-kombu` source files from the
   stale `MIT OR Apache-2.0` to `Apache-2.0`, matching the workspace's actual single-license
   `license = "Apache-2.0"` (`Cargo.toml`, `LICENSE`) — the dual-license form was never accurate for
@@ -684,40 +884,57 @@ now fixed and re-verified live.
 
 ### Known Limitations
 
-- **`celers-backend-db` and `celers-broker-sql` collide on the MySQL table name
-  `celers_task_results`.** `celers-backend-db`'s `001_init_mysql.sql` and `celers-broker-sql`'s
-  `010_task_results.sql` each declare `CREATE TABLE IF NOT EXISTS celers_task_results` with
-  **incompatible schemas**. Whichever crate's migration reaches a shared database *second* finds the
-  table already present with the other crate's columns, and its own follow-up statement fails —
-  observed as `celers-backend-db`'s `CREATE INDEX ... (expires_at)` failing with
-  `ERROR 1072 (42000): Key column 'expires_at' doesn't exist in table` against a database
-  `celers-broker-sql` migrated first. This is not a stale-database artifact: it reproduces
-  deterministically on a freshly created database, in either migration order, and only when the two
-  crates are pointed at the *same* MySQL database — which is exactly what running both of
-  `tests/integration/README.md`'s MySQL rows against one `docker-compose` database does. Each crate
-  is otherwise fully correct against MySQL on its own — `celers-broker-sql`'s full suite passes
-  217/217, and `celers-backend-db`'s **150/150** (its full suite, not only its MySQL-specific tests)
-  passes with `MYSQL_URL` pointed at a database `celers-broker-sql` has never migrated — so use
-  separate MySQL databases for the broker and the result backend until this is fixed. See
-  [TODO.md → Known gaps #16](TODO.md#known-gaps--the-roadmap-after-031)
+- ~~**`celers-backend-db` and `celers-broker-sql` collide on the MySQL table name
+  `celers_task_results`.**~~ **Fixed before release.** This shipped as an open limitation through
+  most of the campaign and is now closed by renaming the broker's table to `celers_broker_results`,
+  with an automatic in-Rust upgrade for existing databases — see **Breaking changes → Database
+  schema**, above, for the operator-facing detail. The configuration that used to fail (both crates
+  on one MySQL database) is now a covered, passing case: `celers-broker-sql` **236/236** and
+  `celers-backend-db` **151/151** against the same `docker-compose` database, in that order, on a
+  volume created fresh for the test. The collision is also regression-tested from both directions —
+  `broker_and_result_backend_coexist_on_one_database` migrates both crates onto one database and
+  round-trips a result through each, and `tests_hardening::migration_upgrade` proves the rename
+  leaves the result backend's identically-named table strictly alone
+
+- **The AMQP suite has an intermittent failure under parallel execution.** Across five consecutive
+  full runs of `celers-broker-amqp`'s gated suite against one RabbitMQ, one run had a single
+  failure (`tests::test_integration_queue_stats`), in the run immediately following a container
+  restart; the test passes on its own, and the four other runs — including three back to back —
+  were 313/313. The residual is most likely test-to-test interference through the shared broker's
+  management API rather than a defect in the crate, but it has not been root-caused, so it is
+  recorded here rather than claimed fixed
 
 Final verified state for 0.3.1 (this hardening campaign): workspace builds and
 `clippy --all-targets -- -D warnings` clean with both `--all-features` and default features,
-`cargo fmt --all --check` and `cargo deny check bans` clean (empty `[graph] exclude`).
-`cargo nextest run --workspace --all-features`: **7,722 tests run, 7,722 passed, 0 failed, 112
-`#[ignore]`d**; default features: **7,447 run, 7,447 passed, 0 failed, 98 `#[ignore]`d**.
-`cargo test --doc --workspace --all-features`: **1,175 passing doctests, 0 failed**, 138 more are
-```` ```ignore ```` and never compile. Live-service gated suites, brought up via the root
-`docker-compose.yml` (redis, postgres, rabbitmq, mysql, localstack): `celers-broker-redis` + `celers-backend-redis` +
-`celers-worker` + `celers-cli` together (**2,926/2,926**, one shared Redis), `celers-broker-amqp`
-(**313/313** against a real RabbitMQ) and `celers-broker-postgres` (**230/230** against a real
-PostgreSQL 16) all pass in full; `celers-broker-sql` passes in full against a real MySQL 8
-(**217/217**, verified under both `nextest`'s default parallel execution and `--test-threads=1`);
-`celers-backend-db` passes in full, **150/150**, with `DATABASE_URL` on the same PostgreSQL server
-and `MYSQL_URL` on a MySQL database `celers-broker-sql` has never migrated — see Known Limitations,
-above, for the one *shared*-database case it does not pass. `tests/python-compat` (a real Celery
-5.6.3 + kombu 5.6.2 client and worker):
-**38/38**. All counts measured 2026-08-26 against the tree this entry describes.
+`cargo fmt --all --check` clean, and `cargo deny check` clean on all four checks
+(advisories/bans/licenses/sources; empty `[graph] exclude`).
+`cargo nextest run --workspace --all-features`: **7,791 tests run, 7,791 passed, 0 failed, 104
+`#[ignore]`d**; default features: **7,509 run, 7,509 passed, 0 failed, 97 `#[ignore]`d**.
+`cargo test --doc --workspace --all-features`: **1,178 passing doctests, 0 failed**, 138 more are
+```` ```ignore ```` and never compile.
+
+Live-service gated suites, brought up via the root `docker-compose.yml` (redis, postgres, rabbitmq,
+mysql, localstack) and — for PostgreSQL and MySQL — on **volumes destroyed and recreated with
+`docker compose down -v` first**, so the schema each suite ran against was built from nothing by the
+migrations in this tree, then re-run a second time against the now-populated volumes to exercise the
+replay and upgrade paths. Both passes were identical: `celers-broker-redis` + `celers-backend-redis`
++ `celers-worker` + `celers-cli` together (**2,926/2,926**, one shared Redis, via
+`scripts/test-integration.sh --only redis`), `celers-broker-amqp` (**313/313** against a real
+RabbitMQ — see Known Limitations for one intermittent), `celers-broker-postgres` (**271/271**
+against a real PostgreSQL 16), `celers-broker-sql` (**236/236** against a real MySQL 8, under both
+`nextest`'s default parallel execution and `--test-threads=1`), `celers-broker-sqs` (**436/436**
+against LocalStack), and the `celers` facade with all eight variables exported (**185/185**).
+`celers-backend-db` passes **151/151** with `DATABASE_URL` on the PostgreSQL server and `MYSQL_URL`
+on a separate MySQL database *and*, now that the table-name collision is fixed, **151/151 on the
+very database `celers-broker-sql` had just migrated**. `tests/python-compat` (a real Celery 5.6.3 +
+kombu 5.6.2 client and worker): **38/38**.
+
+The PostgreSQL migration set was additionally proved to build its schema from nothing by
+`migrate()` itself, not merely by the `docker-entrypoint-initdb.d` mount that a fresh compose volume
+uses: against a database `initdb` never touched, `PostgresBroker::migrate()` created all **11**
+tables and recorded **9** ledger rows — 000 is applied untracked, and `003_partitioning.sql` is an
+opt-in file `migrate()` deliberately does not apply — after which the full suite passed 271/271 on
+it. All counts measured 2026-08-26 against the tree this entry describes.
 
 ## [0.3.0] - 2026-07-12
 

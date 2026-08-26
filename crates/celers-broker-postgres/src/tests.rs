@@ -1135,23 +1135,27 @@ fn test_deduplication_window_expiry() {
 // and `get_slowest_tasks` are exercised against a real database in
 // `tests_pg.rs`, gated on `CELERS_TEST_POSTGRES_URL`.
 //
-// `test_advisory_lock_acquire_release` and `test_advisory_lock_blocking`
-// were dropped rather than filled in: `try_advisory_lock` / `advisory_lock`
-// / `release_advisory_lock` (`convenience.rs`) are session-scoped Postgres
-// advisory locks issued through `PgPool::{query,execute}` (`pool.rs`), which
-// checks out a connection per call and returns it to the pool immediately
-// after. An acquire and its matching release therefore usually land on
-// different backend sessions: `pg_advisory_unlock` returns `false` without
-// releasing anything, and the lock stays held on whichever pooled
-// connection happens to have acquired it until that connection is closed.
-// `is_advisory_lock_held` is unaffected (it reads the system-wide
-// `pg_locks` view rather than a session-local check), but "release, then
-// verify the lock can be acquired again" — the stub's own step 3-5 — is not
-// reachable through the current API against a pooled broker. Tracked as a
-// followup: the fix needs the `TaskNotificationListener` pattern
-// (`notifications.rs`) — a guard type owning a dedicated `PgConnection`,
-// returned from acquire and released on `Drop` — which changes three public
-// signatures. No caller in this workspace uses these methods today.
+// Advisory locks moved to `advisory_lock.rs` and are exercised against a real
+// database in `tests_pg_locks.rs`, gated on `CELERS_TEST_POSTGRES_URL`.
+//
+// The stubs that used to sit here (`test_advisory_lock_acquire_release`,
+// `test_advisory_lock_blocking`) were unfillable at the time, and the reason
+// was a real bug rather than a testing gap: `try_advisory_lock` /
+// `advisory_lock` / `release_advisory_lock` issued session-scoped Postgres
+// advisory locks through `PgPool::{query,execute}`, which checks out a
+// connection per statement and returns it immediately. An acquire and its
+// release therefore usually landed on different backend sessions —
+// `pg_advisory_unlock` returned `false` without releasing anything, and the
+// lock stayed held on whichever pooled connection had taken it until the
+// process exited. "Release, then verify the lock can be acquired again" was
+// simply not reachable through that API.
+//
+// It is now. `AdvisoryLockGuard` owns the `PooledConnection` the lock lives
+// on, so the release is guaranteed to reach the right session, and the three
+// old methods — kept for API compatibility, `#[deprecated]` in favour of the
+// guard — park their connection in `PostgresBroker::advisory_locks` for the
+// same reason. `tests_pg_locks.rs` covers exclusion across two connections,
+// release-then-reacquire, and the bounded `migrate()` acquisition.
 
 // ========== Tests for Rate Limiting, Priority, DLQ Analytics, Cancellation (real DB) ==========
 //

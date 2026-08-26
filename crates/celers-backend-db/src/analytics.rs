@@ -1084,8 +1084,9 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires PostgreSQL running
     async fn test_pg_task_stats_live() {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(url) = crate::test_env::postgres_url("test_pg_task_stats_live") else {
+            return;
+        };
         let backend = crate::PostgresResultBackend::new(&url)
             .await
             .expect("connect to live PostgreSQL");
@@ -1109,8 +1110,9 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires PostgreSQL running
     async fn test_pg_storage_stats_live() {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(url) = crate::test_env::postgres_url("test_pg_storage_stats_live") else {
+            return;
+        };
         let backend = crate::PostgresResultBackend::new(&url)
             .await
             .expect("connect to live PostgreSQL");
@@ -1131,8 +1133,11 @@ mod tests {
         // Regression test for the NUMERIC-vs-double_precision EXTRACT(EPOCH)
         // version drift (PostgreSQL >= 14 returns `numeric`): this must not
         // fail with a TypeMismatch regardless of server version.
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(url) =
+            crate::test_env::postgres_url("test_pg_percentile_latencies_live_decimal_safe")
+        else {
+            return;
+        };
         let backend = crate::PostgresResultBackend::new(&url)
             .await
             .expect("connect to live PostgreSQL");
@@ -1154,8 +1159,10 @@ mod tests {
         // Regression test for the MySQL DECIMAL-read bug: every SUM(CASE...)
         // column here surfaces as Value::Decimal, which the old
         // `row.col::<i64>` read could not decode.
-        let url = std::env::var("MYSQL_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let Some(url) = crate::test_env::mysql_url("test_mysql_task_stats_live_decimal_safe")
+        else {
+            return;
+        };
         let backend = crate::MysqlResultBackend::new(&url)
             .await
             .expect("connect to live MySQL");
@@ -1172,8 +1179,9 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires MySQL running
     async fn test_mysql_storage_stats_live() {
-        let url = std::env::var("MYSQL_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let Some(url) = crate::test_env::mysql_url("test_mysql_storage_stats_live") else {
+            return;
+        };
         let backend = crate::MysqlResultBackend::new(&url)
             .await
             .expect("connect to live MySQL");

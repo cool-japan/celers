@@ -724,11 +724,28 @@ mod tests {
         assert!(matches!(converted.result, TaskResult::Pending));
     }
 
+    /// Connecting to an address nothing is serving must fail, loudly.
+    ///
+    /// This used to be `#[ignore]`d "requires gRPC server running" and its
+    /// whole body was `let _ = GrpcResultBackend::connect(..).await;` — it
+    /// asserted nothing at all, in either direction, and could not have
+    /// failed if `connect` had started returning `Ok` for an unreachable
+    /// endpoint. The success path is covered for real (over a tonic wire,
+    /// against an in-process server) by
+    /// `server::tests::test_client_server_round_trip`; what was missing was
+    /// the other half, which needs no server and therefore no `#[ignore]`.
+    ///
+    /// Port 1 on loopback is used deliberately: it is privileged, so nothing
+    /// in a test environment binds it, and the connection is refused rather
+    /// than left hanging.
     #[tokio::test]
-    #[ignore] // Requires gRPC server running
-    async fn test_grpc_backend_connection() {
-        let backend = GrpcResultBackend::connect("http://localhost:50051").await;
-        // Will fail if server not running, but tests compilation
-        let _ = backend;
+    async fn test_grpc_backend_connect_fails_without_a_server() {
+        let backend = GrpcResultBackend::connect("http://127.0.0.1:1").await;
+
+        assert!(
+            backend.is_err(),
+            "connecting to an endpoint with no gRPC server must be an error, \
+             not a handle that fails later on first use"
+        );
     }
 }

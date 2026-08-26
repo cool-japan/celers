@@ -13,7 +13,7 @@ MySQL database broker implementation for CeleRS - a high-performance Celery-comp
 - **Batch Operations**: High-throughput batch enqueue/dequeue/ack operations
 - **Queue Control**: Pause/resume queue processing at runtime
 - **Task Inspection**: Query task status, statistics, and worker assignments
-- **Result Storage**: Store and retrieve task execution results (`celers_task_results`, migration `010_task_results.sql`)
+- **Result Storage**: Store and retrieve task execution results (`celers_broker_results`, migration `010_broker_results.sql`)
 - **Worker Tracking**: Monitor which workers are processing which tasks
 - **Health Monitoring**: Database health checks and table size monitoring
 - **Maintenance Tools**: Task archiving, stuck task recovery, and selective purging
@@ -49,18 +49,92 @@ not queue-scoped: `purge_all`, `purge_by_state`, `purge_by_task_name`,
 `archive_completed_tasks`, `recover_stuck_tasks`, `list_tasks`,
 `count_by_task_name`, and the DLQ helpers.
 
+The five bulk statements among them (`purge_all`, `purge_by_state`,
+`purge_by_task_name`, `archive_completed_tasks`, `recover_stuck_tasks`) are
+retried on `ERROR 1213 (40001) Deadlock found`, with the same bounded, jittered
+backoff the claim/ack/reject paths use. Running maintenance against a live
+queue can form a lock cycle with in-flight claims, and InnoDB resolves one by
+rolling a transaction back — which is not a failure of the maintenance call and
+should not be reported as one.
+
 ## Testing against a real server
 
 The unit tests run with no database. To additionally exercise the integration
 suite, point `CELERS_TEST_MYSQL_URL` at a MySQL 8 / MariaDB 10.6 instance:
 
 ```bash
-CELERS_TEST_MYSQL_URL=mysql://root:password@127.0.0.1:3306/celers_test \
-    cargo nextest run -p celers-broker-sql --all-features
+CELERS_TEST_MYSQL_URL=mysql://celers:celers_password@127.0.0.1:3306/celers_test \
+    cargo nextest run -p celers-broker-sql --all-features --run-ignored all
 ```
 
-Without the variable those tests return immediately, so the suite stays green
-on machines with no server.
+The repository's `docker-compose.yml` provides a matching server behind the
+`test` profile (`docker compose --profile test up -d mysql`), or run
+`scripts/test-integration.sh --only mysql`, which brings it up, provisions the
+extra databases described below, exports every variable and runs this suite for
+you.
+
+With a server configured the suite is **236/236** (verified 2026-08-26 against
+MySQL 8.0, under both `nextest`'s default parallel execution and
+`--test-threads=1`).
+
+`--run-ignored all` matters: most of the integration suite early-returns when
+the variable is unset (so a run with no server stays green), but a few tests
+are `#[ignore]`d and are only selected by that flag. Every gated test that
+does skip prints a `SKIPPED: <test name> (set CELERS_TEST_MYSQL_URL to run)`
+line naming itself, so a skipped run and a real run can be told apart from the
+output rather than only from the test count. No gated test falls back to a
+hardcoded connection string: unset means skip, never a surprise connection to
+`localhost`.
+
+The older `src/tests.rs` suite also accepts the bare `MYSQL_URL` as a
+documented fallback, but `CELERS_TEST_MYSQL_URL` is the name to use.
+
+### Sharing a database with `celers-backend-db`
+
+Pointing this crate and `celers-backend-db` at the **same** database is
+supported and covered by a test
+(`broker_and_result_backend_coexist_on_one_database`), which migrates both
+crates onto one database and round-trips a result through each:
+
+```bash
+CELERS_TEST_MYSQL_URL=mysql://celers:celers_password@127.0.0.1:3306/celers_test \
+    cargo nextest run -p celers-broker-sql -p celers-backend-db \
+    --all-features --run-ignored all
+```
+
+This used to fail: both crates auto-migrated a `celers_task_results` table
+with incompatible schemas, and both declared a schema-scoped
+`chk_result_state` CHECK constraint, so whichever migrated second died with
+`ERROR 1072` or `ERROR 3822`. The broker's table is now
+`celers_broker_results` and its constraint `chk_broker_result_state`; existing
+databases are upgraded in place by `migrate()`.
+
+**If you query the result table directly, repoint it.** `celers_task_results`
+now belongs exclusively to `celers-backend-db`. `migrate()`'s untracked
+`rename_legacy_broker_results_table` step carries an existing broker table
+across with `RENAME TABLE`, preserving every row and index, but only when the
+table actually carries this crate's schema (it probes for the `traceback`
+column); a `celers_task_results` that belongs to the result backend is
+recognised and left strictly alone, and the legacy table is never dropped or
+written to under any branch.
+
+### Testing the upgrade path
+
+The rename has its own suite, `tests_hardening::migration_upgrade`, which drives
+all four branches against a real server. It drops and recreates both result
+tables, so it must **not** share a database with anything else and reads a
+separate variable naming a disposable schema:
+
+```bash
+CELERS_TEST_MYSQL_UPGRADE_URL=mysql://celers:celers_password@127.0.0.1:3306/celers_upgrade_test \
+    cargo nextest run -p celers-broker-sql --all-features -E 'test(migration_upgrade)'
+```
+
+The suite refuses to run if that URL names the same database as
+`CELERS_TEST_MYSQL_URL`, and skips with a visible line when it is unset. The
+stock `mysql:8.0` image grants its `MYSQL_USER` rights on `MYSQL_DATABASE` only,
+so the database has to be created with the root credentials —
+`scripts/test-integration.sh --only mysql` does this for you.
 
 ## Installation
 
@@ -229,7 +303,12 @@ let worker_tasks = broker.get_tasks_by_worker(worker_id).await?;
 
 ### Task Result Storage
 
-> **Known gap**: the `celers_task_results` table used by `store_result()`/`get_result()` below is referenced by this code but is not created by any shipped migration yet, so these calls fail against a freshly-migrated database. See TODO.md's "queue_name schema drift audit (2026-07)" for tracked details; the example remains a valid API reference for once the table exists.
+> **Table name**: these calls read and write `celers_broker_results`, created by migration
+> `010_broker_results.sql`. It used to be called `celers_task_results` — the same name
+> `celers-backend-db`'s `MysqlResultBackend` uses for its own, differently shaped table, which
+> made the two crates collide on a shared database. `migrate()` renames a pre-existing
+> `celers_task_results` (rows and indexes preserved) when it carries this crate's schema, and
+> leaves the result backend's table alone when it does not.
 
 ```rust
 use celers_broker_sql::TaskResultStatus;
@@ -343,17 +422,44 @@ queue_b.enqueue(task_b).await?;
 
 - `celers_tasks` - Main task queue
 - `celers_dead_letter_queue` - Failed tasks that exceeded max retries
-- `celers_task_results` - Task execution results
+- `celers_broker_results` - Task execution results (renamed from `celers_task_results`; see below)
 - `celers_task_history` - Task audit trail (future)
+
+Every object this crate creates is named so it cannot collide with
+`celers-backend-db` in a shared schema: `celers_broker_results` rather than
+`celers_task_results` for the table, and `chk_broker_result_state` rather than
+`chk_result_state` for the CHECK constraint on `celers_results` (MySQL scopes
+CHECK constraint names to the schema, not the table). `migrate()` upgrades a
+database created before either rename, and never touches a
+`celers_task_results` that carries the result backend's schema.
 
 ### Key Indexes
 
+- `idx_tasks_queue_dequeue` - `(queue_name, state, scheduled_at, priority, created_at)`;
+  the composite index the claim's candidate scan is built for
 - `idx_tasks_state_priority` - Efficient dequeue by state and priority
 - `idx_tasks_scheduled` - Scheduled task processing
 - `idx_tasks_worker` - Worker tracking
 - `idx_tasks_task_name` - Task name lookups
 - `idx_results_task_name` - Result queries by task type
 - See migration files for complete index strategy
+
+### How a claim locks
+
+A claim is two statements, not one:
+
+1. a **non-locking** `SELECT id … WHERE queue_name = ? AND state = 'pending'
+   AND scheduled_at <= NOW() ORDER BY priority DESC, created_at ASC LIMIT ?`
+   that picks candidates, and
+2. a locking `SELECT … FORCE INDEX (PRIMARY) WHERE id IN (…) AND state =
+   'pending' FOR UPDATE SKIP LOCKED` that locks only those primary keys.
+
+The single locking `SELECT` this replaces took next-key locks that reached
+into a *different* logical queue's index records — one worker's in-flight
+claim could make another queue's `dequeue()` return `None` — and its filesort
+locked the whole due backlog of its own queue before `LIMIT` applied. The
+two-statement form holds one `X,REC_NOT_GAP` record lock per row it actually
+claims, and nothing else.
 
 ## Performance Tuning
 
@@ -471,7 +577,7 @@ Use `mysqldump` for backing up CeleRS tables:
 mysqldump -u user -p database_name \
   celers_tasks \
   celers_dead_letter_queue \
-  celers_task_results \
+  celers_broker_results \
   celers_task_history \
   celers_migrations \
   > celers_backup_$(date +%Y%m%d_%H%M%S).sql
@@ -480,7 +586,7 @@ mysqldump -u user -p database_name \
 mysqldump -u user -p database_name \
   celers_tasks \
   celers_dead_letter_queue \
-  celers_task_results \
+  celers_broker_results \
   celers_task_history \
   celers_migrations \
   | gzip > celers_backup_$(date +%Y%m%d_%H%M%S).sql.gz
@@ -491,7 +597,7 @@ mysqldump -u user -p database_name \
   --triggers \
   celers_tasks \
   celers_dead_letter_queue \
-  celers_task_results \
+  celers_broker_results \
   celers_task_history \
   celers_migrations \
   > celers_full_backup_$(date +%Y%m%d_%H%M%S).sql
@@ -510,7 +616,7 @@ mysqldump -u user -p database_name celers_dead_letter_queue \
   > celers_dlq_$(date +%Y%m%d).sql
 
 # Backup results for auditing
-mysqldump -u user -p database_name celers_task_results \
+mysqldump -u user -p database_name celers_broker_results \
   > celers_results_$(date +%Y%m%d).sql
 ```
 
@@ -572,7 +678,7 @@ mysqldump -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
   --triggers \
   celers_tasks \
   celers_dead_letter_queue \
-  celers_task_results \
+  celers_broker_results \
   celers_task_history \
   celers_migrations \
   | gzip > "$BACKUP_DIR/celers_$TIMESTAMP.sql.gz"

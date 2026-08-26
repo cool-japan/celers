@@ -1347,8 +1347,9 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires MySQL running
     async fn test_mysql_backend_creation() {
-        let database_url = std::env::var("MYSQL_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let Some(database_url) = crate::test_env::mysql_url("test_mysql_backend_creation") else {
+            return;
+        };
 
         let backend = MysqlResultBackend::new(&database_url).await;
         assert!(backend.is_ok());
@@ -1362,8 +1363,11 @@ mod tests {
         // valid JSON envelope (a raw compressed blob would be rejected by
         // the column's own JSON validation), and `get_result` must decode
         // it back to the exact original value.
-        let database_url = std::env::var("MYSQL_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let Some(database_url) =
+            crate::test_env::mysql_url("test_mysql_store_get_roundtrip_with_compression_enabled")
+        else {
+            return;
+        };
         let mut backend = MysqlResultBackend::new(&database_url)
             .await
             .expect("connect")
@@ -1428,8 +1432,11 @@ mod tests {
         // `Success(null)` projection (see that module's doc comments) --
         // actually survives a real `extra` JSON column round trip, not
         // just the in-memory `TaskMetaExtra` unit tests.
-        let database_url = std::env::var("MYSQL_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let Some(database_url) =
+            crate::test_env::mysql_url("test_mysql_store_get_roundtrip_with_ignored_error")
+        else {
+            return;
+        };
         let mut backend = MysqlResultBackend::new(&database_url)
             .await
             .expect("connect");
@@ -1487,8 +1494,11 @@ mod tests {
         // gates the chord callback dispatch on). Before the fix, the
         // separate UPDATE and SELECT statements let two concurrent callers
         // both read back the terminal count, firing the callback twice.
-        let database_url = std::env::var("MYSQL_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let Some(database_url) = crate::test_env::mysql_url(
+            "test_mysql_chord_complete_task_fires_callback_exactly_once_concurrently",
+        ) else {
+            return;
+        };
         let backend = MysqlResultBackend::new(&database_url)
             .await
             .expect("connect");
@@ -1565,8 +1575,11 @@ mod tests {
         // `test_postgres_chord_init_resets_completed_counter_on_conflict` —
         // see its comment. The `ON DUPLICATE KEY UPDATE` branch had the same
         // gap as Postgres's `ON CONFLICT DO UPDATE`.
-        let database_url = std::env::var("MYSQL_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let Some(database_url) = crate::test_env::mysql_url(
+            "test_mysql_chord_init_resets_completed_counter_on_conflict",
+        ) else {
+            return;
+        };
         let mut backend = MysqlResultBackend::new(&database_url)
             .await
             .expect("connect");
@@ -1612,8 +1625,11 @@ mod tests {
         // MySQL counterpart of
         // `test_postgres_chord_cancel_preserves_completed_counter` — see its
         // comment.
-        let database_url = std::env::var("MYSQL_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/celers_test".to_string());
+        let Some(database_url) =
+            crate::test_env::mysql_url("test_mysql_chord_cancel_preserves_completed_counter")
+        else {
+            return;
+        };
         let mut backend = MysqlResultBackend::new(&database_url)
             .await
             .expect("connect");

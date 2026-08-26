@@ -3,8 +3,8 @@
 **CeleRS** (Celery + Rust) is a Celery-protocol-compatible distributed task queue library for Rust: a
 type-safe, Pure-Rust task runtime that speaks Python Celery's message format.
 
-**Status (v0.3.1)**: ✅ 0 errors | ✅ 0 warnings | ✅ `cargo deny check bans` clean, `[graph] exclude` empty
-| ✅ **7,722 tests + 1,175 doctests passing** (`--all-features`, verified 2026-08-26 — see
+**Status (v0.3.1)**: ✅ 0 errors | ✅ 0 warnings | ✅ `cargo deny check` clean on all four checks (advisories/bans/licenses/sources), `[graph] exclude` empty
+| ✅ **7,791 tests + 1,178 doctests passing** (`--all-features`, verified 2026-08-26 — see
 [Crate Status](#crate-status-v031))
 
 ### What is and is not verified
@@ -255,37 +255,54 @@ crypto. Bring your own TLS-enabled `Channel` via
 
 ### Crate Status (v0.3.1)
 
-**Verified 2026-08-26 with `cargo nextest run --workspace --all-features`: 7,722 tests run, 7,722 passed, 0
-failed, 112 skipped** (default features: 7,447 run, 7,447 passed, 0 failed, 98 skipped), plus **1,175 passing
+**Verified 2026-08-26 with `cargo nextest run --workspace --all-features`: 7,791 tests run, 7,791 passed, 0
+failed, 104 skipped** (default features: 7,509 run, 7,509 passed, 0 failed, 97 skipped), plus **1,178 passing
 doctests** (`cargo test --doc --workspace --all-features`; 138 more are ```` ```ignore ```` and never
 compile). A per-crate breakdown is intentionally not reproduced here: with 18 published crates under
 active, parallel development, a static table drifts out of date between releases faster than it gets
 corrected -- regenerate one locally with `cargo nextest list --workspace --all-features` if you want a
 current snapshot, or watch a single crate's count with `cargo nextest list -p <crate> --all-features`.
 
-That 7,722 total is not the whole story on what it verifies. Three categories of test coexist inside it, and
+That 7,791 total is not the whole story on what it verifies. Three categories of test coexist inside it, and
 only the first two ran a real assertion:
 
 1. **Ordinary tests** -- ran, asserted, passed.
-2. **Env-gated live-service tests** (~63) -- ran and asserted for real *only if* the matching `CELERS_TEST_*`
-   (or, for two crates, the differently-named) variable was set to a reachable server; otherwise they print a
-   `skipping` line and return, **still counted as passing**. See
+2. **Env-gated live-service tests** -- ran and asserted for real *only if* the matching `CELERS_TEST_*`
+   (or, for `celers-backend-db` and the facade tests that drive it, the differently-named `DATABASE_URL` /
+   `MYSQL_URL`) variable was set to a reachable server; otherwise they print a `skipping` line and return,
+   **still counted as passing**. The size of this category is measured rather than estimated: `cargo nextest
+   run --workspace --all-features --no-capture` with none of those variables exported emits **147 skip
+   lines** (re-measured 2026-08-26; it was 109 before this release added the PostgreSQL result-store and
+   advisory-lock suites, which account for 90 of the 147 on their own). That is an upper bound on the number
+   of such tests -- a test that opens two connections prints two lines (see `celers-broker-sql`'s
+   `queues_are_isolated_from_each_other`). See
    [tests/integration/README.md](tests/integration/README.md) for the full variable-to-service table and how
    to tell which happened.
-3. **`#[ignore]`d tests** (112, the "skipped" figure above) -- not attempted at all unless the run adds
+3. **`#[ignore]`d tests** (104, the "skipped" figure above) -- not attempted at all unless the run adds
    `--run-ignored all`.
 
 Category 2 means a green `--all-features` run with no service URLs exported -- the common case on a laptop --
 has not exercised live Redis/PostgreSQL/MySQL/RabbitMQ/SQS behavior in that subset, only the code paths that
-don't need one. `docker-compose.yml` now carries a service for every one of them (`--profile test` adds MySQL
-and LocalStack, `--profile python-compat` adds Celery), but **nothing in this repository runs the full
-matrix**: `.github/` holds only `dependabot.yml`, `FUNDING.yml` and a `workflows.disabled/` directory, so no
-workflow runs on push today. Running the matrix by hand -- services up, every gate variable exported,
-`--run-ignored all` -- is the only way to know all 7,722 assertions actually fired; this campaign's final wave
-did exactly that for `celers-broker-postgres`/`celers-broker-sql`/`celers-backend-db` and found (then fixed)
-real defects that every category-1/2 run above had been silently passing around -- see
-[CHANGELOG.md](CHANGELOG.md)'s 0.3.1 "Fixed" section and [TODO.md → Known gaps #16](TODO.md#known-gaps--the-roadmap-after-031)
-for the one such defect still open.
+don't need one. `docker-compose.yml` carries a service for every one of them (`--profile test` adds MySQL
+and LocalStack, `--profile python-compat` adds Celery), and **[`scripts/test-integration.sh`](scripts/test-integration.sh)
+runs the full matrix in one command**:
+
+```bash
+./scripts/test-integration.sh              # every service, every gated suite, PASS/FAIL/SKIP summary
+./scripts/test-integration.sh --only mysql # or scope it to one service
+```
+
+It brings the services up, waits for a real protocol handshake through the host-forwarded port (restarting a
+container that accepts TCP but never answers -- four of five services needed exactly that on a fresh `up -d`
+during this release's verification), exports all eight gate variables, and runs each suite with
+`--run-ignored all`. What is still missing is *automation*, not tooling: `.github/` holds only
+`dependabot.yml`, `FUNDING.yml` and a `workflows.disabled/` directory, so no workflow runs it on push -- it
+has to be invoked by hand. Doing so is the only way to know all 7,791 assertions actually fired, and it is
+what found (then fixed) real defects in `celers-broker-postgres`/`celers-broker-sql`/`celers-backend-db` that
+every category-1/2 run above had been silently passing around -- including a PostgreSQL result store whose
+table no migration created, and the MySQL table-name collision between the broker and the result backend that
+was tracked as Known gaps #16 and is now closed. See
+[CHANGELOG.md](CHANGELOG.md)'s 0.3.1 "Fixed" and "Breaking changes → Database schema" sections.
 
 ## 🚀 Quick Start
 
@@ -612,8 +629,8 @@ cargo run -p celers-examples --example prometheus_metrics --features metrics
 
 ## 🧪 Testing
 
-Verified workspace-wide with `cargo nextest run --workspace --all-features`: **7,722 tests passing, 0
-failed, 112 skipped**, plus **1,175 passing doctests**. See [Crate Status](#crate-status-v031) above for what
+Verified workspace-wide with `cargo nextest run --workspace --all-features`: **7,791 tests passing, 0
+failed, 104 skipped**, plus **1,178 passing doctests**. See [Crate Status](#crate-status-v031) above for what
 those figures do and do not establish about the env-gated live-service suites, and
 [tests/integration/README.md](tests/integration/README.md) to run them against real services.
 

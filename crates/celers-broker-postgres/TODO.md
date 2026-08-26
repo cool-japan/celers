@@ -734,7 +734,9 @@ confirmed no behavior change.
 - [x] `success_rate()` - Task success rate
 
 ### Task Result Storage ✅
-- [x] `celers_task_results` table for result backend
+- [x] `celers_broker_results` table (migration `009_broker_results.sql`) —
+      deliberately NOT `celers_task_results`, which is `celers-backend-db`'s
+      result-backend table with an incompatible schema on the same server
 - [x] `store_result()` - Store task execution results
 - [x] `get_result()` - Retrieve task results by ID
 - [x] `delete_result()` - Remove task results
@@ -872,7 +874,12 @@ confirmed no behavior change.
 - [x] **Task deduplication with idempotency keys** (enqueue_idempotent, check_deduplication, cleanup_deduplication)
 - [x] **PostgreSQL LISTEN/NOTIFY for real-time task notifications** (create_notification_listener, enable_notifications, wait_for_notification)
 - [x] **Task TTL (Time To Live)** (expire_tasks_by_ttl, expire_all_tasks_by_ttl)
-- [x] **PostgreSQL Advisory Locks** (try_advisory_lock, advisory_lock, release_advisory_lock, is_advisory_lock_held)
+- [x] **PostgreSQL Advisory Locks** — `AdvisoryLockGuard` via
+      `acquire_advisory_lock` / `try_acquire_advisory_lock` /
+      `acquire_advisory_lock_within`, plus `is_advisory_lock_held`.
+      `try_advisory_lock` / `advisory_lock` / `release_advisory_lock` are kept
+      but `#[deprecated]`: a session-scoped lock must keep the pooled
+      connection it was taken on.
 - [x] **Task Performance Analytics** (get_task_percentiles, get_slowest_tasks)
 - [x] **Rate Limiting** (get_task_rate, is_rate_limited)
 - [x] **Dynamic Priority Management** (boost_task_priority, set_task_priority)

@@ -150,6 +150,70 @@ pub(crate) fn default_ttl_config() -> TaskTtlConfig {
     TaskTtlConfig::with_default(ttl::SUCCESS)
 }
 
+/// Connection strings for this crate's live-database tests.
+///
+/// # Why there is no hardcoded default any more
+///
+/// Every live test in this crate used to open its connection with
+///
+/// ```ignore
+/// let url = std::env::var("DATABASE_URL")
+///     .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+/// ```
+///
+/// which means an unconfigured `--run-ignored all` run does not skip: it
+/// *connects*, to a `localhost` server nobody asked for, with credentials
+/// nobody configured. In the good case that server does not exist and the
+/// suite reports a wall of connection failures that read as a broken crate
+/// rather than an unconfigured one. In the bad case something is listening on
+/// the default port and the tests silently migrate and write to a database
+/// that was never meant for them. Unset must mean **skip**, visibly.
+///
+/// # Variable names
+///
+/// The workspace standard is `CELERS_TEST_POSTGRES_URL` /
+/// `CELERS_TEST_MYSQL_URL` — the names `celers-broker-postgres` and
+/// `celers-broker-sql` already read. This crate historically read the bare
+/// `DATABASE_URL` / `MYSQL_URL` instead, which is exactly the trap
+/// `tests/integration/README.md` had to call out. Both are accepted: the
+/// `CELERS_TEST_*` name is preferred, the bare name is a documented fallback
+/// so existing environments keep working unchanged. A set-but-blank value is
+/// treated as unset for both, so `FOO= cargo nextest …` skips rather than
+/// trying to connect to the empty string.
+#[cfg(test)]
+pub(crate) mod test_env {
+    /// The value of `key`, or `None` when it is unset or blank.
+    fn non_empty(key: &str) -> Option<String> {
+        std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Resolve one variable pair, printing a greppable skip line naming
+    /// `test_name` when neither is configured.
+    fn resolve(preferred: &str, legacy: &str, test_name: &str) -> Option<String> {
+        match non_empty(preferred).or_else(|| non_empty(legacy)) {
+            Some(url) => Some(url),
+            None => {
+                eprintln!("SKIPPED: {test_name} (set {preferred} to run)");
+                None
+            }
+        }
+    }
+
+    /// PostgreSQL connection string for a live test, or `None` (with a
+    /// visible skip line) when none is configured.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) fn postgres_url(test_name: &str) -> Option<String> {
+        resolve("CELERS_TEST_POSTGRES_URL", "DATABASE_URL", test_name)
+    }
+
+    /// MySQL connection string for a live test, or `None` (with a visible
+    /// skip line) when none is configured.
+    #[cfg_attr(not(feature = "mysql"), allow(dead_code))]
+    pub(crate) fn mysql_url(test_name: &str) -> Option<String> {
+        resolve("CELERS_TEST_MYSQL_URL", "MYSQL_URL", test_name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +278,45 @@ mod tests {
         {
             TaskResult::Failure(msg) => assert_eq!(msg, "boom"),
             other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    /// No live test may fall back to a hardcoded connection string.
+    ///
+    /// A `unwrap_or_else(|_| "postgres://…@localhost/…")` default does not
+    /// make an unconfigured run skip — it makes it *connect*, either to
+    /// nothing (a wall of failures that reads as a broken crate) or, worse,
+    /// to whatever happens to be listening on the default port, which the
+    /// tests then migrate and write to. Every live test goes through
+    /// [`crate::test_env`] instead, where unset means skip.
+    #[test]
+    fn no_test_falls_back_to_a_hardcoded_connection_string() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("lib.rs", include_str!("lib.rs")),
+            ("analytics.rs", include_str!("analytics.rs")),
+            ("lock.rs", include_str!("lock.rs")),
+            ("mysql_backend.rs", include_str!("mysql_backend.rs")),
+            ("postgres_backend.rs", include_str!("postgres_backend.rs")),
+            ("event_persistence.rs", include_str!("event_persistence.rs")),
+        ];
+        for (name, raw) in SOURCES {
+            // Comments are allowed to quote the forbidden pattern — this
+            // module's own doc comment does exactly that.
+            let code: String = raw
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("//") && !trimmed.starts_with("///")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for scheme in ["postgres://", "postgresql://", "mysql://"] {
+                assert!(
+                    !code.contains(&format!("unwrap_or_else(|_| \"{scheme}")),
+                    "{name} falls back to a hardcoded {scheme} connection string; \
+                     use crate::test_env so an unset variable skips instead of connecting"
+                );
+            }
         }
     }
 

@@ -161,7 +161,7 @@ impl MysqlBroker {
             let rows_affected = tx
                 .execute(
                     r#"
-                    INSERT INTO celers_task_results
+                    INSERT INTO celers_broker_results
                         (task_id, task_name, status, result, error, traceback, runtime_ms, created_at, completed_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
                     ON DUPLICATE KEY UPDATE
@@ -233,7 +233,7 @@ impl MysqlBroker {
         let query_str = format!(
             r#"
             SELECT task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms
-            FROM celers_task_results
+            FROM celers_broker_results
             WHERE task_id IN ({})
             "#,
             placeholders
@@ -262,14 +262,19 @@ impl MysqlBroker {
                 let status: String = row
                     .col("status")
                     .map_err(|e| CelersError::Other(format!("Failed to fetch results: {e}")))?;
-                let result: String = row
-                    .col("result")
+                // `result`, `error` and `traceback` are `LONGTEXT`/`TEXT`.
+                // MySQL sends those over the same wire type as `BLOB`, so
+                // `oxisql-mysql` hands them back as `Value::Blob`, which
+                // `col::<String>` rejects with `type mismatch: expected Text,
+                // got Blob` — see `row_ext::opt_text_from_row`. `result` used
+                // to be read as a non-optional `String`, which additionally
+                // failed outright on a stored `NULL` result rather than
+                // reading it back as "no value".
+                let result = crate::row_ext::opt_text_from_row(&row, "result")
                     .map_err(|e| CelersError::Other(format!("Failed to fetch results: {e}")))?;
-                let error: Option<String> = row
-                    .col("error")
+                let error = crate::row_ext::opt_text_from_row(&row, "error")
                     .map_err(|e| CelersError::Other(format!("Failed to fetch results: {e}")))?;
-                let traceback: Option<String> = row
-                    .col("traceback")
+                let traceback = crate::row_ext::opt_text_from_row(&row, "traceback")
                     .map_err(|e| CelersError::Other(format!("Failed to fetch results: {e}")))?;
                 let created_at: DateTime<Utc> = row
                     .col("created_at")
@@ -286,7 +291,7 @@ impl MysqlBroker {
                         .map_err(|e| CelersError::Other(format!("Invalid UUID: {}", e)))?,
                     task_name,
                     status: status.parse()?,
-                    result: serde_json::from_str(&result).ok(),
+                    result: result.and_then(|text| serde_json::from_str(&text).ok()),
                     error,
                     traceback,
                     created_at,

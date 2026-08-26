@@ -332,6 +332,22 @@ async fn rpc_round_trip_against_a_live_broker() {
 }
 
 /// `peek_queue` must return distinct messages, not the same one repeatedly.
+///
+/// The trailing size check polls rather than reading `queue_size` once.
+/// `basic.nack` has no synchronous broker-side completion in AMQP 0-9-1 --
+/// lapin resolves the call once the frame is written, not once the broker
+/// has applied the redelivery (confirmed by inspecting `lapin::Channel::
+/// basic_nack`: it registers no `expected_reply`) -- so a `queue.declare
+/// (passive)` issued immediately after `peek_queue` requeues 3 messages can
+/// observe a `message_count` that has not caught up yet. This is not
+/// hypothetical: an unpolled read here was observed to under-count (0, 1 or
+/// 2 instead of 3) in roughly 15-45% of back-to-back runs against a real
+/// RabbitMQ, with `requeue_tags`'s own error path (checked via a temporary
+/// `tracing_subscriber` capturing its `warn!`) never firing -- every
+/// `basic_nack` call itself succeeded. Polling preserves the exact
+/// assertion (all 3 messages are genuinely still there) while dropping the
+/// unrealistic assumption that AMQP nack is synchronous; a real loss still
+/// fails, loudly, once the bounded wait below is exhausted.
 #[tokio::test]
 async fn peek_queue_returns_distinct_messages_against_a_live_broker() {
     let Some(url) = integration_url() else {
@@ -359,8 +375,27 @@ async fn peek_queue_returns_distinct_messages_against_a_live_broker() {
     ids.dedup();
     assert_eq!(ids.len(), 3, "peek returned the same message repeatedly");
 
-    // The messages must still be in the queue afterwards.
-    assert_eq!(broker.queue_size(&queue).await.unwrap_or(0), 3);
+    // The messages must still be in the queue afterwards -- poll for it
+    // (see the doc comment above for why a single read is not reliable).
+    let mut last_seen = None;
+    let mut converged = false;
+    for _ in 0..40 {
+        let size = broker
+            .queue_size(&queue)
+            .await
+            .expect("queue_size must succeed against a live broker");
+        last_seen = Some(size);
+        if size == 3 {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        converged,
+        "queue_size never converged to 3 requeued messages (last observed: {:?})",
+        last_seen
+    );
 
     let _ = broker.delete_queue(&queue).await;
 }

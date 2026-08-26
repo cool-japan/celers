@@ -91,7 +91,7 @@
 --     INDEX idx_tasks_created_at (created_at)
 -- );
 --
--- CREATE TABLE celers_task_results (
+-- CREATE TABLE celers_broker_results (
 --     task_id BINARY(16) PRIMARY KEY,
 --     -- ... other columns ...
 -- );
@@ -187,7 +187,7 @@
 --     t.task_name,
 --     r.status
 -- FROM celers_tasks t
--- JOIN celers_task_results r ON t.id = r.task_id
+-- JOIN celers_broker_results r ON t.id = r.task_id
 -- WHERE t.state = 'completed';
 --
 -- ============================================================================

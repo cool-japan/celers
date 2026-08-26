@@ -5,7 +5,10 @@ use chrono::Utc;
 use oxisql_core::ToSqlValue;
 use uuid::Uuid;
 
-use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};
+use crate::row_ext::{
+    decimal_f64_from_row, decimal_i64_from_row, json_param, opt_decimal_f64_from_row,
+    uuid_from_row, uuid_param, RowExt,
+};
 use crate::types::{
     DbTaskState, QueueCapacityAnalysis, QueueForecast, QueueHealthCheck, QueueHealthThresholds,
     QueueTrendAnalysis, TaskCompletionEstimate, TaskGroupStatus, TaskInfo, TaskSearchFilter,
@@ -110,7 +113,8 @@ impl PostgresBroker {
                 .execute(
                     r#"
                 UPDATE celers_tasks
-                SET priority = $2
+                SET priority = $2,
+                    updated_at = NOW()
                 WHERE queue_name = $1
                   AND state = 'pending'
                 "#,
@@ -132,7 +136,8 @@ impl PostgresBroker {
             UPDATE celers_tasks
             SET priority = $3 + (
                 (priority - $4)::FLOAT / ($5 - $4)::FLOAT * ($6 - $3)::FLOAT
-            )::INTEGER
+            )::INTEGER,
+                updated_at = NOW()
             WHERE queue_name = $1
               AND state = 'pending'
             "#,
@@ -225,14 +230,17 @@ impl PostgresBroker {
             CelersError::Other("Failed to forecast queue depth: no rows returned".to_string())
         })?;
 
-        let avg_arrival_rate: f64 = row
-            .col("avg_arrival_rate")
+        // `AVG`/`STDDEV` over `COUNT(*)` values: exact-value input, so the
+        // server may answer `NUMERIC` regardless of the `::double precision`
+        // casts in the statement above. The `COALESCE(.., 0)` wrappers make
+        // them non-nullable, so the non-optional helper is right here.
+        let avg_arrival_rate: f64 = decimal_f64_from_row(&row, "avg_arrival_rate")
             .map_err(|e| CelersError::Other(format!("Failed to read avg_arrival_rate: {}", e)))?;
-        let avg_completion_rate: f64 = row.col("avg_completion_rate").map_err(|e| {
-            CelersError::Other(format!("Failed to read avg_completion_rate: {}", e))
-        })?;
-        let arrival_stddev: f64 = row
-            .col("arrival_stddev")
+        let avg_completion_rate: f64 =
+            decimal_f64_from_row(&row, "avg_completion_rate").map_err(|e| {
+                CelersError::Other(format!("Failed to read avg_completion_rate: {}", e))
+            })?;
+        let arrival_stddev: f64 = decimal_f64_from_row(&row, "arrival_stddev")
             .map_err(|e| CelersError::Other(format!("Failed to read arrival_stddev: {}", e)))?;
         let current_pending: i64 = row
             .col("current_pending")
@@ -349,20 +357,21 @@ impl PostgresBroker {
             CelersError::Other("Failed to get queue trend analysis: no rows returned".to_string())
         })?;
 
-        let peak_pending: i64 = row
-            .col("peak_pending")
+        // `MAX`/`AVG`/`SUM` over the CTE's counts: exact-value aggregates, so
+        // NUMERIC-capable whatever the projection casts them to.
+        let peak_pending: i64 = decimal_i64_from_row(&row, "peak_pending")
             .map_err(|e| CelersError::Other(format!("Failed to read peak_pending: {}", e)))?;
         // Matches the original sqlx `row.try_get(..).unwrap_or(0.0)` soft-fail
         // default (this column can be SQL NULL when `hourly_stats` is empty).
-        let avg_pending: f64 = row.col("avg_pending").unwrap_or(0.0);
-        let total_tasks: i64 = row
-            .col("total_tasks")
+        let avg_pending: f64 = opt_decimal_f64_from_row(&row, "avg_pending")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
+        let total_tasks: i64 = decimal_i64_from_row(&row, "total_tasks")
             .map_err(|e| CelersError::Other(format!("Failed to read total_tasks: {}", e)))?;
-        let total_completed: i64 = row
-            .col("total_completed")
+        let total_completed: i64 = decimal_i64_from_row(&row, "total_completed")
             .map_err(|e| CelersError::Other(format!("Failed to read total_completed: {}", e)))?;
-        let total_failed: i64 = row
-            .col("total_failed")
+        let total_failed: i64 = decimal_i64_from_row(&row, "total_failed")
             .map_err(|e| CelersError::Other(format!("Failed to read total_failed: {}", e)))?;
         let peak_hour: i32 = row
             .col("peak_hour")
@@ -488,11 +497,14 @@ impl PostgresBroker {
             CelersError::Other("Failed to estimate completion time: no rows returned".to_string())
         })?;
 
-        let avg_task_duration_secs: f64 = row.col("avg_task_duration_secs").map_err(|e| {
-            CelersError::Other(format!("Failed to read avg_task_duration_secs: {}", e))
-        })?;
-        let duration_stddev: f64 = row
-            .col("duration_stddev")
+        // `AVG`/`STDDEV` over `EXTRACT(EPOCH ...)` — NUMERIC on PostgreSQL
+        // >= 14 before the projection's cast, made non-nullable by the
+        // `COALESCE` defaults.
+        let avg_task_duration_secs: f64 = decimal_f64_from_row(&row, "avg_task_duration_secs")
+            .map_err(|e| {
+                CelersError::Other(format!("Failed to read avg_task_duration_secs: {}", e))
+            })?;
+        let duration_stddev: f64 = decimal_f64_from_row(&row, "duration_stddev")
             .map_err(|e| CelersError::Other(format!("Failed to read duration_stddev: {}", e)))?;
         let tasks_ahead: i64 = row
             .col("tasks_ahead")
@@ -580,8 +592,9 @@ impl PostgresBroker {
         let completed_last_hour: i64 = row.col("completed_last_hour").map_err(|e| {
             CelersError::Other(format!("Failed to read completed_last_hour: {}", e))
         })?;
-        let avg_duration_secs: i64 = row
-            .col("avg_duration_secs")
+        // `EXTRACT(EPOCH FROM AVG(interval))` — NUMERIC before the `::BIGINT`
+        // cast, `COALESCE`d to 60 so it is never NULL.
+        let avg_duration_secs: i64 = decimal_i64_from_row(&row, "avg_duration_secs")
             .map_err(|e| CelersError::Other(format!("Failed to read avg_duration_secs: {}", e)))?;
 
         let estimated_worker_count = processing;
@@ -1217,7 +1230,8 @@ impl PostgresBroker {
                 COALESCE(metadata, '{{}}'::jsonb),
                 '{{task_group_id}}',
                 to_jsonb($1::text)
-            )
+            ),
+                updated_at = NOW()
             WHERE queue_name = $2 AND id IN ({})
             "#,
             placeholders
@@ -1436,7 +1450,8 @@ impl PostgresBroker {
             UPDATE celers_tasks
             SET state = 'cancelled',
                 error_message = $3,
-                completed_at = NOW()
+                completed_at = NOW(),
+                updated_at = NOW()
             WHERE queue_name = $1
               AND metadata->>'task_group_id' = $2
               AND state IN ('pending', 'processing')
@@ -1491,7 +1506,8 @@ impl PostgresBroker {
                 COALESCE(metadata, '{{}}'::jsonb),
                 '{{tags}}',
                 COALESCE(metadata->'tags', '[]'::jsonb) || $1::text::jsonb
-            )
+            ),
+                updated_at = NOW()
             WHERE queue_name = $2 AND id IN ({})
             "#,
             placeholders

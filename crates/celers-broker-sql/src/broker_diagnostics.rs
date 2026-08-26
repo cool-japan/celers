@@ -410,7 +410,7 @@ impl MysqlBroker {
 
             tx.execute(
                 r#"
-                INSERT INTO celers_task_results
+                INSERT INTO celers_broker_results
                     (task_id, task_name, status, result, error, traceback, runtime_ms, created_at, completed_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
                 ON DUPLICATE KEY UPDATE

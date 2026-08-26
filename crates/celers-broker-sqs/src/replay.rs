@@ -498,7 +498,14 @@ impl ReplayManager {
         // DLQ correctly must not be reported as a failed run because the
         // release call did not land.
         for delivery_tag in &to_release {
-            if let Err(error) = broker.extend_visibility(delivery_tag, 0).await {
+            // `reject_on(.., requeue = true)` rather than a bare
+            // `extend_visibility(tag, 0)`: it stops any visibility heartbeat
+            // this receive started first (see
+            // `SqsBroker::with_visibility_heartbeat`), which would otherwise
+            // extend the timeout straight back out from under the reset. The
+            // queue is taken from the delivery tag either way, so the message
+            // is released against the DLQ it came from, never the main queue.
+            if let Err(error) = broker.reject_on(&dlq_name, delivery_tag, true).await {
                 warn!(
                     "Failed to return an inspected message to DLQ {}: {} \
                      (it becomes visible again when its visibility timeout expires)",

@@ -1715,8 +1715,14 @@ Superseding parts of the two audit sections below:
   Section 1 below ("used only as a logical JSON label") is therefore
   **obsolete** — the label is still written for compatibility, but the column
   is authoritative.
-- **`celers_task_results` now has a migration** (`010_task_results.sql`).
-  Section 2's missing-table census is reduced by one.
+- **The broker's result table now has a migration** — and a new name.
+  `010_broker_results.sql` creates `celers_broker_results`; the table was
+  called `celers_task_results` until that name was ceded to
+  `celers-backend-db`'s result backend, which auto-migrates an incompatible
+  table of the same name into the same database (Known gaps #16, now closed).
+  Existing databases are carried across by `migrate()`'s untracked
+  `rename_legacy_broker_results_table` step. Section 2's missing-table census
+  is reduced by one.
 - **The migration runner was broken and is fixed.** `run_migration` skipped
   any `;`-chunk starting with `--`, which discarded the first statement of
   every migration file — including `CREATE TABLE celers_migrations` — so

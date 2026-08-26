@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::{DbTaskState, DeduplicationConfig, PostgresBroker, RetryStrategy};
 
 /// The connection string to test against, if one is configured.
-fn test_pg_url() -> Option<String> {
+pub(crate) fn test_pg_url() -> Option<String> {
     match std::env::var("CELERS_TEST_POSTGRES_URL") {
         Ok(url) if !url.trim().is_empty() => Some(url),
         _ => None,

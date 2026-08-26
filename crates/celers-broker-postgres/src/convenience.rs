@@ -4,7 +4,7 @@ use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use oxisql_core::ToSqlValue;
 use std::time::Duration;
 
-use crate::row_ext::{uuid_from_row, uuid_param, RowExt};
+use crate::row_ext::{opt_decimal_f64_from_row, uuid_from_row, uuid_param, RowExt};
 use crate::types::{DbTaskState, DlqTaskInfo, TaskInfo};
 use crate::PostgresBroker;
 
@@ -170,7 +170,8 @@ impl PostgresBroker {
                 Box::pin(async move {
                     let id_param = uuid_param(&id);
                     conn.execute(
-                        "UPDATE celers_tasks SET state = 'completed', completed_at = NOW() \
+                        "UPDATE celers_tasks SET state = 'completed', completed_at = NOW(), \
+                         updated_at = NOW() \
                          WHERE id = $1::text::uuid AND queue_name = $2 \
                          AND state = 'processing'",
                         &[&id_param, &queue],
@@ -189,7 +190,8 @@ impl PostgresBroker {
                 Box::pin(async move {
                     let id_param = uuid_param(&id);
                     conn.execute(
-                        "UPDATE celers_tasks SET retry_count = retry_count + 1 \
+                        "UPDATE celers_tasks SET retry_count = retry_count + 1, \
+                         updated_at = NOW() \
                          WHERE id = $1::text::uuid AND queue_name = $2",
                         &[&id_param, &queue],
                     )
@@ -268,7 +270,7 @@ impl PostgresBroker {
             .conn
             .execute(
                 "UPDATE celers_tasks
-             SET state = 'cancelled', completed_at = NOW()
+             SET state = 'cancelled', completed_at = NOW(), updated_at = NOW()
              WHERE task_name = $1 AND state IN ('pending', 'processing')",
                 &[&task_name],
             )
@@ -420,7 +422,8 @@ impl PostgresBroker {
 
         // Queue-scoped by bound label, not by table name — see
         // `find_tasks_by_priority_range` above.
-        let query_str = "UPDATE celers_tasks SET state = 'cancelled', completed_at = NOW()
+        let query_str = "UPDATE celers_tasks SET state = 'cancelled', completed_at = NOW(),
+                       updated_at = NOW()
                  WHERE queue_name = $1
                    AND state = 'pending' AND created_at < $2::text::timestamptz";
         let cutoff_param = cutoff.to_rfc3339();
@@ -458,7 +461,8 @@ impl PostgresBroker {
         let placeholders = in_clause_placeholders(1, task_ids.len());
         let queue_idx = task_ids.len() + 1;
         let query_str = format!(
-            "UPDATE celers_tasks SET state = 'cancelled', completed_at = NOW()
+            "UPDATE celers_tasks SET state = 'cancelled', completed_at = NOW(),
+                       updated_at = NOW()
                  WHERE id IN ({placeholders}) AND queue_name = ${queue_idx}
                    AND state IN ('pending', 'processing')"
         );
@@ -539,7 +543,8 @@ impl PostgresBroker {
                 .map_err(|e| CelersError::Other(format!("Invalid duration: {}", e)))?;
 
         let query_str =
-            "UPDATE celers_tasks SET state = 'pending', started_at = NULL, worker_id = NULL
+            "UPDATE celers_tasks SET state = 'pending', started_at = NULL, worker_id = NULL,
+                       updated_at = NOW()
                  WHERE queue_name = $1
                    AND state = 'processing' AND started_at < $2::text::timestamptz";
         let cutoff_param = cutoff.to_rfc3339();
@@ -693,9 +698,13 @@ impl PostgresBroker {
             let task_name: String = row
                 .col("task_name")
                 .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
-            let avg_duration: Option<f64> = row.col("avg_duration_ms").map_err(|e| {
-                CelersError::Other(format!("Failed to read avg_duration_ms: {}", e))
-            })?;
+            // `AVG(EXTRACT(EPOCH ...) * 1000)` — NUMERIC on PostgreSQL >= 14
+            // before the statement's `::double precision` cast, and NULL for a
+            // task type with no completed runs in the window.
+            let avg_duration: Option<f64> = opt_decimal_f64_from_row(row, "avg_duration_ms")
+                .map_err(|e| {
+                    CelersError::Other(format!("Failed to read avg_duration_ms: {}", e))
+                })?;
             if let Some(duration) = avg_duration {
                 duration_map.insert(task_name, duration);
             }
@@ -742,6 +751,7 @@ impl PostgresBroker {
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW(),
+                updated_at = NOW(),
                 error_message = 'Task expired due to TTL'
             WHERE task_name = $1
               AND queue_name = $2
@@ -793,6 +803,7 @@ impl PostgresBroker {
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW(),
+                updated_at = NOW(),
                 error_message = 'Task expired due to TTL'
             WHERE queue_name = $1
               AND state IN ('pending', 'processing')
@@ -817,177 +828,12 @@ impl PostgresBroker {
     }
 
     // ========== PostgreSQL Advisory Locks ==========
-
-    /// Acquire PostgreSQL advisory lock for exclusive task processing
-    ///
-    /// Advisory locks provide application-level distributed locking using PostgreSQL's
-    /// advisory lock mechanism. This is useful when you need to ensure only one worker
-    /// processes tasks of a specific type at a time.
-    ///
-    /// The lock is automatically released when the connection is closed or when
-    /// `release_advisory_lock` is called.
-    ///
-    /// # Arguments
-    ///
-    /// * `lock_id` - Numeric lock ID (must be i64)
-    ///
-    /// # Returns
-    ///
-    /// `true` if lock was acquired, `false` if already locked by another session
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use celers_broker_postgres::PostgresBroker;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
-    ///
-    /// // Try to acquire lock for critical section
-    /// let lock_id = 12345i64;
-    /// if broker.try_advisory_lock(lock_id).await? {
-    ///     // Process critical task
-    ///     println!("Lock acquired, processing...");
-    ///
-    ///     // Release lock when done
-    ///     broker.release_advisory_lock(lock_id).await?;
-    /// } else {
-    ///     println!("Lock held by another worker");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn try_advisory_lock(&self, lock_id: i64) -> Result<bool> {
-        let rows = self
-            .conn
-            .query("SELECT pg_try_advisory_lock($1) as locked", &[&lock_id])
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to acquire advisory lock: {}", e)))?;
-
-        let row = rows.into_iter().next().ok_or_else(|| {
-            CelersError::Other("Failed to acquire advisory lock: no rows returned".to_string())
-        })?;
-        let locked: bool = row
-            .col("locked")
-            .map_err(|e| CelersError::Other(format!("Failed to read locked: {}", e)))?;
-
-        if locked {
-            tracing::debug!(lock_id = lock_id, "Advisory lock acquired");
-        } else {
-            tracing::debug!(lock_id = lock_id, "Advisory lock already held");
-        }
-
-        Ok(locked)
-    }
-
-    /// Release PostgreSQL advisory lock
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use celers_broker_postgres::PostgresBroker;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
-    /// broker.release_advisory_lock(12345).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn release_advisory_lock(&self, lock_id: i64) -> Result<bool> {
-        let rows = self
-            .conn
-            .query("SELECT pg_advisory_unlock($1) as unlocked", &[&lock_id])
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to release advisory lock: {}", e)))?;
-
-        let row = rows.into_iter().next().ok_or_else(|| {
-            CelersError::Other("Failed to release advisory lock: no rows returned".to_string())
-        })?;
-        let unlocked: bool = row
-            .col("unlocked")
-            .map_err(|e| CelersError::Other(format!("Failed to read unlocked: {}", e)))?;
-
-        if unlocked {
-            tracing::debug!(lock_id = lock_id, "Advisory lock released");
-        } else {
-            tracing::warn!(lock_id = lock_id, "Advisory lock was not held");
-        }
-
-        Ok(unlocked)
-    }
-
-    /// Acquire blocking advisory lock (waits until available)
-    ///
-    /// Unlike `try_advisory_lock`, this method will block until the lock becomes available.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use celers_broker_postgres::PostgresBroker;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
-    ///
-    /// // Wait for lock to become available
-    /// broker.advisory_lock(12345).await?;
-    /// // Process critical section
-    /// broker.release_advisory_lock(12345).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn advisory_lock(&self, lock_id: i64) -> Result<()> {
-        self.conn
-            .execute("SELECT pg_advisory_lock($1)", &[&lock_id])
-            .await
-            .map_err(|e| {
-                CelersError::Other(format!("Failed to acquire blocking advisory lock: {}", e))
-            })?;
-
-        tracing::debug!(lock_id = lock_id, "Blocking advisory lock acquired");
-
-        Ok(())
-    }
-
-    /// Check if an advisory lock is currently held
-    ///
-    /// Note: This checks across all sessions, not just the current one.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use celers_broker_postgres::PostgresBroker;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let broker = PostgresBroker::new("postgres://localhost/db").await?;
-    ///
-    /// let is_locked = broker.is_advisory_lock_held(12345).await?;
-    /// println!("Lock held: {}", is_locked);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn is_advisory_lock_held(&self, lock_id: i64) -> Result<bool> {
-        let rows = self
-            .conn
-            .query(
-                r#"
-            SELECT COUNT(*) > 0 as held
-            FROM pg_locks
-            WHERE locktype = 'advisory'
-              AND objid = $1
-            "#,
-                &[&lock_id],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to check advisory lock: {}", e)))?;
-
-        let row = rows.into_iter().next().ok_or_else(|| {
-            CelersError::Other("Failed to check advisory lock: no rows returned".to_string())
-        })?;
-        let held: bool = row
-            .col("held")
-            .map_err(|e| CelersError::Other(format!("Failed to read held: {}", e)))?;
-        Ok(held)
-    }
+    //
+    // `try_advisory_lock` / `advisory_lock` / `release_advisory_lock` /
+    // `is_advisory_lock_held` moved to `advisory_lock.rs`, alongside the
+    // `AdvisoryLockGuard` that replaces them: a session-scoped Postgres
+    // advisory lock has to keep the pooled connection it was taken on, which
+    // is a topic of its own rather than a convenience wrapper.
 
     // ========== Task Performance Analytics ==========
 
@@ -1040,14 +886,15 @@ impl PostgresBroker {
             CelersError::Other("Failed to get task percentiles: no rows returned".to_string())
         })?;
 
-        let p50: Option<f64> = row
-            .col("p50")
+        // `PERCENTILE_CONT` ordered by `EXTRACT(EPOCH ...) * 1000`, which is
+        // `NUMERIC` on PostgreSQL >= 14 — and the ordered-set aggregate is
+        // `NULL` when the task type has no completed runs at all, which is the
+        // normal answer on a fresh queue rather than an error.
+        let p50: Option<f64> = opt_decimal_f64_from_row(&row, "p50")
             .map_err(|e| CelersError::Other(format!("Failed to read p50: {}", e)))?;
-        let p95: Option<f64> = row
-            .col("p95")
+        let p95: Option<f64> = opt_decimal_f64_from_row(&row, "p95")
             .map_err(|e| CelersError::Other(format!("Failed to read p95: {}", e)))?;
-        let p99: Option<f64> = row
-            .col("p99")
+        let p99: Option<f64> = opt_decimal_f64_from_row(&row, "p99")
             .map_err(|e| CelersError::Other(format!("Failed to read p99: {}", e)))?;
 
         Ok((p50.unwrap_or(0.0), p95.unwrap_or(0.0), p99.unwrap_or(0.0)))
@@ -1209,7 +1056,8 @@ impl PostgresBroker {
             .execute(
                 r#"
             UPDATE celers_tasks
-            SET priority = priority + $1
+            SET priority = priority + $1,
+                updated_at = NOW()
             WHERE task_name = $2
               AND queue_name = $3
               AND state = 'pending'
@@ -1269,7 +1117,8 @@ impl PostgresBroker {
         let query_str = format!(
             r#"
             UPDATE celers_tasks
-            SET priority = $1
+            SET priority = $1,
+                updated_at = NOW()
             WHERE id IN ({})
               AND queue_name = ${}
               AND state = 'pending'
@@ -1498,6 +1347,7 @@ impl PostgresBroker {
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW(),
+                updated_at = NOW(),
                 error_message = $1
             WHERE id = $2::text::uuid
               AND queue_name = $3
@@ -1556,6 +1406,7 @@ impl PostgresBroker {
             UPDATE celers_tasks
             SET state = 'cancelled',
                 completed_at = NOW(),
+                updated_at = NOW(),
                 error_message = $1
             WHERE id IN ({})
               AND queue_name = ${}

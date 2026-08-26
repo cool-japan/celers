@@ -228,7 +228,7 @@ impl MysqlBroker {
         self.connection()
             .execute(
                 r#"
-                INSERT INTO celers_task_results
+                INSERT INTO celers_broker_results
                     (task_id, task_name, status, result, created_at)
                 VALUES (?, ?, 'PENDING', ?, NOW())
                 ON DUPLICATE KEY UPDATE
@@ -294,7 +294,7 @@ impl MysqlBroker {
             .query(
                 r#"
                 SELECT task_id, result
-                FROM celers_task_results
+                FROM celers_broker_results
                 WHERE task_name LIKE '__recurring__%'
                   AND status = 'PENDING'
                 "#,
@@ -396,7 +396,7 @@ impl MysqlBroker {
             .query(
                 r#"
                 SELECT task_id, result
-                FROM celers_task_results
+                FROM celers_broker_results
                 WHERE task_name LIKE '__recurring__%'
                   AND status = 'PENDING'
                 "#,
@@ -436,7 +436,7 @@ impl MysqlBroker {
             .connection()
             .execute(
                 r#"
-                DELETE FROM celers_task_results
+                DELETE FROM celers_broker_results
                 WHERE task_id = ? AND task_name LIKE '__recurring__%'
                 "#,
                 &[&config_id],

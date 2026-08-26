@@ -4,7 +4,7 @@ use celers_core::{CelersError, Result};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::row_ext::RowExt;
+use crate::row_ext::{opt_decimal_f64_from_row_idx, opt_decimal_i64_from_row_idx, RowExt};
 use crate::types::{DbTaskState, IndexUsageInfo, TableSizeInfo};
 use crate::PostgresBroker;
 
@@ -168,10 +168,10 @@ impl PostgresBroker {
             })?;
 
         self.conn
-            .execute("ANALYZE celers_task_results", &[])
+            .execute("ANALYZE celers_broker_results", &[])
             .await
             .map_err(|e| {
-                CelersError::Other(format!("Failed to analyze celers_task_results: {}", e))
+                CelersError::Other(format!("Failed to analyze celers_broker_results: {}", e))
             })?;
 
         tracing::info!("Analyzed all CeleRS tables");
@@ -196,10 +196,10 @@ impl PostgresBroker {
             })?;
 
         self.conn
-            .execute("VACUUM ANALYZE celers_task_results", &[])
+            .execute("VACUUM ANALYZE celers_broker_results", &[])
             .await
             .map_err(|e| {
-                CelersError::Other(format!("Failed to vacuum celers_task_results: {}", e))
+                CelersError::Other(format!("Failed to vacuum celers_broker_results: {}", e))
             })?;
 
         tracing::info!("Vacuumed all CeleRS tables");
@@ -354,7 +354,8 @@ impl PostgresBroker {
                 r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
-                completed_at = NOW()
+                completed_at = NOW(),
+                updated_at = NOW()
             WHERE state = 'pending'
             "#,
                 &[],
@@ -407,8 +408,11 @@ impl PostgresBroker {
             .await
             .map_err(|e| CelersError::Other(format!("Failed to get oldest pending age: {}", e)))?;
 
+        // `EXTRACT(EPOCH FROM ...)` is `NUMERIC` on PostgreSQL >= 14 before
+        // the statement's `::BIGINT` cast, and the projection is unaliased —
+        // hence the positional NUMERIC-tolerant read.
         match rows.into_iter().next() {
-            Some(row) => row.col_idx(0).map_err(|e| {
+            Some(row) => opt_decimal_i64_from_row_idx(&row, 0).map_err(|e| {
                 CelersError::Other(format!("Failed to read oldest pending age: {}", e))
             }),
             None => Ok(None),
@@ -437,7 +441,7 @@ impl PostgresBroker {
             })?;
 
         match rows.into_iter().next() {
-            Some(row) => row.col_idx(0).map_err(|e| {
+            Some(row) => opt_decimal_i64_from_row_idx(&row, 0).map_err(|e| {
                 CelersError::Other(format!("Failed to read oldest processing age: {}", e))
             }),
             None => Ok(None),
@@ -471,8 +475,10 @@ impl PostgresBroker {
                 CelersError::Other(format!("Failed to calculate avg processing time: {}", e))
             })?;
 
+        // `AVG(EXTRACT(EPOCH ...) * 1000)`: NUMERIC-capable and `NULL` when no
+        // task has completed yet, on an unaliased projection.
         match rows.into_iter().next() {
-            Some(row) => row.col_idx(0).map_err(|e| {
+            Some(row) => opt_decimal_f64_from_row_idx(&row, 0).map_err(|e| {
                 CelersError::Other(format!("Failed to read avg processing time: {}", e))
             }),
             None => Ok(None),

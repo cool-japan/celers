@@ -1,13 +1,12 @@
 //! Core MysqlBroker struct and primary implementation
 //!
-//! Contains the broker struct definition, constructors, migration,
-//! and core enqueue/dequeue/ack/reject operations.
+//! Contains the broker struct definition, constructors, and core
+//! enqueue/dequeue/ack/reject operations. Schema migration — including the
+//! two untracked upgrade steps that let this crate share a database with
+//! `celers-backend-db` — lives in the crate-internal `broker_migrate` module.
 
 use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerStateInternal};
-use crate::mysql_error::{
-    is_duplicate_column_name, is_duplicate_key_name, is_unsupported_in_prepared_protocol,
-    with_deadlock_retry,
-};
+use crate::mysql_error::with_deadlock_retry;
 use crate::row_ext::RowExt;
 use crate::tls_mode;
 use crate::types::*;
@@ -111,36 +110,6 @@ pub const DEFAULT_REVOCATION_TTL_SECS: u64 = 86_400;
 /// idle worker fleet is not issuing a `SELECT` against this table five times
 /// a second per worker.
 pub const DEFAULT_REVOCATION_POLL_INTERVAL_SECS: u64 = 2;
-
-/// Remove whole-line `--` comments from one `;`-delimited migration chunk.
-///
-/// Line-based on purpose: it never inspects the interior of a statement, so a
-/// `--` sequence inside a string literal or an identifier is untouched. Only
-/// lines whose first non-whitespace characters are `--` are dropped.
-pub(crate) fn strip_sql_line_comments(chunk: &str) -> String {
-    chunk
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Is `statement` a `CREATE INDEX`?
-///
-/// Leading `--` comment lines are already removed by
-/// [`strip_sql_line_comments`] before the `;` split, so the keyword is the
-/// first token.
-pub(crate) fn is_create_index(statement: &str) -> bool {
-    let mut words = statement.split_whitespace();
-    matches!(words.next(), Some(w) if w.eq_ignore_ascii_case("CREATE"))
-        && matches!(words.next(), Some(w) if w.eq_ignore_ascii_case("INDEX"))
-}
-
-/// Is `statement` an `ALTER TABLE ... ADD COLUMN ...`?
-pub(crate) fn is_add_column(statement: &str) -> bool {
-    let upper = statement.to_ascii_uppercase();
-    upper.trim_start().starts_with("ALTER TABLE") && upper.contains("ADD COLUMN")
-}
 
 impl MysqlBroker {
     /// Create a new MySQL broker
@@ -264,295 +233,6 @@ impl MysqlBroker {
         }
 
         Ok(conn)
-    }
-
-    /// Run database migrations
-    pub async fn migrate(&self) -> Result<()> {
-        // First, create migrations table if it doesn't exist
-        self.run_migration_untracked(include_str!("../migrations/000_migrations.sql"))
-            .await?;
-
-        // Run migrations with tracking
-        self.run_migration_tracked(
-            "001",
-            "initial_schema",
-            include_str!("../migrations/001_init.sql"),
-        )
-        .await?;
-
-        self.run_migration_tracked(
-            "002",
-            "results_table",
-            include_str!("../migrations/002_results.sql"),
-        )
-        .await?;
-
-        self.run_migration_tracked(
-            "003",
-            "performance_indexes",
-            include_str!("../migrations/003_performance_indexes.sql"),
-        )
-        .await?;
-
-        self.run_migration_tracked(
-            "006",
-            "idempotency_keys",
-            include_str!("../migrations/006_idempotency.sql"),
-        )
-        .await?;
-
-        self.run_migration_tracked(
-            "007",
-            "workflow_dag",
-            include_str!("../migrations/007_workflow.sql"),
-        )
-        .await?;
-
-        self.run_migration_tracked(
-            "008",
-            "production_features",
-            include_str!("../migrations/008_production_features.sql"),
-        )
-        .await?;
-
-        self.run_migration_tracked(
-            "009",
-            "queue_name_column",
-            include_str!("../migrations/009_queue_name.sql"),
-        )
-        .await?;
-
-        self.run_migration_tracked(
-            "010",
-            "task_results_table",
-            include_str!("../migrations/010_task_results.sql"),
-        )
-        .await?;
-
-        self.run_migration_tracked(
-            "011",
-            "revocation",
-            include_str!("../migrations/011_revocation.sql"),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    /// Check if a migration has been applied
-    async fn is_migration_applied(&self, version: &str) -> Result<bool> {
-        let rows = self
-            .conn
-            .query(
-                "SELECT COUNT(*) AS c FROM celers_migrations WHERE version = ?",
-                &[&version],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to check migration status: {}", e)))?;
-
-        let count: i64 = rows
-            .first()
-            .map(|row| row.col("c"))
-            .transpose()
-            .map_err(|e| CelersError::Other(format!("Failed to check migration status: {e}")))?
-            .unwrap_or(0);
-
-        Ok(count > 0)
-    }
-
-    /// Mark a migration as applied
-    async fn mark_migration_applied(&self, version: &str, name: &str) -> Result<()> {
-        // `ON DUPLICATE KEY UPDATE` rather than a bare `INSERT`: two brokers
-        // starting together both pass `is_migration_applied` (a
-        // check-then-act with nothing serialising it), both apply the — now
-        // idempotent — DDL, and both reach here. A bare INSERT made the
-        // loser fail with `Duplicate entry '001' for key
-        // celers_migrations.version`, turning a harmless duplicate effort
-        // into a failed `migrate()`. Re-asserting `name` is a no-op write
-        // that keeps the statement a single round trip.
-        self.conn
-            .execute(
-                "INSERT INTO celers_migrations (version, name) VALUES (?, ?) \
-                 ON DUPLICATE KEY UPDATE name = VALUES(name)",
-                &[&version, &name],
-            )
-            .await
-            .map_err(|e| {
-                CelersError::Other(format!("Failed to mark migration as applied: {}", e))
-            })?;
-
-        tracing::info!(version = %version, name = %name, "Migration applied");
-        Ok(())
-    }
-
-    /// Run a migration with tracking
-    async fn run_migration_tracked(
-        &self,
-        version: &str,
-        name: &str,
-        migration_sql: &str,
-    ) -> Result<()> {
-        // Check if already applied
-        if self.is_migration_applied(version).await? {
-            tracing::debug!(version = %version, name = %name, "Migration already applied, skipping");
-            return Ok(());
-        }
-
-        // Run the migration
-        self.run_migration_untracked(migration_sql).await?;
-
-        // Mark as applied
-        self.mark_migration_applied(version, name).await?;
-
-        Ok(())
-    }
-
-    /// Execute one migration DDL statement, tolerating the ways a *concurrent*
-    /// migration of the same database can make it fail.
-    ///
-    /// `run_migration_tracked`'s "already applied?" lookup is a check-then-act
-    /// with nothing serialising it, and MySQL offers no usable lock to close
-    /// that window here: `CREATE INDEX IF NOT EXISTS` does not exist in any
-    /// released MySQL, `ADD COLUMN IF NOT EXISTS` needs 8.0.29+ (this schema
-    /// targets 5.7+), and `GET_LOCK` is session-scoped while every
-    /// `execute` checks a fresh connection out of `mysql_async`'s pool.
-    ///
-    /// So each statement is made *effectively* idempotent instead. Every case
-    /// below is one where the post-condition the migration wanted already
-    /// holds, or where MySQL itself says to retry:
-    ///
-    /// * `1061 Duplicate key name` — another migrator created the index.
-    /// * `1060 Duplicate column name` — another migrator added the column.
-    /// * `1213 Deadlock found ... try restarting transaction` — concurrent DDL
-    ///   on the same table. MySQL's own advice is to retry, which is what
-    ///   [`with_deadlock_retry`] does (shared with the application statements
-    ///   that can lose the same race, so there is one retry policy in the
-    ///   crate rather than a bespoke loop here).
-    ///
-    /// Anything else is a real migration failure and propagates. Before this,
-    /// any one of these aborted `migrate()` part-way, leaving later files —
-    /// including `009_queue_name.sql`, whose column the statistics query
-    /// needs — unapplied, so the broker then failed with
-    /// `Unknown column 'queue_name'`.
-    async fn execute_migration_statement(&self, statement: &str) -> Result<()> {
-        with_deadlock_retry("migration statement", || async {
-            match self.conn.execute(statement, &[]).await {
-                Ok(_) => Ok(()),
-                Err(e) if is_create_index(statement) && is_duplicate_key_name(&e) => {
-                    tracing::debug!(
-                        statement = %statement,
-                        "index already exists (concurrent migration); continuing"
-                    );
-                    Ok(())
-                }
-                Err(e) if is_add_column(statement) && is_duplicate_column_name(&e) => {
-                    tracing::debug!(
-                        statement = %statement,
-                        "column already exists (concurrent migration); continuing"
-                    );
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        })
-        .await
-        .map_err(|e| CelersError::Other(format!("Migration failed: {}", e)))
-    }
-
-    /// Run a migration without tracking (for the migrations table itself)
-    async fn run_migration_untracked(&self, migration_sql: &str) -> Result<()> {
-        self.run_migration(migration_sql).await
-    }
-
-    /// Run a single migration file
-    ///
-    /// MySQL's `COM_STMT_EXECUTE` (extended/prepared-statement) protocol —
-    /// which `oxisql_mysql::MyConnection::execute`/`query` always use —
-    /// rejects multi-statement text, and a stored-procedure body itself
-    /// contains internal `;`-separated statements that must not be split.
-    /// This mirrors the pre-migration `sqlx` approach exactly (see the
-    /// already-completed `celers-backend-db::MysqlResultBackend::migrate`
-    /// for the identical, proven shape): split on the literal `DELIMITER //`
-    /// / `DELIMITER ;` markers first, then split the *non-procedure* section
-    /// on `;` and execute each statement individually. Deliberately does
-    /// NOT use `Connection::execute_batch` here — `execute_batch`'s own
-    /// naive `;` split (see its doc comment in `oxisql-core`) would itself
-    /// break on a stored procedure body containing internal semicolons,
-    /// which is exactly the hazard this hand-rolled DELIMITER-aware split
-    /// exists to avoid.
-    ///
-    /// # Leading `--` comments
-    ///
-    /// Splitting on `;` puts each statement in the same chunk as the comment
-    /// block that precedes it, so a chunk normally *starts* with `--`. This
-    /// function previously skipped any chunk whose trimmed text started with
-    /// `--`, which discarded the statement along with its comment. Because
-    /// every migration file in this crate opens with a title comment, that
-    /// dropped the first statement of every file — including
-    /// `CREATE TABLE celers_migrations` in `000_migrations.sql`, which made
-    /// the very next `is_migration_applied` query fail against a table that
-    /// had never been created. `migrate()` therefore failed on every fresh
-    /// database.
-    ///
-    /// [`strip_sql_line_comments`] now removes the comment *lines* and keeps
-    /// the statement, and it runs **before** the `;` split rather than
-    /// per-chunk: a prose comment containing a semicolon would otherwise be
-    /// cut in half and its tail submitted to the server as a statement.
-    async fn run_migration(&self, migration_sql: &str) -> Result<()> {
-        let sections: Vec<&str> = migration_sql.split("DELIMITER //").collect();
-
-        // Execute the main DDL statements (before DELIMITER)
-        if let Some(main_sql) = sections.first() {
-            for statement in strip_sql_line_comments(main_sql).split(';') {
-                let trimmed = statement.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                self.execute_migration_statement(trimmed).await?;
-            }
-        }
-
-        // Execute the stored procedure (between DELIMITER // and DELIMITER ;)
-        if sections.len() > 1 {
-            let proc_section = sections[1];
-            if let Some(proc_sql) = proc_section.split("DELIMITER ;").next() {
-                let stripped = strip_sql_line_comments(proc_sql);
-                // The body ends with the client-side `//` delimiter marker,
-                // which is not SQL: submitting `... END//` over
-                // COM_STMT_PREPARE is a syntax error.
-                let trimmed = stripped.trim().trim_end_matches("//").trim_end();
-                if !trimmed.is_empty() {
-                    match self.conn.execute(trimmed, &[]).await {
-                        Ok(_) => {}
-                        // MySQL will not accept `CREATE PROCEDURE` over the
-                        // prepared-statement protocol, which is the only one
-                        // this driver speaks — see
-                        // the `dlq_move` module for the full explanation.
-                        // Failing here aborted `migrate()` on every MySQL
-                        // database, leaving the schema half-applied and the
-                        // broker unusable. Nothing depends on the routine any
-                        // more: the one caller (`move_to_dlq`) now issues the
-                        // procedure's two statements directly.
-                        Err(e) if is_unsupported_in_prepared_protocol(&e) => {
-                            tracing::debug!(
-                                error = %e,
-                                "skipping stored-procedure creation: not sendable over the \
-                                 prepared-statement protocol. CeleRS does not call it — the \
-                                 DLQ move runs as plain SQL."
-                            );
-                        }
-                        Err(e) => {
-                            return Err(CelersError::Other(format!(
-                                "Stored procedure creation failed: {}",
-                                e
-                            )))
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Get the underlying connection
@@ -1088,6 +768,9 @@ impl MysqlBroker {
     /// Archive completed tasks older than the specified duration
     ///
     /// Returns the number of tasks archived (deleted).
+    ///
+    /// Retried on `ERROR 1213` — see [`Self::purge_all`] for why every bulk
+    /// maintenance statement needs it.
     pub async fn archive_completed_tasks(&self, older_than: Duration) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::seconds(older_than.as_secs() as i64);
         // MySQL DATETIME/TIMESTAMP parameter convention — see `row_ext.rs`'s
@@ -1095,18 +778,20 @@ impl MysqlBroker {
         // `.format("%Y-%m-%d %H:%M:%S%.6f")`, never `.to_rfc3339()`.
         let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
 
-        let affected = self
-            .conn
-            .execute(
-                r#"
+        let affected = with_deadlock_retry("archive_completed_tasks", || async {
+            self.conn
+                .execute(
+                    r#"
                 DELETE FROM celers_tasks
                 WHERE state IN ('completed', 'failed', 'cancelled')
                   AND completed_at < ?
                 "#,
-                &[&cutoff_str],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to archive tasks: {}", e)))?;
+                    &[&cutoff_str],
+                )
+                .await
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to archive tasks: {}", e)))?;
 
         tracing::info!(count = affected, cutoff = %cutoff, "Archived completed tasks");
         Ok(affected)
@@ -1115,14 +800,17 @@ impl MysqlBroker {
     /// Clean up stuck processing tasks (tasks that have been processing too long)
     ///
     /// This can happen if a worker crashes. Tasks are requeued with incremented retry count.
+    ///
+    /// Retried on `ERROR 1213` — see [`Self::purge_all`] for why every bulk
+    /// maintenance statement needs it.
     pub async fn recover_stuck_tasks(&self, stuck_threshold: Duration) -> Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::seconds(stuck_threshold.as_secs() as i64);
         let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
 
-        let affected = self
-            .conn
-            .execute(
-                r#"
+        let affected = with_deadlock_retry("recover_stuck_tasks", || async {
+            self.conn
+                .execute(
+                    r#"
                 UPDATE celers_tasks
                 SET state = 'pending',
                     started_at = NULL,
@@ -1131,10 +819,12 @@ impl MysqlBroker {
                 WHERE state = 'processing'
                   AND started_at < ?
                 "#,
-                &[&cutoff_str],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to recover stuck tasks: {}", e)))?;
+                    &[&cutoff_str],
+                )
+                .await
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to recover stuck tasks: {}", e)))?;
 
         if affected > 0 {
             tracing::warn!(count = affected, "Recovered stuck processing tasks");
@@ -1143,12 +833,27 @@ impl MysqlBroker {
     }
 
     /// Purge all tasks (dangerous - use with caution)
+    ///
+    /// # Deadlock retry
+    ///
+    /// This and its four siblings (`purge_by_state`, `purge_by_task_name`,
+    /// `archive_completed_tasks`, `recover_stuck_tasks`) are the crate's
+    /// *bulk* statements: one `DELETE`/`UPDATE` touching an unbounded number
+    /// of rows and every secondary index on `celers_tasks`. That is precisely
+    /// the shape most likely to form a lock cycle with the claim/ack/reject
+    /// traffic running alongside it, and InnoDB resolves a cycle by rolling
+    /// one transaction back with `ERROR 1213 (40001)`. Unretried, a single
+    /// such rollback surfaced to the operator as a failed maintenance call
+    /// even though nothing was wrong — the same spurious failure
+    /// `with_deadlock_retry` was introduced for on the task-lifecycle
+    /// paths. The whole statement is the retryable unit: the rollback is
+    /// complete, so a restart is not a partial re-run.
     pub async fn purge_all(&self) -> Result<u64> {
-        let affected = self
-            .conn
-            .execute("DELETE FROM celers_tasks", &[])
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to purge all tasks: {}", e)))?;
+        let affected = with_deadlock_retry("purge_all", || async {
+            self.conn.execute("DELETE FROM celers_tasks", &[]).await
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to purge all tasks: {}", e)))?;
 
         tracing::warn!(count = affected, "Purged all tasks");
         Ok(affected)
@@ -1220,10 +925,10 @@ impl MysqlBroker {
             })?;
 
         self.conn
-            .execute("OPTIMIZE TABLE celers_task_results", &[])
+            .execute("OPTIMIZE TABLE celers_broker_results", &[])
             .await
             .map_err(|e| {
-                CelersError::Other(format!("Failed to optimize celers_task_results: {}", e))
+                CelersError::Other(format!("Failed to optimize celers_broker_results: {}", e))
             })?;
 
         tracing::info!("Optimized all CeleRS tables");
@@ -1245,10 +950,10 @@ impl MysqlBroker {
             })?;
 
         self.conn
-            .execute("ANALYZE TABLE celers_task_results", &[])
+            .execute("ANALYZE TABLE celers_broker_results", &[])
             .await
             .map_err(|e| {
-                CelersError::Other(format!("Failed to analyze celers_task_results: {}", e))
+                CelersError::Other(format!("Failed to analyze celers_broker_results: {}", e))
             })?;
 
         tracing::info!("Analyzed all CeleRS tables");
@@ -1515,15 +1220,18 @@ impl MysqlBroker {
     /// Purge tasks by state
     ///
     /// Deletes all tasks with the specified state. Use with caution.
+    ///
+    /// Retried on `ERROR 1213` — see [`Self::purge_all`] for why every bulk
+    /// maintenance statement needs it.
     pub async fn purge_by_state(&self, state: DbTaskState) -> Result<u64> {
-        let affected = self
-            .conn
-            .execute(
-                "DELETE FROM celers_tasks WHERE state = ?",
-                &[&state.to_string()],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to purge tasks by state: {}", e)))?;
+        let state_str = state.to_string();
+        let affected = with_deadlock_retry("purge_by_state", || async {
+            self.conn
+                .execute("DELETE FROM celers_tasks WHERE state = ?", &[&state_str])
+                .await
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to purge tasks by state: {}", e)))?;
 
         tracing::info!(state = %state, count = affected, "Purged tasks by state");
         Ok(affected)
@@ -1547,15 +1255,20 @@ impl MysqlBroker {
     /// Purge tasks by task name
     ///
     /// Deletes all tasks with the specified task name. Use with caution.
+    ///
+    /// Retried on `ERROR 1213` — see [`Self::purge_all`] for why every bulk
+    /// maintenance statement needs it.
     pub async fn purge_by_task_name(&self, task_name: &str) -> Result<u64> {
-        let affected = self
-            .conn
-            .execute(
-                "DELETE FROM celers_tasks WHERE task_name = ?",
-                &[&task_name],
-            )
-            .await
-            .map_err(|e| CelersError::Other(format!("Failed to purge tasks by name: {}", e)))?;
+        let affected = with_deadlock_retry("purge_by_task_name", || async {
+            self.conn
+                .execute(
+                    "DELETE FROM celers_tasks WHERE task_name = ?",
+                    &[&task_name],
+                )
+                .await
+        })
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to purge tasks by name: {}", e)))?;
 
         tracing::info!(task_name = %task_name, count = affected, "Purged tasks by name");
         Ok(affected)
@@ -1723,14 +1436,22 @@ impl MysqlBroker {
     /// Useful for query optimization and performance tuning.
     ///
     /// Explains the *actual* statement `dequeue` runs (built by
-    /// `sql_text::dequeue_select_sql`), not a hand-copied
-    /// approximation of it — the previous copy had already drifted away from
-    /// the real query's clause order and predicates.
+    /// `sql_text::dequeue_candidate_sql`), not a hand-copied approximation of
+    /// it — the previous copy had already drifted away from the real query's
+    /// clause order and predicates.
+    ///
+    /// A claim is two statements (see the crate-internal `sql_text` module):
+    /// this reports the
+    /// plan of the *candidate scan*, which is the half whose plan is worth
+    /// tuning — it is the one that picks an index and may filesort. The
+    /// second half is a `FORCE INDEX (PRIMARY)` lookup on a bound id list, so
+    /// its plan is fixed by construction and carries no tuning signal.
     pub async fn explain_dequeue(&self) -> Result<Vec<QueryPlan>> {
-        let explain_sql = format!("EXPLAIN {}", sql_text::dequeue_select_sql("1"));
+        let explain_sql = format!("EXPLAIN {}", sql_text::dequeue_candidate_sql());
+        let candidate_limit = sql_text::claim_candidate_limit(1);
         let rows = self
             .conn
-            .query(&explain_sql, &[&self.queue_name])
+            .query(&explain_sql, &[&self.queue_name, &candidate_limit])
             .await
             .map_err(|e| CelersError::Other(format!("Failed to explain query: {}", e)))?;
 

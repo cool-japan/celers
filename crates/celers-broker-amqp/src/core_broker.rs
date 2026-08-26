@@ -7,8 +7,8 @@
 //! (`publish`/`consume`/`purge`/...). A worker consumes
 //! [`celers_core::Broker`] (`enqueue`/`dequeue`/`ack`/`reject`/...). This
 //! module is the join: it teaches `AmqpBroker` the
-//! [`CoreBrokerTransport`] seam and re-exports the resulting task-queue broker
-//! as [`AmqpCoreBroker`].
+//! [`celers_kombu::core_adapter::CoreBrokerTransport`] seam and re-exports
+//! the resulting task-queue broker as [`AmqpCoreBroker`].
 //!
 //! ```no_run
 //! use celers_broker_amqp::AmqpBroker;
@@ -323,12 +323,46 @@ mod tests {
         let ids = broker.enqueue_batch(tasks).await.expect("enqueue_batch");
         assert_eq!(ids.len(), 5);
 
-        // The prefetch window is 100 by default, so one call drains all five.
-        let messages = broker.dequeue_batch(5).await.expect("dequeue_batch");
+        // The prefetch window is 100 by default, so one call *can* drain all
+        // five -- but `receive_batch`'s zero-timeout drain (after its first,
+        // blocking read) only picks up whatever the broker has already
+        // pushed to this consumer's local buffer by that exact moment.
+        // `enqueue_batch`'s publisher confirms mean the broker durably has
+        // all five messages by the time it returns, not that it has
+        // finished *pushing* every one of them to this already-subscribed
+        // consumer yet -- confirmed live: an immediate `dequeue_batch(5)`
+        // sometimes saw only 1. Poll rather than assume a single call gets
+        // everything, the same eventual-consistency reality any caller of a
+        // real distributed queue's batch API has to handle -- while still
+        // keeping the property this test is named for: at least one of the
+        // calls must actually return more than one message, proving the
+        // batch mechanism rather than repeated single fetches.
+        let mut messages = Vec::new();
+        let mut saw_a_real_batch = false;
+        for _ in 0..20 {
+            if messages.len() >= 5 {
+                break;
+            }
+            let batch = broker
+                .dequeue_batch(5 - messages.len())
+                .await
+                .expect("dequeue_batch");
+            if batch.len() > 1 {
+                saw_a_real_batch = true;
+            }
+            messages.extend(batch);
+            if messages.len() < 5 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        assert_eq!(
+            messages.len(),
+            5,
+            "all 5 enqueued messages must eventually be dequeued"
+        );
         assert!(
-            messages.len() > 1,
-            "batch dequeue must return a batch, got {} message(s)",
-            messages.len()
+            saw_a_real_batch,
+            "at least one dequeue_batch call must return more than one message"
         );
 
         let acks: Vec<(Uuid, Option<String>)> = messages

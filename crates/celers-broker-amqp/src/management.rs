@@ -651,6 +651,16 @@ pub struct ConnectionInfo {
     pub name: String,
     pub vhost: String,
     pub user: String,
+    // `#[serde(default)]`, unlike `name`/`vhost`/`user` above: RabbitMQ's
+    // real Management API can omit `state` for a connection that has not
+    // finished negotiating yet (observed live -- `list_connections` failed
+    // outright with a "missing field `state`" parse error rather than
+    // simply not describing that one connection's state). Every other
+    // optional-in-practice field below already gets this treatment; `state`
+    // had been overlooked. `is_running()` correctly reports `false` for the
+    // resulting empty string, the same conservative answer it gives any
+    // other non-"running" state.
+    #[serde(default)]
     pub state: String,
     #[serde(default)]
     pub channels: u32,
@@ -733,6 +743,9 @@ pub struct ChannelInfo {
     pub acks_uncommitted: u64,
     #[serde(default)]
     pub prefetch_count: u32,
+    // See `ConnectionInfo::state`'s comment: the same "RabbitMQ can omit
+    // this for a not-yet-negotiated entry" failure mode applies here.
+    #[serde(default)]
     pub state: String,
 }
 

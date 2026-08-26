@@ -277,6 +277,196 @@ pub fn json_from_row(row: &Row, col: &str) -> Result<serde_json::Value, OxiSqlEr
         .unwrap_or(serde_json::Value::Null))
 }
 
+// ── Numeric column convention (NUMERIC / DECIMAL) ───────────────────────────
+//
+// PostgreSQL returns `NUMERIC` for a whole family of expressions this crate
+// reads as plain numbers:
+//
+//   * `EXTRACT(EPOCH FROM interval)` and `EXTRACT(EPOCH FROM timestamptz)` —
+//     `numeric` since PostgreSQL 14 (they were `double precision` before);
+//   * `SUM()` / `AVG()` over an exact-value argument (`bigint`, `numeric`);
+//   * any arithmetic whose operands include a `numeric`, so
+//     `EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000` is `numeric`
+//     too, and so is a `PERCENTILE_CONT` fed from one.
+//
+// `oxisql-postgres` maps `Type::NUMERIC` to `oxisql_core::Value::Decimal`
+// (a string), and `oxisql_core::FromValue` is implemented for `f64`/`i64`
+// against `Value::F64`/`Value::I64` **only** — never `Value::Decimal`. A
+// direct `row.col::<f64>(..)` on such a column therefore fails with
+// `OxiSqlError::TypeMismatch`, at run time, against a real server, on a
+// PostgreSQL version boundary nobody was thinking about.
+//
+// Until now this crate defended against that in the SQL text, by appending an
+// explicit `::double precision` / `::BIGINT` cast to every aggregate
+// projection. That works, but it is enforced by convention across three dozen
+// hand-written statements: one new aggregate written without the cast is a
+// live-server failure with no local test that can catch it.
+//
+// The helpers below make the *read* side self-defending instead. They inspect
+// the raw `Value` (via `Row::get`, bypassing `FromValue`) and accept `F64`,
+// `I64` **and** `Decimal`, so the read is correct whether or not the
+// statement carried a cast, and on either side of the PostgreSQL 14 change.
+// Ported from `celers-backend-db`'s `row_ext.rs`, which reached the same
+// conclusion from the MySQL `DECIMAL` side.
+//
+// Prefer these over `row.col::<f64/i64>(..)` for any column derived from
+// `SUM`/`AVG`/`MIN`/`MAX`/`STDDEV`/`PERCENTILE_CONT`/`EXTRACT`/division —
+// i.e. anything that is not provably `COUNT(*)` (always `bigint`/`I64`) or a
+// plain stored column.
+
+/// The shared `Value` -> `Option<f64>` core of the `*_decimal_f64_*` helpers.
+///
+/// `label` names the column (or index) for error messages only.
+fn opt_decimal_f64_from_value(
+    value: &oxisql_core::Value,
+    label: &str,
+) -> Result<Option<f64>, OxiSqlError> {
+    match value {
+        oxisql_core::Value::Null => Ok(None),
+        oxisql_core::Value::F64(f) => Ok(Some(*f)),
+        #[allow(clippy::cast_precision_loss)]
+        oxisql_core::Value::I64(n) => Ok(Some(*n as f64)),
+        oxisql_core::Value::Decimal(s) => s.trim().parse::<f64>().map(Some).map_err(|e| {
+            OxiSqlError::Other(format!("invalid NUMERIC in column '{label}': {e} ({s:?})"))
+        }),
+        other => Err(OxiSqlError::TypeMismatch {
+            expected: "F64/I64/Decimal",
+            got: other.type_name(),
+        }),
+    }
+}
+
+/// The shared `Value` -> `i64` core of the `*_decimal_i64_*` helpers.
+fn decimal_i64_from_value(value: &oxisql_core::Value, label: &str) -> Result<i64, OxiSqlError> {
+    match value {
+        oxisql_core::Value::I64(n) => Ok(*n),
+        #[allow(clippy::cast_possible_truncation)]
+        oxisql_core::Value::F64(f) => Ok(*f as i64),
+        oxisql_core::Value::Decimal(s) => s.trim().parse::<i64>().or_else(|_| {
+            // `EXTRACT(EPOCH FROM ...)` yields a scaled decimal
+            // (`"3600.000000"`), which does not parse as `i64` even though it
+            // is integral. Fall back to parsing as `f64` and rounding rather
+            // than failing on a well-formed integral decimal.
+            #[allow(clippy::cast_possible_truncation)]
+            s.trim()
+                .parse::<f64>()
+                .map(|f| f.round() as i64)
+                .map_err(|e| {
+                    OxiSqlError::Other(format!("invalid NUMERIC in column '{label}': {e} ({s:?})"))
+                })
+        }),
+        other => Err(OxiSqlError::TypeMismatch {
+            expected: "I64/F64/Decimal",
+            got: other.type_name(),
+        }),
+    }
+}
+
+/// Read a numeric column as `f64`, accepting `Value::F64`, `Value::I64`, or
+/// `Value::Decimal` (PostgreSQL `NUMERIC`).
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::TypeMismatch`] if the column holds any other
+/// variant (including `Null` — use [`opt_decimal_f64_from_row`] for a
+/// nullable column), or [`OxiSqlError::Other`] if a `Decimal` string fails to
+/// parse as `f64`.
+pub fn decimal_f64_from_row(row: &Row, col: &str) -> Result<f64, OxiSqlError> {
+    opt_decimal_f64_from_row(row, col)?.ok_or(OxiSqlError::TypeMismatch {
+        expected: "F64/I64/Decimal",
+        got: "Null",
+    })
+}
+
+/// Read a nullable numeric column as `Option<f64>`, accepting `Value::F64`,
+/// `Value::I64`, `Value::Decimal`, or `Value::Null` (-> `None`).
+///
+/// `AVG(...)`/`SUM(...)`/`STDDEV(...)` over **zero rows** is `NULL`, not `0`,
+/// so this — not [`decimal_f64_from_row`] — is the right helper for any
+/// aggregate over a window that can legitimately be empty, which on a fresh
+/// deployment is all of them.
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::TypeMismatch`] if the column holds a non-numeric,
+/// non-null variant, or [`OxiSqlError::Other`] if a `Decimal` string fails to
+/// parse as `f64`.
+pub fn opt_decimal_f64_from_row(row: &Row, col: &str) -> Result<Option<f64>, OxiSqlError> {
+    let value = row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?;
+    opt_decimal_f64_from_value(value, col)
+}
+
+/// [`opt_decimal_f64_from_row`] for a column addressed by position.
+///
+/// Same reason [`RowExt::col_idx`] exists: an unaliased `SELECT AVG(...)`
+/// projection has no dependable column name to look up.
+///
+/// # Errors
+///
+/// As [`opt_decimal_f64_from_row`], plus [`OxiSqlError::Other`] if the row has
+/// no column at `idx`.
+pub fn opt_decimal_f64_from_row_idx(row: &Row, idx: usize) -> Result<Option<f64>, OxiSqlError> {
+    let value = row
+        .get_by_index(idx)
+        .ok_or_else(|| OxiSqlError::Other(format!("no column at index {idx}")))?;
+    opt_decimal_f64_from_value(value, &idx.to_string())
+}
+
+/// Read a numeric column as `i64`, accepting `Value::I64`, `Value::F64`
+/// (truncating), or `Value::Decimal` (PostgreSQL `NUMERIC`).
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::TypeMismatch`] if the column holds any other
+/// variant (including `Null` — use [`opt_decimal_i64_from_row`] for an
+/// aggregate that can be `NULL`), or [`OxiSqlError::Other`] if a `Decimal`
+/// string parses as neither `i64` nor `f64`.
+pub fn decimal_i64_from_row(row: &Row, col: &str) -> Result<i64, OxiSqlError> {
+    let value = row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?;
+    decimal_i64_from_value(value, col)
+}
+
+/// Read a nullable aggregate column as `Option<i64>`, accepting everything
+/// [`decimal_i64_from_row`] does plus `Value::Null` (-> `None`).
+///
+/// `SUM(...)` over **zero rows** is `NULL`, not `0`. Reading such a column
+/// with the non-optional [`decimal_i64_from_row`] fails the moment the
+/// aggregated window is empty — the normal state of a fresh deployment, not
+/// an edge case. Use this and treat `None` as the zero the caller means.
+///
+/// # Errors
+///
+/// As [`decimal_i64_from_row`], minus the `Null` case.
+pub fn opt_decimal_i64_from_row(row: &Row, col: &str) -> Result<Option<i64>, OxiSqlError> {
+    let value = row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?;
+    if matches!(value, oxisql_core::Value::Null) {
+        return Ok(None);
+    }
+    decimal_i64_from_value(value, col).map(Some)
+}
+
+/// [`opt_decimal_i64_from_row`] for a column addressed by position.
+///
+/// # Errors
+///
+/// As [`opt_decimal_i64_from_row`], plus [`OxiSqlError::Other`] if the row has
+/// no column at `idx`.
+pub fn opt_decimal_i64_from_row_idx(row: &Row, idx: usize) -> Result<Option<i64>, OxiSqlError> {
+    let value = row
+        .get_by_index(idx)
+        .ok_or_else(|| OxiSqlError::Other(format!("no column at index {idx}")))?;
+    if matches!(value, oxisql_core::Value::Null) {
+        return Ok(None);
+    }
+    decimal_i64_from_value(value, &idx.to_string()).map(Some)
+}
+
 // ── DateTime<Utc> parameter convention ──────────────────────────────────────
 //
 // oxisql-core provides `FromValue for chrono::DateTime<Utc>` (behind the
@@ -435,6 +625,109 @@ mod tests {
         let row = row_with("data", Value::Text("not json".to_string()));
         let result = json_from_row(&row, "data");
         assert!(result.is_err());
+    }
+
+    // ── NUMERIC read guards ─────────────────────────────────────────────
+    //
+    // The whole point of these helpers is that they accept the variant a
+    // plain `row.col::<f64>(..)` rejects, so every test below pins one
+    // concrete `Value` variant. `Value::Decimal` is what `oxisql-postgres`
+    // hands back for a PostgreSQL `NUMERIC` — i.e. for every uncast
+    // `EXTRACT(EPOCH ...)`, `SUM(...)` and `AVG(...)` in the crate.
+
+    #[test]
+    fn decimal_f64_accepts_every_numeric_variant() {
+        assert_eq!(
+            decimal_f64_from_row(&row_with("v", Value::F64(3.5)), "v").expect("f64 column"),
+            3.5
+        );
+        assert_eq!(
+            decimal_f64_from_row(&row_with("v", Value::I64(7)), "v").expect("i64 column"),
+            7.0
+        );
+        let decimal = row_with("v", Value::Decimal("12.25".to_string()));
+        assert!(
+            (decimal_f64_from_row(&decimal, "v").expect("numeric column") - 12.25).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn decimal_f64_rejects_null_and_nonsense_without_panicking() {
+        assert!(decimal_f64_from_row(&row_with("v", Value::Null), "v").is_err());
+        assert!(decimal_f64_from_row(&row_with("v", Value::Decimal("abc".into())), "v").is_err());
+        assert!(decimal_f64_from_row(&row_with("v", Value::Text("3.5".into())), "v").is_err());
+        assert!(decimal_f64_from_row(&row_with("v", Value::F64(1.0)), "missing").is_err());
+    }
+
+    #[test]
+    fn opt_decimal_f64_maps_null_to_none() {
+        assert_eq!(
+            opt_decimal_f64_from_row(&row_with("v", Value::Null), "v").expect("nullable"),
+            None
+        );
+        assert_eq!(
+            opt_decimal_f64_from_row(&row_with("v", Value::Decimal("0.5".into())), "v")
+                .expect("nullable"),
+            Some(0.5)
+        );
+    }
+
+    #[test]
+    fn decimal_i64_accepts_every_numeric_variant() {
+        assert_eq!(
+            decimal_i64_from_row(&row_with("v", Value::I64(9)), "v").expect("i64 column"),
+            9
+        );
+        assert_eq!(
+            decimal_i64_from_row(&row_with("v", Value::F64(9.7)), "v").expect("f64 column"),
+            9
+        );
+        assert_eq!(
+            decimal_i64_from_row(&row_with("v", Value::Decimal("42".into())), "v")
+                .expect("integral numeric"),
+            42
+        );
+    }
+
+    #[test]
+    fn decimal_i64_accepts_a_scaled_integral_numeric() {
+        // What `EXTRACT(EPOCH FROM (NOW() - created_at))` actually returns:
+        // an integral value carrying a decimal scale, which `"3600.000000"
+        // .parse::<i64>()` rejects outright.
+        let row = row_with("v", Value::Decimal("3600.000000".to_string()));
+        assert_eq!(
+            decimal_i64_from_row(&row, "v").expect("scaled integral numeric"),
+            3600
+        );
+        // And a genuinely fractional one rounds rather than failing.
+        let row = row_with("v", Value::Decimal("3600.75".to_string()));
+        assert_eq!(
+            decimal_i64_from_row(&row, "v").expect("fractional numeric"),
+            3601
+        );
+    }
+
+    #[test]
+    fn decimal_i64_rejects_null_and_nonsense_without_panicking() {
+        assert!(decimal_i64_from_row(&row_with("v", Value::Null), "v").is_err());
+        assert!(decimal_i64_from_row(&row_with("v", Value::Decimal("abc".into())), "v").is_err());
+        assert!(decimal_i64_from_row(&row_with("v", Value::Text("42".into())), "v").is_err());
+        assert!(decimal_i64_from_row(&row_with("v", Value::I64(1)), "missing").is_err());
+    }
+
+    #[test]
+    fn opt_decimal_i64_maps_an_empty_sum_to_none() {
+        // `SUM(...)` over zero rows is NULL in PostgreSQL, not 0.
+        assert_eq!(
+            opt_decimal_i64_from_row(&row_with("total", Value::Null), "total").expect("nullable"),
+            None
+        );
+        assert_eq!(
+            opt_decimal_i64_from_row(&row_with("total", Value::Decimal("5".into())), "total")
+                .expect("nullable"),
+            Some(5)
+        );
+        assert!(opt_decimal_i64_from_row(&row_with("total", Value::Null), "missing").is_err());
     }
 
     #[test]

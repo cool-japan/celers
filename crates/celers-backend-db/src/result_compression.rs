@@ -5,7 +5,7 @@
 //! anything stored there that is not valid JSON. Compressing it therefore
 //! cannot mean writing raw compressed bytes into the column: it means
 //! replacing a large-enough value with a small JSON *envelope* (see
-//! [`maybe_compress`]/[`maybe_decompress`]) carrying the compressed bytes
+//! `maybe_compress`/`maybe_decompress`) carrying the compressed bytes
 //! (base64-encoded, since JSON strings are text) and the algorithm that
 //! produced them.
 //!
@@ -37,7 +37,7 @@ use crate::{BackendError, Result};
 
 /// Object key marking a compressed envelope. Paired with [`DATA_KEY`] and
 /// chosen to be implausible as a real task-result field name;
-/// [`maybe_decompress`] additionally requires the object to have *exactly*
+/// `maybe_decompress` additionally requires the object to have *exactly*
 /// these two keys before treating it as an envelope at all, which is the
 /// practical mitigation for the (unavoidable, for any marker embedded in an
 /// otherwise schema-free JSON value) risk of a genuine result coincidentally
@@ -62,8 +62,8 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    /// Compression off. [`maybe_compress`] always returns its input
-    /// unchanged; [`maybe_decompress`] still works normally, because
+    /// Compression off. `maybe_compress` always returns its input
+    /// unchanged; `maybe_decompress` still works normally, because
     /// decoding a `celers_core` codec needs no configuration beyond the
     /// codec being registered — which every [`ResultCompressor`] this
     /// module builds always has, regardless of `enabled`. That is what

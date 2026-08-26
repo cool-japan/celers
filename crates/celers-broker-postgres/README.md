@@ -363,13 +363,31 @@ Main task queue with columns for task state, priority, retries, scheduling, and 
 ### `celers_dead_letter_queue`
 Storage for permanently failed tasks.
 
-### `celers_task_results`
-Result backend for task execution outcomes.
+### `celers_broker_results`
+The broker's own store for task execution outcomes (`status`, `result` JSONB,
+`error`, `traceback`, `runtime_ms`), written by `store_result` /
+`store_results_batch` and read by `get_result` / `get_results_batch`.
+
+Deliberately **not** named `celers_task_results`: that name belongs to
+`celers-backend-db`'s result backend, whose schema
+(`result_state` / `result_data` / `extra`) is incompatible with this one, and
+both crates auto-migrate — often against the same database. The two coexist,
+and `celers-broker-sql` uses the same split on MySQL. See
+`migrations/009_broker_results.sql`.
 
 ### `celers_task_history`
 Optional audit log of task state changes.
 
-See `migrations/001_init.sql` and `migrations/002_results.sql` for full schema details.
+### `celers_schema_migrations`
+Ledger of applied migration files. `migrate()` records each file here as it is
+applied and skips the ones already listed, so a fleet of workers all calling
+`migrate()` on start-up runs the DDL once rather than once per worker.
+
+See `migrations/001_init.sql` and the rest of `migrations/` for full schema
+details. Note that `celers_tasks.updated_at`
+(`migrations/010_task_updated_at.sql`) is maintained explicitly by every
+`UPDATE celers_tasks` this crate issues rather than by a trigger, so a custom
+statement written against these tables should set it too.
 
 ## Performance Characteristics
 
@@ -467,8 +485,9 @@ pg_basebackup -h localhost -U postgres -D /backup/postgres -Ft -z -P
 pg_dump -h localhost -U postgres -d mydb \
   -t celers_tasks \
   -t celers_dead_letter_queue \
-  -t celers_task_results \
+  -t celers_broker_results \
   -t celers_task_history \
+  -t celers_schema_migrations \
   -F c -f celers_tables_backup.dump
 ```
 
@@ -589,18 +608,47 @@ async fn backup_tasks(broker: &PostgresBroker) -> Result<(), Box<dyn std::error:
    broker.archive_results(thirty_days).await?;
    ```
 
-## Testing
+## Testing against a real server
 
-Unit tests:
+The unit tests run with no database. To additionally exercise the integration
+suite, point **`CELERS_TEST_POSTGRES_URL`** at a PostgreSQL 12+ instance:
+
 ```bash
-cargo test
+CELERS_TEST_POSTGRES_URL=postgres://celers:celers_password@127.0.0.1:5432/celers \
+    cargo nextest run -p celers-broker-postgres --all-features --run-ignored all
 ```
 
-Integration tests (requires PostgreSQL):
-```bash
-export DATABASE_URL="postgres://postgres:postgres@localhost/celers_test"
-cargo test --all-features -- --ignored
-```
+The variable is `CELERS_TEST_POSTGRES_URL`, not `DATABASE_URL` — the latter is
+what the *result backend* crate (`celers-backend-db`) reads, and the two can
+point at the same server. The repository's `docker-compose.yml` provides a
+matching instance (`docker compose up -d postgres`), or run
+`scripts/test-integration.sh --only postgres`, which brings it up, exports the
+variable and runs this suite for you.
+
+`--run-ignored all` matters: most of the integration suite early-returns when
+the variable is unset (so a run with no server stays green), but a few tests are
+`#[ignore]`d and are only selected by that flag. Every gated test that skips
+prints a `SKIPPED: <test name> (set CELERS_TEST_POSTGRES_URL to run)` line
+naming itself, so a skipped run and a real run can be told apart from the output
+rather than only from the test count. No gated test falls back to a hardcoded
+connection string: unset means skip, never a surprise connection to `localhost`.
+
+With a server configured the suite is **271/271** (verified 2026-08-26 against
+PostgreSQL 16), covering `tests_pg.rs` (the claim/ack/cancel spine),
+`tests_pg_binds.rs` (the UUID/JSONB/NUMERIC parameter binding this crate needs
+`::text::uuid`-style casts for), `tests_pg_results.rs` (the
+`celers_broker_results` store and the `celers_tasks.updated_at` analytics) and
+`tests_pg_locks.rs` (the `AdvisoryLockGuard` API and the migration lock).
+
+### Schema and migrations
+
+`PostgresBroker::migrate()` applies `migrations/000_schema_migrations.sql`
+untracked and then records each of the rest in `celers_schema_migrations`. Note
+that **`003_partitioning.sql` is deliberately not applied**: it is an opt-in
+file for deployments that want a partitioned `celers_tasks`. The broker's own
+result store is `celers_broker_results` (migration `009`) — *not*
+`celers_task_results`, which belongs to `celers-backend-db`'s result backend and
+is left strictly alone so both can share one database.
 
 ## License
 

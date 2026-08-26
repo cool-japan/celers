@@ -36,6 +36,32 @@
 //! real in-process parallelism, and a dropped connection is detected and
 //! reconnected (with backoff) instead of wedging the broker.
 //!
+//! # Result storage
+//!
+//! [`PostgresBroker::store_result`] and friends write to
+//! `celers_broker_results` (migration `009_broker_results.sql`), **not** to
+//! `celers_task_results` — that name belongs to `celers-backend-db`'s result
+//! backend, which auto-migrates an incompatible schema onto the same server.
+//! `results.rs`'s module docs carry the full three-table split.
+//!
+//! # `celers_tasks.updated_at`
+//!
+//! Every `UPDATE celers_tasks` this crate issues sets `updated_at = NOW()`
+//! explicitly (migration `010_task_updated_at.sql`); there is deliberately no
+//! trigger. [`PostgresBroker::get_state_transition_history`] and
+//! [`PostgresBroker::detect_abnormal_state_duration`] read it, and a custom
+//! statement written against these tables should maintain it too.
+//!
+//! # Advisory locks
+//!
+//! [`PostgresBroker::acquire_advisory_lock`] and its siblings return an
+//! [`AdvisoryLockGuard`] that owns the pooled connection the lock was taken
+//! on — `pg_advisory_lock` is session-scoped, so the lock and its release must
+//! reach the same backend session. The older
+//! `try_advisory_lock`/`advisory_lock`/`release_advisory_lock` trio is
+//! `#[deprecated]` in favour of it. [`PostgresBroker::migrate`]'s own lock
+//! acquisition is bounded by [`DEFAULT_MIGRATION_LOCK_TIMEOUT`].
+//!
 //! # Retention
 //!
 //! `ack` keeps terminal rows for auditing. Since `celers_tasks` is also the
@@ -129,6 +155,7 @@ pub mod types;
 
 // Feature modules
 mod advanced_ops;
+mod advisory_lock;
 mod analytics;
 mod convenience;
 mod db_monitoring;
@@ -149,6 +176,7 @@ pub mod monitoring;
 pub mod utilities;
 
 // Re-export all public types
+pub use advisory_lock::{AdvisoryLockGuard, DEFAULT_MIGRATION_LOCK_TIMEOUT};
 pub use broker_core::{PostgresBroker, DEFAULT_REVOCATION_TTL_SECS, MIGRATION_ADVISORY_LOCK_ID};
 pub use notifications::TaskNotificationListener;
 pub use revocation::PgRevocationStream;
@@ -163,3 +191,9 @@ mod tests_pg;
 
 #[cfg(test)]
 mod tests_pg_binds;
+
+#[cfg(test)]
+mod tests_pg_locks;
+
+#[cfg(test)]
+mod tests_pg_results;

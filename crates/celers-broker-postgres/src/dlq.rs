@@ -289,6 +289,7 @@ impl PostgresBroker {
             SET state = 'pending',
                 started_at = NULL,
                 worker_id = NULL,
+                updated_at = NOW(),
                 error_message = 'Recovered from stuck processing state'
             WHERE state = 'processing'
               AND started_at < $1::text::timestamptz

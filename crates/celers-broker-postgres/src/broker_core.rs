@@ -74,6 +74,25 @@ pub struct PostgresBroker {
     /// `revocation.rs`. Mirrors `celers-broker-redis`'s
     /// `DEFAULT_REVOCATION_TTL_SECS`/`with_revocation_ttl`.
     pub(crate) revocation_ttl_secs: u64,
+    /// Advisory locks currently held through the *deprecated*
+    /// `try_advisory_lock` / `advisory_lock` / `release_advisory_lock` trio,
+    /// keyed by lock id.
+    ///
+    /// `pg_advisory_lock` is **session**-scoped, so a lock taken on one
+    /// pooled connection can only be released on that same connection. The
+    /// trio's signatures carry nothing between the acquire call and the
+    /// release call, so the connection has to be parked somewhere for the
+    /// pair to be sound at all — that is what this map is. Each entry pins
+    /// the [`PooledConnection`] whose session holds the lock, exactly the way
+    /// [`crate::AdvisoryLockGuard`] does for the non-deprecated API, and
+    /// `release_advisory_lock` takes the entry back out and unlocks on it.
+    ///
+    /// The guard API is preferred precisely because this map cannot express
+    /// ownership: a caller that forgets to release pins one of the broker's
+    /// pool slots for the broker's whole lifetime, whereas a dropped guard is
+    /// at least noisy about it. See `advisory_lock.rs`.
+    pub(crate) advisory_locks:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<i64, PooledConnection>>>,
 }
 
 /// Default lifetime of a durable revocation record: 24 hours, matching
@@ -161,6 +180,7 @@ impl PostgresBroker {
             retry_strategy: RetryStrategy::default(),
             hooks: Arc::new(tokio::sync::RwLock::new(TaskHooks::new())),
             revocation_ttl_secs: DEFAULT_REVOCATION_TTL_SECS,
+            advisory_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -490,19 +510,48 @@ impl PostgresBroker {
     /// A database migrated by an older build has no ledger rows: the first
     /// call after the upgrade replays the set once (harmlessly — every file
     /// is idempotent) and records it, and subsequent calls skip it.
+    ///
+    /// # The lock acquisition is bounded
+    ///
+    /// Waiting for the lock is capped at
+    /// [`crate::DEFAULT_MIGRATION_LOCK_TIMEOUT`] (60 s); use
+    /// [`migrate_with_lock_timeout`](Self::migrate_with_lock_timeout) to pick
+    /// another deadline. This used to be an unbounded `pg_advisory_lock`,
+    /// which is a statement the client cannot abandon once the server is
+    /// waiting on it: a single session that took the migration lock and then
+    /// stalled — a debugger paused on a breakpoint, a `BEGIN` nobody
+    /// committed, a container frozen mid-`docker pause` — silently wedged
+    /// every worker in the fleet at start-up, with no error, no log line and
+    /// no timeout to hit. A bounded wait turns that into an actionable
+    /// failure naming the lock id and pointing at `pg_locks`.
     pub async fn migrate(&self) -> Result<()> {
+        self.migrate_with_lock_timeout(crate::advisory_lock::DEFAULT_MIGRATION_LOCK_TIMEOUT)
+            .await
+    }
+
+    /// [`migrate`](Self::migrate) with an explicit deadline for acquiring the
+    /// migration advisory lock.
+    ///
+    /// The deadline covers only the *lock acquisition*; the migrations
+    /// themselves then run to completion. A zero deadline degrades to a
+    /// single non-blocking attempt, which is the natural "migrate only if
+    /// nobody else is" behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming [`MIGRATION_ADVISORY_LOCK_ID`] and the elapsed
+    /// wait if another session still holds the lock when `lock_timeout`
+    /// expires, or whatever the migration set itself failed with.
+    pub async fn migrate_with_lock_timeout(&self, lock_timeout: Duration) -> Result<()> {
         // One connection for the whole call: `pg_advisory_lock` is
         // *session*-scoped, so taking it on a pooled connection and releasing
         // it on whichever slot the pool hands out next would leak the lock
         // forever. Holding the guard pins the slot until this returns.
         let conn = self.connection().await?;
 
-        conn.execute(
-            "SELECT pg_advisory_lock($1)",
-            &[&MIGRATION_ADVISORY_LOCK_ID],
-        )
-        .await
-        .map_err(|e| CelersError::Other(format!("Failed to lock for migration: {}", e)))?;
+        crate::advisory_lock::lock_within(&conn, MIGRATION_ADVISORY_LOCK_ID, lock_timeout)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to lock for migration: {e}")))?;
 
         let outcome = Self::run_migration_set(&conn).await;
 
@@ -527,7 +576,7 @@ impl PostgresBroker {
     /// Split out of [`migrate`](Self::migrate) so the advisory lock there
     /// wraps every path, including an early return from a failing migration.
     async fn run_migration_set(conn: &crate::pool::PooledConnection) -> Result<()> {
-        let migrations: [(&str, &str); 7] = [
+        let migrations: [(&str, &str); 9] = [
             ("001_init", include_str!("../migrations/001_init.sql")),
             ("002_results", include_str!("../migrations/002_results.sql")),
             (
@@ -554,6 +603,26 @@ impl PostgresBroker {
             (
                 "008_revocation",
                 include_str!("../migrations/008_revocation.sql"),
+            ),
+            // `celers_broker_results` — the broker's own result store, which
+            // `results.rs` and `analytics.rs`'s `store_results_batch` have
+            // always addressed and that no migration created, so every one of
+            // those calls failed with `relation ... does not exist`. The name
+            // is deliberately not `celers_task_results`: that belongs to
+            // `celers-backend-db`'s result backend, which auto-migrates an
+            // incompatible schema onto the same server. See the file header.
+            (
+                "009_broker_results",
+                include_str!("../migrations/009_broker_results.sql"),
+            ),
+            // `celers_tasks.updated_at` — read by
+            // `get_state_transition_history` and by
+            // `detect_abnormal_state_duration("processing", ..)`, and now
+            // maintained explicitly by every `UPDATE celers_tasks` in this
+            // crate.
+            (
+                "010_task_updated_at",
+                include_str!("../migrations/010_task_updated_at.sql"),
             ),
         ];
 

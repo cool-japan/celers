@@ -5,11 +5,13 @@
 //! [`Broker::dequeue`](celers_core::Broker::dequeue) previously carried three
 //! independent copies of the same claim statement and the same row-mapping
 //! code, and all three copies carried the same two defects. They now share
-//! [`crate::sql_text::dequeue_select_sql`] and
+//! [`crate::sql_text::dequeue_candidate_sql`] /
+//! [`crate::sql_text::dequeue_claim_sql`] and
 //! [`crate::task_row::row_to_broker_message`], plus the two helpers below.
 
 use crate::broker_core::MysqlBroker;
 use crate::mysql_error::with_deadlock_retry_celers;
+use crate::row_ext::RowExt;
 use crate::sql_text;
 use crate::task_row;
 use celers_core::{BrokerMessage, CelersError, Result, SerializedTask, TaskId};
@@ -21,26 +23,121 @@ use uuid::Uuid;
 #[cfg(feature = "metrics")]
 use celers_metrics::{TASKS_ENQUEUED_BY_TYPE, TASKS_ENQUEUED_TOTAL};
 
+/// Hard ceiling on the locking round trips one claim will spend walking its
+/// candidate list.
+///
+/// Each round asks for exactly the number of tasks still needed, so a round
+/// that comes back short means that many candidates were held by competing
+/// workers, and `offset` advances by the number asked for whether or not any
+/// came back.
+///
+/// # This is a backstop, not the operative bound
+///
+/// The candidate window is what actually ends the walk in every case but one.
+/// A round advances `offset` by at most `limit`, and
+/// [`sql_text::claim_candidate_limit`] hands back roughly `limit * 4`
+/// candidates, so the list is exhausted after about four rounds for any
+/// `limit >= 2` — well inside this cap. The single exception is `limit == 1`,
+/// where the window is its floor of 8 and `offset` advances by 1 per round:
+/// there the two bounds coincide exactly, and eight round trips examine
+/// exactly the eight candidates on offer.
+///
+/// It is kept because it makes non-termination structurally impossible rather
+/// than merely arguable: the loop's progress otherwise rests on `needed >= 1`
+/// holding on every iteration.
+const MAX_CLAIM_ROUNDS: usize = 8;
+
 /// Claim up to `limit` pending tasks from `queue_name` inside `tx`.
 ///
-/// `limit` of `None` claims a single task with a literal `LIMIT 1`; `Some(n)`
-/// binds the limit. The returned pairs carry the real database row id
-/// alongside the message, so the caller never has to re-derive it.
+/// `limit` of `None` claims a single task; `Some(n)` claims up to `n`. The
+/// returned pairs carry the real database row id alongside the message, so
+/// the caller never has to re-derive it.
+///
+/// # Two statements, not one
+///
+/// The claim is deliberately split into a non-locking candidate scan and a
+/// primary-key-only locking read — see [`crate::sql_text`]'s module header for
+/// the `performance_schema.data_locks` measurement that forced it and why
+/// neither `READ COMMITTED` nor a rewrite of the single statement was
+/// available. The short version: a locking range scan takes next-key locks
+/// that reach into a *neighbouring queue's* index records, and its filesort
+/// locks the whole due backlog of its own queue.
+///
+/// # Candidate walk
+///
+/// Step 1 returns [`sql_text::claim_candidate_limit`] ids in dispatch order.
+/// Step 2 then locks them in chunks sized to what is still needed, so no row
+/// is ever locked and then discarded. A candidate a competing worker already
+/// holds (`SKIP LOCKED`) or has already claimed (the re-checked
+/// `state = 'pending'`) simply does not come back, and the next round moves
+/// further down the list.
+///
+/// A claim can still come back short when every candidate in the window is
+/// contended — that is the documented trade-off of a bounded window (see
+/// [`sql_text::claim_candidate_limit`]), and it is a case `dequeue`'s
+/// `Option`/`Vec` contract and every worker poll loop already handle.
 pub(crate) async fn claim_pending_rows(
     tx: &mut (dyn Transaction + '_),
     queue_name: &str,
     limit: Option<i64>,
 ) -> Result<Vec<(Uuid, BrokerMessage)>> {
-    let sql = sql_text::dequeue_select_sql(if limit.is_some() { "?" } else { "1" });
-
-    let queue_param: &dyn ToSqlValue = &queue_name;
-    let rows = match limit.as_ref() {
-        Some(limit_value) => tx.query(&sql, &[queue_param, limit_value]).await,
-        None => tx.query(&sql, &[queue_param]).await,
+    let wanted = limit.unwrap_or(1).max(0) as usize;
+    if wanted == 0 {
+        return Ok(Vec::new());
     }
-    .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
 
-    rows.iter().map(task_row::row_to_broker_message).collect()
+    let candidates = candidate_ids(tx, queue_name, wanted).await?;
+
+    let mut claimed: Vec<(Uuid, BrokerMessage)> = Vec::with_capacity(wanted);
+    let mut offset = 0usize;
+    let mut rounds = 0usize;
+
+    while claimed.len() < wanted && offset < candidates.len() && rounds < MAX_CLAIM_ROUNDS {
+        let needed = wanted - claimed.len();
+        let end = (offset + needed).min(candidates.len());
+        let chunk = &candidates[offset..end];
+        offset = end;
+        rounds += 1;
+
+        let sql = sql_text::dequeue_claim_sql(chunk.len());
+        let params: Vec<&dyn ToSqlValue> = chunk.iter().map(|id| id as &dyn ToSqlValue).collect();
+        let rows = tx
+            .query(&sql, &params)
+            .await
+            .map_err(|e| CelersError::Other(format!("Failed to dequeue task: {}", e)))?;
+
+        for row in rows.iter() {
+            claimed.push(task_row::row_to_broker_message(row)?);
+        }
+    }
+
+    // A chunk can only ever return rows for the ids it bound, so this is
+    // belt and braces against a server handing back more than was asked for.
+    claimed.truncate(wanted);
+    Ok(claimed)
+}
+
+/// Step 1 of the claim: candidate task ids in dispatch order, locking nothing.
+async fn candidate_ids(
+    tx: &mut (dyn Transaction + '_),
+    queue_name: &str,
+    wanted: usize,
+) -> Result<Vec<String>> {
+    let candidate_limit = sql_text::claim_candidate_limit(wanted);
+    let rows = tx
+        .query(
+            sql_text::dequeue_candidate_sql(),
+            &[&queue_name, &candidate_limit],
+        )
+        .await
+        .map_err(|e| CelersError::Other(format!("Failed to scan for claimable tasks: {}", e)))?;
+
+    rows.iter()
+        .map(|row| {
+            row.col::<String>("id")
+                .map_err(|e| CelersError::Other(format!("Failed to scan for claimable tasks: {e}")))
+        })
+        .collect()
 }
 
 /// Transition the claimed rows to `processing`, optionally recording the

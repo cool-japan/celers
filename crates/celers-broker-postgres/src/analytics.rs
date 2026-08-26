@@ -5,7 +5,10 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};
+use crate::row_ext::{
+    decimal_i64_from_row, json_param, opt_decimal_f64_from_row, opt_decimal_i64_from_row,
+    uuid_from_row, uuid_param, RowExt,
+};
 use crate::types::{
     DbTaskState, PriorityStrategy, PriorityStrategyResult, StateTransitionStats, TaskInfo,
     TaskLifecycle, TaskResult,
@@ -77,7 +80,7 @@ impl PostgresBroker {
             let result_param: Option<String> = result.result.as_ref().map(json_param);
             tx.execute(
                 r#"
-                INSERT INTO celers_task_results (task_id, status, result, error, traceback)
+                INSERT INTO celers_broker_results (task_id, status, result, error, traceback)
                 VALUES ($1::text::uuid, $2, $3::text::jsonb, $4, $5)
                 ON CONFLICT (task_id) DO UPDATE
                 SET status = EXCLUDED.status,
@@ -335,11 +338,14 @@ impl PostgresBroker {
             let processed: i64 = row
                 .col("processed")
                 .map_err(|e| CelersError::Other(format!("Failed to read processed: {}", e)))?;
-            let avg_time_ms: Option<f64> = row
-                .col("avg_time_ms")
+            // `AVG(EXTRACT(EPOCH ...) * 1000)` and the `SUM(..)::FLOAT / COUNT(*)`
+            // ratio are both aggregates: `NULL` over an empty group and, on
+            // PostgreSQL >= 14, `NUMERIC` without the explicit casts the SQL
+            // above happens to carry. `opt_decimal_f64_from_row` accepts both
+            // without depending on the cast surviving a future edit.
+            let avg_time_ms: Option<f64> = opt_decimal_f64_from_row(row, "avg_time_ms")
                 .map_err(|e| CelersError::Other(format!("Failed to read avg_time_ms: {}", e)))?;
-            let success_rate: Option<f64> = row
-                .col("success_rate")
+            let success_rate: Option<f64> = opt_decimal_f64_from_row(row, "success_rate")
                 .map_err(|e| CelersError::Other(format!("Failed to read success_rate: {}", e)))?;
             stats.push((worker_id, processed, avg_time_ms, success_rate));
         }
@@ -490,7 +496,8 @@ impl PostgresBroker {
             .execute(
                 r#"
             UPDATE celers_tasks
-            SET queue_name = $1
+            SET queue_name = $1,
+                updated_at = NOW()
             WHERE id IN (
                 SELECT id FROM celers_tasks
                 WHERE queue_name = $2 AND state = 'pending'
@@ -1300,7 +1307,12 @@ impl PostgresBroker {
             let transition_time: DateTime<Utc> = row
                 .col("updated_at")
                 .map_err(|e| CelersError::Other(format!("Failed to read updated_at: {}", e)))?;
-            let duration_ms: Option<f64> = row.col("duration_ms").ok();
+            // `(EXTRACT(EPOCH ...) * 1000)` — `NUMERIC` on PostgreSQL >= 14,
+            // and `NULL` for the first row of every window partition. The
+            // original soft-fail (`.ok()`) is preserved: a duration that
+            // cannot be read is reported as absent, not as an error.
+            let duration_ms: Option<f64> =
+                opt_decimal_f64_from_row(row, "duration_ms").ok().flatten();
             let duration_ms = duration_ms.map(|d| d as i64);
             transitions.push((
                 id,
@@ -1385,14 +1397,20 @@ impl PostgresBroker {
                 retry_count: row.col("retry_count").map_err(|e| {
                     CelersError::Other(format!("Failed to read retry_count: {}", e))
                 })?,
-                total_lifetime_secs: row.col::<f64>("total_lifetime_secs").map_err(|e| {
-                    CelersError::Other(format!("Failed to read total_lifetime_secs: {}", e))
-                })? as i64,
-                time_pending_secs: row.col::<f64>("time_pending_secs").ok().map(|v| v as i64),
-                time_processing_secs: row
-                    .col::<f64>("time_processing_secs")
+                // Every `*_secs` column here is an `EXTRACT(EPOCH ...)`
+                // expression, i.e. `NUMERIC` on PostgreSQL >= 14 whatever the
+                // SQL text casts it to. `decimal_i64_from_row` reads the
+                // seconds directly (rounding a fractional value) instead of
+                // routing through `f64` and truncating.
+                total_lifetime_secs: decimal_i64_from_row(&row, "total_lifetime_secs").map_err(
+                    |e| CelersError::Other(format!("Failed to read total_lifetime_secs: {}", e)),
+                )?,
+                time_pending_secs: opt_decimal_i64_from_row(&row, "time_pending_secs")
                     .ok()
-                    .map(|v| v as i64),
+                    .flatten(),
+                time_processing_secs: opt_decimal_i64_from_row(&row, "time_processing_secs")
+                    .ok()
+                    .flatten(),
                 error_message: row.col("error_message").ok(),
             };
             Ok(Some(lifecycle))
@@ -1489,8 +1507,7 @@ impl PostgresBroker {
             let task_name: String = row
                 .col("task_name")
                 .map_err(|e| CelersError::Other(format!("Failed to read task_name: {}", e)))?;
-            let duration_secs: i64 = row
-                .col("duration_secs")
+            let duration_secs: i64 = decimal_i64_from_row(row, "duration_secs")
                 .map_err(|e| CelersError::Other(format!("Failed to read duration_secs: {}", e)))?;
             let retry_count: i32 = row
                 .col("retry_count")
@@ -1554,8 +1571,17 @@ impl PostgresBroker {
             CelersError::Other("Failed to get state transition stats: no rows returned".to_string())
         })?;
 
-        let avg_time_pending_secs: Option<f64> = row.col("avg_time_pending_secs").ok();
-        let avg_time_processing_secs: Option<f64> = row.col("avg_time_processing_secs").ok();
+        // Both are `AVG(EXTRACT(EPOCH ...))` aggregates: `NUMERIC` on
+        // PostgreSQL >= 14 and `NULL` over an empty window. The soft-fail is
+        // preserved — an unreadable average means "no data", not an error.
+        let avg_time_pending_secs: Option<f64> =
+            opt_decimal_f64_from_row(&row, "avg_time_pending_secs")
+                .ok()
+                .flatten();
+        let avg_time_processing_secs: Option<f64> =
+            opt_decimal_f64_from_row(&row, "avg_time_processing_secs")
+                .ok()
+                .flatten();
         let total_finished: i64 = row
             .col("total_finished")
             .map_err(|e| CelersError::Other(format!("Failed to read total_finished: {}", e)))?;
@@ -1636,7 +1662,8 @@ impl PostgresBroker {
             .execute(
                 r#"
             UPDATE celers_tasks
-            SET priority = priority + $3
+            SET priority = priority + $3,
+                updated_at = NOW()
             WHERE queue_name = $1
               AND state = 'pending'
               AND EXTRACT(EPOCH FROM (NOW() - created_at)) > $2::bigint
@@ -1697,7 +1724,8 @@ impl PostgresBroker {
             .execute(
                 r#"
             UPDATE celers_tasks
-            SET priority = priority + $3
+            SET priority = priority + $3,
+                updated_at = NOW()
             WHERE queue_name = $1
               AND state IN ('pending', 'processing')
               AND retry_count >= $2
@@ -1787,7 +1815,8 @@ impl PostgresBroker {
                 .execute(
                     r#"
                 UPDATE celers_tasks
-                SET priority = priority + $3
+                SET priority = priority + $3,
+                    updated_at = NOW()
                 WHERE queue_name = $1
                   AND task_name = $2
                   AND state = 'pending'

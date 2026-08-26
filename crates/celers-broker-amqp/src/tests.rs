@@ -273,25 +273,70 @@ fn test_health_status_is_healthy() {
 }
 
 // ==================== Integration Tests ====================
-// These tests require a running RabbitMQ instance
-// Run with: docker run -d --name rabbitmq -p 5672:5672 rabbitmq:3-management
+// These tests require a running RabbitMQ instance, reached through
+// `CELERS_TEST_AMQP_URL` -- see tests/integration/README.md. They stay
+// `#[ignore]`d (run with `--run-ignored all`) rather than joining the
+// early-return suite in `tests_hardening.rs`, but no longer hardcode
+// `amqp://localhost:5672` / `guest`/`guest`: the docker-compose RabbitMQ
+// never creates a `guest` user once `RABBITMQ_DEFAULT_USER` is set (confirmed
+// via `docker exec celers-rabbitmq rabbitmqctl list_users`), so every test
+// below used to silently skip via its own connect-failure branch -- even
+// when `--run-ignored all` was paired with a real `CELERS_TEST_AMQP_URL`,
+// since none of them read it. They now read it like every other gated
+// suite in this crate, print the same greppable `SKIPPED: {location}` line
+// when it is unset, and -- since a real URL was configured -- treat a
+// connect failure as a genuine failure rather than a second, silent skip.
+
+/// AMQP URL of a live broker to run these integration tests against, if any.
+/// Mirrors `tests_hardening::integration_url` (kept as a private copy here
+/// rather than shared, matching this crate's existing per-module convention
+/// -- `core_broker`'s own test module keeps its own copy too).
+#[track_caller]
+fn integration_url() -> Option<String> {
+    match std::env::var("CELERS_TEST_AMQP_URL") {
+        Ok(url) if !url.is_empty() => Some(url),
+        _ => {
+            let location = std::panic::Location::caller();
+            eprintln!("SKIPPED: {location} (set CELERS_TEST_AMQP_URL to run)");
+            None
+        }
+    }
+}
+
+/// Derive the RabbitMQ Management API base URL and credentials from the same
+/// `CELERS_TEST_AMQP_URL` used for the AMQP connection, rather than a second,
+/// independently-hardcoded `http://localhost:15672` + `guest`/`guest` (which
+/// cannot authenticate against the docker-compose broker at all -- see
+/// above). This avoids introducing an eighth `CELERS_TEST_*` variable: the
+/// management API always shares the AMQP broker's host and account in this
+/// repository's docker-compose setup.
+fn management_endpoint(amqp_url: &str) -> (String, String, String) {
+    let uri: lapin::uri::AMQPUri = amqp_url
+        .parse()
+        .expect("CELERS_TEST_AMQP_URL must be a valid AMQP URI");
+    (
+        format!("http://{}:15672", uri.authority.host),
+        uri.authority.userinfo.username,
+        uri.authority.userinfo.password,
+    )
+}
 
 #[tokio::test]
 #[ignore] // Requires RabbitMQ to be running
 async fn test_integration_connection_and_disconnect() {
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_integration")
+    let Some(url) = integration_url() else {
+        return;
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_integration")
         .await
-        .unwrap();
+        .expect("broker construction");
 
     // Test connection
-    let result = broker.connect().await;
-    if result.is_err() {
-        eprintln!(
-            "Skipping integration test - RabbitMQ not available: {:?}",
-            result.err()
-        );
-        return;
-    }
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     assert!(broker.is_connected());
     assert!(broker.is_healthy());
@@ -311,14 +356,18 @@ async fn test_integration_connection_and_disconnect() {
 async fn test_integration_publish_and_consume() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_pubsub")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_pubsub")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     // Purge queue to start clean
     let _ = broker.purge("test_pubsub").await;
@@ -359,14 +408,18 @@ async fn test_integration_publish_and_consume() {
 async fn test_integration_batch_publish() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_batch")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_batch")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     let _ = broker.purge("test_batch").await;
 
@@ -396,14 +449,18 @@ async fn test_integration_batch_publish() {
 async fn test_integration_pipeline_publish() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_pipeline")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_pipeline")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     let _ = broker.purge("test_pipeline").await;
 
@@ -436,14 +493,18 @@ async fn test_integration_pipeline_publish() {
 async fn test_integration_message_ordering() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_ordering")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_ordering")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     let _ = broker.purge("test_ordering").await;
 
@@ -465,10 +526,20 @@ async fn test_integration_message_ordering() {
         assert!(envelope.is_some());
 
         let envelope = envelope.unwrap();
-        // Deserialize body to get TaskArgs
-        let task_args: celers_protocol::TaskArgs =
-            serde_json::from_slice(&envelope.message.body).unwrap();
-        assert_eq!(task_args.args[0], serde_json::json!(i));
+        // The body is the Celery-compatible `(args, kwargs, embed)` triple
+        // `MessageBuilder`/`EmbeddedBody::encode` actually writes (see
+        // `celers_protocol::embed`), not a flat `{args, kwargs}` object --
+        // deserializing it straight into `TaskArgs` used to fail with a
+        // confusing "trailing characters" error (serde's struct-from-seq
+        // path silently stops after filling `TaskArgs`'s 2 fields from the
+        // 3-element array, leaving the embed element unconsumed), a defect
+        // this test could not have caught before it always silently skipped
+        // on a `guest`/`guest` connect failure -- see the module doc
+        // comment above. `EmbeddedBody::decode` is the real, current
+        // decoder for this exact wire shape.
+        let embedded = celers_protocol::embed::EmbeddedBody::decode(&envelope.message.body)
+            .expect("body must decode as the (args, kwargs, embed) triple");
+        assert_eq!(embedded.args[0], serde_json::json!(i));
 
         broker.ack(&envelope.delivery_tag).await.unwrap();
     }
@@ -481,24 +552,48 @@ async fn test_integration_message_ordering() {
 async fn test_integration_priority_queue() {
     use celers_protocol::builder::MessageBuilder;
 
-    let config = AmqpConfig::default();
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_priority", config)
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
 
-    // Declare priority queue
+    let config = AmqpConfig::default();
+    // A broker's constructor queue argument becomes `connect()`'s
+    // auto-declared *default queue* (see `setup_topology_internal`), always
+    // with a plain `QueueConfig` -- there is no way to hand it this test's
+    // `x-max-priority` argument. Naming that default queue "test_priority"
+    // (the actual queue under test, declared explicitly below instead) is
+    // what used to make this test fail deterministically once it actually
+    // reached a real broker: whichever declaration ran second -- this run's
+    // `connect()`, or a *previous* run's leftover priority-configured queue
+    // still sitting on this long-lived broker -- conflicted with the other
+    // (PRECONDITION_FAILED: queue arguments must match exactly on
+    // redeclare; both directions reproduced live). An unrelated scratch
+    // name sidesteps it entirely: "test_priority" itself is declared,
+    // bound and cleaned up only by this test, below.
+    let mut broker = AmqpBroker::with_config(&url, "test_priority_scratch", config)
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
+
+    // Delete any stale "test_priority" first (e.g. left over from a run
+    // that failed before reaching the cleanup at the end of this test), then
+    // declare fresh and bind explicitly -- `declare_queue_with_config` only
+    // declares, it does not bind.
+    let exchange = broker.config().default_exchange.clone();
+    let _ = broker.delete_queue("test_priority").await;
     let queue_config = QueueConfig::new().with_max_priority(10);
     broker
         .declare_queue_with_config("test_priority", &queue_config)
         .await
         .unwrap();
-
-    let _ = broker.purge("test_priority").await;
+    broker
+        .bind_queue("test_priority", &exchange, "test_priority")
+        .await
+        .unwrap();
 
     // Publish messages with different priorities (lower number = lower priority)
     for priority in [1, 5, 3, 9, 7] {
@@ -530,6 +625,12 @@ async fn test_integration_priority_queue() {
         broker.ack(&envelope.delivery_tag).await.unwrap();
     }
 
+    // Both queues are durable, so they would otherwise sit on this
+    // long-lived broker until some *later* run's cleanup at the top of this
+    // test happens to reach it -- delete them here too so a run that fails
+    // before this point is the only thing that can still leave one behind.
+    let _ = broker.delete_queue("test_priority").await;
+    let _ = broker.delete_queue("test_priority_scratch").await;
     broker.disconnect().await.unwrap();
 }
 
@@ -540,18 +641,21 @@ async fn test_integration_concurrent_publishing() {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    let Some(url) = integration_url() else {
+        return;
+    };
+
     let broker = Arc::new(Mutex::new(
-        AmqpBroker::new("amqp://localhost:5672", "test_concurrent")
+        AmqpBroker::new(&url, "test_concurrent")
             .await
-            .unwrap(),
+            .expect("broker construction"),
     ));
 
     {
         let mut b = broker.lock().await;
-        if b.connect().await.is_err() {
-            eprintln!("Skipping integration test - RabbitMQ not available");
-            return;
-        }
+        b.connect()
+            .await
+            .expect("connect to the configured CELERS_TEST_AMQP_URL");
         let _ = b.purge("test_concurrent").await;
     }
 
@@ -592,18 +696,22 @@ async fn test_integration_concurrent_publishing() {
 #[tokio::test]
 #[ignore] // Requires RabbitMQ to be running
 async fn test_integration_connection_recovery() {
+    let Some(url) = integration_url() else {
+        return;
+    };
+
     let config = AmqpConfig::default()
         .with_auto_reconnect(true)
         .with_auto_reconnect_config(3, Duration::from_millis(500));
 
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_recovery", config)
+    let mut broker = AmqpBroker::with_config(&url, "test_recovery", config)
         .await
-        .unwrap();
+        .expect("broker construction");
 
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
-        return;
-    }
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     // Verify initial connection
     assert!(broker.is_connected());
@@ -624,14 +732,18 @@ async fn test_integration_connection_recovery() {
 async fn test_integration_transaction_commit() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_transaction")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_transaction")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     let _ = broker.purge("test_transaction").await;
 
@@ -662,14 +774,18 @@ async fn test_integration_transaction_commit() {
 async fn test_integration_transaction_rollback() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_rollback")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_rollback")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     let _ = broker.purge("test_rollback").await;
 
@@ -699,14 +815,31 @@ async fn test_integration_transaction_rollback() {
 async fn test_integration_dead_letter_exchange() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_dlx_main")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    // A broker's constructor queue argument becomes `connect()`'s
+    // auto-declared *default queue* (see `setup_topology_internal`), always
+    // with a plain `QueueConfig` -- there is no way to hand it this test's
+    // `x-dead-letter-exchange` argument. Naming that default queue
+    // "test_dlx_main" (the actual queue under test, declared explicitly
+    // below instead) is what used to make this test fail deterministically
+    // once it actually reached a real broker: whichever declaration ran
+    // second -- this run's `connect()`, or a *previous* run's leftover
+    // DLX-configured queue still sitting on this long-lived broker --
+    // conflicted with the other (PRECONDITION_FAILED: queue arguments must
+    // match exactly on redeclare; both directions reproduced live). An
+    // unrelated scratch name sidesteps it entirely: "test_dlx_main" itself
+    // is declared, bound and cleaned up only by this test, below.
+    let mut broker = AmqpBroker::new(&url, "test_dlx_main_scratch")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     // Declare DLX
     broker
@@ -714,12 +847,21 @@ async fn test_integration_dead_letter_exchange() {
         .await
         .unwrap();
 
-    // Declare main queue with DLX configuration
+    // Delete any stale "test_dlx_main" first (e.g. left over from a run
+    // that failed before reaching the cleanup at the end of this test), then
+    // declare fresh with the DLX configuration and bind explicitly --
+    // `declare_queue_with_config` only declares, it does not bind.
+    let exchange = broker.config().default_exchange.clone();
+    let _ = broker.delete_queue("test_dlx_main").await;
     let dlx_config = DlxConfig::new("test_dlx_exchange").with_routing_key("test_dlx_queue");
     let queue_config = QueueConfig::new().with_dlx(dlx_config);
 
     broker
         .declare_queue_with_config("test_dlx_main", &queue_config)
+        .await
+        .unwrap();
+    broker
+        .bind_queue("test_dlx_main", &exchange, "test_dlx_main")
         .await
         .unwrap();
 
@@ -752,6 +894,13 @@ async fn test_integration_dead_letter_exchange() {
     let dlx_size = broker.queue_size("test_dlx_queue").await.unwrap();
     assert_eq!(dlx_size, 1);
 
+    // Every queue here is durable, so each would otherwise sit on this
+    // long-lived broker until some *later* run's cleanup at the top of this
+    // test happens to reach it -- delete them here too so a run that fails
+    // before this point is the only thing that can still leave one behind.
+    let _ = broker.delete_queue("test_dlx_main").await;
+    let _ = broker.delete_queue("test_dlx_main_scratch").await;
+    let _ = broker.delete_queue("test_dlx_queue").await;
     broker.disconnect().await.unwrap();
 }
 
@@ -760,14 +909,18 @@ async fn test_integration_dead_letter_exchange() {
 async fn test_integration_message_ttl() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_ttl")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_ttl")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     let _ = broker.purge("test_ttl").await;
 
@@ -797,14 +950,18 @@ async fn test_integration_message_ttl() {
 async fn test_integration_metrics_tracking() {
     use celers_protocol::builder::MessageBuilder;
 
-    let mut broker = AmqpBroker::new("amqp://localhost:5672", "test_metrics")
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+
+    let mut broker = AmqpBroker::new(&url, "test_metrics")
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     broker.reset_metrics();
     let _ = broker.purge("test_metrics").await;
@@ -844,18 +1001,22 @@ async fn test_integration_metrics_tracking() {
 async fn test_integration_deduplication() {
     use celers_protocol::builder::MessageBuilder;
 
+    let Some(url) = integration_url() else {
+        return;
+    };
+
     let config = AmqpConfig::default()
         .with_deduplication(true)
         .with_deduplication_config(100, Duration::from_secs(60));
 
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_dedup", config)
+    let mut broker = AmqpBroker::with_config(&url, "test_dedup", config)
         .await
-        .unwrap();
+        .expect("broker construction");
 
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
-        return;
-    }
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     let _ = broker.purge("test_dedup").await;
 
@@ -919,17 +1080,20 @@ async fn test_management_api_configured() {
 #[tokio::test]
 #[ignore] // Requires RabbitMQ Management API to be running
 async fn test_integration_list_queues() {
-    let config =
-        AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
-
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_list", config)
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+    let (mgmt_url, mgmt_user, mgmt_pass) = management_endpoint(&url);
+    let config = AmqpConfig::default().with_management_api(mgmt_url, mgmt_user, mgmt_pass);
+
+    let mut broker = AmqpBroker::with_config(&url, "test_mgmt_list", config)
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     // Declare a test queue
     broker
@@ -937,13 +1101,24 @@ async fn test_integration_list_queues() {
         .await
         .unwrap();
 
-    // List queues
-    let queues = broker.list_queues().await.unwrap();
-    assert!(!queues.is_empty());
-
-    // Find our test queue
-    let found = queues.iter().any(|q| q.name == "test_mgmt_list");
-    assert!(found);
+    // List queues -- poll: the Management API's /api/queues is backed by
+    // RabbitMQ's periodic stats aggregator, not a synchronous view of the
+    // live process, so a queue declared moments ago can be briefly absent
+    // (see `test_integration_list_channels`'s doc comment for the same
+    // characteristic, measured there).
+    let mut found = false;
+    for _ in 0..20 {
+        let queues = broker.list_queues().await.unwrap();
+        found = queues.iter().any(|q| q.name == "test_mgmt_list");
+        if found {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        found,
+        "the management API never listed the just-declared queue"
+    );
 
     broker.disconnect().await.unwrap();
 }
@@ -953,17 +1128,20 @@ async fn test_integration_list_queues() {
 async fn test_integration_queue_stats() {
     use celers_protocol::builder::MessageBuilder;
 
-    let config =
-        AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
-
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_stats", config)
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+    let (mgmt_url, mgmt_user, mgmt_pass) = management_endpoint(&url);
+    let config = AmqpConfig::default().with_management_api(mgmt_url, mgmt_user, mgmt_pass);
+
+    let mut broker = AmqpBroker::with_config(&url, "test_mgmt_stats", config)
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     // Declare a test queue
     broker
@@ -982,13 +1160,27 @@ async fn test_integration_queue_stats() {
         broker.publish("test_mgmt_stats", msg).await.unwrap();
     }
 
-    // Give RabbitMQ time to update stats
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Get queue stats
-    let stats = broker.get_queue_stats("test_mgmt_stats").await.unwrap();
+    // Get queue stats -- poll: the Management API's /api/queues/<name> is
+    // backed by RabbitMQ's periodic stats aggregator, not a synchronous view
+    // of the live process, so it can under-report a batch of messages
+    // published moments ago (observed live: a fixed 500ms wait here was not
+    // always enough under contention -- one otherwise-clean run failed on
+    // exactly this assertion, passing again in isolation. See
+    // `test_integration_list_channels`'s doc comment for the same
+    // characteristic, measured there).
+    let mut stats = broker.get_queue_stats("test_mgmt_stats").await.unwrap();
+    for _ in 0..20 {
+        if stats.messages == 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        stats = broker.get_queue_stats("test_mgmt_stats").await.unwrap();
+    }
     assert_eq!(stats.name, "test_mgmt_stats");
-    assert_eq!(stats.messages, 5);
+    assert_eq!(
+        stats.messages, 5,
+        "the management API never reported all 5 published messages"
+    );
     assert_eq!(stats.messages_ready, 5);
     assert_eq!(stats.messages_unacknowledged, 0);
 
@@ -998,17 +1190,20 @@ async fn test_integration_queue_stats() {
 #[tokio::test]
 #[ignore] // Requires RabbitMQ Management API to be running
 async fn test_integration_server_overview() {
-    let config =
-        AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
-
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_overview", config)
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+    let (mgmt_url, mgmt_user, mgmt_pass) = management_endpoint(&url);
+    let config = AmqpConfig::default().with_management_api(mgmt_url, mgmt_user, mgmt_pass);
+
+    let mut broker = AmqpBroker::with_config(&url, "test_mgmt_overview", config)
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     // Get server overview
     let overview = broker.get_server_overview().await.unwrap();
@@ -1025,23 +1220,40 @@ async fn test_integration_server_overview() {
 #[tokio::test]
 #[ignore] // Requires RabbitMQ Management API to be running
 async fn test_integration_list_connections() {
-    let config =
-        AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
-
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_conn", config)
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
+    };
+    let (mgmt_url, mgmt_user, mgmt_pass) = management_endpoint(&url);
+    let config = AmqpConfig::default().with_management_api(mgmt_url, mgmt_user, mgmt_pass);
+
+    let mut broker = AmqpBroker::with_config(&url, "test_mgmt_conn", config)
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
+
+    // List connections -- poll: the Management API's /api/connections is
+    // backed by RabbitMQ's periodic stats aggregator, not a synchronous view
+    // of the live process, so it can take a moment after connect() to
+    // report this very connection (observed live: an immediate, unpolled
+    // read here sometimes sees none).
+    let mut connections = broker.list_connections().await.unwrap();
+    for _ in 0..20 {
+        if !connections.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        connections = broker.list_connections().await.unwrap();
     }
 
-    // List connections
-    let connections = broker.list_connections().await.unwrap();
-
     // Should have at least our connection
-    assert!(!connections.is_empty());
+    assert!(
+        !connections.is_empty(),
+        "the management API never reported any open connection"
+    );
 
     // Verify connection data
     let conn = &connections[0];
@@ -1055,23 +1267,40 @@ async fn test_integration_list_connections() {
 #[tokio::test]
 #[ignore] // Requires RabbitMQ Management API to be running
 async fn test_integration_list_channels() {
-    let config =
-        AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
-
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_chan", config)
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
+    };
+    let (mgmt_url, mgmt_user, mgmt_pass) = management_endpoint(&url);
+    let config = AmqpConfig::default().with_management_api(mgmt_url, mgmt_user, mgmt_pass);
+
+    let mut broker = AmqpBroker::with_config(&url, "test_mgmt_chan", config)
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
+
+    // List channels -- poll: the Management API's /api/channels is backed by
+    // RabbitMQ's periodic stats aggregator, not a synchronous view of the
+    // live process, so it can take a moment after connect() to report this
+    // very channel (observed live: an immediate, unpolled read here
+    // sometimes sees none).
+    let mut channels = broker.list_channels().await.unwrap();
+    for _ in 0..20 {
+        if !channels.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        channels = broker.list_channels().await.unwrap();
     }
 
-    // List channels
-    let channels = broker.list_channels().await.unwrap();
-
     // Should have at least our channel
-    assert!(!channels.is_empty());
+    assert!(
+        !channels.is_empty(),
+        "the management API never reported any open channel"
+    );
 
     // Verify channel data
     let chan = &channels[0];
@@ -1086,17 +1315,20 @@ async fn test_integration_list_channels() {
 #[tokio::test]
 #[ignore] // Requires RabbitMQ Management API to be running
 async fn test_integration_list_exchanges() {
-    let config =
-        AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
-
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_exch", config)
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+    let (mgmt_url, mgmt_user, mgmt_pass) = management_endpoint(&url);
+    let config = AmqpConfig::default().with_management_api(mgmt_url, mgmt_user, mgmt_pass);
+
+    let mut broker = AmqpBroker::with_config(&url, "test_mgmt_exch", config)
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     // List exchanges
     let exchanges = broker.list_exchanges(None).await.unwrap();
@@ -1119,17 +1351,20 @@ async fn test_integration_list_exchanges() {
 #[tokio::test]
 #[ignore] // Requires RabbitMQ Management API to be running
 async fn test_integration_list_queue_bindings() {
-    let config =
-        AmqpConfig::default().with_management_api("http://localhost:15672", "guest", "guest");
-
-    let mut broker = AmqpBroker::with_config("amqp://localhost:5672", "test_mgmt_bindings", config)
-        .await
-        .unwrap();
-
-    if broker.connect().await.is_err() {
-        eprintln!("Skipping integration test - RabbitMQ not available");
+    let Some(url) = integration_url() else {
         return;
-    }
+    };
+    let (mgmt_url, mgmt_user, mgmt_pass) = management_endpoint(&url);
+    let config = AmqpConfig::default().with_management_api(mgmt_url, mgmt_user, mgmt_pass);
+
+    let mut broker = AmqpBroker::with_config(&url, "test_mgmt_bindings", config)
+        .await
+        .expect("broker construction");
+
+    broker
+        .connect()
+        .await
+        .expect("connect to the configured CELERS_TEST_AMQP_URL");
 
     // Declare a test queue
     broker
@@ -1137,17 +1372,32 @@ async fn test_integration_list_queue_bindings() {
         .await
         .unwrap();
 
-    // Give RabbitMQ time to register the queue
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // List bindings
-    let bindings = broker
+    // List bindings -- poll: the Management API's /api/queues/<name>/bindings
+    // is backed by RabbitMQ's periodic stats aggregator, not a synchronous
+    // view of the live process, so it can under-report the just-declared
+    // queue's own default binding (see `test_integration_list_channels`'s
+    // doc comment for the same characteristic, measured there; a fixed
+    // 200ms wait here was the previous approach).
+    let mut bindings = broker
         .list_queue_bindings("test_mgmt_bindings")
         .await
         .unwrap();
+    for _ in 0..20 {
+        if !bindings.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        bindings = broker
+            .list_queue_bindings("test_mgmt_bindings")
+            .await
+            .unwrap();
+    }
 
     // Should have at least the default binding
-    assert!(!bindings.is_empty());
+    assert!(
+        !bindings.is_empty(),
+        "the management API never reported the queue's own binding"
+    );
 
     // Verify binding data
     let binding = &bindings[0];

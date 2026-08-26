@@ -902,7 +902,7 @@ impl MysqlBroker {
         // First check if a task with this dedup key already exists.
         //
         // Scoped to `queue_name` (leading predicate, matching the
-        // `sql_text::dequeue_select_sql` convention): without it, two
+        // `sql_text::dequeue_candidate_sql` convention): without it, two
         // brokers on different logical queues but the same database would
         // collide on an identical `dedup_key`, and the *second* broker's
         // `enqueue_deduplicated` would silently return the *first* broker's

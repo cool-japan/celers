@@ -984,8 +984,10 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires PostgreSQL running
     async fn test_postgres_backend_creation() {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(database_url) = crate::test_env::postgres_url("test_postgres_backend_creation")
+        else {
+            return;
+        };
 
         let backend = PostgresResultBackend::new(&database_url).await;
         assert!(backend.is_ok());
@@ -1001,8 +1003,11 @@ mod tests {
         // INSERT, get_result's SELECT, delete_result's DELETE) against a
         // live server, where the bug would surface as a connection/protocol
         // error rather than a Rust-level type error.
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(database_url) =
+            crate::test_env::postgres_url("test_postgres_store_get_delete_roundtrip_uuid_binding")
+        else {
+            return;
+        };
         let mut backend = PostgresResultBackend::new(&database_url)
             .await
             .expect("connect");
@@ -1041,8 +1046,11 @@ mod tests {
         // valid JSON envelope (a raw compressed blob would be rejected by
         // the column's own JSONB validation), and `get_result` must decode
         // it back to the exact original value.
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(database_url) = crate::test_env::postgres_url(
+            "test_postgres_store_get_roundtrip_with_compression_enabled",
+        ) else {
+            return;
+        };
         let mut backend = PostgresResultBackend::new(&database_url)
             .await
             .expect("connect")
@@ -1107,8 +1115,11 @@ mod tests {
         // `Success(null)` projection (see that module's doc comments) --
         // actually survives a real `extra` JSONB column round trip, not
         // just the in-memory `TaskMetaExtra` unit tests.
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(database_url) =
+            crate::test_env::postgres_url("test_postgres_store_get_roundtrip_with_ignored_error")
+        else {
+            return;
+        };
         let mut backend = PostgresResultBackend::new(&database_url)
             .await
             .expect("connect");
@@ -1184,8 +1195,11 @@ mod tests {
         // `chord_retry` path — left a terminal counter in place: the
         // barrier looked already-complete before any of the retried tasks
         // reported in, and the callback would fire immediately.
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(database_url) = crate::test_env::postgres_url(
+            "test_postgres_chord_init_resets_completed_counter_on_conflict",
+        ) else {
+            return;
+        };
         let mut backend = PostgresResultBackend::new(&database_url)
             .await
             .expect("connect");
@@ -1238,8 +1252,11 @@ mod tests {
         // overridden, this fell back to `chord_init`, which (once fixed to
         // reset `completed` on conflict) would have made cancellation
         // un-complete a chord's in-flight progress.
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/celers_test".to_string());
+        let Some(database_url) =
+            crate::test_env::postgres_url("test_postgres_chord_cancel_preserves_completed_counter")
+        else {
+            return;
+        };
         let mut backend = PostgresResultBackend::new(&database_url)
             .await
             .expect("connect");

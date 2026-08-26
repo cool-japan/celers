@@ -1,4 +1,27 @@
-//! Task result storage operations
+//! Task result storage operations, backed by `celers_broker_results`.
+//!
+//! # Three result tables, and which one is which
+//!
+//! A PostgreSQL server running CeleRS can carry three similarly named result
+//! tables, migrated by three different code paths. Getting them confused is
+//! what made every function in this module unreachable until migration
+//! `009_broker_results.sql`, so the split is stated here as well as in that
+//! file's header:
+//!
+//! | Table | Owner | Shape |
+//! |---|---|---|
+//! | `celers_broker_results` | **this module** (migration `009_broker_results.sql`) | `status`, `result` JSONB, `error`, `traceback`, `runtime_ms` |
+//! | `celers_task_results` | `celers-backend-db`'s `PostgresResultBackend` (`001_init_postgres.sql`) | `result_state`, `result_data`, `retry_count`, `worker`, `expires_at`, `extra` |
+//! | `celers_results` | this crate's migration `002_results.sql`, for schema compatibility with `celers-broker-sql` | `result` BYTEA, `error_message`, `state`, `expires_at` |
+//!
+//! Nothing in this crate reads or writes either of the other two:
+//! `celers_results` has no Rust caller here at all, and
+//! `celers_task_results` belongs to the *result backend*, which auto-migrates
+//! it onto the same database that this broker migrates. This module's
+//! statements used to name `celers_task_results`, which meant they collided
+//! head-on with that backend's incompatible schema — the identical collision
+//! `celers-broker-sql` already resolved on MySQL by renaming its own store to
+//! `celers_broker_results`. The two backends now agree on both names.
 
 use celers_core::{CelersError, Result, TaskId};
 use chrono::Utc;
@@ -82,7 +105,7 @@ impl PostgresBroker {
         self.conn
             .execute(
                 r#"
-            INSERT INTO celers_task_results
+            INSERT INTO celers_broker_results
                 (task_id, task_name, status, result, error, traceback, created_at, completed_at, runtime_ms)
             VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5, $6, NOW(), $7::text::timestamptz, $8)
             ON CONFLICT (task_id) DO UPDATE SET
@@ -119,7 +142,7 @@ impl PostgresBroker {
                 r#"
             SELECT task_id, task_name, status, result::text AS result, error, traceback,
                    created_at, completed_at, runtime_ms
-            FROM celers_task_results
+            FROM celers_broker_results
             WHERE task_id = $1::text::uuid
             "#,
                 &[&task_id_param],
@@ -168,7 +191,7 @@ impl PostgresBroker {
         let rows_affected = self
             .conn
             .execute(
-                "DELETE FROM celers_task_results WHERE task_id = $1::text::uuid",
+                "DELETE FROM celers_broker_results WHERE task_id = $1::text::uuid",
                 &[&task_id_param],
             )
             .await
@@ -190,7 +213,7 @@ impl PostgresBroker {
             .conn
             .execute(
                 r#"
-            DELETE FROM celers_task_results
+            DELETE FROM celers_broker_results
             WHERE completed_at < $1::text::timestamptz
             "#,
                 &[&cutoff_param],
@@ -247,7 +270,7 @@ impl PostgresBroker {
             r#"
             SELECT task_id, task_name, status, result::text AS result, error, traceback,
                    runtime_ms, created_at, completed_at
-            FROM celers_task_results
+            FROM celers_broker_results
             WHERE task_id IN ({})
             ORDER BY created_at DESC
             "#,
@@ -335,7 +358,7 @@ impl PostgresBroker {
         let placeholders = crate::sql::uuid_in_clause(1, task_ids.len());
         let query_str = format!(
             r#"
-            DELETE FROM celers_task_results
+            DELETE FROM celers_broker_results
             WHERE task_id IN ({})
             "#,
             placeholders

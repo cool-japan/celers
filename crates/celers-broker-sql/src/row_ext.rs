@@ -250,6 +250,37 @@ pub fn text_from_row(row: &Row, col: &str) -> Result<String, OxiSqlError> {
     }
 }
 
+/// [`text_from_row`] for a **nullable** text column.
+///
+/// Same wire-type problem, same fix, with `NULL` mapped to `None` instead of
+/// an error. This is what every read of `celers_broker_results`' `result`,
+/// `error` and `traceback` needs: those are `LONGTEXT`/`TEXT`, so a plain
+/// `row.col::<Option<String>>("result")` succeeded on a row whose column was
+/// `NULL` and failed with `type mismatch: expected Text, got Blob` on every
+/// row that actually held a value — which is to say, `get_result` and
+/// `get_result_batch` could never read back a result they had just stored.
+///
+/// # Errors
+///
+/// [`OxiSqlError::Other`] if the bytes are not valid UTF-8,
+/// [`OxiSqlError::TypeMismatch`] for a non-text variant.
+pub fn opt_text_from_row(row: &Row, col: &str) -> Result<Option<String>, OxiSqlError> {
+    match row
+        .get(col)
+        .ok_or_else(|| OxiSqlError::Other(format!("column '{col}' not found")))?
+    {
+        oxisql_core::Value::Null => Ok(None),
+        oxisql_core::Value::Text(s) | oxisql_core::Value::Json(s) => Ok(Some(s.clone())),
+        oxisql_core::Value::Blob(bytes) => std::str::from_utf8(bytes)
+            .map(|s| Some(s.to_string()))
+            .map_err(|e| OxiSqlError::Other(format!("column '{col}' is not valid UTF-8: {e}"))),
+        other => Err(OxiSqlError::TypeMismatch {
+            expected: "Text/Json/Blob",
+            got: other.type_name(),
+        }),
+    }
+}
+
 // ── DateTime<Utc> parameter convention (PostgreSQL) ─────────────────────────
 //
 // oxisql-core provides `FromValue for chrono::DateTime<Utc>` (behind the

@@ -234,7 +234,8 @@ impl PostgresBroker {
                             .execute(
                                 r#"
                             UPDATE celers_tasks
-                            SET scheduled_at = NOW()
+                            SET scheduled_at = NOW(),
+                                updated_at = NOW()
                             WHERE id = $1::text::uuid
                             "#,
                                 &[&next_task_id_param],
@@ -462,7 +463,8 @@ impl PostgresBroker {
                                     .execute(
                                         r#"
                                     UPDATE celers_tasks
-                                    SET scheduled_at = NOW()
+                                    SET scheduled_at = NOW(),
+                                        updated_at = NOW()
                                     WHERE metadata->>'workflow_id' = $1
                                       AND metadata->>'stage_id' = $2
                                       AND state = 'pending'
@@ -576,7 +578,8 @@ impl PostgresBroker {
                 r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
-                completed_at = NOW()
+                completed_at = NOW(),
+                updated_at = NOW()
             WHERE metadata->>'chain_id' = $1
               AND state IN ('pending', 'processing')
             "#,
@@ -605,7 +608,8 @@ impl PostgresBroker {
                 r#"
             UPDATE celers_tasks
             SET state = 'cancelled',
-                completed_at = NOW()
+                completed_at = NOW(),
+                updated_at = NOW()
             WHERE metadata->>'workflow_id' = $1
               AND state IN ('pending', 'processing')
             "#,
@@ -993,7 +997,8 @@ impl PostgresBroker {
             UPDATE celers_tasks
             SET state = $1::text,
                 completed_at = CASE WHEN $1::text IN ('completed', 'failed', 'cancelled')
-                                    THEN NOW() ELSE completed_at END
+                                    THEN NOW() ELSE completed_at END,
+                updated_at = NOW()
             WHERE id IN ({})
             "#,
             placeholders

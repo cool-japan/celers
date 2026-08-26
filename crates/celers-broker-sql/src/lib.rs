@@ -93,6 +93,11 @@ pub use stats_types::*;
 pub mod broker_core;
 pub use broker_core::MysqlBroker;
 
+// Schema migration, including the two untracked upgrade steps that let this
+// crate share a database with `celers-backend-db` (split out of
+// broker_core.rs).
+mod broker_migrate;
+
 // Distributed tracing and lifecycle hooks
 mod broker_hooks;
 

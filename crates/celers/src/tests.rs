@@ -644,8 +644,11 @@ mod beat_integration {
     #[allow(unused_imports)]
     use super::*;
 
+    /// Not `#[ignore]`d, despite the "requires broker server" label it used to
+    /// carry: `BeatScheduler::new()` opens no connection (as the body's own
+    /// comment says), so the label kept a perfectly hermetic assertion out of
+    /// every default run for nothing.
     #[tokio::test]
-    #[ignore = "requires broker server"]
     async fn test_beat_scheduler_integration() {
         use crate::BeatScheduler;
 

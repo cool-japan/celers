@@ -4,7 +4,7 @@ use celers_core::{Broker, CelersError, Result, SerializedTask, TaskId};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::row_ext::{json_param, uuid_from_row, uuid_param, RowExt};
+use crate::row_ext::{decimal_i64_from_row, json_param, uuid_from_row, uuid_param, RowExt};
 use crate::types::{DeduplicationConfig, DeduplicationInfo};
 use crate::PostgresBroker;
 
@@ -349,8 +349,10 @@ impl PostgresBroker {
         let active_entries: i64 = row
             .col("active_entries")
             .map_err(|e| CelersError::Other(format!("Failed to read active_entries: {}", e)))?;
-        let total_duplicates: i64 = row
-            .col("total_duplicates")
+        // `SUM(duplicate_count)` is an exact-value aggregate, so the server
+        // can answer `NUMERIC`; the `COALESCE(.., 0)` covers the empty-window
+        // `NULL`, but the type is still not guaranteed to be `bigint`.
+        let total_duplicates: i64 = decimal_i64_from_row(&row, "total_duplicates")
             .map_err(|e| CelersError::Other(format!("Failed to read total_duplicates: {}", e)))?;
 
         Ok((active_entries, total_duplicates))

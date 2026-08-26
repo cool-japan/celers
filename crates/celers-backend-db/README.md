@@ -90,9 +90,31 @@ This crate is part of the [CeleRS](https://github.com/cool-japan/celers) project
 **131 tests passing** (`cargo nextest run --all-features`), **19 skipped** (marked `#[ignore]`; require a live
 PostgreSQL/MySQL instance — run with `cargo nextest run --all-features --run-ignored all`). Plus **1 doc test passing** (5
 additional doc tests intentionally `ignore`d as illustrative-only, since they also require a live
-database). Live-verified this release against real PostgreSQL and MySQL servers — see
-[../../tests/integration/README.md](../../tests/integration/README.md) for the invocations and a caveat
-about running this crate's MySQL half against the same database as `celers-broker-sql`.
+database).
+
+### Live-database tests
+
+Point `CELERS_TEST_POSTGRES_URL` and/or `CELERS_TEST_MYSQL_URL` at a real server:
+
+```bash
+CELERS_TEST_POSTGRES_URL=postgres://celers:celers_password@127.0.0.1:5432/celers \
+CELERS_TEST_MYSQL_URL=mysql://celers:celers_password@127.0.0.1:3306/celers_test \
+    cargo nextest run -p celers-backend-db --all-features --run-ignored all
+```
+
+The bare `DATABASE_URL` / `MYSQL_URL` names this crate historically read are still accepted as a
+documented fallback, so existing environments keep working; the `CELERS_TEST_*` names are the
+workspace standard and take precedence.
+
+There is **no** hardcoded default connection string. A variable that is unset (or set but blank)
+makes the test print `SKIPPED: <test name> (set CELERS_TEST_POSTGRES_URL to run)` and return —
+never connect to a `localhost` server nobody configured.
+
+Pointing this crate's MySQL half at the **same** database as `celers-broker-sql` is supported: the
+two used to collide on a shared `celers_task_results` table and a schema-scoped `chk_result_state`
+constraint, and `celers-broker-sql` has since renamed both of its own objects. See
+[../../tests/integration/README.md](../../tests/integration/README.md) for the full per-service
+invocation table.
 
 ## License
 
