@@ -144,7 +144,7 @@ pub(crate) use row_to;
 /// ```
 ///
 /// Every UUID-column placeholder in this crate carries that cast (see
-/// [`crate::sql`]'s "Binding conventions"), including the generated
+/// `crate::sql`'s "Binding conventions"), including the generated
 /// `IN ($1::text::uuid, ..)` lists. Adding a UUID parameter without one is a
 /// silent, server-rejected write, so the cast must be visible at the call
 /// site to stay auditable — which is why there is no wrapper hiding it.
@@ -237,7 +237,7 @@ pub fn opt_uuid_from_row(row: &Row, col: &str) -> Result<Option<uuid::Uuid>, Oxi
 /// type to `text` — which *is* transferred verbatim — and casts it to `jsonb`
 /// server-side, where the ordinary JSON text parser runs. It is the same idiom
 /// the UUID and timestamp parameters in this crate use
-/// (`$n::text::uuid`, `$n::text::timestamptz`); see [`crate::sql`]'s "Binding
+/// (`$n::text::uuid`, `$n::text::timestamptz`); see `crate::sql`'s "Binding
 /// conventions", which its unit tests assert on.
 ///
 /// # Example

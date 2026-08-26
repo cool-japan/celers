@@ -76,7 +76,7 @@ pub const IGNORE_ERRORS_KEY: &str = "ignore_errors";
 
 /// JSON key carrying a task's own retry backoff policy to the worker.
 ///
-/// Without it the worker can only apply *its* configured [`RetryConfig`]
+/// Without it the worker can only apply *its* configured `RetryConfig`
 /// (`celers_worker::RetryConfig`) to every task alike, so a signature built
 /// with [`Signature::with_retry_delay`]/[`Signature::with_retry_backoff`] would
 /// have those values dropped on the floor. The value is an object:
@@ -435,7 +435,7 @@ pub async fn dispatch_signature<B: Broker>(
 /// chord header is dispatched only after
 /// [`ChordState`](celers_backend_redis::ChordState) has already been written
 /// with `total` set to the *full* header count (see
-/// [`crate::Chord::register_and_dispatch`]), so the barrier is live before the
+/// `Chord::register_and_dispatch`), so the barrier is live before the
 /// first task goes out. If the header were split across chunks and a later
 /// chunk failed, the earlier chunks would already be enqueued against a
 /// barrier that can now never reach `total`: the callback would never fire and

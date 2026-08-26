@@ -23,13 +23,13 @@
 //!
 //! # The pieces
 //!
-//! * [`task_to_message`] / [`message_to_task`] convert between the two models
-//!   without losing metadata (see [`convert`] for exactly how, and for what
+//! * [`task_to_message`](core_adapter::task_to_message) / [`message_to_task`](core_adapter::message_to_task) convert between the two models
+//!   without losing metadata (see `convert` for exactly how, and for what
 //!   happens to a message from a foreign producer).
-//! * [`CoreBrokerTransport`] is the seam a transport implements to lend the
+//! * [`CoreBrokerTransport`](core_adapter::CoreBrokerTransport) is the seam a transport implements to lend the
 //!   adapter its native batch, defer and delayed-publish operations. Every
 //!   method has a working default, so opting in costs one empty `impl`.
-//! * [`KombuBrokerAdapter`] is the [`celers_core::Broker`] itself.
+//! * [`KombuBrokerAdapter`](core_adapter::KombuBrokerAdapter) is the [`celers_core::Broker`] itself.
 //!
 //! # Using it
 //!

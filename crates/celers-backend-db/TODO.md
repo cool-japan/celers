@@ -2,7 +2,7 @@
 
 > Database (PostgreSQL/MySQL) result backend for CeleRS
 
-**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 55**
+**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-08-26 | Tests: 132**
 
 ## Status: ✅ FEATURE COMPLETE + v0.2.0 ENHANCED + v0.3.0 PURE-RUST MIGRATION + ANALYTICS
 
@@ -274,7 +274,7 @@ let state = backend.chord_get_state(chord_id).await?;
 ## Testing Status
 
 - [x] Compilation tests
-- [x] Unit tests (55 passing via `cargo nextest run --all-features`, 6 skipped/`#[ignore]`d):
+- [x] Unit tests (132 passing via `cargo nextest run --all-features`, 6 skipped/`#[ignore]`d):
   - 25 in `tls_mode.rs` (URL TLS-mode resolution — PostgreSQL `sslmode`, MySQL `ssl-mode`/`tls`)
   - 13 in `row_ext.rs` (UUID/JSON param + row-extraction bridging helpers)
   - 10 in `analytics.rs` (+ 2 `#[ignore]`d, require a live PostgreSQL instance)

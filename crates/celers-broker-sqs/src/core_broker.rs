@@ -6,7 +6,8 @@
 //! [`SqsBroker`] speaks the `celers-kombu` transport traits
 //! (`publish`/`consume`/`purge`/...). A worker consumes
 //! [`celers_core::Broker`] (`enqueue`/`dequeue`/`ack`/`reject`/...). This
-//! module is the join: it teaches `SqsBroker` the [`CoreBrokerTransport`] seam
+//! module is the join: it teaches `SqsBroker` the
+//! [`CoreBrokerTransport`](celers_kombu::core_adapter::CoreBrokerTransport) seam
 //! and re-exports the resulting task-queue broker as [`SqsCoreBroker`].
 //!
 //! ```no_run

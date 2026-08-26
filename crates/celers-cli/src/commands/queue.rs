@@ -1041,7 +1041,7 @@ async fn export_zset_entries(
 
 /// Export queue tasks to a JSON file.
 ///
-/// Every entry is captured raw and byte-for-byte (see [`ExportedEntry`]),
+/// Every entry is captured raw and byte-for-byte (see `ExportedEntry`),
 /// so nothing is silently dropped even when this CLI's own
 /// `SerializedTask` cannot parse an entry -- unlike the previous
 /// `if let Ok(task) = serde_json::from_str(...)` implementation, which

@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.1] - Unreleased
+## [0.3.1] - 2026-08-26
 
 0.3.1 is a hardening release, not a feature drop: 557 files changed against 0.3.0. The headline
 additions are the ones that make a CeleRS deployment operable and defensible in production — a
@@ -1427,6 +1427,7 @@ celers-cli test count pending final release-check re-verification before publish
 ### Repository
 - https://github.com/cool-japan/celers
 
+[0.3.1]: https://github.com/cool-japan/celers/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/cool-japan/celers/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/cool-japan/celers/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cool-japan/celers/releases/tag/v0.1.0

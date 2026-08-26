@@ -33,7 +33,7 @@
 //! that message is dead-lettered on arrival.
 //!
 //! * **Your application code**, wherever it enqueues — call
-//!   [`sign_task`](celers_core::task_security::sign_task) on the task
+//!   [`sign_task`] on the task
 //!   immediately before handing it to the broker. This is the one that matters.
 //! * **`celers-beat`** does *not* enqueue: it is a schedule engine with no
 //!   broker handle at all, so whatever your integration enqueues when a
@@ -77,7 +77,8 @@
 //! # Payload hygiene
 //!
 //! Set [`WorkerConfig::payload_hygiene`](crate::WorkerConfig::payload_hygiene)
-//! to a [`PayloadHygiene`] and the worker redacts secret-looking keys and masks
+//! to a [`PayloadHygiene`](celers_core::task_security::PayloadHygiene) and the
+//! worker redacts secret-looking keys and masks
 //! PII in the payload **copies** it shows to operators:
 //!
 //! * the bounded payload preview `inspect active` reports, and

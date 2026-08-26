@@ -24,11 +24,11 @@
 //! Each chunk used to retry independently up to `max_retries` times, so a
 //! 100-message call (10 chunks) against a persistently throttled queue could
 //! issue up to `max_retries * 10` requests with no call-wide cap. A
-//! [`RetryBudget`] is now shared across every chunk of one top-level call:
+//! `RetryBudget` is now shared across every chunk of one top-level call:
 //! every chunk still gets its unconditional *first* attempt (entries can
 //! never be silently dropped — see above), but attempts beyond the first draw
 //! from a pool sized so that small/medium batches (up to
-//! [`RETRY_BUDGET_CHUNK_CAP`] chunks) are unaffected, while a call with many
+//! `RETRY_BUDGET_CHUNK_CAP` chunks) are unaffected, while a call with many
 //! chunks can no longer retry every single one of them to the hilt. An entry
 //! that loses a retry to budget exhaustion is reported as
 //! [`RETRY_BUDGET_EXHAUSTED_CODE`], distinguishable from a real AWS error
@@ -220,7 +220,7 @@ pub fn entry_wire_size(body: &str, attributes: &HashMap<String, MessageAttribute
 }
 
 /// AWS error code reported for an entry that lost a retry to the shared
-/// [`RetryBudget`] rather than to an AWS-side rejection.
+/// `RetryBudget` rather than to an AWS-side rejection.
 ///
 /// Prefixed so it can never collide with a real AWS batch error code (all of
 /// which are bare PascalCase identifiers such as `InternalError`), letting a

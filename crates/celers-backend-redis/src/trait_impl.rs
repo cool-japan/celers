@@ -4,8 +4,8 @@
 //! and optimized batch operations, plus the low-level inherent helpers every
 //! read/write path shares.
 //!
-//! All writes go through [`crate::codec::write_command`] and all reads through
-//! [`crate::codec::decode_many`], so compression, encryption, chunking and TTL
+//! All writes go through `codec::write_command` and all reads through
+//! `codec::decode_many`, so compression, encryption, chunking and TTL
 //! behave identically no matter which entry point a caller uses.
 
 use async_trait::async_trait;

@@ -2,7 +2,7 @@
 
 > PostgreSQL-based broker implementation for CeleRS
 
-## Status: ✅ STABLE (v0.3.1) — 149 tests passing, 26 ignored (require a real PostgreSQL instance) + 179 doc tests passing, 6 ignored | Updated: 2026-07-13
+## Status: ✅ STABLE (v0.3.1) — 271 tests passing, 26 ignored (require a real PostgreSQL instance) + 191 doc tests passing, 6 ignored | Updated: 2026-08-26
 
 ## queue_name schema drift (2026-07) — RESOLVED (migration 007)
 
@@ -206,10 +206,10 @@ a correctness fix.
 - Intelligent batch size optimization for network and memory efficiency
 - Production-ready analytics for capacity planning and optimization
 
-**Re-verified 2026-07-13 (v0.3.0 release, current totals — supersedes the Round 6 counts above, which
+**Re-verified 2026-08-26 (v0.3.0 release, current totals — supersedes the Round 6 counts above, which
 reflect a 2026-01-07 snapshot predating further work including the sqlx→oxisql migration):**
-`cargo nextest run -p celers-broker-postgres --all-features` → **149 tests passed, 26 skipped**
-(0 failed); `cargo test --doc -p celers-broker-postgres --all-features` → **179 passed, 6 ignored**
+`cargo nextest run -p celers-broker-postgres --all-features` → **271 tests passed, 26 skipped**
+(0 failed); `cargo test --doc -p celers-broker-postgres --all-features` → **191 passed, 6 ignored**
 (0 failed). No `todo!()`/`unimplemented!()` in `src/`. Zero `sqlx` remaining (migrated to
 `oxisql-postgres`/`oxisql-core`); 3 previously-broken private intra-doc-links in `broker_core.rs` /
 `notifications.rs` (rustdoc `[PostgresBroker::conn]`-style square-bracket links pointing at a private

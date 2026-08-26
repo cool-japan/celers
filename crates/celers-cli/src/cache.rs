@@ -84,14 +84,14 @@ where
 {
     /// Create a cache with the given time-to-live, backed by the real
     /// monotonic clock (`Instant::now`) and capped at
-    /// [`DEFAULT_MAX_ENTRIES`] distinct keys.
+    /// `DEFAULT_MAX_ENTRIES` distinct keys.
     #[must_use]
     pub fn new(ttl: Duration) -> Self {
         Self::with_clock(ttl, Instant::now)
     }
 
     /// Create a cache with the given time-to-live and an injectable clock,
-    /// capped at [`DEFAULT_MAX_ENTRIES`] distinct keys.
+    /// capped at `DEFAULT_MAX_ENTRIES` distinct keys.
     ///
     /// Intended for tests that need to simulate TTL expiry deterministically:
     /// pass a closure backed by e.g. an `Arc<Mutex<Instant>>` that the test
@@ -111,7 +111,7 @@ where
     ///
     /// Not reachable from this crate's own `bin` target: this crate's own
     /// production caches (`crate::commands::queue`/`crate::commands::worker`)
-    /// are all sized off [`DEFAULT_MAX_ENTRIES`] via [`TtlCache::new`], not
+    /// are all sized off `DEFAULT_MAX_ENTRIES` via [`TtlCache::new`], not
     /// individually tuned. It is still reachable via the public
     /// `celers_cli::cache` library API, which is the surface this function
     /// exists for, and is covered by this module's own tests; also kept as
@@ -185,7 +185,7 @@ where
     /// the backing `HashMap` would grow without limit for the life of the
     /// process). If every entry is still live after that sweep, one
     /// arbitrary entry is evicted to make room, mirroring
-    /// [`crate::pool::ClientPool::insert`]'s capacity policy. Overwriting an
+    /// `ClientPool::insert`'s capacity policy. Overwriting an
     /// already-present key never evicts anything, regardless of capacity.
     pub fn insert(&self, key: K, value: V) {
         let now = (self.now_fn)();

@@ -115,8 +115,8 @@ pub(crate) fn sign_continuation(
 /// triggers appropriate workflow actions.
 ///
 /// `signature` is the worker's
-/// [`SignatureVerification`](crate::SignatureVerification) when it authenticates
-/// messages, and `None` otherwise. See [`sign_continuation`] for why it has to
+/// [`SignatureVerification`] when it authenticates
+/// messages, and `None` otherwise. See `sign_continuation` for why it has to
 /// be threaded through here rather than left to the producer.
 /// [`handle_workflow_completion`] is the `None` case.
 ///

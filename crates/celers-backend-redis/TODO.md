@@ -2,7 +2,7 @@
 
 > Redis result backend for task results and workflow state
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 208**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-08-26 | Tests: 243**
 
 ## Status: ✅ FEATURE COMPLETE + ENHANCED + PRODUCTION-READY + UTILITIES & MONITORING + BATCH ANALYTICS + ADVANCED OPERATIONS + TRANSACTIONS & DEPENDENCIES + QUERYING & ARCHIVAL + TAGS & CUSTOM METADATA + TAG-BASED BULK OPS + DETAILED BATCH TRACKING + TELEMETRY & OBSERVABILITY + CONNECTION RETRY + BATCH STREAMING + PIPELINE OPTIMIZATION + PERFORMANCE PROFILING + v0.2.0 ENHANCEMENTS
 
@@ -459,7 +459,7 @@ All core result backend features implemented plus advanced features:
 - [x] Connection failure tests ✅ (included in integration tests)
 
 ### Test Summary
-- Unit tests: 208 passing (verified via `cargo nextest run --all-features`; category breakdown
+- Unit tests: 243 passing (verified via `cargo nextest run --all-features`; category breakdown
   below is representative, not an exhaustive/reconciled sum)
   - 10 encryption tests
   - 3 chord retry tests
@@ -500,7 +500,7 @@ All core result backend features implemented plus advanced features:
   - Get statistics
   - Cleanup old results
   - Cleanup completed chords
-- **Total: 208 unit/library tests + 41 doc tests passing with 0 warnings (+ 18 integration tests available)**
+- **Total: 243 unit/library tests + 41 doc tests passing with 0 warnings (+ 18 integration tests available)**
   - unit tests (telemetry, retry, batch_stream, pipeline, profiler modules)
   - doc tests (all public APIs)
 

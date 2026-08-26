@@ -372,7 +372,7 @@ impl TenantRegistry {
 /// per-tenant override), plus an optional cumulative quota. The limiter is cheap
 /// to clone (`Arc`-backed) and safe to share across threads.
 ///
-/// State is split across [`SHARD_COUNT`] independently locked shards keyed by a
+/// State is split across `SHARD_COUNT` independently locked shards keyed by a
 /// hash of the tenant id, so admission decisions for unrelated tenants do not
 /// serialise against each other, and the registry is capacity-bounded with
 /// least-recently-used eviction (see [`DEFAULT_MAX_TRACKED_TENANTS`]).

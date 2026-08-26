@@ -2,7 +2,7 @@
 
 > Prometheus metrics integration for CeleRS monitoring
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 319 unit + 48 doc**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-08-26 | Tests: 354 unit/integration + 50 doc**
 
 ## Status: ✅ FEATURE COMPLETE + ENHANCED WITH ADVANCED ANALYTICS & PRODUCTION-READY TOOLS + VALIDATION & REGISTRY + EXPORT UTILITIES + SLA & HEALTH MANAGEMENT + CAPACITY PLANNING + ALERT HISTORY + QUERY BUILDER + NATIVE HISTOGRAMS/SUMMARIES + STATSD BACKEND + STATEFUL SLO TRACKING + ANOMALY DETECTION + AUDIT LOG (0.3.0)
 
@@ -422,7 +422,7 @@ Complete Prometheus metrics implementation with comprehensive task queue monitor
 
 ## Testing Status
 
-**Total: 319 unit + 48 doc tests passing** (unit + doc + integration-style) — verified 2026-07-13
+**Total: 354 unit/integration + 50 doc tests passing** (unit + doc + integration-style) — verified 2026-08-26
 via `cargo nextest run -p celers-metrics --all-features` and
 `cargo test --doc -p celers-metrics --all-features`
 
@@ -615,10 +615,10 @@ via `cargo nextest run -p celers-metrics --all-features` and
   - [x] Delayed task scheduling
 - [x] Performance impact testing ✅
 
-**Total: 319 unit tests (incl. 18 SLO-tracker + 12 anomaly-detector + 30 audit-log) - All passing ✅**
-**Doc tests: 48 tests (incl. slo_tracker + anomaly + audit module examples) - All passing ✅**
+**Total: 354 unit tests (incl. 18 SLO-tracker + 12 anomaly-detector + 30 audit-log) - All passing ✅**
+**Doc tests: 50 tests (incl. slo_tracker + anomaly + audit module examples) - All passing ✅**
 **Benchmarks: 51 benchmark cases across 27 groups - builds clean** (`cargo bench -p celers-metrics --no-run --all-features`, includes benchmarks for all features)
-**Clippy warnings: 0 ✅** (`cargo clippy -p celers-metrics --all-features --all-targets`, verified 2026-07-13)
+**Clippy warnings: 0 ✅** (`cargo clippy -p celers-metrics --all-features --all-targets`, verified 2026-08-26)
 
 ## Deferred / Known Follow-Ups (OPEN)
 

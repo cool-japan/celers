@@ -4,7 +4,7 @@
 //! [`RedisBroker::revoke`](celers_core::Broker::revoke) do two things: they
 //! record the revocation in the durable `<queue>:revoked` sorted set (scored by
 //! its expiry) and they publish a
-//! [`RevocationNotice`](celers_core::RevocationNotice) on `<queue>:cancel`.
+//! [`RevocationNotice`] on `<queue>:cancel`.
 //! This module is the *reading* half of that channel: the subscription a worker
 //! obtains through
 //! [`Broker::subscribe_revocations`](celers_core::Broker::subscribe_revocations)
@@ -21,9 +21,9 @@
 //! # RESP3 is required
 //!
 //! Like [`crate::control`], the subscription rides RESP3 server pushes on a
-//! multiplexed connection, so it needs Redis 6.0+. A [`RedisBroker`]'s own
+//! multiplexed connection, so it needs Redis 6.0+. A [`crate::RedisBroker`]'s own
 //! client speaks RESP2, which would connect happily and then deliver nothing;
-//! [`revocation_client`] therefore re-opens the broker's connection info with
+//! `revocation_client` therefore re-opens the broker's connection info with
 //! the protocol forced to RESP3.
 
 use crate::control::{open_resp3, subscribe_push, RedisPushStream};

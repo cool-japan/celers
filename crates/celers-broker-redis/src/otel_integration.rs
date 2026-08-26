@@ -331,7 +331,7 @@ impl OtelBrokerInstrumentation {
     /// Start a span for an operation.
     ///
     /// Sweeps stale/excess entries from the active-span map first (see
-    /// [`Self::evict_stale_spans_locked`]) so a leaked span can never grow
+    /// `evict_stale_spans_locked`) so a leaked span can never grow
     /// the map without bound.
     pub fn start_span(&self, name: &str, attributes: HashMap<String, String>) -> String {
         let span_id = generate_span_id();

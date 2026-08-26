@@ -79,7 +79,7 @@ pub struct QueueBackup {
     pub delayed_tasks: Vec<DelayedTaskEntry>,
 }
 
-/// One delayed-queue entry captured by [`capture_broker_state`]: the raw
+/// One delayed-queue entry captured by `capture_broker_state`: the raw
 /// task payload exactly as stored in Redis, plus the `execute_at`
 /// unix-timestamp `ZADD` score it had in the source broker.
 ///

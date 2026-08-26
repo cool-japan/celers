@@ -136,7 +136,7 @@ where
 ///
 /// Every field starts at `0` from [`StartupMetrics::new`] / `Default`; call
 /// the `record_*` methods with real [`std::time::Duration`]s (typically
-/// captured with [`time_init!`] around each startup stage, or with a plain
+/// captured with [`crate::time_init!`] around each startup stage, or with a plain
 /// [`std::time::Instant`]) to populate them. `total_ms` is kept in sync
 /// automatically: it is recomputed as the sum of the three stage timings
 /// every time one of them is recorded, so it never needs to be set by hand.
@@ -190,7 +190,7 @@ impl StartupMetrics {
     /// Record how long broker initialization took and refresh `total_ms`.
     ///
     /// `duration` is typically the second element of the tuple returned by
-    /// [`time_init!`] wrapped around the broker-creation call.
+    /// [`crate::time_init!`] wrapped around the broker-creation call.
     pub fn record_broker_init(&mut self, duration: std::time::Duration) {
         self.broker_init_ms = duration.as_millis() as u64;
         self.recompute_total();

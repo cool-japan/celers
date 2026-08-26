@@ -1076,7 +1076,7 @@ impl RedisBroker {
     /// Move tasks from DLQ back to main queue in bulk
     ///
     /// Single pass: one `LRANGE` to read the candidates, then one `EVAL` per
-    /// [`REPLAY_CHUNK`] entries to claim and re-enqueue them. Replaying `n`
+    /// `REPLAY_CHUNK` entries to claim and re-enqueue them. Replaying `n`
     /// tasks by calling [`Self::replay_from_dlq`] in a loop would instead read
     /// and deserialize the *whole* dead letter queue once per task.
     ///

@@ -2,7 +2,7 @@
 
 MySQL database broker implementation for CeleRS - a high-performance Celery-compatible task queue framework for Rust.
 
-**Version: 0.3.1 | Status: [Alpha] | Tests: 197 (`--all-features`, excluding `#[ignore]`d) + 107 doctests | Updated: 2026-08-26**
+**Version: 0.3.1 | Status: [Alpha] | Tests: 216 (`--all-features`, excluding `#[ignore]`d) + 107 doctests | Updated: 2026-08-26**
 
 ## Features
 

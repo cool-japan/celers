@@ -12,7 +12,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxError {
     /// The configuration is internally inconsistent (see
-    /// [`SandboxConfig::is_valid`]).
+    /// [`super::SandboxConfig::is_valid`]).
     InvalidConfig(String),
     /// The configuration asks for containment this build/platform cannot
     /// provide.  Returned instead of pretending the control is active.

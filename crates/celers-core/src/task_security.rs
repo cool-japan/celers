@@ -4,7 +4,7 @@
 //! [`pii`](crate::pii) are primitive layers: they operate on
 //! [`SignedFields`] and [`TaskValue`], not on the message type the brokers move
 //! around. This module is the adapter between them and
-//! [`SerializedTask`](crate::SerializedTask), so that the worker, a producer
+//! [`SerializedTask`], so that the worker, a producer
 //! and an operator tool all agree on:
 //!
 //! * **what is signed** — the canonical projection of a task message onto

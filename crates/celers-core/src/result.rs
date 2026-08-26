@@ -647,7 +647,7 @@ impl<S: ResultStore + Clone> AsyncResult<S> {
     ///
     /// Both this and [`failed`](Self::failed) are `false` for a task whose
     /// failure was deliberately suppressed
-    /// ([`TaskResultValue::Ignored`](TaskResultValue::Ignored)) — see
+    /// ([`TaskResultValue::Ignored`]) — see
     /// [`TaskResultValue::is_successful`] for why that is a third disposition
     /// rather than a missing one. Distinguish it with
     /// [`info`](Self::info)`().is_ignored()`, and note that

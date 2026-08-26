@@ -14,10 +14,12 @@
 //! removes `aws-smithy-http-client` from the dependency graph entirely and
 //! leaves the SDK with no transport at all.
 //!
-//! This module supplies the replacement: an [`HttpClient`] backed by
+//! This module supplies the replacement: an
+//! [`HttpClient`](aws_smithy_runtime_api::client::http::HttpClient) backed by
 //! [`oxihttp-client`](oxihttp_client) (hyper 1.x + `tokio-rustls` + OxiTLS'
 //! Pure-Rust `rustls-rustcrypto` provider). Install it with
-//! [`pure_http_client`]; [`SqsBroker`](crate::SqsBroker) does that for you at
+//! [`pure_http_client`](crate::pure_http::pure_http_client);
+//! [`SqsBroker`](crate::SqsBroker) does that for you at
 //! every `aws_config::defaults(..)` call.
 //!
 //! Removing `aws-smithy-http-client` also removes the ~12 s
@@ -29,8 +31,11 @@
 //!
 //! # Fidelity to the stock connector
 //!
-//! * **Timeouts.** [`HttpConnectorSettings::connect_timeout`] is applied to the
-//!   TCP connect, and [`HttpConnectorSettings::read_timeout`] bounds the wait
+//! * **Timeouts.**
+//!   [`HttpConnectorSettings::connect_timeout`](aws_smithy_runtime_api::client::http::HttpConnectorSettings::connect_timeout)
+//!   is applied to the TCP connect, and
+//!   [`HttpConnectorSettings::read_timeout`](aws_smithy_runtime_api::client::http::HttpConnectorSettings::read_timeout)
+//!   bounds the wait
 //!   for *response headers* — the same placement `aws-smithy-http-client` uses
 //!   (`ConnectTimeout` around the connector, `HttpReadTimeout` around the
 //!   response future). The body is read afterwards, unbounded, exactly as
@@ -40,10 +45,12 @@
 //!   `HttpClient::http_connector` is called per operation and a fresh pool each
 //!   time would mean a fresh TLS handshake per request.
 //! * **Error classification.** Transport faults map to
-//!   [`ConnectorError::io`] / [`ConnectorError::timeout`] so the SDK's retry
-//!   policy still sees them as transient; only unusable requests and
-//!   configurations map to [`ConnectorError::user`]. See
-//!   [`classify_transport_error`].
+//!   [`ConnectorError::io`](aws_smithy_runtime_api::client::result::ConnectorError::io) /
+//!   [`ConnectorError::timeout`](aws_smithy_runtime_api::client::result::ConnectorError::timeout)
+//!   so the SDK's retry policy still sees them as transient; only unusable
+//!   requests and configurations map to
+//!   [`ConnectorError::user`](aws_smithy_runtime_api::client::result::ConnectorError::user).
+//!   See `classify_transport_error`.
 //!
 //! # Known deviation
 //!

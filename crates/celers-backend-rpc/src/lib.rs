@@ -424,7 +424,7 @@ impl ResultBackend for GrpcResultBackend {
     ///
     /// `ChordUpdateState` is a new RPC: a client built with this method
     /// against an older [`server::RpcBackendServer`] that predates it gets
-    /// back gRPC `Unimplemented`, which [`is_retryable_code`] correctly
+    /// back gRPC `Unimplemented`, which `is_retryable_code` correctly
     /// does not retry, so [`ResultBackend::chord_cancel`] (and any other
     /// caller of this method) fails outright during a rolling deploy where
     /// servers lag clients. That is a loud failure, and strictly better

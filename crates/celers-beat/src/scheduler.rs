@@ -446,7 +446,7 @@ impl BeatScheduler {
     /// through.
     ///
     /// Once set, [`Self::save_state_async`] (and, transitively,
-    /// [`Self::persist_after_tick`]) writes through `store` instead of the
+    /// `persist_after_tick`) writes through `store` instead of the
     /// local file named by `state_file` — `state_file` is otherwise
     /// unaffected (sync [`Self::save_state`] still uses it, unchanged) and
     /// can be left unset entirely when a store is configured.
@@ -456,7 +456,7 @@ impl BeatScheduler {
     /// [`Self::add_task`] and this crate's other mutators persist via sync
     /// [`Self::save_state`], which never touches `store` — nothing here can
     /// synchronously await its I/O. A running beat instance still reaches
-    /// `store` within one tick regardless ([`Self::persist_after_tick`] calls
+    /// `store` within one tick regardless (`persist_after_tick` calls
     /// [`Self::save_state_async`] every tick), but a caller needing the store
     /// updated immediately (or that never ticks, e.g. a one-shot CLI command)
     /// must call [`Self::save_state_async`] explicitly.

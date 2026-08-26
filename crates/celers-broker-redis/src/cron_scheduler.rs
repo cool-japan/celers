@@ -479,7 +479,7 @@ impl CronScheduler {
     /// now" trigger). Does not change the job's cron expression; after this
     /// firing, `next_run` is recalculated from the cron expression as usual.
     ///
-    /// Note: the dispatch claim (see [`Self::claim_occurrence`]) is keyed by
+    /// Note: the dispatch claim (see `claim_occurrence`) is keyed by
     /// `(job_id, next_run)` at one-second resolution, so calling this twice
     /// for the same job within the same wall-clock second — before the
     /// first firing's `get_due_tasks` call — dispatches only once; the

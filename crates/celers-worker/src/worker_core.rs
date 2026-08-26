@@ -396,7 +396,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// task running here.
     /// While the worker runs, every in-flight task is registered with the
     /// watcher's registry and executed inside a [`TaskExecutionContext`] carrying
-    /// a [`CancellationToken`](crate::cancellation::CancellationToken). When a
+    /// a [`CancellationToken`]. When a
     /// revocation signal for an in-flight task arrives, its token is tripped: the
     /// task's future is raced against the token via [`tokio::select!`], so a
     /// cooperative task stops at its next `is_cancelled()` check (and any task is

@@ -238,7 +238,7 @@ async fn probe_control_channel(broker_url: &str, channel: &str) -> anyhow::Resul
 #[derive(Debug, Clone, Default)]
 pub struct WorkerStartupOptions {
     /// Grace period `start_worker` waits for in-flight tasks to finish
-    /// during shutdown; see [`worker_shutdown_timeout`]. `None` falls back
+    /// during shutdown; see `worker_shutdown_timeout`. `None` falls back
     /// to `CELERS_WORKER_SHUTDOWN_TIMEOUT_SECS`, then a 30s default.
     pub shutdown_timeout_secs: Option<u64>,
 
@@ -251,7 +251,7 @@ pub struct WorkerStartupOptions {
     pub no_connect_check: bool,
 
     /// Total wall-clock budget for the connectivity probe's bounded
-    /// exponential-backoff retry loop; see [`broker_connect_timeout`].
+    /// exponential-backoff retry loop; see `broker_connect_timeout`.
     /// Ignored when `no_connect_check` is set.
     pub connect_timeout_secs: Option<u64>,
 

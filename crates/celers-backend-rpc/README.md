@@ -1,6 +1,6 @@
 # celers-backend-rpc
 
-**Version: 0.3.1 | Status: [Alpha] | Tests: 62 (`--all-features`, excluding `#[ignore]`d) + 2 doctests | Updated: 2026-08-26**
+**Version: 0.3.1 | Status: [Alpha] | Tests: 63 (`--all-features`, excluding `#[ignore]`d) + 2 doctests | Updated: 2026-08-26**
 
 gRPC/RPC result backend for CeleRS. Enables remote task result storage and retrieval over gRPC, suitable for distributed microservices architectures and service mesh deployments.
 
@@ -152,7 +152,7 @@ This crate is part of the [CeleRS](https://github.com/cool-japan/celers) project
 
 ## Testing
 
-**62 tests passing** (`cargo nextest run --all-features`; type conversions including sub-second timestamp
+**63 tests passing** (`cargo nextest run --all-features`; type conversions including sub-second timestamp
 round-tripping and corrupt-payload rejection, chord operations, connection modes, retry-decision
 logic, request hardening (deadlines/auth headers), the metrics ring-buffer/percentile logic, and
 an in-process client-server round trip over a real local TCP listener exercising every RPC), **1

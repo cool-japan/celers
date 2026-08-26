@@ -842,10 +842,10 @@ impl Config {
     /// parse are also ignored the same way, but logged via [`tracing::warn`]
     /// (idx 337) so a typo like `CELERS_CONCURRENCY=abc` or
     /// `CELERS_MAX_RETRIES=-1` does not silently vanish -- see
-    /// [`first_env_parsed`].
+    /// `first_env_parsed`.
     ///
     /// When neither `CELERY_BROKER_URL` nor `CELERS_BROKER_URL` is set, and
-    /// `broker.url` is still exactly [`DEFAULT_BROKER_URL`] (i.e. no config
+    /// `broker.url` is still exactly `DEFAULT_BROKER_URL` (i.e. no config
     /// file supplied one -- `BrokerConfig::url` has no `#[serde(default)]`,
     /// so parsing *any* file that omits it fails outright, meaning this
     /// field can only still hold the hardcoded default here if
@@ -862,7 +862,7 @@ impl Config {
     /// `broker.url = "amqp://..."` from `celers.toml` with no warning (idx
     /// 338). NOTE: this is a value-based heuristic, not true provenance
     /// tracking -- a config file that explicitly sets `broker.url` to
-    /// exactly [`DEFAULT_BROKER_URL`] is indistinguishable here from "no
+    /// exactly `DEFAULT_BROKER_URL` is indistinguishable here from "no
     /// file was loaded at all", so it would still be overridden by
     /// `REDIS_URL`/`AMQP_URL`. Precisely tracking "was this explicitly set"
     /// would need `BrokerConfig::url` to become `Option<String>`, which

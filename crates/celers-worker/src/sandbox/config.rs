@@ -116,9 +116,9 @@ impl SandboxConfig {
     /// Filtering exists only on Linux, only when `celers-worker` is built
     /// with its off-by-default `seccomp` feature, and only at
     /// [`IsolationLevel::Process`] — the level at which
-    /// [`Sandbox::enforce_process_limits`] runs and installs it. In any other
-    /// configuration setting this to `true` makes [`Sandbox::new`] fail with
-    /// [`SandboxError::Unsupported`] rather than silently ignore the request.
+    /// [`super::Sandbox::enforce_process_limits`] runs and installs it. In any other
+    /// configuration setting this to `true` makes [`super::Sandbox::new`] fail with
+    /// [`super::SandboxError::Unsupported`] rather than silently ignore the request.
     ///
     /// # Warning: process-wide and irreversible
     ///
@@ -129,7 +129,7 @@ impl SandboxConfig {
     /// deny-list of syscalls the worker itself never makes (module loading,
     /// `ptrace`, mount/namespace manipulation, `bpf`, keyring access, …),
     /// answered with `EPERM` rather than a `SIGSYS` kill. It is installed by
-    /// [`Sandbox::enforce_process_limits`], which should be called once at
+    /// [`super::Sandbox::enforce_process_limits`], which should be called once at
     /// worker start-up.
     pub fn with_seccomp(mut self, enable: bool) -> Self {
         self.enable_seccomp = enable;
@@ -139,7 +139,7 @@ impl SandboxConfig {
     /// Set isolation level
     ///
     /// See [`IsolationLevel`] for which levels this build can actually
-    /// enforce; unsupported levels are rejected by [`Sandbox::new`].
+    /// enforce; unsupported levels are rejected by [`super::Sandbox::new`].
     pub fn with_isolation_level(mut self, level: IsolationLevel) -> Self {
         self.isolation_level = level;
         self
@@ -211,7 +211,7 @@ impl SandboxConfig {
     ///
     /// The preset uses [`IsolationLevel::Basic`] and leaves seccomp off so
     /// that it stays constructible on every platform: asking for containment
-    /// this build cannot provide would only turn [`Sandbox::new`] into a hard
+    /// this build cannot provide would only turn [`super::Sandbox::new`] into a hard
     /// error.  Combine with [`SandboxConfig::with_isolation_level`] and the
     /// `rlimit` feature when running on Unix and real limits are wanted.
     pub fn strict() -> Self {
@@ -266,9 +266,9 @@ impl fmt::Display for SandboxConfig {
 ///
 /// Only [`IsolationLevel::None`] and [`IsolationLevel::Basic`] are supported
 /// on every platform.  [`IsolationLevel::Process`] additionally requires a
-/// Unix target (it is what unlocks [`Sandbox::enforce_process_limits`]).
+/// Unix target (it is what unlocks [`super::Sandbox::enforce_process_limits`]).
 /// [`IsolationLevel::Container`] and [`IsolationLevel::Full`] are **not
-/// implemented**; [`Sandbox::new`] rejects them.
+/// implemented**; [`super::Sandbox::new`] rejects them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IsolationLevel {
     /// No isolation (use with caution)
@@ -278,7 +278,7 @@ pub enum IsolationLevel {
     #[default]
     Basic,
     /// Everything `Basic` provides plus process-wide OS resource limits
-    /// applied through [`Sandbox::enforce_process_limits`].  Unix only; the
+    /// applied through [`super::Sandbox::enforce_process_limits`].  Unix only; the
     /// limits themselves additionally require the crate's `rlimit` feature.
     Process,
     /// Container isolation (namespace isolation) — not implemented.

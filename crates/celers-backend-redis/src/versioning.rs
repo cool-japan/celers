@@ -12,7 +12,7 @@
 //! * `{task_key}:v{n}` — the payload of version `n`, written through the same
 //!   encode path (compression, encryption, chunking, TTL) as the live record.
 //!
-//! Retention is capped by [`VersioningConfig::max_versions`]; the oldest
+//! Retention is capped by [`crate::backend::VersioningConfig::max_versions`]; the oldest
 //! version outside the window is deleted on every write so history cannot grow
 //! without bound.
 
@@ -130,7 +130,7 @@ impl RedisResultBackend {
     /// Only versions still inside the retention window are reported, and only
     /// those whose history key exists — the newest version can be absent here
     /// if a crash interrupted the write between the live record and its history
-    /// entry. [`Self::get_result_version_impl`] still answers for it from the
+    /// entry. `get_result_version_impl` still answers for it from the
     /// live record.
     pub async fn list_result_versions(&mut self, task_id: Uuid) -> Result<Vec<u32>> {
         let counter_key = self.version_counter_key(task_id);

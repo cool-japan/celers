@@ -2,7 +2,7 @@
 
 > Procedural macros for simplified CeleRS task definition
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 221**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-08-26 | Tests: 227**
 
 ## Status: ✅ FEATURE COMPLETE
 
@@ -82,9 +82,9 @@ async fn process_data(id: u64, name: String) -> celers_core::Result<String> {
 
 ## Testing
 
-- 221 total tests passing (verified via `cargo nextest run -p celers-macros --all-features`, 2026-07-13)
+- 227 total tests passing (verified via `cargo nextest run -p celers-macros --all-features`, 2026-08-26)
 - 21 unit tests
-- 200 integration tests (task_attr, task_macro, derive_macro, validation modules; all in
+- 206 integration tests (task_attr, task_macro, derive_macro, validation modules; all in
   `tests/integration_test.rs` — see Deferred section below for its file size)
 - 23 doc examples, all marked `` ```ignore `` (not compiled/run by `cargo test --doc`; they
   illustrate macro-generated code that only exists after expansion in a real crate)

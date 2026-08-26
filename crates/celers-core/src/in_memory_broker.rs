@@ -539,9 +539,9 @@ impl crate::Broker for InMemoryBroker {
         }
     }
 
-    /// A real non-blocking dequeue: [`Self::poll_once`] promotes what is due,
+    /// A real non-blocking dequeue: `poll_once` promotes what is due,
     /// takes a deliverable entry if there is one, and returns either way. It
-    /// never waits on [`Self::acquire_permit`], which is the only thing
+    /// never waits on `acquire_permit`, which is the only thing
     /// [`Broker::dequeue`](crate::Broker::dequeue) parks on.
     async fn try_dequeue(&self) -> Result<Option<BrokerMessage>> {
         let (message, _) = self.poll_once().await;
@@ -550,9 +550,9 @@ impl crate::Broker for InMemoryBroker {
 
     /// Verified cancel-safe: `dequeue` holds no message across an `.await`.
     ///
-    /// The only place a message is taken is [`Self::try_dequeue_locked`], a
+    /// The only place a message is taken is `try_dequeue_locked`, a
     /// synchronous function called under the state lock inside
-    /// [`Self::poll_once`]. Once that lock await has resolved, `poll_once` runs
+    /// `poll_once`. Once that lock await has resolved, `poll_once` runs
     /// straight through to its return — permit bookkeeping included — and
     /// `dequeue` returns the message immediately. There is no poll boundary
     /// between "the message left the ready queue" and "the caller has it", so
@@ -629,10 +629,10 @@ impl crate::Broker for InMemoryBroker {
 
     /// Return the message to the queue with its retry state untouched.
     ///
-    /// This broker's [`reject`](Self::reject) already leaves `Retrying(n)`
+    /// This broker's [`reject`](crate::Broker::reject) already leaves `Retrying(n)`
     /// alone, so the retry-neutrality half of the contract is free here. What
     /// the override buys is the other half: `delay` is honoured through the
-    /// same scheduled set [`enqueue_after`](Self::enqueue_after) uses, so a
+    /// same scheduled set [`enqueue_after`](crate::Broker::enqueue_after) uses, so a
     /// deferred message is genuinely invisible until it is due instead of being
     /// re-delivered to the very worker that just refused it.
     async fn defer(

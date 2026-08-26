@@ -221,7 +221,7 @@ pub struct MessageRef<'a> {
     ///
     /// On the wire this is a base64 JSON string, identical to
     /// [`crate::Message::body`]'s representation - `"body": "dGVzdA=="`,
-    /// never `"body": [116,101,115,116]` - via the [`base64_body`] serde
+    /// never `"body": [116,101,115,116]` - via the `base64_body` serde
     /// adapter. `MessageRef` and `Message` therefore serialize to, and
     /// deserialize from, the same wire shape, and `into_owned()` never
     /// re-encodes or corrupts an already-decoded body.

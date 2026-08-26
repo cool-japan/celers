@@ -295,7 +295,7 @@ pub struct WorkerConfig {
     ///
     /// `None` — the default — means the worker executes whatever the broker
     /// hands it, signed or not. Set it to a
-    /// [`SignatureVerification`](crate::SignatureVerification) and a message
+    /// [`SignatureVerification`] and a message
     /// that does not verify is rejected before dispatch: dead-lettered when a
     /// DLQ is configured, dropped otherwise. See [`crate::security`].
     pub signature_verification: Option<SignatureVerification>,

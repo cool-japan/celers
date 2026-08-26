@@ -131,7 +131,7 @@ const NON_RETRYABLE_MARKERS: &[&str] = &[
 ///
 /// Serialization and configuration failures are deterministic and never
 /// retried. Operation failures are inspected for the AWS error codes listed in
-/// [`NON_RETRYABLE_MARKERS`]; anything else (throttling, 5xx, transport
+/// `NON_RETRYABLE_MARKERS`; anything else (throttling, 5xx, transport
 /// hiccups) is treated as transient.
 ///
 /// # Examples

@@ -2,7 +2,7 @@
 
 > Periodic task scheduler (Celery Beat equivalent)
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 501 (425 unit/integration + 76 doc)**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-08-26 | Tests: 590 (510 unit/integration + 80 doc)**
 
 ## Status: ✅ FEATURE COMPLETE + v0.3.0 ENHANCED
 
@@ -590,7 +590,7 @@ distributed dispatch locking, and a crontab day-of-week correctness fix (see bel
 - [x] Zero warnings in cargo test
 - [x] Zero warnings in cargo build
 - [x] Zero warnings in cargo clippy
-- [x] All tests passing (501 total: 425 unit/integration via `cargo nextest --all-features` + 76
+- [x] All tests passing (590 total: 510 unit/integration via `cargo nextest --all-features` + 80
       doc tests, across focused modules)
 - [x] Comprehensive test coverage
 

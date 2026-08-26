@@ -2,7 +2,7 @@
 
 > RabbitMQ/AMQP broker implementation for CeleRS
 
-## Status: ✅ STABLE (v0.3.1) — 244 tests passing | Updated: 2026-07-13
+## Status: ✅ STABLE (v0.3.1) — 292 tests passing | Updated: 2026-08-26
 
 Enterprise-ready AMQP broker with comprehensive production patterns including backpressure management, poison message detection, advanced routing, performance optimization, lifecycle hooks, DLX analytics, adaptive batching, performance profiling, rate limiting, bulkhead isolation, message scheduling, metrics export, circuit breaker pattern, advanced retry strategies, message compression, topology validation, observability enhancements, consumer group management, and comprehensive monitoring/utility modules.
 

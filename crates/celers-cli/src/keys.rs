@@ -39,7 +39,7 @@
 //!   `commands::schedule::add_schedule`) are a separate namespace from the
 //!   queue-family keys above -- a scheduled-task definition is not a broker
 //!   queue at all -- but the scan pattern used to discover them (see
-//!   `backup.rs`) is still centralized as [`SCHEDULE_SCAN_PATTERN`].
+//!   `backup.rs`) is still centralized as `SCHEDULE_SCAN_PATTERN`.
 
 /// The Redis key for `queue`'s main queue: a LIST in FIFO mode, a ZSET in
 /// Priority mode. Matches `RedisBroker::queue_name` exactly -- no prefix at

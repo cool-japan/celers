@@ -643,7 +643,7 @@ celers_tasks_failed_total > 1000
 
 ## Testing
 
-**319 unit/integration tests + 48 doc tests (367 total), all passing** — verified via
+**354 unit/integration tests + 50 doc tests (404 total), all passing** — verified via
 `cargo nextest run -p celers-metrics --all-features` and `cargo test --doc -p celers-metrics --all-features`
 
 ```rust

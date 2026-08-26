@@ -14,7 +14,7 @@
 /// backend (`redis`/`rediss`, `postgres`/`postgresql`, `mysql`,
 /// `amqp`/`amqps`, `sqs`) -- not only the ones `celers-cli`'s own `celers
 /// worker` can start a worker against (Redis only, today; see
-/// [`crate::commands::worker`]).
+/// `commands::worker`).
 pub const KNOWN_BROKER_SCHEMES: &[&str] = &[
     "redis",
     "rediss",
@@ -104,7 +104,7 @@ fn expected_schemes_for(broker_type: &str) -> Option<&'static [&'static str]> {
 /// "postgres://..."`), else `None`.
 ///
 /// Returns `None` (no warning) when `broker_type` is not itself recognized --
-/// see [`expected_schemes_for`].
+/// see `expected_schemes_for`.
 #[must_use]
 pub fn scheme_broker_type_mismatch(url: &str, broker_type: &str) -> Option<String> {
     let expected = expected_schemes_for(broker_type)?;

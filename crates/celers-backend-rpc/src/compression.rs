@@ -13,8 +13,8 @@ use celers_core::ResultCompressor;
 
 /// Compression settings for `GrpcResultBackend`'s `result_data`.
 ///
-/// Disabled by default (what [`crate::GrpcResultBackend::new`]/`connect`
-/// install): compression is an opt-in wire-size optimization, not a
+/// Disabled by default (what [`crate::GrpcResultBackend::connect`]
+/// installs): compression is an opt-in wire-size optimization, not a
 /// silent default behavior change for existing deployments.
 #[derive(Debug, Clone)]
 pub struct CompressionConfig {
@@ -24,7 +24,7 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    /// Compression off: [`super::codec::to_proto_meta_with_compression`]
+    /// Compression off: `to_proto_meta_with_compression`
     /// always leaves `result_data_compressed` unset. Decoding an *incoming*
     /// compressed message is unconditional and needs no config at all (see
     /// `from_proto_meta`), so this only affects what this side writes.

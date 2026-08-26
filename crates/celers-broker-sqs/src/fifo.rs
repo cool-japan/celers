@@ -7,7 +7,7 @@
 //! `MessageGroupId`. The generic [`Producer`](celers_kombu::Producer) interface
 //! — the one the worker and kombu layers actually call — has nowhere to put
 //! one, so the broker has to *derive* it from the message and its own
-//! configuration. [`FifoGroupIdSource`](crate::types::FifoGroupIdSource)
+//! configuration. [`FifoGroupIdSource`]
 //! selects the derivation; the functions here implement it and are pure so
 //! they can be unit tested without AWS.
 //!

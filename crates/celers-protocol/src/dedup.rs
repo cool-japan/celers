@@ -55,7 +55,7 @@ impl DedupKey {
 
     /// Create a dedup key from message content hash
     ///
-    /// Uses [`fnv1a_hash`] rather than `DefaultHasher` so the digest -- and
+    /// Uses `fnv1a_hash` rather than `DefaultHasher` so the digest -- and
     /// therefore a message's deduplication identity -- stays stable across
     /// Rust toolchain upgrades. `task` is length-prefixed before being
     /// concatenated with `body` so that distinct `(task, body)` pairs which

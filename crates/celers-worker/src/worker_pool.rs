@@ -26,7 +26,7 @@
 //!
 //! Queue depth is supplied by the embedding application through
 //! [`WorkerPool::set_queue_depth`] — the pool is broker-agnostic. CPU and
-//! memory utilisation are sampled from [`crate::sysinfo`] and are
+//! memory utilisation are sampled from `sysinfo` and are
 //! [`Option`]al: a missing sample means *unknown*, never *idle*. An unknown
 //! load signal can never trigger a scale-down, because "I cannot measure the
 //! load" and "the load is zero" are very different statements.

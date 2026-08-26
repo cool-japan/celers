@@ -2,7 +2,7 @@
 
 > Worker runtime for processing CeleRS tasks
 
-**Version: 0.3.1 | Status: [Stable] | Updated: 2026-07-13 | Tests: 703 (655 unit/integration + 48 doc)**
+**Version: 0.3.1 | Status: [Stable] | Updated: 2026-08-26 | Tests: 961 unit/integration + 68 doc**
 
 ## Status: ✅ FEATURE COMPLETE
 
@@ -545,8 +545,8 @@ Full-featured worker with retry logic, timeouts, health checks, and observabilit
   - Long-running worker, allocation cycles, queue overflow tests
   - Connection pool exhaustion, cascading failures, fragmentation tests
 
-**Total Tests**: 703 passing (655 unit/integration via `cargo nextest --all-features` + 48 doc tests;
-6 further doc tests are `ignore`d, requiring a live Postgres/Redis instance)
+**Total Tests**: 961 unit/integration tests + 68 doc tests, all passing (`cargo nextest --all-features`);
+6 further doc tests are `ignore`d, requiring a live Postgres/Redis instance
 
 ## v0.3.0 Stub Elimination (2026-05-29)
 

@@ -1,6 +1,6 @@
 # celers-backend-db
 
-**Version: 0.3.1 | Status: [Alpha] | Tests: 131 (`--all-features`, excluding `#[ignore]`d) + 1 doctest | Updated: 2026-08-26**
+**Version: 0.3.1 | Status: [Alpha] | Tests: 132 (`--all-features`, excluding `#[ignore]`d) + 1 doctest | Updated: 2026-08-26**
 
 Database (PostgreSQL/MySQL) result backend for CeleRS. Provides persistent task result storage, event persistence, chord state management, database analytics, and optional distributed locks using SQL databases.
 
@@ -87,7 +87,7 @@ This crate is part of the [CeleRS](https://github.com/cool-japan/celers) project
 
 ## Testing
 
-**131 tests passing** (`cargo nextest run --all-features`), **19 skipped** (marked `#[ignore]`; require a live
+**132 tests passing** (`cargo nextest run --all-features`), **19 skipped** (marked `#[ignore]`; require a live
 PostgreSQL/MySQL instance — run with `cargo nextest run --all-features --run-ignored all`). Plus **1 doc test passing** (5
 additional doc tests intentionally `ignore`d as illustrative-only, since they also require a live
 database).

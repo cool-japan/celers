@@ -251,7 +251,7 @@ impl LoadTestConfig {
 /// only at enqueue time in [`run_loadtest`].
 ///
 /// Payload bytes are **not** stored on this struct -- only `seed` and
-/// `payload_size`, the inputs [`build_payload`] needs to regenerate them
+/// `payload_size`, the inputs `build_payload` needs to regenerate them
 /// deterministically on demand via [`SyntheticTask::payload`]. A plan with a
 /// large `total` and/or `payload_size` would otherwise hold every task's
 /// full payload in memory simultaneously (`total * payload_size` bytes,
@@ -285,7 +285,7 @@ impl SyntheticTask {
     /// payloads in memory at once (only the ones actually being enqueued or
     /// previewed at any given moment). Calling this twice for the same task
     /// always returns identical bytes (same `(seed, index, payload_size)` in,
-    /// same [`build_payload`] output out).
+    /// same `build_payload` output out).
     #[must_use]
     pub fn payload(&self) -> Vec<u8> {
         build_payload(self.seed, self.index, self.payload_size)

@@ -46,12 +46,12 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     /// the worker a revocation channel that nothing outside the process can
     /// publish to. This connects it to the broker, which is what makes
     /// `celers control revoke <id>` — or any other process calling
-    /// [`Broker::revoke`](celers_core::Broker::revoke) — reach a task running
+    /// [`Broker::revoke`] — reach a task running
     /// here. Two things are switched on together, because each covers what the
     /// other cannot:
     ///
     /// 1. **The bridge.** A background task subscribes to
-    ///    [`Broker::subscribe_revocations`](celers_core::Broker::subscribe_revocations)
+    ///    [`Broker::subscribe_revocations`]
     ///    and, for every notice, records the revocation in this worker's
     ///    [`WorkerRevocationManager`] *and* publishes it into the
     ///    [`RevocationWatcher`]'s channel — so a task that is already running is
@@ -60,7 +60,7 @@ impl<B: Broker + 'static, E: EventEmitter + 'static> Worker<B, E> {
     ///    its own if the broker connection drops.
     /// 2. **The dequeue-time check.** Every message this worker dequeues is
     ///    checked against
-    ///    [`Broker::is_revoked`](celers_core::Broker::is_revoked) — the
+    ///    [`Broker::is_revoked`] — the
     ///    broker's *persisted* revoked-id set — before it runs. Pub/Sub is
     ///    fire-and-forget, so a worker that was restarting when the revocation
     ///    was published never saw it; the persisted set is what survives that.

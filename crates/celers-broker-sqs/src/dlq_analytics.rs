@@ -13,7 +13,7 @@
 //! [`DlqMessage::failure_count`] should come from the broker's authoritative
 //! `receive_count` (SQS's `ApproximateReceiveCount`) rather than a
 //! caller-tracked counter, the same source
-//! [`crate::replay::replayable_from_envelope`] uses for
+//! `replayable_from_envelope` (private to [`crate::replay`]) uses for
 //! `ReplayableMessage::failure_count`.
 //! [`DlqMessage::from_receive_count`] takes it directly, and
 //! [`dlq_message_from_envelope`] reads it (plus the message id and an
@@ -158,7 +158,7 @@ impl DlqMessage {
 /// Build a [`DlqMessage`] from a DLQ envelope, taking the failure count from
 /// the broker's authoritative [`SqsBroker::receive_count`] for the
 /// envelope's delivery tag rather than a caller-tracked counter -- the same
-/// source [`crate::replay::replayable_from_envelope`] uses for
+/// source `replayable_from_envelope` (private to [`crate::replay`]) uses for
 /// `ReplayableMessage::failure_count`. Falls back to `1` (first delivery)
 /// when the broker holds no metadata for the tag.
 ///

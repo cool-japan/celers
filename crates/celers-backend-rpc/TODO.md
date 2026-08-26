@@ -2,7 +2,7 @@
 
 > gRPC/RPC result backend for CeleRS
 
-**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-08-24 | Tests: 38**
+**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-08-26 | Tests: 63**
 
 ## Status: ✅ FEATURE COMPLETE — CLIENT + REFERENCE SERVER
 
@@ -301,7 +301,7 @@ Benefits:
 ## Testing Status
 
 - [x] Compilation tests
-- [x] Unit tests (38 passing via `cargo nextest run --all-features`: type conversions including
+- [x] Unit tests (63 passing via `cargo nextest run --all-features`: type conversions including
       sub-second timestamp round-tripping and corrupt-payload rejection, chord operations,
       connection modes, retry-decision logic, request hardening, and the `RpcMetrics`
       ring-buffer/percentile logic), 1 skipped (`#[ignore]`d, requires a *live external* server)

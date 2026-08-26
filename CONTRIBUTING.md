@@ -182,7 +182,7 @@ the same PR; don't leave it for the release to reconstruct from `git log`.
 ## License
 
 CeleRS is licensed under [Apache-2.0](LICENSE). By contributing, you agree your contribution is
-licensed under the same terms. (A minority of source files carry an `SPDX-License-Identifier: MIT OR
-Apache-2.0` header left over from an earlier plan to dual-license; the project's actual license, per
-the workspace `Cargo.toml` and the committed `LICENSE` file, is Apache-2.0 only, and no `LICENSE-MIT`
-is present. Treat the header as stale rather than as a second license grant.)
+licensed under the same terms. (Every source file's `SPDX-License-Identifier` header, where
+present, was normalized to `Apache-2.0` during the 0.3.1 hardening pass — see
+[CHANGELOG.md](CHANGELOG.md)'s Fixed section; none carries the stale `MIT OR Apache-2.0` header
+left over from the project's early dual-license plan, and no `LICENSE-MIT` is present.)

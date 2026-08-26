@@ -13,7 +13,7 @@ use super::convert::{message_to_task, task_to_message};
 use super::transport::CoreBrokerTransport;
 use crate::{BrokerError, Envelope};
 
-/// How long [`KombuBrokerAdapter::dequeue`] waits for a message by default.
+/// How long [`Broker::dequeue`](celers_core::Broker::dequeue) waits for a message by default.
 ///
 /// One second is the smallest value that is not actively wrong on either
 /// transport this adapter was built for:

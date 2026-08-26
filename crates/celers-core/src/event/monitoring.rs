@@ -85,7 +85,7 @@ impl AlertCondition {
 
 /// Number of one-second buckets kept for event-rate calculation.
 ///
-/// This is the longest window [`AlertContext::get_event_rate`] can measure;
+/// This is the longest window `AlertContext::get_event_rate` can measure;
 /// longer windows are clamped to it.
 pub const RATE_WINDOW_BUCKETS: u64 = 600;
 

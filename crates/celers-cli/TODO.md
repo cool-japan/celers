@@ -2,7 +2,7 @@
 
 > Command-line interface for CeleRS task queue management
 
-**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-07-13 | Tests: 757**
+**Version: 0.3.1 | Status: [Alpha] | Updated: 2026-08-26 | Tests: 1107**
 
 ## Status: ✅ FEATURE COMPLETE
 
@@ -319,7 +319,7 @@ Full-featured CLI for worker management, queue inspection, and DLQ operations.
 
 ## Testing Status
 
-**Total: 757 tests passing** (`cargo nextest run -p celers-cli --all-features`, confirmed 2026-07-13; 0 failed, 0 skipped)
+**Total: 1107 tests passing** (`cargo nextest run -p celers-cli --all-features`, confirmed 2026-08-26; 0 failed, 0 skipped)
 
 - [x] Unit tests for configuration parsing ✅
   - [x] Default configuration tests
