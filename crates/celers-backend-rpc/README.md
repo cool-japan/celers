@@ -163,4 +163,4 @@ one already covered above).
 
 Apache-2.0
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)

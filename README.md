@@ -726,7 +726,7 @@ is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Sponsorship
 
-CeleRS is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+CeleRS is developed and maintained by **COOLJAPAN OU (Team KitaSan)**.
 
 If you find CeleRS useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
 

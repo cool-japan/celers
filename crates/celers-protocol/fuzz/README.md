@@ -47,4 +47,4 @@ This crate is part of the [CeleRS](https://github.com/cool-japan/celers) project
 
 Apache-2.0
 
-Copyright (c) COOLJAPAN OU (Team Kitasan)
+Copyright (c) COOLJAPAN OU (Team KitaSan)

@@ -1422,7 +1422,7 @@ celers-cli test count pending final release-check re-verification before publish
 - Apache-2.0
 
 ### Authors
-- COOLJAPAN OU (Team Kitasan)
+- COOLJAPAN OU (Team KitaSan)
 
 ### Repository
 - https://github.com/cool-japan/celers
